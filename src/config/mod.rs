@@ -159,13 +159,20 @@ impl PastorConfig {
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let cfg: PastorConfig =
             toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-        for (name, v) in [
-            ("tick", &cfg.tick),
-            ("settle", &cfg.settle),
-            ("reconcile_every", &cfg.reconcile_every),
-            ("defaults.timeout", &cfg.defaults.timeout),
+        // tick, settle and reconcile_every all drive `tokio::time::interval`,
+        // which panics on a zero period. Reject zero here so a bad config
+        // fails to load instead of crashing the daemon at startup.
+        for (name, v, zero_ok) in [
+            ("tick", &cfg.tick, false),
+            ("settle", &cfg.settle, false),
+            ("reconcile_every", &cfg.reconcile_every, false),
+            ("defaults.timeout", &cfg.defaults.timeout, true),
         ] {
-            parse_duration(v).map_err(|e| anyhow::anyhow!("{}: {name}: {e}", path.display()))?;
+            let d = parse_duration(v)
+                .map_err(|e| anyhow::anyhow!("{}: {name}: {e}", path.display()))?;
+            if !zero_ok && d.is_zero() {
+                anyhow::bail!("{}: {name}: must not be zero", path.display());
+            }
         }
         Ok(cfg)
     }
@@ -307,5 +314,26 @@ mod tests {
                 .to_string()
                 .contains("settle")
         );
+    }
+
+    #[test]
+    fn zero_intervals_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+
+        std::fs::write(&path, "tick = \"0s\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("tick"), "{err}");
+        assert!(err.contains("must not be zero"), "{err}");
+
+        std::fs::write(&path, "reconcile_every = \"0s\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("reconcile_every"), "{err}");
+        assert!(err.contains("must not be zero"), "{err}");
+
+        std::fs::write(&path, "settle = \"0s\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("settle"), "{err}");
+        assert!(err.contains("must not be zero"), "{err}");
     }
 }
