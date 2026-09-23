@@ -69,6 +69,7 @@ pub enum AgentStatus {
     Working,
     Blocked,
     Done,
+    #[serde(other)]
     Unknown,
 }
 
@@ -199,6 +200,13 @@ mod tests {
         assert_eq!(list.agents[0].completion_seq, None);
         assert_eq!(list.agents[0].state_change_seq, 0);
         assert_eq!(list.agents[0].agent_status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn unknown_agent_status_value_falls_back_to_unknown() {
+        let status: AgentStatus = serde_json::from_value(serde_json::json!("something_new"))
+            .expect("an unrecognised status must not fail to parse");
+        assert_eq!(status, AgentStatus::Unknown);
     }
 
     #[test]
