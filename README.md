@@ -44,7 +44,7 @@ ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
 ## Try it
 
 ```bash
-cargo build --release
+make install                         # pastor and fake-herdr into ~/.cargo/bin
 pastor flock add pi-3 fleet@pi-3 --max-agents 2
 pastor flock add here --local
 pastor flock status                  # ssh, herdr version, protocol
@@ -59,7 +59,7 @@ pastor open pi-3                     # the full herdr UI on that machine
 Without a real herdr, a fake one speaks the same protocol:
 
 ```bash
-pastor flock add fake --command target/release/fake-herdr
+pastor flock add fake --command fake-herdr
 FAKE_HERDR_AUTO_DONE_MS=500 pastor serve
 ```
 
@@ -76,7 +76,15 @@ FAKE_HERDR_AUTO_DONE_MS=500 pastor serve
 
 ## Development
 
+The Makefile is the list of things you can run here; `make help` prints it.
+
 ```bash
-cargo test            # unit tests plus an end-to-end run against fake-herdr
-cargo run -- --help
+make check            # fmt check, clippy with warnings as errors, full test suite
+make test             # unit tests plus an end-to-end run against fake-herdr
+make test-machine     # the machine actor tests five times, to catch timing flakes
+make smoke SESSION=s  # opt-in test against a real herdr running session s on this host
+make build            # debug build of both binaries; cargo run -- --help works from there
 ```
+
+`make check` is what a pull request has to pass. Nothing in the suite talks to
+a real herdr, so run `make smoke` on a fleet machine before trusting it there.
