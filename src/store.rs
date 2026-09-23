@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
 
-use crate::task::{DispatchSpec, Task, TaskState};
+use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -177,15 +177,16 @@ impl Store {
     }
 
     /// Open tasks that hold a pane on this machine (for capacity and reconciliation).
+    ///
+    /// Filters pane-owning states in SQL rather than loading every historical
+    /// task for the machine and filtering in Rust: a machine with a long
+    /// closed/failed history would otherwise read rows it never needed.
     pub fn tasks_on_machine(&self, machine: &str) -> anyhow::Result<Vec<Task>> {
-        let all = self.list_tasks(&TaskFilter {
+        self.list_tasks(&TaskFilter {
             machine: Some(machine.into()),
+            states: Some(PANE_OWNING_STATES.to_vec()),
             ..Default::default()
-        })?;
-        Ok(all
-            .into_iter()
-            .filter(|t| t.state.occupies_pane())
-            .collect())
+        })
     }
 
     pub fn queued_tasks(&self) -> anyhow::Result<Vec<Task>> {
@@ -366,6 +367,43 @@ mod tests {
         );
         assert_eq!(s.find_by_pane("pi-3", "w1:p1").unwrap().unwrap().id, 1);
         assert!(s.find_by_pane("pi-3", "w2:p1").unwrap().is_none());
+    }
+
+    #[test]
+    fn tasks_on_machine_filters_pane_owning_states_in_sql() {
+        let s = Store::open_in_memory().unwrap();
+        let mut open = s.insert_task(new_task("run")).unwrap();
+        let mut closed = s.insert_task(new_task("run")).unwrap();
+        let mut failed = s.insert_task(new_task("run")).unwrap();
+        open.state = TaskState::Running;
+        open.machine = Some("pi-3".into());
+        closed.state = TaskState::Closed;
+        closed.machine = Some("pi-3".into());
+        failed.state = TaskState::Failed;
+        failed.machine = Some("pi-3".into());
+        s.update_task(&open).unwrap();
+        s.update_task(&closed).unwrap();
+        s.update_task(&failed).unwrap();
+
+        let on_machine = s.tasks_on_machine("pi-3").unwrap();
+        assert_eq!(
+            on_machine.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![open.id],
+            "closed and failed history must not come back from tasks_on_machine"
+        );
+
+        // The closed row is corrupted so a read that touched it would fail; a
+        // filter applied in Rust after loading every row would trip this.
+        s.execute_raw(&format!(
+            "UPDATE tasks SET state = 'not-a-real-state' WHERE id = {}",
+            closed.id
+        ));
+        let still_open = s.tasks_on_machine("pi-3").unwrap();
+        assert_eq!(
+            still_open.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![open.id],
+            "the SQL filter must exclude the closed row before it is decoded"
+        );
     }
 
     #[test]

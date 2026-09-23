@@ -17,6 +17,17 @@ pub enum TaskState {
     Closed,
 }
 
+/// States whose task holds a pane on its machine. Kept next to
+/// `occupies_pane` so the two stay in sync; `Store::tasks_on_machine` filters
+/// on this list in SQL instead of loading every historical task.
+pub const PANE_OWNING_STATES: [TaskState; 5] = [
+    TaskState::Starting,
+    TaskState::Running,
+    TaskState::Blocked,
+    TaskState::Done,
+    TaskState::Stale,
+];
+
 impl TaskState {
     pub fn occupies_pane(&self) -> bool {
         matches!(
