@@ -78,15 +78,23 @@ made of four cooperating parts sharing one SQLite store.
 2. **Connector runner.** Spawns poll connectors per due run and keeps stream
    connectors alive with restart backoff. Connectors only print items; they
    never touch herdr.
-3. **Machine channels.** One persistent SSH connection per machine running
-   `herdr --session <s> remote-api-bridge`, which pipes stdio to that
-   machine's herdr socket. pastor speaks herdr's newline-delimited JSON
-   protocol over it for every call: `workspace.create`, `worktree.create`,
-   `agent.start`, `agent.prompt`, `agent.list`, `agent.read`,
-   `events.subscribe`. A `local = true` machine uses the socket path
-   directly. On drop: reconnect with backoff, poll that machine each tick
-   until it returns. pastor does not use `herdr --machine` and does not
-   depend on the head's herdr client catalog.
+3. **Machine channels.** herdr's API server answers exactly one request per
+   connection and then closes it (`src/api/server.rs`), so a channel is not
+   one long-lived stream. Correction to the original design: pastor opens a
+   connection per request — an `ssh` running `herdr --session <s>
+   remote-api-bridge`, which pipes stdio to that machine's herdr socket —
+   and keeps one long-lived connection for `events.subscribe`, the one
+   method herdr does hold open. The per-request connections are cheap because
+   every `ssh` shares one `ControlMaster` per machine
+   (`ControlPath = <state_dir>/ssh/<machine>.sock`, `ControlPersist=600`),
+   so only the first pays a handshake. pastor speaks herdr's
+   newline-delimited JSON protocol for every call: `workspace.create`,
+   `worktree.create`, `agent.start`, `agent.prompt`, `agent.list`,
+   `agent.read`, `events.subscribe`. A `local = true` machine connects to the
+   socket path directly, once per request, the same way. When a request fails
+   below the API, or the event stream ends: reconnect with backoff, poll that
+   machine each tick until it returns. pastor does not use `herdr --machine`
+   and does not depend on the head's herdr client catalog.
 4. **Dispatcher.** Picks a machine, creates a place, starts the agent, sends
    the prompt, records the task. State after that comes from events.
 
@@ -95,7 +103,9 @@ running because herdr owns them.
 
 herdr facts this design relies on, verified against herdr 0.9.1 source:
 `remote-api-bridge` exists as an internal subcommand and is what herdr's own
-client uses; the socket API has `events.subscribe` with
+client uses, one process per request; the API server serves one request per
+connection, and herdr's own client (`src/api/client.rs`, `request_value`)
+connects per request for the same reason; the socket API has `events.subscribe` with
 `pane.agent_status_changed` and `pane.closed`; agent states are `idle`,
 `working`, `blocked`, `done`, `unknown`; `completion_seq` marks real
 completed work; agent names must match `[a-z][a-z0-9_-]{0,31}`; `agent.start`
@@ -328,7 +338,7 @@ States:
 `done` means the agent stopped and is waiting, not that the work is good.
 The pane stays open.
 
-Dispatch steps, all over the machine channel:
+Dispatch steps, each its own request on its own connection:
 
 1. Pick a machine: pinned `machine` wins; else filter by `tags`, drop
    machines at `max_agents`, with a down channel, or `incompatible`; take the
@@ -346,8 +356,8 @@ Dispatch steps, all over the machine channel:
 A failing step marks the task `failed` with herdr's error code and message.
 Created things are left in place. No automatic dispatch retry.
 
-Tracking: each channel subscribes to `pane.agent_status_changed` and
-`pane.closed`; events match tasks by pane id. On reconnect, and each tick
+Tracking: each machine holds one long-lived connection subscribed to
+`pane.agent_status_changed` and `pane.closed`; events match tasks by pane id. On reconnect, and each tick
 for a polling machine, `agent.list` reconciles. Pane gone means `closed`.
 `timeout` elapsed means `stale`, nothing is killed.
 

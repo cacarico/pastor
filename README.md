@@ -11,11 +11,17 @@ plugins and systemd setup are the next milestones; see
 
 ## How it works
 
-`pastor serve` runs on one machine, the head. For every machine in the flock it
-keeps an SSH connection running `herdr --session <s> remote-api-bridge`, which
-pipes herdr's socket protocol over stdio. Through it pastor creates a workspace,
-starts an agent named after the task, sends the prompt, and subscribes to agent
-status events. Task state lives in SQLite under `~/.local/state/pastor/`.
+`pastor serve` runs on one machine, the head. herdr answers one request per
+connection and then closes it, so pastor opens a connection per request: an
+`ssh` running `herdr --session <s> remote-api-bridge`, which pipes herdr's
+socket protocol over stdio. Those connections are cheap because all of a
+machine's share one multiplexed ssh master
+(`ControlMaster=auto`, `ControlPath=~/.local/state/pastor/ssh/<machine>.sock`,
+`ControlPersist=600`), so only the first one authenticates. Alongside them each
+machine keeps one long-lived connection for `events.subscribe`, the one thing
+herdr holds open. Over these pastor creates a workspace, starts an agent named
+after the task, sends the prompt, and watches agent status events. Task state
+lives in SQLite under `~/.local/state/pastor/`.
 
 The CLI talks to `pastor serve` over a unix socket (`pastor.sock`) with
 newline-delimited JSON; each response is `{"kind": ..., "data": ...}`.
@@ -56,11 +62,14 @@ pastor attach t-1                    # lands in the agent's pane; ctrl+b q detac
 pastor open pi-3                     # the full herdr UI on that machine
 ```
 
-Without a real herdr, a fake one speaks the same protocol:
+Without a real herdr, a fake one speaks the same protocol. It comes in the same
+two pieces the real thing does, because state has to outlive a single request:
+a server, and a bridge per request.
 
 ```bash
-pastor flock add fake --command fake-herdr
-FAKE_HERDR_AUTO_DONE_MS=500 pastor serve
+FAKE_HERDR_AUTO_DONE_MS=500 fake-herdr --listen /tmp/fake-herdr.sock &
+pastor flock add fake --command fake-herdr --connect /tmp/fake-herdr.sock
+pastor serve
 ```
 
 ## Files
@@ -70,6 +79,7 @@ FAKE_HERDR_AUTO_DONE_MS=500 pastor serve
 ~/.config/pastor/flock.toml       machines
 ~/.local/state/pastor/pastor.db   tasks
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
 ```
 
 `PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override the locations.
