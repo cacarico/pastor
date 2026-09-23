@@ -22,7 +22,7 @@ pub struct NewTask {
     pub spec: DispatchSpec,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TaskFilter {
     pub job: Option<String>,
     pub machine: Option<String>,
