@@ -15,8 +15,13 @@
 //! So a flock machine is `command = ["fake-herdr", "--connect", "<socket>"]` with a
 //! `--listen` process running beside it.
 //!
-//! Env `FAKE_HERDR_AUTO_DONE_MS=<n>`: after `agent.prompt` flips an agent to
-//! `working`, flip it back to `idle` n ms later with `completion_seq` incremented.
+//! Env, for the `--listen` server (the only mode that outlives a request):
+//!   FAKE_HERDR_AUTO_DONE_MS=<n>  after `agent.prompt` flips an agent to
+//!                                `working`, flip it back to `idle` n ms later
+//!                                with `completion_seq` incremented.
+//!   FAKE_HERDR_READY_MS=<n>      a started agent reports `unknown` and refuses
+//!                                prompts for n ms, the way herdr does while a
+//!                                managed agent is still launching.
 use std::path::PathBuf;
 
 use pastor::herdr::{AgentStatus, fake::FakeHerdr};
@@ -39,10 +44,11 @@ async fn main() {
     }
 }
 
-/// One connection on stdin/stdout: one request, one reply, exit.
+/// One connection on stdin/stdout: one request, one reply, exit. No auto-done
+/// watcher — this process is gone before it could ever fire.
 async fn stdio() {
     let fake = FakeHerdr::new();
-    auto_done(&fake);
+    ready_after(&fake);
     fake.serve(Box::new(tokio::io::stdin()), Box::new(tokio::io::stdout()))
         .await;
 }
@@ -50,6 +56,7 @@ async fn stdio() {
 /// The server: every accepted connection carries one request, as herdr's does.
 async fn listen(path: PathBuf) {
     let fake = FakeHerdr::new();
+    ready_after(&fake);
     auto_done(&fake);
     // A leftover socket from a previous run would make bind fail with EADDRINUSE.
     let _ = std::fs::remove_file(&path);
@@ -85,6 +92,17 @@ async fn bridge(path: PathBuf) {
     let _ = tokio::io::copy(&mut from_server, &mut stdout).await;
     let _ = stdout.flush().await;
     up.abort();
+}
+
+/// Makes started agents spend `FAKE_HERDR_READY_MS` launching, so a dispatch
+/// has to wait for readiness the way it does against a real herdr.
+fn ready_after(fake: &FakeHerdr) {
+    if let Some(ms) = std::env::var("FAKE_HERDR_READY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        fake.set_ready_after(std::time::Duration::from_millis(ms));
+    }
 }
 
 /// Watches for agents that have just been prompted and lets them finish on their

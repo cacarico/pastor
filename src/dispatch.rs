@@ -1,7 +1,13 @@
-use chrono::Utc;
+use std::time::Duration;
 
-use crate::herdr::{CallError, Connector, ConnectorExt, HerdrError};
+use chrono::Utc;
+use tokio::time::Instant;
+
+use crate::herdr::{AgentStatus, CallError, Connector, ConnectorExt, HerdrError};
 use crate::task::{DispatchSpec, Task, TaskState};
+
+/// How often dispatch asks `agent.list` whether the agent it started is up yet.
+const READY_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub struct MachineView {
@@ -40,17 +46,59 @@ pub enum DispatchOutcome {
     Blocked,
 }
 
-/// Create the workspace, start the agent, send the prompt. Each step is its own
-/// herdr request on its own connection (see `ConnectorExt`), so a dispatch is
-/// three round trips, not one session: nothing but the task row ties them
-/// together, which is why `agent_name` identifies the agent afterwards.
-pub async fn dispatch(conn: &dyn Connector, task: &mut Task) -> Result<DispatchOutcome, CallError> {
+/// Why a dispatch did not reach `Running`.
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    /// A herdr call failed. Only this one can mean the machine is gone.
+    #[error(transparent)]
+    Call(#[from] CallError),
+    /// pastor's own verdict about this dispatch: the spec is unusable, the agent
+    /// never came up, the agent exited. The task failed; the machine is fine.
+    #[error("{0}")]
+    Task(String),
+}
+
+impl From<HerdrError> for DispatchError {
+    fn from(err: HerdrError) -> DispatchError {
+        DispatchError::Call(CallError::Herdr(err))
+    }
+}
+
+impl DispatchError {
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            DispatchError::Call(err) => err.code(),
+            DispatchError::Task(_) => None,
+        }
+    }
+
+    /// Did this fail because the machine is unreachable, rather than because
+    /// this task could not be started on it?
+    pub fn is_transport(&self) -> bool {
+        matches!(self, DispatchError::Call(err) if err.is_transport())
+    }
+}
+
+/// Create the workspace, start the agent, wait for it to come up, send the
+/// prompt. Each step is its own herdr request on its own connection (see
+/// `ConnectorExt`), so a dispatch is several round trips, not one session:
+/// nothing but the task row ties them together, which is why `agent_name`
+/// identifies the agent afterwards.
+///
+/// `ready_timeout` bounds the wait between `agent.start` and a prompt herdr
+/// accepts; it must stay below the caller's per-request timeout, or a slow
+/// agent surfaces as a confusing "request timed out".
+pub async fn dispatch(
+    conn: &dyn Connector,
+    task: &mut Task,
+    ready_timeout: Duration,
+) -> Result<DispatchOutcome, DispatchError> {
     let name = Task::agent_name_for(task.id);
     task.agent_name = Some(name.clone());
     task.state = TaskState::Starting;
     task.error = None;
 
-    let result = dispatch_steps(conn, task, &name).await;
+    let result = dispatch_steps(conn, task, &name, ready_timeout).await;
     match &result {
         Ok(DispatchOutcome::Running) => {
             task.state = TaskState::Running;
@@ -74,7 +122,8 @@ async fn dispatch_steps(
     conn: &dyn Connector,
     task: &mut Task,
     name: &str,
-) -> Result<DispatchOutcome, CallError> {
+    ready_timeout: Duration,
+) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
     let created = if spec.worktree {
         let repo = spec
@@ -92,21 +141,66 @@ async fn dispatch_steps(
     task.workspace_id = Some(created.workspace.workspace_id.clone());
     task.pane_id = Some(created.root_pane.pane_id.clone());
 
-    match conn
-        .agent_start(
-            name,
-            &spec.agent,
-            &created.root_pane.pane_id,
-            &spec.agent_args,
-        )
-        .await
-    {
-        Ok(_) => {}
-        Err(err) if err.code() == Some("agent_not_ready") => return Ok(DispatchOutcome::Blocked),
-        Err(err) => return Err(err),
+    // herdr's `agent.start` returns as soon as it has launched the agent in the
+    // pane; it never reports `agent_not_ready` (its errors are about the name,
+    // the kind and the pane). Readiness shows up afterwards, in `agent.list` and
+    // in whether `agent.prompt` is accepted.
+    conn.agent_start(
+        name,
+        &spec.agent,
+        &created.root_pane.pane_id,
+        &spec.agent_args,
+    )
+    .await?;
+
+    prompt_when_ready(conn, task, name, ready_timeout).await
+}
+
+/// Poll `agent.list` until the agent herdr just started is up, then prompt it.
+///
+/// herdr answers `agent_not_ready` both while a managed agent is still launching
+/// (transient) and once the agent is no longer the pane's foreground process —
+/// an agent that exited, e.g. because its binary is not installed on that
+/// machine. The two are told apart by whether the agent is still in
+/// `agent.list`: gone means failed now, present-but-`unknown` means wait.
+async fn prompt_when_ready(
+    conn: &dyn Connector,
+    task: &Task,
+    name: &str,
+    ready_timeout: Duration,
+) -> Result<DispatchOutcome, DispatchError> {
+    let machine = task.machine.as_deref().unwrap_or("that machine");
+    let deadline = Instant::now() + ready_timeout;
+    loop {
+        let agents = conn.agent_list().await?;
+        let Some(agent) = agents.iter().find(|a| a.name.as_deref() == Some(name)) else {
+            return Err(DispatchError::Task(format!(
+                "agent {name} exited before accepting a prompt (is `{}` installed on {machine}?)",
+                task.spec.agent
+            )));
+        };
+        if agent.agent_status != AgentStatus::Unknown {
+            match conn.agent_prompt(name, &task.prompt).await {
+                Ok(_) => return Ok(DispatchOutcome::Running),
+                // The agent is up and waiting for a human, not for us.
+                Err(err) if err.code() == Some("agent_blocked") => {
+                    return Ok(DispatchOutcome::Blocked);
+                }
+                // Still launching: herdr refuses prompts until the agent owns the
+                // pane. Keep waiting inside the same bound.
+                Err(err) if err.code() == Some("agent_not_ready") => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(DispatchError::Task(format!(
+                "agent {name} not ready after {ready_timeout:?}; \
+                 a live agent {name} may remain on {machine}; close it in herdr"
+            )));
+        }
+        tokio::time::sleep(READY_POLL.min(deadline - now)).await;
     }
-    conn.agent_prompt(name, &task.prompt).await?;
-    Ok(DispatchOutcome::Running)
 }
 
 #[cfg(test)]
@@ -115,6 +209,10 @@ mod tests {
     use crate::herdr::AgentStatus;
     use crate::herdr::fake::{FakeHerdr, StartBehaviour};
     use serde_json::Value;
+
+    /// Generous next to every `ready_after` these tests use, so only the test
+    /// that means to hit the bound does.
+    const READY: Duration = Duration::from_secs(5);
 
     fn mv(name: &str, max: u32, live: usize, tags: &[&str], healthy: bool) -> MachineView {
         MachineView {
@@ -252,7 +350,7 @@ mod tests {
     async fn dispatch_sends_prompt_verbatim() {
         let fake = FakeHerdr::new();
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t).await.unwrap();
+        let out = dispatch(&fake, &mut t, READY).await.unwrap();
         assert_eq!(out, DispatchOutcome::Running);
         assert_eq!(t.state, TaskState::Running);
         assert_eq!(t.agent_name.as_deref(), Some("t-7"));
@@ -282,7 +380,7 @@ mod tests {
             branch: Some("pastor/k1".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t).await.unwrap();
+        dispatch(&fake, &mut t, READY).await.unwrap();
         let wt = fake
             .requests()
             .into_iter()
@@ -293,23 +391,113 @@ mod tests {
         assert_eq!(wt.params["label"], "t-7");
     }
 
+    /// herdr reports a managed agent as `unknown` and refuses prompts while it
+    /// is still launching. Dispatch waits that out instead of failing the task:
+    /// this is the live defect (`agent_not_ready: agent t-1 is not an active
+    /// named agent` on a perfectly healthy machine).
     #[tokio::test]
-    async fn not_ready_is_blocked_and_failures_are_failed() {
+    async fn dispatch_waits_for_a_launching_agent() {
         let fake = FakeHerdr::new();
-        fake.set_start_behaviour(StartBehaviour::NotReady);
+        fake.set_ready_after(Duration::from_millis(300));
         let mut t = task(spec());
-        assert_eq!(
-            dispatch(&fake, &mut t).await.unwrap(),
-            DispatchOutcome::Blocked
+        let out = dispatch(&fake, &mut t, READY).await.unwrap();
+        assert_eq!(out, DispatchOutcome::Running);
+        assert_eq!(t.state, TaskState::Running);
+        let methods: Vec<String> = fake.requests().into_iter().map(|r| r.method).collect();
+        assert!(
+            methods.iter().filter(|m| *m == "agent.list").count() >= 2,
+            "expected repeated agent.list polling, got {methods:?}"
         );
+        assert_eq!(
+            methods.last().map(String::as_str),
+            Some("agent.prompt"),
+            "the prompt is sent last, once the agent is up: {methods:?}"
+        );
+    }
+
+    /// The same `agent_not_ready` code with the opposite meaning: the agent is
+    /// gone from `agent.list`, so it exited (the usual cause is the agent binary
+    /// missing on that machine). Fail now, do not wait out the bound.
+    #[tokio::test]
+    async fn an_agent_that_exits_on_start_fails_immediately() {
+        let fake = FakeHerdr::new();
+        fake.exit_agents_on_start(true);
+        let mut t = task(spec());
+        t.machine = Some("pi-1".into());
+        let started = Instant::now();
+        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} for an agent that was already gone",
+            started.elapsed()
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("exited before accepting a prompt"),
+            "{message}"
+        );
+        assert!(message.contains("claude"), "{message}");
+        assert!(message.contains("pi-1"), "{message}");
+        assert!(!err.is_transport(), "a dead agent is not a dead machine");
+        assert_eq!(t.state, TaskState::Failed);
+        assert_eq!(t.error.as_deref(), Some(message.as_str()));
+    }
+
+    /// The agent never comes up within the bound. The task fails, the machine is
+    /// untouched, and the message says an agent may still be sitting there.
+    #[tokio::test]
+    async fn an_agent_that_never_becomes_ready_fails_with_the_bound() {
+        let fake = FakeHerdr::new();
+        fake.set_ready_after(Duration::from_secs(30));
+        let mut t = task(spec());
+        t.machine = Some("pi-1".into());
+        let err = dispatch(&fake, &mut t, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("not ready after"), "{message}");
+        assert!(message.contains("may remain on pi-1"), "{message}");
+        assert!(!err.is_transport(), "a slow agent is not a dead machine");
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(t.pane_id.is_some(), "pane is kept for inspection");
+    }
+
+    /// An agent that is up but waiting for a human still blocks the task.
+    #[tokio::test]
+    async fn a_blocked_agent_blocks_the_task() {
+        let fake = FakeHerdr::new();
+        // The agent has to exist before it can be blocked, and dispatch has to
+        // still be polling when it is: block it from a watcher during the
+        // launch window.
+        fake.set_ready_after(Duration::from_millis(150));
+        let watcher = fake.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(a) = watcher.agents().first() {
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked, None);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let mut t = task(spec());
+        let out = dispatch(&fake, &mut t, READY).await.unwrap();
+        assert_eq!(out, DispatchOutcome::Blocked);
         assert_eq!(t.state, TaskState::Blocked);
         assert!(t.pane_id.is_some(), "pane is kept for inspection");
-        assert!(!fake.requests().iter().any(|r| r.method == "agent.prompt"));
+    }
 
+    #[tokio::test]
+    async fn start_failures_are_failed() {
+        let fake = FakeHerdr::new();
         fake.set_start_behaviour(StartBehaviour::Fail("unsupported_agent_kind".into()));
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t).await.unwrap_err();
+        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
         assert_eq!(err.code(), Some("unsupported_agent_kind"));
+        assert!(
+            !err.is_transport(),
+            "a rejected start is not a dead machine"
+        );
         assert_eq!(t.state, TaskState::Failed);
         assert!(
             t.error
@@ -321,6 +509,7 @@ mod tests {
             t.workspace_id.is_some(),
             "created workspace is recorded even on failure"
         );
+        assert!(!fake.requests().iter().any(|r| r.method == "agent.prompt"));
     }
 
     #[tokio::test]
@@ -331,13 +520,19 @@ mod tests {
             repo: None,
             ..spec()
         });
-        let err = dispatch(&fake, &mut t).await.unwrap_err();
+        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
         assert!(
-            matches!(err, CallError::Herdr(HerdrError::Protocol(_))),
+            matches!(
+                err,
+                DispatchError::Call(CallError::Herdr(HerdrError::Protocol(_)))
+            ),
             "{err:?}"
+        );
+        assert!(
+            !err.is_transport(),
+            "a task pastor itself rejects must not mark the machine lost"
         );
         assert_eq!(t.state, TaskState::Failed);
         assert!(fake.requests().is_empty());
-        let _ = AgentStatus::Idle;
     }
 }

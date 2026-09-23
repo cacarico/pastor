@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -19,13 +20,49 @@ pub type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 /// while `diagnose` builds an error message out of it.
 const DIAGNOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A bridge process whose stdio this connection is speaking over. Kept only so
-/// that a connection that dies can name the command, its exit status and its
-/// stderr (that is how a herdr missing from the remote `PATH` is diagnosed).
+/// How much of a child's stderr is kept for that error message. Only the tail
+/// is worth keeping: the last thing ssh or herdr said before dying.
+const STDERR_LIMIT: usize = 8 * 1024;
+
+/// A bridge process whose stdio this connection is speaking over. Kept so that a
+/// connection that dies can name the command, its exit status and its stderr
+/// (that is how a herdr missing from the remote `PATH` is diagnosed).
 struct Bridge {
     argv: Vec<String>,
     child: tokio::process::Child,
-    stderr: tokio::process::ChildStderr,
+    /// The tail of the child's stderr, filled by `reader` as it arrives.
+    stderr: Arc<Mutex<Vec<u8>>>,
+    /// Drains that stderr pipe for the child's whole life. Without it a
+    /// long-lived bridge — the events subscription — blocks the moment ssh
+    /// writes more diagnostics than a pipe buffer holds, and the event stream
+    /// silently stops.
+    reader: tokio::task::JoinHandle<()>,
+}
+
+/// Read `stderr` to EOF in the background, keeping only the last
+/// `STDERR_LIMIT` bytes.
+fn drain_stderr(
+    mut stderr: tokio::process::ChildStderr,
+) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>) {
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    let sink = tail.clone();
+    let handle = tokio::spawn(async move {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let mut buf = sink.lock().unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    let extra = buf.len().saturating_sub(STDERR_LIMIT);
+                    if extra > 0 {
+                        buf.drain(..extra);
+                    }
+                }
+            }
+        }
+    });
+    (tail, handle)
 }
 
 /// One herdr socket connection, which carries **at most one request and its
@@ -59,10 +96,12 @@ impl Connection {
         child: tokio::process::Child,
         stderr: tokio::process::ChildStderr,
     ) -> Connection {
+        let (stderr, reader) = drain_stderr(stderr);
         self.bridge = Some(Bridge {
             argv,
             child,
             stderr,
+            reader,
         });
         self
     }
@@ -73,6 +112,9 @@ impl Connection {
     pub async fn call(mut self, method: &str, params: Value) -> Result<Value, HerdrError> {
         match self.call_inner(method, params).await {
             Ok(v) => Ok(v),
+            // An `error` reply is herdr answering, not the connection failing:
+            // it keeps its code and never pays for `diagnose`.
+            Err(err @ HerdrError::Api { .. }) => Err(err),
             Err(err) => Err(self.diagnose(err).await),
         }
     }
@@ -115,6 +157,7 @@ impl Connection {
     pub async fn subscribe(mut self, subscriptions: Vec<Value>) -> Result<EventStream, HerdrError> {
         match self.subscribe_inner(subscriptions).await {
             Ok(()) => Ok(EventStream { conn: self }),
+            Err(err @ HerdrError::Api { .. }) => Err(err),
             Err(err) => Err(self.diagnose(err).await),
         }
     }
@@ -173,6 +216,10 @@ impl Connection {
     /// names the command, its exit status and its stderr. A bridge that never
     /// started (wrong path, `ssh` refusing the host, herdr missing on the remote)
     /// looks like a plain EOF otherwise, which says nothing about why.
+    ///
+    /// Only failures below the API come here: an `error` reply means herdr
+    /// answered, and rewriting it would lose its code and declare a healthy
+    /// machine dead.
     async fn diagnose(&mut self, err: HerdrError) -> HerdrError {
         let Some(mut bridge) = self.bridge.take() else {
             return err;
@@ -180,9 +227,6 @@ impl Connection {
         // Close our end of the child's stdin so a process that is still running
         // (waiting for more input it will never get) can exit and be reaped.
         let _ = self.writer.shutdown().await;
-        let mut stderr = String::new();
-        let _ =
-            tokio::time::timeout(DIAGNOSE_TIMEOUT, bridge.stderr.read_to_string(&mut stderr)).await;
         let status = match tokio::time::timeout(DIAGNOSE_TIMEOUT, bridge.child.wait()).await {
             Ok(Ok(s)) => s.to_string(),
             Ok(Err(e)) => e.to_string(),
@@ -190,6 +234,14 @@ impl Connection {
                 let _ = bridge.child.kill().await;
                 "still running, killed".to_string()
             }
+        };
+        // The child is gone, so its stderr is at EOF and the drain task is about
+        // to finish; give it that moment so the last words make it into the
+        // message, then take whatever it collected.
+        let _ = tokio::time::timeout(DIAGNOSE_TIMEOUT, &mut bridge.reader).await;
+        let stderr = {
+            let buf = bridge.stderr.lock().unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
         };
         HerdrError::Transport(format!(
             "{}: {err} ({status}) {}",
@@ -217,6 +269,9 @@ impl EventStream {
     pub async fn next(&mut self) -> Result<Event, HerdrError> {
         match self.next_inner().await {
             Ok(ev) => Ok(ev),
+            // `events_lost` and friends arrive as `error` replies: they are herdr
+            // talking, so they keep their code.
+            Err(err @ HerdrError::Api { .. }) => Err(err),
             Err(err) => Err(self.conn.diagnose(err).await),
         }
     }
@@ -260,18 +315,19 @@ impl CallError {
         }
     }
 
-    /// Did this fail below the API — connect refused, socket closed, garbage on
-    /// the wire, bridge process gone? The machine actor treats that as the
-    /// machine being lost, while an API error is just this request failing.
+    /// Did this fail below the API — connect refused, socket closed, bridge
+    /// process gone? The machine actor treats that as the machine being lost,
+    /// while anything herdr actually answered is just this request failing.
+    ///
+    /// `Protocol` is deliberately not in here: a result pastor cannot parse, or
+    /// one of its own validation errors, fails the task; it says nothing about
+    /// whether the machine is reachable.
     pub fn is_transport(&self) -> bool {
         match self {
             CallError::Connect(_) => true,
             CallError::Herdr(err) => matches!(
                 err,
-                HerdrError::Io(_)
-                    | HerdrError::Closed
-                    | HerdrError::Protocol(_)
-                    | HerdrError::Transport(_)
+                HerdrError::Io(_) | HerdrError::Closed | HerdrError::Transport(_)
             ),
         }
     }

@@ -44,6 +44,10 @@ fn start() -> Env {
         .arg("--listen")
         .arg(&socket)
         .env("FAKE_HERDR_AUTO_DONE_MS", "300")
+        // Agents spend a moment launching, as they do under a real herdr, so
+        // this run exercises dispatch's readiness wait and not just the happy
+        // path where the agent is up the instant it is started.
+        .env("FAKE_HERDR_READY_MS", "200")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

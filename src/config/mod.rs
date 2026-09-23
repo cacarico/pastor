@@ -67,11 +67,19 @@ impl Paths {
         self.state_dir.join("ssh")
     }
 
-    /// Socket for `machine`'s ssh master. Named after the machine, not the ssh
-    /// target: a unix socket path is capped near 108 bytes, and `user@host` (or
-    /// ssh's own `%C` hash) makes that easy to blow. Anything outside
-    /// `[A-Za-z0-9._-]` is replaced, so a machine name can never walk out of the
-    /// directory or smuggle a separator into the path.
+    /// ControlPath template for `machine`'s ssh master: the machine name plus
+    /// ssh's own `%C`, which hashes the destination, user and port.
+    ///
+    /// The name alone would be wrong: retarget a machine (edit `ssh =`, or
+    /// remove and re-add it against another host) and the next connection would
+    /// reuse a master still attached to the *old* host for up to
+    /// `ControlPersist` seconds. `%C` changes with the destination, so a
+    /// retargeted machine simply gets a new master. It also separates two names
+    /// that sanitise to the same thing (`a/b` and `a_b`).
+    ///
+    /// The name is still in there, sanitised to `[A-Za-z0-9._-]`, so the socket
+    /// is recognisable and can never walk out of the directory; any `%` in the
+    /// state dir is escaped as `%%`, or ssh would expand it.
     pub fn ssh_control_path(&self, machine: &str) -> PathBuf {
         let safe: String = machine
             .chars()
@@ -83,12 +91,21 @@ impl Paths {
                 }
             })
             .collect();
-        self.ssh_dir().join(format!("{safe}.sock"))
+        let dir = self.ssh_dir().to_string_lossy().replace('%', "%%");
+        PathBuf::from(format!("{dir}/{safe}-%C"))
     }
 }
 
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    // Called on every ssh connect, so the common case — it is already there and
+    // already private — costs one stat instead of a create plus a chmod.
+    if let Ok(md) = std::fs::metadata(dir)
+        && md.is_dir()
+        && md.permissions().mode() & 0o777 == 0o700
+    {
+        return Ok(());
+    }
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("chmod {}", dir.display()))?;
@@ -233,14 +250,22 @@ mod tests {
         }
         assert_eq!(p.flock_file(), tmp.path().join("c/flock.toml"));
         assert_eq!(p.db_file(), tmp.path().join("s/pastor.db"));
-        assert_eq!(
-            p.ssh_control_path("pi-3"),
-            tmp.path().join("s/ssh/pi-3.sock")
-        );
+        assert_eq!(p.ssh_control_path("pi-3"), tmp.path().join("s/ssh/pi-3-%C"));
         assert_eq!(
             p.ssh_control_path("../../etc/x"),
-            tmp.path().join("s/ssh/.._.._etc_x.sock"),
+            tmp.path().join("s/ssh/.._.._etc_x-%C"),
             "a machine name must not escape the ssh directory"
+        );
+    }
+
+    #[test]
+    fn control_path_escapes_percent_in_the_state_dir() {
+        // ssh expands `%` in a ControlPath, so a state dir that contains one has
+        // to arrive escaped or the socket lands somewhere unintended.
+        let p = Paths::new("/tmp/c", "/tmp/100%/state");
+        assert_eq!(
+            p.ssh_control_path("pi-3"),
+            PathBuf::from("/tmp/100%%/state/ssh/pi-3-%C")
         );
     }
 

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -7,10 +8,13 @@ use tokio::sync::broadcast;
 
 use super::{AgentInfo, AgentStatus, BoxRead, BoxWrite, Connection, Event, Request};
 
+/// How `agent.start` behaves. herdr's `agent.start` never reports readiness
+/// (its error codes are `agent_pane_*`, `unsupported_agent_kind`,
+/// `agent_name_taken`, ...): readiness only shows up later, through
+/// `agent.list` and `agent.prompt`. See `ready_after`.
 #[derive(Debug, Clone)]
 pub enum StartBehaviour {
     Ready,
-    NotReady,
     Fail(String),
 }
 
@@ -18,12 +22,21 @@ pub enum StartBehaviour {
 struct State {
     next_ws: u32,
     agents: HashMap<String, AgentInfo>,
+    /// pane id -> when `agent.start` ran, for the `ready_after` window.
+    started: HashMap<String, Instant>,
     requests: Vec<Request>,
     start: Option<StartBehaviour>,
     protocol: u32,
     /// A method name that, once received, gets no reply at all: the connection
     /// just stops answering, simulating a wedged herdr.
     hang: Option<String>,
+    /// How long a freshly started agent stays unready: `agent.list` reports it
+    /// `unknown` and `agent.prompt` answers `agent_not_ready`, the way herdr
+    /// does while a managed agent is still launching. Zero by default.
+    ready_after: Duration,
+    /// The started agent vanishes immediately, as it does when the agent binary
+    /// is missing and the process exits the moment it is launched.
+    exit_on_start: bool,
 }
 
 #[derive(Clone)]
@@ -62,6 +75,16 @@ impl FakeHerdr {
     }
     pub fn set_protocol(&self, p: u32) {
         self.state.lock().unwrap().protocol = p;
+    }
+    /// A started agent reports `unknown` and refuses prompts for this long,
+    /// like a managed agent herdr is still launching.
+    pub fn set_ready_after(&self, d: Duration) {
+        self.state.lock().unwrap().ready_after = d;
+    }
+    /// The next started agents disappear the moment they start: `agent.start`
+    /// succeeds and `agent.list` never shows them again.
+    pub fn exit_agents_on_start(&self, yes: bool) {
+        self.state.lock().unwrap().exit_on_start = yes;
     }
     /// The next request for `method` gets no reply; the connection just stops
     /// answering, as if the herdr process wedged. Lets tests exercise a client-side
@@ -280,9 +303,6 @@ impl FakeHerdr {
                 let ws = ws_part.to_string();
                 match s.start.clone().unwrap_or(StartBehaviour::Ready) {
                     StartBehaviour::Fail(code) => return Err((code, "start failed".into())),
-                    StartBehaviour::NotReady => {
-                        return Err(("agent_not_ready".into(), "blocked during startup".into()));
-                    }
                     StartBehaviour::Ready => {}
                 }
                 let info = AgentInfo {
@@ -296,11 +316,29 @@ impl FakeHerdr {
                     state_change_seq: 1,
                     interactive_ready: true,
                 };
+                if s.exit_on_start {
+                    // The agent process died on launch: herdr still reports the
+                    // start it performed, and the agent is gone from then on.
+                    return Ok(json!({"type": "agent_started", "agent": info, "argv": []}));
+                }
+                s.started.insert(pane_id.clone(), Instant::now());
                 s.agents.insert(pane_id, info.clone());
                 Ok(json!({"type": "agent_started", "agent": info, "argv": []}))
             }
             "agent.prompt" => {
                 let target = p["target"].as_str().unwrap_or("");
+                let ready_after = s.ready_after;
+                let launching = s
+                    .agents
+                    .values()
+                    .find(|a| a.name.as_deref() == Some(target) || a.pane_id == target)
+                    .is_some_and(|a| is_launching(&s.started, &a.pane_id, ready_after));
+                if launching {
+                    return Err((
+                        "agent_not_ready".into(),
+                        format!("agent {target} is not an active named agent"),
+                    ));
+                }
                 let Some(a) = s
                     .agents
                     .values_mut()
@@ -320,9 +358,25 @@ impl FakeHerdr {
                 });
                 Ok(json!({"type": "agent_prompted", "agent": info}))
             }
-            "agent.list" => Ok(
-                json!({"type": "agent_list", "agents": s.agents.values().cloned().collect::<Vec<_>>()}),
-            ),
+            "agent.list" => {
+                let ready_after = s.ready_after;
+                let agents: Vec<AgentInfo> = s
+                    .agents
+                    .values()
+                    .map(|a| {
+                        if is_launching(&s.started, &a.pane_id, ready_after) {
+                            AgentInfo {
+                                agent_status: AgentStatus::Unknown,
+                                interactive_ready: false,
+                                ..a.clone()
+                            }
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect();
+                Ok(json!({"type": "agent_list", "agents": agents}))
+            }
             "agent.read" => Ok(json!({"type": "pane_read", "read": {"text": "fake output\n"}})),
             other => Err(("unsupported_method".into(), other.into())),
         }
@@ -336,6 +390,13 @@ impl super::transport::Connector for FakeHerdr {
     fn describe(&self) -> String {
         "fake herdr".into()
     }
+}
+
+/// Is this agent still inside its `ready_after` window?
+fn is_launching(started: &HashMap<String, Instant>, pane_id: &str, ready_after: Duration) -> bool {
+    started
+        .get(pane_id)
+        .is_some_and(|at| at.elapsed() < ready_after)
 }
 
 fn subscription_matches(subs: &[Value], ev: &Event) -> bool {
@@ -393,13 +454,7 @@ mod tests {
     #[tokio::test]
     async fn start_behaviours() {
         let fake = FakeHerdr::new();
-        fake.set_start_behaviour(StartBehaviour::NotReady);
         let created = fake.workspace_create(None, "x").await.unwrap();
-        let err = fake
-            .agent_start("t-2", "claude", &created.root_pane.pane_id, &[])
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), Some("agent_not_ready"));
         fake.set_start_behaviour(StartBehaviour::Fail("unsupported_agent_kind".into()));
         let err = fake
             .agent_start("t-3", "nope", &created.root_pane.pane_id, &[])
@@ -490,6 +545,44 @@ mod tests {
         let mut second = String::new();
         let n = reader.read_line(&mut second).await.unwrap();
         assert_eq!(n, 0, "expected EOF after one reply, got {second:?}");
+    }
+
+    /// herdr reports a managed agent as `unknown` and refuses prompts until it
+    /// is the pane's foreground process; `ready_after` models that window.
+    #[tokio::test]
+    async fn an_agent_is_unready_for_ready_after() {
+        let fake = FakeHerdr::new();
+        fake.set_ready_after(Duration::from_millis(200));
+        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.agent_list().await.unwrap()[0].agent_status,
+            AgentStatus::Unknown
+        );
+        let err = fake.agent_prompt("t-1", "hi").await.unwrap_err();
+        assert_eq!(err.code(), Some("agent_not_ready"));
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            fake.agent_list().await.unwrap()[0].agent_status,
+            AgentStatus::Idle
+        );
+        fake.agent_prompt("t-1", "hi").await.unwrap();
+    }
+
+    /// The agent binary was missing: the start call succeeds, the process is
+    /// gone straight away and `agent.list` never shows it.
+    #[tokio::test]
+    async fn an_agent_can_exit_on_start() {
+        let fake = FakeHerdr::new();
+        fake.exit_agents_on_start(true);
+        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
+            .await
+            .unwrap();
+        assert!(fake.agent_list().await.unwrap().is_empty());
     }
 
     /// The long-lived connection a disconnect can still cut is the event stream;

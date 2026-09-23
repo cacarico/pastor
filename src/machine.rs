@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::MIN_HERDR_PROTOCOL;
 use crate::dispatch::dispatch;
 use crate::herdr::{
-    AgentInfo, CallError, Connector, ConnectorExt, EventStream, subscription_agent_status,
+    AgentInfo, Connector, ConnectorExt, EventStream, subscription_agent_status,
     subscription_lifecycle,
 };
 use crate::store::Store;
@@ -58,6 +58,11 @@ pub struct MachineSettings {
     /// connect as well as the reply. A machine that does not answer within this
     /// window is treated as lost: the request fails and the actor reconnects.
     pub request_timeout: Duration,
+    /// How long a dispatch waits between `agent.start` and a prompt herdr
+    /// accepts. Must stay below `request_timeout`, which bounds the dispatch as
+    /// a whole: otherwise a slow agent surfaces as "request timed out" (and a
+    /// reconnect) instead of the readiness failure it is.
+    pub agent_ready_timeout: Duration,
 }
 
 impl Default for MachineSettings {
@@ -68,6 +73,7 @@ impl Default for MachineSettings {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
             request_timeout: Duration::from_secs(60),
+            agent_ready_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -402,6 +408,11 @@ impl Actor {
 
     /// The one connection pastor keeps open: herdr dedicates it to events and
     /// never serves a request on it.
+    ///
+    /// The subscribe is bounded here rather than at each call site, so a herdr
+    /// that accepts the connection and never acknowledges the subscription is
+    /// treated like any other wedged request: both callers turn the error into a
+    /// reconnect with backoff.
     async fn open_events(&self) -> Result<EventStream, anyhow::Error> {
         let mut subs = vec![
             subscription_lifecycle("pane.closed"),
@@ -412,7 +423,12 @@ impl Actor {
                 subs.push(subscription_agent_status(p));
             }
         }
-        Ok(self.connector.subscribe(subs).await?)
+        let timeout = self.settings.request_timeout;
+        Ok(
+            tokio::time::timeout(timeout, self.connector.subscribe(subs))
+                .await
+                .map_err(|_| anyhow::anyhow!("events.subscribe timed out after {timeout:?}"))??,
+        )
     }
 
     async fn handle_command(&mut self, cmd: MachineCommand) -> CommandOutcome {
@@ -512,29 +528,36 @@ impl Actor {
             return (Err(err), false);
         }
         let timeout = self.settings.request_timeout;
-        let outcome =
-            match tokio::time::timeout(timeout, dispatch(self.connector.as_ref(), &mut task)).await
-            {
-                Ok(outcome) => outcome,
-                // `dispatch()` itself never got to resolve, so its own Failed-recording
-                // never ran; do the same bookkeeping it would have done on an error, and
-                // force a reconnect: a herdr that stops answering is a machine that is gone.
-                Err(_) => {
-                    let message = format!("request timed out after {timeout:?}");
-                    task.state = TaskState::Failed;
-                    task.error = Some(message.clone());
-                    task.finished_at = Some(Utc::now());
-                    if let Err(err) = self.store.update_task(&task) {
-                        return (Err(err), true);
-                    }
-                    self.emit("task.failed", Some(task.id));
-                    return (
-                        Err(anyhow::anyhow!("dispatch {}: {message}", task.display_id())),
-                        true,
-                    );
+        let outcome = match tokio::time::timeout(
+            timeout,
+            dispatch(
+                self.connector.as_ref(),
+                &mut task,
+                self.settings.agent_ready_timeout,
+            ),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            // `dispatch()` itself never got to resolve, so its own Failed-recording
+            // never ran; do the same bookkeeping it would have done on an error, and
+            // force a reconnect: a herdr that stops answering is a machine that is gone.
+            Err(_) => {
+                let message = format!("request timed out after {timeout:?}");
+                task.state = TaskState::Failed;
+                task.error = Some(message.clone());
+                task.finished_at = Some(Utc::now());
+                if let Err(err) = self.store.update_task(&task) {
+                    return (Err(err), true);
                 }
-            };
-        let dead = matches!(&outcome, Err(err) if CallError::is_transport(err));
+                self.emit("task.failed", Some(task.id));
+                return (
+                    Err(anyhow::anyhow!("dispatch {}: {message}", task.display_id())),
+                    true,
+                );
+            }
+        };
+        let dead = matches!(&outcome, Err(err) if err.is_transport());
         if let Err(err) = self.store.update_task(&task) {
             return (Err(err), dead);
         }
@@ -635,9 +658,20 @@ impl Actor {
         {
             task.last_completion_seq = Some(*seq);
         }
+        let from = task.state;
         task.state = to;
         if matches!(to, TaskState::Done | TaskState::Failed | TaskState::Closed) {
             task.finished_at = Some(Utc::now());
+        } else {
+            // The task is open again (a `Done` agent that picked the work back
+            // up, say): the old finish time belongs to a cycle that is over, and
+            // leaving it there reads as "finished at ..." on a running task.
+            task.finished_at = None;
+        }
+        if from == TaskState::Blocked && matches!(to, TaskState::Running | TaskState::Done) {
+            // "agent blocked during startup; answer its prompt" was advice about
+            // a state the task has left; it is not an error on a running task.
+            task.error = None;
         }
         if to == TaskState::Failed && task.error.is_none() {
             task.error = Some("agent process exited".into());
@@ -806,6 +840,23 @@ mod tests {
             initial_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_millis(200),
             request_timeout: Duration::from_secs(5),
+            agent_ready_timeout: Duration::from_millis(500),
+        }
+    }
+
+    /// `agent_ready_timeout` has to stay under `request_timeout`, which bounds a
+    /// whole dispatch: otherwise the readiness wait is cut short by the outer
+    /// timeout and reported as a wedged machine instead of an agent that never
+    /// came up. Pinned for the shipped defaults and for the test settings above.
+    #[test]
+    fn ready_timeout_stays_under_the_request_timeout() {
+        for s in [MachineSettings::default(), settings()] {
+            assert!(
+                s.agent_ready_timeout < s.request_timeout,
+                "{:?} >= {:?}",
+                s.agent_ready_timeout,
+                s.request_timeout
+            );
         }
     }
 
@@ -938,6 +989,58 @@ mod tests {
         wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
         wait_for("live 0", || h.snapshot().live == 0).await;
         let _ = h.read(t.id, 10).await.unwrap_err();
+    }
+
+    /// Recovering from `Blocked` must not carry the startup advice onto a task
+    /// that is running again, and a `Done` task that goes back to work must not
+    /// keep the finish time of the cycle it just left.
+    #[tokio::test]
+    async fn state_changes_clear_the_previous_state_s_metadata() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(100)),
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+
+        // A task that blocks carries dispatch's advice, then answers the prompt.
+        fake.set_status(&pane, AgentStatus::Blocked, None);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        let mut blocked = store.get_task(t.id).unwrap().unwrap();
+        blocked.error = Some("agent blocked during startup; answer its prompt".into());
+        store.update_task(&blocked).unwrap();
+        fake.set_status(&pane, AgentStatus::Working, None);
+        wait_for("running again", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().error,
+            None,
+            "the blocked advice outlived the blocked state"
+        );
+
+        // A done task that goes back to work loses the old finish time.
+        fake.set_status(&pane, AgentStatus::Idle, Some(1));
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        assert!(store.get_task(t.id).unwrap().unwrap().finished_at.is_some());
+        fake.set_status(&pane, AgentStatus::Working, None);
+        wait_for("working again", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().finished_at,
+            None,
+            "a running task kept the finish time of its last cycle"
+        );
     }
 
     #[tokio::test]
@@ -1240,28 +1343,51 @@ mod tests {
         assert_eq!(fake.agents().len(), 1, "nothing was killed");
     }
 
-    /// Alternates: even-numbered `connect()` calls hand back a fresh fake
-    /// connection, odd-numbered ones fail. Each connect attempt makes an even
-    /// number of calls before subscribing (ping, then reconcile's agent.list), so
-    /// the subscribe always lands on a failing one and every attempt dies inside
-    /// `open_events` without ever reaching the inner loop.
+    /// Every request is served by the fake except `events.subscribe`, which gets
+    /// a connection that closes without answering. Selecting by method, not by
+    /// call parity: a connect attempt makes several ordinary calls (ping,
+    /// reconcile's `agent.list`) before it subscribes, so a parity rule would
+    /// fail one of those instead and never reach `open_events` at all.
     struct FlakyEvents {
-        calls: Arc<std::sync::atomic::AtomicUsize>,
+        subscribes: Arc<std::sync::atomic::AtomicUsize>,
         fake: FakeHerdr,
     }
 
     impl Connector for FlakyEvents {
         fn connect(&self) -> ConnectFuture<'_> {
-            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let fake = self.fake.clone();
+            let subscribes = self.subscribes.clone();
             Box::pin(async move {
-                if n.is_multiple_of(2) {
-                    Ok(fake.connect())
-                } else {
-                    Err(ConnectError {
-                        message: "events refused".into(),
-                    })
-                }
+                let (a, b) = tokio::io::duplex(64 * 1024);
+                let (ar, aw) = tokio::io::split(a);
+                let (br, bw) = tokio::io::split(b);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                    let mut reader = tokio::io::BufReader::new(br);
+                    let mut writer = bw;
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let Ok(req) = serde_json::from_str::<crate::herdr::Request>(line.trim()) else {
+                        return;
+                    };
+                    if req.method == "events.subscribe" {
+                        subscribes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return; // dropping `writer` is the EOF the subscribe sees
+                    }
+                    // Anything else is relayed to the fake on a connection of its
+                    // own and the reply is handed back with the caller's id.
+                    let reply = match fake.connect().call(&req.method, req.params).await {
+                        Ok(result) => serde_json::json!({"id": req.id, "result": result}),
+                        Err(crate::herdr::HerdrError::Api { code, message }) => {
+                            serde_json::json!({"id": req.id, "error": {"code": code, "message": message}})
+                        }
+                        Err(_) => return,
+                    };
+                    let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+                });
+                Ok(Connection::new(Box::new(ar), Box::new(aw)))
             })
         }
         fn describe(&self) -> String {
@@ -1274,9 +1400,9 @@ mod tests {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
         let (events, _rx) = broadcast::channel(64);
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscribes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let connector = FlakyEvents {
-            calls: calls.clone(),
+            subscribes: subscribes.clone(),
             fake,
         };
         let _h = spawn_machine(
@@ -1290,13 +1416,14 @@ mod tests {
         );
         // Busy-spinning would run this thousands of times in 300ms; exponential
         // backoff (50ms, 100ms, 200ms, 200ms, ...) keeps it to about 3 attempts
-        // (6 `connect()` calls) in that window. Bound generously above that to
-        // avoid flakes from scheduling jitter while still catching a real spin.
+        // in that window. Bound generously above that to avoid flakes from
+        // scheduling jitter while still catching a real spin — and from below,
+        // so a test that stopped reaching the subscribe at all fails too.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let n = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let n = subscribes.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
-            n < 12,
-            "connect() called {n} times in 300ms: not backing off"
+            (2..12).contains(&n),
+            "events.subscribe attempted {n} times in 300ms: expected a few, backing off"
         );
     }
 
@@ -1380,6 +1507,7 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut settings = settings();
         settings.request_timeout = Duration::from_millis(100);
+        settings.agent_ready_timeout = Duration::from_millis(50);
         let (h, mut events) = spawn_with_settings(&fake, &store, settings);
         wait_for("connected", || {
             h.snapshot().channel == ChannelState::Connected
@@ -1422,6 +1550,25 @@ mod tests {
         assert_eq!(h.snapshot().channel, ChannelState::Connected);
     }
 
+    /// A herdr that accepts the events connection and never acknowledges the
+    /// subscription must not hang the actor: `open_events` bounds the subscribe
+    /// by `request_timeout` and the attempt is retried after backoff.
+    /// `hang_method` is one-shot, so only the first attempt is wedged.
+    #[tokio::test]
+    async fn a_wedged_subscribe_reconnects() {
+        let fake = FakeHerdr::new();
+        fake.hang_method("events.subscribe");
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut settings = settings();
+        settings.request_timeout = Duration::from_millis(100);
+        settings.agent_ready_timeout = Duration::from_millis(50);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected despite the wedged subscribe", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+    }
+
     /// `reconcile` runs right after `ping` on every connect attempt, and its
     /// `agent.list` call had no timeout before this fix: a herdr that accepted the
     /// connection and then stopped answering there would hang the actor forever,
@@ -1435,6 +1582,7 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut settings = settings();
         settings.request_timeout = Duration::from_millis(100);
+        settings.agent_ready_timeout = Duration::from_millis(50);
         let (h, _events) = spawn_with_settings(&fake, &store, settings);
         wait_for("connected despite the wedged reconcile", || {
             h.snapshot().channel == ChannelState::Connected

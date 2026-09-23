@@ -12,6 +12,16 @@ use crate::config::flock::MachineConfig;
 /// value herdr's own remote transport uses (`src/remote/attach.rs`).
 const CONTROL_PERSIST_SECS: u32 = 600;
 
+/// OpenSSH creates the master socket at `<path>.XXXXXXXXXXXXXXXX` and renames it
+/// into place, so the staged name is 17 bytes longer than the ControlPath.
+const CONTROL_PATH_STAGING: usize = 17;
+
+/// `sun_path` is 108 bytes on Linux, including the terminating NUL.
+const UNIX_PATH_MAX: usize = 108;
+
+/// `%C` expands to a hex SHA-1 of the connection parameters.
+const EXPANDED_C: usize = 40;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
     Local {
@@ -21,7 +31,9 @@ pub enum Endpoint {
         target: String,
         session: String,
         /// Socket for the shared ssh `ControlMaster`, under pastor's state dir.
-        control_path: PathBuf,
+        /// `None` when that path would not fit in a unix socket name: the
+        /// connection then works without multiplexing rather than not at all.
+        control_path: Option<PathBuf>,
     },
     Command {
         argv: Vec<String>,
@@ -33,10 +45,23 @@ impl Endpoint {
         if let Some(argv) = &m.command {
             Endpoint::Command { argv: argv.clone() }
         } else if let Some(target) = &m.ssh {
+            let control_path = paths.ssh_control_path(&m.name);
+            let control_path = if control_path_fits(&control_path) {
+                Some(control_path)
+            } else {
+                // Decided once, when the endpoint is built, so this is said once
+                // per machine instead of once per request.
+                tracing::warn!(
+                    machine = %m.name,
+                    path = %control_path.display(),
+                    "ssh ControlPath is too long for a unix socket; connecting without multiplexing (every request pays a full ssh handshake). Set PASTOR_STATE_DIR to something shorter."
+                );
+                None
+            };
             Endpoint::Ssh {
                 target: target.clone(),
                 session: m.session.clone(),
-                control_path: paths.ssh_control_path(&m.name),
+                control_path,
             }
         } else {
             Endpoint::Local {
@@ -97,11 +122,41 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
-/// ssh argv for a bridge over the shared master. Nothing here goes through a
-/// shell: `target` and `control_path` are separate argv elements, and only the
-/// remote command (which a remote shell does parse) is quoted, by `bridge_command`.
-fn ssh_argv(target: &str, session: &str, control_path: &Path) -> Vec<String> {
-    vec![
+/// The length of `path` as ssh will have expanded it: `%%` is one byte, `%C` is
+/// a 40-byte hash. Other `%` tokens do not appear in paths pastor builds.
+fn expanded_len(path: &Path) -> usize {
+    let s = path.to_string_lossy();
+    let mut len = 0usize;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            len += c.len_utf8();
+            continue;
+        }
+        match chars.next() {
+            Some('%') => len += 1,
+            Some('C') => len += EXPANDED_C,
+            Some(other) => len += 1 + other.len_utf8(),
+            None => len += 1,
+        }
+    }
+    len
+}
+
+/// Would ssh's staged socket name fit in `sun_path`? A ControlPath that does not
+/// makes every connection fail, so an endpoint whose path is too long drops the
+/// multiplexing options instead.
+fn control_path_fits(path: &Path) -> bool {
+    // `+ 1` for the NUL would read better, but clippy prefers the strict form.
+    expanded_len(path) + CONTROL_PATH_STAGING < UNIX_PATH_MAX
+}
+
+/// ssh argv for a bridge, over the shared master when there is one. Nothing here
+/// goes through a shell: `target` and `control_path` are separate argv elements,
+/// and only the remote command (which a remote shell does parse) is quoted, by
+/// `bridge_command`.
+fn ssh_argv(target: &str, session: &str, control_path: Option<&Path>) -> Vec<String> {
+    let mut argv = vec![
         "ssh".to_string(),
         "-o".into(),
         "BatchMode=yes".into(),
@@ -109,18 +164,26 @@ fn ssh_argv(target: &str, session: &str, control_path: &Path) -> Vec<String> {
         "ServerAliveInterval=15".into(),
         "-o".into(),
         "ServerAliveCountMax=3".into(),
-        // One authenticated master per machine, reused by every request
-        // connection: without it each request would pay a full ssh handshake.
-        "-o".into(),
-        "ControlMaster=auto".into(),
-        "-o".into(),
-        format!("ControlPath={}", control_path.display()),
-        "-o".into(),
-        format!("ControlPersist={CONTROL_PERSIST_SECS}"),
-        "-T".into(),
+    ];
+    if let Some(control_path) = control_path {
+        // One authenticated master per machine and destination, reused by every
+        // request connection: without it each request would pay a full ssh
+        // handshake.
+        argv.extend([
+            "-o".to_string(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={}", control_path.display()),
+            "-o".into(),
+            format!("ControlPersist={CONTROL_PERSIST_SECS}"),
+        ]);
+    }
+    argv.extend([
+        "-T".to_string(),
         target.to_string(),
         bridge_command(session),
-    ]
+    ]);
+    argv
 }
 
 pub type ConnectFuture<'a> =
@@ -167,12 +230,12 @@ pub async fn connect(ep: &Endpoint) -> Result<Connection, ConnectError> {
         } => {
             // The master socket lives here; ssh creates the socket itself but not
             // the directory, and it must not be world-readable.
-            if let Some(parent) = control_path.parent() {
+            if let Some(parent) = control_path.as_ref().and_then(|p| p.parent()) {
                 crate::config::create_private_dir(parent).map_err(|e| ConnectError {
                     message: e.to_string(),
                 })?;
             }
-            spawn(&ssh_argv(target, session, control_path)).await
+            spawn(&ssh_argv(target, session, control_path.as_deref())).await
         }
         Endpoint::Command { argv } => spawn(argv).await,
     }
@@ -251,17 +314,20 @@ mod tests {
         else {
             panic!("expected an ssh endpoint, got {ep:?}");
         };
-        // Named after the machine, not the target: a unix socket path is capped
-        // near 108 bytes and `user@host` can be long.
-        assert_eq!(control_path, &PathBuf::from("/tmp/s/ssh/pi-3.sock"));
-        let argv = ssh_argv(target, session, control_path);
+        // Named after the machine plus ssh's `%C`, so retargeting the machine
+        // cannot reuse a master still attached to the old host.
+        assert_eq!(
+            control_path.as_deref(),
+            Some(Path::new("/tmp/s/ssh/pi-3-%C"))
+        );
+        let argv = ssh_argv(target, session, control_path.as_deref());
         assert!(
             argv.windows(2)
                 .any(|w| w[0] == "-o" && w[1] == "ControlMaster=auto")
         );
         assert!(
             argv.windows(2)
-                .any(|w| w[0] == "-o" && w[1] == "ControlPath=/tmp/s/ssh/pi-3.sock")
+                .any(|w| w[0] == "-o" && w[1] == "ControlPath=/tmp/s/ssh/pi-3-%C")
         );
         assert!(
             argv.windows(2)
@@ -273,6 +339,52 @@ mod tests {
             "herdr --session default remote-api-bridge"
         );
         assert_eq!(argv[argv.len() - 2], "fleet@pi-3");
+    }
+
+    #[test]
+    fn a_control_path_that_cannot_fit_drops_multiplexing() {
+        // 40 bytes for %C, 17 for ssh's staging and a NUL leave about 50 for the
+        // directory and the name, so a deep state dir runs out.
+        let deep = format!("/tmp/{}", "d".repeat(80));
+        let m = MachineConfig {
+            name: "pi-3".into(),
+            local: false,
+            ssh: Some("fleet@pi-3".into()),
+            command: None,
+            session: "default".into(),
+            max_agents: 2,
+            tags: vec![],
+        };
+        let paths = Paths::new("/tmp/c", &deep);
+        let Endpoint::Ssh {
+            target,
+            session,
+            control_path,
+        } = Endpoint::from_machine(&m, &paths)
+        else {
+            panic!("expected an ssh endpoint");
+        };
+        assert!(control_path.is_none(), "{control_path:?}");
+        let argv = ssh_argv(&target, &session, control_path.as_deref());
+        assert!(
+            !argv.iter().any(|a| a.starts_with("ControlPath=")),
+            "a machine still connects, just without multiplexing: {argv:?}"
+        );
+        assert_eq!(
+            argv.last().unwrap(),
+            "herdr --session default remote-api-bridge"
+        );
+    }
+
+    #[test]
+    fn expanded_len_counts_ssh_escapes() {
+        assert_eq!(expanded_len(Path::new("/a/b")), 4);
+        assert_eq!(expanded_len(Path::new("%%")), 1);
+        assert_eq!(expanded_len(Path::new("/a-%C")), 3 + EXPANDED_C);
+        // The guard's boundary: exactly `UNIX_PATH_MAX` staged bytes is fine.
+        let fits = "x".repeat(UNIX_PATH_MAX - CONTROL_PATH_STAGING - 1);
+        assert!(control_path_fits(Path::new(&fits)));
+        assert!(!control_path_fits(Path::new(&format!("{fits}x"))));
     }
 
     #[tokio::test]
