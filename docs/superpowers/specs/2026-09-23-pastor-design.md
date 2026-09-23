@@ -476,7 +476,7 @@ Commitments: pastor never destroys anything on error. Retries happen only
 where the source of truth is external and cheap to re-read (connectors,
 channels). Dispatch retries only on command.
 
-CLI errors: JSON on stderr with a stable `code`; exit 1 runtime, 2 usage.
+CLI errors: runtime errors are JSON on stderr with a stable `code` and exit 1. Usage errors keep clap's plain text and exit 2, as herdr's own CLI does.
 
 ## Testing
 

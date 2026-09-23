@@ -23,7 +23,7 @@
 - `agent.read` takes `source` as `recent_unwrapped` (underscore on the wire; the CLI spells it with a hyphen) and returns the text at `result.read.text`.
 - Config in `~/.config/pastor/`, state in `~/.local/state/pastor/`, both created 0700. Env `PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override (tests use them).
 - pastor never closes panes, kills agents or removes worktrees on its own.
-- Every CLI error is JSON on stderr `{"code":"...","message":"..."}`, exit 1 runtime, 2 usage.
+- Every runtime CLI error is JSON on stderr `{"code":"...","message":"..."}` with exit 1. Usage errors (clap parsing, missing subcommand, `--help`) keep clap's plain text with exit 2, exactly as herdr does.
 - Machine rules: no `sudo`, no package installs. Work on a branch, open a PR, never push `main`. Git hooks add an `Assisted-by:` trailer; do not add co-author lines.
 - Commit messages: conventional prefix (`feat:`, `test:`, `chore:`, `docs:`), imperative, short.
 
