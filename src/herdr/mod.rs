@@ -1,4 +1,5 @@
 pub mod client;
+pub mod fake;
 pub mod protocol;
 
 pub use client::*;
