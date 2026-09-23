@@ -27,6 +27,13 @@ when it's not (`list` says so on stderr); `attach` always reads the store
 directly, since it only needs the task's machine and agent name to hand off
 to `ssh`/`herdr`.
 
+`pastor list` shows every task except closed ones, including blocked, stale
+and failed tasks; `--all` adds closed tasks back, and `--blocked`/`--done`
+narrow to just those. `pastor task read t-1` fetches recent output from the
+task's pane over the machine channel. `pastor open pi-3` execs the full herdr
+UI against a flock machine (`herdr --remote` for an SSH one, `herdr` directly
+for a local one) instead of showing pastor's own view.
+
 Runtime errors print JSON on stderr with a stable `code` and exit 1; a
 malformed command line gets clap's plain usage text and exit 2.
 
@@ -44,7 +51,9 @@ pastor flock status                  # ssh, herdr version, protocol
 pastor serve &                       # or run it under systemd later
 pastor run "Fix the flaky test in ci.yml" --repo ~/work/api --machine pi-3
 pastor list
+pastor task read t-1                 # recent pane output, without attaching
 pastor attach t-1                    # lands in the agent's pane; ctrl+b q detaches
+pastor open pi-3                     # the full herdr UI on that machine
 ```
 
 Without a real herdr, a fake one speaks the same protocol:
@@ -57,7 +66,7 @@ FAKE_HERDR_AUTO_DONE_MS=500 pastor serve
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, defaults (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, defaults (all optional)
 ~/.config/pastor/flock.toml       machines
 ~/.local/state/pastor/pastor.db   tasks
 ~/.local/state/pastor/pastor.sock daemon socket
