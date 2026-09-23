@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dispatch;
 pub mod herdr;
 pub mod store;
 pub mod task;
