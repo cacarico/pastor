@@ -232,6 +232,90 @@ fn print_task(t: &Task, json: bool) {
     }
 }
 
+/// Turn a `flock status` probe into a table/JSON row's fields. Pure so the
+/// classification (including the agent.list-failed case) is unit-testable
+/// without a live herdr.
+///
+/// `agent_count` is `None` when `ping` itself failed (agent.list was never
+/// called), `Some(Err(_))` when ping succeeded but agent.list failed, and
+/// `Some(Ok(n))` for the normal case.
+///
+/// Connect/ping failure classification (server down / unreachable / error) is
+/// unchanged; only the ping-succeeded, agent.list-failed case is new: it must
+/// not report the row as reachable with zero agents.
+type FlockStatusRow = (
+    &'static str,
+    Option<String>,
+    Option<u32>,
+    Option<usize>,
+    Option<String>,
+);
+
+fn flock_status_row(
+    ping: Result<pastor::herdr::Pong, pastor::herdr::CallError>,
+    agent_count: Option<Result<usize, pastor::herdr::CallError>>,
+) -> FlockStatusRow {
+    match ping {
+        Ok(p) => {
+            let compatible = p.protocol >= pastor::MIN_HERDR_PROTOCOL;
+            match agent_count {
+                Some(Ok(n)) => (
+                    if compatible {
+                        "reachable"
+                    } else {
+                        "incompatible"
+                    },
+                    Some(p.version),
+                    Some(p.protocol),
+                    Some(n),
+                    if compatible {
+                        None
+                    } else {
+                        Some(format!(
+                            "protocol {} < {}",
+                            p.protocol,
+                            pastor::MIN_HERDR_PROTOCOL
+                        ))
+                    },
+                ),
+                Some(Err(e)) => (
+                    "error",
+                    Some(p.version),
+                    Some(p.protocol),
+                    None,
+                    Some(format!("agent.list: {e}")),
+                ),
+                // The caller always attempts agent.list once ping succeeds; treat a
+                // missing count the same as an agent.list failure rather than
+                // pretending the machine is reachable with zero agents.
+                None => (
+                    "error",
+                    Some(p.version),
+                    Some(p.protocol),
+                    None,
+                    Some("agent.list: not attempted".into()),
+                ),
+            }
+        }
+        Err(e) => {
+            let message = e.to_string();
+            (
+                if message.contains("herdr.sock") {
+                    "server down"
+                } else if e.is_transport() {
+                    "unreachable"
+                } else {
+                    "error"
+                },
+                None,
+                None,
+                None,
+                Some(message),
+            )
+        }
+    }
+}
+
 /// Every state `pastor list` shows without `--all`: everything except `Closed`,
 /// matching the spec's CLI table ("hides closed by default"). `Failed` belongs
 /// here too — a failed task needs a human same as a blocked one, and hiding it by
@@ -411,47 +495,13 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                 let ep = Endpoint::from_machine(m, paths);
                 // Two ordinary calls, each on its own connection, exactly as the
                 // daemon makes them: herdr answers one request per connection.
-                let (status, version, protocol, agents, error) = match ep.ping().await {
-                    Ok(p) => {
-                        let compatible = p.protocol >= pastor::MIN_HERDR_PROTOCOL;
-                        let n = ep.agent_list().await.map(|a| a.len()).unwrap_or(0);
-                        (
-                            if compatible {
-                                "reachable"
-                            } else {
-                                "incompatible"
-                            },
-                            Some(p.version),
-                            Some(p.protocol),
-                            n,
-                            if compatible {
-                                None
-                            } else {
-                                Some(format!(
-                                    "protocol {} < {}",
-                                    p.protocol,
-                                    pastor::MIN_HERDR_PROTOCOL
-                                ))
-                            },
-                        )
-                    }
-                    Err(e) => {
-                        let message = e.to_string();
-                        (
-                            if message.contains("herdr.sock") {
-                                "server down"
-                            } else if e.is_transport() {
-                                "unreachable"
-                            } else {
-                                "error"
-                            },
-                            None,
-                            None,
-                            0,
-                            Some(message),
-                        )
-                    }
+                let ping = ep.ping().await;
+                let agent_count = match &ping {
+                    Ok(_) => Some(ep.agent_list().await.map(|a| a.len())),
+                    Err(_) => None,
                 };
+                let (status, version, protocol, agents, error) =
+                    flock_status_row(ping, agent_count);
                 rows.push(serde_json::json!({"name": m.name, "endpoint": ep.describe(), "status": status, "herdr_version": version, "protocol": protocol, "agents": agents, "error": error}));
             }
             if json {
@@ -464,7 +514,10 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                             r["name"].as_str().unwrap_or("").into(),
                             r["status"].as_str().unwrap_or("").into(),
                             r["herdr_version"].as_str().unwrap_or("-").into(),
-                            r["agents"].to_string(),
+                            r["agents"]
+                                .as_u64()
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "-".into()),
                             r["error"].as_str().unwrap_or("").into(),
                         ]
                     })
@@ -573,6 +626,51 @@ mod tests {
         ] {
             assert!(states.contains(&s), "{s} missing from {states:?}");
         }
+    }
+
+    fn pong() -> pastor::herdr::Pong {
+        pastor::herdr::Pong {
+            version: "0.9.1".into(),
+            protocol: pastor::MIN_HERDR_PROTOCOL,
+        }
+    }
+
+    fn agent_list_error() -> pastor::herdr::CallError {
+        pastor::herdr::CallError::from(pastor::herdr::HerdrError::Api {
+            code: "internal_error".into(),
+            message: "boom".into(),
+        })
+    }
+
+    #[test]
+    fn agent_list_failure_is_surfaced_not_hidden_as_zero_agents() {
+        let (status, version, protocol, agents, error) =
+            flock_status_row(Ok(pong()), Some(Err(agent_list_error())));
+        assert_eq!(status, "error");
+        assert_eq!(version, Some("0.9.1".into()));
+        assert_eq!(protocol, Some(pastor::MIN_HERDR_PROTOCOL));
+        assert_eq!(agents, None, "agent count must show as absent, not zero");
+        let error = error.expect("the agent.list error must be surfaced");
+        assert!(error.contains("boom"), "{error}");
+    }
+
+    #[test]
+    fn agent_list_success_still_reports_reachable() {
+        let (status, _, _, agents, error) = flock_status_row(Ok(pong()), Some(Ok(3)));
+        assert_eq!(status, "reachable");
+        assert_eq!(agents, Some(3));
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn ping_failure_classification_is_unchanged() {
+        let err = pastor::herdr::CallError::from(pastor::herdr::HerdrError::Closed);
+        let (status, version, protocol, agents, error) = flock_status_row(Err(err), None);
+        assert_eq!(status, "unreachable");
+        assert_eq!(version, None);
+        assert_eq!(protocol, None);
+        assert_eq!(agents, None);
+        assert!(error.is_some());
     }
 
     #[test]
