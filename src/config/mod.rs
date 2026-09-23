@@ -1,3 +1,5 @@
+pub mod flock;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -22,11 +24,17 @@ impl Paths {
                 .context("no state dir")?
                 .join("pastor"),
         };
-        Ok(Paths { config_dir, state_dir })
+        Ok(Paths {
+            config_dir,
+            state_dir,
+        })
     }
 
     pub fn new(config_dir: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Paths {
-        Paths { config_dir: config_dir.into(), state_dir: state_dir.into() }
+        Paths {
+            config_dir: config_dir.into(),
+            state_dir: state_dir.into(),
+        }
     }
 
     /// Create both directories with mode 0700. Idempotent.
@@ -37,9 +45,15 @@ impl Paths {
         Ok(())
     }
 
-    pub fn flock_file(&self) -> PathBuf { self.config_dir.join("flock.toml") }
-    pub fn db_file(&self) -> PathBuf { self.state_dir.join("pastor.db") }
-    pub fn socket_file(&self) -> PathBuf { self.state_dir.join("pastor.sock") }
+    pub fn flock_file(&self) -> PathBuf {
+        self.config_dir.join("flock.toml")
+    }
+    pub fn db_file(&self) -> PathBuf {
+        self.state_dir.join("pastor.db")
+    }
+    pub fn socket_file(&self) -> PathBuf {
+        self.state_dir.join("pastor.sock")
+    }
 }
 
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
