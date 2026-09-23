@@ -20,7 +20,12 @@ pub enum IpcRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+// Adjacently tagged (`content = "data"`), not internally tagged: several variants
+// here are newtypes wrapping a `Vec` or a `String` (`Tasks`, `Text`, `Machines`),
+// and serde_json cannot serialize those under internal tagging (a sequence or a
+// string cannot carry a `kind` field merged into it). Adjacent tagging works
+// uniformly across struct and newtype variants alike.
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 // One response crosses the socket at a time (never in a hot loop), so the size
 // difference between variants that clippy flags here doesn't matter in practice.
 #[allow(clippy::large_enum_variant)]
@@ -165,6 +170,29 @@ mod tests {
             start.elapsed()
         );
         assert!(err.to_string().contains("did not respond"), "{err}");
+    }
+
+    /// Every `IpcResponse` variant must round-trip through JSON: the newtype
+    /// variants wrapping a `Vec` or `String` (`Tasks`, `Text`, `Machines`) broke
+    /// under internal tagging (serde_json refuses to merge a `kind` field into a
+    /// sequence or a string), which the adjacently-tagged `content = "data"`
+    /// representation fixes for every shape uniformly.
+    #[test]
+    fn every_response_variant_round_trips_through_json() {
+        let responses = vec![
+            IpcResponse::Pong {
+                version: "1".into(),
+            },
+            IpcResponse::Tasks(vec![]),
+            IpcResponse::Text("hello".into()),
+            IpcResponse::Machines(vec![]),
+            IpcResponse::error("some_code", "some message"),
+        ];
+        for resp in responses {
+            let json = serde_json::to_string(&resp).unwrap();
+            let back: IpcResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{resp:?}"), format!("{back:?}"), "{json}");
+        }
     }
 
     #[tokio::test]
