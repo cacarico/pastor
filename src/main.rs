@@ -42,6 +42,8 @@ enum Command {
     Attach { task: String },
     /// Open the full herdr UI on a machine
     Open { machine: String },
+    /// Print a shell completion script (fish, bash, zsh, ...) to stdout
+    Completions { shell: clap_complete::Shell },
 }
 
 #[derive(Args)]
@@ -154,6 +156,11 @@ fn main() {
             Command::Flock { cmd } => flock(&paths, cmd).await,
             Command::Attach { task } => attach(&paths, &task).await,
             Command::Open { machine } => open(&paths, &machine).await,
+            Command::Completions { shell } => {
+                let mut cmd = <Cli as clap::CommandFactory>::command();
+                clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
+                Ok(())
+            }
         }
     });
     if let Err(err) = result {

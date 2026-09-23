@@ -74,6 +74,17 @@ FAKE_HERDR_AUTO_DONE_MS=500 pastor serve
 
 `PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override the locations.
 
+## Shell completions
+
+`pastor completions <shell>` prints a completion script generated from the
+command definitions, so it always matches the installed binary. Ready-made
+copies for bash and fish live in `contrib/completions/`.
+
+```bash
+pastor completions fish > ~/.config/fish/completions/pastor.fish
+pastor completions bash > ~/.local/share/bash-completion/completions/pastor
+```
+
 ## Development
 
 The Makefile is the list of things you can run here; `make help` prints it.
