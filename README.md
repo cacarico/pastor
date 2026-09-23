@@ -17,11 +17,16 @@ connection and then closes it, so pastor opens a connection per request: an
 socket protocol over stdio. Those connections are cheap because all of a
 machine's share one multiplexed ssh master
 (`ControlMaster=auto`, `ControlPath=~/.local/state/pastor/ssh/<machine>.sock`,
-`ControlPersist=600`), so only the first one authenticates. Alongside them each
+`ControlPersist=600`), so only the first one authenticates. A master lingers for
+up to 10 minutes after `pastor serve` exits; end one by hand with `ssh -O exit -o
+ControlPath=~/.local/state/pastor/ssh/<machine>-%C <target>`. Alongside them each
 machine keeps one long-lived connection for `events.subscribe`, the one thing
 herdr holds open. Over these pastor creates a workspace, starts an agent named
-after the task, sends the prompt, and watches agent status events. Task state
-lives in SQLite under `~/.local/state/pastor/`.
+after the task, waits for the agent to come up (herdr's `agent.start` returns
+before it has), sends the prompt, and watches agent status events. An agent that
+never becomes ready within 30s fails the task; one that exits on start fails it
+straight away, usually because the agent is not installed on that machine. Task
+state lives in SQLite under `~/.local/state/pastor/`.
 
 The CLI talks to `pastor serve` over a unix socket (`pastor.sock`) with
 newline-delimited JSON; each response is `{"kind": ..., "data": ...}`.
@@ -79,7 +84,7 @@ pastor serve
 ~/.config/pastor/flock.toml       machines
 ~/.local/state/pastor/pastor.db   tasks
 ~/.local/state/pastor/pastor.sock daemon socket
-~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
+~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
 ```
 
 `PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override the locations.

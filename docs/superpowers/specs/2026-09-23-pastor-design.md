@@ -86,7 +86,10 @@ made of four cooperating parts sharing one SQLite store.
    and keeps one long-lived connection for `events.subscribe`, the one
    method herdr does hold open. The per-request connections are cheap because
    every `ssh` shares one `ControlMaster` per machine
-   (`ControlPath = <state_dir>/ssh/<machine>.sock`, `ControlPersist=600`),
+   (`ControlPath = <state_dir>/ssh/<machine>-%C`, where ssh's `%C` hashes the
+   destination so a retargeted machine cannot reuse the old host's master;
+   `ControlPersist=600`, so a master outlives `pastor serve` by up to ten
+   minutes and `ssh -O exit` ends one by hand),
    so only the first pays a handshake. pastor speaks herdr's
    newline-delimited JSON protocol for every call: `workspace.create`,
    `worktree.create`, `agent.start`, `agent.prompt`, `agent.list`,
@@ -347,11 +350,23 @@ Dispatch steps, each its own request on its own connection:
 2. Make a place: `worktree.create` (repo, branch, label = task id) when
    `worktree = true`, else `workspace.create` with cwd = repo. Use the
    returned root pane. One workspace per task.
-3. `agent.start` with name = task id, kind, pane, `agent_args`. Default 30s
-   readiness timeout. `agent_not_ready` marks the task `blocked`, not
-   failed.
-4. `agent.prompt` with the rendered prompt, no wait.
-5. Record ids, mark `running`.
+3. `agent.start` with name = task id, kind, pane, `agent_args`. Correction to
+   the original design: herdr's `agent.start` returns as soon as it has
+   launched the agent, before the agent is up, and it never answers
+   `agent_not_ready` (its errors are about the name, the kind and the pane).
+4. Wait for readiness: poll `agent.list` until the agent named `t-<id>` reports
+   a status other than `unknown`, within a 30s bound
+   (`agent_ready_timeout`, which must stay below the per-request timeout that
+   bounds the whole dispatch).
+5. `agent.prompt` with the rendered prompt, no wait. herdr answers
+   `agent_not_ready` both while the agent is still launching and once the agent
+   is no longer the pane's foreground process; the two are told apart by
+   `agent.list`. Still launching: keep waiting inside the same bound. Gone from
+   `agent.list`: the agent exited (usually it is not installed on that machine)
+   and the task fails now. Bound elapsed: the task fails, and the message says
+   a live agent may still be sitting on that machine. `agent_blocked` marks the
+   task `blocked`, not failed.
+6. Record ids, mark `running`.
 
 A failing step marks the task `failed` with herdr's error code and message.
 Created things are left in place. No automatic dispatch retry.
