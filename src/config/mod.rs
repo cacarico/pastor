@@ -1,8 +1,10 @@
 pub mod flock;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 
 /// Where pastor reads config and keeps state. Overridable by env for tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +56,10 @@ impl Paths {
     pub fn socket_file(&self) -> PathBuf {
         self.state_dir.join("pastor.sock")
     }
+
+    pub fn config_file(&self) -> PathBuf {
+        self.config_dir.join("pastor.toml")
+    }
 }
 
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
@@ -62,6 +68,111 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("chmod {}", dir.display()))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Defaults {
+    pub agent: String,
+    pub max_tasks_per_run: u32,
+    pub timeout: String,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Defaults {
+            agent: "claude".into(),
+            max_tasks_per_run: 5,
+            timeout: "2h".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PastorConfig {
+    pub tick: String,
+    pub settle: String,
+    pub reconcile_every: String,
+    pub defaults: Defaults,
+}
+
+impl Default for PastorConfig {
+    fn default() -> Self {
+        PastorConfig {
+            tick: "10s".into(),
+            settle: "10s".into(),
+            reconcile_every: "60s".into(),
+            defaults: Defaults::default(),
+        }
+    }
+}
+
+impl PastorConfig {
+    pub fn load(path: &Path) -> anyhow::Result<PastorConfig> {
+        if !path.exists() {
+            return Ok(PastorConfig::default());
+        }
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let cfg: PastorConfig =
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        for (name, v) in [
+            ("tick", &cfg.tick),
+            ("settle", &cfg.settle),
+            ("reconcile_every", &cfg.reconcile_every),
+            ("defaults.timeout", &cfg.defaults.timeout),
+        ] {
+            parse_duration(v).map_err(|e| anyhow::anyhow!("{}: {name}: {e}", path.display()))?;
+        }
+        Ok(cfg)
+    }
+    pub fn tick_duration(&self) -> Duration {
+        duration_or_default(&self.tick, &PastorConfig::default().tick)
+    }
+    pub fn settle_duration(&self) -> Duration {
+        duration_or_default(&self.settle, &PastorConfig::default().settle)
+    }
+    pub fn reconcile_duration(&self) -> Duration {
+        duration_or_default(
+            &self.reconcile_every,
+            &PastorConfig::default().reconcile_every,
+        )
+    }
+    pub fn timeout_duration(&self) -> Duration {
+        duration_or_default(
+            &self.defaults.timeout,
+            &PastorConfig::default().defaults.timeout,
+        )
+    }
+}
+
+/// Parse `value`, falling back to `default` (assumed valid) if `value` is bad.
+fn duration_or_default(value: &str, default: &str) -> Duration {
+    parse_duration(value)
+        .or_else(|_| parse_duration(default))
+        .expect("default durations are valid")
+}
+
+/// "30s", "5m", "2h", "1d". No spaces, one unit.
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| format!("{s:?}: missing unit"))?,
+    );
+    let n: u64 = num.parse().map_err(|_| format!("{s:?}: bad number"))?;
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => return Err(format!("{s:?}: unit must be s, m, h or d")),
+    };
+    let secs = n
+        .checked_mul(mult)
+        .ok_or_else(|| format!("{s:?}: duration too large"))?;
+    Ok(Duration::from_secs(secs))
 }
 
 #[cfg(test)]
@@ -97,5 +208,45 @@ mod tests {
         }
         assert_eq!(p.flock_file(), tmp.path().join("c/flock.toml"));
         assert_eq!(p.db_file(), tmp.path().join("s/pastor.db"));
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
+        assert!(parse_duration("5").is_err());
+        assert!(parse_duration("5 m").is_err());
+        assert!(parse_duration("x").is_err());
+        assert!(parse_duration("300000000000000d").is_err());
+    }
+
+    #[test]
+    fn accessors_fall_back_to_defaults() {
+        let cfg = PastorConfig {
+            tick: "bogus".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.tick_duration(), PastorConfig::default().tick_duration());
+    }
+
+    #[test]
+    fn config_defaults_and_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        assert_eq!(PastorConfig::load(&path).unwrap(), PastorConfig::default());
+        std::fs::write(&path, "tick = \"3s\"\n[defaults]\nagent = \"codex\"\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.tick_duration(), Duration::from_secs(3));
+        assert_eq!(cfg.defaults.agent, "codex");
+        assert_eq!(cfg.defaults.max_tasks_per_run, 5);
+        std::fs::write(&path, "settle = \"soon\"\n").unwrap();
+        assert!(
+            PastorConfig::load(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("settle")
+        );
     }
 }
