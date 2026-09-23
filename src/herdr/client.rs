@@ -1,6 +1,6 @@
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 
 use super::{
     AgentInfo, AgentList, AgentResult, Created, Event, HerdrError, Incoming, PaneRead, Pong,
@@ -12,7 +12,7 @@ pub type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
 /// One herdr socket connection. Requests are sequential: one in flight at a time.
 pub struct Connection {
-    reader: BufReader<BoxRead>,
+    reader: Lines<BufReader<BoxRead>>,
     writer: BoxWrite,
     next_id: u64,
     _child: Option<tokio::process::Child>,
@@ -21,18 +21,24 @@ pub struct Connection {
 impl Connection {
     pub fn new(reader: BoxRead, writer: BoxWrite) -> Connection {
         Connection {
-            reader: BufReader::new(reader),
+            reader: BufReader::new(reader).lines(),
             writer,
             next_id: 1,
             _child: None,
         }
     }
 
+    /// Keeps a bridge process alive for as long as this connection lives. The
+    /// spawner must set `kill_on_drop(true)` on the child so that dropping the
+    /// connection also ends the bridge process.
     pub fn with_child(mut self, child: tokio::process::Child) -> Connection {
         self._child = Some(child);
         self
     }
 
+    /// Sends `method` with `params` and waits for the matching response. This waits
+    /// indefinitely; the caller owns any timeout, e.g. by wrapping the call in
+    /// `tokio::time::timeout`.
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value, HerdrError> {
         let id = self.write_request(method, params).await?;
         loop {
@@ -142,7 +148,9 @@ impl Connection {
     }
 
     /// Turn this connection into an event stream. herdr dedicates the connection to
-    /// events after `events.subscribe`, so no more requests can be sent on it.
+    /// events after `events.subscribe`, so no more requests can be sent on it. This
+    /// waits indefinitely for the subscription to be acknowledged; the caller owns
+    /// any timeout, e.g. by wrapping the call in `tokio::time::timeout`.
     pub async fn subscribe(mut self, subscriptions: Vec<Value>) -> Result<EventStream, HerdrError> {
         let id = self
             .write_request(
@@ -184,13 +192,11 @@ impl Connection {
         Ok(id)
     }
 
+    /// Cancellation safe: `Lines::next_line` keeps its partial-line buffer inside
+    /// the `Lines` reader itself, so dropping this future mid-read (e.g. losing a
+    /// `tokio::select!` branch) does not discard any bytes already read.
     async fn read_line(&mut self) -> Result<Option<String>, HerdrError> {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        Ok(Some(line))
+        Ok(self.reader.next_line().await?)
     }
 }
 
@@ -205,6 +211,10 @@ impl std::fmt::Debug for EventStream {
 }
 
 impl EventStream {
+    /// Returns the next event. This is cancellation safe: if the returned future is
+    /// dropped before it resolves (e.g. it loses a `tokio::select!` branch), no
+    /// event data is lost and the next call to `next` resumes cleanly from where
+    /// the read left off.
     pub async fn next(&mut self) -> Result<Event, HerdrError> {
         loop {
             let Some(line) = self.conn.read_line().await? else {
@@ -320,6 +330,51 @@ mod tests {
         assert!(ev.is_pane_closed());
         let err = stream.next().await.unwrap_err();
         assert_eq!(err.code(), Some("events_lost"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_is_cancellation_safe() {
+        let (client, mut sr, mut sw) = pipe();
+        let server = tokio::spawn(async move {
+            let mut line = String::new();
+            sr.read_line(&mut line).await.unwrap();
+            let req: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.method, "events.subscribe");
+            sw.write_all(
+                format!(
+                    "{{\"id\":\"{}\",\"result\":{{\"type\":\"subscription_started\"}}}}\n",
+                    req.id
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            // Write the event line in two halves with a delay between them, so a
+            // cancelled read races a partial line, not a fully-buffered one.
+            sw.write_all(b"{\"event\":\"pane_closed\",\"data\":{\"type\":\"pane_closed\",")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sw.write_all(b"\"pane_id\":\"w1:p1\",\"workspace_id\":\"w1\"}}\n")
+                .await
+                .unwrap();
+        });
+        let mut stream = client
+            .subscribe(vec![super::super::subscription_lifecycle("pane.closed")])
+            .await
+            .unwrap();
+
+        // The second half of the line won't arrive for 50ms, so this sleep always
+        // wins the race and cancels `stream.next()` mid-read.
+        tokio::select! {
+            _ = stream.next() => panic!("expected the sleep to win the race"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+
+        let ev = stream.next().await.unwrap();
+        assert!(ev.is_pane_closed());
+        assert_eq!(ev.pane_id(), Some("w1:p1"));
         server.await.unwrap();
     }
 
