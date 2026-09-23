@@ -54,6 +54,10 @@ pub struct MachineSettings {
     pub reconcile_every: Duration,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    /// Bound on any single herdr request (dispatch, read, ...). A connection that
+    /// stops answering within this window is treated as dead: the request fails
+    /// and the actor reconnects.
+    pub request_timeout: Duration,
 }
 
 impl Default for MachineSettings {
@@ -63,6 +67,7 @@ impl Default for MachineSettings {
             reconcile_every: Duration::from_secs(60),
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -432,15 +437,28 @@ impl Actor {
                     Ok(Some(t))
                         if t.machine.as_deref() == Some(&self.name) && t.state.occupies_pane() =>
                     {
-                        match req
-                            .agent_read(t.agent_name.as_deref().unwrap_or(""), lines)
-                            .await
+                        let timeout = self.settings.request_timeout;
+                        match tokio::time::timeout(
+                            timeout,
+                            req.agent_read(t.agent_name.as_deref().unwrap_or(""), lines),
+                        )
+                        .await
                         {
-                            Ok(text) => (Ok(text), false),
-                            Err(err) => {
+                            Ok(Ok(text)) => (Ok(text), false),
+                            Ok(Err(err)) => {
                                 let dead = is_dead_connection(&err);
                                 (Err(err.into()), dead)
                             }
+                            // A request that never answers within the bound is treated as a
+                            // dead connection: the caller must reconnect, not retry on the
+                            // same (apparently wedged) request connection.
+                            Err(_) => (
+                                Err(anyhow::anyhow!(
+                                    "request timed out after {}s",
+                                    timeout.as_secs()
+                                )),
+                                true,
+                            ),
                         }
                     }
                     Ok(_) => (
@@ -487,7 +505,27 @@ impl Actor {
             );
         }
         task.machine = Some(self.name.clone());
-        let outcome = dispatch(req, &mut task).await;
+        let timeout = self.settings.request_timeout;
+        let outcome = match tokio::time::timeout(timeout, dispatch(req, &mut task)).await {
+            Ok(outcome) => outcome,
+            // `dispatch()` itself never got to resolve, so its own Failed-recording
+            // never ran; do the same bookkeeping it would have done on an error, and
+            // force a reconnect: a request connection that stops answering is dead.
+            Err(_) => {
+                let message = format!("request timed out after {}s", timeout.as_secs());
+                task.state = TaskState::Failed;
+                task.error = Some(message.clone());
+                task.finished_at = Some(Utc::now());
+                if let Err(err) = self.store.update_task(&task) {
+                    return (Err(err), true);
+                }
+                self.emit("task.failed", Some(task.id));
+                return (
+                    Err(anyhow::anyhow!("dispatch {}: {message}", task.display_id())),
+                    true,
+                );
+            }
+        };
         let dead = matches!(&outcome, Err(err) if is_dead_connection(err));
         if let Err(err) = self.store.update_task(&task) {
             return (Err(err), dead);
@@ -675,6 +713,7 @@ mod tests {
             reconcile_every: Duration::from_millis(200),
             initial_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_millis(200),
+            request_timeout: Duration::from_secs(5),
         }
     }
 
@@ -714,6 +753,14 @@ mod tests {
         fake: &FakeHerdr,
         store: &Arc<Store>,
     ) -> (MachineHandle, broadcast::Receiver<PastorEvent>) {
+        spawn_with_settings(fake, store, settings())
+    }
+
+    fn spawn_with_settings(
+        fake: &FakeHerdr,
+        store: &Arc<Store>,
+        settings: MachineSettings,
+    ) -> (MachineHandle, broadcast::Receiver<PastorEvent>) {
         let (events, rx) = broadcast::channel(64);
         let h = spawn_machine(
             "m".into(),
@@ -721,7 +768,7 @@ mod tests {
             vec![],
             Arc::new(fake.clone()),
             store.clone(),
-            settings(),
+            settings,
             events,
         );
         (h, rx)
@@ -1076,5 +1123,57 @@ mod tests {
         .await;
         let t3 = h.dispatch(new_task(&store).id).await.unwrap();
         assert_eq!(t3.state, TaskState::Running);
+    }
+
+    #[tokio::test]
+    async fn dispatch_over_a_wedged_connection_times_out_fails_and_reconnects() {
+        let fake = FakeHerdr::new();
+        // `agent.start` is the first herdr call inside `dispatch()` that can hang;
+        // hanging it exercises the timeout without needing the connect/ping/
+        // reconcile/subscribe path (none of those are hung) to also cooperate.
+        fake.hang_method("agent.start");
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut settings = settings();
+        settings.request_timeout = Duration::from_millis(100);
+        let (h, mut events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+
+        let t = new_task(&store);
+        let err = h.dispatch(t.id).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(state_of(&store, t.id), TaskState::Failed);
+        assert!(
+            store
+                .get_task(t.id)
+                .unwrap()
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("timed out")
+        );
+
+        // A request that stops answering is dead: the actor must reconnect, which
+        // announces the outage (machine.lost) and its recovery (machine.connected),
+        // just like `disconnect_triggers_reconnect_and_resubscribe`.
+        let mut saw_lost = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("machine.connected within 5s")
+                .unwrap();
+            if ev.kind == "machine.lost" {
+                saw_lost = true;
+            } else if ev.kind == "machine.connected" {
+                assert!(
+                    saw_lost,
+                    "machine.connected without a preceding machine.lost"
+                );
+                break;
+            }
+        }
+        assert_eq!(h.snapshot().channel, ChannelState::Connected);
     }
 }

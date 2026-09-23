@@ -21,6 +21,9 @@ struct State {
     requests: Vec<Request>,
     start: Option<StartBehaviour>,
     protocol: u32,
+    /// A method name that, once received, gets no reply at all: the connection
+    /// just stops answering, simulating a wedged herdr.
+    hang: Option<String>,
 }
 
 #[derive(Clone)]
@@ -59,6 +62,12 @@ impl FakeHerdr {
     }
     pub fn set_protocol(&self, p: u32) {
         self.state.lock().unwrap().protocol = p;
+    }
+    /// The next request for `method` gets no reply; the connection just stops
+    /// answering, as if the herdr process wedged. Lets tests exercise a client-side
+    /// request timeout instead of a transport-level error.
+    pub fn hang_method(&self, method: &str) {
+        self.state.lock().unwrap().hang = Some(method.into());
     }
     pub fn agents(&self) -> Vec<AgentInfo> {
         self.state
@@ -154,6 +163,16 @@ impl FakeHerdr {
                 continue;
             };
             self.state.lock().unwrap().requests.push(req.clone());
+            if self.state.lock().unwrap().hang.as_deref() == Some(req.method.as_str()) {
+                // Wedged herdr: never reply, never read another line. Only the kill
+                // channel (a test dropping/disconnecting the fake) ends this.
+                tokio::select! {
+                    biased;
+                    _ = kill.recv() => return,
+                    _ = std::future::pending::<()>() => {}
+                }
+                return;
+            }
             if req.method == "events.subscribe" {
                 let subs: Vec<Value> = req
                     .params

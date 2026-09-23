@@ -444,4 +444,21 @@ mod tests {
         assert!(line.contains("invalid_request"), "{line}");
         assert!(crate::ipc::daemon_running(&socket).await);
     }
+
+    /// `run` must replace a stale socket file left behind by an unclean shutdown
+    /// (nothing is listening on it) instead of refusing to start. Shutdown-time
+    /// removal of the socket is not exercised here: `run` only exits on ctrl-c,
+    /// and sending that signal from a test would affect the whole test process.
+    #[tokio::test]
+    async fn run_replaces_a_stale_socket_file() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let socket = d.socket_path();
+        std::fs::write(&socket, b"not a socket").unwrap();
+        tokio::spawn(d.run());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::ipc::daemon_running(&socket).await {
+            assert!(Instant::now() < deadline, "daemon never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
