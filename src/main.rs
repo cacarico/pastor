@@ -67,17 +67,22 @@ struct RunArgs {
 
 #[derive(Args)]
 struct ListArgs {
+    /// Only tasks from this job (omit for one-off `run` tasks)
     #[arg(long)]
     job: Option<String>,
+    /// Only tasks on this machine
     #[arg(long)]
     machine: Option<String>,
+    /// Only blocked tasks, needing a human
     #[arg(long)]
     blocked: bool,
+    /// Only done tasks
     #[arg(long)]
     done: bool,
-    /// Include closed and failed tasks
+    /// Include closed tasks
     #[arg(long)]
     all: bool,
+    /// Print full task records as JSON instead of a table
     #[arg(long)]
     json: bool,
 }
@@ -220,6 +225,22 @@ fn print_task(t: &Task, json: bool) {
     }
 }
 
+/// Every state `pastor list` shows without `--all`: everything except `Closed`,
+/// matching the spec's CLI table ("hides closed by default"). `Failed` belongs
+/// here too — a failed task needs a human same as a blocked one, and hiding it by
+/// default was a plan defect, not a design choice.
+fn default_list_states() -> Vec<TaskState> {
+    vec![
+        TaskState::Queued,
+        TaskState::Starting,
+        TaskState::Running,
+        TaskState::Blocked,
+        TaskState::Done,
+        TaskState::Stale,
+        TaskState::Failed,
+    ]
+}
+
 async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
     let states = if a.blocked {
         Some(vec![TaskState::Blocked])
@@ -228,14 +249,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
     } else if a.all {
         None
     } else {
-        Some(vec![
-            TaskState::Queued,
-            TaskState::Starting,
-            TaskState::Running,
-            TaskState::Blocked,
-            TaskState::Done,
-            TaskState::Stale,
-        ])
+        Some(default_list_states())
     };
     let filter = TaskFilter {
         job: a.job,
@@ -529,6 +543,26 @@ async fn open(paths: &Paths, machine: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_list_states_hides_only_closed() {
+        let states = default_list_states();
+        assert!(!states.contains(&TaskState::Closed), "{states:?}");
+        assert!(
+            states.contains(&TaskState::Failed),
+            "a failed task needs a human just as much as a blocked one: {states:?}"
+        );
+        for s in [
+            TaskState::Queued,
+            TaskState::Starting,
+            TaskState::Running,
+            TaskState::Blocked,
+            TaskState::Done,
+            TaskState::Stale,
+        ] {
+            assert!(states.contains(&s), "{s} missing from {states:?}");
+        }
+    }
 
     #[test]
     fn attach_remote_command_quotes_session_and_agent() {
