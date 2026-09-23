@@ -123,6 +123,11 @@ pub enum Observed {
     },
     PaneClosed,
     PaneExited,
+    /// Dispatch is about to make its first herdr call. Not something herdr reports;
+    /// the actor emits it itself so the one legal source transition (only a queued
+    /// task may start) lives with the rest of the state machine instead of being
+    /// hard-coded where dispatch happens.
+    DispatchStarting,
 }
 
 /// Pure transition. `None` means no change. The settle window for `Done` is the
@@ -133,6 +138,13 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
         return None;
     }
     let to = match observed {
+        Observed::DispatchStarting => {
+            if task.state == Queued {
+                Starting
+            } else {
+                return None;
+            }
+        }
         Observed::PaneClosed => Closed,
         Observed::PaneExited => {
             if task.state == Done {
@@ -159,6 +171,14 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
                 } else if task.state == Blocked {
                     // The human answered the prompt; the agent is idle again but has not
                     // produced completed work since. Treat it as running until it does.
+                    Running
+                } else if task.state == Starting {
+                    // An agent found idle right after being adopted (see
+                    // `Actor::reconcile`) proves dispatch reached at least
+                    // `agent.start`; treat it as running, the same target a
+                    // successful dispatch would have recorded, rather than leaving
+                    // it stuck as `Starting` forever (stale only covers
+                    // Running/Blocked).
                     Running
                 } else {
                     return None;
@@ -268,18 +288,67 @@ mod tests {
         );
         assert_eq!(
             next_state(
-                &task(TaskState::Starting, None),
-                &status(AgentStatus::Idle, None)
-            ),
-            None
-        );
-        assert_eq!(
-            next_state(
                 &task(TaskState::Blocked, None),
                 &status(AgentStatus::Idle, None)
             ),
             Some(TaskState::Running)
         );
+    }
+
+    /// A `Starting` task adopted after a crash (see `Actor::reconcile`) can be
+    /// found idle before it ever produces completed work: dispatch reached at
+    /// least `agent.start`, so that counts as reaching `Running`, the same as a
+    /// successful dispatch would have recorded, not as reaching `Done` (that
+    /// still requires completion_seq to advance) or being left stuck.
+    #[test]
+    fn starting_found_idle_or_done_means_running_unless_already_advanced() {
+        assert_eq!(
+            next_state(
+                &task(TaskState::Starting, None),
+                &status(AgentStatus::Idle, None)
+            ),
+            Some(TaskState::Running)
+        );
+        assert_eq!(
+            next_state(
+                &task(TaskState::Starting, None),
+                &status(AgentStatus::Done, None)
+            ),
+            Some(TaskState::Running)
+        );
+        // A real completion_seq advance still wins: an adopted agent that has
+        // already finished its work goes straight to Done, same as any other
+        // state (this is `next_state`'s call; `Actor::reconcile` never lets an
+        // adopted agent's real completion_seq reach here directly — it passes
+        // `None` and routes the real value through the settle window instead).
+        assert_eq!(
+            next_state(
+                &task(TaskState::Starting, None),
+                &status(AgentStatus::Idle, Some(1))
+            ),
+            Some(TaskState::Done)
+        );
+    }
+
+    #[test]
+    fn dispatch_starting_only_leaves_queued() {
+        assert_eq!(
+            next_state(&task(TaskState::Queued, None), &Observed::DispatchStarting),
+            Some(TaskState::Starting)
+        );
+        for state in [
+            TaskState::Starting,
+            TaskState::Running,
+            TaskState::Blocked,
+            TaskState::Done,
+            TaskState::Stale,
+        ] {
+            assert_eq!(
+                next_state(&task(state, None), &Observed::DispatchStarting),
+                None,
+                "{state} must not restart dispatch"
+            );
+        }
     }
 
     #[test]

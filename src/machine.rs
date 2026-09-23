@@ -223,10 +223,22 @@ impl Actor {
                     continue;
                 }
             };
-            let pong = match req.ping().await {
-                Ok(p) => p,
-                Err(err) => {
+            let pong = match tokio::time::timeout(self.settings.request_timeout, req.ping()).await {
+                Ok(Ok(p)) => p,
+                Ok(Err(err)) => {
                     self.connect_failed(err.to_string(), &mut backoff).await;
+                    continue;
+                }
+                // A ping that never answers is exactly as dead as one that errors: a
+                // herdr that accepted the connection and then stopped answering must
+                // not hang the actor (and with it `Daemon::dispatch_queued` and the
+                // accept loop) forever.
+                Err(_) => {
+                    self.connect_failed(
+                        format!("ping timed out after {:?}", self.settings.request_timeout),
+                        &mut backoff,
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -502,6 +514,18 @@ impl Actor {
             );
         }
         task.machine = Some(self.name.clone());
+        // Persist `Starting` with `machine` and `agent_name` set before the first
+        // herdr call below: a daemon crash mid-dispatch then leaves a row `reconcile`
+        // can find and adopt by agent name on restart, instead of one that still reads
+        // `Queued` (no machine, no pane, no name) and gets dispatched a second time.
+        // `dispatch()` below derives and assigns this same name again; setting it here
+        // too just makes it visible before `dispatch()` runs, not a second identity.
+        task.agent_name = Some(Task::agent_name_for(task.id));
+        task.state = next_state(&task, &Observed::DispatchStarting)
+            .expect("task.state == Queued was just checked above");
+        if let Err(err) = self.store.update_task(&task) {
+            return (Err(err), false);
+        }
         let timeout = self.settings.request_timeout;
         let outcome = match tokio::time::timeout(timeout, dispatch(req, &mut task)).await {
             Ok(outcome) => outcome,
@@ -588,7 +612,10 @@ impl Actor {
         if due.is_empty() {
             return Ok(());
         }
-        let agents = req.agent_list().await?;
+        let timeout = self.settings.request_timeout;
+        let agents = tokio::time::timeout(timeout, req.agent_list())
+            .await
+            .map_err(|_| anyhow::anyhow!("agent.list timed out after {timeout:?}"))??;
         for id in due {
             self.pending_done.remove(&id);
             let Ok(Some(task)) = self.store.get_task(id) else {
@@ -640,9 +667,88 @@ impl Actor {
     /// were away; a present agent's status is applied like an event, except idle, which
     /// goes through the settle window. Long-running tasks become stale.
     async fn reconcile(&mut self, req: &mut Connection) -> anyhow::Result<()> {
-        let agents: Vec<AgentInfo> = req.agent_list().await?;
+        let timeout = self.settings.request_timeout;
+        let agents: Vec<AgentInfo> = tokio::time::timeout(timeout, req.agent_list())
+            .await
+            .map_err(|_| anyhow::anyhow!("agent.list timed out after {timeout:?}"))??;
         for task in self.store.tasks_on_machine(&self.name)? {
             let Some(pane_id) = task.pane_id.clone() else {
+                // Only a `Starting` task can occupy a pane slot with no pane recorded
+                // (see `TaskState::occupies_pane`): `run_dispatch` persists `Starting`
+                // with `machine` set before its first herdr call, so a daemon crash
+                // mid-dispatch leaves exactly this row behind. Adopt the agent it
+                // must have started, found by the name dispatch gives it (`t-<id>`);
+                // if none exists the dispatch never got that far and the task failed.
+                let name = Task::agent_name_for(task.id);
+                let mut t = task;
+                match agents
+                    .iter()
+                    .find(|a| a.name.as_deref() == Some(name.as_str()))
+                {
+                    Some(agent) => {
+                        t.pane_id = Some(agent.pane_id.clone());
+                        t.workspace_id = Some(agent.workspace_id.clone());
+                        // Set from the same name just matched on, not read back from
+                        // the row: adoption must not depend on `agent_name` already
+                        // being persisted (belt and suspenders alongside
+                        // `run_dispatch` persisting it up front; see the comment
+                        // there).
+                        t.agent_name = Some(name.clone());
+                        let idle_like = matches!(
+                            agent.agent_status,
+                            crate::herdr::AgentStatus::Idle | crate::herdr::AgentStatus::Done
+                        );
+                        if idle_like {
+                            // Adopting proves dispatch reached at least `agent.start`;
+                            // land the task at `Running` immediately, the same target
+                            // a successful dispatch would have recorded, instead of
+                            // applying the agent's raw idle/done status straight
+                            // through: that could mark it `Done` with no settle
+                            // window (this task's `last_completion_seq` was never
+                            // set, so any `completion_seq` at all looks "advanced"),
+                            // or leave it stuck as `Starting` forever otherwise
+                            // (stale only covers Running/Blocked). Passing
+                            // `completion_seq: None` forces exactly the `Running`
+                            // transition; the agent's real completion_seq is picked
+                            // up through the settle window below instead, same as
+                            // any other task.
+                            t.state = next_state(
+                                &t,
+                                &Observed::Status {
+                                    status: agent.agent_status,
+                                    completion_seq: None,
+                                },
+                            )
+                            .expect("adopting a Starting task always reaches Running");
+                        }
+                        if let Err(err) = self.store.update_task(&t) {
+                            tracing::error!(%err, task = %t.display_id(), "adopt starting task");
+                            continue;
+                        }
+                        if idle_like {
+                            self.emit("task.running", Some(t.id));
+                            // Never mark Done from a reconcile directly: the settle
+                            // window applies here too, same as the pane-known branch
+                            // below.
+                            self.pending_done
+                                .entry(t.id)
+                                .or_insert((t.last_completion_seq, Instant::now()));
+                        } else {
+                            let observed = Observed::Status {
+                                status: agent.agent_status,
+                                completion_seq: agent.completion_seq,
+                            };
+                            self.apply(t, &observed);
+                        }
+                    }
+                    None => {
+                        t.error = Some(format!(
+                            "dispatch of {} was interrupted before an agent started",
+                            t.display_id()
+                        ));
+                        self.apply(t, &Observed::PaneExited);
+                    }
+                }
                 continue;
             };
             match agents.iter().find(|a| a.pane_id == pane_id) {
@@ -655,7 +761,9 @@ impl Actor {
                     if next_state(&t, &Observed::PaneExited) == Some(TaskState::Failed) {
                         t.error = Some(format!(
                             "agent {} not found on machine {}",
-                            t.agent_name.clone().unwrap_or_default(),
+                            t.agent_name
+                                .clone()
+                                .unwrap_or_else(|| Task::agent_name_for(t.id)),
                             self.name
                         ));
                     }
@@ -711,6 +819,18 @@ mod tests {
             initial_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_millis(200),
             request_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// `settings()` with a wider settle window, for the couple of tests that sleep
+    /// for a short, fixed time and assert the settle window has *not* fired yet: a
+    /// 30ms sleep against a 100ms window is close enough to flake under load. 500ms
+    /// gives a comfortable margin without slowing the rest of the suite, which
+    /// doesn't wait out `settle` at all.
+    fn settings_with_settle(settle: Duration) -> MachineSettings {
+        MachineSettings {
+            settle,
+            ..settings()
         }
     }
 
@@ -779,7 +899,11 @@ mod tests {
     async fn dispatch_then_events_drive_state() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let (h, mut events) = spawn(&fake, &store);
+        let (h, mut events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(500)),
+        );
         wait_for("connected", || {
             h.snapshot().channel == ChannelState::Connected
         })
@@ -833,7 +957,11 @@ mod tests {
     async fn done_is_cancelled_if_agent_resumes_within_settle() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let (h, _events) = spawn(&fake, &store);
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(500)),
+        );
         wait_for("connected", || {
             h.snapshot().channel == ChannelState::Connected
         })
@@ -843,7 +971,10 @@ mod tests {
         fake.set_status(&pane, AgentStatus::Idle, Some(1));
         tokio::time::sleep(Duration::from_millis(30)).await;
         fake.set_status(&pane, AgentStatus::Working, Some(1));
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Long enough to clear the 500ms settle window measured from the original
+        // Idle event: if `Working` had *not* cancelled the pending-done entry, the
+        // settle check would have marked the task Done well before this returns.
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
@@ -907,6 +1038,95 @@ mod tests {
         store.update_task(&t).unwrap();
         let (_h, _events) = spawn(&fake, &store);
         wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+    }
+
+    /// A `Starting` task with no pane recorded is what `run_dispatch` persists right
+    /// before its first herdr call (see the comment there); a crash between that
+    /// write and the pane/workspace ids being recorded leaves exactly this row.
+    /// `reconcile` must find the agent dispatch would have started (named `t-<id>`)
+    /// and adopt it instead of leaving the task stuck, or worse, re-dispatching it.
+    /// The row here has no `agent_name` either, and the fake agent is left idle (no
+    /// `agent.prompt`): both are deliberately the plainest shape a crash can leave
+    /// (`agent_name` is now always set by `run_dispatch`'s pre-persist, but adoption
+    /// must not *depend* on that; a crash between `agent.start` and `agent.prompt`
+    /// is exactly as real), so this exercises adoption doing all the work itself,
+    /// not a test fixture that already looks like a successful dispatch.
+    #[tokio::test]
+    async fn reconcile_adopts_a_starting_task_by_agent_name() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut t = new_task(&store);
+        let name = Task::agent_name_for(t.id);
+        let mut c = fake.connect();
+        let created = c.workspace_create(None, &name).await.unwrap();
+        c.agent_start(&name, "claude", &created.root_pane.pane_id, &[])
+            .await
+            .unwrap();
+        t.state = TaskState::Starting;
+        t.machine = Some("m".into());
+        // pane_id, workspace_id and agent_name are all left unset.
+        store.update_task(&t).unwrap();
+        let (_h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(500)),
+        );
+        wait_for("adopted and running", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        let got = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            got.pane_id.as_deref(),
+            Some(created.root_pane.pane_id.as_str())
+        );
+        assert_eq!(
+            got.workspace_id.as_deref(),
+            Some(created.workspace.workspace_id.as_str())
+        );
+        assert_eq!(
+            got.agent_name.as_deref(),
+            Some(name.as_str()),
+            "adoption must set agent_name itself, not rely on it already being there"
+        );
+
+        // Idle with no completed work must not fast-track to Done, and a later
+        // completion_seq advance must still wait out the settle window, same as
+        // the pane-known path (mirrors `dispatch_then_events_drive_state`).
+        fake.set_status(&created.root_pane.pane_id, AgentStatus::Idle, Some(1));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "done waits for the settle window"
+        );
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// Same interrupted-dispatch shape, but no agent named `t-<id>` exists anywhere:
+    /// the crash happened before `agent.start` even ran. Nothing to adopt, so the
+    /// task must fail, not hang forever as `Starting`.
+    #[tokio::test]
+    async fn reconcile_fails_a_starting_task_with_no_agent() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut t = new_task(&store);
+        t.state = TaskState::Starting;
+        t.machine = Some("m".into());
+        // agent_name is left unset: `reconcile` matches by the name it derives from
+        // the task id, not by reading a persisted `agent_name` back.
+        store.update_task(&t).unwrap();
+        let (_h, _events) = spawn(&fake, &store);
+        wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+        assert!(
+            store
+                .get_task(t.id)
+                .unwrap()
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("interrupted")
+        );
     }
 
     struct Refusing;
@@ -1172,5 +1392,25 @@ mod tests {
             }
         }
         assert_eq!(h.snapshot().channel, ChannelState::Connected);
+    }
+
+    /// `reconcile` runs right after `ping` on every connect attempt, and its
+    /// `agent.list` call had no timeout before this fix: a herdr that accepted the
+    /// connection and then stopped answering there would hang the actor forever,
+    /// which in turn blocks `Daemon::dispatch_queued` and the accept loop behind it.
+    /// `hang_method` is one-shot, so this hangs only the first connect attempt's
+    /// `agent.list`; the retry after backoff finds it answering normally again.
+    #[tokio::test]
+    async fn reconcile_over_a_wedged_connection_reconnects() {
+        let fake = FakeHerdr::new();
+        fake.hang_method("agent.list");
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut settings = settings();
+        settings.request_timeout = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected despite the wedged reconcile", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
     }
 }

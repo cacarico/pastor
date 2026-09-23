@@ -211,7 +211,15 @@ impl Daemon {
         }
     }
 
-    /// Try to place every queued task, oldest first. Called on each tick and after `run`.
+    /// Try to place every queued task, oldest first. Called on each tick and after `run`,
+    /// and concurrent callers already exist today: each accepted IPC connection is its
+    /// own spawned task, so a tick and any number of in-flight `Run` requests can all be
+    /// awaiting this at once. No task is ever dispatched twice because `run_dispatch`
+    /// re-checks the task is still `Queued` inside the actor's own serialized command
+    /// loop, not because of anything here. The capacity snapshot this loop's
+    /// `pick_machine` reads can still be stale under that concurrency and over-dispatch
+    /// past `max_agents` before the next tick's `refresh_live` catches up; that's a known
+    /// gap, not something this comment claims is handled.
     pub async fn dispatch_queued(&self) {
         let queued = match self.store.queued_tasks() {
             Ok(q) => q,
