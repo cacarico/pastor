@@ -544,5 +544,11 @@ mod tests {
             attach_remote_command("default", "t-3"),
             "herdr --session default agent attach t-3"
         );
+        // An empty session name must still quote to `''`, not to nothing, or the
+        // remote shell would see `agent` where it expects the session argument.
+        assert_eq!(
+            attach_remote_command("", "t-1"),
+            "herdr --session '' agent attach t-1"
+        );
     }
 }

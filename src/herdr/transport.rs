@@ -68,8 +68,12 @@ pub fn bridge_command(session: &str) -> String {
 /// anything else is wrapped in single quotes, with embedded single quotes
 /// escaped the standard POSIX way (`'\''`).
 pub fn shell_quote(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    // `"".chars().all(..)` is vacuously true, so the safe-passthrough check alone
+    // would return `""` (nothing) for an empty string, dropping it from the
+    // command line and shifting every argv position after it.
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
     {
         s.to_string()
     } else {
@@ -196,6 +200,8 @@ mod tests {
             bridge_command("my session"),
             "herdr --session 'my session' remote-api-bridge"
         );
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(bridge_command(""), "herdr --session '' remote-api-bridge");
     }
 
     #[tokio::test]

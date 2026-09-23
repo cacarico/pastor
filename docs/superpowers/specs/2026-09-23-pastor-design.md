@@ -424,9 +424,12 @@ cursors, job last-run, machine last-seen), `events.jsonl`,
 pruned), `pastor.sock`. Managed plugin checkouts in
 `~/.local/share/pastor/plugins/`.
 
-CLI to daemon: newline-delimited JSON over `pastor.sock`. When the daemon is
-down, read-only commands fall back to the database and say so. `pastor tick`
-and `pastor run` refuse to run while the daemon holds the store.
+CLI to daemon: newline-delimited JSON over `pastor.sock`. Responses are
+adjacently tagged (`{"kind": ..., "data": ...}`), not internally tagged,
+because serde_json can't serialize an internally tagged newtype variant that
+holds a sequence or a string. When the daemon is down, read-only commands
+fall back to the database and say so. `pastor tick` and `pastor run` refuse
+to run while the daemon holds the store.
 
 Reload: the daemon watches the config directory. Job and flock edits apply on
 the next tick; a file that fails to parse is reported and the previous
