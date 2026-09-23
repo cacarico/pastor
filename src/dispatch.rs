@@ -1,6 +1,6 @@
 use chrono::Utc;
 
-use crate::herdr::{Connection, HerdrError};
+use crate::herdr::{CallError, Connector, ConnectorExt, HerdrError};
 use crate::task::{DispatchSpec, Task, TaskState};
 
 #[derive(Debug, Clone)]
@@ -40,10 +40,11 @@ pub enum DispatchOutcome {
     Blocked,
 }
 
-pub async fn dispatch(
-    conn: &mut Connection,
-    task: &mut Task,
-) -> Result<DispatchOutcome, HerdrError> {
+/// Create the workspace, start the agent, send the prompt. Each step is its own
+/// herdr request on its own connection (see `ConnectorExt`), so a dispatch is
+/// three round trips, not one session: nothing but the task row ties them
+/// together, which is why `agent_name` identifies the agent afterwards.
+pub async fn dispatch(conn: &dyn Connector, task: &mut Task) -> Result<DispatchOutcome, CallError> {
     let name = Task::agent_name_for(task.id);
     task.agent_name = Some(name.clone());
     task.state = TaskState::Starting;
@@ -70,10 +71,10 @@ pub async fn dispatch(
 }
 
 async fn dispatch_steps(
-    conn: &mut Connection,
+    conn: &dyn Connector,
     task: &mut Task,
     name: &str,
-) -> Result<DispatchOutcome, HerdrError> {
+) -> Result<DispatchOutcome, CallError> {
     let spec = task.spec.clone();
     let created = if spec.worktree {
         let repo = spec
@@ -250,9 +251,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_sends_prompt_verbatim() {
         let fake = FakeHerdr::new();
-        let mut c = fake.connect();
         let mut t = task(spec());
-        let out = dispatch(&mut c, &mut t).await.unwrap();
+        let out = dispatch(&fake, &mut t).await.unwrap();
         assert_eq!(out, DispatchOutcome::Running);
         assert_eq!(t.state, TaskState::Running);
         assert_eq!(t.agent_name.as_deref(), Some("t-7"));
@@ -277,13 +277,12 @@ mod tests {
     #[tokio::test]
     async fn dispatch_uses_worktree_when_asked() {
         let fake = FakeHerdr::new();
-        let mut c = fake.connect();
         let mut t = task(DispatchSpec {
             worktree: true,
             branch: Some("pastor/k1".into()),
             ..spec()
         });
-        dispatch(&mut c, &mut t).await.unwrap();
+        dispatch(&fake, &mut t).await.unwrap();
         let wt = fake
             .requests()
             .into_iter()
@@ -298,10 +297,9 @@ mod tests {
     async fn not_ready_is_blocked_and_failures_are_failed() {
         let fake = FakeHerdr::new();
         fake.set_start_behaviour(StartBehaviour::NotReady);
-        let mut c = fake.connect();
         let mut t = task(spec());
         assert_eq!(
-            dispatch(&mut c, &mut t).await.unwrap(),
+            dispatch(&fake, &mut t).await.unwrap(),
             DispatchOutcome::Blocked
         );
         assert_eq!(t.state, TaskState::Blocked);
@@ -310,7 +308,7 @@ mod tests {
 
         fake.set_start_behaviour(StartBehaviour::Fail("unsupported_agent_kind".into()));
         let mut t = task(spec());
-        let err = dispatch(&mut c, &mut t).await.unwrap_err();
+        let err = dispatch(&fake, &mut t).await.unwrap_err();
         assert_eq!(err.code(), Some("unsupported_agent_kind"));
         assert_eq!(t.state, TaskState::Failed);
         assert!(
@@ -328,14 +326,16 @@ mod tests {
     #[tokio::test]
     async fn worktree_without_repo_fails_before_calling_herdr() {
         let fake = FakeHerdr::new();
-        let mut c = fake.connect();
         let mut t = task(DispatchSpec {
             worktree: true,
             repo: None,
             ..spec()
         });
-        let err = dispatch(&mut c, &mut t).await.unwrap_err();
-        assert!(matches!(err, HerdrError::Protocol(_)));
+        let err = dispatch(&fake, &mut t).await.unwrap_err();
+        assert!(
+            matches!(err, CallError::Herdr(HerdrError::Protocol(_))),
+            "{err:?}"
+        );
         assert_eq!(t.state, TaskState::Failed);
         assert!(fake.requests().is_empty());
         let _ = AgentStatus::Idle;

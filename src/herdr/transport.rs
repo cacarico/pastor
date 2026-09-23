@@ -1,28 +1,42 @@
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 
-use tokio::io::AsyncReadExt;
-
 use super::Connection;
+use crate::config::Paths;
 use crate::config::flock::MachineConfig;
+
+/// How long an ssh `ControlMaster` sticks around with no channels open. Every
+/// request opens a connection, so the master is what makes them cheap: the same
+/// value herdr's own remote transport uses (`src/remote/attach.rs`).
+const CONTROL_PERSIST_SECS: u32 = 600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
-    Local { session: String },
-    Ssh { target: String, session: String },
-    Command { argv: Vec<String> },
+    Local {
+        session: String,
+    },
+    Ssh {
+        target: String,
+        session: String,
+        /// Socket for the shared ssh `ControlMaster`, under pastor's state dir.
+        control_path: PathBuf,
+    },
+    Command {
+        argv: Vec<String>,
+    },
 }
 
 impl Endpoint {
-    pub fn from_machine(m: &MachineConfig) -> Endpoint {
+    pub fn from_machine(m: &MachineConfig, paths: &Paths) -> Endpoint {
         if let Some(argv) = &m.command {
             Endpoint::Command { argv: argv.clone() }
         } else if let Some(target) = &m.ssh {
             Endpoint::Ssh {
                 target: target.clone(),
                 session: m.session.clone(),
+                control_path: paths.ssh_control_path(&m.name),
             }
         } else {
             Endpoint::Local {
@@ -34,7 +48,9 @@ impl Endpoint {
     pub fn describe(&self) -> String {
         match self {
             Endpoint::Local { session } => format!("local herdr session {session}"),
-            Endpoint::Ssh { target, session } => format!("ssh {target} (session {session})"),
+            Endpoint::Ssh {
+                target, session, ..
+            } => format!("ssh {target} (session {session})"),
             Endpoint::Command { argv } => format!("command {}", argv.join(" ")),
         }
     }
@@ -81,10 +97,40 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// ssh argv for a bridge over the shared master. Nothing here goes through a
+/// shell: `target` and `control_path` are separate argv elements, and only the
+/// remote command (which a remote shell does parse) is quoted, by `bridge_command`.
+fn ssh_argv(target: &str, session: &str, control_path: &Path) -> Vec<String> {
+    vec![
+        "ssh".to_string(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+        // One authenticated master per machine, reused by every request
+        // connection: without it each request would pay a full ssh handshake.
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        format!("ControlPath={}", control_path.display()),
+        "-o".into(),
+        format!("ControlPersist={CONTROL_PERSIST_SECS}"),
+        "-T".into(),
+        target.to_string(),
+        bridge_command(session),
+    ]
+}
+
 pub type ConnectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Connection, ConnectError>> + Send + 'a>>;
 
 /// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
+///
+/// A connection carries one request (see `Connection`), so this is called once
+/// per request; `ConnectorExt` in `client.rs` has the request vocabulary built
+/// on top of it.
 pub trait Connector: Send + Sync {
     fn connect(&self) -> ConnectFuture<'_>;
     fn describe(&self) -> String;
@@ -114,27 +160,27 @@ pub async fn connect(ep: &Endpoint) -> Result<Connection, ConnectError> {
             let (r, w) = stream.into_split();
             Ok(Connection::new(Box::new(r), Box::new(w)))
         }
-        Endpoint::Ssh { target, session } => {
-            let argv = vec![
-                "ssh".to_string(),
-                "-o".into(),
-                "BatchMode=yes".into(),
-                "-o".into(),
-                "ServerAliveInterval=15".into(),
-                "-o".into(),
-                "ServerAliveCountMax=3".into(),
-                "-T".into(),
-                target.clone(),
-                bridge_command(session),
-            ];
-            spawn(&argv).await
+        Endpoint::Ssh {
+            target,
+            session,
+            control_path,
+        } => {
+            // The master socket lives here; ssh creates the socket itself but not
+            // the directory, and it must not be world-readable.
+            if let Some(parent) = control_path.parent() {
+                crate::config::create_private_dir(parent).map_err(|e| ConnectError {
+                    message: e.to_string(),
+                })?;
+            }
+            spawn(&ssh_argv(target, session, control_path)).await
         }
         Endpoint::Command { argv } => spawn(argv).await,
     }
 }
 
-/// Spawn argv with piped stdio, then prove the bridge is alive with a `ping`.
-/// If the process exits before answering, report its exit status and stderr.
+/// Spawn argv with piped stdio. The bridge is not proven alive here: that is the
+/// first request's job, and `Connection` reports the child's exit status and
+/// stderr if it died before replying (see `Connection::diagnose`).
 async fn spawn(argv: &[String]) -> Result<Connection, ConnectError> {
     let (program, args) = argv.split_first().ok_or_else(|| ConnectError {
         message: "empty command".into(),
@@ -151,40 +197,20 @@ async fn spawn(argv: &[String]) -> Result<Connection, ConnectError> {
         })?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let mut conn = Connection::new(Box::new(stdout), Box::new(stdin));
-    match tokio::time::timeout(std::time::Duration::from_secs(30), conn.ping()).await {
-        Ok(Ok(_)) => Ok(conn.with_child(child)),
-        Ok(Err(err)) => {
-            drop(conn); // closes the child's stdin so a live process can exit
-            let mut err_text = String::new();
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                stderr.read_to_string(&mut err_text),
-            )
-            .await;
-            let status =
-                match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
-                    Ok(Ok(s)) => s.to_string(),
-                    Ok(Err(e)) => e.to_string(),
-                    Err(_) => {
-                        let _ = child.kill().await;
-                        "still running, killed".to_string()
-                    }
-                };
-            Err(ConnectError {
-                message: format!("{}: {err} ({status}) {}", argv.join(" "), err_text.trim()),
-            })
-        }
-        Err(_) => Err(ConnectError {
-            message: format!("{}: no ping reply within 30s", argv.join(" ")),
-        }),
-    }
+    let stderr = child.stderr.take().expect("piped stderr");
+    Ok(
+        Connection::new(Box::new(stdout), Box::new(stdin)).with_bridge(
+            argv.to_vec(),
+            child,
+            stderr,
+        ),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::herdr::ConnectorExt;
 
     #[test]
     fn socket_paths_and_bridge_command() {
@@ -204,6 +230,51 @@ mod tests {
         assert_eq!(bridge_command(""), "herdr --session '' remote-api-bridge");
     }
 
+    #[test]
+    fn ssh_endpoint_multiplexes_through_one_master() {
+        let m = MachineConfig {
+            name: "pi-3".into(),
+            local: false,
+            ssh: Some("fleet@pi-3".into()),
+            command: None,
+            session: "default".into(),
+            max_agents: 2,
+            tags: vec![],
+        };
+        let paths = Paths::new("/tmp/c", "/tmp/s");
+        let ep = Endpoint::from_machine(&m, &paths);
+        let Endpoint::Ssh {
+            target,
+            session,
+            control_path,
+        } = &ep
+        else {
+            panic!("expected an ssh endpoint, got {ep:?}");
+        };
+        // Named after the machine, not the target: a unix socket path is capped
+        // near 108 bytes and `user@host` can be long.
+        assert_eq!(control_path, &PathBuf::from("/tmp/s/ssh/pi-3.sock"));
+        let argv = ssh_argv(target, session, control_path);
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ControlMaster=auto")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ControlPath=/tmp/s/ssh/pi-3.sock")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ControlPersist=600")
+        );
+        // The remote command is the only element a shell ever parses.
+        assert_eq!(
+            argv.last().unwrap(),
+            "herdr --session default remote-api-bridge"
+        );
+        assert_eq!(argv[argv.len() - 2], "fleet@pi-3");
+    }
+
     #[tokio::test]
     async fn process_transport_reports_exit_and_stderr() {
         let ep = Endpoint::Command {
@@ -213,9 +284,15 @@ mod tests {
                 "echo permission denied >&2; exit 255".into(),
             ],
         };
-        let err = connect(&ep).await.err().unwrap();
-        assert!(err.message.contains("permission denied"), "{}", err.message);
-        assert!(err.message.contains("255"), "{}", err.message);
+        // The connect itself succeeds now (it only spawns); the request is what
+        // discovers the process is gone, and it must still name argv, the exit
+        // status and stderr.
+        let err = ep.ping().await.err().unwrap();
+        let message = err.to_string();
+        assert!(message.contains("permission denied"), "{message}");
+        assert!(message.contains("255"), "{message}");
+        assert!(message.contains("sh -c"), "{message}");
+        assert!(err.is_transport(), "{message}");
     }
 
     #[tokio::test]

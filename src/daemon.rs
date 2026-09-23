@@ -40,7 +40,7 @@ impl Daemon {
             None => flock
                 .machines
                 .iter()
-                .map(|m| Arc::new(Endpoint::from_machine(m)) as Arc<dyn Connector>)
+                .map(|m| Arc::new(Endpoint::from_machine(m, &paths)) as Arc<dyn Connector>)
                 .collect(),
         };
         anyhow::ensure!(

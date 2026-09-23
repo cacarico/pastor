@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::MIN_HERDR_PROTOCOL;
 use crate::dispatch::dispatch;
 use crate::herdr::{
-    AgentInfo, Connection, Connector, EventStream, HerdrError, subscription_agent_status,
+    AgentInfo, CallError, Connector, ConnectorExt, EventStream, subscription_agent_status,
     subscription_lifecycle,
 };
 use crate::store::Store;
@@ -54,9 +54,9 @@ pub struct MachineSettings {
     pub reconcile_every: Duration,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
-    /// Bound on any single herdr request (dispatch, read, ...). A connection that
-    /// stops answering within this window is treated as dead: the request fails
-    /// and the actor reconnects.
+    /// Bound on any single herdr request (dispatch, read, ...), covering the
+    /// connect as well as the reply. A machine that does not answer within this
+    /// window is treated as lost: the request fails and the actor reconnects.
     pub request_timeout: Duration,
 }
 
@@ -197,18 +197,11 @@ struct Actor {
 
 /// What the inner loop should do after a command: nothing, reopen the event
 /// subscription (the tracked pane set changed), or drop everything and reconnect
-/// (the request connection itself appears dead).
+/// (a request failed below the API, so the machine looks lost).
 enum CommandOutcome {
     Nothing,
     Resubscribe,
     Reconnect,
-}
-
-fn is_dead_connection(err: &HerdrError) -> bool {
-    matches!(
-        err,
-        HerdrError::Io(_) | HerdrError::Closed | HerdrError::Protocol(_)
-    )
 }
 
 impl Actor {
@@ -216,32 +209,30 @@ impl Actor {
         let mut backoff = self.settings.initial_backoff;
         loop {
             self.set_channel(ChannelState::Connecting, None);
-            let mut req = match self.connector.connect().await {
-                Ok(c) => c,
-                Err(err) => {
-                    self.connect_failed(err.message, &mut backoff).await;
-                    continue;
-                }
-            };
-            let pong = match tokio::time::timeout(self.settings.request_timeout, req.ping()).await {
-                Ok(Ok(p)) => p,
-                Ok(Err(err)) => {
-                    self.connect_failed(err.to_string(), &mut backoff).await;
-                    continue;
-                }
-                // A ping that never answers is exactly as dead as one that errors: a
-                // herdr that accepted the connection and then stopped answering must
-                // not hang the actor (and with it `Daemon::dispatch_queued` and the
-                // accept loop) forever.
-                Err(_) => {
-                    self.connect_failed(
-                        format!("ping timed out after {:?}", self.settings.request_timeout),
-                        &mut backoff,
-                    )
-                    .await;
-                    continue;
-                }
-            };
+            // Nothing is held open for requests: a ping is an ordinary call, on a
+            // connection of its own, and it is what proves the machine reachable.
+            let pong =
+                match tokio::time::timeout(self.settings.request_timeout, self.connector.ping())
+                    .await
+                {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(err)) => {
+                        self.connect_failed(err.to_string(), &mut backoff).await;
+                        continue;
+                    }
+                    // A ping that never answers is exactly as dead as one that errors: a
+                    // herdr that accepted the connection and then stopped answering must
+                    // not hang the actor (and with it `Daemon::dispatch_queued` and the
+                    // accept loop) forever.
+                    Err(_) => {
+                        self.connect_failed(
+                            format!("ping timed out after {:?}", self.settings.request_timeout),
+                            &mut backoff,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
             {
                 let mut s = self.status.write().unwrap();
                 s.herdr_version = Some(pong.version.clone());
@@ -259,7 +250,7 @@ impl Actor {
                     .await;
                 continue;
             }
-            if let Err(err) = self.reconcile(&mut req).await {
+            if let Err(err) = self.reconcile().await {
                 self.connect_failed(format!("reconcile: {err}"), &mut backoff)
                     .await;
                 continue;
@@ -290,7 +281,7 @@ impl Actor {
                 tokio::select! {
                     cmd = self.rx.recv() => {
                         let Some(cmd) = cmd else { return };
-                        match self.handle_command(cmd, &mut req).await {
+                        match self.handle_command(cmd).await {
                             CommandOutcome::Nothing => {}
                             CommandOutcome::Resubscribe => {
                                 match self.open_events().await {
@@ -303,7 +294,7 @@ impl Actor {
                                 }
                             }
                             CommandOutcome::Reconnect => {
-                                tracing::warn!(machine = %self.name, "request connection appears dead; reconnecting");
+                                tracing::warn!(machine = %self.name, "a request failed at the transport level; reconnecting");
                                 break;
                             }
                         }
@@ -313,10 +304,10 @@ impl Actor {
                         Err(err) => { tracing::warn!(machine = %self.name, %err, "event stream ended"); break; }
                     },
                     _ = settle_tick.tick() => {
-                        if let Err(err) = self.confirm_pending_done(&mut req).await { tracing::warn!(machine = %self.name, %err, "settle check failed"); break; }
+                        if let Err(err) = self.confirm_pending_done().await { tracing::warn!(machine = %self.name, %err, "settle check failed"); break; }
                     }
                     _ = reconcile_tick.tick() => {
-                        if let Err(err) = self.reconcile(&mut req).await { tracing::warn!(machine = %self.name, %err, "reconcile failed"); break; }
+                        if let Err(err) = self.reconcile().await { tracing::warn!(machine = %self.name, %err, "reconcile failed"); break; }
                     }
                 }
             }
@@ -409,8 +400,9 @@ impl Actor {
         });
     }
 
+    /// The one connection pastor keeps open: herdr dedicates it to events and
+    /// never serves a request on it.
     async fn open_events(&self) -> Result<EventStream, anyhow::Error> {
-        let conn = self.connector.connect().await?;
         let mut subs = vec![
             subscription_lifecycle("pane.closed"),
             subscription_lifecycle("pane.exited"),
@@ -420,17 +412,13 @@ impl Actor {
                 subs.push(subscription_agent_status(p));
             }
         }
-        Ok(conn.subscribe(subs).await?)
+        Ok(self.connector.subscribe(subs).await?)
     }
 
-    async fn handle_command(
-        &mut self,
-        cmd: MachineCommand,
-        req: &mut Connection,
-    ) -> CommandOutcome {
+    async fn handle_command(&mut self, cmd: MachineCommand) -> CommandOutcome {
         match cmd {
             MachineCommand::Dispatch { task_id, reply } => {
-                let (result, dead) = self.run_dispatch(task_id, req).await;
+                let (result, dead) = self.run_dispatch(task_id).await;
                 let changed = result.is_ok();
                 let _ = reply.send(result);
                 self.refresh_live();
@@ -452,18 +440,19 @@ impl Actor {
                         let timeout = self.settings.request_timeout;
                         match tokio::time::timeout(
                             timeout,
-                            req.agent_read(t.agent_name.as_deref().unwrap_or(""), lines),
+                            self.connector
+                                .agent_read(t.agent_name.as_deref().unwrap_or(""), lines),
                         )
                         .await
                         {
                             Ok(Ok(text)) => (Ok(text), false),
                             Ok(Err(err)) => {
-                                let dead = is_dead_connection(&err);
+                                let dead = err.is_transport();
                                 (Err(err.into()), dead)
                             }
                             // A request that never answers within the bound is treated as a
-                            // dead connection: the caller must reconnect, not retry on the
-                            // same (apparently wedged) request connection.
+                            // dead machine: the actor reconnects and backs off instead of
+                            // hammering an apparently wedged herdr.
                             Err(_) => (
                                 Err(anyhow::anyhow!("request timed out after {timeout:?}")),
                                 true,
@@ -489,15 +478,11 @@ impl Actor {
         }
     }
 
-    /// Runs a dispatch and reports whether the herdr request connection itself
-    /// appears dead (a transport-level `HerdrError`, not an API error): the
-    /// caller must then reconnect, not just resubscribe. The task's own outcome
+    /// Runs a dispatch and reports whether it failed below the API (a transport
+    /// error, not a herdr error code): the caller must then treat the machine as
+    /// lost and reconnect, not just resubscribe. The task's own outcome
     /// (including `Failed`, as `dispatch()` records it) is left to the store.
-    async fn run_dispatch(
-        &mut self,
-        task_id: i64,
-        req: &mut Connection,
-    ) -> (anyhow::Result<Task>, bool) {
+    async fn run_dispatch(&mut self, task_id: i64) -> (anyhow::Result<Task>, bool) {
         let mut task = match self.store.get_task(task_id) {
             Ok(Some(t)) => t,
             Ok(None) => return (Err(anyhow::anyhow!("task {task_id} not found")), false),
@@ -527,27 +512,29 @@ impl Actor {
             return (Err(err), false);
         }
         let timeout = self.settings.request_timeout;
-        let outcome = match tokio::time::timeout(timeout, dispatch(req, &mut task)).await {
-            Ok(outcome) => outcome,
-            // `dispatch()` itself never got to resolve, so its own Failed-recording
-            // never ran; do the same bookkeeping it would have done on an error, and
-            // force a reconnect: a request connection that stops answering is dead.
-            Err(_) => {
-                let message = format!("request timed out after {timeout:?}");
-                task.state = TaskState::Failed;
-                task.error = Some(message.clone());
-                task.finished_at = Some(Utc::now());
-                if let Err(err) = self.store.update_task(&task) {
-                    return (Err(err), true);
+        let outcome =
+            match tokio::time::timeout(timeout, dispatch(self.connector.as_ref(), &mut task)).await
+            {
+                Ok(outcome) => outcome,
+                // `dispatch()` itself never got to resolve, so its own Failed-recording
+                // never ran; do the same bookkeeping it would have done on an error, and
+                // force a reconnect: a herdr that stops answering is a machine that is gone.
+                Err(_) => {
+                    let message = format!("request timed out after {timeout:?}");
+                    task.state = TaskState::Failed;
+                    task.error = Some(message.clone());
+                    task.finished_at = Some(Utc::now());
+                    if let Err(err) = self.store.update_task(&task) {
+                        return (Err(err), true);
+                    }
+                    self.emit("task.failed", Some(task.id));
+                    return (
+                        Err(anyhow::anyhow!("dispatch {}: {message}", task.display_id())),
+                        true,
+                    );
                 }
-                self.emit("task.failed", Some(task.id));
-                return (
-                    Err(anyhow::anyhow!("dispatch {}: {message}", task.display_id())),
-                    true,
-                );
-            }
-        };
-        let dead = matches!(&outcome, Err(err) if is_dead_connection(err));
+            };
+        let dead = matches!(&outcome, Err(err) if CallError::is_transport(err));
         if let Err(err) = self.store.update_task(&task) {
             return (Err(err), dead);
         }
@@ -602,7 +589,7 @@ impl Actor {
 
     /// After the settle window, confirm with agent.list that the agent is still idle and
     /// its completion_seq advanced. Only then is the task done.
-    async fn confirm_pending_done(&mut self, req: &mut Connection) -> anyhow::Result<()> {
+    async fn confirm_pending_done(&mut self) -> anyhow::Result<()> {
         let due: Vec<i64> = self
             .pending_done
             .iter()
@@ -613,7 +600,7 @@ impl Actor {
             return Ok(());
         }
         let timeout = self.settings.request_timeout;
-        let agents = tokio::time::timeout(timeout, req.agent_list())
+        let agents = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
             .map_err(|_| anyhow::anyhow!("agent.list timed out after {timeout:?}"))??;
         for id in due {
@@ -666,9 +653,9 @@ impl Actor {
     /// Compare open tasks with live agents. Missing agent means the task failed while we
     /// were away; a present agent's status is applied like an event, except idle, which
     /// goes through the settle window. Long-running tasks become stale.
-    async fn reconcile(&mut self, req: &mut Connection) -> anyhow::Result<()> {
+    async fn reconcile(&mut self) -> anyhow::Result<()> {
         let timeout = self.settings.request_timeout;
-        let agents: Vec<AgentInfo> = tokio::time::timeout(timeout, req.agent_list())
+        let agents: Vec<AgentInfo> = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
             .map_err(|_| anyhow::anyhow!("agent.list timed out after {timeout:?}"))??;
         for task in self.store.tasks_on_machine(&self.name)? {
@@ -808,7 +795,7 @@ impl Actor {
 mod tests {
     use super::*;
     use crate::herdr::fake::FakeHerdr;
-    use crate::herdr::{AgentStatus, ConnectError, ConnectFuture};
+    use crate::herdr::{AgentStatus, ConnectError, ConnectFuture, Connection};
     use crate::store::NewTask;
     use crate::task::DispatchSpec;
 
@@ -1024,9 +1011,8 @@ mod tests {
     async fn reconcile_adopts_live_agent_state() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let mut c = fake.connect();
-        let created = c.workspace_create(None, "t-1").await.unwrap();
-        c.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
+        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
         fake.set_status(&created.root_pane.pane_id, AgentStatus::Blocked, None);
@@ -1057,9 +1043,8 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut t = new_task(&store);
         let name = Task::agent_name_for(t.id);
-        let mut c = fake.connect();
-        let created = c.workspace_create(None, &name).await.unwrap();
-        c.agent_start(&name, "claude", &created.root_pane.pane_id, &[])
+        let created = fake.workspace_create(None, &name).await.unwrap();
+        fake.agent_start(&name, "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
         t.state = TaskState::Starting;
@@ -1256,10 +1241,10 @@ mod tests {
     }
 
     /// Alternates: even-numbered `connect()` calls hand back a fresh fake
-    /// connection, odd-numbered ones fail. `req` always lands on an even call and
-    /// succeeds; `open_events`'s own `connect()` always lands on an odd call and
-    /// fails, so every attempt dies inside `open_events` without ever reaching the
-    /// inner loop.
+    /// connection, odd-numbered ones fail. Each connect attempt makes an even
+    /// number of calls before subscribing (ping, then reconcile's agent.list), so
+    /// the subscribe always lands on a failing one and every attempt dies inside
+    /// `open_events` without ever reaching the inner loop.
     struct FlakyEvents {
         calls: Arc<std::sync::atomic::AtomicUsize>,
         fake: FakeHerdr,
@@ -1315,25 +1300,68 @@ mod tests {
         );
     }
 
+    /// Wraps a fake and can be broken: while broken, every connection it hands
+    /// out is already at EOF, so the first read of any request fails at the
+    /// transport level. That is what a machine that went away looks like now
+    /// that no connection is held between requests.
+    struct Breakable {
+        fake: FakeHerdr,
+        broken: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Connector for Breakable {
+        fn connect(&self) -> ConnectFuture<'_> {
+            let broken = self.broken.load(std::sync::atomic::Ordering::SeqCst);
+            let fake = self.fake.clone();
+            Box::pin(async move {
+                if broken {
+                    Ok(Connection::new(
+                        Box::new(tokio::io::empty()),
+                        Box::new(tokio::io::sink()),
+                    ))
+                } else {
+                    Ok(fake.connect())
+                }
+            })
+        }
+        fn describe(&self) -> String {
+            "breakable fake".into()
+        }
+    }
+
     #[tokio::test]
-    async fn request_connection_death_triggers_reconnect() {
+    async fn a_request_failing_at_the_transport_level_triggers_reconnect() {
         let fake = FakeHerdr::new();
+        let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let (h, _events) = spawn(&fake, &store);
+        let (events, _rx) = broadcast::channel(64);
+        let h = spawn_machine(
+            "m".into(),
+            2,
+            vec![],
+            Arc::new(Breakable {
+                fake: fake.clone(),
+                broken: broken.clone(),
+            }),
+            store.clone(),
+            settings(),
+            events,
+        );
         wait_for("connected", || {
             h.snapshot().channel == ChannelState::Connected
         })
         .await;
         h.dispatch(new_task(&store).id).await.unwrap();
 
-        fake.disconnect_all();
-        // Sent immediately, racing the event stream noticing the disconnect: either
-        // way the request connection (`req`) is dead, so this must fail rather than
-        // hang or silently succeed against a broken pipe.
+        broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The machine is gone: this dispatch must fail rather than hang or
+        // silently succeed against a connection that answers nothing.
         let t2 = new_task(&store);
         let err = h.dispatch(t2.id).await;
-        assert!(err.is_err(), "dispatch over a dead connection must fail");
+        assert!(err.is_err(), "dispatch against a dead machine must fail");
+        assert_eq!(state_of(&store, t2.id), TaskState::Failed);
 
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
         wait_for("reconnected", || {
             h.snapshot().channel == ChannelState::Connected
         })

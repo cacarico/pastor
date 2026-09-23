@@ -11,12 +11,15 @@ struct Env {
     config: std::path::PathBuf,
     state: std::path::PathBuf,
     serve: std::process::Child,
+    herdr: std::process::Child,
 }
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = self.serve.kill();
-        let _ = self.serve.wait();
+        for child in [&mut self.serve, &mut self.herdr] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -25,23 +28,32 @@ fn start() -> Env {
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
     std::fs::create_dir_all(&config).unwrap();
-    // `command` transport spawns a fresh, stateless `fake-herdr` process per
-    // connect(); the machine actor opens one such process for requests and a
-    // second, separate one for the event subscription, so a status change made
-    // over the request connection is never seen by the (empty) events process.
-    // The only path that still notices it is periodic reconcile, which polls
-    // agent state over the request connection itself: keep it fast so the test
-    // doesn't wait out the default 60s.
+    // Fast tick/settle/reconcile so the test doesn't wait out the 60s defaults.
     std::fs::write(
         config.join("pastor.toml"),
         "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n",
     )
     .unwrap();
+    // A herdr connection carries one request, so the `command` transport spawns a
+    // bridge process per request. The state has to outlive those: `fake-herdr
+    // --listen` is the server (herdr's role) and `--connect` is the bridge
+    // (`remote-api-bridge`'s role), which is exactly the shape pastor talks to
+    // over ssh.
+    let socket = tmp.path().join("herdr.sock");
+    let herdr = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+        .arg("--listen")
+        .arg(&socket)
+        .env("FAKE_HERDR_AUTO_DONE_MS", "300")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
     std::fs::write(
         config.join("flock.toml"),
         format!(
-            "[[machine]]\nname = \"fake\"\ncommand = [\"{}\"]\nmax_agents = 2\n",
-            env!("CARGO_BIN_EXE_fake-herdr")
+            "[[machine]]\nname = \"fake\"\ncommand = [\"{}\", \"--connect\", \"{}\"]\nmax_agents = 2\n",
+            env!("CARGO_BIN_EXE_fake-herdr"),
+            socket.display()
         ),
     )
     .unwrap();
@@ -49,7 +61,6 @@ fn start() -> Env {
         .args(["serve"])
         .env("PASTOR_CONFIG_DIR", &config)
         .env("PASTOR_STATE_DIR", &state)
-        .env("FAKE_HERDR_AUTO_DONE_MS", "300")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -59,6 +70,7 @@ fn start() -> Env {
         config,
         state,
         serve,
+        herdr,
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

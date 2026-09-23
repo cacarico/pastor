@@ -3,7 +3,7 @@ use std::os::unix::process::CommandExt;
 use clap::{Args, Parser, Subcommand};
 use pastor::config::flock::{Flock, MachineConfig};
 use pastor::config::{PastorConfig, Paths, parse_duration};
-use pastor::herdr::{Connector, Endpoint, shell_quote};
+use pastor::herdr::{ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{IpcRequest, IpcResponse, daemon_running, request};
 use pastor::machine::{ChannelState, MachineStatus};
 use pastor::store::{Store, TaskFilter};
@@ -377,7 +377,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                     .iter()
                     .map(|m| MachineStatus {
                         name: m.name.clone(),
-                        endpoint: Endpoint::from_machine(m).describe(),
+                        endpoint: Endpoint::from_machine(m, paths).describe(),
                         channel: ChannelState::Connecting,
                         herdr_version: None,
                         protocol: None,
@@ -408,45 +408,49 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                 .iter()
                 .filter(|m| name.as_ref().is_none_or(|n| &m.name == n))
             {
-                let ep = Endpoint::from_machine(m);
-                let (status, version, protocol, agents, error) = match ep.connect().await {
-                    Ok(mut c) => match c.ping().await {
-                        Ok(p) => {
-                            let compatible = p.protocol >= pastor::MIN_HERDR_PROTOCOL;
-                            let n = c.agent_list().await.map(|a| a.len()).unwrap_or(0);
-                            (
-                                if compatible {
-                                    "reachable"
-                                } else {
-                                    "incompatible"
-                                },
-                                Some(p.version),
-                                Some(p.protocol),
-                                n,
-                                if compatible {
-                                    None
-                                } else {
-                                    Some(format!(
-                                        "protocol {} < {}",
-                                        p.protocol,
-                                        pastor::MIN_HERDR_PROTOCOL
-                                    ))
-                                },
-                            )
-                        }
-                        Err(e) => ("error", None, None, 0, Some(e.to_string())),
-                    },
-                    Err(e) => (
-                        if e.message.contains("herdr.sock") {
-                            "server down"
-                        } else {
-                            "unreachable"
-                        },
-                        None,
-                        None,
-                        0,
-                        Some(e.message),
-                    ),
+                let ep = Endpoint::from_machine(m, paths);
+                // Two ordinary calls, each on its own connection, exactly as the
+                // daemon makes them: herdr answers one request per connection.
+                let (status, version, protocol, agents, error) = match ep.ping().await {
+                    Ok(p) => {
+                        let compatible = p.protocol >= pastor::MIN_HERDR_PROTOCOL;
+                        let n = ep.agent_list().await.map(|a| a.len()).unwrap_or(0);
+                        (
+                            if compatible {
+                                "reachable"
+                            } else {
+                                "incompatible"
+                            },
+                            Some(p.version),
+                            Some(p.protocol),
+                            n,
+                            if compatible {
+                                None
+                            } else {
+                                Some(format!(
+                                    "protocol {} < {}",
+                                    p.protocol,
+                                    pastor::MIN_HERDR_PROTOCOL
+                                ))
+                            },
+                        )
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        (
+                            if message.contains("herdr.sock") {
+                                "server down"
+                            } else if e.is_transport() {
+                                "unreachable"
+                            } else {
+                                "error"
+                            },
+                            None,
+                            None,
+                            0,
+                            Some(message),
+                        )
+                    }
                 };
                 rows.push(serde_json::json!({"name": m.name, "endpoint": ep.describe(), "status": status, "herdr_version": version, "protocol": protocol, "agents": agents, "error": error}));
             }

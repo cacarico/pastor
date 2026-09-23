@@ -1,7 +1,12 @@
+use std::time::Duration;
+
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
+};
 
+use super::transport::{ConnectError, Connector};
 use super::{
     AgentInfo, AgentList, AgentResult, Created, Event, HerdrError, Incoming, PaneRead, Pong,
     Request, Response,
@@ -10,12 +15,29 @@ use super::{
 pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
 pub type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
-/// One herdr socket connection. Requests are sequential: one in flight at a time.
+/// How long a dead child gets to flush its stderr and report an exit status
+/// while `diagnose` builds an error message out of it.
+const DIAGNOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A bridge process whose stdio this connection is speaking over. Kept only so
+/// that a connection that dies can name the command, its exit status and its
+/// stderr (that is how a herdr missing from the remote `PATH` is diagnosed).
+struct Bridge {
+    argv: Vec<String>,
+    child: tokio::process::Child,
+    stderr: tokio::process::ChildStderr,
+}
+
+/// One herdr socket connection, which carries **at most one request and its
+/// reply**, or one subscription. herdr's API server reads a single request line
+/// per connection, answers it and closes (`src/api/server.rs`,
+/// `handle_connection_with_stop`); only `events.subscribe` keeps the socket
+/// open. `call` and `subscribe` therefore both consume the connection, so the
+/// type itself rules out a second request.
 pub struct Connection {
     reader: Lines<BufReader<BoxRead>>,
     writer: BoxWrite,
-    next_id: u64,
-    _child: Option<tokio::process::Child>,
+    bridge: Option<Bridge>,
 }
 
 impl Connection {
@@ -23,23 +45,48 @@ impl Connection {
         Connection {
             reader: BufReader::new(reader).lines(),
             writer,
-            next_id: 1,
-            _child: None,
+            bridge: None,
         }
     }
 
-    /// Keeps a bridge process alive for as long as this connection lives. The
-    /// spawner must set `kill_on_drop(true)` on the child so that dropping the
-    /// connection also ends the bridge process.
-    pub fn with_child(mut self, child: tokio::process::Child) -> Connection {
-        self._child = Some(child);
+    /// Keeps a bridge process alive for as long as this connection lives, and
+    /// lets a failed request report what the process did. The spawner must set
+    /// `kill_on_drop(true)` on the child so that dropping the connection also
+    /// ends the bridge process.
+    pub fn with_bridge(
+        mut self,
+        argv: Vec<String>,
+        child: tokio::process::Child,
+        stderr: tokio::process::ChildStderr,
+    ) -> Connection {
+        self.bridge = Some(Bridge {
+            argv,
+            child,
+            stderr,
+        });
         self
     }
 
-    /// Sends `method` with `params` and waits for the matching response. This waits
-    /// indefinitely; the caller owns any timeout, e.g. by wrapping the call in
-    /// `tokio::time::timeout`.
-    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value, HerdrError> {
+    /// Sends `method` with `params` and waits for the matching response, then
+    /// drops the connection. This waits indefinitely; the caller owns any
+    /// timeout, e.g. by wrapping the call in `tokio::time::timeout`.
+    pub async fn call(mut self, method: &str, params: Value) -> Result<Value, HerdrError> {
+        match self.call_inner(method, params).await {
+            Ok(v) => Ok(v),
+            Err(err) => Err(self.diagnose(err).await),
+        }
+    }
+
+    pub async fn call_as<T: DeserializeOwned>(
+        self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, HerdrError> {
+        let v = self.call(method, params).await?;
+        serde_json::from_value(v).map_err(|e| HerdrError::Protocol(format!("{method} result: {e}")))
+    }
+
+    async fn call_inner(&mut self, method: &str, params: Value) -> Result<Value, HerdrError> {
         let id = self.write_request(method, params).await?;
         loop {
             let Some(line) = self.read_line().await? else {
@@ -61,97 +108,18 @@ impl Connection {
         }
     }
 
-    pub async fn call_as<T: DeserializeOwned>(
-        &mut self,
-        method: &str,
-        params: Value,
-    ) -> Result<T, HerdrError> {
-        let v = self.call(method, params).await?;
-        serde_json::from_value(v).map_err(|e| HerdrError::Protocol(format!("{method} result: {e}")))
-    }
-
-    pub async fn ping(&mut self) -> Result<Pong, HerdrError> {
-        self.call_as("ping", serde_json::json!({})).await
-    }
-
-    pub async fn agent_list(&mut self) -> Result<Vec<AgentInfo>, HerdrError> {
-        Ok(self
-            .call_as::<AgentList>("agent.list", serde_json::json!({}))
-            .await?
-            .agents)
-    }
-
-    pub async fn workspace_create(
-        &mut self,
-        cwd: Option<&str>,
-        label: &str,
-    ) -> Result<Created, HerdrError> {
-        self.call_as(
-            "workspace.create",
-            serde_json::json!({"cwd": cwd, "label": label, "focus": false}),
-        )
-        .await
-    }
-
-    pub async fn worktree_create(
-        &mut self,
-        cwd: &str,
-        branch: &str,
-        label: &str,
-    ) -> Result<Created, HerdrError> {
-        self.call_as(
-            "worktree.create",
-            serde_json::json!({"cwd": cwd, "branch": branch, "label": label, "focus": false}),
-        )
-        .await
-    }
-
-    pub async fn agent_start(
-        &mut self,
-        name: &str,
-        kind: &str,
-        pane_id: &str,
-        args: &[String],
-    ) -> Result<AgentInfo, HerdrError> {
-        Ok(self
-            .call_as::<AgentResult>(
-                "agent.start",
-                serde_json::json!({"name": name, "kind": kind, "pane_id": pane_id, "args": args}),
-            )
-            .await?
-            .agent)
-    }
-
-    pub async fn agent_prompt(
-        &mut self,
-        target: &str,
-        text: &str,
-    ) -> Result<AgentInfo, HerdrError> {
-        Ok(self
-            .call_as::<AgentResult>(
-                "agent.prompt",
-                serde_json::json!({"target": target, "text": text}),
-            )
-            .await?
-            .agent)
-    }
-
-    pub async fn agent_read(&mut self, target: &str, lines: u32) -> Result<String, HerdrError> {
-        Ok(self
-            .call_as::<PaneRead>(
-                "agent.read",
-                serde_json::json!({"target": target, "source": "recent_unwrapped", "lines": lines}),
-            )
-            .await?
-            .read
-            .text)
-    }
-
     /// Turn this connection into an event stream. herdr dedicates the connection to
     /// events after `events.subscribe`, so no more requests can be sent on it. This
     /// waits indefinitely for the subscription to be acknowledged; the caller owns
     /// any timeout, e.g. by wrapping the call in `tokio::time::timeout`.
     pub async fn subscribe(mut self, subscriptions: Vec<Value>) -> Result<EventStream, HerdrError> {
+        match self.subscribe_inner(subscriptions).await {
+            Ok(()) => Ok(EventStream { conn: self }),
+            Err(err) => Err(self.diagnose(err).await),
+        }
+    }
+
+    async fn subscribe_inner(&mut self, subscriptions: Vec<Value>) -> Result<(), HerdrError> {
         let id = self
             .write_request(
                 "events.subscribe",
@@ -164,7 +132,7 @@ impl Connection {
             };
             match parse_incoming(&line) {
                 Some(Incoming::Response(Response::Success { id: rid, .. })) if rid == id => {
-                    return Ok(EventStream { conn: self });
+                    return Ok(());
                 }
                 Some(Incoming::Response(Response::Error { id: rid, error })) if rid == id => {
                     return Err(HerdrError::Api {
@@ -178,8 +146,10 @@ impl Connection {
     }
 
     async fn write_request(&mut self, method: &str, params: Value) -> Result<String, HerdrError> {
-        let id = format!("p{}", self.next_id);
-        self.next_id += 1;
+        // One request per connection, so one id is enough. It still has to match
+        // the reply: herdr echoes it back, and an event line must not be mistaken
+        // for the answer.
+        let id = "p1".to_string();
         let mut line = serde_json::to_string(&Request {
             id: id.clone(),
             method: method.into(),
@@ -197,6 +167,35 @@ impl Connection {
     /// `tokio::select!` branch) does not discard any bytes already read.
     async fn read_line(&mut self) -> Result<Option<String>, HerdrError> {
         Ok(self.reader.next_line().await?)
+    }
+
+    /// Turn a transport-level failure on a bridge connection into an error that
+    /// names the command, its exit status and its stderr. A bridge that never
+    /// started (wrong path, `ssh` refusing the host, herdr missing on the remote)
+    /// looks like a plain EOF otherwise, which says nothing about why.
+    async fn diagnose(&mut self, err: HerdrError) -> HerdrError {
+        let Some(mut bridge) = self.bridge.take() else {
+            return err;
+        };
+        // Close our end of the child's stdin so a process that is still running
+        // (waiting for more input it will never get) can exit and be reaped.
+        let _ = self.writer.shutdown().await;
+        let mut stderr = String::new();
+        let _ =
+            tokio::time::timeout(DIAGNOSE_TIMEOUT, bridge.stderr.read_to_string(&mut stderr)).await;
+        let status = match tokio::time::timeout(DIAGNOSE_TIMEOUT, bridge.child.wait()).await {
+            Ok(Ok(s)) => s.to_string(),
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => {
+                let _ = bridge.child.kill().await;
+                "still running, killed".to_string()
+            }
+        };
+        HerdrError::Transport(format!(
+            "{}: {err} ({status}) {}",
+            bridge.argv.join(" "),
+            stderr.trim()
+        ))
     }
 }
 
@@ -216,6 +215,13 @@ impl EventStream {
     /// event data is lost and the next call to `next` resumes cleanly from where
     /// the read left off.
     pub async fn next(&mut self) -> Result<Event, HerdrError> {
+        match self.next_inner().await {
+            Ok(ev) => Ok(ev),
+            Err(err) => Err(self.conn.diagnose(err).await),
+        }
+    }
+
+    async fn next_inner(&mut self) -> Result<Event, HerdrError> {
         loop {
             let Some(line) = self.conn.read_line().await? else {
                 return Err(HerdrError::Closed);
@@ -233,6 +239,145 @@ impl EventStream {
         }
     }
 }
+
+/// Either end of a one-shot request: the connection could not be opened, or the
+/// request itself failed once it was.
+#[derive(Debug, thiserror::Error)]
+pub enum CallError {
+    #[error("connect: {0}")]
+    Connect(#[from] ConnectError),
+    #[error(transparent)]
+    Herdr(#[from] HerdrError),
+}
+
+impl CallError {
+    /// The herdr error code, for the API errors that carry one (`agent_not_ready`,
+    /// `pane_not_found`, ...). `None` for anything transport-level.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            CallError::Herdr(err) => err.code(),
+            CallError::Connect(_) => None,
+        }
+    }
+
+    /// Did this fail below the API — connect refused, socket closed, garbage on
+    /// the wire, bridge process gone? The machine actor treats that as the
+    /// machine being lost, while an API error is just this request failing.
+    pub fn is_transport(&self) -> bool {
+        match self {
+            CallError::Connect(_) => true,
+            CallError::Herdr(err) => matches!(
+                err,
+                HerdrError::Io(_)
+                    | HerdrError::Closed
+                    | HerdrError::Protocol(_)
+                    | HerdrError::Transport(_)
+            ),
+        }
+    }
+}
+
+/// The request vocabulary, on top of `Connector::connect`.
+///
+/// Every method opens a fresh connection, sends one request, reads one reply and
+/// drops the connection, because that is all herdr serves per connection. Over
+/// ssh the connections are cheap: `Endpoint::Ssh` multiplexes them through one
+/// `ControlMaster` (see `transport.rs`). `subscribe` is the exception herdr also
+/// makes: it keeps its connection for as long as the caller holds the stream.
+///
+/// This is an extension trait rather than part of `Connector` so that `Connector`
+/// stays dyn-compatible: the machine actor holds an `Arc<dyn Connector>` and
+/// calls these straight on it.
+#[allow(async_fn_in_trait)] // Self is always a concrete connector; Send leaks through.
+pub trait ConnectorExt: Connector {
+    async fn call(&self, method: &str, params: Value) -> Result<Value, CallError> {
+        Ok(self.connect().await?.call(method, params).await?)
+    }
+
+    async fn call_as<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, CallError> {
+        Ok(self.connect().await?.call_as(method, params).await?)
+    }
+
+    async fn ping(&self) -> Result<Pong, CallError> {
+        self.call_as("ping", serde_json::json!({})).await
+    }
+
+    async fn agent_list(&self) -> Result<Vec<AgentInfo>, CallError> {
+        Ok(self
+            .call_as::<AgentList>("agent.list", serde_json::json!({}))
+            .await?
+            .agents)
+    }
+
+    async fn workspace_create(&self, cwd: Option<&str>, label: &str) -> Result<Created, CallError> {
+        self.call_as(
+            "workspace.create",
+            serde_json::json!({"cwd": cwd, "label": label, "focus": false}),
+        )
+        .await
+    }
+
+    async fn worktree_create(
+        &self,
+        cwd: &str,
+        branch: &str,
+        label: &str,
+    ) -> Result<Created, CallError> {
+        self.call_as(
+            "worktree.create",
+            serde_json::json!({"cwd": cwd, "branch": branch, "label": label, "focus": false}),
+        )
+        .await
+    }
+
+    async fn agent_start(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        args: &[String],
+    ) -> Result<AgentInfo, CallError> {
+        Ok(self
+            .call_as::<AgentResult>(
+                "agent.start",
+                serde_json::json!({"name": name, "kind": kind, "pane_id": pane_id, "args": args}),
+            )
+            .await?
+            .agent)
+    }
+
+    async fn agent_prompt(&self, target: &str, text: &str) -> Result<AgentInfo, CallError> {
+        Ok(self
+            .call_as::<AgentResult>(
+                "agent.prompt",
+                serde_json::json!({"target": target, "text": text}),
+            )
+            .await?
+            .agent)
+    }
+
+    async fn agent_read(&self, target: &str, lines: u32) -> Result<String, CallError> {
+        Ok(self
+            .call_as::<PaneRead>(
+                "agent.read",
+                serde_json::json!({"target": target, "source": "recent_unwrapped", "lines": lines}),
+            )
+            .await?
+            .read
+            .text)
+    }
+
+    /// Opens a connection and keeps it: the returned stream owns it until dropped.
+    async fn subscribe(&self, subscriptions: Vec<Value>) -> Result<EventStream, CallError> {
+        Ok(self.connect().await?.subscribe(subscriptions).await?)
+    }
+}
+
+impl<T: Connector + ?Sized> ConnectorExt for T {}
 
 fn parse_incoming(line: &str) -> Option<Incoming> {
     let line = line.trim();
@@ -270,34 +415,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_returns_result_and_maps_errors() {
-        let (mut client, mut sr, mut sw) = pipe();
+    async fn call_returns_result() {
+        let (client, mut sr, mut sw) = pipe();
         let server = tokio::spawn(async move {
             let mut line = String::new();
             sr.read_line(&mut line).await.unwrap();
             let req: Request = serde_json::from_str(&line).unwrap();
             assert_eq!(req.method, "ping");
             sw.write_all(format!("{{\"id\":\"{}\",\"result\":{{\"type\":\"pong\",\"version\":\"0.9.1\",\"protocol\":22}}}}\n", req.id).as_bytes()).await.unwrap();
+        });
+        let pong: Pong = client.call_as("ping", serde_json::json!({})).await.unwrap();
+        assert_eq!(pong.protocol, 22);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_maps_api_errors() {
+        let (client, mut sr, mut sw) = pipe();
+        let server = tokio::spawn(async move {
             let mut line = String::new();
             sr.read_line(&mut line).await.unwrap();
             let req: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.method, "agent.prompt");
             sw.write_all(format!("{{\"id\":\"{}\",\"error\":{{\"code\":\"agent_blocked\",\"message\":\"no\"}}}}\n", req.id).as_bytes()).await.unwrap();
         });
-        let pong = client.ping().await.unwrap();
-        assert_eq!(pong.protocol, 22);
-        let err = client.agent_prompt("x", "hi").await.unwrap_err();
+        let err = client
+            .call("agent.prompt", serde_json::json!({"target": "x"}))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Some("agent_blocked"));
         server.await.unwrap();
     }
 
     #[tokio::test]
     async fn call_reports_closed_on_eof() {
-        let (mut client, _sr, mut sw) = pipe();
+        let (client, _sr, mut sw) = pipe();
         // `sw` and `_sr` are split halves of the same underlying duplex stream, so
         // dropping `sw` alone does not signal EOF to the peer's read side while
         // `_sr` keeps the shared stream alive: shut it down explicitly instead.
         sw.shutdown().await.unwrap();
-        let err = client.ping().await.unwrap_err();
+        let err = client
+            .call("ping", serde_json::json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, HerdrError::Closed), "{err:?}");
     }
 

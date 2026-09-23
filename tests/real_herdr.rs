@@ -24,7 +24,7 @@
 //! dispatch would leave it.
 
 use pastor::MIN_HERDR_PROTOCOL;
-use pastor::herdr::{Connector, Endpoint};
+use pastor::herdr::{ConnectorExt, Endpoint};
 
 #[tokio::test]
 #[ignore = "needs a real herdr server; set PASTOR_REAL_HERDR_SESSION and run with --ignored"]
@@ -37,13 +37,13 @@ async fn talks_to_a_real_herdr_session() {
         return;
     };
 
+    // Every call below opens its own connection, because that is all a real herdr
+    // connection carries: one request, one reply, close. Two calls in a row are
+    // the point of this test — the defect this shape fixes looked exactly like a
+    // ping that worked followed by a second request that got EOF.
     let endpoint = Endpoint::Local { session };
-    let mut conn = endpoint
-        .connect()
-        .await
-        .expect("connect to the real herdr socket");
 
-    let pong = conn.ping().await.expect("ping the real herdr");
+    let pong = endpoint.ping().await.expect("ping the real herdr");
     assert!(
         pong.protocol >= MIN_HERDR_PROTOCOL,
         "herdr protocol {} is older than the {} pastor requires; update herdr",
@@ -51,16 +51,26 @@ async fn talks_to_a_real_herdr_session() {
         MIN_HERDR_PROTOCOL
     );
 
+    // The second request, on a second connection: before the one-request-per-
+    // connection fix this is where a real herdr returned EOF.
+    endpoint
+        .agent_list()
+        .await
+        .expect("list agents on a second connection");
+
     let label = format!("pastor-real-herdr-test-{}", std::process::id());
-    let created = conn
+    let created = endpoint
         .workspace_create(None, &label)
         .await
         .expect("create a workspace on the real herdr");
     assert!(!created.workspace.workspace_id.is_empty());
     assert!(!created.root_pane.pane_id.is_empty());
 
-    // Round-trips agent.list against the workspace just created. No agent was
-    // started in it, so this only proves the call itself works against a real
-    // server, not any particular agent state.
-    conn.agent_list().await.expect("list agents");
+    // Round-trips agent.list once more, now with the workspace just created. No
+    // agent was started in it, so this only proves the call itself works against
+    // a real server, not any particular agent state.
+    endpoint
+        .agent_list()
+        .await
+        .expect("list agents after creating a workspace");
 }

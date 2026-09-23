@@ -15,6 +15,10 @@ pub enum HerdrError {
     Io(#[from] std::io::Error),
     #[error("protocol: {0}")]
     Protocol(String),
+    /// The connection itself failed in a way worth spelling out: a bridge process
+    /// that died before replying reports its command, exit status and stderr here.
+    #[error("{0}")]
+    Transport(String),
     #[error("connection closed")]
     Closed,
 }

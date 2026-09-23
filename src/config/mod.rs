@@ -60,6 +60,31 @@ impl Paths {
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("pastor.toml")
     }
+
+    /// Directory for the ssh `ControlMaster` sockets, one per machine. Created
+    /// with mode 0700 by the transport when it first connects.
+    pub fn ssh_dir(&self) -> PathBuf {
+        self.state_dir.join("ssh")
+    }
+
+    /// Socket for `machine`'s ssh master. Named after the machine, not the ssh
+    /// target: a unix socket path is capped near 108 bytes, and `user@host` (or
+    /// ssh's own `%C` hash) makes that easy to blow. Anything outside
+    /// `[A-Za-z0-9._-]` is replaced, so a machine name can never walk out of the
+    /// directory or smuggle a separator into the path.
+    pub fn ssh_control_path(&self, machine: &str) -> PathBuf {
+        let safe: String = machine
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        self.ssh_dir().join(format!("{safe}.sock"))
+    }
 }
 
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
@@ -208,6 +233,15 @@ mod tests {
         }
         assert_eq!(p.flock_file(), tmp.path().join("c/flock.toml"));
         assert_eq!(p.db_file(), tmp.path().join("s/pastor.db"));
+        assert_eq!(
+            p.ssh_control_path("pi-3"),
+            tmp.path().join("s/ssh/pi-3.sock")
+        );
+        assert_eq!(
+            p.ssh_control_path("../../etc/x"),
+            tmp.path().join("s/ssh/.._.._etc_x.sock"),
+            "a machine name must not escape the ssh directory"
+        );
     }
 
     #[test]

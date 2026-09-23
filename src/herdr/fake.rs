@@ -82,6 +82,7 @@ impl FakeHerdr {
         self.state.lock().unwrap().requests.clone()
     }
 
+    /// A fresh connection, good for exactly one request (or one subscription).
     pub fn connect(&self) -> Connection {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (ar, aw) = tokio::io::split(a);
@@ -133,11 +134,17 @@ impl FakeHerdr {
         let _ = self.kill.send(());
     }
 
+    /// Serve one connection (one request, or one subscription) on this reader
+    /// and writer. Used by the `fake-herdr` binary.
     pub async fn serve(&self, reader: BoxRead, writer: BoxWrite) {
         let kill = self.kill.subscribe();
         self.serve_with_kill(reader, writer, kill).await;
     }
 
+    /// Serves exactly one request on this connection and returns, closing it,
+    /// which is what herdr's API server does (`src/api/server.rs`,
+    /// `handle_connection_with_stop`). `events.subscribe` is the one method that
+    /// keeps the connection: it never returns until the stream ends.
     async fn serve_with_kill(
         &self,
         reader: BoxRead,
@@ -145,101 +152,91 @@ impl FakeHerdr {
         mut kill: broadcast::Receiver<()>,
     ) {
         let mut reader = BufReader::new(reader);
-        loop {
-            let mut line = String::new();
-            // `biased` puts the kill branch first so a kill that raced a
-            // simultaneously-ready read always wins the poll, instead of
-            // `select!`'s default random pick servicing one more request first.
-            let read = tokio::select! {
-                biased;
-                _ = kill.recv() => return,
-                r = reader.read_line(&mut line) => r,
-            };
-            match read {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
+        let mut line = String::new();
+        // `biased` puts the kill branch first so a kill that raced a
+        // simultaneously-ready read always wins the poll, instead of
+        // `select!`'s default random pick servicing the request first.
+        let read = tokio::select! {
+            biased;
+            _ = kill.recv() => return,
+            r = reader.read_line(&mut line) => r,
+        };
+        match read {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let Ok(req) = serde_json::from_str::<Request>(line.trim()) else {
+            return;
+        };
+        self.state.lock().unwrap().requests.push(req.clone());
+        let hung = {
+            let mut s = self.state.lock().unwrap();
+            if s.hang.as_deref() == Some(req.method.as_str()) {
+                // One-shot: only this one request hangs, as `hang_method` documents.
+                s.hang = None;
+                true
+            } else {
+                false
             }
-            let Ok(req) = serde_json::from_str::<Request>(line.trim()) else {
-                continue;
-            };
-            self.state.lock().unwrap().requests.push(req.clone());
-            let hung = {
-                let mut s = self.state.lock().unwrap();
-                if s.hang.as_deref() == Some(req.method.as_str()) {
-                    // One-shot: only this one request hangs, as `hang_method` documents.
-                    s.hang = None;
-                    true
-                } else {
-                    false
-                }
-            };
-            if hung {
-                // Wedged herdr: never reply, never read another line. Only the kill
-                // channel (a test dropping/disconnecting the fake) ends this.
-                tokio::select! {
-                    biased;
-                    _ = kill.recv() => return,
-                    _ = std::future::pending::<()>() => {}
-                }
-                return;
-            }
-            if req.method == "events.subscribe" {
-                let subs: Vec<Value> = req
-                    .params
-                    .get("subscriptions")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let mut rx = self.events.subscribe();
-                let ack = json!({"id": req.id, "result": {"type": "subscription_started"}});
-                if writer
-                    .write_all(format!("{ack}\n").as_bytes())
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                loop {
-                    let ev = tokio::select! {
-                        biased;
-                        _ = kill.recv() => return,
-                        ev = rx.recv() => ev,
-                    };
-                    let ev = match ev {
-                        Ok(ev) => ev,
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let err = json!({"id": req.id, "error": {"code": "events_lost", "message": "fell behind"}});
-                            let _ = writer.write_all(format!("{err}\n").as_bytes()).await;
-                            return;
-                        }
-                        Err(_) => return,
-                    };
-                    if subscription_matches(&subs, &ev) {
-                        let line = serde_json::to_string(&ev).unwrap();
-                        if writer
-                            .write_all(format!("{line}\n").as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-            }
-            let reply = match self.handle(&req) {
-                Ok(result) => json!({"id": req.id, "result": result}),
-                Err((code, message)) => {
-                    json!({"id": req.id, "error": {"code": code, "message": message}})
-                }
-            };
+        };
+        if hung {
+            // Wedged herdr: never reply, never close. Only the kill channel (a
+            // test disconnecting the fake) ends this.
+            let _ = kill.recv().await;
+            return;
+        }
+        if req.method == "events.subscribe" {
+            let subs: Vec<Value> = req
+                .params
+                .get("subscriptions")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut rx = self.events.subscribe();
+            let ack = json!({"id": req.id, "result": {"type": "subscription_started"}});
             if writer
-                .write_all(format!("{reply}\n").as_bytes())
+                .write_all(format!("{ack}\n").as_bytes())
                 .await
                 .is_err()
             {
                 return;
             }
+            loop {
+                let ev = tokio::select! {
+                    biased;
+                    _ = kill.recv() => return,
+                    ev = rx.recv() => ev,
+                };
+                let ev = match ev {
+                    Ok(ev) => ev,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let err = json!({"id": req.id, "error": {"code": "events_lost", "message": "fell behind"}});
+                        let _ = writer.write_all(format!("{err}\n").as_bytes()).await;
+                        return;
+                    }
+                    Err(_) => return,
+                };
+                if subscription_matches(&subs, &ev) {
+                    let line = serde_json::to_string(&ev).unwrap();
+                    if writer
+                        .write_all(format!("{line}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
         }
+        let reply = match self.handle(&req) {
+            Ok(result) => json!({"id": req.id, "result": result}),
+            Err((code, message)) => {
+                json!({"id": req.id, "error": {"code": code, "message": message}})
+            }
+        };
+        let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+        // Returning here drops `writer`, closing the connection: one reply is all
+        // a herdr connection ever carries.
     }
 
     fn handle(&self, req: &Request) -> Result<Value, (String, String)> {
@@ -358,20 +355,25 @@ fn subscription_matches(subs: &[Value], ev: &Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::herdr::ConnectorExt;
 
     #[tokio::test]
     async fn create_start_prompt_list_roundtrip() {
+        // Each call here opens its own connection, exactly as it does against a
+        // real herdr; the fake's state lives in the `FakeHerdr`, not the connection.
         let fake = FakeHerdr::new();
-        let mut c = fake.connect();
-        assert_eq!(c.ping().await.unwrap().protocol, 22);
-        let created = c.workspace_create(Some("/tmp"), "t-1").await.unwrap();
+        assert_eq!(fake.ping().await.unwrap().protocol, 22);
+        let created = fake.workspace_create(Some("/tmp"), "t-1").await.unwrap();
         assert_eq!(created.root_pane.pane_id, "w1:p1");
-        let a = c.agent_start("t-1", "claude", "w1:p1", &[]).await.unwrap();
+        let a = fake
+            .agent_start("t-1", "claude", "w1:p1", &[])
+            .await
+            .unwrap();
         assert_eq!(a.name.as_deref(), Some("t-1"));
         assert_eq!(a.agent_status, AgentStatus::Idle);
-        let a = c.agent_prompt("t-1", "hello").await.unwrap();
+        let a = fake.agent_prompt("t-1", "hello").await.unwrap();
         assert_eq!(a.agent_status, AgentStatus::Working);
-        let list = c.agent_list().await.unwrap();
+        let list = fake.agent_list().await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(
             fake.requests()
@@ -392,20 +394,19 @@ mod tests {
     async fn start_behaviours() {
         let fake = FakeHerdr::new();
         fake.set_start_behaviour(StartBehaviour::NotReady);
-        let mut c = fake.connect();
-        let created = c.workspace_create(None, "x").await.unwrap();
-        let err = c
+        let created = fake.workspace_create(None, "x").await.unwrap();
+        let err = fake
             .agent_start("t-2", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("agent_not_ready"));
         fake.set_start_behaviour(StartBehaviour::Fail("unsupported_agent_kind".into()));
-        let err = c
+        let err = fake
             .agent_start("t-3", "nope", &created.root_pane.pane_id, &[])
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("unsupported_agent_kind"));
-        let err = c
+        let err = fake
             .agent_start("t-4", "claude", "w9:p9", &[])
             .await
             .unwrap_err();
@@ -415,30 +416,27 @@ mod tests {
     #[tokio::test]
     async fn prompt_on_blocked_agent_is_rejected() {
         let fake = FakeHerdr::new();
-        let mut c = fake.connect();
-        let created = c.workspace_create(None, "x").await.unwrap();
-        c.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
+        let created = fake.workspace_create(None, "x").await.unwrap();
+        fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
         fake.set_status(&created.root_pane.pane_id, AgentStatus::Blocked, None);
-        let err = c.agent_prompt("t-1", "hi").await.unwrap_err();
+        let err = fake.agent_prompt("t-1", "hi").await.unwrap_err();
         assert_eq!(err.code(), Some("agent_blocked"));
     }
 
     #[tokio::test]
     async fn subscription_filters_by_pane_and_delivers_lifecycle() {
         let fake = FakeHerdr::new();
-        let mut c = fake.connect();
-        let a = c.workspace_create(None, "a").await.unwrap();
-        let b = c.workspace_create(None, "b").await.unwrap();
-        c.agent_start("t-1", "claude", &a.root_pane.pane_id, &[])
+        let a = fake.workspace_create(None, "a").await.unwrap();
+        let b = fake.workspace_create(None, "b").await.unwrap();
+        fake.agent_start("t-1", "claude", &a.root_pane.pane_id, &[])
             .await
             .unwrap();
-        c.agent_start("t-2", "claude", &b.root_pane.pane_id, &[])
+        fake.agent_start("t-2", "claude", &b.root_pane.pane_id, &[])
             .await
             .unwrap();
         let mut stream = fake
-            .connect()
             .subscribe(vec![
                 super::super::subscription_lifecycle("pane.closed"),
                 super::super::subscription_agent_status(&a.root_pane.pane_id),
@@ -456,13 +454,55 @@ mod tests {
         assert_eq!(e2.pane_id(), Some(b.root_pane.pane_id.as_str()));
     }
 
+    /// herdr's API server answers exactly one request per connection and then
+    /// closes (`src/api/server.rs`, `handle_connection_with_stop`); only
+    /// `events.subscribe` keeps the socket open. The fake must do the same, or
+    /// every test in this crate passes against a server pastor will never meet.
+    /// Written with the raw line protocol on purpose: `Connection::call` consumes
+    /// the connection, so a second request on one connection is not expressible
+    /// through the client at all.
+    #[tokio::test]
+    async fn second_request_on_one_connection_gets_eof() {
+        use tokio::io::AsyncBufReadExt;
+        let fake = FakeHerdr::new();
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let server = fake.clone();
+        tokio::spawn(async move { server.serve(Box::new(br), Box::new(bw)).await });
+        let mut reader = BufReader::new(ar);
+        let mut writer = aw;
+
+        writer
+            .write_all(b"{\"id\":\"1\",\"method\":\"ping\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.contains("pong"), "{line}");
+
+        // The reply above was the connection's whole life. A second request may
+        // even fail to write (the peer is gone); what matters is that no second
+        // reply ever arrives and the read side is at EOF.
+        let _ = writer
+            .write_all(b"{\"id\":\"2\",\"method\":\"ping\",\"params\":{}}\n")
+            .await;
+        let mut second = String::new();
+        let n = reader.read_line(&mut second).await.unwrap();
+        assert_eq!(n, 0, "expected EOF after one reply, got {second:?}");
+    }
+
+    /// The long-lived connection a disconnect can still cut is the event stream;
+    /// request connections are gone by themselves after one reply.
     #[tokio::test]
     async fn disconnect_all_closes_connections() {
         let fake = FakeHerdr::new();
-        let mut c = fake.connect();
-        c.ping().await.unwrap();
+        let mut stream = fake
+            .subscribe(vec![super::super::subscription_lifecycle("pane.closed")])
+            .await
+            .unwrap();
         fake.disconnect_all();
-        let err = c.ping().await.unwrap_err();
+        let err = stream.next().await.unwrap_err();
         assert!(
             matches!(
                 err,
@@ -475,18 +515,20 @@ mod tests {
         // `connect()` and `disconnect_all()` — the kill receiver must already be
         // registered synchronously in `connect()`, not lazily inside the spawned
         // `serve` task, or this send races the task and can be lost.
-        let mut c = fake.connect();
+        let c = fake.connect();
         fake.disconnect_all();
-        assert!(c.ping().await.is_err());
+        assert!(c.call("ping", json!({})).await.is_err());
     }
 
     #[tokio::test]
     async fn agent_start_rejects_malformed_and_unknown_panes() {
         let fake = FakeHerdr::new();
-        let mut c = fake.connect();
-        c.workspace_create(None, "x").await.unwrap();
+        fake.workspace_create(None, "x").await.unwrap();
         for pane in ["é:p1", "w1:p99", "w1"] {
-            let err = c.agent_start("t", "claude", pane, &[]).await.unwrap_err();
+            let err = fake
+                .agent_start("t", "claude", pane, &[])
+                .await
+                .unwrap_err();
             assert_eq!(err.code(), Some("pane_not_found"), "pane {pane:?}");
         }
         // A non-ASCII workspace part must not panic while `state`'s mutex is held
