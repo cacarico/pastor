@@ -157,6 +157,12 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
             status,
             completion_seq,
         } => match status {
+            // Stale is sticky: a working/blocked observation after a timeout must not
+            // flip the task back to running or blocked, or it would oscillate with the
+            // next timeout check. Only a real completion (below) or a pane event moves
+            // it on from here.
+            AgentStatus::Working if task.state == Stale => return None,
+            AgentStatus::Blocked if task.state == Stale => return None,
             AgentStatus::Working => Running,
             AgentStatus::Blocked => Blocked,
             AgentStatus::Unknown => return None,
@@ -390,6 +396,58 @@ mod tests {
         assert_eq!(
             next_state(&task(TaskState::Done, Some(1)), &Observed::PaneExited),
             Some(TaskState::Closed)
+        );
+    }
+
+    #[test]
+    fn stale_is_sticky_until_completion_or_pane_event() {
+        // Working and blocked observations must not pull a stale task back into
+        // the live states, or it would oscillate with the next timeout check.
+        assert_eq!(
+            next_state(
+                &task(TaskState::Stale, None),
+                &status(AgentStatus::Working, None)
+            ),
+            None
+        );
+        assert_eq!(
+            next_state(
+                &task(TaskState::Stale, None),
+                &status(AgentStatus::Blocked, None)
+            ),
+            None
+        );
+        // Idle/done with no new completion_seq is not a real completion either.
+        assert_eq!(
+            next_state(
+                &task(TaskState::Stale, Some(1)),
+                &status(AgentStatus::Idle, Some(1))
+            ),
+            None
+        );
+        // A real completion (completion_seq advances) still moves it to Done.
+        assert_eq!(
+            next_state(
+                &task(TaskState::Stale, Some(1)),
+                &status(AgentStatus::Idle, Some(2))
+            ),
+            Some(TaskState::Done)
+        );
+        assert_eq!(
+            next_state(
+                &task(TaskState::Stale, None),
+                &status(AgentStatus::Done, Some(1))
+            ),
+            Some(TaskState::Done)
+        );
+        // A pane event still moves a stale task on.
+        assert_eq!(
+            next_state(&task(TaskState::Stale, None), &Observed::PaneClosed),
+            Some(TaskState::Closed)
+        );
+        assert_eq!(
+            next_state(&task(TaskState::Stale, None), &Observed::PaneExited),
+            Some(TaskState::Failed)
         );
     }
 
