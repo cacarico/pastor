@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 
 use tokio::io::AsyncReadExt;
@@ -67,6 +69,24 @@ fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+pub type ConnectFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Connection, ConnectError>> + Send + 'a>>;
+
+/// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
+pub trait Connector: Send + Sync {
+    fn connect(&self) -> ConnectFuture<'_>;
+    fn describe(&self) -> String;
+}
+
+impl Connector for Endpoint {
+    fn connect(&self) -> ConnectFuture<'_> {
+        Box::pin(connect(self))
+    }
+    fn describe(&self) -> String {
+        Endpoint::describe(self)
     }
 }
 

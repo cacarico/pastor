@@ -303,6 +303,15 @@ impl FakeHerdr {
     }
 }
 
+impl super::transport::Connector for FakeHerdr {
+    fn connect(&self) -> super::transport::ConnectFuture<'_> {
+        Box::pin(async move { Ok(FakeHerdr::connect(self)) })
+    }
+    fn describe(&self) -> String {
+        "fake herdr".into()
+    }
+}
+
 fn subscription_matches(subs: &[Value], ev: &Event) -> bool {
     subs.iter().any(|s| {
         let t = s.get("type").and_then(Value::as_str).unwrap_or("");

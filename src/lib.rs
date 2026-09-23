@@ -1,6 +1,7 @@
 pub mod config;
 pub mod dispatch;
 pub mod herdr;
+pub mod machine;
 pub mod store;
 pub mod task;
 
