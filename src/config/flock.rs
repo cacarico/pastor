@@ -93,7 +93,11 @@ impl Flock {
             return Err(format!("machine {} already exists", m.name));
         }
         self.machines.push(m);
-        self.validate()
+        if let Err(e) = self.validate() {
+            self.machines.pop();
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
@@ -192,5 +196,28 @@ tags = ["fast"]
         assert!(f.add(pi("a")).is_err());
         assert!(f.remove("a"));
         assert!(!f.remove("a"));
+    }
+
+    #[test]
+    fn add_rejects_invalid_machine_without_mutating() {
+        let mut f = Flock::default();
+        assert!(
+            f.add(MachineConfig {
+                local: true,
+                ..pi("both")
+            })
+            .is_err()
+        );
+        assert!(f.machines.is_empty());
+
+        let mut f = Flock::default();
+        assert!(
+            f.add(MachineConfig {
+                max_agents: 0,
+                ..pi("zero")
+            })
+            .is_err()
+        );
+        assert!(f.machines.is_empty());
     }
 }
