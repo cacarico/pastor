@@ -163,7 +163,17 @@ impl FakeHerdr {
                 continue;
             };
             self.state.lock().unwrap().requests.push(req.clone());
-            if self.state.lock().unwrap().hang.as_deref() == Some(req.method.as_str()) {
+            let hung = {
+                let mut s = self.state.lock().unwrap();
+                if s.hang.as_deref() == Some(req.method.as_str()) {
+                    // One-shot: only this one request hangs, as `hang_method` documents.
+                    s.hang = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if hung {
                 // Wedged herdr: never reply, never read another line. Only the kill
                 // channel (a test dropping/disconnecting the fake) ends this.
                 tokio::select! {

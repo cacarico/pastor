@@ -8,7 +8,7 @@ use crate::config::flock::Flock;
 use crate::config::{PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
-use crate::ipc::{IpcRequest, IpcResponse};
+use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
 use crate::machine::{ChannelState, MachineHandle, MachineSettings, PastorEvent, spawn_machine};
 use crate::store::{NewTask, Store};
 
@@ -87,14 +87,21 @@ impl Daemon {
         if socket.exists() {
             // Staleness is a property of the connect, not of the reply: a live
             // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
-            // herdr) can go a while without answering a ping, but the connect
-            // itself only succeeds while something is actually listening.
-            match tokio::net::UnixStream::connect(&socket).await {
-                Ok(_) => anyhow::bail!(
+            // herdr) can go a while without answering a ping, and a busy daemon
+            // looks exactly like a wedged one from the outside. Only a refused (or
+            // absent) connect means nothing is actually listening; anything else
+            // must be left alone rather than unlinked and stolen.
+            match crate::ipc::probe_daemon(&socket).await {
+                DaemonProbe::Running => anyhow::bail!(
                     "another pastor daemon is already running on {}",
                     socket.display()
                 ),
-                Err(_) => std::fs::remove_file(&socket)?,
+                DaemonProbe::Unresponsive => anyhow::bail!(
+                    "a daemon is listening on {} but did not respond within 2s; \
+                     remove the socket file by hand only if that daemon is dead",
+                    socket.display()
+                ),
+                DaemonProbe::NotRunning => std::fs::remove_file(&socket)?,
             }
         }
         let listener = tokio::net::UnixListener::bind(&socket)?;
@@ -466,16 +473,17 @@ mod tests {
         }
     }
 
-    /// A live daemon that is mid-request and not answering pings must not have its
-    /// socket unlinked by a second `pastor serve`: staleness is decided by whether
-    /// the connect succeeds, not by whether anything replies.
+    /// A daemon that is mid-request and not answering pings (or a listener that
+    /// never reads at all) must not have its socket unlinked by a second `pastor
+    /// serve`: staleness is decided by whether the connect is refused, not by
+    /// whether anything replies within the probe window.
     #[tokio::test]
-    async fn run_refuses_to_replace_a_live_socket() {
+    async fn run_refuses_to_replace_an_unresponsive_listener() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let socket = d.socket_path();
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         tokio::spawn(async move {
-            // Accept connections and never reply: a live but unresponsive daemon.
+            // Accept connections and never read or reply: unresponsive, not dead.
             let mut kept = Vec::new();
             loop {
                 match listener.accept().await {
@@ -485,14 +493,14 @@ mod tests {
             }
         });
 
-        let err = tokio::time::timeout(Duration::from_secs(5), d.run())
+        let err = tokio::time::timeout(Duration::from_secs(10), d.run())
             .await
             .expect("run must not hang waiting on the other daemon")
             .unwrap_err();
-        assert!(err.to_string().contains("another pastor daemon"), "{err}");
+        assert!(err.to_string().contains("did not respond"), "{err}");
         assert!(
             socket.exists(),
-            "a live daemon's socket file must not be removed"
+            "an unresponsive daemon's socket file must not be removed"
         );
     }
 }

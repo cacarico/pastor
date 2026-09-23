@@ -74,6 +74,13 @@ pub async fn request_with_timeout(
 
 async fn request_once(socket: &Path, req: &IpcRequest) -> anyhow::Result<IpcResponse> {
     let stream = tokio::net::UnixStream::connect(socket).await?;
+    round_trip(stream, req).await
+}
+
+async fn round_trip(
+    stream: tokio::net::UnixStream,
+    req: &IpcRequest,
+) -> anyhow::Result<IpcResponse> {
     let (r, mut w) = stream.into_split();
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
@@ -88,11 +95,45 @@ async fn request_once(socket: &Path, req: &IpcRequest) -> anyhow::Result<IpcResp
     Ok(serde_json::from_str(reply.trim())?)
 }
 
+/// What `probe_daemon` found at a socket path. Only `NotRunning` means it's safe to
+/// unlink and replace the socket file: a connect refused (or a path that doesn't
+/// exist) is the one signal that nothing is on the other end. `Running` and
+/// `Unresponsive` both mean something is there — a busy daemon mid-request looks
+/// exactly like a wedged one from the outside, so both must be left alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonProbe {
+    /// Connected and got back a `Pong` within the probe window.
+    Running,
+    /// The connect failed the way an absent or abandoned socket does (refused, or
+    /// the path doesn't exist).
+    NotRunning,
+    /// Something accepted the connection but didn't answer `Ping` within
+    /// `PING_TIMEOUT`, or the connect failed some other way (e.g. permission
+    /// denied). Either way, it is not safe to assume the socket is stale.
+    Unresponsive,
+}
+
+pub async fn probe_daemon(socket: &Path) -> DaemonProbe {
+    let stream = match tokio::net::UnixStream::connect(socket).await {
+        Ok(s) => s,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return DaemonProbe::NotRunning;
+        }
+        Err(_) => return DaemonProbe::Unresponsive,
+    };
+    match tokio::time::timeout(PING_TIMEOUT, round_trip(stream, &IpcRequest::Ping)).await {
+        Ok(Ok(IpcResponse::Pong { .. })) => DaemonProbe::Running,
+        _ => DaemonProbe::Unresponsive,
+    }
+}
+
 pub async fn daemon_running(socket: &Path) -> bool {
-    matches!(
-        request_with_timeout(socket, &IpcRequest::Ping, PING_TIMEOUT).await,
-        Ok(IpcResponse::Pong { .. })
-    )
+    matches!(probe_daemon(socket).await, DaemonProbe::Running)
 }
 
 #[cfg(test)]
@@ -124,5 +165,13 @@ mod tests {
             start.elapsed()
         );
         assert!(err.to_string().contains("did not respond"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn probe_daemon_reports_not_running_for_a_missing_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("nothing-here.sock");
+        assert_eq!(probe_daemon(&socket).await, DaemonProbe::NotRunning);
+        assert!(!daemon_running(&socket).await);
     }
 }
