@@ -68,10 +68,7 @@ pub async fn request_with_timeout(
 ) -> anyhow::Result<IpcResponse> {
     match tokio::time::timeout(timeout, request_once(socket, req)).await {
         Ok(result) => result,
-        Err(_) => anyhow::bail!(
-            "pastor daemon did not respond within {}s",
-            timeout.as_secs()
-        ),
+        Err(_) => anyhow::bail!("pastor daemon did not respond within {timeout:?}"),
     }
 }
 

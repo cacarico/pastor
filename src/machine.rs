@@ -453,10 +453,7 @@ impl Actor {
                             // dead connection: the caller must reconnect, not retry on the
                             // same (apparently wedged) request connection.
                             Err(_) => (
-                                Err(anyhow::anyhow!(
-                                    "request timed out after {}s",
-                                    timeout.as_secs()
-                                )),
+                                Err(anyhow::anyhow!("request timed out after {timeout:?}")),
                                 true,
                             ),
                         }
@@ -512,7 +509,7 @@ impl Actor {
             // never ran; do the same bookkeeping it would have done on an error, and
             // force a reconnect: a request connection that stops answering is dead.
             Err(_) => {
-                let message = format!("request timed out after {}s", timeout.as_secs());
+                let message = format!("request timed out after {timeout:?}");
                 task.state = TaskState::Failed;
                 task.error = Some(message.clone());
                 task.finished_at = Some(Utc::now());

@@ -85,13 +85,17 @@ impl Daemon {
     pub async fn run(self) -> anyhow::Result<()> {
         let socket = self.socket_path();
         if socket.exists() {
-            if crate::ipc::daemon_running(&socket).await {
-                anyhow::bail!(
-                    "another pastor serve is already listening on {}",
+            // Staleness is a property of the connect, not of the reply: a live
+            // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
+            // herdr) can go a while without answering a ping, but the connect
+            // itself only succeeds while something is actually listening.
+            match tokio::net::UnixStream::connect(&socket).await {
+                Ok(_) => anyhow::bail!(
+                    "another pastor daemon is already running on {}",
                     socket.display()
-                );
+                ),
+                Err(_) => std::fs::remove_file(&socket)?,
             }
-            std::fs::remove_file(&socket)?;
         }
         let listener = tokio::net::UnixListener::bind(&socket)?;
         std::fs::set_permissions(
@@ -460,5 +464,35 @@ mod tests {
             assert!(Instant::now() < deadline, "daemon never started");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A live daemon that is mid-request and not answering pings must not have its
+    /// socket unlinked by a second `pastor serve`: staleness is decided by whether
+    /// the connect succeeds, not by whether anything replies.
+    #[tokio::test]
+    async fn run_refuses_to_replace_a_live_socket() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let socket = d.socket_path();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            // Accept connections and never reply: a live but unresponsive daemon.
+            let mut kept = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => kept.push(stream),
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let err = tokio::time::timeout(Duration::from_secs(5), d.run())
+            .await
+            .expect("run must not hang waiting on the other daemon")
+            .unwrap_err();
+        assert!(err.to_string().contains("another pastor daemon"), "{err}");
+        assert!(
+            socket.exists(),
+            "a live daemon's socket file must not be removed"
+        );
     }
 }
