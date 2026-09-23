@@ -76,13 +76,13 @@ struct ListArgs {
     #[arg(long)]
     machine: Option<String>,
     /// Only blocked tasks, needing a human
-    #[arg(long)]
+    #[arg(long, group = "list_filter")]
     blocked: bool,
     /// Only done tasks
-    #[arg(long)]
+    #[arg(long, group = "list_filter")]
     done: bool,
     /// Include closed tasks
-    #[arg(long)]
+    #[arg(long, group = "list_filter")]
     all: bool,
     /// Print full task records as JSON instead of a table
     #[arg(long)]
@@ -671,6 +671,41 @@ mod tests {
         assert_eq!(protocol, None);
         assert_eq!(agents, None);
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn list_blocked_done_all_are_mutually_exclusive() {
+        fn err(args: &[&str]) -> clap::Error {
+            match Cli::try_parse_from(args) {
+                Ok(_) => panic!("{args:?}: expected a usage error"),
+                Err(e) => e,
+            }
+        }
+
+        let e = err(&["pastor", "list", "--blocked", "--done"]);
+        assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(e.exit_code(), 2);
+
+        assert_eq!(
+            err(&["pastor", "list", "--blocked", "--all"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            err(&["pastor", "list", "--done", "--all"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+
+        // Each flag alone, and none of them, must still parse.
+        for args in [
+            vec!["pastor", "list"],
+            vec!["pastor", "list", "--blocked"],
+            vec!["pastor", "list", "--done"],
+            vec!["pastor", "list", "--all"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(&args) {
+                panic!("{args:?}: {e}");
+            }
+        }
     }
 
     #[test]
