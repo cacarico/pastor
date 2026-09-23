@@ -1,9 +1,11 @@
 pub mod client;
 pub mod fake;
 pub mod protocol;
+pub mod transport;
 
 pub use client::*;
 pub use protocol::*;
+pub use transport::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HerdrError {
