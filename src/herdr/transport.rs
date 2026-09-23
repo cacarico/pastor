@@ -62,7 +62,12 @@ pub fn bridge_command(session: &str) -> String {
     format!("herdr --session {} remote-api-bridge", shell_quote(session))
 }
 
-fn shell_quote(s: &str) -> String {
+/// Quote `s` as a single POSIX shell word, safe to splice into a command string
+/// that a remote shell (e.g. one invoked via `ssh target <command>`) will parse.
+/// Plain alphanumeric-plus-`-_.` strings pass through unquoted for readability;
+/// anything else is wrapped in single quotes, with embedded single quotes
+/// escaped the standard POSIX way (`'\''`).
+pub fn shell_quote(s: &str) -> String {
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
     {

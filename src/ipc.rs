@@ -172,18 +172,54 @@ mod tests {
         assert!(err.to_string().contains("did not respond"), "{err}");
     }
 
+    /// Minimal, directly-constructed `Task`. `task::tests` has its own builder but
+    /// it lives in a private `mod tests` that isn't reachable from here, so this
+    /// mirrors its shape instead of trying to reuse it.
+    fn minimal_task() -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: 1,
+            job: "run".into(),
+            item: serde_json::Value::Null,
+            prompt: "hi".into(),
+            spec: DispatchSpec {
+                agent: "claude".into(),
+                agent_args: vec![],
+                repo: None,
+                worktree: false,
+                branch: None,
+                machine: None,
+                tags: vec![],
+                timeout_secs: 60,
+            },
+            machine: None,
+            workspace_id: None,
+            pane_id: None,
+            agent_name: None,
+            state: crate::task::TaskState::Queued,
+            error: None,
+            last_completion_seq: None,
+            created_at: now,
+            started_at: None,
+            finished_at: None,
+            updated_at: now,
+        }
+    }
+
     /// Every `IpcResponse` variant must round-trip through JSON: the newtype
     /// variants wrapping a `Vec` or `String` (`Tasks`, `Text`, `Machines`) broke
     /// under internal tagging (serde_json refuses to merge a `kind` field into a
     /// sequence or a string), which the adjacently-tagged `content = "data"`
-    /// representation fixes for every shape uniformly.
+    /// representation fixes for every shape uniformly. `Task(Task)` is included
+    /// too: it's what `run` and `task show` actually return over the wire.
     #[test]
     fn every_response_variant_round_trips_through_json() {
         let responses = vec![
             IpcResponse::Pong {
                 version: "1".into(),
             },
-            IpcResponse::Tasks(vec![]),
+            IpcResponse::Task(minimal_task()),
+            IpcResponse::Tasks(vec![minimal_task()]),
             IpcResponse::Text("hello".into()),
             IpcResponse::Machines(vec![]),
             IpcResponse::error("some_code", "some message"),
@@ -193,6 +229,29 @@ mod tests {
             let back: IpcResponse = serde_json::from_str(&json).unwrap();
             assert_eq!(format!("{resp:?}"), format!("{back:?}"), "{json}");
         }
+    }
+
+    /// Pin the adjacent-tagging wire shape itself for the two variants that used
+    /// to be impossible to serialize at all: `Task`'s payload is a JSON object,
+    /// `Tasks`'s is a JSON array, both carried under a `"data"` key alongside
+    /// `"kind"`.
+    #[test]
+    fn task_and_tasks_carry_kind_and_data_with_the_expected_shape() {
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&IpcResponse::Task(minimal_task())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["kind"], "task");
+        assert!(v["data"].is_object(), "{v}");
+        assert_eq!(v["data"]["id"], 1);
+
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&IpcResponse::Tasks(vec![minimal_task()])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["kind"], "tasks");
+        assert!(v["data"].is_array(), "{v}");
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

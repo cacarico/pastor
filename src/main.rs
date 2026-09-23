@@ -3,7 +3,7 @@ use std::os::unix::process::CommandExt;
 use clap::{Args, Parser, Subcommand};
 use pastor::config::flock::{Flock, MachineConfig};
 use pastor::config::{PastorConfig, Paths, parse_duration};
-use pastor::herdr::{Connector, Endpoint};
+use pastor::herdr::{Connector, Endpoint, shell_quote};
 use pastor::ipc::{IpcRequest, IpcResponse, daemon_running, request};
 use pastor::machine::{ChannelState, MachineStatus};
 use pastor::store::{Store, TaskFilter};
@@ -457,6 +457,18 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The command run on the remote host by `ssh -t target <this>`. `session` and
+/// `agent` both come from data an attacker could shape (a flock session name,
+/// a task's agent name derived from user input via the daemon) and are quoted
+/// with `shell_quote` so the remote shell can't be made to run anything else.
+fn attach_remote_command(session: &str, agent: &str) -> String {
+    format!(
+        "herdr --session {} agent attach {}",
+        shell_quote(session),
+        shell_quote(agent)
+    )
+}
+
 async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     let id = task_id(task);
     paths.ensure()?;
@@ -480,10 +492,7 @@ async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
         std::process::Command::new("ssh")
             .arg("-t")
             .arg(target)
-            .arg(format!(
-                "herdr --session {} agent attach {agent}",
-                m.session
-            ))
+            .arg(attach_remote_command(&m.session, &agent))
             .exec()
     } else if m.local {
         std::process::Command::new("herdr")
@@ -515,4 +524,25 @@ async fn open(paths: &Paths, machine: &str) -> anyhow::Result<()> {
         fail("no_terminal", "command machines have no UI to open")
     };
     Err(anyhow::anyhow!("exec failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_remote_command_quotes_session_and_agent() {
+        assert_eq!(
+            attach_remote_command("my session", "t-1"),
+            "herdr --session 'my session' agent attach t-1"
+        );
+        assert_eq!(
+            attach_remote_command("o'brien's box", "t-2"),
+            "herdr --session 'o'\\''brien'\\''s box' agent attach t-2"
+        );
+        assert_eq!(
+            attach_remote_command("default", "t-3"),
+            "herdr --session default agent attach t-3"
+        );
+    }
 }
