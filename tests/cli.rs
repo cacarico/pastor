@@ -392,27 +392,26 @@ fn clock_job_creates_tasks_end_to_end() {
 
     // The clock connector keys an item by the current wall-clock second, and
     // the background scheduler (also "every 1s") is racing this forced dry
-    // run for that same second. Retry until it lands on one the background
-    // pass has not already claimed, rather than assume a fixed gap wins it.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let runs: Vec<serde_json::Value> = loop {
-        let out = env.cmd(&["tick", "--dry-run", "--job", "tick", "--json"]);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let runs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
-        if runs[0]["created"].as_array().unwrap().len() == 1 {
-            break runs;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "dry run never landed on a second the background tick hadn't claimed: {runs:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    // run for that same second: whichever gets there first marks it seen. A
+    // 0-created dry run right after a real run is correct product behaviour
+    // (the item shows up as `skipped_seen` instead), so assert the outcome
+    // either way rather than retry for the lucky one.
+    let out = env.cmd(&["tick", "--dry-run", "--job", "tick", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let runs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(runs[0]["outcome"], "dry_run");
+    assert_eq!(runs[0]["items"], 1);
+    let created = runs[0]["created"].as_array().unwrap().len();
+    let skipped = runs[0]["skipped_seen"].as_u64().unwrap();
+    assert_eq!(
+        created as u64 + skipped,
+        1,
+        "the one item is either newly created or already claimed by the background tick: {runs:?}"
+    );
 
     let out = env.cmd(&["job", "disable", "tick"]);
     assert!(
@@ -440,6 +439,23 @@ fn clock_job_creates_tasks_end_to_end() {
     let out = env.cmd(&["job", "run", "ghost"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("job_not_found"));
+
+    // `job_path` joins the raw name under the jobs dir; an unvalidated name
+    // like "../pastor" would resolve to config/pastor.toml, which exists, so
+    // this must be rejected by name before any existence check runs.
+    let pastor_toml_before = std::fs::read_to_string(env.config.join("pastor.toml")).unwrap();
+    let out = env.cmd(&["job", "disable", "../pastor"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("job_not_found"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.config.join("pastor.toml")).unwrap(),
+        pastor_toml_before,
+        "a path-traversal job name must not touch pastor.toml"
+    );
 }
 
 #[test]
@@ -461,6 +477,22 @@ fn tick_without_daemon_queues_tasks_for_later() {
             .output()
             .unwrap()
     };
+    // No daemon and no background scheduler process exists here, so unlike
+    // the e2e test above a dry run is not racing anything: it must create
+    // exactly the one item and write nothing to the store.
+    let out = run(&["tick", "--dry-run", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let runs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(runs[0]["outcome"], "dry_run");
+    assert_eq!(runs[0]["created"].as_array().unwrap().len(), 1);
+    let out = run(&["list", "--json"]);
+    let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(tasks.is_empty(), "--dry-run must write nothing: {tasks:?}");
+
     let out = run(&["tick", "--json"]);
     assert!(
         out.status.success(),
