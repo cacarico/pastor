@@ -123,12 +123,7 @@ Plan 3 (events and plugins):
 
 Plan 4 (cleanup and lifecycle):
 
-- A dispatch that fails after `agent.start` leaves a live agent that no task
-  row points at; it is invisible to reconcile and to capacity accounting.
-  Same for a daemon that is killed mid-dispatch before `starting` is
-  persisted.
 - A machine removed from the flock leaves its open tasks `running` forever.
-- `apply` overwrites `finished_at` on `done -> closed`.
 - `flock.toml` and `pastor.toml` do not reload; a machine added with `pastor
   machine add` needs a daemon restart. Job files do reload.
 - `pastor task run --worktree` without `--repo` is accepted by the CLI and queued,
@@ -154,6 +149,19 @@ Plan 4 (cleanup and lifecycle):
 - The whole dispatch pass runs under the fleet lock, so slow agent readiness
   delays `job list`, `tick`, `job reload` and `task run` too. Move readiness waits out
   of the lock.
+- Orphans (agents named `t-N` that no open task owns: a dispatch that failed
+  after `agent.start`, a daemon killed mid-dispatch) are found by reconcile,
+  counted in `live` and closeable with `MachineCommand::Close`, but only as
+  often as `reconcile_every`, and on the assumption that one pastor owns the
+  `t-N` names on each herdr.
+- `pastor task retry|close|prune` have store and actor support
+  (`Store::{insert_retry, close_task, prune}`, `MachineHandle::close`) but no
+  IPC request, daemon arm or CLI yet; they wait for the `Fleet` from
+  `feat/jobs`.
+- A retry copies the rendered spec, so a job whose branch template does not
+  use the task id (`pastor/{{ item.key }}`) retries onto the same branch; if
+  the old worktree is still there, `worktree.create` fails. Close the old task
+  with `--remove-worktree` first.
 
 Not yet assigned a plan:
 
