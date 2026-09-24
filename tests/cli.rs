@@ -1596,8 +1596,15 @@ fn task_retry_close_and_prune_end_to_end() {
     let pruned = env.json(&["task", "prune", "--done", "--older-than", "3d", "--json"]);
     assert_eq!(pruned["pruned"], 0);
     let pruned = env.json(&["task", "prune", "--closed", "--older-than", "0s", "--json"]);
-    assert_eq!(pruned["pruned"], 3);
+    assert_eq!(
+        pruned["pruned"], 2,
+        "t-3, the newest, stays so its id is not reused"
+    );
     env.fails_with(&["task", "show", "t-1"], "task_not_found");
+    assert_eq!(
+        env.json(&["task", "show", "t-3", "--json"])["state"],
+        "closed"
+    );
     let out = env.cmd(&[
         "task",
         "prune",

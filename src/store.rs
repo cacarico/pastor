@@ -340,7 +340,8 @@ impl Store {
     /// Delete tasks in `states` that finished more than `older_than` ago
     /// (`finished_at`, or `updated_at` for a row that never recorded one).
     /// Their `seen` rows stay, so the items never trigger again. Only
-    /// finished states may be pruned. Returns how many rows went.
+    /// finished states may be pruned, and never the newest task (so ids are
+    /// not reused). Returns how many rows went.
     pub fn prune(&self, states: &[TaskState], older_than: Duration) -> anyhow::Result<usize> {
         if states.is_empty() {
             return Ok(0);
@@ -360,9 +361,13 @@ impl Store {
             .collect();
         // julianday parses the stored RFC 3339 text, offset and fraction
         // included; comparing the strings would not order them reliably.
+        // The newest row always stays: `id` has no AUTOINCREMENT, so SQLite
+        // gives the next task MAX(id) + 1, and deleting the newest row would
+        // hand its id (and its agent name t-<id>) out again.
         let sql = format!(
             "DELETE FROM tasks WHERE state IN ({})
-             AND julianday(COALESCE(finished_at, updated_at)) < julianday(?1)",
+             AND julianday(COALESCE(finished_at, updated_at)) < julianday(?1)
+             AND id < (SELECT MAX(id) FROM tasks)",
             placeholders.join(",")
         );
         let conn = self.conn.lock().unwrap();
@@ -1262,6 +1267,28 @@ mod tests {
                 .any(|c| c == "prompt_pending" || c == "retry_of"),
             "rolled back: {cols:?}"
         );
+    }
+
+    /// `tasks.id` has no AUTOINCREMENT, so SQLite hands out MAX(id) + 1:
+    /// deleting the newest row would give its id to the next task, and with
+    /// it the agent name `t-<id>` and branch the old one may still hold.
+    /// Prune keeps the newest row so ids never repeat.
+    #[test]
+    fn prune_never_frees_the_newest_id() {
+        let s = Store::open_in_memory().unwrap();
+        let old = Utc::now() - chrono::Duration::days(4);
+        for _ in 0..3 {
+            let t = s.insert_task(new_task("run")).unwrap();
+            let mut t = set_state(&s, t.id, TaskState::Closed);
+            t.finished_at = Some(old);
+            s.update_task(&mut t).unwrap();
+        }
+        let n = s
+            .prune(&[TaskState::Closed], Duration::from_secs(86400))
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(s.get_task(3).unwrap().is_some(), "the newest row stays");
+        assert_eq!(s.insert_task(new_task("run")).unwrap().id, 4);
     }
 
     #[test]
