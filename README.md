@@ -132,6 +132,7 @@ pastor machine add here --local
 pastor machine status                  # ssh, herdr version, protocol
 pastor setup systemd                 # pastor serve as a user service; or `pastor serve &`
 pastor run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
+pastor run "Review the open PR" --agent-arg=--model --agent-arg=claude-opus-5-5
 mkdir -p ~/.config/pastor/jobs
 cat > ~/.config/pastor/jobs/hourly.toml <<'EOF'
 every = "1h"
@@ -160,6 +161,20 @@ opens the pane somewhere else when it does not exist. Quote it, or your shell
 expands it to the head's home first. A `command` machine cannot report a home,
 and neither can one whose shell has no absolute `$HOME`; give those absolute
 paths.
+
+`pastor run` takes `--repo`, `--machine`, `--agent`, `--agent-arg`,
+`--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
+`--timeout` and `--json`. `--agent-arg` hands one argument to the agent,
+through herdr's `agent.start`; repeat it for more, in order. It always takes the
+next word as its value, even one that starts with a dash, so
+`--agent-arg --model --agent-arg claude-opus-5-5` and
+`--agent-arg=--model --agent-arg=claude-opus-5-5` mean the same thing; the
+`=` form just reads more clearly. There is no single-string form: pastor would
+have to split it on spaces, and that breaks any argument that contains one. A
+job file's `agent_args` does the same for its tasks. When neither says
+anything, `[defaults] agent_args` in pastor.toml applies; a job file that sets
+`agent_args = []` opts out of it. `pastor task show t-1` prints the args a task
+was started with.
 
 Without a real herdr, a fake one speaks the same protocol. It comes in the same
 two pieces the real thing does, because state has to outlive a single request:
@@ -205,6 +220,20 @@ socket and plugin `.env` files to 0600, and says what it changed.
 ```
 
 `PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override the locations.
+
+```toml
+# pastor.toml, every key optional; these are the defaults
+tick = "10s"                 # scheduler pass
+settle = "10s"               # a finished agent stays idle this long before its task is done
+reconcile_every = "60s"
+request_timeout = "60s"      # one herdr request, connect included
+agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
+[defaults]                   # for run flags and job keys that are left out
+agent = "claude"
+agent_args = []              # e.g. ["--model", "claude-opus-5-5"]
+max_tasks_per_run = 5
+timeout = "2h"
+```
 
 ## Shell completions
 
