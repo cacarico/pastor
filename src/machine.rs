@@ -441,9 +441,16 @@ impl Actor {
                         }
                     }
                     _ = reconcile_tick.tick() => {
-                        if let Err(err) = self.reconcile().await {
-                            if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "reconcile failed"); break; }
-                            tracing::warn!(machine = %self.name, %err, "reconcile failed; staying connected");
+                        match self.reconcile().await {
+                            Ok(false) => {}
+                            Ok(true) => match self.open_events().await {
+                                Ok(s) => events = s,
+                                Err(err) => { tracing::warn!(machine = %self.name, %err, "resubscribe after adopting a pane failed"); break; }
+                            },
+                            Err(err) => {
+                                if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "reconcile failed"); break; }
+                                tracing::warn!(machine = %self.name, %err, "reconcile failed; staying connected");
+                            }
                         }
                     }
                 }
@@ -651,10 +658,19 @@ impl Actor {
                     // failure or a request that never answered) means the machine
                     // is gone. A herdr API error or a store error is logged and
                     // the next tick tries again.
-                    if let Err(err) = self.reconcile().await {
-                        tracing::warn!(machine = %self.name, %err, "poll reconcile failed");
-                        if is_outage(&err) {
-                            return PollExit::Reconnect(format!("poll reconcile failed: {err}"));
+                    match self.reconcile().await {
+                        // An attempt already in flight was built before the
+                        // adoption and would miss the pane; start it over. With
+                        // none in flight the next attempt reads the store fresh.
+                        Ok(true) if subscribing.is_some() => {
+                            subscribing = self.subscribe_future().ok();
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(machine = %self.name, %err, "poll reconcile failed");
+                            if is_outage(&err) {
+                                return PollExit::Reconnect(format!("poll reconcile failed: {err}"));
+                            }
                         }
                     }
                     if let Err(err) = self.confirm_pending_done().await {
@@ -1036,7 +1052,11 @@ impl Actor {
         }
         let from = task.state;
         task.state = to;
-        if matches!(to, TaskState::Done | TaskState::Failed | TaskState::Closed) {
+        if to == TaskState::Closed {
+            // `done -> closed` ends the cycle that finished at `finished_at`;
+            // the pane going away later is not when the work finished.
+            task.finished_at = task.finished_at.or_else(|| Some(Utc::now()));
+        } else if matches!(to, TaskState::Done | TaskState::Failed) {
             task.finished_at = Some(Utc::now());
         } else {
             // The task is open again (a `Done` agent that picked the work back
@@ -1063,7 +1083,13 @@ impl Actor {
     /// Compare open tasks with live agents. Missing agent means the task failed while we
     /// were away; a present agent's status is applied like an event, except idle, which
     /// goes through the settle window. Long-running tasks become stale.
-    async fn reconcile(&mut self) -> anyhow::Result<()> {
+    ///
+    /// Returns whether it adopted a pane (a `Starting` task found by agent
+    /// name): the event subscription open at that moment does not cover the
+    /// pane, so the caller must resubscribe or the task is only ever seen by
+    /// the next reconcile.
+    async fn reconcile(&mut self) -> anyhow::Result<bool> {
+        let mut adopted = false;
         let timeout = self.settings.request_timeout;
         let agents: Vec<AgentInfo> = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
@@ -1132,6 +1158,7 @@ impl Actor {
                             tracing::error!(%err, task = %t.display_id(), "adopt starting task");
                             continue;
                         }
+                        adopted = true;
                         if idle_like {
                             self.emit("task.running", Some(t.id));
                             // Never mark Done from a reconcile directly: the settle
@@ -1225,7 +1252,7 @@ impl Actor {
             }
         }
         self.refresh_live();
-        Ok(())
+        Ok(adopted)
     }
 }
 
@@ -1749,6 +1776,65 @@ mod tests {
             None,
             "a running task kept the finish time of its last cycle"
         );
+    }
+
+    /// The pane of a finished task closing later is not when its work
+    /// finished: `done -> closed` keeps `finished_at`.
+    #[tokio::test]
+    async fn closing_a_done_task_keeps_its_finish_time() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        let finished = store.get_task(t.id).unwrap().unwrap().finished_at;
+        assert!(finished.is_some());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        fake.close_pane(&pane);
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        assert_eq!(store.get_task(t.id).unwrap().unwrap().finished_at, finished);
+    }
+
+    /// A pane adopted by a reconcile while connected is not in the event
+    /// subscription that is already open; the actor must resubscribe so its
+    /// status changes arrive as events, not only at the next reconcile.
+    #[tokio::test]
+    async fn a_pane_adopted_while_connected_is_subscribed() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let mut t = new_task(&store);
+        let name = Task::agent_name_for(t.id);
+        let created = fake.workspace_create(None, &name).await.unwrap();
+        let pane = created.root_pane.pane_id.clone();
+        fake.agent_start(&name, "claude", &pane, &[]).await.unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        t.state = TaskState::Starting;
+        t.machine = Some("m".into());
+        store.update_task(&mut t).unwrap();
+        wait_for("adopted", || {
+            store.get_task(t.id).unwrap().unwrap().pane_id.as_deref() == Some(pane.as_str())
+        })
+        .await;
+        wait_for("a subscription covering the pane", || {
+            fake.requests().iter().any(|r| {
+                r.method == "events.subscribe"
+                    && r.params["subscriptions"]
+                        .as_array()
+                        .is_some_and(|subs| subs.iter().any(|s| s["pane_id"] == pane.as_str()))
+            })
+        })
+        .await;
     }
 
     #[tokio::test]
