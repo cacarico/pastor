@@ -130,7 +130,7 @@ make install                         # pastor and fake-herdr into ~/.cargo/bin
 pastor machine add pi-3 fleet@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
 pastor machine add here --local
 pastor machine status                  # ssh, herdr version, protocol
-pastor serve &                       # or run it under systemd later
+pastor setup systemd                 # pastor serve as a user service; or `pastor serve &`
 pastor run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
 mkdir -p ~/.config/pastor/jobs
 cat > ~/.config/pastor/jobs/hourly.toml <<'EOF'
@@ -171,6 +171,25 @@ pastor machine add fake --command fake-herdr --connect /tmp/fake-herdr.sock
 pastor serve
 ```
 
+## Run under systemd
+
+`pastor setup systemd` installs `contrib/systemd/pastor.service` to
+`~/.config/systemd/user/` and runs `systemctl --user enable --now` on it.
+`pastor setup systemd --herdr` does the same with `herdr.service` (the herdr
+server) and belongs on every machine in the flock. Both units restart on
+failure and log to the journal (`journalctl --user -u pastor`). Setup points
+`ExecStart` at the binary it finds (the running pastor, or `herdr` on PATH)
+and copies your shell's `PATH` into the unit, so `ssh`, `herdr` and the agents
+resolve under systemd the way they do in a terminal; re-run it after moving a
+binary. A unit that differs from what setup would write is kept as
+`<unit>.service.bak`, and a running service is not restarted, since
+restarting herdr stops its agents: run `systemctl --user restart` yourself.
+
+A user service stops at logout unless lingering is on. Setup checks
+`loginctl show-user` and prints `loginctl enable-linger` when it is off.
+For `pastor.service` it also sets the config and state dirs to 0700 and the
+socket and plugin `.env` files to 0600, and says what it changed.
+
 ## Files
 
 ```
@@ -181,6 +200,7 @@ pastor serve
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
+~/.config/systemd/user/{pastor,herdr}.service   written by `pastor setup systemd`
 ```
 
 `PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override the locations.
