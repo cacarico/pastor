@@ -129,14 +129,28 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 #[serde(default)]
 pub struct Defaults {
     pub agent: String,
+    /// Extra argv for the agent (`["--model", "claude-opus-5-5"]`), for tasks
+    /// whose run flags or job file give none. See `agent_args_or`.
+    pub agent_args: Vec<String>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
+}
+
+impl Defaults {
+    /// The agent args a task gets. `given` is what `pastor run --agent-arg` or
+    /// a job file's `agent_args` said, `None` when they said nothing; only
+    /// then do `[defaults] agent_args` apply. The one place that rule lives,
+    /// so run and jobs cannot drift apart.
+    pub fn agent_args_or(&self, given: Option<Vec<String>>) -> Vec<String> {
+        given.unwrap_or_else(|| self.agent_args.clone())
+    }
 }
 
 impl Default for Defaults {
     fn default() -> Self {
         Defaults {
             agent: "claude".into(),
+            agent_args: vec![],
             max_tasks_per_run: 5,
             timeout: "2h".into(),
         }
@@ -355,6 +369,23 @@ mod tests {
                 .to_string()
                 .contains("settle")
         );
+    }
+
+    #[test]
+    fn defaults_agent_args_parse_and_apply_only_when_none_are_given() {
+        assert!(Defaults::default().agent_args.is_empty());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nagent_args = [\"--model\", \"claude-opus-5-5\"]\n",
+        )
+        .unwrap();
+        let d = PastorConfig::load(&path).unwrap().defaults;
+        assert_eq!(d.agent_args, vec!["--model", "claude-opus-5-5"]);
+        assert_eq!(d.agent_args_or(None), vec!["--model", "claude-opus-5-5"]);
+        assert_eq!(d.agent_args_or(Some(vec!["-v".into()])), vec!["-v"]);
+        assert!(d.agent_args_or(Some(vec![])).is_empty());
     }
 
     #[test]
