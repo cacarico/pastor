@@ -486,7 +486,11 @@ impl Actor {
                                         // A fresh subscribe just succeeded: proof of health.
                                         backoff = self.settings.initial_backoff;
                                     }
-                                    Err(err) => { tracing::warn!(machine = %self.name, %err, "resubscribe failed"); break; }
+                                    Err(err) => match self.poll_after_resubscribe_failed(err).await {
+                                        PollExit::Subscribed(s) => events = *s,
+                                        PollExit::Shutdown => return,
+                                        PollExit::Reconnect(_) => break,
+                                    },
                                 }
                             }
                             CommandOutcome::Reconnect => {
@@ -515,7 +519,11 @@ impl Actor {
                             Ok(false) => {}
                             Ok(true) => match self.open_events().await {
                                 Ok(s) => events = s,
-                                Err(err) => { tracing::warn!(machine = %self.name, %err, "resubscribe after adopting a pane failed"); break; }
+                                Err(err) => match self.poll_after_resubscribe_failed(err).await {
+                                    PollExit::Subscribed(s) => events = *s,
+                                    PollExit::Shutdown => return,
+                                    PollExit::Reconnect(_) => break,
+                                },
                             },
                             Err(err) => {
                                 if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "reconcile failed"); break; }
@@ -535,6 +543,27 @@ impl Actor {
             self.drain_commands_while_down(backoff).await;
             backoff = (backoff * 2).min(self.settings.max_backoff);
         }
+    }
+
+    /// A resubscribe from the connected loop failed. Only an outage ends the
+    /// connection. Anything else (herdr refusing a subscription to a pane
+    /// that closed since the reconcile that adopted it, a store error while
+    /// building the list) leaves the machine answering, so it polls until a
+    /// subscribe opens, like a subscription that will not open at connect.
+    async fn poll_after_resubscribe_failed(&mut self, err: anyhow::Error) -> PollExit {
+        if is_outage(&err) {
+            tracing::warn!(machine = %self.name, %err, "resubscribe failed");
+            return PollExit::Reconnect(format!("events: {err}"));
+        }
+        tracing::warn!(machine = %self.name, %err, "resubscribe refused; polling");
+        self.set_channel(ChannelState::Polling, Some(format!("events: {err}")));
+        self.refresh_live();
+        let exit = self.poll_until_subscribed().await;
+        if matches!(exit, PollExit::Subscribed(_)) {
+            self.set_channel(ChannelState::Connected, None);
+            self.refresh_live();
+        }
+        exit
     }
 
     async fn connect_failed(&mut self, message: String, backoff: &mut Duration) {
@@ -2058,6 +2087,55 @@ mod tests {
             })
         })
         .await;
+    }
+
+    /// A pane that closes between the reconcile that adopted it and the
+    /// resubscribe gets that subscription refused with herdr's
+    /// `pane_not_found`, an API error: the machine answers, so it polls and
+    /// subscribes again instead of announcing `machine.lost`.
+    #[tokio::test]
+    async fn a_pane_gone_before_the_resubscribe_is_not_an_outage() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let mut t = new_task(&store);
+        let name = Task::agent_name_for(t.id);
+        let pane = start_agent(&fake, &name).await;
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.close_pane_before_subscribe(&pane);
+        t.state = TaskState::Starting;
+        t.machine = Some("m".into());
+        store.update_task(&mut t).unwrap();
+        let names_pane = |r: &crate::herdr::Request| {
+            r.method == "events.subscribe"
+                && r.params["subscriptions"]
+                    .as_array()
+                    .is_some_and(|subs| subs.iter().any(|s| s["pane_id"] == pane.as_str()))
+        };
+        wait_for("the refused resubscribe", || {
+            fake.requests().iter().any(&names_pane)
+        })
+        .await;
+        // Polling reconciles the closed pane away and subscribes again.
+        wait_for("a later subscribe", || {
+            let reqs = fake.requests();
+            let refused = reqs.iter().position(&names_pane).unwrap();
+            reqs[refused + 1..]
+                .iter()
+                .any(|r| r.method == "events.subscribe")
+        })
+        .await;
+        wait_for("connected again", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        while let Ok(ev) = events.try_recv() {
+            assert_ne!(ev.kind, "machine.lost", "{ev:?}");
+        }
     }
 
     /// Start an agent named `name` in a fresh workspace; returns its pane.
