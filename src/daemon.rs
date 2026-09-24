@@ -109,7 +109,7 @@ impl Daemon {
     ) -> anyhow::Result<Daemon> {
         paths.ensure()?;
         let store = Arc::new(Store::open(&paths.db_file())?);
-        let (events, _) = broadcast::channel(1024);
+        let (events, log_rx) = broadcast::channel(1024);
         let settings = MachineSettings {
             settle: config.settle_duration(),
             reconcile_every: config.reconcile_duration(),
@@ -147,6 +147,15 @@ impl Daemon {
             })
             .collect();
         let fleet = Arc::new(Fleet::new(machines, store.clone()));
+        // Subscribed in `start`, before any actor runs, so the log sees the
+        // first events too.
+        crate::events::spawn_log(
+            paths.events_file(),
+            crate::events::DEFAULT_MAX_BYTES,
+            store.clone(),
+            Some(fleet.clone() as Arc<dyn crate::events::MachineLookup>),
+            log_rx,
+        );
         let scheduler = Scheduler::new(
             paths.clone(),
             &config,
@@ -242,7 +251,6 @@ impl Daemon {
     pub async fn run_with_listener(self, listener: tokio::net::UnixListener) -> anyhow::Result<()> {
         let socket = self.socket_path();
         let daemon = Arc::new(self);
-        let mut events = daemon.events.subscribe();
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -261,11 +269,6 @@ impl Daemon {
                         let _ = w.write_all(out.as_bytes()).await;
                     });
                 }
-                ev = events.recv() => match ev {
-                    Ok(ev) => tracing::info!(kind = %ev.kind, task = ?ev.task_id, machine = ?ev.machine, job = ?ev.job, "pastor event"),
-                    Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(n, "event log lagged"),
-                    Err(_) => {}
-                },
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("shutting down; agents keep running");
                     let _ = std::fs::remove_file(&socket);
