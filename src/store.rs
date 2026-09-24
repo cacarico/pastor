@@ -160,15 +160,23 @@ impl Store {
                 // One `if v < N` block per migration. The job tables go in
                 // first whatever the version: a version-2 file from before
                 // plan 2 may lack them.
+                //
+                // All steps and the version bump share the transaction opened
+                // above, so an interrupted start leaves the old version and
+                // the old shape together. Each ALTER still checks for its
+                // column first: a file half migrated by a pastor from before
+                // the transaction has the column at the old version, and a
+                // bare ALTER would fail on it at every start.
                 tx.execute_batch(V2_TABLES)?;
                 if v < 2 {
-                    tx.execute(
-                        "ALTER TABLE tasks ADD COLUMN prompt_pending INTEGER NOT NULL DEFAULT 0",
-                        [],
+                    add_column(
+                        &tx,
+                        "prompt_pending",
+                        "prompt_pending INTEGER NOT NULL DEFAULT 0",
                     )?;
                 }
                 if v < 3 {
-                    tx.execute("ALTER TABLE tasks ADD COLUMN retry_of INTEGER", [])?;
+                    add_column(&tx, "retry_of", "retry_of INTEGER")?;
                 }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -283,29 +291,29 @@ impl Store {
     /// may still be alive on its machine (a stale task always is). Refused
     /// unless `of` is failed or stale. The `seen` row keeps pointing at `of`.
     pub fn insert_retry(&self, of: i64) -> anyhow::Result<Task> {
-        let old = self
-            .get_task(of)?
-            .with_context(|| format!("task t-{of} not found"))?;
-        if !old.state.is_retryable() {
-            anyhow::bail!(
-                "task t-{of} is {}; only failed or stale tasks can be retried",
-                old.state
-            );
-        }
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        // Check and copy in one statement, so a task closed, pruned or
+        // finished by another writer in between is not retried.
+        let n = conn.execute(
             "INSERT INTO tasks (job, item, prompt, spec, state, retry_of, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?6)",
-            params![
-                old.job,
-                serde_json::to_string(&old.item)?,
-                old.prompt,
-                serde_json::to_string(&old.spec)?,
-                of,
-                now
-            ],
+             SELECT job, item, prompt, spec, 'queued', id, ?2, ?2 FROM tasks
+             WHERE id = ?1 AND state IN ('failed', 'stale')",
+            params![of, now],
         )?;
+        if n == 0 {
+            let state: Option<String> = conn
+                .query_row("SELECT state FROM tasks WHERE id = ?1", params![of], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            match state {
+                None => anyhow::bail!("task t-{of} not found"),
+                Some(state) => anyhow::bail!(
+                    "task t-{of} is {state}; only failed or stale tasks can be retried"
+                ),
+            }
+        }
         let id = conn.last_insert_rowid();
         drop(conn);
         self.get_task(id)?.context("task vanished after insert")
@@ -523,6 +531,20 @@ impl Store {
             })
             .optional()?)
     }
+}
+
+/// `ALTER TABLE tasks ADD COLUMN <definition>` unless `tasks` already has
+/// `name`, so a migration step can run again on a file it half changed.
+fn add_column(conn: &Connection, name: &str, definition: &str) -> anyhow::Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?1",
+        params![name],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if !present {
+        conn.execute(&format!("ALTER TABLE tasks ADD COLUMN {definition}"), [])?;
+    }
+    Ok(())
 }
 
 /// A corrupt database must be surfaced, never silently reinterpreted: any column
@@ -1180,6 +1202,79 @@ mod tests {
         let s = Store::open(&path).unwrap();
         assert_eq!(s.get_task(1).unwrap().unwrap().retry_of, None);
         assert_eq!(s.meta("schema_version").unwrap().unwrap(), "3");
+    }
+
+    /// A v2 -> v3 migration that added `retry_of` but died before recording
+    /// version 3 (a pastor from before the migration ran in a transaction)
+    /// must still open: the step sees the column and skips the ALTER.
+    #[test]
+    fn a_half_applied_migration_still_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw("UPDATE meta SET value = '2' WHERE key = 'schema_version'");
+        }
+        let s = Store::open(&path).expect("column present, version 2");
+        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "3");
+        assert_eq!(s.get_task(1).unwrap().unwrap().retry_of, None);
+    }
+
+    /// A migration step that fails part way leaves the file as it was, at
+    /// its old version, instead of half changed.
+    #[test]
+    fn a_failed_migration_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            // A v1 file whose version bump fails (a trigger aborts it)
+            // after both ALTERs have run: nothing of the migration may stay.
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN prompt_pending;
+                 ALTER TABLE tasks DROP COLUMN retry_of;
+                 UPDATE meta SET value = '1' WHERE key = 'schema_version';
+                 CREATE TRIGGER no_retry_of BEFORE UPDATE ON meta
+                   WHEN NEW.value = '3' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            );
+        }
+        assert!(Store::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        let v: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, "1");
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('tasks')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            !cols
+                .iter()
+                .any(|c| c == "prompt_pending" || c == "retry_of"),
+            "rolled back: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn a_closed_task_is_not_retried_and_the_error_names_its_state() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        set_state(&s, t.id, TaskState::Closed);
+        let before = s.list_tasks(&TaskFilter::default()).unwrap().len();
+        let err = s.insert_retry(t.id).unwrap_err();
+        assert!(err.to_string().contains("is closed"), "{err}");
+        assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), before);
+        let err = s.insert_retry(99).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
     }
 
     fn set_state(s: &Store, id: i64, state: TaskState) -> Task {
