@@ -123,6 +123,14 @@ impl Manifest {
     pub fn parse_for(text: &str, pastor: &Version) -> Result<Manifest, String> {
         let file: ManifestFile = toml::from_str(text).map_err(|e| e.to_string())?;
         check_id(&file.id)?;
+        // The catalog resolves a built-in id to the built-in, so a plugin by
+        // that name could never run; say so at install, not at the first job.
+        if crate::connector::builtin(&file.id).is_some() {
+            return Err(format!(
+                "id {:?} is reserved for the built-in connector",
+                file.id
+            ));
+        }
         let version = Version::parse(&file.version).map_err(|e| format!("version: {e}"))?;
         let min_pastor_version = file
             .min_pastor_version
@@ -388,6 +396,10 @@ command = ["bash", "dm-me.sh"]
                 "major.minor.patch",
             ),
             (format!("id = \"ok\"\n{conn}"), "version"),
+            (
+                format!("id = \"clock\"\nversion = \"0.1.0\"\n{conn}"),
+                "reserved for the built-in connector",
+            ),
             (format!("{base}colour = 1\n{conn}"), "colour"),
             (
                 format!("{base}[connector]\ncommand = []\n"),

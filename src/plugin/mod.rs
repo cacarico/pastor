@@ -199,12 +199,6 @@ impl PluginCatalog {
         let mut invalid = BTreeMap::new();
         for d in discover(paths)? {
             match d {
-                Discovered::Valid(p) if connector::builtin(&p.id).is_some() => {
-                    invalid.insert(
-                        p.id.clone(),
-                        format!("id {:?} is reserved for the built-in connector", p.id),
-                    );
-                }
                 Discovered::Valid(p) => {
                     plugins.insert(p.id.clone(), Arc::from(p));
                 }
