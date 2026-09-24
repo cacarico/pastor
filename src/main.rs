@@ -6,7 +6,7 @@ use pastor::config::flock::{Flock, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
 use pastor::herdr::{ConnectorExt, Endpoint, shell_quote};
-use pastor::ipc::{IpcRequest, IpcResponse, daemon_running, request};
+use pastor::ipc::{IpcRequest, IpcResponse, RequestError, daemon_running, request};
 use pastor::machine::{ChannelState, MachineStatus};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
@@ -241,13 +241,41 @@ fn fail(code: &str, message: &str) -> ! {
 
 async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
     let socket = paths.socket_file();
-    let resp = request(&socket, &req).await.map_err(|e| {
-        anyhow::anyhow!("pastor serve is not running ({e}); start it with `pastor serve`")
-    })?;
+    let resp = match request(&socket, &req).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            let (code, message) = request_failure(&err);
+            fail(code, &message);
+        }
+    };
     if let IpcResponse::Error { code, message } = &resp {
         fail(code, message);
     }
     Ok(resp)
+}
+
+/// The stable code and message for a request that got no reply. Only a failed
+/// connect means nothing is listening; a head that took the connection and
+/// then sat on it is running but busy, and telling the user to start it would
+/// send them the wrong way.
+fn request_failure(err: &RequestError) -> (&'static str, String) {
+    match err {
+        RequestError::Connect(e) => (
+            "runtime_error",
+            format!("pastor serve is not running ({e}); start it with `pastor serve`"),
+        ),
+        RequestError::Timeout(bound) => (
+            "timeout",
+            format!(
+                "pastor serve did not answer within {}s; it may be busy dispatching, try again shortly",
+                bound.as_secs()
+            ),
+        ),
+        RequestError::Exchange(e) => (
+            "runtime_error",
+            format!("pastor serve dropped the request: {e:#}"),
+        ),
+    }
 }
 
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
@@ -985,6 +1013,21 @@ mod tests {
         assert_eq!(spec.agent_args, vec!["--model", "claude-sonnet-5"]);
         let spec = run_spec(&run_args(&["hi", "--agent-arg=--verbose"]), &config).unwrap();
         assert_eq!(spec.agent_args, vec!["--verbose"]);
+    }
+
+    #[test]
+    fn a_busy_head_is_a_timeout_not_a_missing_daemon() {
+        let (code, message) =
+            request_failure(&RequestError::Timeout(std::time::Duration::from_secs(120)));
+        assert_eq!(code, "timeout");
+        assert!(message.contains("did not answer within 120s"), "{message}");
+        assert!(message.contains("busy dispatching"), "{message}");
+        assert!(!message.contains("not running"), "{message}");
+
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let (code, message) = request_failure(&RequestError::Connect(refused));
+        assert_eq!(code, "runtime_error");
+        assert!(message.contains("not running"), "{message}");
     }
 
     #[test]

@@ -81,9 +81,29 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// shouldn't itself hang for a minute against a wedged daemon.
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Why a request to the head failed. The CLI tells the user different things
+/// for each: nothing listening means `pastor serve` is not running, while a
+/// connection that was accepted and then left unanswered means the head is up
+/// but busy (a long dispatch pass holds the accept loop).
+#[derive(Debug, thiserror::Error)]
+pub enum RequestError {
+    /// The connect itself failed: no socket, connection refused, permission
+    /// denied. Nothing answered.
+    #[error("{0}")]
+    Connect(std::io::Error),
+    /// Something accepted the connection (or kept it in the backlog) but did
+    /// not reply within the bound.
+    #[error("the head did not answer within {0:?}")]
+    Timeout(Duration),
+    /// Connected, then the exchange broke: a dropped connection, an empty or
+    /// malformed reply.
+    #[error(transparent)]
+    Exchange(anyhow::Error),
+}
+
 /// One request, one reply, then the connection closes. Bounded by
 /// `DEFAULT_REQUEST_TIMEOUT`; use `request_with_timeout` to choose a different bound.
-pub async fn request(socket: &Path, req: &IpcRequest) -> anyhow::Result<IpcResponse> {
+pub async fn request(socket: &Path, req: &IpcRequest) -> Result<IpcResponse, RequestError> {
     request_with_timeout(socket, req, DEFAULT_REQUEST_TIMEOUT).await
 }
 
@@ -95,16 +115,19 @@ pub async fn request_with_timeout(
     socket: &Path,
     req: &IpcRequest,
     timeout: Duration,
-) -> anyhow::Result<IpcResponse> {
-    match tokio::time::timeout(timeout, request_once(socket, req)).await {
+) -> Result<IpcResponse, RequestError> {
+    let exchange = async {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(RequestError::Connect)?;
+        round_trip(stream, req)
+            .await
+            .map_err(RequestError::Exchange)
+    };
+    match tokio::time::timeout(timeout, exchange).await {
         Ok(result) => result,
-        Err(_) => anyhow::bail!("pastor daemon did not respond within {timeout:?}"),
+        Err(_) => Err(RequestError::Timeout(timeout)),
     }
-}
-
-async fn request_once(socket: &Path, req: &IpcRequest) -> anyhow::Result<IpcResponse> {
-    let stream = tokio::net::UnixStream::connect(socket).await?;
-    round_trip(stream, req).await
 }
 
 async fn round_trip(
@@ -194,7 +217,21 @@ mod tests {
             "did not bound the round trip: took {:?}",
             start.elapsed()
         );
-        assert!(err.to_string().contains("did not respond"), "{err}");
+        assert!(matches!(err, RequestError::Timeout(_)), "{err:?}");
+        assert!(err.to_string().contains("did not answer"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn request_to_a_missing_socket_is_a_connect_error_not_a_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = request_with_timeout(
+            &tmp.path().join("absent.sock"),
+            &IpcRequest::Ping,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RequestError::Connect(_)), "{err:?}");
     }
 
     /// Minimal, directly-constructed `Task`. `task::tests` has its own builder but
