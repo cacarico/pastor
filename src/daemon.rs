@@ -33,6 +33,8 @@ impl Daemon {
         let settings = MachineSettings {
             settle: config.settle_duration(),
             reconcile_every: config.reconcile_duration(),
+            request_timeout: config.request_timeout_duration(),
+            agent_ready_timeout: config.agent_ready_timeout_duration(),
             ..Default::default()
         };
         let connectors: Vec<Arc<dyn Connector>> = match connectors {
