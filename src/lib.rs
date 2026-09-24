@@ -7,6 +7,7 @@ pub mod events;
 pub mod herdr;
 pub mod ipc;
 pub mod machine;
+pub mod plugin;
 pub mod schedule;
 pub mod scheduler;
 pub mod setup;
