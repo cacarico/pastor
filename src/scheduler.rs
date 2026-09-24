@@ -202,6 +202,7 @@ pub async fn run_job(
     }
     report.items = output.items.len();
     let mut in_run: HashSet<&str> = HashSet::new();
+    let mut insert_failed = false;
     for item in &output.items {
         if item.key.is_empty() {
             tracing::warn!(job = %job.name, "item without a key skipped");
@@ -245,6 +246,7 @@ pub async fn run_job(
             Err(e) => {
                 tracing::error!(job = %job.name, key = %item.key, %e, "create task");
                 report.error = Some(format!("{}: {e:#}", item.key));
+                insert_failed = true;
             }
         }
     }
@@ -260,9 +262,15 @@ pub async fn run_job(
         state.failures = 0;
         state.backoff_until = None;
         state.last_run_at = Some(now);
-        state.last_ok_at = Some(now);
-        if output.cursor.is_some() {
-            state.cursor = output.cursor;
+        // The cursor and `since` move past every item the connector returned,
+        // so they only advance when every new item became a task. A deferred
+        // or failed item must be asked for again; the seen-store drops the
+        // ones that did land.
+        if report.deferred == 0 && !insert_failed {
+            state.last_ok_at = Some(now);
+            if output.cursor.is_some() {
+                state.cursor = output.cursor;
+            }
         }
         state.last_result = Some(format!(
             "ok: {} items, {} tasks",
@@ -1045,6 +1053,68 @@ mod tests {
         assert_eq!(report.created, vec!["t-3", "t-4"]);
         assert_eq!(report.skipped_seen, 2);
         assert_eq!(report.deferred, 0);
+    }
+
+    #[tokio::test]
+    async fn a_capped_run_keeps_the_old_cursor_and_since() {
+        let store = Store::open_in_memory().unwrap();
+        let (tx, _rx) = events();
+        let t0 = Utc::now() - chrono::Duration::hours(1);
+        store
+            .save_job_state(&JobState {
+                name: "j".into(),
+                last_run_at: Some(t0),
+                last_ok_at: Some(t0),
+                cursor: Some("old".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut j = job("j");
+        j.max_tasks_per_run = 2;
+        let src = Scripted::with_keys(&["k1", "k2", "k3", "k4"]);
+        *src.cursor.lock().unwrap() = Some("new".into());
+
+        let t1 = Utc::now();
+        let report = run_job(&store, &j, &src, &tx, t1, false).await;
+        assert_eq!(report.deferred, 2);
+        let s = store.job_state("j").unwrap().unwrap();
+        assert_eq!(
+            s.cursor.as_deref(),
+            Some("old"),
+            "a cursor past deferred items would lose them"
+        );
+        assert_eq!(s.last_ok_at, Some(t0), "since must still cover them");
+        assert_eq!(s.last_run_at, Some(t1), "the schedule still advances");
+
+        // The next run is asked from the old cursor and picks the rest up;
+        // with nothing deferred, the new cursor is kept.
+        let t2 = t1 + chrono::Duration::seconds(60);
+        let report = run_job(&store, &j, &src, &tx, t2, false).await;
+        let input = src.inputs.lock().unwrap()[1].clone();
+        assert_eq!(input.cursor.as_deref(), Some("old"));
+        assert_eq!(input.since, t0);
+        assert_eq!(report.created, vec!["t-3", "t-4"]);
+        assert_eq!(report.deferred, 0);
+        let s = store.job_state("j").unwrap().unwrap();
+        assert_eq!(s.cursor.as_deref(), Some("new"));
+        assert_eq!(s.last_ok_at, Some(t2));
+    }
+
+    #[tokio::test]
+    async fn a_failed_insert_keeps_the_old_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        let (tx, _rx) = events();
+        let mut j = job("j");
+        j.prompt = "{{ unclosed".into();
+        let src = Scripted::with_keys(&["k1"]);
+        *src.cursor.lock().unwrap() = Some("new".into());
+        let t1 = Utc::now();
+        let report = run_job(&store, &j, &src, &tx, t1, false).await;
+        assert!(report.error.is_some(), "{report:?}");
+        let s = store.job_state("j").unwrap().unwrap();
+        assert!(s.cursor.is_none(), "{s:?}");
+        assert!(s.last_ok_at.is_none());
+        assert_eq!(s.last_run_at, Some(t1));
     }
 
     #[tokio::test]
