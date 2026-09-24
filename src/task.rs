@@ -39,6 +39,19 @@ impl TaskState {
                 | TaskState::Stale
         )
     }
+    /// May `pastor task retry` start this task over? Only a task that ended
+    /// without its work done, or one that ran past its timeout.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, TaskState::Failed | TaskState::Stale)
+    }
+    /// May `pastor task prune` delete rows in this state? Only finished ones;
+    /// anything still queued or working would lose its bookkeeping.
+    pub fn is_prunable(&self) -> bool {
+        matches!(
+            self,
+            TaskState::Done | TaskState::Failed | TaskState::Closed
+        )
+    }
     pub fn is_open(&self) -> bool {
         !matches!(self, TaskState::Failed | TaskState::Closed)
     }
@@ -129,6 +142,10 @@ pub struct Task {
     /// goes stale.
     #[serde(skip)]
     pub activity_seen: bool,
+    /// The task this one retries (`pastor task retry`). A retry is a new row
+    /// with a new id, because the old agent `t-<id>` may still be alive.
+    #[serde(default)]
+    pub retry_of: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -291,6 +308,7 @@ mod tests {
             last_completion_seq,
             prompt_pending: false,
             activity_seen: false,
+            retry_of: None,
             created_at: now,
             started_at: Some(now),
             finished_at: None,

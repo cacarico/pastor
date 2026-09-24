@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -8,7 +9,7 @@ use serde_json::Value;
 
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -137,6 +138,7 @@ impl Store {
                         error TEXT,
                         last_completion_seq INTEGER,
                         prompt_pending INTEGER NOT NULL DEFAULT 0,
+                        retry_of INTEGER,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -155,13 +157,18 @@ impl Store {
             // job tables, so a current file still gets them if missing.
             Some(v) if v == SCHEMA_VERSION => tx.execute_batch(V2_TABLES)?,
             Some(v) if v < SCHEMA_VERSION => {
-                // One `if v < N` block per migration.
+                // One `if v < N` block per migration. The job tables go in
+                // first whatever the version: a version-2 file from before
+                // plan 2 may lack them.
+                tx.execute_batch(V2_TABLES)?;
                 if v < 2 {
-                    tx.execute_batch(V2_TABLES)?;
                     tx.execute(
                         "ALTER TABLE tasks ADD COLUMN prompt_pending INTEGER NOT NULL DEFAULT 0",
                         [],
                     )?;
+                }
+                if v < 3 {
+                    tx.execute("ALTER TABLE tasks ADD COLUMN retry_of INTEGER", [])?;
                 }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -268,6 +275,90 @@ impl Store {
             return Ok(None);
         }
         self.get_task(id)
+    }
+
+    /// Queue a fresh task that copies job, item, prompt and spec from task
+    /// `of`, with `retry_of = of`. A new row and id rather than a reset of the
+    /// old one: the agent is named after the id, and the old agent `t-<of>`
+    /// may still be alive on its machine (a stale task always is). Refused
+    /// unless `of` is failed or stale. The `seen` row keeps pointing at `of`.
+    pub fn insert_retry(&self, of: i64) -> anyhow::Result<Task> {
+        let old = self
+            .get_task(of)?
+            .with_context(|| format!("task t-{of} not found"))?;
+        if !old.state.is_retryable() {
+            anyhow::bail!(
+                "task t-{of} is {}; only failed or stale tasks can be retried",
+                old.state
+            );
+        }
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tasks (job, item, prompt, spec, state, retry_of, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?6)",
+            params![
+                old.job,
+                serde_json::to_string(&old.item)?,
+                old.prompt,
+                serde_json::to_string(&old.spec)?,
+                of,
+                now
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        self.get_task(id)?.context("task vanished after insert")
+    }
+
+    /// Mark task `id` closed, keeping the finish time of a task that already
+    /// finished (`done -> closed` is the end of the same cycle, not a new
+    /// one). Closing a closed task returns it unchanged. Optimistic like
+    /// `update_task`: a row that moves on between the read and the write is a
+    /// `Conflict`. Only the row changes; herdr is the machine actor's job.
+    pub fn close_task(&self, id: i64) -> anyhow::Result<Task> {
+        let mut t = self
+            .get_task(id)?
+            .with_context(|| format!("task t-{id} not found"))?;
+        if t.state == TaskState::Closed {
+            return Ok(t);
+        }
+        t.state = TaskState::Closed;
+        t.finished_at = t.finished_at.or_else(|| Some(Utc::now()));
+        self.update_task(&mut t)?;
+        Ok(t)
+    }
+
+    /// Delete tasks in `states` that finished more than `older_than` ago
+    /// (`finished_at`, or `updated_at` for a row that never recorded one).
+    /// Their `seen` rows stay, so the items never trigger again. Only
+    /// finished states may be pruned. Returns how many rows went.
+    pub fn prune(&self, states: &[TaskState], older_than: Duration) -> anyhow::Result<usize> {
+        if states.is_empty() {
+            return Ok(0);
+        }
+        if let Some(s) = states.iter().find(|s| !s.is_prunable()) {
+            anyhow::bail!("{s} tasks cannot be pruned; only done, failed and closed");
+        }
+        let cutoff = Utc::now()
+            - chrono::Duration::from_std(older_than).context("--older-than is too large")?;
+        let mut args: Vec<String> = vec![cutoff.to_rfc3339()];
+        let placeholders: Vec<String> = states
+            .iter()
+            .map(|s| {
+                args.push(s.as_str().to_string());
+                format!("?{}", args.len())
+            })
+            .collect();
+        // julianday parses the stored RFC 3339 text, offset and fraction
+        // included; comparing the strings would not order them reliably.
+        let sql = format!(
+            "DELETE FROM tasks WHERE state IN ({})
+             AND julianday(COALESCE(finished_at, updated_at)) < julianday(?1)",
+            placeholders.join(",")
+        );
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(&sql, rusqlite::params_from_iter(args.iter()))?)
     }
 
     pub fn list_tasks(&self, f: &TaskFilter) -> anyhow::Result<Vec<Task>> {
@@ -479,6 +570,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         prompt_pending: row.get("prompt_pending")?,
         // Held in the machine actor's memory, never stored.
         activity_seen: false,
+        retry_of: row.get("retry_of")?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -704,6 +796,7 @@ mod tests {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "ALTER TABLE tasks DROP COLUMN prompt_pending;
+                 ALTER TABLE tasks DROP COLUMN retry_of;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';",
             )
             .unwrap();
@@ -1048,10 +1141,11 @@ mod tests {
             let s = Store::open(&path).unwrap();
             s.insert_task(new_task("run")).unwrap();
             // A genuine v1 file has neither the plan-2 tables nor the
-            // prompt_pending column; v2 gained both.
+            // prompt_pending column; v2 gained both, v3 retry_of.
             s.execute_raw(
                 "DROP TABLE seen; DROP TABLE job_state;
                  ALTER TABLE tasks DROP COLUMN prompt_pending;
+                 ALTER TABLE tasks DROP COLUMN retry_of;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version'",
             );
         }
@@ -1067,6 +1161,137 @@ mod tests {
             "the new column exists with its default"
         );
         let v: String = s.meta("schema_version").unwrap().unwrap();
-        assert_eq!(v, "2");
+        assert_eq!(v, SCHEMA_VERSION.to_string());
+    }
+
+    /// A v2 database predates `retry_of`; opening it adds the column empty.
+    #[test]
+    fn a_v2_database_gains_retry_of() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN retry_of;
+                 UPDATE meta SET value = '2' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.get_task(1).unwrap().unwrap().retry_of, None);
+        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "3");
+    }
+
+    fn set_state(s: &Store, id: i64, state: TaskState) -> Task {
+        let mut t = s.get_task(id).unwrap().unwrap();
+        t.state = state;
+        s.update_task(&mut t).unwrap();
+        t
+    }
+
+    #[test]
+    fn insert_retry_copies_the_work_and_links_back() {
+        let s = Store::open_in_memory().unwrap();
+        let item = serde_json::json!({"key": "k1", "title": "t"});
+        let old = s
+            .insert_job_task("j", &item, |_| Ok(("p".into(), spec())))
+            .unwrap();
+        for state in [
+            TaskState::Queued,
+            TaskState::Starting,
+            TaskState::Running,
+            TaskState::Blocked,
+            TaskState::Done,
+            TaskState::Closed,
+        ] {
+            set_state(&s, old.id, state);
+            let err = s.insert_retry(old.id).unwrap_err();
+            assert!(err.to_string().contains("only failed or stale"), "{err}");
+        }
+        assert!(s.insert_retry(99).is_err());
+
+        for state in [TaskState::Failed, TaskState::Stale] {
+            let mut o = set_state(&s, old.id, state);
+            o.machine = Some("pi-1".into());
+            o.pane_id = Some("w1:p1".into());
+            o.error = Some("boom".into());
+            s.update_task(&mut o).unwrap();
+            let r = s.insert_retry(old.id).unwrap();
+            assert_ne!(r.id, old.id);
+            assert_eq!(r.retry_of, Some(old.id));
+            assert_eq!(r.state, TaskState::Queued);
+            assert_eq!((r.job.as_str(), r.prompt.as_str()), ("j", "p"));
+            assert_eq!(r.item, item);
+            assert_eq!(r.spec, spec());
+            assert_eq!((r.machine, r.pane_id, r.error), (None, None, None));
+            assert_eq!(s.get_task(r.id).unwrap().unwrap().retry_of, Some(old.id));
+        }
+        assert_eq!(
+            s.get_task(old.id).unwrap().unwrap().state,
+            TaskState::Stale,
+            "the old row is left alone"
+        );
+        assert!(s.is_seen("j", "k1").unwrap());
+    }
+
+    #[test]
+    fn close_task_keeps_a_finish_time_and_is_idempotent() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        let mut done = set_state(&s, t.id, TaskState::Done);
+        let finished = Utc::now() - chrono::Duration::hours(2);
+        done.finished_at = Some(finished);
+        s.update_task(&mut done).unwrap();
+        let closed = s.close_task(t.id).unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(closed.finished_at, Some(finished));
+        let again = s.close_task(t.id).unwrap();
+        assert_eq!(again.updated_at, closed.updated_at, "nothing written");
+
+        let r = s.insert_task(new_task("run")).unwrap();
+        set_state(&s, r.id, TaskState::Running);
+        let closed = s.close_task(r.id).unwrap();
+        assert!(closed.finished_at.is_some(), "a running task finishes now");
+        assert_eq!(s.get_task(r.id).unwrap().unwrap().state, TaskState::Closed);
+        assert!(s.close_task(99).is_err());
+    }
+
+    #[test]
+    fn prune_deletes_old_finished_rows_and_keeps_seen() {
+        let s = Store::open_in_memory().unwrap();
+        let old = Utc::now() - chrono::Duration::days(4);
+        let mk = |key: &str, state: TaskState, finished: Option<DateTime<Utc>>| {
+            let item = serde_json::json!({ "key": key });
+            let t = s
+                .insert_job_task("j", &item, |_| Ok(("p".into(), spec())))
+                .unwrap();
+            let mut t = set_state(&s, t.id, state);
+            t.finished_at = finished;
+            s.update_task(&mut t).unwrap();
+            t.id
+        };
+        let old_done = mk("a", TaskState::Done, Some(old));
+        let new_done = mk("b", TaskState::Done, Some(Utc::now()));
+        let old_closed = mk("c", TaskState::Closed, Some(old));
+        let old_failed = mk("d", TaskState::Failed, Some(old));
+        let running = mk("e", TaskState::Running, None);
+        let three_days = Duration::from_secs(3 * 86400);
+
+        assert_eq!(s.prune(&[TaskState::Done], three_days).unwrap(), 1);
+        assert!(s.get_task(old_done).unwrap().is_none());
+        assert!(s.get_task(new_done).unwrap().is_some());
+        assert!(s.get_task(old_closed).unwrap().is_some());
+        assert_eq!(
+            s.prune(&[TaskState::Closed, TaskState::Failed], three_days)
+                .unwrap(),
+            2
+        );
+        assert!(s.get_task(old_failed).unwrap().is_none());
+        assert!(s.get_task(running).unwrap().is_some());
+        assert!(s.is_seen("j", "a").unwrap(), "a pruned item stays seen");
+        assert_eq!(s.prune(&[], three_days).unwrap(), 0);
+        let err = s.prune(&[TaskState::Running], three_days).unwrap_err();
+        assert!(err.to_string().contains("cannot be pruned"), "{err}");
+        assert!(s.get_task(running).unwrap().is_some());
     }
 }
