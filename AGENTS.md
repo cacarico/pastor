@@ -116,6 +116,13 @@ Plan 3 (events and plugins):
 - `pastor tick` runs jobs inline in the scheduler task so its report is
   complete; a process connector that takes a minute holds the scheduler for
   that minute. Move to spawned runs with a reply channel when plugins land.
+- Plugins (`feat/plugins`): the daemon and scheduler still use `Builtins`.
+  Wiring `PluginCatalog` in needs the scheduler to resolve per job
+  (`PluginCatalog::source_for_job`), because `RunInput` has no job name and a
+  source resolved by id alone logs under `runs/@<id>/`. `plugin
+  install|link` should end with `pastor reload` when a daemon is up. Event
+  hooks are parsed but not run yet.
+- A stream connector starts on its job's first run, not at daemon start.
 
 Plan 4 (cleanup and lifecycle):
 
@@ -170,8 +177,13 @@ Not yet assigned a plan:
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
 ~/.config/systemd/user/*.service  from `pastor setup systemd [--herdr]`
+~/.config/pastor/plugins/<id>/.env   plugin secrets and settings
+~/.local/share/pastor/plugins/<id>/  plugin checkouts or links (PASTOR_DATA_DIR)
+~/.local/state/pastor/plugins/<job>/ connector scratch per job
+~/.local/state/pastor/runs/<job>/    run logs, 256 KiB each, newest 20 kept
 skills/pastor/SKILL.md            agent skill, in the repo; `pastor --skill` prints it
 ```
 
-`PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override these; tests always set
-them to temp dirs.
+`PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR` override these;
+tests always set them to temp dirs (`Paths::new` puts the data dir under the
+state dir).

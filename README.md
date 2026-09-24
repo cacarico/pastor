@@ -231,6 +231,35 @@ A user service stops at logout unless lingering is on. Setup checks
 For `pastor.service` it also sets the config and state dirs to 0700 and the
 socket and plugin `.env` files to 0600, and says what it changed.
 
+## Plugins
+
+A plugin is a directory with a `pastor-plugin.toml` and the commands it
+names. It can provide a connector (where a job's items come from), event
+hooks, or both. The manifest format and the connector protocol are in the
+spec's Plugins section; `tests/fixtures/plugin/` has two small working
+examples.
+
+```bash
+pastor plugin install cacarico/pastor/plugins/slack   # owner/repo[/subdir], --ref, --yes
+pastor plugin link ~/src/my-plugin                    # use a working copy in place
+pastor plugin list                                    # version, connector, hooks, missing secrets
+pastor plugin run slack --job support --since 1h      # run the connector once, print its items
+pastor plugin uninstall slack                         # or unlink, for a linked one
+```
+
+Secrets and settings go in `~/.config/pastor/plugins/<id>/.env`
+(`KEY=value` lines). Every plugin command runs in the plugin's directory with
+that file in its environment plus `PASTOR_PLUGIN_ID`, `PASTOR_JOB`,
+`PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_PLUGIN_STATE_DIR` (the
+job's scratch directory). What a run writes to stderr lands in
+`~/.local/state/pastor/runs/<job>/<ts>.log`, with the values of the secrets
+the manifest declares replaced by `[redacted:NAME]`; each log is cut at
+256 KiB and the newest 20 per job are kept.
+
+A poll connector runs once per job run and must finish within its `timeout`
+(60s by default); a stream connector is started once, restarted with backoff
+when it exits, and each job run takes what it emitted since the last.
+
 ## Files
 
 ```
@@ -242,9 +271,15 @@ socket and plugin `.env` files to 0600, and says what it changed.
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
 ~/.config/systemd/user/{pastor,herdr}.service   written by `pastor setup systemd`
+~/.config/pastor/plugins/<id>/.env   a plugin's secrets and settings
+~/.local/share/pastor/plugins/<id>/  installed plugins (a symlink for a linked one)
+~/.local/state/pastor/plugins/<job>/ a job's connector scratch
+~/.local/state/pastor/runs/<job>/    captured connector output, capped and pruned
 ```
 
-`PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override the locations.
+`PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR` override the
+locations. `PASTOR_PLUGIN_GIT_BASE` (default `https://github.com`) is where
+`plugin install` clones `owner/repo` from.
 
 ```toml
 # pastor.toml, every key optional; these are the defaults
