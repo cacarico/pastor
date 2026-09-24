@@ -6,6 +6,7 @@
 //! Every `systemctl` and `loginctl` call goes through [`Runner`], so the tests
 //! script their answers instead of touching the real user manager.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -34,6 +35,10 @@ pub enum SetupCmd {
         /// Stop the unit now
         #[arg(long, conflicts_with_all = ["enable", "start", "now"])]
         stop: bool,
+        /// Skip the confirmation prompt; needed when stdin is not a terminal
+        /// (a script, a task, `ssh host pastor setup systemd`)
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -45,6 +50,7 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
         start,
         now,
         stop,
+        yes,
     } = cmd;
     let unit = if herdr { Unit::Herdr } else { Unit::Pastor };
     let action = Action::from_flags(enable, start, now, stop);
@@ -78,22 +84,40 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
         env,
         action,
     };
-    confirm(&install)?;
+    let stdin = std::io::stdin();
+    let interactive = stdin.is_terminal();
+    confirm(&install, yes, interactive, &mut stdin.lock())?;
     let report = install.run(&SystemRunner, paths)?;
     print!("{report}");
     Ok(())
 }
 
-fn confirm(install: &Install) -> anyhow::Result<()> {
+/// Show what setup will do and wait for `yes`, unless `--yes` was given.
+/// Without a terminal nobody can answer, so that fails at once instead of
+/// blocking on a read.
+fn confirm(
+    install: &Install,
+    yes: bool,
+    interactive: bool,
+    input: &mut dyn std::io::BufRead,
+) -> anyhow::Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !interactive {
+        anyhow::bail!(
+            "stdin is not a terminal, so setup cannot ask for confirmation; pass --yes to install {} with action {}",
+            install.unit.file_name(),
+            install.action
+        );
+    }
     eprintln!("About to install {}", install.unit.file_name());
     eprintln!("  unit dir: {}", install.unit_dir.display());
     eprintln!("  ExecStart: {}", install.exec.display());
     eprintln!("  action: {}", install.action);
     eprint!("Continue? Type 'yes' to proceed: ");
     let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .context("read confirmation")?;
+    input.read_line(&mut answer).context("read confirmation")?;
     if answer.trim() != "yes" {
         anyhow::bail!("aborted");
     }
@@ -557,6 +581,23 @@ mod tests {
                 action: Action::EnableNow,
             }
         }
+    }
+
+    #[test]
+    fn confirmation_reads_yes_only_from_a_terminal() {
+        let e = env();
+        let install = e.install(Unit::Pastor);
+        // --yes skips the prompt without reading anything.
+        confirm(&install, true, false, &mut "".as_bytes()).unwrap();
+        confirm(&install, true, true, &mut "".as_bytes()).unwrap();
+        // At a terminal only `yes` goes ahead.
+        confirm(&install, false, true, &mut "yes\n".as_bytes()).unwrap();
+        let err = confirm(&install, false, true, &mut "no\n".as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("aborted"), "{err}");
+        // Without a terminal it fails at once, even with `yes` waiting on
+        // stdin, and names the flag that makes it scriptable.
+        let err = confirm(&install, false, false, &mut "yes\n".as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("--yes"), "{err}");
     }
 
     #[test]
