@@ -12,6 +12,9 @@ struct Env {
     state: std::path::PathBuf,
     serve: std::process::Child,
     herdr: std::process::Child,
+    /// Every request the fake herdr has received, as a JSON array
+    /// (`FAKE_HERDR_REQUEST_LOG`).
+    herdr_log: std::path::PathBuf,
 }
 
 impl Drop for Env {
@@ -49,9 +52,11 @@ fn start_with_jobs(jobs: &[(&str, &str)]) -> Env {
     // (`remote-api-bridge`'s role), which is exactly the shape pastor talks to
     // over ssh.
     let socket = tmp.path().join("herdr.sock");
+    let herdr_log = tmp.path().join("herdr-requests.json");
     let herdr = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
         .arg("--listen")
         .arg(&socket)
+        .env("FAKE_HERDR_REQUEST_LOG", &herdr_log)
         .env("FAKE_HERDR_AUTO_DONE_MS", "300")
         // Agents spend a moment launching, as they do under a real herdr, so
         // this run exercises dispatch's readiness wait and not just the happy
@@ -84,6 +89,7 @@ fn start_with_jobs(jobs: &[(&str, &str)]) -> Env {
         state,
         serve,
         herdr,
+        herdr_log,
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -102,6 +108,27 @@ fn start_with_jobs(jobs: &[(&str, &str)]) -> Env {
 }
 
 impl Env {
+    /// The `params` of the `agent.start` the fake herdr got for `agent`.
+    fn agent_start_params(&self, agent: &str) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&self.herdr_log)
+                && let Ok(reqs) = serde_json::from_str::<Vec<serde_json::Value>>(&text)
+                && let Some(r) = reqs
+                    .iter()
+                    .find(|r| r["method"] == "agent.start" && r["params"]["name"] == agent)
+            {
+                return r["params"].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no agent.start for {agent} in {}",
+                self.herdr_log.display()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn cmd(&self, args: &[&str]) -> std::process::Output {
         pastor()
             .args(args)
@@ -146,6 +173,62 @@ fn run_list_show_read_end_to_end() {
     let out = env.cmd(&["task", "show", "t-9"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("task_not_found"));
+}
+
+/// `--agent-arg` reaches herdr's `agent.start` as `args`, in order, and shows
+/// in `task show` and `list --json`; without it, `[defaults] agent_args` does.
+#[test]
+fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
+    let env = start();
+    let out = env.cmd(&[
+        "run",
+        "hi",
+        "--agent-arg=--model",
+        "--agent-arg",
+        "claude-opus-5-5",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let want = serde_json::json!(["--model", "claude-opus-5-5"]);
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["spec"]["agent_args"], want);
+    let start = env.agent_start_params("t-1");
+    assert_eq!(start["args"], want, "{start}");
+    assert_eq!(start["kind"], "claude");
+
+    let out = env.cmd(&["task", "show", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("agent args: --model claude-opus-5-5"),
+        "{text}"
+    );
+    let out = env.cmd(&["list", "--json"]);
+    let tasks: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(tasks[0]["spec"]["agent_args"], want, "{tasks}");
+
+    // `pastor run` reads pastor.toml itself, so the daemon need not restart.
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [defaults]\nagent_args = [\"--model\", \"claude-sonnet-5\"]\n",
+    )
+    .unwrap();
+    let out = env.cmd(&["run", "hi again", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let start = env.agent_start_params("t-2");
+    assert_eq!(
+        start["args"],
+        serde_json::json!(["--model", "claude-sonnet-5"]),
+        "{start}"
+    );
 }
 
 #[test]
