@@ -56,6 +56,8 @@ enum Command {
     },
     /// Print a shell completion script (fish, bash, zsh, ...) to stdout
     Completions { shell: clap_complete::Shell },
+    /// Show the events log (task, job and machine events)
+    Events(pastor::events::EventsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -214,6 +216,7 @@ fn main() {
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
                 Ok(())
             }
+            Command::Events(args) => pastor::events::cli(&paths, args).await,
         }
     });
     if let Err(err) = result {
