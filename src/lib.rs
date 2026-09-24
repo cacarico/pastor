@@ -7,6 +7,7 @@ pub mod herdr;
 pub mod ipc;
 pub mod machine;
 pub mod schedule;
+pub mod scheduler;
 pub mod store;
 pub mod task;
 pub mod template;
