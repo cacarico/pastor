@@ -183,7 +183,19 @@ async fn prompt_when_ready(
                 task.spec.agent
             )));
         };
-        if agent.agent_status != AgentStatus::Unknown {
+        // herdr 0.9.1 reports readiness with two flags, the same ones its own
+        // `agent start --wait` reads: `launch_pending` while the process is
+        // coming up, `interactive_ready` once it accepts input. A listed agent
+        // with neither, and not working or blocked, is a pane whose process
+        // already exited: prompting it answers `agent_not_ready` forever.
+        let can_prompt = agent.interactive_ready
+            || matches!(
+                agent.agent_status,
+                AgentStatus::Working | AgentStatus::Blocked
+            );
+        if agent.launch_pending {
+            // still launching: fall through to the wait below
+        } else if can_prompt {
             match conn.agent_prompt(name, &task.prompt).await {
                 Ok(_) => return Ok(DispatchOutcome::Running),
                 // The agent is up and waiting for a human, not for us. herdr
@@ -191,11 +203,15 @@ async fn prompt_when_ready(
                 Err(err) if err.code() == Some("agent_blocked") => {
                     return Ok(DispatchOutcome::Blocked);
                 }
-                // Still launching: herdr refuses prompts until the agent owns the
-                // pane. Keep waiting inside the same bound.
+                // Raced the flag: herdr still refuses. Keep waiting inside the bound.
                 Err(err) if err.code() == Some("agent_not_ready") => {}
                 Err(err) => return Err(err.into()),
             }
+        } else {
+            return Err(DispatchError::Task(format!(
+                "agent {name} exited before becoming interactive (is `{}` installed on {machine}?)",
+                task.spec.agent
+            )));
         }
         let now = Instant::now();
         if now >= deadline {
@@ -516,6 +532,37 @@ mod tests {
             "created workspace is recorded even on failure"
         );
         assert!(!fake.requests().iter().any(|r| r.method == "agent.prompt"));
+    }
+
+    /// The pane is still listed but the agent process died before becoming
+    /// interactive: neither launch flag set, status idle. herdr's own
+    /// `agent start --wait` fails here; so must dispatch, at once, instead of
+    /// prompting a corpse until the bound elapses.
+    #[tokio::test]
+    async fn an_agent_that_exits_but_stays_listed_fails_immediately() {
+        let fake = FakeHerdr::new();
+        fake.exit_agents_listed(true);
+        let mut t = task(spec());
+        t.machine = Some("pi-1".into());
+        let started = Instant::now();
+        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} for an agent that had already exited",
+            started.elapsed()
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("exited before becoming interactive"),
+            "{message}"
+        );
+        assert!(message.contains("pi-1"), "{message}");
+        assert!(!err.is_transport());
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(
+            !fake.requests().iter().any(|r| r.method == "agent.prompt"),
+            "a dead agent must not be prompted"
+        );
     }
 
     #[tokio::test]
