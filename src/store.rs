@@ -14,6 +14,14 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// `update_task` found the row changed since this copy was read. The caller holds
+/// stale data; reload and decide again rather than overwrite.
+#[derive(Debug, thiserror::Error)]
+#[error("task t-{id} changed underneath this update; reload it and apply again")]
+pub struct Conflict {
+    pub id: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewTask {
     pub job: String,
@@ -135,13 +143,21 @@ impl Store {
             .optional()?)
     }
 
-    pub fn update_task(&self, t: &Task) -> anyhow::Result<()> {
+    /// Optimistic: the write lands only if the row still carries `t.updated_at`.
+    /// On success `t.updated_at` is advanced to the value written, so the same
+    /// copy can be updated again. A row that moved on is a `Conflict`; a row
+    /// that is gone is a plain error.
+    pub fn update_task(&self, t: &mut Task) -> anyhow::Result<()> {
+        // Strictly later than the value being replaced, so two writes within one
+        // clock tick still produce distinct stamps and the next check can tell
+        // them apart.
+        let now = Utc::now().max(t.updated_at + chrono::Duration::nanoseconds(1));
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE tasks SET machine = ?2, workspace_id = ?3, pane_id = ?4, agent_name = ?5, state = ?6, error = ?7,
                 last_completion_seq = ?8, started_at = ?9, finished_at = ?10, updated_at = ?11, prompt = ?12, spec = ?13,
                 prompt_pending = ?14
-             WHERE id = ?1",
+             WHERE id = ?1 AND updated_at = ?15",
             params![
                 t.id,
                 t.machine,
@@ -153,14 +169,47 @@ impl Store {
                 t.last_completion_seq.map(|v| v as i64),
                 t.started_at.map(|d| d.to_rfc3339()),
                 t.finished_at.map(|d| d.to_rfc3339()),
-                Utc::now().to_rfc3339(),
+                now.to_rfc3339(),
                 t.prompt,
                 serde_json::to_string(&t.spec)?,
                 t.prompt_pending,
+                t.updated_at.to_rfc3339(),
             ],
         )?;
-        anyhow::ensure!(n == 1, "task {} not found", t.id);
-        Ok(())
+        if n == 1 {
+            t.updated_at = now;
+            return Ok(());
+        }
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+            params![t.id],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        if exists {
+            Err(Conflict { id: t.id }.into())
+        } else {
+            anyhow::bail!("task {} not found", t.id)
+        }
+    }
+
+    /// The one transition dispatch is allowed to make on its own, done in SQL so
+    /// concurrent dispatch passes cannot both take a task: `queued` -> `starting`
+    /// on `machine`, with the agent name dispatch will use. `None` means the task
+    /// was not queued any more (or never existed). This is `Observed::DispatchStarting`
+    /// as a conditional UPDATE; `task::next_state` keeps the rule readable.
+    pub fn claim_task(&self, id: i64, machine: &str) -> anyhow::Result<Option<Task>> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE tasks SET state = 'starting', machine = ?2, agent_name = ?3, error = NULL, updated_at = ?4
+             WHERE id = ?1 AND state = 'queued'",
+            params![id, machine, Task::agent_name_for(id), now],
+        )?;
+        drop(conn);
+        if n == 0 {
+            return Ok(None);
+        }
+        self.get_task(id)
     }
 
     pub fn list_tasks(&self, f: &TaskFilter) -> anyhow::Result<Vec<Task>> {
@@ -324,7 +373,7 @@ mod tests {
         got.agent_name = Some("t-1".into());
         got.last_completion_seq = Some(4);
         got.started_at = Some(Utc::now());
-        s.update_task(&got).unwrap();
+        s.update_task(&mut got).unwrap();
         let again = s.get_task(1).unwrap().unwrap();
         assert_eq!(again.state, TaskState::Running);
         assert_eq!(again.machine.as_deref(), Some("pi-3"));
@@ -345,8 +394,8 @@ mod tests {
         b.state = TaskState::Closed;
         b.machine = Some("pi-3".into());
         b.pane_id = Some("w2:p1".into());
-        s.update_task(&a).unwrap();
-        s.update_task(&b).unwrap();
+        s.update_task(&mut a).unwrap();
+        s.update_task(&mut b).unwrap();
         let newest_first = s.list_tasks(&TaskFilter::default()).unwrap();
         assert_eq!(
             newest_first.iter().map(|t| t.id).collect::<Vec<_>>(),
@@ -402,9 +451,9 @@ mod tests {
         closed.machine = Some("pi-3".into());
         failed.state = TaskState::Failed;
         failed.machine = Some("pi-3".into());
-        s.update_task(&open).unwrap();
-        s.update_task(&closed).unwrap();
-        s.update_task(&failed).unwrap();
+        s.update_task(&mut open).unwrap();
+        s.update_task(&mut closed).unwrap();
+        s.update_task(&mut failed).unwrap();
 
         let on_machine = s.tasks_on_machine("pi-3").unwrap();
         assert_eq!(
@@ -476,7 +525,7 @@ mod tests {
         let mut t = s.get_task(1).unwrap().unwrap();
         assert!(!t.prompt_pending);
         t.prompt_pending = true;
-        s.update_task(&t).unwrap();
+        s.update_task(&mut t).unwrap();
         assert!(s.get_task(1).unwrap().unwrap().prompt_pending);
     }
 
@@ -519,5 +568,65 @@ mod tests {
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn update_task_refuses_a_stale_copy() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        let mut a = s.get_task(t.id).unwrap().unwrap();
+        let mut b = s.get_task(t.id).unwrap().unwrap();
+        a.state = TaskState::Running;
+        s.update_task(&mut a).unwrap();
+        assert!(
+            a.updated_at > b.updated_at,
+            "a successful update must advance the in-memory updated_at"
+        );
+        b.state = TaskState::Closed;
+        let err = s.update_task(&mut b).unwrap_err();
+        assert!(err.downcast_ref::<Conflict>().is_some(), "{err}");
+        assert_eq!(
+            s.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Running,
+            "the stale write must not land"
+        );
+        // The fresh copy keeps working, and a second write on it too.
+        a.state = TaskState::Done;
+        s.update_task(&mut a).unwrap();
+        a.state = TaskState::Closed;
+        s.update_task(&mut a).unwrap();
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().state, TaskState::Closed);
+    }
+
+    #[test]
+    fn update_task_still_reports_a_missing_row() {
+        let s = Store::open_in_memory().unwrap();
+        let mut t = s.insert_task(new_task("run")).unwrap();
+        t.id = 99;
+        let err = s.update_task(&mut t).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        assert!(err.downcast_ref::<Conflict>().is_none());
+    }
+
+    #[test]
+    fn claim_task_is_exclusive() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        let claimed = s
+            .claim_task(t.id, "pi-3")
+            .unwrap()
+            .expect("first claim wins");
+        assert_eq!(claimed.state, TaskState::Starting);
+        assert_eq!(claimed.machine.as_deref(), Some("pi-3"));
+        assert_eq!(claimed.agent_name.as_deref(), Some("t-1"));
+        assert!(
+            s.claim_task(t.id, "pi-1").unwrap().is_none(),
+            "a second claim must find nothing to claim"
+        );
+        assert!(s.claim_task(99, "pi-1").unwrap().is_none());
+        // A claimed copy is fresh: updating it must not conflict.
+        let mut c = claimed;
+        c.state = TaskState::Running;
+        s.update_task(&mut c).unwrap();
     }
 }
