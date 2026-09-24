@@ -257,7 +257,9 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 /// The stable code and message for a request that got no reply. Only a failed
 /// connect means nothing is listening; a head that took the connection and
 /// then sat on it is running but busy, and telling the user to start it would
-/// send them the wrong way.
+/// send them the wrong way. The head handles each request in a detached task,
+/// so a timed-out `run`, `tick` or `job run` may still land; sending it again
+/// blindly can queue a duplicate.
 fn request_failure(err: &RequestError) -> (&'static str, String) {
     match err {
         RequestError::Connect(e) => (
@@ -267,7 +269,7 @@ fn request_failure(err: &RequestError) -> (&'static str, String) {
         RequestError::Timeout(bound) => (
             "timeout",
             format!(
-                "pastor serve did not answer within {}s; it may be busy dispatching, try again shortly",
+                "pastor serve did not answer within {}s; the request may still complete, so check `pastor task list` (or `pastor job list` for a tick or job run) before sending it again",
                 bound.as_secs()
             ),
         ),
@@ -1024,7 +1026,11 @@ mod tests {
             request_failure(&RequestError::Timeout(std::time::Duration::from_secs(120)));
         assert_eq!(code, "timeout");
         assert!(message.contains("did not answer within 120s"), "{message}");
-        assert!(message.contains("busy dispatching"), "{message}");
+        assert!(message.contains("may still complete"), "{message}");
+        assert!(message.contains("pastor task list"), "{message}");
+        assert!(message.contains("pastor job list"), "{message}");
+        assert!(!message.contains("retry"), "{message}");
+        assert!(!message.contains("try again"), "{message}");
         assert!(!message.contains("not running"), "{message}");
 
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
