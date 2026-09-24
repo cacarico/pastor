@@ -76,6 +76,46 @@ matches herdr's entry by label only; when none matches but the same host is
 saved under another label, it prints that entry's remove command rather than
 guessing.
 
+## Events
+
+`pastor serve` appends every task, job and machine event to
+`~/.local/state/pastor/events.jsonl`, one JSON record per line. When the next
+line would take the file past 10 MiB it is moved to `events.jsonl.1`
+(replacing the previous one) and a new file started, so the log keeps at most
+two generations. `pastor events` prints both, oldest first; `--task t-3` keeps
+one task's records, `--json` prints the records as stored, and `--follow`
+keeps printing as new ones are written. It reads the file, not the daemon, so
+it works with `pastor serve` down.
+
+A record, which is also what plugin event hooks will get on stdin:
+
+```json
+{
+  "at": "2026-09-24T10:15:02.123Z",
+  "type": "task.done",
+  "task": {"id": 3, "job": "triage", "item": {"key": "...", "title": "..."},
+           "prompt": "...", "spec": {"agent": "claude", "...": "..."},
+           "machine": "pi-3", "state": "done", "error": null, "...": "..."},
+  "job": "triage",
+  "machine": null
+}
+```
+
+- `at`: when the daemon received the event, RFC 3339 UTC.
+- `type`: `task.queued|started|running|blocked|done|stale|failed|closed`,
+  `job.failed`, `machine.connected`, `machine.lost`.
+- `task`: the full task row (the same object as `pastor task show --json`) at
+  that moment, on `task.*` events; `null` otherwise or if the row is gone.
+- `job`: the job name. For a task event it is the task's `job` (`run` for a
+  one-off `pastor run` task); for `job.failed`, the job that failed.
+- `machine`: on `machine.*` events, the machine's status as `pastor machine
+  list --json` shows it (`name`, `endpoint`, `channel`, `herdr_version`,
+  `protocol`, `error`, `live`, `max_agents`, `tags`); `null` on other events.
+  A task's machine is `task.machine`.
+
+Fields may be added; none will be renamed or removed. Unreadable lines (a
+torn write, a hand edit) are skipped.
+
 Runtime errors print JSON on stderr with a stable `code` and exit 1; a
 malformed command line gets clap's plain usage text and exit 2.
 
@@ -110,6 +150,7 @@ pastor list
 pastor task read t-1                 # recent pane output, without attaching
 pastor attach t-1                    # lands in the agent's pane; ctrl+b q detaches
 pastor open pi-3                     # the full herdr UI on that machine
+pastor events --follow               # task, job and machine events as they happen
 ```
 
 `--repo` and a job's `repo` are paths on the machine that runs the agent. A
@@ -138,6 +179,7 @@ pastor serve
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.local/state/pastor/pastor.db   tasks, seen keys, job state
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
 ```
 
