@@ -29,9 +29,11 @@ struct Cli {
 enum Command {
     /// Run the daemon: scheduler, machine channels, dispatch
     Serve,
-    /// Create a one-off task and dispatch it
+    /// Old spelling of `task run`, kept for scripts
+    #[command(hide = true)]
     Run(RunArgs),
-    /// List tasks across the flock
+    /// Old spelling of `task list`, kept for scripts
+    #[command(hide = true)]
     List(ListArgs),
     /// Manage tasks
     Task {
@@ -45,10 +47,14 @@ enum Command {
     },
     /// Open the full herdr UI on a machine
     Open { machine: String },
-    /// Attach to a task's agent terminal (ctrl+b q detaches)
+    /// Old spelling of `task attach`, kept for scripts
+    #[command(hide = true)]
     Attach { task: String },
     /// Run one scheduler pass now and report what it did
     Tick(TickArgs),
+    /// Old spelling of `job reload`, kept for scripts
+    #[command(hide = true)]
+    Reload,
     /// Manage jobs (files in ~/.config/pastor/jobs/)
     Job {
         #[command(subcommand)]
@@ -217,16 +223,29 @@ fn main() {
     let result = rt.block_on(async {
         match cli.command {
             Command::Serve => pastor::daemon::serve(paths).await,
-            Command::Run(args) => run(&paths, args).await,
-            Command::List(args) => list(&paths, args).await,
+            Command::Run(args) => {
+                moved("run", "task run");
+                run(&paths, args).await
+            }
+            Command::List(args) => {
+                moved("list", "task list");
+                list(&paths, args).await
+            }
             Command::Task { cmd } => task(&paths, cmd).await,
             Command::Machine { cmd } => machine(&paths, cmd).await,
             Command::Open { machine } => open(&paths, &machine).await,
-            Command::Attach { task } => attach(&paths, &task).await,
+            Command::Attach { task } => {
+                moved("attach", "task attach");
+                attach(&paths, &task).await
+            }
             Command::Tick(args) => tick(&paths, args).await,
+            Command::Reload => {
+                moved("reload", "job reload");
+                reload(&paths).await
+            }
             Command::Job { cmd } => job(&paths, cmd).await,
             Command::Completions { shell } => {
-                let mut cmd = <Cli as clap::CommandFactory>::command();
+                let mut cmd = completion_tree();
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
                 Ok(())
             }
@@ -237,6 +256,22 @@ fn main() {
     if let Err(err) = result {
         fail("runtime_error", &format!("{err:#}"));
     }
+}
+
+/// The command tree `pastor completions` describes. clap_complete offers
+/// hidden subcommands too, so the old top-level spellings are dropped here and
+/// the scripts name only `task run`, `task list`, `task attach`, `job reload`.
+fn completion_tree() -> clap::Command {
+    let full = <Cli as clap::CommandFactory>::command();
+    clap::Command::new("pastor")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about(full.get_about().cloned().unwrap_or_default())
+        .subcommands(full.get_subcommands().filter(|c| !c.is_hide_set()).cloned())
+}
+
+/// The hint a hidden old spelling prints before doing exactly what `new` does.
+fn moved(old: &str, new: &str) {
+    eprintln!("pastor {old} is now pastor {new}");
 }
 
 fn fail(code: &str, message: &str) -> ! {

@@ -202,6 +202,103 @@ fn run_list_show_read_end_to_end() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("task_not_found"));
 }
 
+/// The old top-level `run`, `list`, `attach` and `reload` still work, hidden
+/// from `--help` and the completions, with a one-line hint on stderr and the
+/// same stdout and exit status as the nested command.
+#[test]
+fn old_top_level_commands_are_hidden_aliases_with_a_hint() {
+    let env = start();
+    let out = env.cmd(&["run", "hi", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pastor run is now pastor task run"),
+        "{stderr}"
+    );
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["agent_name"], "t-1");
+
+    for (old, new, hint) in [
+        (
+            vec!["list", "--all", "--json"],
+            vec!["task", "list", "--all", "--json"],
+            "pastor list is now pastor task list",
+        ),
+        (
+            vec!["attach", "t-9"],
+            vec!["task", "attach", "t-9"],
+            "pastor attach is now pastor task attach",
+        ),
+        (
+            vec!["reload"],
+            vec!["job", "reload"],
+            "pastor reload is now pastor job reload",
+        ),
+    ] {
+        let a = env.cmd(&old);
+        let b = env.cmd(&new);
+        let stderr = String::from_utf8_lossy(&a.stderr);
+        assert!(stderr.contains(hint), "{old:?}: {stderr}");
+        assert_eq!(a.status.code(), b.status.code(), "{old:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&a.stdout),
+            String::from_utf8_lossy(&b.stdout),
+            "{old:?}"
+        );
+        assert_eq!(
+            stderr.replace(&format!("{hint}\n"), ""),
+            String::from_utf8_lossy(&b.stderr),
+            "{old:?}"
+        );
+    }
+
+    let help = String::from_utf8_lossy(&env.cmd(&["--help"]).stdout).into_owned();
+    for old in ["run", "list", "attach", "reload"] {
+        assert!(
+            !help.lines().any(|l| l.starts_with(&format!("  {old} "))),
+            "{old} should be hidden:\n{help}"
+        );
+    }
+}
+
+/// clap_complete emits hidden subcommands too, so `pastor completions` has to
+/// leave the old spellings out itself; the nested ones stay.
+#[test]
+fn completions_offer_only_the_nested_spellings() {
+    let gen_ = |shell: &str| {
+        let out = pastor().args(["completions", shell]).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let fish = gen_("fish");
+    let bash = gen_("bash");
+    let top = bash
+        .lines()
+        .find(|l| l.trim_start().starts_with("opts=\"-h -V --help --version"))
+        .unwrap_or_else(|| panic!("no top-level opts line:\n{bash}"));
+    for old in ["run", "list", "attach", "reload"] {
+        assert!(
+            !fish.contains(&format!("__fish_pastor_needs_command\" -f -a \"{old}\"")),
+            "fish offers {old}"
+        );
+        assert!(
+            !top.split_whitespace().any(|w| w.trim_matches('"') == old),
+            "bash offers {old}: {top}"
+        );
+        assert!(
+            !bash.contains(&format!("pastor,{old})")),
+            "bash knows {old}"
+        );
+    }
+    assert!(fish.contains("-f -a \"run\" -d 'Create a one-off task and dispatch it'"));
+    assert!(bash.contains("pastor__subcmd__task,run)"));
+    assert!(bash.contains("pastor__subcmd__job,reload)"));
+}
+
 /// `--agent-arg` reaches herdr's `agent.start` as `args`, in order, and shows
 /// in `task show` and `task list --json`; without it, `[defaults] agent_args` does.
 #[test]
