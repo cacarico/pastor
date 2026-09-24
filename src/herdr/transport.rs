@@ -45,19 +45,16 @@ impl Endpoint {
         if let Some(argv) = &m.command {
             Endpoint::Command { argv: argv.clone() }
         } else if let Some(target) = &m.ssh {
-            let control_path = paths.ssh_control_path(&m.name);
-            let control_path = if control_path_fits(&control_path) {
-                Some(control_path)
-            } else {
+            let control_path = fitting_control_path(paths, &m.name);
+            if control_path.is_none() {
                 // Decided once, when the endpoint is built, so this is said once
                 // per machine instead of once per request.
                 tracing::warn!(
                     machine = %m.name,
-                    path = %control_path.display(),
-                    "ssh ControlPath is too long for a unix socket; connecting without multiplexing (every request pays a full ssh handshake). Set PASTOR_STATE_DIR to something shorter."
+                    path = %paths.ssh_control_path("").display(),
+                    "ssh ControlPath is too long for a unix socket even without the machine name; connecting without multiplexing (every request pays a full ssh handshake). Set PASTOR_STATE_DIR to something shorter."
                 );
-                None
-            };
+            }
             Endpoint::Ssh {
                 target: target.clone(),
                 session: m.session.clone(),
@@ -141,6 +138,20 @@ fn expanded_len(path: &Path) -> usize {
         }
     }
     len
+}
+
+/// The ControlPath for `machine`, with the name shortened until ssh's staged
+/// socket name fits in `sun_path`. The name is only there to make the socket
+/// recognisable in `ls`; `%C` (a hash of the destination) is what keeps
+/// machines apart, so cutting the name loses nothing. `None` only when even a
+/// bare `-%C` does not fit, which takes an unusually deep state dir.
+fn fitting_control_path(paths: &Paths, machine: &str) -> Option<PathBuf> {
+    let chars = machine.chars().count();
+    (0..=chars).rev().find_map(|keep| {
+        let short: String = machine.chars().take(keep).collect();
+        let path = paths.ssh_control_path(&short);
+        control_path_fits(&path).then_some(path)
+    })
 }
 
 /// Would ssh's staged socket name fit in `sun_path`? A ControlPath that does not
@@ -277,6 +288,76 @@ async fn spawn(argv: &[String]) -> Result<Connection, ConnectError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ssh_machine(name: &str) -> MachineConfig {
+        MachineConfig {
+            name: name.into(),
+            local: false,
+            ssh: Some("fleet@host".into()),
+            command: None,
+            session: "default".into(),
+            max_agents: 2,
+            tags: vec![],
+        }
+    }
+
+    /// The machine name in the ControlPath is only there to be recognisable;
+    /// `%C` is the identity. A name that would push the socket name past
+    /// `sun_path` must be shortened, not cost every request a full handshake.
+    /// `pastor-sauron` under the default state dir is exactly that case.
+    #[test]
+    fn long_machine_names_are_shortened_to_keep_multiplexing() {
+        let paths = Paths::new(
+            "/home/cacarico/.config/pastor",
+            "/home/cacarico/.local/state/pastor",
+        );
+        let Endpoint::Ssh { control_path, .. } =
+            Endpoint::from_machine(&ssh_machine("pastor-sauron"), &paths)
+        else {
+            panic!("ssh machine")
+        };
+        let path = control_path.expect("a shortened path must still multiplex");
+        assert!(control_path_fits(&path), "{}", path.display());
+        let text = path.to_string_lossy();
+        assert!(
+            text.starts_with("/home/cacarico/.local/state/pastor/ssh/pastor"),
+            "{text}"
+        );
+        assert!(text.ends_with("-%C"), "{text}");
+        assert!(
+            text.len()
+                < paths
+                    .ssh_control_path("pastor-sauron")
+                    .to_string_lossy()
+                    .len()
+        );
+
+        // A short name is untouched.
+        let Endpoint::Ssh { control_path, .. } =
+            Endpoint::from_machine(&ssh_machine("cberry"), &paths)
+        else {
+            panic!()
+        };
+        assert_eq!(control_path, Some(paths.ssh_control_path("cberry")));
+
+        // Two machines whose names only differ past the cut share nothing but
+        // the directory: `%C` hashes the target, so distinct hosts stay apart.
+        let Endpoint::Ssh {
+            control_path: a, ..
+        } = Endpoint::from_machine(&ssh_machine("pastor-sauron-one"), &paths)
+        else {
+            panic!()
+        };
+        assert!(a.is_some());
+
+        // Only when even `-%C` alone will not fit does multiplexing go away.
+        let deep = Paths::new("/c", format!("/{}", "x".repeat(70)));
+        let Endpoint::Ssh { control_path, .. } = Endpoint::from_machine(&ssh_machine("m"), &deep)
+        else {
+            panic!()
+        };
+        assert_eq!(control_path, None);
+    }
     use crate::herdr::ConnectorExt;
 
     #[test]
