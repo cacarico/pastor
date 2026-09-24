@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -247,6 +249,22 @@ enum CommandOutcome {
     Reconnect,
 }
 
+/// A pending `events.subscribe` call, boxed so `poll_until_subscribed` can hold
+/// it across `select!` iterations without keeping `&self` (or `&mut self`)
+/// borrowed for as long as the call takes to answer.
+type SubscribeFuture = Pin<Box<dyn Future<Output = anyhow::Result<EventStream>> + Send>>;
+
+/// How `poll_until_subscribed` ended: a fresh subscription, a request that
+/// failed below the API while polling (carries the reason, same as
+/// `connect_failed`'s message), or the command channel closing — the handle
+/// was dropped, so nothing is asking about this machine any more and the actor
+/// should stop instead of spinning trying to reconnect it.
+enum PollExit {
+    Subscribed(Box<EventStream>),
+    Reconnect(String),
+    Shutdown,
+}
+
 impl Actor {
     async fn run(mut self) {
         let mut backoff = self.settings.initial_backoff;
@@ -311,15 +329,13 @@ impl Actor {
                     self.set_channel(ChannelState::Polling, Some(format!("events: {err}")));
                     self.announce_connected();
                     self.refresh_live();
-                    match self.poll_until_subscribed(&mut backoff).await {
-                        Some(s) => s,
-                        None => {
+                    match self.poll_until_subscribed().await {
+                        PollExit::Subscribed(s) => *s,
+                        PollExit::Shutdown => return,
+                        PollExit::Reconnect(reason) => {
                             // A request failed while polling: the machine is gone
                             // after all. Fall through to the reconnect path.
-                            self.set_channel(
-                                ChannelState::Reconnecting,
-                                Some("connection lost".into()),
-                            );
+                            self.set_channel(ChannelState::Reconnecting, Some(reason));
                             self.announce_lost();
                             self.drain_commands_while_down(backoff).await;
                             backoff = (backoff * 2).min(self.settings.max_backoff);
@@ -477,14 +493,14 @@ impl Actor {
         });
     }
 
-    /// The one connection pastor keeps open: herdr dedicates it to events and
-    /// never serves a request on it.
-    ///
-    /// The subscribe is bounded here rather than at each call site, so a herdr
-    /// that accepts the connection and never acknowledges the subscription is
-    /// treated like any other wedged request: both callers turn the error into a
-    /// reconnect with backoff.
-    async fn open_events(&self) -> Result<EventStream, anyhow::Error> {
+    /// Builds the `events.subscribe` call (bounded by `request_timeout`) as a
+    /// free-standing future that owns everything it needs, rather than
+    /// borrowing `self`: `poll_until_subscribed` races it against commands and
+    /// poll ticks in a `select!`, so it must be possible to hold one in flight
+    /// across many loop iterations without tying up the actor for as long as a
+    /// wedged herdr leaves it hanging. Building `subs` (a store read) is kept
+    /// synchronous and done eagerly, before the future is returned.
+    fn subscribe_future(&self) -> anyhow::Result<SubscribeFuture> {
         let mut subs = vec![
             subscription_lifecycle("pane.closed"),
             subscription_lifecycle("pane.exited"),
@@ -494,52 +510,94 @@ impl Actor {
                 subs.push(subscription_agent_status(p));
             }
         }
+        let connector = self.connector.clone();
         let timeout = self.settings.request_timeout;
-        Ok(
-            tokio::time::timeout(timeout, self.connector.subscribe(subs))
+        Ok(Box::pin(async move {
+            Ok(tokio::time::timeout(timeout, connector.subscribe(subs))
                 .await
-                .map_err(|_| TimedOut("events.subscribe", timeout))??,
-        )
+                .map_err(|_| TimedOut("events.subscribe", timeout))??)
+        }))
+    }
+
+    /// The one connection pastor keeps open: herdr dedicates it to events and
+    /// never serves a request on it.
+    ///
+    /// The subscribe is bounded here rather than at each call site, so a herdr
+    /// that accepts the connection and never acknowledges the subscription is
+    /// treated like any other wedged request: both callers turn the error into a
+    /// reconnect with backoff.
+    async fn open_events(&self) -> Result<EventStream, anyhow::Error> {
+        self.subscribe_future()?.await
     }
 
     /// The `Polling` loop: serve commands, reconcile every `poll_every`, retry
-    /// the subscription with backoff. `Some(stream)` once a subscribe succeeds;
-    /// `None` when a request failed below the API, which means a full reconnect.
-    async fn poll_until_subscribed(&mut self, backoff: &mut Duration) -> Option<EventStream> {
+    /// the subscription on its own backoff (independent of `run`'s reconnect
+    /// `backoff`; see the comment where `PollExit::Reconnect` is handled).
+    ///
+    /// The subscribe attempt itself is never awaited inline: it is started as
+    /// a free-standing future (`subscribe_future`) and raced in the `select!`
+    /// below alongside commands and poll ticks. Polling claims to accept
+    /// dispatch (`ChannelState::Polling.accepts_dispatch()`), so a herdr that
+    /// accepts `events.subscribe` and then never acknowledges it must not
+    /// block a dispatch reply for up to `request_timeout` — that would stall
+    /// every machine behind a fleet-wide dispatch lock, not just this one.
+    async fn poll_until_subscribed(&mut self) -> PollExit {
         let mut poll = tokio::time::interval(self.settings.poll_every);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         poll.tick().await; // fires immediately; we reconciled a moment ago
-        let retry = tokio::time::sleep(*backoff);
+
+        // The subscribe retry delay is local to this loop: it must not leak
+        // into `run`'s `backoff`, which times the reconnect path and is left
+        // exactly as `run` already manages it once polling ends.
+        let mut retry_delay = self.settings.initial_backoff;
+        let retry = tokio::time::sleep(retry_delay);
         tokio::pin!(retry);
+        let mut subscribing: Option<SubscribeFuture> = None;
+
         loop {
             tokio::select! {
                 cmd = self.rx.recv() => {
-                    let cmd = cmd?;
+                    let Some(cmd) = cmd else { return PollExit::Shutdown };
                     match self.handle_command(cmd).await {
                         // A resubscribe request is what the retry timer does anyway.
                         CommandOutcome::Nothing | CommandOutcome::Resubscribe => {}
-                        CommandOutcome::Reconnect => return None,
+                        CommandOutcome::Reconnect => {
+                            let reason = "a request failed at the transport level while polling".to_string();
+                            tracing::warn!(machine = %self.name, "{reason}");
+                            return PollExit::Reconnect(reason);
+                        }
                     }
                 }
                 _ = poll.tick() => {
                     if let Err(err) = self.reconcile().await {
                         tracing::warn!(machine = %self.name, %err, "poll reconcile failed");
-                        return None;
+                        return PollExit::Reconnect(format!("poll reconcile failed: {err}"));
                     }
                     if let Err(err) = self.confirm_pending_done().await {
                         tracing::warn!(machine = %self.name, %err, "settle check failed");
-                        return None;
+                        return PollExit::Reconnect(format!("settle check failed: {err}"));
                     }
                 }
-                _ = &mut retry => {
-                    match self.open_events().await {
-                        Ok(s) => {
-                            *backoff = self.settings.initial_backoff;
-                            return Some(s);
-                        }
+                // Only starts a new attempt once the previous one (if any) is
+                // done: `subscribing` already holds one in flight otherwise.
+                _ = &mut retry, if subscribing.is_none() => {
+                    match self.subscribe_future() {
+                        Ok(fut) => subscribing = Some(fut),
                         Err(err) => {
-                            *backoff = (*backoff * 2).min(self.settings.max_backoff);
-                            tracing::debug!(machine = %self.name, %err, next_in = ?backoff, "subscribe still failing");
-                            retry.as_mut().reset(tokio::time::Instant::now() + *backoff);
+                            retry_delay = (retry_delay * 2).min(self.settings.max_backoff);
+                            tracing::debug!(machine = %self.name, %err, next_in = ?retry_delay, "could not prepare the subscribe request");
+                            retry.as_mut().reset(tokio::time::Instant::now() + retry_delay);
+                        }
+                    }
+                }
+                res = async { subscribing.as_mut().unwrap().await }, if subscribing.is_some() => {
+                    subscribing = None;
+                    match res {
+                        Ok(s) => return PollExit::Subscribed(Box::new(s)),
+                        Err(err) => {
+                            retry_delay = (retry_delay * 2).min(self.settings.max_backoff);
+                            tracing::debug!(machine = %self.name, %err, next_in = ?retry_delay, "subscribe still failing");
+                            retry.as_mut().reset(tokio::time::Instant::now() + retry_delay);
                         }
                     }
                 }
@@ -1610,9 +1668,16 @@ mod tests {
     /// makes several ordinary calls (ping, reconcile's `agent.list`) before it
     /// subscribes, so a parity rule would fail one of those instead and never
     /// reach `open_events` at all.
+    ///
+    /// Past `fail_until`, `wedge_forever` chooses what "past the failures"
+    /// means: `false` (most tests) hands the subscription to the wrapped fake
+    /// for real; `true` accepts the connection and then never acknowledges the
+    /// subscribe at all — the shape of a herdr that is permanently wedged, not
+    /// just failing, used to prove a stuck subscribe cannot block the poll loop.
     struct FlakyEvents {
         subscribes: Arc<std::sync::atomic::AtomicUsize>,
         fail_until: usize,
+        wedge_forever: bool,
         fake: FakeHerdr,
     }
 
@@ -1621,6 +1686,7 @@ mod tests {
             let fake = self.fake.clone();
             let subscribes = self.subscribes.clone();
             let fail_until = self.fail_until;
+            let wedge_forever = self.wedge_forever;
             Box::pin(async move {
                 let (a, b) = tokio::io::duplex(64 * 1024);
                 let (ar, aw) = tokio::io::split(a);
@@ -1640,6 +1706,12 @@ mod tests {
                         let n = subscribes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         if n < fail_until {
                             return; // dropping `writer` is the EOF the subscribe sees
+                        }
+                        if wedge_forever {
+                            // Accept the connection but never write a reply: no
+                            // EOF, no ack, nothing. Held here for the lifetime of
+                            // the test.
+                            std::future::pending::<()>().await;
                         }
                         // Past the failures: hand the subscription to the fake for real.
                         let mut stream = match fake
@@ -1703,6 +1775,7 @@ mod tests {
         let connector = FlakyEvents {
             subscribes: subscribes.clone(),
             fail_until: usize::MAX,
+            wedge_forever: false,
             fake,
         };
         let _h = spawn_machine(
@@ -1731,6 +1804,14 @@ mod tests {
     /// the spec's `polling` state. The machine stays dispatchable, tasks are
     /// tracked by reconcile every `poll_every`, no `machine.lost` is announced,
     /// and the first successful subscribe returns it to `connected`.
+    ///
+    /// `fail_until: 6` keeps the subscribe failing past the local retry delay's
+    /// climb from `initial_backoff` (50ms) to `max_backoff` (200ms, both from
+    /// `settings()`): attempts land at roughly 0 (the initial one, in `run`,
+    /// before `Polling`), 50, 150, 350, 550, 750ms, and the 7th, at ~950ms,
+    /// succeeds. That is comfortably past the 100ms `poll_every` below, so the
+    /// Blocked status set right after dispatch is certain to be caught by a
+    /// poll tick while still `Polling`, not by a lucky `Connected` reconcile.
     #[tokio::test]
     async fn a_machine_whose_events_will_not_open_polls_instead_of_dropping() {
         let fake = FakeHerdr::new();
@@ -1745,7 +1826,8 @@ mod tests {
             vec![],
             Arc::new(FlakyEvents {
                 subscribes: subscribes.clone(),
-                fail_until: 3,
+                fail_until: 6,
+                wedge_forever: false,
                 fake: fake.clone(),
             }),
             store.clone(),
@@ -1772,6 +1854,11 @@ mod tests {
             state_of(&store, t.id) == TaskState::Blocked
         })
         .await;
+        assert_eq!(
+            h.snapshot().channel,
+            ChannelState::Polling,
+            "the change must have been caught by the poll tick, not a lucky connected reconcile"
+        );
 
         wait_for("connected once the subscribe succeeds", || {
             h.snapshot().channel == ChannelState::Connected
@@ -1781,6 +1868,59 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             assert_ne!(ev.kind, "machine.lost", "{ev:?}");
         }
+    }
+
+    /// A wedged `events.subscribe` (a herdr that accepts the connection and
+    /// never acknowledges it, forever, not just for one attempt) must not block
+    /// the poll loop: `dispatch` must still reply promptly, and the channel must
+    /// stay `Polling`. `request_timeout` is set high (10s) so the subscribe's
+    /// own internal timeout cannot rescue a blocking implementation within the
+    /// window this test actually waits; the old inline `self.open_events().await`
+    /// in the retry arm would have held up commands and poll ticks for up to
+    /// that long.
+    #[tokio::test]
+    async fn a_wedged_subscribe_does_not_block_dispatch_while_polling() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, _rx) = broadcast::channel(64);
+        let subscribes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut settings = settings();
+        settings.request_timeout = Duration::from_secs(10);
+        let h = spawn_machine(
+            "m".into(),
+            2,
+            vec![],
+            Arc::new(FlakyEvents {
+                subscribes: subscribes.clone(),
+                fail_until: 1,
+                wedge_forever: true,
+                fake,
+            }),
+            store.clone(),
+            settings,
+            events,
+        );
+        wait_for("polling", || h.snapshot().channel == ChannelState::Polling).await;
+        // Wait until the retry timer has actually fired and the wedged attempt
+        // (the one past `fail_until`) is in flight server-side, not just until
+        // `Polling` is reached: dispatching too early would race the retry
+        // timer and could get served before the wedge even starts, proving
+        // nothing.
+        wait_for("wedged subscribe attempt in flight", || {
+            subscribes.load(std::sync::atomic::Ordering::SeqCst) >= 2
+        })
+        .await;
+
+        let dispatched =
+            tokio::time::timeout(Duration::from_secs(2), h.dispatch(new_task(&store).id))
+                .await
+                .expect("dispatch must not be blocked by a wedged subscribe attempt");
+        assert_eq!(dispatched.unwrap().state, TaskState::Running);
+        assert_eq!(
+            h.snapshot().channel,
+            ChannelState::Polling,
+            "a wedged subscribe attempt must not be mistaken for a lost machine"
+        );
     }
 
     /// The reply to a dispatch must carry an already-refreshed live count: a
@@ -1815,19 +1955,19 @@ mod tests {
         assert_eq!(ChannelState::Polling.to_string(), "polling");
     }
 
-    /// Wraps a fake and can be broken: while broken, every connection it hands
-    /// out is already at EOF, so the first read of any request fails at the
-    /// transport level. That is what a machine that went away looks like now
-    /// that no connection is held between requests.
+    /// Wraps any connector and can be broken: while broken, every connection it
+    /// hands out is already at EOF, so the first read of any request fails at
+    /// the transport level. That is what a machine that went away looks like
+    /// now that no connection is held between requests.
     struct Breakable {
-        fake: FakeHerdr,
+        inner: Arc<dyn Connector>,
         broken: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Connector for Breakable {
         fn connect(&self) -> ConnectFuture<'_> {
             let broken = self.broken.load(std::sync::atomic::Ordering::SeqCst);
-            let fake = self.fake.clone();
+            let inner = self.inner.clone();
             Box::pin(async move {
                 if broken {
                     Ok(Connection::new(
@@ -1835,12 +1975,12 @@ mod tests {
                         Box::new(tokio::io::sink()),
                     ))
                 } else {
-                    Ok(fake.connect())
+                    inner.connect().await
                 }
             })
         }
         fn describe(&self) -> String {
-            "breakable fake".into()
+            "breakable".into()
         }
     }
 
@@ -1855,7 +1995,7 @@ mod tests {
             2,
             vec![],
             Arc::new(Breakable {
-                fake: fake.clone(),
+                inner: Arc::new(fake.clone()),
                 broken: broken.clone(),
             }),
             store.clone(),
@@ -1883,6 +2023,71 @@ mod tests {
         .await;
         let t3 = h.dispatch(new_task(&store).id).await.unwrap();
         assert_eq!(t3.state, TaskState::Running);
+    }
+
+    /// A request failing at the transport level while `Polling` (not just while
+    /// `Connected`) must take the same reconnect path: `Reconnecting`,
+    /// `machine.lost`, then back to `Polling` (its subscribe never succeeds
+    /// here) once requests work again, with `machine.connected` marking the
+    /// recovery. `FlakyEvents` never lets the subscribe through
+    /// (`fail_until: usize::MAX`), so the machine can only ever be `Polling` or
+    /// `Reconnecting`, never `Connected`, which keeps this test about the
+    /// poll loop's own `PollExit::Reconnect` path specifically.
+    #[tokio::test]
+    async fn a_broken_request_while_polling_reconnects_and_returns_to_polling() {
+        let fake = FakeHerdr::new();
+        let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, mut rx) = broadcast::channel(64);
+        let subscribes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut settings = settings();
+        settings.poll_every = Duration::from_millis(50);
+        let inner: Arc<dyn Connector> = Arc::new(FlakyEvents {
+            subscribes: subscribes.clone(),
+            fail_until: usize::MAX,
+            wedge_forever: false,
+            fake,
+        });
+        let h = spawn_machine(
+            "m".into(),
+            2,
+            vec![],
+            Arc::new(Breakable {
+                inner,
+                broken: broken.clone(),
+            }),
+            store,
+            settings,
+            events,
+        );
+        wait_for("polling", || h.snapshot().channel == ChannelState::Polling).await;
+
+        broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("machine.lost within 5s")
+                .unwrap();
+            if ev.kind == "machine.lost" {
+                break;
+            }
+        }
+        wait_for("reconnecting", || {
+            h.snapshot().channel == ChannelState::Reconnecting
+        })
+        .await;
+
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("machine.connected within 5s")
+                .unwrap();
+            if ev.kind == "machine.connected" {
+                break;
+            }
+        }
+        assert_eq!(h.snapshot().channel, ChannelState::Polling);
     }
 
     #[tokio::test]
