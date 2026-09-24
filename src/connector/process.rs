@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use super::{Item, ItemSource, RunFuture, RunInput, RunOutput};
-use crate::config::{Paths, create_private_dir};
+use crate::config::Paths;
 use crate::plugin::Plugin;
 use crate::plugin::exec::{self, Invocation, RunLog, SharedLog};
 use crate::plugin::manifest::Mode;
@@ -119,23 +119,12 @@ impl Runner {
             .connector
             .as_ref()
             .ok_or_else(|| format!("plugin {:?} has no connector", self.plugin.id))?;
-        let dotenv = self.plugin.env(&self.paths).map_err(|e| format!("{e:#}"))?;
-        let log = RunLog::create(
-            &self.paths.runs_dir(&self.log_dir_name()),
-            self.plugin.redactor(&dotenv),
-        )
-        .map_err(|e| format!("run log: {e:#}"))?;
-        let state_dir = self.paths.plugin_state_dir(&self.log_dir_name());
-        create_private_dir(&state_dir).map_err(|e| format!("{e:#}"))?;
-        let mut env = dotenv;
-        let dir = |p: &std::path::Path| p.to_string_lossy().into_owned();
-        env.push(("PASTOR_PLUGIN_ID".into(), self.plugin.id.clone()));
-        if let Some(job) = &self.job {
-            env.push(("PASTOR_JOB".into(), job.clone()));
-        }
-        env.push(("PASTOR_CONFIG_DIR".into(), dir(&self.paths.config_dir)));
-        env.push(("PASTOR_STATE_DIR".into(), dir(&self.paths.state_dir)));
-        env.push(("PASTOR_PLUGIN_STATE_DIR".into(), dir(&state_dir)));
+        let (env, redactor) = self
+            .plugin
+            .command_env(&self.paths, self.job.as_deref())
+            .map_err(|e| format!("{e:#}"))?;
+        let log = RunLog::create(&self.paths.runs_dir(&self.log_dir_name()), redactor)
+            .map_err(|e| format!("run log: {e:#}"))?;
         let handshake = serde_json::json!({
             "config": input.config,
             "cursor": input.cursor,

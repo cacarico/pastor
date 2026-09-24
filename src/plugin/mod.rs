@@ -145,6 +145,35 @@ impl Plugin {
     pub fn redactor(&self, env: &[(String, String)]) -> Redactor {
         Redactor::new(self.manifest.secrets.keys().map(String::as_str), env)
     }
+
+    /// The environment every command of this plugin gets, connector or hook:
+    /// its `.env`, then `PASTOR_PLUGIN_ID`, `PASTOR_JOB` (when there is a
+    /// job), `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and
+    /// `PASTOR_PLUGIN_STATE_DIR`, the job's scratch dir (`@<id>` without a
+    /// job), created 0700. Plus the redactor for what the command prints.
+    pub fn command_env(
+        &self,
+        paths: &Paths,
+        job: Option<&str>,
+    ) -> anyhow::Result<(Vec<(String, String)>, Redactor)> {
+        let dotenv = self.env(paths)?;
+        let redactor = self.redactor(&dotenv);
+        let scope = job
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("@{}", self.id));
+        let state_dir = paths.plugin_state_dir(&scope);
+        crate::config::create_private_dir(&state_dir)?;
+        let dir = |p: &Path| p.to_string_lossy().into_owned();
+        let mut env = dotenv;
+        env.push(("PASTOR_PLUGIN_ID".into(), self.id.clone()));
+        if let Some(job) = job {
+            env.push(("PASTOR_JOB".into(), job.to_string()));
+        }
+        env.push(("PASTOR_CONFIG_DIR".into(), dir(&paths.config_dir)));
+        env.push(("PASTOR_STATE_DIR".into(), dir(&paths.state_dir)));
+        env.push(("PASTOR_PLUGIN_STATE_DIR".into(), dir(&state_dir)));
+        Ok((env, redactor))
+    }
 }
 
 /// The built-in connectors plus every valid plugin that has a connector,
