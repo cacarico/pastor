@@ -45,6 +45,18 @@ them too; they are repeated here because getting them wrong cost a day.
   `agent_blocked`. pastor marks the task `blocked` without prompting, and
   once the block clears the agent goes straight to active and the pending
   prompt is sent.
+- There is no `completion_seq` in herdr 0.9.1. `agent.list` entries carry
+  `agent_status` and `state_change_seq`, a server-wide counter stamped on an
+  agent each time its detected state (idle, working, blocked, unknown)
+  changes. `done` is idle after a working or blocked spell that nobody has
+  looked at yet; once someone focuses the pane it reads `idle`, with no new
+  sequence. Subscription events carry the status only, no sequence. So pastor
+  takes the sequence from the `agent.prompt` reply as the task's baseline
+  (column `last_completion_seq`, name kept for the schema) and calls a task
+  done when, after `settle`, `agent.list` shows it idle or done at a sequence
+  past that baseline and unchanged since it was first seen idle. herdr's own
+  `agent.prompt --wait` uses the same test. Unreleased herdr adds
+  `completion_seq` in the same sequence; pastor prefers it when present.
 - A herdr error reply is an API error with a code, never a dead connection.
   Only EOF before a reply, spawn failure or a non-zero exit with no reply are
   transport failures, and only those make a machine `lost`.
