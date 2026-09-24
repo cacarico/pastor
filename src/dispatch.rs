@@ -185,10 +185,13 @@ async fn expand_home(
     };
     let machine = machine.unwrap_or("this machine");
     match conn.home_dir().await.map_err(CallError::from)? {
+        // A bare `~` is the home as reported, `/` included; only a suffix
+        // needs the trailing slash dropped to avoid `//`.
+        Some(home) if rest.is_empty() => Ok(home),
         Some(home) => Ok(format!("{}{rest}", home.trim_end_matches('/'))),
         None => Err(DispatchError::Task(format!(
-            "repo {repo}: pastor cannot tell the home directory on {machine} \
-             (a `command` machine); use an absolute path"
+            "repo {repo}: pastor cannot tell the home directory on {machine}; \
+             use an absolute path"
         ))),
     }
 }
@@ -451,9 +454,16 @@ mod tests {
     /// workspace and a worktree alike.
     #[tokio::test]
     async fn a_leading_tilde_is_the_machine_s_home() {
-        for (repo, cwd) in [("~/work/app", "/home/fake/work/app"), ("~", "/home/fake")] {
+        for (home, repo, cwd) in [
+            ("/home/fake", "~/work/app", "/home/fake/work/app"),
+            ("/home/fake", "~", "/home/fake"),
+            // root's home: a bare `~` must stay `/`, not become empty.
+            ("/", "~", "/"),
+            ("/", "~/work", "/work"),
+        ] {
             for worktree in [false, true] {
                 let fake = FakeHerdr::new();
+                fake.set_home(Some(home));
                 let mut t = task(DispatchSpec {
                     repo: Some(repo.into()),
                     worktree,
@@ -470,7 +480,10 @@ mod tests {
                     .into_iter()
                     .find(|r| r.method == method)
                     .unwrap();
-                assert_eq!(req.params["cwd"], cwd, "{repo} via {method}");
+                assert_eq!(
+                    req.params["cwd"], cwd,
+                    "{repo} with home {home} via {method}"
+                );
                 assert_eq!(
                     t.spec.repo.as_deref(),
                     Some(repo),
