@@ -61,6 +61,12 @@ impl MachineLookup for Vec<MachineHandle> {
     }
 }
 
+impl MachineLookup for crate::daemon::Fleet {
+    fn machine_status(&self, name: &str) -> Option<MachineStatus> {
+        self.machines().machine_status(name)
+    }
+}
+
 impl EventRecord {
     /// Stamp `ev` with the time of receipt and expand its ids into records: the
     /// task row for task events, the machine status for `machine.*` events. A
