@@ -67,6 +67,13 @@ them too; they are repeated here because getting them wrong cost a day.
 - A herdr error reply is an API error with a code, never a dead connection.
   Only EOF before a reply, spawn failure or a non-zero exit with no reply are
   transport failures, and only those make a machine `lost`.
+- `pane.close {pane_id}` closes the pane and its agent, and closing a
+  workspace's last pane closes the workspace. `worktree.remove
+  {workspace_id, force}` deletes the checkout and closes its workspace, so
+  `task close --remove-worktree` calls it instead of `pane.close`, never
+  after. Codes: `pane_not_found`, `dirty_worktree_requires_force`,
+  `not_linked_worktree` (a plain workspace), `workspace_not_found` (an
+  unknown id). `make smoke` checks them.
 - `remote-api-bridge` is a plain stdio forwarder to the local socket, so a
   bridge that exits with `command not found` means herdr is not on the PATH
   of a non-interactive shell on that machine.
@@ -111,7 +118,6 @@ Plan 3 (events and plugins):
 
 - A 30s unread events socket can overrun herdr's retained history; pastor
   reconnects and reconciles, at the cost of a `machine.lost` blip.
-- Adopted panes get no `agent_status` subscription until the next reconnect.
 - `pastor machine list` without a head does unbounded connect/ping/list on the
   CLI path, one machine at a time.
 - A stream connector starts on its job's first run, not at daemon start,
@@ -126,9 +132,6 @@ Plan 4 (cleanup and lifecycle):
 - A machine removed from the flock leaves its open tasks `running` forever.
 - `flock.toml` and `pastor.toml` do not reload; a machine added with `pastor
   machine add` needs a daemon restart. Job files do reload.
-- `pastor task run --worktree` without `--repo` is accepted by the CLI and queued,
-  and only fails at dispatch. Reject it in the CLI (clap `requires`) and in
-  `Run`.
 - `machine add --command` is greedy (`num_args = 1..`): options placed after
   it are taken as part of the command. Put options before it, or add `--`.
 - Claude Code's "trust this folder" dialog blocks every agent started in a
@@ -141,27 +144,29 @@ Plan 4 (cleanup and lifecycle):
 - A hand edit of `flock.toml` leaves herdr's saved-machine list stale; only
   `machine add|remove --herdr` touches it. Candidate: `machine sync --herdr`,
   or reconciling the two lists on head start.
-- `tasks.id` has no `AUTOINCREMENT`, so ids can be reused after a rollback or
-  pruning; ids appear in branch names (`pastor/t-<n>`) and in
-  `seen.task_id`.
+- `tasks.id` has no `AUTOINCREMENT`, so an id can be reused after a rolled
+  back insert of the newest task; ids appear in agent names, branch names
+  (`pastor/t-<n>`) and `seen.task_id`. `task prune` never deletes the newest
+  row for this reason. The real fix is a table rebuild in a later schema.
 - `pastor open` should detect a nested herdr and say so instead of herdr
   refusing to start.
 - The whole dispatch pass runs under the fleet lock, so slow agent readiness
   delays `job list`, `tick`, `job reload` and `task run` too. Move readiness waits out
   of the lock.
-- Orphans (agents named `t-N` that no open task owns: a dispatch that failed
-  after `agent.start`, a daemon killed mid-dispatch) are found by reconcile,
-  counted in `live` and closeable with `MachineCommand::Close`, but only as
-  often as `reconcile_every`, and on the assumption that one pastor owns the
-  `t-N` names on each herdr.
-- `pastor task retry|close|prune` have store and actor support
-  (`Store::{insert_retry, close_task, prune}`, `MachineHandle::close`) but no
-  IPC request, daemon arm or CLI yet; they wait for the `Fleet` from
-  `feat/jobs`.
+- Orphans (agents named `t-N` that no open task owns) are found only by
+  reconcile, so they appear up to `reconcile_every` late, and the rule
+  assumes one pastor owns the `t-N` names on each herdr. `task close t-N`
+  for an orphan with no row finds it through the machines' last reconcile.
 - A retry copies the rendered spec, so a job whose branch template does not
   use the task id (`pastor/{{ item.key }}`) retries onto the same branch; if
   the old worktree is still there, `worktree.create` fails. Close the old task
-  with `--remove-worktree` first.
+  with `--remove-worktree` first, or re-render from the job file on retry.
+- `task close --remove-worktree` never sends `force`; a dirty checkout is an
+  error until someone commits or cleans it. A `--force` would be a separate
+  decision.
+- `tests/transport.rs` `command_transport_talks_to_fake_herdr` failed once
+  under a loaded `make check` (the stdio fake-herdr closed before replying)
+  and passed on every rerun.
 
 Not yet assigned a plan:
 
@@ -177,7 +182,7 @@ Not yet assigned a plan:
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks, seen keys, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 3: retry_of), seen keys, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
@@ -194,3 +199,9 @@ skills/pastor/SKILL.md            agent skill, in the repo; `pastor --skill` pri
 `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR` override these;
 tests always set them to temp dirs (`Paths::new` puts the data dir under the
 state dir).
+
+In the code: `task retry|close|prune` are `src/task_cli.rs` (CLI), the
+`TaskRetry|TaskClose|TaskPrune` arms in `Daemon::handle`,
+`Store::{insert_retry, close_task, prune}` and `MachineCommand::Close` in
+the actor; orphan detection is `machine::orphan_agents`, used by reconcile
+and by the head-less probe in `machine list`.

@@ -66,9 +66,9 @@ to `ssh`/`herdr`.
 `pastor machine list` shows the head first, then each machine in the flock:
 
 ```
-NAME    HOST        CHANNEL    HERDR  PASTOR  AGENTS  TAGS  ERROR
-pastor  darkbeat    head       0.9.1  0.2.0   -       -
-pi-3    fleet@pi-3  connected  0.9.1  0.2.0   1/2     fast
+NAME    HOST        CHANNEL    HERDR  PASTOR  AGENTS  ORPHANS  TAGS  ERROR
+pastor  darkbeat    head       0.9.1  0.2.0   -       -        -
+pi-3    fleet@pi-3  connected  0.9.1  0.2.0   1/2     -        fast
 ```
 
 HOST is the ssh target, `local`, or the program a `command` machine runs.
@@ -82,7 +82,7 @@ machine, one with no pastor, or one that gives an odd answer shows `-`. The
 head asks once each time it connects to a machine, so an upgrade shows after
 the next reconnect.
 With `pastor serve` running, CHANNEL is the head's live channel state and
-AGENTS counts pastor's tasks against `max_agents`. Without it, the command
+AGENTS counts pastor's tasks and orphans (see below) against `max_agents`. Without it, the command
 probes each machine itself (a ping and an `agent.list`, one at a time, with no
 time limit, plus the pastor version for a machine that answered); CHANNEL
 reads one of four values: `probed` (the ping answered — an old protocol or a
@@ -129,6 +129,34 @@ for you, and without the flag `machine add` prints the command instead. `remove`
 matches herdr's entry by label only; when none matches but the same host is
 saved under another label, it prints that entry's remove command rather than
 guessing.
+
+pastor never closes panes or removes worktrees on its own; three commands do
+it when asked, all with `--json`. `pastor task retry t-4` queues a new task
+copying a failed or stale one (job, item, prompt and dispatch settings, with
+`retry_of` pointing back and a "retry of t-4" note in `task list`) and dispatches it
+at once. It gets a new id because the old agent `t-4`, named after the task, may
+still be running. A retried job task keeps the branch it was rendered with, so
+if that branch has no `{{ task.id }}` in it and the old worktree is still
+there, close the old task with `--remove-worktree` first. `pastor task close
+t-4` closes the task's pane (and the agent in it) and marks it `closed`; a
+queued task only has its row closed. `--remove-worktree` removes the task's
+worktree instead, which closes its workspace, pane included. herdr refuses a
+checkout with uncommitted or untracked files; the task is then left as it was,
+so commit or clean up and run it again. `pastor task prune --done --older-than
+3d` deletes done tasks that finished more than three days ago; `--failed` and
+`--closed` add those states. A pruned task's item stays seen, so a job never
+queues it again, and the newest task is always kept so its id is never handed
+out twice. Prune works without `pastor serve`; retry and close need it.
+`task run --worktree` needs `--repo`.
+
+An agent named like a task (`t-N`) that no open task owns is an orphan: a
+dispatch that failed after the agent started, a daemon killed mid-dispatch, a
+failed task whose agent never exited, a pruned row. Orphans still hold a pane,
+so they count toward `max_agents`. `pastor task list` prints a line for each under
+its table, `machine list` names them in an ORPHANS column,
+and `pastor task close t-N` closes one, with or without a row. pastor finds
+them when it reconciles (every `reconcile_every`). It assumes it is the only
+pastor naming agents `t-N` on each herdr.
 
 ## Events
 
@@ -204,6 +232,9 @@ pastor task list --job hourly        # live tasks only
 pastor job disable hourly
 pastor task list --all               # finished tasks too
 pastor task read t-1                 # recent pane output, without attaching
+pastor task retry t-4                # a failed or stale task again, as a new task
+pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
+pastor task prune --done --closed --older-than 7d
 pastor task attach t-1               # lands in the agent's pane; ctrl+b q detaches
 pastor open pi-3                     # the full herdr UI on that machine
 pastor events --follow               # task, job and machine events as they happen
@@ -348,7 +379,7 @@ like connector logs.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, defaults (all optional)
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks, seen keys, job state
+~/.local/state/pastor/pastor.db   tasks (schema 3, with retry_of), seen keys, job state
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
