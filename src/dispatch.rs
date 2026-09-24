@@ -229,7 +229,14 @@ async fn prompt_when_ready(
                 agent.agent_status,
                 AgentStatus::Working | AgentStatus::Blocked
             );
-        if agent.launch_pending {
+        if agent.agent_status == AgentStatus::Blocked {
+            // Waiting for a human, usually on the agent's own startup question
+            // (Claude's folder trust dialog). herdr keeps `launch_pending` set
+            // meanwhile and refuses prompts with `agent_not_ready`, so waiting
+            // here would only run out the bound. The machine sends the prompt
+            // once the block clears (`Task::prompt_pending`).
+            return Ok(DispatchOutcome::Blocked);
+        } else if agent.launch_pending {
             // still launching: fall through to the wait below
         } else if can_prompt {
             match conn.agent_prompt(name, &task.prompt).await {
@@ -594,6 +601,39 @@ mod tests {
         assert!(!err.is_transport(), "a slow agent is not a dead machine");
         assert_eq!(t.state, TaskState::Failed);
         assert!(t.pane_id.is_some(), "pane is kept for inspection");
+    }
+
+    /// An agent stuck on its startup question (Claude's folder trust dialog)
+    /// is `blocked` with `launch_pending` still set, and herdr answers
+    /// `agent_not_ready` to prompts until a human clears it. That is a blocked
+    /// task, not an agent that never came up.
+    #[tokio::test]
+    async fn an_agent_blocked_while_launching_blocks_the_task() {
+        let fake = FakeHerdr::new();
+        // Launching for longer than the readiness bound: only the blocked
+        // status can end dispatch in time.
+        fake.set_ready_after(READY * 2);
+        let watcher = fake.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(a) = watcher.agents().first() {
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked, None);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let mut t = task(spec());
+        let started = Instant::now();
+        let out = dispatch(&fake, &mut t, READY).await.unwrap();
+        assert_eq!(out, DispatchOutcome::Blocked);
+        assert!(started.elapsed() < READY, "waited out the readiness bound");
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(t.prompt_pending, "the agent has not seen the prompt");
+        assert!(
+            !fake.requests().iter().any(|r| r.method == "agent.prompt"),
+            "a blocked agent is not prompted"
+        );
     }
 
     /// An agent that is up but waiting for a human still blocks the task.

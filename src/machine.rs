@@ -1316,6 +1316,46 @@ mod tests {
         );
     }
 
+    /// The folder trust dialog case end to end: the agent is blocked before it
+    /// finishes launching, dispatch leaves the task `blocked` with the prompt
+    /// pending, and once a human answers, herdr may still refuse with
+    /// `agent_not_ready` for a moment. Reconcile keeps retrying until the
+    /// prompt lands, then the task runs.
+    #[tokio::test]
+    async fn an_agent_blocked_at_launch_gets_its_prompt_once_answered() {
+        let fake = FakeHerdr::new();
+        fake.set_ready_after(Duration::from_millis(400));
+        let watcher = fake.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(a) = watcher.agents().first() {
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked, None);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(t.prompt_pending);
+
+        // Answered while the fake still counts the agent as launching: the
+        // first delivery attempt is refused and has to be retried.
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle, None);
+        wait_for("running with the prompt sent", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Running && !t.prompt_pending
+        })
+        .await;
+        assert_eq!(fake.agents()[0].agent_status, AgentStatus::Working);
+    }
+
     /// A store error in reconcile is pastor's problem, not the machine's: the
     /// channel stays connected and no `machine.lost` goes out.
     #[tokio::test]
