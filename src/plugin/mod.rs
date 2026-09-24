@@ -3,8 +3,10 @@
 //! either a managed checkout (`plugin install`) or a symlink to a directory
 //! the user develops in (`plugin link`).
 
+pub mod cli;
 pub mod env;
 pub mod exec;
+pub mod install;
 pub mod manifest;
 
 use std::collections::{BTreeMap, HashMap};
