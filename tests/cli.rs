@@ -1,5 +1,4 @@
 //! Drives the real binaries: pastor serve with a fake-herdr machine, then run/list/task.
-use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -574,8 +573,10 @@ fn herdr_flag_adds_and_removes_the_saved_machine_too() {
     );
 }
 
+/// `--yes`/`-y` installs with no prompt, so setup runs from a script, a task
+/// or `ssh host pastor setup systemd --yes`. Stdin here is not a terminal.
 #[test]
-fn setup_systemd_confirmation_accepts_and_installs() {
+fn setup_systemd_yes_installs_without_a_prompt() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
@@ -594,51 +595,51 @@ fn setup_systemd_confirmation_accepts_and_installs() {
         "#!/bin/sh\nif [ \"$1\" = show-user ]; then echo Linger=yes; fi\n",
     )
     .unwrap();
-    std::fs::set_permissions(
-        bin.join("systemctl"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    std::fs::set_permissions(bin.join("loginctl"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    for f in ["systemctl", "loginctl"] {
+        std::fs::set_permissions(bin.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let path = format!(
         "{}:{}",
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let mut child = pastor()
-        .args(["setup", "systemd"])
-        .env("PATH", &path)
-        .env("XDG_CONFIG_HOME", &xdg)
-        .env("PASTOR_CONFIG_DIR", &config)
-        .env("PASTOR_STATE_DIR", &state)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.as_mut().unwrap().write_all(b"yes\n").unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        xdg.join("systemd/user/pastor.service").exists(),
-        "confirmation should install the unit"
-    );
-    let calls = std::fs::read_to_string(calls).unwrap();
-    assert!(calls.contains("--user daemon-reload"), "{calls}");
-    assert!(
-        calls.contains("--user enable --now pastor.service"),
-        "{calls}"
-    );
+    for flag in ["--yes", "-y"] {
+        let _ = std::fs::remove_file(&calls);
+        let out = pastor()
+            .args(["setup", "systemd", flag])
+            .env("PATH", &path)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{flag}\nstdout:\n{}\nstderr:\n{stderr}",
+            String::from_utf8_lossy(&out.stdout),
+        );
+        assert!(!stderr.contains("Continue?"), "{flag} prompted: {stderr}");
+        assert!(
+            xdg.join("systemd/user/pastor.service").exists(),
+            "{flag} should install the unit"
+        );
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        assert!(calls.contains("--user daemon-reload"), "{calls}");
+        assert!(
+            calls.contains("--user enable --now pastor.service"),
+            "{calls}"
+        );
+    }
 }
 
+/// Without `--yes` and without a terminal, setup fails at once, telling the
+/// caller to pass --yes, instead of waiting on a stdin nobody will answer;
+/// and it fails before touching anything.
 #[test]
-fn setup_systemd_confirmation_rejects_before_mutating() {
+fn setup_systemd_without_a_terminal_fails_fast_and_names_yes() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
@@ -653,17 +654,28 @@ fn setup_systemd_confirmation_rejects_before_mutating() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.as_mut().unwrap().write_all(b"no\n").unwrap();
+    // Hold stdin open: a read_line would block here until the deadline.
+    let stdin = child.stdin.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("setup systemd waited on a stdin that is not a terminal");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(stdin);
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("aborted"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--yes"), "{stderr}");
     assert!(
         !xdg.join("systemd/user/pastor.service").exists(),
-        "rejection must not write the unit"
+        "a refused setup must not write the unit"
     );
     assert!(
         !config.exists() && !state.exists(),
-        "rejection must happen before permission hardening mutates paths"
+        "a refused setup must stop before permission hardening mutates paths"
     );
 }
 

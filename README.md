@@ -192,7 +192,9 @@ pastor serve
 
 `pastor setup systemd` installs `contrib/systemd/pastor.service` to
 `~/.config/systemd/user/`, shows what it will do, and only continues after you
-type `yes`. With no action flag it runs `systemctl --user enable --now` on the
+type `yes`. `--yes` (`-y`) skips the prompt; it is required when stdin is not a
+terminal (a script, a task, `ssh host pastor setup systemd --yes`), where setup
+fails at once rather than wait for an answer. With no action flag it runs `systemctl --user enable --now` on the
 unit. `--enable`, `--start`, `--enable --now`, `--enable --start` and `--stop`
 map to the same `systemctl --user` actions after the unit is written.
 `pastor setup systemd --herdr` does the same with `herdr.service` (the herdr

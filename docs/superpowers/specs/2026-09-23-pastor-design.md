@@ -484,8 +484,8 @@ systemd, user units shipped in `contrib/systemd/`, installed to
 `~/.config/systemd/user/` without sudo:
 
 ```
-pastor setup systemd [--enable] [--start|--stop] [--now]
-pastor setup systemd --herdr [--enable] [--start|--stop] [--now]
+pastor setup systemd [--enable] [--start|--stop] [--now] [--yes]
+pastor setup systemd --herdr [--enable] [--start|--stop] [--now] [--yes]
 ```
 
 No action flag means `enable --now`, the same as the original `enable + start`
@@ -493,6 +493,9 @@ contract. `--enable`, `--start`, `--enable --start`, `--enable --now` and
 `--stop` map to the matching `systemctl --user` actions. Before writing a unit
 or running `systemctl`, pastor prints the target unit, install directory,
 `ExecStart` and action, and continues only when stdin answers exactly `yes`.
+`--yes` (`-y`) skips the prompt, for scripts, tasks and `ssh host pastor setup
+systemd --yes`; without it, a stdin that is not a terminal is an error that
+names `--yes`, never a read that waits forever.
 
 Both use `Restart=on-failure` and `After=network-online.target`, log to
 stdout for journald, and need `loginctl enable-linger`, which pastor checks
@@ -567,7 +570,7 @@ pastor machine add|remove|list|status ...
 pastor job list|enable|disable|run ...
 pastor plugin install|link|uninstall|unlink|list|run ...
 pastor events [--follow] [--task T]
-pastor setup systemd [--herdr] [--enable] [--start|--stop] [--now]
+pastor setup systemd [--herdr] [--enable] [--start|--stop] [--now] [--yes]
 ```
 
 `pastor run`, `pastor list`, `pastor attach` and `pastor reload` are hidden
