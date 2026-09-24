@@ -236,8 +236,8 @@ socket and plugin `.env` files to 0600, and says what it changed.
 A plugin is a directory with a `pastor-plugin.toml` and the commands it
 names. It can provide a connector (where a job's items come from), event
 hooks, or both. The manifest format and the connector protocol are in the
-spec's Plugins section; `tests/fixtures/plugin/` has two small working
-examples.
+spec's Plugins section; `tests/fixtures/plugin/` has small working
+examples (`echo` and `stream` connectors, a `notify` hook).
 
 ```bash
 pastor plugin install cacarico/pastor/plugins/slack   # owner/repo[/subdir], --ref, --yes
@@ -256,9 +256,42 @@ job's scratch directory). What a run writes to stderr lands in
 the manifest declares replaced by `[redacted:NAME]`; each log is cut at
 256 KiB and the newest 20 per job are kept.
 
-A poll connector runs once per job run and must finish within its `timeout`
-(60s by default); a stream connector is started once, restarted with backoff
-when it exits, and each job run takes what it emitted since the last.
+A job uses a plugin's connector by its id (`[connector] use = "slack"`);
+`pastor serve` and `pastor tick` check the job's connector table against the
+keys the manifest marks `required`, and `job list` shows a job whose plugin is
+missing or unhappy as invalid, with the reason. A poll connector runs once per
+job run and must finish within its `timeout` (60s by default); a stream
+connector is started once, restarted with backoff when it exits, and each job
+run takes what it emitted since the last. Item fields that a job puts into
+`repo` or `branch` may not contain `/`, `\`, `..`, a leading `-` or control
+characters; such an item is skipped and reported.
+
+`plugin install|link|uninstall|unlink` tell a running daemon to reload, so a
+new plugin is usable without a restart (this also restarts stream
+connectors).
+
+### Event hooks
+
+A plugin's `[[events]]` hooks run on the head for every event whose type is
+in `on` (`task.queued`, `task.done`, `task.blocked`, `task.failed`,
+`job.failed`, `machine.lost`, ... as in `pastor events`). The hook gets the
+event record, the same JSON `pastor events --json` prints, on stdin, and the
+same environment as the connector (`PASTOR_JOB` is the task's job). With
+`only_own = true` it only hears about tasks and jobs whose connector is this
+plugin; one-off `pastor run` tasks belong to no plugin.
+
+```toml
+[[events]]
+on = ["task.done", "task.blocked"]
+only_own = true
+command = ["sh", "report.sh"]
+timeout = "60s"                     # the default
+```
+
+Hooks of different plugins run at the same time; one plugin's hooks run one
+after another, in event order. A hook that fails or times out is logged and
+not retried. Its output goes to `~/.local/state/pastor/runs/@<id>/`, redacted
+like connector logs.
 
 ## Files
 
@@ -275,6 +308,7 @@ when it exits, and each job run takes what it emitted since the last.
 ~/.local/share/pastor/plugins/<id>/  installed plugins (a symlink for a linked one)
 ~/.local/state/pastor/plugins/<job>/ a job's connector scratch
 ~/.local/state/pastor/runs/<job>/    captured connector output, capped and pruned
+~/.local/state/pastor/runs/@<id>/    captured hook output (and job-less `plugin` runs)
 ```
 
 `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR` override the

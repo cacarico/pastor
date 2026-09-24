@@ -76,11 +76,6 @@ enum Command {
         #[command(subcommand)]
         cmd: JobCmd,
     },
-    /// Install, link, list and try out plugins
-    Plugin {
-        #[command(subcommand)]
-        cmd: pastor::plugin::cli::PluginCmd,
-    },
     /// Print a shell completion script (fish, bash, zsh, ...) to stdout
     Completions { shell: clap_complete::Shell },
     /// Show the events log (task, job and machine events)
@@ -89,6 +84,11 @@ enum Command {
     Setup {
         #[command(subcommand)]
         cmd: pastor::setup::SetupCmd,
+    },
+    /// Install, link, list and try out plugins
+    Plugin {
+        #[command(subcommand)]
+        cmd: pastor::plugin::cli::PluginCmd,
     },
 }
 
@@ -274,7 +274,6 @@ fn main() {
                 reload(&paths).await
             }
             Command::Job { cmd } => job(&paths, cmd).await,
-            Command::Plugin { cmd } => pastor::plugin::cli::run(&paths, cmd).await,
             Command::Completions { shell } => {
                 let mut cmd = completion_tree();
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
@@ -282,6 +281,7 @@ fn main() {
             }
             Command::Events(args) => pastor::events::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
+            Command::Plugin { cmd } => pastor::plugin::cli::run(&paths, cmd).await,
         }
     });
     if let Err(err) = result {

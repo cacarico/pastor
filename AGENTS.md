@@ -113,16 +113,15 @@ Plan 3 (events and plugins):
   reconnects and reconciles, at the cost of a `machine.lost` blip.
 - Adopted panes get no `agent_status` subscription until the next reconnect.
 - `pastor machine status` does unbounded connect/ping/list on the CLI path.
-- `pastor tick` runs jobs inline in the scheduler task so its report is
-  complete; a process connector that takes a minute holds the scheduler for
-  that minute. Move to spawned runs with a reply channel when plugins land.
-- Plugins (`feat/plugins`): the daemon and scheduler still use `Builtins`.
-  Wiring `PluginCatalog` in needs the scheduler to resolve per job
-  (`PluginCatalog::source_for_job`), because `RunInput` has no job name and a
-  source resolved by id alone logs under `runs/@<id>/`. `plugin
-  install|link` should end with `pastor reload` when a daemon is up. Event
-  hooks are parsed but not run yet.
-- A stream connector starts on its job's first run, not at daemon start.
+- A stream connector starts on its job's first run, not at daemon start,
+  and `pastor reload` (which every `plugin install|link|uninstall|unlink`
+  sends) rebuilds the catalog, restarting every stream connector.
+- Items deferred by `max_tasks_per_run` stay unseen, but the cursor still
+  advances past them, so a connector that resumes strictly from its cursor
+  never emits them again. Failed inserts hold the cursor; deferrals do not.
+- `only_own` decides ownership by reading the task's job file for
+  `connector.use`; a job file edited or removed after its tasks were made
+  changes who owns them.
 
 Plan 4 (cleanup and lifecycle):
 
@@ -179,8 +178,10 @@ Not yet assigned a plan:
 ~/.config/systemd/user/*.service  from `pastor setup systemd [--herdr]`
 ~/.config/pastor/plugins/<id>/.env   plugin secrets and settings
 ~/.local/share/pastor/plugins/<id>/  plugin checkouts or links (PASTOR_DATA_DIR)
-~/.local/state/pastor/plugins/<job>/ connector scratch per job
-~/.local/state/pastor/runs/<job>/    run logs, 256 KiB each, newest 20 kept
+~/.local/state/pastor/plugins/<job>/ plugin scratch per job (PASTOR_PLUGIN_STATE_DIR)
+~/.local/state/pastor/plugins/@<id>/ plugin scratch for hooks and runs with no job
+~/.local/state/pastor/runs/<job>/    connector run logs, 256 KiB each, newest 20 kept
+~/.local/state/pastor/runs/@<id>/    hook logs (and `plugin` runs with no job)
 skills/pastor/SKILL.md            agent skill, in the repo; `pastor --skill` prints it
 ```
 
