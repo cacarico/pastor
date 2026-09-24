@@ -1,0 +1,537 @@
+//! One job per TOML file in `~/.config/pastor/jobs/`. `JobFile` is the file's
+//! shape and nothing else; `Job` is what survives validation and is what the
+//! scheduler runs. Validation happens here, at load, so `job list` can show a
+//! broken file as `invalid` with its reason instead of a run failing later.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::Context;
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::config::{Defaults, parse_duration};
+use crate::schedule::Schedule;
+use crate::task::DispatchSpec;
+use crate::template;
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobFile {
+    pub name: Option<String>,
+    pub every: Option<String>,
+    pub cron: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub connector: ConnectorTable,
+    pub dispatch: DispatchTable,
+}
+
+/// `use` names the connector; every other key is passed to it as config.
+#[derive(Debug, Deserialize)]
+pub struct ConnectorTable {
+    #[serde(rename = "use")]
+    pub use_: String,
+    #[serde(flatten)]
+    pub config: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DispatchTable {
+    pub agent: Option<String>,
+    pub agent_args: Vec<String>,
+    pub repo: Option<String>,
+    pub worktree: bool,
+    pub branch: Option<String>,
+    pub tags: Vec<String>,
+    pub machine: Option<String>,
+    pub timeout: Option<String>,
+    pub max_tasks_per_run: Option<u32>,
+    pub backfill: Option<String>,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub name: String,
+    pub schedule: Schedule,
+    pub enabled: bool,
+    pub connector: String,
+    /// The `[connector]` table minus `use`, as JSON for the connector's stdin.
+    pub connector_config: Value,
+    /// Unrendered; `{{ item.* }}`, `{{ job.name }}`, `{{ task.id }}` allowed.
+    pub prompt: String,
+    pub max_tasks_per_run: u32,
+    pub backfill: Duration,
+    /// `repo` and `branch` are unrendered templates too; the scheduler renders
+    /// a copy per task.
+    pub spec: DispatchSpec,
+}
+
+impl Job {
+    /// Parse and validate one file's text. `stem` is the file name without
+    /// `.toml`: it is the job's name, and a `name` key must agree with it.
+    pub fn parse(text: &str, stem: &str, defaults: &Defaults) -> Result<Job, String> {
+        let file: JobFile = toml::from_str(text).map_err(|e| e.to_string())?;
+        let name = file.name.clone().unwrap_or_else(|| stem.to_string());
+        if name != stem {
+            return Err(format!(
+                "name {name:?} does not match the file name {stem:?}"
+            ));
+        }
+        check_name(&name)?;
+        let schedule = Schedule::from_fields(file.every.as_deref(), file.cron.as_deref())?;
+        if file.connector.use_.is_empty() {
+            return Err("connector.use is required".into());
+        }
+        if !crate::connector::is_available(&file.connector.use_) {
+            return Err(format!(
+                "connector {:?} is not available (only the built-in clock exists until plugins ship)",
+                file.connector.use_
+            ));
+        }
+        let d = file.dispatch;
+        if d.prompt.trim().is_empty() {
+            return Err("dispatch.prompt is required".into());
+        }
+        if d.worktree && d.repo.is_none() {
+            return Err("dispatch.worktree = true needs dispatch.repo".into());
+        }
+        for (field, text) in [
+            ("prompt", Some(d.prompt.as_str())),
+            ("branch", d.branch.as_deref()),
+            ("repo", d.repo.as_deref()),
+        ] {
+            let Some(text) = text else { continue };
+            for path in
+                template::placeholders(text).map_err(|e| format!("dispatch.{field}: {e}"))?
+            {
+                let known = path.starts_with("item.") || path == "job.name" || path == "task.id";
+                if !known {
+                    return Err(format!(
+                        "dispatch.{field}: unknown placeholder {{{{ {path} }}}}; use item.*, job.name or task.id"
+                    ));
+                }
+            }
+        }
+        let timeout = match d.timeout.as_deref() {
+            Some(t) => parse_duration(t).map_err(|e| format!("dispatch.timeout: {e}"))?,
+            None => {
+                parse_duration(&defaults.timeout).map_err(|e| format!("defaults.timeout: {e}"))?
+            }
+        };
+        let backfill = match d.backfill.as_deref() {
+            Some(b) => parse_duration(b).map_err(|e| format!("dispatch.backfill: {e}"))?,
+            None => Duration::ZERO,
+        };
+        let max_tasks_per_run = d.max_tasks_per_run.unwrap_or(defaults.max_tasks_per_run);
+        if max_tasks_per_run == 0 {
+            return Err("dispatch.max_tasks_per_run must be at least 1".into());
+        }
+        let connector_config =
+            serde_json::to_value(&file.connector.config).map_err(|e| e.to_string())?;
+        Ok(Job {
+            name,
+            schedule,
+            enabled: file.enabled,
+            connector: file.connector.use_,
+            connector_config,
+            prompt: d.prompt,
+            max_tasks_per_run,
+            backfill,
+            spec: DispatchSpec {
+                agent: d.agent.unwrap_or_else(|| defaults.agent.clone()),
+                agent_args: d.agent_args,
+                repo: d.repo,
+                worktree: d.worktree,
+                branch: d.branch,
+                machine: d.machine,
+                tags: d.tags,
+                timeout_secs: timeout.as_secs(),
+            },
+        })
+    }
+}
+
+/// Job names appear in `tasks.job`, in `{{ job.name }}` and, from plan 3, as a
+/// directory under the state dir, so they are kept to a safe alphabet. `run`
+/// is what one-off tasks carry in `tasks.job`.
+fn check_name(name: &str) -> Result<(), String> {
+    let first_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let rest_ok = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c));
+    if !(first_ok && rest_ok && name.len() <= 64) {
+        return Err(format!(
+            "job name {name:?} must match [a-z0-9][a-z0-9_.-]{{0,63}}"
+        ));
+    }
+    if name == "run" {
+        return Err("job name \"run\" is reserved for one-off tasks".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub enum Loaded {
+    // Boxed: `Invalid`'s two `String`s would otherwise force every `Loaded`
+    // (including the common `Invalid` case) to be sized for the much larger
+    // `Job`.
+    Valid(Box<Job>),
+    Invalid { name: String, error: String },
+}
+
+impl Loaded {
+    pub fn name(&self) -> &str {
+        match self {
+            Loaded::Valid(j) => &j.name,
+            Loaded::Invalid { name, .. } => name,
+        }
+    }
+}
+
+pub fn job_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.toml"))
+}
+
+/// Every `*.toml` in `dir`, sorted by name, each valid or invalid with its
+/// reason. A missing directory is simply no jobs.
+pub fn load_dir(dir: &Path, defaults: &Defaults) -> anyhow::Result<Vec<Loaded>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        out.push(load_file(&path, stem, defaults));
+    }
+    out.sort_by(|a, b| a.name().cmp(b.name()));
+    Ok(out)
+}
+
+pub fn load_file(path: &Path, stem: &str, defaults: &Defaults) -> Loaded {
+    let parsed = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| Job::parse(&text, stem, defaults));
+    match parsed {
+        Ok(job) => Loaded::Valid(Box::new(job)),
+        Err(error) => Loaded::Invalid {
+            name: stem.to_string(),
+            error,
+        },
+    }
+}
+
+/// `pastor job enable|disable`: rewrite the top-level `enabled` line (or insert
+/// one before the first table) and nothing else, so comments and layout the
+/// user wrote survive. The result must still parse or the file is left alone.
+pub fn set_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let line = format!("enabled = {enabled}");
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    let mut top_level = true;
+    for l in text.lines() {
+        let t = l.trim_start();
+        if t.starts_with('[') {
+            top_level = false;
+        }
+        let is_enabled_key = t
+            .strip_prefix("enabled")
+            .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if top_level && !replaced && is_enabled_key {
+            out.push(line.clone());
+            replaced = true;
+        } else {
+            out.push(l.to_string());
+        }
+    }
+    if !replaced {
+        // Insert before whatever ends the top-level block first: a table
+        // header, or the blank line conventionally left before one. Inserting
+        // only before the header would land the new key after that blank
+        // line, inside what reads as the table's own paragraph.
+        let at = out
+            .iter()
+            .position(|l| l.trim().is_empty() || l.trim_start().starts_with('['))
+            .unwrap_or(out.len());
+        out.insert(at, line);
+    }
+    let mut new_text = out.join("\n");
+    if text.ends_with('\n') || !text.is_empty() {
+        new_text.push('\n');
+    }
+    // A syntax check only: full `JobFile` validation would reject unrelated
+    // fields the user has every right to keep (e.g. a `dispatch` key pastor
+    // does not know yet), which is not what "leave a broken edit alone" means.
+    toml::from_str::<toml::Value>(&new_text)
+        .with_context(|| format!("{} would not parse after the edit", path.display()))?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &new_text).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SPEC_EXAMPLE: &str = r#"
+name = "support-slack"
+every = "5m"
+enabled = true
+
+[connector]
+use = "clock"
+channel = "C0123ABC"
+
+[dispatch]
+agent = "claude"
+agent_args = []
+repo = "~/work/support"
+worktree = true
+branch = "pastor/{{ item.key }}"
+tags = ["fast"]
+timeout = "2h"
+max_tasks_per_run = 5
+backfill = "0s"
+prompt = """
+New message in #support from {{ item.author }}:
+
+{{ item.text }}
+
+Investigate, fix if it is a bug, and write your answer to REPLY.md.
+"""
+"#;
+
+    fn defaults() -> Defaults {
+        Defaults::default()
+    }
+
+    #[test]
+    fn parses_the_spec_example() {
+        let job = Job::parse(SPEC_EXAMPLE, "support-slack", &defaults()).unwrap();
+        assert_eq!(job.name, "support-slack");
+        assert_eq!(job.schedule, Schedule::Every(Duration::from_secs(300)));
+        assert!(job.enabled);
+        assert_eq!(job.connector, "clock");
+        assert_eq!(job.connector_config["channel"], "C0123ABC");
+        assert!(
+            job.connector_config.get("use").is_none(),
+            "use is not config"
+        );
+        assert_eq!(job.spec.agent, "claude");
+        assert_eq!(job.spec.repo.as_deref(), Some("~/work/support"));
+        assert!(job.spec.worktree);
+        assert_eq!(job.spec.branch.as_deref(), Some("pastor/{{ item.key }}"));
+        assert_eq!(job.spec.tags, vec!["fast"]);
+        assert_eq!(job.spec.timeout_secs, 7200);
+        assert_eq!(job.max_tasks_per_run, 5);
+        assert_eq!(job.backfill, Duration::ZERO);
+        assert!(job.prompt.contains("{{ item.author }}"));
+    }
+
+    #[test]
+    fn a_connector_without_a_plugin_is_invalid_for_now() {
+        let text = SPEC_EXAMPLE.replace("use = \"clock\"", "use = \"slack\"");
+        let err = Job::parse(&text, "support-slack", &defaults()).unwrap_err();
+        assert!(err.contains("slack"), "{err}");
+        assert!(err.contains("not available"), "{err}");
+    }
+
+    #[test]
+    fn exactly_one_schedule_and_name_must_match_stem() {
+        let both = SPEC_EXAMPLE.replace("every = \"5m\"", "every = \"5m\"\ncron = \"* * * * *\"");
+        assert!(
+            Job::parse(&both, "support-slack", &defaults())
+                .unwrap_err()
+                .contains("not both")
+        );
+        let neither = SPEC_EXAMPLE.replace("every = \"5m\"\n", "");
+        assert!(
+            Job::parse(&neither, "support-slack", &defaults())
+                .unwrap_err()
+                .contains("every or cron")
+        );
+        let err = Job::parse(SPEC_EXAMPLE, "other", &defaults()).unwrap_err();
+        assert!(err.contains("does not match the file name"), "{err}");
+        // No name: the stem is the name.
+        let unnamed = SPEC_EXAMPLE.replace("name = \"support-slack\"\n", "");
+        assert_eq!(
+            Job::parse(&unnamed, "anything-9", &defaults())
+                .unwrap()
+                .name,
+            "anything-9"
+        );
+    }
+
+    #[test]
+    fn defaults_fill_agent_timeout_and_max_tasks() {
+        let text = r#"
+every = "1h"
+[connector]
+use = "clock"
+[dispatch]
+prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
+"#;
+        let d = Defaults {
+            agent: "codex".into(),
+            max_tasks_per_run: 2,
+            timeout: "30m".into(),
+        };
+        let job = Job::parse(text, "hourly", &d).unwrap();
+        assert_eq!(job.spec.agent, "codex");
+        assert_eq!(job.max_tasks_per_run, 2);
+        assert_eq!(job.spec.timeout_secs, 1800);
+        assert!(job.enabled, "enabled defaults to true");
+        assert!(!job.spec.worktree);
+        assert_eq!(job.connector_config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn rejects_bad_names_templates_and_shapes() {
+        let base = |name: &str, extra: &str| {
+            format!(
+                "name = \"{name}\"\nevery = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        for (name, needle) in [
+            ("run", "reserved"),
+            ("Upper", "must match"),
+            ("-x", "must match"),
+            ("a b", "must match"),
+        ] {
+            let err = Job::parse(&base(name, ""), name, &defaults()).unwrap_err();
+            assert!(err.contains(needle), "{name}: {err}");
+        }
+        let err = Job::parse(
+            &base("ok", "branch = \"pastor/{{ job.nope }}\"\n"),
+            "ok",
+            &defaults(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("dispatch.branch") && err.contains("job.nope"),
+            "{err}"
+        );
+        let err =
+            Job::parse(&base("ok", "repo = \"{{ item.repo \"\n"), "ok", &defaults()).unwrap_err();
+        assert!(
+            err.contains("dispatch.repo") && err.contains("unterminated"),
+            "{err}"
+        );
+        let err = Job::parse(&base("ok", "worktree = true\n"), "ok", &defaults()).unwrap_err();
+        assert!(err.contains("needs dispatch.repo"), "{err}");
+        let err =
+            Job::parse(&base("ok", "max_tasks_per_run = 0\n"), "ok", &defaults()).unwrap_err();
+        assert!(err.contains("max_tasks_per_run"), "{err}");
+        let err = Job::parse(&base("ok", "colour = \"blue\"\n"), "ok", &defaults()).unwrap_err();
+        assert!(
+            err.contains("colour"),
+            "unknown keys must be reported: {err}"
+        );
+        let err = Job::parse(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"  \"\n",
+            "ok",
+            &defaults(),
+        )
+        .unwrap_err();
+        assert!(err.contains("prompt is required"), "{err}");
+    }
+
+    #[test]
+    fn load_dir_sorts_and_reports_invalid_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("jobs");
+        assert!(
+            load_dir(&dir, &defaults()).unwrap().is_empty(),
+            "missing dir is no jobs"
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            job_path(&dir, "zeta"),
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"z\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            job_path(&dir, "alpha"),
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"a\"\n",
+        )
+        .unwrap();
+        std::fs::write(job_path(&dir, "broken"), "every = \"1h\"\n[connector\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+        let loaded = load_dir(&dir, &defaults()).unwrap();
+        assert_eq!(
+            loaded.iter().map(Loaded::name).collect::<Vec<_>>(),
+            vec!["alpha", "broken", "zeta"]
+        );
+        let Loaded::Invalid { error, .. } = &loaded[1] else {
+            panic!("broken must be invalid")
+        };
+        assert!(!error.is_empty());
+        assert!(matches!(&loaded[0], Loaded::Valid(j) if j.prompt == "a"));
+    }
+
+    #[test]
+    fn set_enabled_rewrites_one_line_and_keeps_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("j.toml");
+        // `enabled_looking` is a decoy: a sub-table key that merely starts
+        // with "enabled", to prove the top-level-only line match isn't fooled
+        // by a prefix. It sits under [connector], which accepts arbitrary
+        // connector-specific keys; [dispatch] has a closed, known field set
+        // and would reject it as unknown, which is not what this test is
+        // about.
+        let original = "# my job\nname = \"j\"\nevery = \"1h\"   # hourly\nenabled = true\n\n[connector]\nuse = \"clock\"\nenabled_looking = 1\n\n[dispatch]\nprompt = \"p\"\n";
+        std::fs::write(&path, original).unwrap();
+        set_enabled(&path, false).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            original.replace("enabled = true", "enabled = false"),
+            "only the top-level enabled line changes"
+        );
+        assert!(Job::parse(&text, "j", &defaults()).is_ok());
+        assert!(!Job::parse(&text, "j", &defaults()).unwrap().enabled);
+
+        // Absent: inserted before the first table so it stays top-level.
+        let without = "name = \"k\"\nevery = \"1h\"\n\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n";
+        std::fs::write(&path, without).unwrap();
+        set_enabled(&path, false).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "name = \"k\"\nevery = \"1h\"\nenabled = false\n\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n"
+        );
+        set_enabled(&path, true).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("enabled = true\n")
+        );
+
+        // A file that would not parse after the edit is left untouched.
+        std::fs::write(&path, "every = \"1h\"\n[connector\n").unwrap();
+        assert!(set_enabled(&path, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "every = \"1h\"\n[connector\n"
+        );
+    }
+}
