@@ -5,8 +5,10 @@ tasks while your laptop is closed. It sits on top of [herdr](https://herdr.dev):
 herdr owns the terminals and the agents, pastor owns the fleet and the
 bookkeeping. When you open the laptop you attach to the panes through herdr.
 
-Status: core only. One-off tasks work end to end. Scheduled jobs, connector
-plugins and systemd setup are the next milestones; see
+Status: core and jobs. `pastor serve`, the head, runs one-off tasks and
+scheduled jobs end to end with the built-in `clock` connector. Connector
+plugins, event hooks and systemd setup are the next milestones; see the
+design spec on the `docs` branch,
 `docs/superpowers/specs/2026-09-23-pastor-design.md`.
 
 ## How it works
@@ -42,6 +44,24 @@ when it's not (`list` says so on stderr); `attach` always reads the store
 directly, since it only needs the task's machine and agent name to hand off
 to `ssh`/`herdr`.
 
+Jobs are one TOML file each in `~/.config/pastor/jobs/`. On every `tick` the
+daemon re-reads files that changed (a file that stops parsing keeps its last
+good version and shows the error in `pastor job list`), asks each due job's
+connector for items, drops keys it has seen before, renders `prompt`, `repo`
+and `branch` with `{{ item.* }}`, `{{ job.name }}` and `{{ task.id }}`, and
+queues one task per new item up to `max_tasks_per_run`. The rest stay unseen
+for the next run. A job never overlaps itself; `pastor job run <name>` fires
+one regardless. `every = "5m"` or `cron = "*/5 9-18 * * 1-5"` (local time)
+says when. The only connector today is `clock`, one item per run keyed by the
+run time; jobs that name another connector are `invalid` until plugins ship.
+A failed connector backs the job off, one minute doubling to an hour, and
+keeps its cursor.
+
+A machine whose requests answer but whose event subscription will not open is
+`polling`: it still takes tasks and is reconciled every `tick`. Two dispatch
+passes never run at once, and a task moves from `queued` to `starting` with a
+conditional update, so a machine is never given more than `max_agents`.
+
 `pastor list` shows every task except closed ones, including blocked, stale
 and failed tasks; `--all` adds closed tasks back, and `--blocked`/`--done`
 narrow to just those. `pastor task read t-1` fetches recent output from the
@@ -72,6 +92,20 @@ pastor machine add here --local
 pastor machine status                  # ssh, herdr version, protocol
 pastor serve &                       # or run it under systemd later
 pastor run "Fix the flaky test in ci.yml" --repo ~/work/api --machine pi-3
+mkdir -p ~/.config/pastor/jobs
+cat > ~/.config/pastor/jobs/hourly.toml <<'EOF'
+every = "1h"
+[connector]
+use = "clock"
+[dispatch]
+repo = "~/work/api"
+prompt = "It is {{ item.key }}. Run the test suite and fix what broke. Task {{ task.id }}."
+EOF
+pastor job list                      # picked up at the next tick
+pastor tick --dry-run --job hourly   # what a run would create, without creating it
+pastor job run hourly                # fire it now
+pastor list --job hourly
+pastor job disable hourly
 pastor list
 pastor task read t-1                 # recent pane output, without attaching
 pastor attach t-1                    # lands in the agent's pane; ctrl+b q detaches
@@ -91,8 +125,9 @@ pastor serve
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, defaults (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, defaults (all optional)
 ~/.config/pastor/flock.toml       machines
+~/.config/pastor/jobs/<name>.toml one job per file
 ~/.local/state/pastor/pastor.db   tasks
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
