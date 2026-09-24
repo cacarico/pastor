@@ -16,7 +16,7 @@ connection and then closes it, so pastor opens a connection per request: an
 `ssh` running `herdr --session <s> remote-api-bridge`, which pipes herdr's
 socket protocol over stdio. Those connections are cheap because all of a
 machine's share one multiplexed ssh master
-(`ControlMaster=auto`, `ControlPath=~/.local/state/pastor/ssh/<machine>.sock`,
+(`ControlMaster=auto`, `ControlPath=~/.local/state/pastor/ssh/<machine>-%C`,
 `ControlPersist=600`), so only the first one authenticates. A master lingers for
 up to 10 minutes after `pastor serve` exits; end one by hand with `ssh -O exit -o
 ControlPath=~/.local/state/pastor/ssh/<machine>-%C <target>`. Alongside them each

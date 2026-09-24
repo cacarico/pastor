@@ -229,9 +229,13 @@ pub async fn connect(ep: &Endpoint) -> Result<Connection, ConnectError> {
             control_path,
         } => {
             // The master socket lives here; ssh creates the socket itself but not
-            // the directory, and it must not be world-readable.
+            // the directory, and it must not be world-readable. The path is in
+            // ssh's escaped form (`%%` for a literal `%`), so undo that before
+            // touching the filesystem or a `%` in the state dir would create one
+            // directory while ssh looks for another.
             if let Some(parent) = control_path.as_ref().and_then(|p| p.parent()) {
-                crate::config::create_private_dir(parent).map_err(|e| ConnectError {
+                let literal = PathBuf::from(parent.to_string_lossy().replace("%%", "%"));
+                crate::config::create_private_dir(&literal).map_err(|e| ConnectError {
                     message: e.to_string(),
                 })?;
             }
