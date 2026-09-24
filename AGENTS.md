@@ -56,6 +56,8 @@ them too; they are repeated here because getting them wrong cost a day.
 
 - `make check` is the gate: fmt check, clippy with warnings as errors, the
   full suite. Run it before every commit. `make help` lists the rest.
+- CI (`.github/workflows/ci.yml`) runs `make check` and `make test-machine`
+  on every pull request and on pushes to `main`.
 - Nothing in the suite talks to a real herdr. `make smoke SESSION=s` runs the
   opt-in test against one on the same host; do it on a fleet machine before
   trusting a change to the transport or dispatch.
