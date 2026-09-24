@@ -573,6 +573,21 @@ fn herdr_flag_adds_and_removes_the_saved_machine_too() {
     );
 }
 
+/// The default action is part of the command's own help, not only the README.
+#[test]
+fn setup_systemd_help_names_the_default_action() {
+    let out = pastor()
+        .args(["setup", "systemd", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("With no action flag") && help.contains("enable --now"),
+        "{help}"
+    );
+}
+
 /// `--yes`/`-y` installs with no prompt, so setup runs from a script, a task
 /// or `ssh host pastor setup systemd --yes`. Stdin here is not a terminal.
 #[test]
