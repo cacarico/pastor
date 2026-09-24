@@ -7,3 +7,6 @@ version = "0.1.0"
 [connector]
 mode = "stream"
 command = ["sh", "stream.sh"]
+
+[secrets.FIXTURE_TOKEN]
+description = "Echoed in a log record so redaction can be checked"

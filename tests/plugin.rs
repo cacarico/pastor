@@ -111,9 +111,14 @@ async fn a_poll_connector_gets_the_handshake_and_its_lines_are_parsed() {
         out.logs[1],
         format!("debug: env echo support {}", cwd.display())
     );
+    assert_eq!(
+        out.logs[2], "info: logging token [redacted:FIXTURE_TOKEN]",
+        "protocol log records are redacted like stderr"
+    );
+    assert!(!out.logs.iter().any(|l| l.contains("tok-sekrit-42")));
     let skipped: Vec<&String> = out.logs.iter().filter(|l| l.starts_with("warn:")).collect();
     assert_eq!(skipped.len(), 3, "{:?}", out.logs);
-    assert!(skipped[0].contains("line 4") && skipped[0].contains("not JSON"));
+    assert!(skipped[0].contains("line 5") && skipped[0].contains("not JSON"));
 
     let logs = env.logs("support");
     assert_eq!(logs.len(), 1);
@@ -123,7 +128,7 @@ async fn a_poll_connector_gets_the_handshake_and_its_lines_are_parsed() {
         logs[0]
     );
     assert!(!logs[0].contains("tok-sekrit-42"));
-    assert!(logs[0].contains("[pastor: skipped stdout line 4: not JSON"));
+    assert!(logs[0].contains("[pastor: skipped stdout line 5: not JSON"));
     assert!(logs[0].ends_with("[pastor: exit 0]\n"), "{}", logs[0]);
     assert!(env.paths.plugin_state_dir("support").is_dir());
 }
@@ -199,10 +204,20 @@ async fn drain_until(
 #[tokio::test]
 async fn a_stream_stays_up_and_each_run_drains_what_it_emitted() {
     let env = env_with(&["stream"]);
+    env.dotenv("stream", "FIXTURE_TOKEN=tok-stream-77\n");
     let src = process::source(env.plugin("stream"), env.paths.clone(), Some("s".into()));
     let cfg = json!({"room": "r1"});
     let (keys, cursors, logs) = drain_until(src.as_ref(), &cfg, 1).await;
     assert_eq!(keys, vec!["start-1"]);
+    assert!(
+        logs.iter()
+            .any(|l| l == "info: logging token [redacted:FIXTURE_TOKEN]"),
+        "stream log records are redacted: {logs:?}"
+    );
+    assert!(
+        !logs.iter().any(|l| l.contains("tok-stream-77")),
+        "{logs:?}"
+    );
     assert!(
         logs.iter()
             .any(|l| l.contains(r#""config":{"room":"r1"}"#) && l.contains(r#""cursor":"cur-0""#)),

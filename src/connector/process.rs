@@ -77,7 +77,9 @@ impl Collected {
             None => {}
             Some(Line::Item(item)) => self.out.items.push(item),
             Some(Line::Cursor(c)) => self.out.cursor = Some(c),
-            Some(Line::Log(l)) => self.out.logs.push(l),
+            // Log records reach the scheduler's log and `plugin run`, so they
+            // get the same redaction as stderr.
+            Some(Line::Log(l)) => self.out.logs.push(lock(log).redact(&l)),
             Some(Line::Bad(why)) => {
                 let note = format!("skipped stdout line {}: {why}", self.n);
                 lock(log).line(&format!("[pastor: {note}]"));
@@ -217,17 +219,66 @@ pub const STREAM_BACKOFF_MAX: Duration = Duration::from_secs(300);
 pub const STREAM_HEALTHY_AFTER: Duration = Duration::from_secs(60);
 /// Items held between drains; beyond it the oldest are dropped and logged.
 pub const STREAM_BUFFER_MAX: usize = 10_000;
+/// Log lines held between drains; beyond it the oldest are dropped, counted
+/// in one note.
+pub const STREAM_LOG_MAX: usize = 1000;
 
 #[derive(Default)]
 struct Buffer {
-    items: Vec<Item>,
+    items: std::collections::VecDeque<Item>,
+    items_dropped: usize,
     /// The newest cursor since the last drain, handed to the scheduler.
     cursor: Option<String>,
     /// The newest cursor ever seen: what a restart hands back.
     latest_cursor: Option<String>,
-    logs: Vec<String>,
+    logs: std::collections::VecDeque<String>,
+    logs_dropped: usize,
     /// Why the stream is not running right now, if it is not.
     down: Option<String>,
+}
+
+/// A stream can run for days between two drains of an infrequent job, so
+/// both queues are bounded and overflow is one counter each, not a line per
+/// dropped entry.
+impl Buffer {
+    fn push_item(&mut self, item: Item) {
+        if self.items.len() >= STREAM_BUFFER_MAX {
+            self.items.pop_front();
+            self.items_dropped += 1;
+        }
+        self.items.push_back(item);
+    }
+
+    fn push_log(&mut self, line: String) {
+        if self.logs.len() >= STREAM_LOG_MAX {
+            self.logs.pop_front();
+            self.logs_dropped += 1;
+        }
+        self.logs.push_back(line);
+    }
+
+    /// Everything since the last drain, overflow notes first.
+    fn drain(&mut self) -> RunOutput {
+        let mut logs = Vec::with_capacity(self.logs.len() + 2);
+        if self.logs_dropped > 0 {
+            logs.push(format!(
+                "warn: {} stream log lines dropped (buffer holds {STREAM_LOG_MAX})",
+                std::mem::take(&mut self.logs_dropped)
+            ));
+        }
+        if self.items_dropped > 0 {
+            logs.push(format!(
+                "warn: stream buffer full ({STREAM_BUFFER_MAX}); dropped the {} oldest items",
+                std::mem::take(&mut self.items_dropped)
+            ));
+        }
+        logs.extend(self.logs.drain(..));
+        RunOutput {
+            items: self.items.drain(..).collect(),
+            cursor: self.cursor.take(),
+            logs,
+        }
+    }
 }
 
 struct Running {
@@ -321,13 +372,10 @@ impl ItemSource for StreamSource {
                 && let Some(why) = b.down.clone()
             {
                 b.logs.clear();
+                b.logs_dropped = 0;
                 return Err(why);
             }
-            Ok(RunOutput {
-                items: std::mem::take(&mut b.items),
-                cursor: b.cursor.take(),
-                logs: std::mem::take(&mut b.logs),
-            })
+            Ok(b.drain())
         })
     }
 }
@@ -351,24 +399,16 @@ async fn supervise(runner: Runner, first: RunInput, buffer: Arc<Mutex<Buffer>>, 
                     let mut b = lock(&buffer);
                     match parse_line(raw) {
                         None => {}
-                        Some(Line::Item(item)) => {
-                            if b.items.len() >= STREAM_BUFFER_MAX {
-                                b.items.remove(0);
-                                b.logs.push(format!(
-                                    "warn: stream buffer full ({STREAM_BUFFER_MAX}); dropped the oldest item"
-                                ));
-                            }
-                            b.items.push(item);
-                        }
+                        Some(Line::Item(item)) => b.push_item(item),
                         Some(Line::Cursor(c)) => {
                             b.latest_cursor = Some(c.clone());
                             b.cursor = Some(c);
                         }
-                        Some(Line::Log(l)) => b.logs.push(l),
+                        Some(Line::Log(l)) => b.push_log(lock(&line_log).redact(&l)),
                         Some(Line::Bad(why)) => {
                             let note = format!("skipped stdout line {n}: {why}");
                             lock(&line_log).line(&format!("[pastor: {note}]"));
-                            b.logs.push(format!("warn: {note}"));
+                            b.push_log(format!("warn: {note}"));
                         }
                     }
                 })
@@ -386,7 +426,7 @@ async fn supervise(runner: Runner, first: RunInput, buffer: Arc<Mutex<Buffer>>, 
         tracing::warn!(plugin = %runner.plugin.id, job = ?runner.job, %reason, retry_in = ?backoff, "stream connector restarting");
         {
             let mut b = lock(&buffer);
-            b.logs.push(format!(
+            b.push_log(format!(
                 "warn: {reason}; restarting in {}s",
                 backoff.as_secs_f32()
             ));
@@ -400,6 +440,37 @@ async fn supervise(runner: Runner, first: RunInput, buffer: Arc<Mutex<Buffer>>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stream_buffer_caps_logs_and_items_with_one_note_each() {
+        let mut b = Buffer::default();
+        for i in 0..STREAM_LOG_MAX + 5 {
+            b.push_log(format!("info: line {i}"));
+        }
+        for i in 0..STREAM_BUFFER_MAX + 3 {
+            b.push_item(Item::new(format!("k{i}"), serde_json::Map::new()));
+        }
+        let out = b.drain();
+        assert_eq!(out.items.len(), STREAM_BUFFER_MAX);
+        assert_eq!(out.items[0].key, "k3", "the oldest items go");
+        assert_eq!(out.logs.len(), STREAM_LOG_MAX + 2, "the cap plus two notes");
+        assert_eq!(
+            out.logs[0],
+            "warn: 5 stream log lines dropped (buffer holds 1000)"
+        );
+        assert_eq!(
+            out.logs[1],
+            "warn: stream buffer full (10000); dropped the 3 oldest items"
+        );
+        assert_eq!(out.logs[2], "info: line 5", "the newest logs are kept");
+        assert_eq!(
+            out.logs.last().unwrap(),
+            &format!("info: line {}", STREAM_LOG_MAX + 4)
+        );
+        // The counters start over after a drain.
+        b.push_log("info: again".into());
+        assert_eq!(b.drain().logs, vec!["info: again"]);
+    }
 
     #[test]
     fn parses_the_three_line_types() {
