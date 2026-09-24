@@ -84,6 +84,69 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// `pastor task show`: every field a human asks about one task, one per line,
+/// then the prompt. The agent args are shell-quoted, so the line reads as the
+/// command herdr runs.
+pub fn task_detail(t: &Task) -> String {
+    let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
+    let when = |v: Option<chrono::DateTime<Utc>>| {
+        v.map(|at| format!("{} ({} ago)", at.format("%Y-%m-%d %H:%M:%S UTC"), age(at)))
+            .unwrap_or_else(|| "-".into())
+    };
+    let args = if t.spec.agent_args.is_empty() {
+        "-".to_string()
+    } else {
+        t.spec
+            .agent_args
+            .iter()
+            .map(|a| crate::herdr::shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut repo = opt(&t.spec.repo);
+    if t.spec.worktree {
+        repo.push_str(" (worktree");
+        if let Some(b) = &t.spec.branch {
+            repo.push_str(&format!(", branch {b}"));
+        }
+        repo.push(')');
+    }
+    let tags = if t.spec.tags.is_empty() {
+        "-".to_string()
+    } else {
+        t.spec.tags.join(",")
+    };
+    let mut fields = vec![
+        ("id", t.display_id()),
+        ("state", t.state.to_string()),
+        ("job", t.job.clone()),
+        ("machine", opt(&t.machine)),
+        ("agent", t.spec.agent.clone()),
+        ("agent args", args),
+        ("repo", repo),
+        ("tags", tags),
+        ("timeout", format!("{}s", t.spec.timeout_secs)),
+        ("pane", opt(&t.pane_id)),
+        ("created", when(Some(t.created_at))),
+        ("started", when(t.started_at)),
+        ("finished", when(t.finished_at)),
+    ];
+    if let Some(e) = &t.error {
+        fields.push(("error", e.clone()));
+    }
+    let mut out: Vec<String> = fields
+        .into_iter()
+        .map(|(k, v)| format!("{:<12}{v}", format!("{k}:")))
+        .collect();
+    out.push("prompt:".into());
+    out.extend(
+        t.prompt
+            .lines()
+            .map(|l| format!("  {l}").trim_end().to_string()),
+    );
+    out.join("\n")
+}
+
 pub const TASK_HEADER: [&str; 7] = ["ID", "STATE", "MACHINE", "AGENT", "JOB", "AGE", "NOTE"];
 
 pub fn machine_rows(ms: &[MachineStatus]) -> Vec<Vec<String>> {
@@ -174,6 +237,67 @@ pub fn run_rows(runs: &[JobRunReport]) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task_with(spec: crate::task::DispatchSpec) -> Task {
+        let now = Utc::now();
+        Task {
+            id: 3,
+            job: "run".into(),
+            item: serde_json::Value::Null,
+            prompt: "fix it\nthen stop".into(),
+            spec,
+            machine: Some("pi-3".into()),
+            workspace_id: Some("w1".into()),
+            pane_id: Some("w1:p1".into()),
+            agent_name: Some("t-3".into()),
+            state: crate::task::TaskState::Running,
+            error: None,
+            last_completion_seq: None,
+            prompt_pending: false,
+            created_at: now,
+            started_at: Some(now),
+            finished_at: None,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn task_detail_prints_the_agent_args_shell_quoted() {
+        let spec = crate::task::DispatchSpec {
+            agent: "claude".into(),
+            agent_args: vec![
+                "--model".into(),
+                "claude-opus-5-5".into(),
+                "--append-system-prompt".into(),
+                "be brief".into(),
+            ],
+            repo: Some("~/work/api".into()),
+            worktree: true,
+            branch: Some("pastor/t-3".into()),
+            machine: None,
+            tags: vec!["fast".into()],
+            timeout_secs: 7200,
+        };
+        let out = task_detail(&task_with(spec.clone()));
+        assert!(
+            out.contains("agent args: --model claude-opus-5-5 --append-system-prompt 'be brief'"),
+            "{out}"
+        );
+        assert!(out.contains("agent:      claude"), "{out}");
+        assert!(
+            out.contains("repo:       ~/work/api (worktree, branch pastor/t-3)"),
+            "{out}"
+        );
+        assert!(out.contains("machine:    pi-3"), "{out}");
+        assert!(out.ends_with("prompt:\n  fix it\n  then stop"), "{out}");
+        assert!(!out.contains("error:"), "{out}");
+
+        let bare = task_detail(&task_with(crate::task::DispatchSpec {
+            agent_args: vec![],
+            ..spec
+        }));
+        assert!(bare.contains("agent args: -"), "{bare}");
+    }
 
     #[test]
     fn table_aligns_and_trims() {
