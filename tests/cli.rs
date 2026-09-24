@@ -1,4 +1,5 @@
 //! Drives the real binaries: pastor serve with a fake-herdr machine, then run/list/task.
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -473,6 +474,99 @@ fn herdr_flag_adds_and_removes_the_saved_machine_too() {
         std::fs::read_to_string(config.join("flock.toml"))
             .unwrap()
             .contains("name = \"boom\"")
+    );
+}
+
+#[test]
+fn setup_systemd_confirmation_accepts_and_installs() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    let xdg = tmp.path().join("xdg");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = tmp.path().join("systemctl.log");
+    std::fs::write(
+        bin.join("systemctl"),
+        format!("#!/bin/sh\necho \"$@\" >> {}\n", calls.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        bin.join("loginctl"),
+        "#!/bin/sh\nif [ \"$1\" = show-user ]; then echo Linger=yes; fi\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        bin.join("systemctl"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("loginctl"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut child = pastor()
+        .args(["setup", "systemd"])
+        .env("PATH", &path)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"yes\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        xdg.join("systemd/user/pastor.service").exists(),
+        "confirmation should install the unit"
+    );
+    let calls = std::fs::read_to_string(calls).unwrap();
+    assert!(calls.contains("--user daemon-reload"), "{calls}");
+    assert!(
+        calls.contains("--user enable --now pastor.service"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn setup_systemd_confirmation_rejects_before_mutating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    let xdg = tmp.path().join("xdg");
+    let mut child = pastor()
+        .args(["setup", "systemd"])
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"no\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("aborted"));
+    assert!(
+        !xdg.join("systemd/user/pastor.service").exists(),
+        "rejection must not write the unit"
+    );
+    assert!(
+        !config.exists() && !state.exists(),
+        "rejection must happen before permission hardening mutates paths"
     );
 }
 
