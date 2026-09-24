@@ -67,6 +67,9 @@ struct State {
     /// herdr's `next_agent_state_change_seq`: one counter for the whole server,
     /// bumped on every agent state change and stamped on the agent that changed.
     seq: u64,
+    /// Closed just before the next `events.subscribe` that names it (see
+    /// `close_pane_before_subscribe`).
+    close_before_subscribe: Option<String>,
 }
 
 /// herdr 0.9.1 derives `agent_status` from a detected state (idle, working,
@@ -265,6 +268,21 @@ impl FakeHerdr {
     /// The pane goes away, as when a human closes it. Its workspace had only
     /// this pane, so it closes too, the way herdr closes a workspace whose
     /// last pane closes.
+    /// The pane closes just before the next `events.subscribe` that names it
+    /// arrives, so that subscribe is refused: the race of a pane that goes
+    /// away between the `agent.list` that found it and the subscription.
+    pub fn close_pane_before_subscribe(&self, pane_id: &str) {
+        self.state.lock().unwrap().close_before_subscribe = Some(pane_id.into());
+    }
+
+    /// Does the fake have this pane: a workspace's root pane, or one with an
+    /// agent on it.
+    fn has_pane(s: &State, pane_id: &str) -> bool {
+        let ws = pane_id.split(':').next().unwrap_or("");
+        s.agents.contains_key(pane_id)
+            || (pane_id.ends_with(":p1") && s.workspaces.contains_key(ws))
+    }
+
     pub fn close_pane(&self, pane_id: &str) {
         let ws = pane_id.split(':').next().unwrap_or("w1").to_string();
         {
@@ -359,6 +377,34 @@ impl FakeHerdr {
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
+            let named = |pane: &str| subs.iter().any(|sub| sub["pane_id"] == pane);
+            let vanish = {
+                let mut s = self.state.lock().unwrap();
+                match s.close_before_subscribe.take() {
+                    Some(pane) if named(&pane) => Some(pane),
+                    other => {
+                        s.close_before_subscribe = other;
+                        None
+                    }
+                }
+            };
+            if let Some(pane) = vanish {
+                self.close_pane(&pane);
+            }
+            // herdr 0.9.1 refuses a subscription to a pane it does not have
+            // under `<id>:sub:<index>:probe`, then closes the connection.
+            let refused = {
+                let s = self.state.lock().unwrap();
+                subs.iter().enumerate().find_map(|(i, sub)| {
+                    let pane = sub["pane_id"].as_str()?;
+                    (!Self::has_pane(&s, pane)).then(|| (i, pane.to_string()))
+                })
+            };
+            if let Some((i, pane)) = refused {
+                let err = json!({"id": format!("{}:sub:{i}:probe", req.id), "error": {"code": "pane_not_found", "message": format!("pane {pane} not found")}});
+                let _ = writer.write_all(format!("{err}\n").as_bytes()).await;
+                return;
+            }
             let mut rx = self.events.subscribe();
             let ack = json!({"id": req.id, "result": {"type": "subscription_started"}});
             if writer
@@ -834,6 +880,35 @@ mod tests {
     /// The request log is written when a request is received, not when its
     /// connection ends: `events.subscribe` holds its connection open for as
     /// long as the subscription lives, and a hung request never ends at all.
+    /// As herdr 0.9.1 does: a subscription to a pane it does not have is an
+    /// API error, and `close_pane_before_subscribe` makes a known pane one.
+    #[tokio::test]
+    async fn subscribe_refuses_a_pane_it_does_not_have() {
+        let fake = FakeHerdr::new();
+        let Err(err) = fake
+            .subscribe(vec![super::super::subscription_agent_status("w9:p1")])
+            .await
+        else {
+            panic!("subscribed to a missing pane")
+        };
+        assert_eq!(err.code(), Some("pane_not_found"), "{err:?}");
+
+        let ws = fake.workspace_create(None, "x").await.unwrap();
+        let pane = ws.root_pane.pane_id;
+        fake.close_pane_before_subscribe(&pane);
+        fake.subscribe(vec![super::super::subscription_lifecycle("pane.closed")])
+            .await
+            .expect("a subscribe that does not name the pane is untouched");
+        let Err(err) = fake
+            .subscribe(vec![super::super::subscription_agent_status(&pane)])
+            .await
+        else {
+            panic!("subscribed to a pane that closed")
+        };
+        assert_eq!(err.code(), Some("pane_not_found"), "{err:?}");
+        assert!(fake.workspaces().is_empty());
+    }
+
     #[tokio::test]
     async fn request_log_lists_a_subscribe_while_it_is_still_open() {
         let tmp = tempfile::tempdir().unwrap();

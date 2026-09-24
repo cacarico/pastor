@@ -177,7 +177,11 @@ impl Connection {
                 Some(Incoming::Response(Response::Success { id: rid, .. })) if rid == id => {
                     return Ok(());
                 }
-                Some(Incoming::Response(Response::Error { id: rid, error })) if rid == id => {
+                // herdr 0.9.1 refuses one subscription (a pane it does not
+                // have) under `<id>:sub:<index>:probe`, then closes.
+                Some(Incoming::Response(Response::Error { id: rid, error }))
+                    if rid == id || rid.starts_with(&format!("{id}:sub:")) =>
+                {
                     return Err(HerdrError::Api {
                         code: error.code,
                         message: error.message,
@@ -570,6 +574,33 @@ mod tests {
         assert!(ev.is_pane_closed());
         let err = stream.next().await.unwrap_err();
         assert_eq!(err.code(), Some("events_lost"));
+        server.await.unwrap();
+    }
+
+    /// herdr 0.9.1 refuses a subscription to a pane it does not have with an
+    /// error whose id is `<request id>:sub:<index>:probe`, then closes the
+    /// connection. That is an API error, not a dead machine.
+    #[tokio::test]
+    async fn subscribe_maps_a_refused_subscription_to_an_api_error() {
+        let (client, mut sr, mut sw) = pipe();
+        let server = tokio::spawn(async move {
+            let mut line = String::new();
+            sr.read_line(&mut line).await.unwrap();
+            let req: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.method, "events.subscribe");
+            sw.write_all(format!("{{\"id\":\"{}:sub:1:probe\",\"error\":{{\"code\":\"pane_not_found\",\"message\":\"pane w9:p1 not found\"}}}}\n", req.id).as_bytes()).await.unwrap();
+            sw.shutdown().await.unwrap();
+        });
+        let Err(err) = client
+            .subscribe(vec![
+                super::super::subscription_lifecycle("pane.closed"),
+                super::super::subscription_agent_status("w9:p1"),
+            ])
+            .await
+        else {
+            panic!("subscribed")
+        };
+        assert_eq!(err.code(), Some("pane_not_found"), "{err:?}");
         server.await.unwrap();
     }
 
