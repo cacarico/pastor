@@ -14,7 +14,7 @@ schedule (`every`/`cron`), the built-in `clock` connector behind the
 `ItemSource` seam, the seen-store and per-job state (schema v2), templates,
 the scheduler as its own task with one dispatch lock, SQL task claims and
 optimistic `update_task`, the `polling` channel state, readiness from herdr's
-launch flags, and `job list|enable|disable|run`, `tick`, `reload`.
+launch flags, and `task run|list`, `job list|enable|disable|run|reload`, `tick`.
 
 Plans 3 and 4 are not written yet:
 
@@ -104,7 +104,7 @@ Plan 4 (cleanup and lifecycle):
 - `apply` overwrites `finished_at` on `done -> closed`.
 - `flock.toml` and `pastor.toml` do not reload; a machine added with `pastor
   machine add` needs a daemon restart. Job files do reload.
-- `pastor run --worktree` without `--repo` is accepted by the CLI and queued,
+- `pastor task run --worktree` without `--repo` is accepted by the CLI and queued,
   and only fails at dispatch. Reject it in the CLI (clap `requires`) and in
   `Run`.
 - `machine add --command` is greedy (`num_args = 1..`): options placed after
@@ -114,7 +114,7 @@ Plan 4 (cleanup and lifecycle):
   `workspace.create` behaviour and fail the task if the cwd is wrong.
 - Claude Code's "trust this folder" dialog blocks every agent started in a
   folder it has not seen, on a fresh machine, until answered once per
-  machine; pastor cannot answer it, so use `pastor attach` to answer it by
+  machine; pastor cannot answer it, so use `pastor task attach` to answer it by
   hand, or document a one-time `claude` run per repo per machine.
 - The Pis lack git and lingering, and herdr's server does not survive a
   reboot: start it with `herdr server`; a systemd user unit needs
@@ -128,7 +128,7 @@ Plan 4 (cleanup and lifecycle):
 - `pastor open` should detect a nested herdr and say so instead of herdr
   refusing to start.
 - The whole dispatch pass runs under the fleet lock, so slow agent readiness
-  delays `job list`, `tick`, `reload` and `run` too. Move readiness waits out
+  delays `job list`, `tick`, `job reload` and `task run` too. Move readiness waits out
   of the lock.
 
 Not yet assigned a plan:

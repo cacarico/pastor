@@ -29,11 +29,7 @@ struct Cli {
 enum Command {
     /// Run the daemon: scheduler, machine channels, dispatch
     Serve,
-    /// Create a one-off task and dispatch it
-    Run(RunArgs),
-    /// List live tasks across the flock; --all adds finished ones
-    List(ListArgs),
-    /// Inspect a task
+    /// Manage tasks
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
@@ -43,14 +39,10 @@ enum Command {
         #[command(subcommand)]
         cmd: MachineCmd,
     },
-    /// Attach to a task's agent terminal (ctrl+b q detaches)
-    Attach { task: String },
     /// Open the full herdr UI on a machine
     Open { machine: String },
     /// Run one scheduler pass now and report what it did
     Tick(TickArgs),
-    /// Re-read the job files now instead of at the next tick
-    Reload,
     /// Manage jobs (files in ~/.config/pastor/jobs/)
     Job {
         #[command(subcommand)]
@@ -86,16 +78,14 @@ enum JobCmd {
         #[arg(long)]
         json: bool,
     },
-    Enable {
-        name: String,
-    },
-    Disable {
-        name: String,
-    },
+    /// Enable a job file
+    Enable { name: String },
+    /// Disable a job file
+    Disable { name: String },
     /// Fire a job now, ignoring its schedule, the overlap rule and `enabled`
-    Run {
-        name: String,
-    },
+    Run { name: String },
+    /// Re-read the job files now instead of at the next tick
+    Reload,
 }
 
 #[derive(Args, Debug)]
@@ -148,16 +138,24 @@ struct ListArgs {
 
 #[derive(Subcommand, Debug)]
 enum TaskCmd {
+    /// Create a one-off task and dispatch it
+    Run(RunArgs),
+    /// List live tasks across the flock; --all adds finished ones
+    List(ListArgs),
+    /// Show one task row
     Show {
         task: String,
         #[arg(long)]
         json: bool,
     },
+    /// Read recent output from a task's pane
     Read {
         task: String,
         #[arg(long, default_value_t = 40)]
         lines: u32,
     },
+    /// Attach to a task's agent terminal (ctrl+b q detaches)
+    Attach { task: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -213,14 +211,10 @@ fn main() {
     let result = rt.block_on(async {
         match cli.command {
             Command::Serve => pastor::daemon::serve(paths).await,
-            Command::Run(args) => run(&paths, args).await,
-            Command::List(args) => list(&paths, args).await,
             Command::Task { cmd } => task(&paths, cmd).await,
             Command::Machine { cmd } => machine(&paths, cmd).await,
-            Command::Attach { task } => attach(&paths, &task).await,
             Command::Open { machine } => open(&paths, &machine).await,
             Command::Tick(args) => tick(&paths, args).await,
-            Command::Reload => reload(&paths).await,
             Command::Job { cmd } => job(&paths, cmd).await,
             Command::Completions { shell } => {
                 let mut cmd = <Cli as clap::CommandFactory>::command();
@@ -305,7 +299,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What `pastor run`'s flags ask for, with pastor.toml's `[defaults]` filling
+/// What `pastor task run`'s flags ask for, with pastor.toml's `[defaults]` filling
 /// in what they leave out.
 fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> {
     let timeout = a
@@ -427,7 +421,7 @@ fn machine_status_row(
 }
 
 /// The states a task can be in while it still needs pastor or a human:
-/// what `pastor list` shows by default. Done, failed, stale and closed tasks
+/// what `pastor task list` shows by default. Done, failed, stale and closed tasks
 /// are finished; they appear only with `--all` (or `--done` for done ones).
 const LIVE_STATES: [TaskState; 4] = [
     TaskState::Queued,
@@ -436,7 +430,7 @@ const LIVE_STATES: [TaskState; 4] = [
     TaskState::Blocked,
 ];
 
-/// The states `pastor list` selects, `None` meaning all of them. `--blocked`
+/// The states `pastor task list` selects, `None` meaning all of them. `--blocked`
 /// and `--done` are single-state views, `--all` is everything, and no flag is
 /// the live tasks. `--job` and `--machine` narrow whichever set this picks.
 fn list_states(a: &ListArgs) -> Option<Vec<TaskState>> {
@@ -455,7 +449,7 @@ fn list_states(a: &ListArgs) -> Option<Vec<TaskState>> {
 /// view hides anything a user might be looking for.
 fn list_empty_hint(a: &ListArgs) -> Option<&'static str> {
     (list_states(a).as_deref() == Some(&LIVE_STATES[..]))
-        .then_some("no live tasks; pastor list --all shows finished ones")
+        .then_some("no live tasks; pastor task list --all shows finished ones")
 }
 
 async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
@@ -503,6 +497,8 @@ fn task_id(s: &str) -> i64 {
 
 async fn task(paths: &Paths, cmd: TaskCmd) -> anyhow::Result<()> {
     match cmd {
+        TaskCmd::Run(args) => run(paths, args).await?,
+        TaskCmd::List(args) => list(paths, args).await?,
         TaskCmd::Show { task, json } => {
             let id = task_id(&task);
             let t = if daemon_running(&paths.socket_file()).await {
@@ -536,6 +532,7 @@ async fn task(paths: &Paths, cmd: TaskCmd) -> anyhow::Result<()> {
             };
             print!("{text}");
         }
+        TaskCmd::Attach { task } => attach(paths, &task).await?,
     }
     Ok(())
 }
@@ -957,6 +954,7 @@ async fn job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
             };
             println!("{msg}");
         }
+        JobCmd::Reload => reload(paths).await?,
     }
     Ok(())
 }
@@ -988,10 +986,12 @@ mod tests {
     use super::*;
 
     fn run_args(argv: &[&str]) -> RunArgs {
-        let mut full = vec!["pastor", "run"];
+        let mut full = vec!["pastor", "task", "run"];
         full.extend_from_slice(argv);
         match Cli::try_parse_from(full).unwrap().command {
-            Command::Run(a) => a,
+            Command::Task {
+                cmd: TaskCmd::Run(a),
+            } => a,
             other => panic!("{other:?}"),
         }
     }
@@ -1044,10 +1044,12 @@ mod tests {
     }
 
     fn list_args(argv: &[&str]) -> ListArgs {
-        let mut full = vec!["pastor", "list"];
+        let mut full = vec!["pastor", "task", "list"];
         full.extend_from_slice(argv);
         match Cli::try_parse_from(full).unwrap().command {
-            Command::List(a) => a,
+            Command::Task {
+                cmd: TaskCmd::List(a),
+            } => a,
             other => panic!("{other:?}"),
         }
     }
@@ -1141,7 +1143,7 @@ mod tests {
     fn empty_default_list_points_at_all() {
         assert_eq!(
             list_empty_hint(&list_args(&[])),
-            Some("no live tasks; pastor list --all shows finished ones")
+            Some("no live tasks; pastor task list --all shows finished ones")
         );
         assert_eq!(
             list_empty_hint(&list_args(&["--json"])),
@@ -1203,25 +1205,25 @@ mod tests {
             }
         }
 
-        let e = err(&["pastor", "list", "--blocked", "--done"]);
+        let e = err(&["pastor", "task", "list", "--blocked", "--done"]);
         assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict);
         assert_eq!(e.exit_code(), 2);
 
         assert_eq!(
-            err(&["pastor", "list", "--blocked", "--all"]).kind(),
+            err(&["pastor", "task", "list", "--blocked", "--all"]).kind(),
             clap::error::ErrorKind::ArgumentConflict
         );
         assert_eq!(
-            err(&["pastor", "list", "--done", "--all"]).kind(),
+            err(&["pastor", "task", "list", "--done", "--all"]).kind(),
             clap::error::ErrorKind::ArgumentConflict
         );
 
         // Each flag alone, and none of them, must still parse.
         for args in [
-            vec!["pastor", "list"],
-            vec!["pastor", "list", "--blocked"],
-            vec!["pastor", "list", "--done"],
-            vec!["pastor", "list", "--all"],
+            vec!["pastor", "task", "list"],
+            vec!["pastor", "task", "list", "--blocked"],
+            vec!["pastor", "task", "list", "--done"],
+            vec!["pastor", "task", "list", "--all"],
         ] {
             if let Err(e) = Cli::try_parse_from(&args) {
                 panic!("{args:?}: {e}");
@@ -1315,11 +1317,11 @@ mod tests {
         for args in [
             vec!["pastor", "tick"],
             vec!["pastor", "tick", "--dry-run", "--job", "a", "--json"],
-            vec!["pastor", "reload"],
             vec!["pastor", "job", "list", "--json"],
             vec!["pastor", "job", "enable", "a"],
             vec!["pastor", "job", "disable", "a"],
             vec!["pastor", "job", "run", "a"],
+            vec!["pastor", "job", "reload"],
         ] {
             if let Err(e) = Cli::try_parse_from(&args) {
                 panic!("{args:?}: {e}");
@@ -1327,6 +1329,27 @@ mod tests {
         }
         assert_eq!(
             Cli::try_parse_from(["pastor", "job", "enable"])
+                .unwrap_err()
+                .exit_code(),
+            2
+        );
+    }
+
+    #[test]
+    fn task_commands_parse_under_task() {
+        for args in [
+            vec!["pastor", "task", "run", "hi"],
+            vec!["pastor", "task", "list", "--json"],
+            vec!["pastor", "task", "show", "t-1"],
+            vec!["pastor", "task", "read", "t-1"],
+            vec!["pastor", "task", "attach", "t-1"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(&args) {
+                panic!("{args:?}: {e}");
+            }
+        }
+        assert_eq!(
+            Cli::try_parse_from(["pastor", "run", "hi"])
                 .unwrap_err()
                 .exit_code(),
             2

@@ -38,9 +38,9 @@ The CLI talks to `pastor serve` over a unix socket (`pastor.sock`) with
 newline-delimited JSON; each response is `{"kind": ..., "data": ...}`.
 `pastor serve` refuses to start if a daemon already holds that socket, or if
 something answers it but not a ping within 2 seconds — it only removes and
-replaces a socket file whose connection is refused. `list` and `task show`
+replaces a socket file whose connection is refused. `task list` and `task show`
 read from `pastor serve` when it's running and fall back to the SQLite store
-when it's not (`list` says so on stderr); `attach` always reads the store
+when it's not (`task list` says so on stderr); `task attach` always reads the store
 directly, since it only needs the task's machine and agent name to hand off
 to `ssh`/`herdr`.
 
@@ -62,7 +62,7 @@ A machine whose requests answer but whose event subscription will not open is
 passes never run at once, and a task moves from `queued` to `starting` with a
 conditional update, so a machine is never given more than `max_agents`.
 
-`pastor list` shows live tasks only: queued, starting, running and blocked.
+`pastor task list` shows live tasks only: queued, starting, running and blocked.
 Finished ones (done, failed, stale, closed) appear with `--all`, and an empty
 default list says so on stderr. `--blocked` and `--done` narrow to just that
 state, `--job` and `--machine` narrow whichever set is shown, and `--json`
@@ -109,7 +109,7 @@ A record, which is also what plugin event hooks will get on stdin:
 - `task`: the full task row (the same object as `pastor task show --json`) at
   that moment, on `task.*` events; `null` otherwise or if the row is gone.
 - `job`: the job name. For a task event it is the task's `job` (`run` for a
-  one-off `pastor run` task); for `job.failed`, the job that failed.
+  one-off `pastor task run` task); for `job.failed`, the job that failed.
 - `machine`: on `machine.*` events, the machine's status as `pastor machine
   list --json` shows it (`name`, `endpoint`, `channel`, `herdr_version`,
   `protocol`, `error`, `live`, `max_agents`, `tags`); `null` on other events.
@@ -132,9 +132,9 @@ make install                         # pastor and fake-herdr into ~/.cargo/bin
 pastor machine add pi-3 fleet@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
 pastor machine add here --local
 pastor machine status                  # ssh, herdr version, protocol
-pastor setup systemd                 # pastor serve as a user service; or `pastor serve &`
-pastor run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
-pastor run "Review the open PR" --agent-arg=--model --agent-arg=claude-opus-5-5
+pastor setup systemd                 # confirm, then install and enable --now; or `pastor serve &`
+pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
+pastor task run "Review the open PR" --agent-arg=--model --agent-arg=claude-opus-5-5
 mkdir -p ~/.config/pastor/jobs
 cat > ~/.config/pastor/jobs/hourly.toml <<'EOF'
 every = "1h"
@@ -147,11 +147,11 @@ EOF
 pastor job list                      # picked up at the next tick
 pastor tick --dry-run --job hourly   # what a run would create, without creating it
 pastor job run hourly                # fire it now
-pastor list --job hourly             # live tasks only
+pastor task list --job hourly        # live tasks only
 pastor job disable hourly
-pastor list --all                    # finished tasks too
+pastor task list --all               # finished tasks too
 pastor task read t-1                 # recent pane output, without attaching
-pastor attach t-1                    # lands in the agent's pane; ctrl+b q detaches
+pastor task attach t-1               # lands in the agent's pane; ctrl+b q detaches
 pastor open pi-3                     # the full herdr UI on that machine
 pastor events --follow               # task, job and machine events as they happen
 ```
@@ -164,7 +164,7 @@ expands it to the head's home first. A `command` machine cannot report a home,
 and neither can one whose shell has no absolute `$HOME`; give those absolute
 paths.
 
-`pastor run` takes `--repo`, `--machine`, `--agent`, `--agent-arg`,
+`pastor task run` takes `--repo`, `--machine`, `--agent`, `--agent-arg`,
 `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
 `--timeout` and `--json`. `--agent-arg` hands one argument to the agent,
 through herdr's `agent.start`; repeat it for more, in order. It always takes the
@@ -191,17 +191,19 @@ pastor serve
 ## Run under systemd
 
 `pastor setup systemd` installs `contrib/systemd/pastor.service` to
-`~/.config/systemd/user/` and runs `systemctl --user enable --now` on it.
+`~/.config/systemd/user/`, shows what it will do, and only continues after you
+type `yes`. With no action flag it runs `systemctl --user enable --now` on the
+unit. `--enable`, `--start`, `--enable --now`, `--enable --start` and `--stop`
+map to the same `systemctl --user` actions after the unit is written.
 `pastor setup systemd --herdr` does the same with `herdr.service` (the herdr
-server) and belongs on every machine in the flock. Both units restart on
-failure and log to the journal (`journalctl --user -u pastor`). Setup points
-`ExecStart` at the binary it finds (the running pastor, or `herdr` on PATH)
-and copies your shell's `PATH` into the unit, so `ssh`, `herdr` and the agents
-resolve under systemd the way they do in a terminal; re-run it after moving a
-binary. A unit that differs from what setup would write is kept as
-`<unit>.service.bak`, and a running service is not restarted, since
-restarting herdr stops its agents: run `systemctl --user restart pastor`
-(or `herdr`) yourself.
+server) and belongs on every machine in the flock. Both units restart on failure
+and log to the journal (`journalctl --user -u pastor`). Setup points `ExecStart`
+at the binary it finds (the running pastor, or `herdr` on PATH) and copies your
+shell's `PATH` into the unit, so `ssh`, `herdr` and the agents resolve under
+systemd the way they do in a terminal; re-run it after moving a binary. A unit
+that differs from what setup would write is kept as `<unit>.service.bak`, and a
+running service is not restarted, since restarting herdr stops its agents: run
+`systemctl --user restart pastor` (or `herdr`) yourself.
 
 A user service stops at logout unless lingering is on. Setup checks
 `loginctl show-user` and prints `loginctl enable-linger` when it is off.

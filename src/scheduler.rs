@@ -588,7 +588,7 @@ impl Scheduler {
     }
 
     /// Like `reload`, but always re-reads the jobs directory even when the
-    /// fingerprint looks unchanged. What `pastor reload` calls: the fingerprint
+    /// fingerprint looks unchanged. What `pastor job reload` calls: the fingerprint
     /// is a cheap heuristic (mtime and size), not proof nothing changed.
     pub fn force_reload(&mut self) -> bool {
         self.fingerprint = None;
@@ -1817,13 +1817,13 @@ mod tests {
             !s.reload(),
             "nothing changed on disk: an ordinary reload is a no-op"
         );
-        // `SchedulerCommand::Reload` (pastor reload) calls this instead of
+        // `SchedulerCommand::Reload` (pastor job reload) calls this instead of
         // `reload()`, precisely so it is not fooled by an unchanged
         // fingerprint (a symlinked target edited within one mtime granule,
         // for instance).
         assert!(
             s.force_reload(),
-            "pastor reload must force a re-read regardless of the fingerprint"
+            "pastor job reload must force a re-read regardless of the fingerprint"
         );
     }
 

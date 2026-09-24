@@ -14,7 +14,7 @@ use crate::scheduler::{Scheduler, SchedulerHandle};
 use crate::store::{NewTask, Store};
 
 /// The machines plus the one lock every dispatch pass takes. Shared by the
-/// daemon (a `pastor run` dispatches inline) and the scheduler (each tick, and
+/// daemon (a `pastor task run` dispatches inline) and the scheduler (each tick, and
 /// after a job run queues tasks), so two passes never read the same capacity
 /// snapshot and both fill the last slot.
 pub struct Fleet {
@@ -660,7 +660,7 @@ mod tests {
         );
     }
 
-    /// Two passes at once (a tick and a `pastor run`) against one machine with
+    /// Two passes at once (a tick and a `pastor task run`) against one machine with
     /// one free slot: the lock makes the second wait and see the first's task.
     #[tokio::test]
     async fn concurrent_dispatch_passes_do_not_over_dispatch() {
