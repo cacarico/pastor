@@ -464,13 +464,19 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                 ),
                 _ => {}
             }
-            println!("restart pastor serve to pick it up");
+            println!(
+                "{}",
+                flock_edit_hint(daemon_running(&paths.socket_file()).await)
+            );
         }
         FlockCmd::Remove { name, herdr } => {
             let mut f = Flock::load(&path)?;
             anyhow::ensure!(f.remove(&name), "machine {name} not found");
             f.save(&path)?;
-            println!("removed {name}; restart pastor serve to apply");
+            println!(
+                "removed {name}; {}",
+                flock_edit_hint(daemon_running(&paths.socket_file()).await)
+            );
             if herdr {
                 // herdr removes by profile id; the label is all pastor knows.
                 match saved_machine_id(&herdr_cmd(&["machine", "list"]), &name) {
@@ -569,6 +575,17 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// What to do after editing the flock. The daemon reads `flock.toml` only at
+/// start (hot reload is a later plan), so a running one must be restarted;
+/// with none running, "restart" reads as "already picked up" and misleads.
+fn flock_edit_hint(daemon_up: bool) -> &'static str {
+    if daemon_up {
+        "restart pastor serve to pick it up (the flock does not reload while it runs)"
+    } else {
+        "start pastor serve to use it"
+    }
 }
 
 /// Run the local `herdr` CLI and return its stdout. Any failure (not on PATH,
@@ -777,6 +794,19 @@ mod tests {
                 panic!("{args:?}: {e}");
             }
         }
+    }
+
+    /// A flock edit is only picked up by a daemon start. With no daemon
+    /// running there is nothing to restart, and saying so misleads: the
+    /// user reads "restart" as "it is already known". Say start or restart
+    /// depending on what is actually running.
+    #[test]
+    fn flock_edit_hint_matches_daemon_state() {
+        assert_eq!(
+            flock_edit_hint(true),
+            "restart pastor serve to pick it up (the flock does not reload while it runs)"
+        );
+        assert_eq!(flock_edit_hint(false), "start pastor serve to use it");
     }
 
     #[test]
