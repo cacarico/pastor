@@ -51,7 +51,7 @@ connector for items, drops keys it has seen before, renders `prompt`, `repo`
 and `branch` with `{{ item.* }}`, `{{ job.name }}` and `{{ task.id }}`, and
 queues one task per new item up to `max_tasks_per_run`. The rest stay unseen
 for the next run. A job never overlaps itself; `pastor job run <name>` fires
-one regardless. `every = "5m"` or `cron = "*/5 9-18 * * 1-5"` (local time)
+one regardless, and it starts once a run already going has finished. `every = "5m"` or `cron = "*/5 9-18 * * 1-5"` (local time)
 says when. The only connector today is `clock`, one item per run keyed by the
 run time; jobs that name another connector are `invalid` until plugins ship.
 A failed connector backs the job off, one minute doubling to an hour, and

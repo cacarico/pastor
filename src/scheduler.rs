@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::job::{Job, Loaded, load_dir};
@@ -396,6 +396,10 @@ pub struct Scheduler {
     fingerprint: Option<Vec<(PathBuf, Option<SystemTime>, u64)>>,
     /// Runs in progress: a job may appear more than once only through `fire`.
     in_flight: Vec<(String, JoinHandle<JobRunReport>)>,
+    /// One lock per job, held for a whole non-dry run. `run_job` reads the
+    /// job state and later replaces the row; two fired runs of one job must
+    /// not interleave, or the older one finishing last writes stale values.
+    run_locks: HashMap<String, Arc<AsyncMutex<()>>>,
     /// When each job was first loaded; a cron job that never ran is due at its
     /// first occurrence after this.
     first_seen: HashMap<String, DateTime<Utc>>,
@@ -421,6 +425,7 @@ impl Scheduler {
             entries: HashMap::new(),
             fingerprint: None,
             in_flight: Vec::new(),
+            run_locks: HashMap::new(),
             first_seen: HashMap::new(),
             warned_queued: HashSet::new(),
         }
@@ -557,6 +562,10 @@ impl Scheduler {
         }
     }
 
+    fn run_lock(&mut self, name: &str) -> Arc<AsyncMutex<()>> {
+        self.run_locks.entry(name.to_string()).or_default().clone()
+    }
+
     fn is_running(&self, name: &str) -> bool {
         self.in_flight.iter().any(|(n, _)| n == name)
     }
@@ -647,6 +656,8 @@ impl Scheduler {
     }
 
     /// `pastor job run`: now, regardless of schedule, overlap and `enabled`.
+    /// A fire while a run is going queues behind it on the job's run lock,
+    /// so the second run starts from the state the first one saved.
     pub fn fire(&mut self, name: &str, now: DateTime<Utc>) -> Result<String, String> {
         let job = self
             .entries
@@ -654,7 +665,10 @@ impl Scheduler {
             .and_then(|e| e.job.clone())
             .ok_or_else(|| format!("no job named {name:?} (or its file has never parsed)"))?;
         if self.is_running(name) {
-            tracing::info!(job = name, "fired while a previous run is still going");
+            tracing::info!(
+                job = name,
+                "fired while a previous run is still going; it waits for that one"
+            );
         }
         self.start_run(job, now)?;
         Ok(format!("started job {name}"))
@@ -667,8 +681,12 @@ impl Scheduler {
         let fleet = self.fleet.clone();
         let events = self.events.clone();
         let name = job.name.clone();
+        let lock = self.run_lock(&name);
         let handle = tokio::spawn(async move {
-            let report = run_job(&store, &job, source.as_ref(), &events, now, false).await;
+            let report = {
+                let _run = lock.lock().await;
+                run_job(&store, &job, source.as_ref(), &events, now, false).await
+            };
             if !report.created.is_empty() {
                 // Do not wait for the next tick to place what this run queued.
                 fleet.dispatch_queued().await;
@@ -748,6 +766,12 @@ impl Scheduler {
                 r.error = Some(format!("connector {:?} is not available", job.connector));
                 reports.push(r);
                 continue;
+            };
+            // A dry run writes nothing, so it need not wait for a fired run.
+            let lock = (!dry_run).then(|| self.run_locks.entry(name.clone()).or_default().clone());
+            let _run = match &lock {
+                Some(l) => Some(l.lock().await),
+                None => None,
             };
             reports.push(
                 run_job(
@@ -1324,8 +1348,70 @@ mod tests {
             "fire twice: overlap rule does not apply"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the second fire waits for the first on the job's run lock"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "then it runs");
         assert!(s.fire("nope", Utc::now()).unwrap_err().contains("no job"));
+    }
+
+    /// First call is slow and returns cursor `c1`; later calls are instant and
+    /// return `c2`. Records the cursor each call was given.
+    struct SlowThenFast {
+        calls: AtomicUsize,
+        given: Mutex<Vec<Option<String>>>,
+    }
+    impl ItemSource for SlowThenFast {
+        fn id(&self) -> &str {
+            "slow-then-fast"
+        }
+        fn run<'a>(&'a self, input: RunInput) -> RunFuture<'a> {
+            Box::pin(async move {
+                self.given.lock().unwrap().push(input.cursor.clone());
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                Ok(RunOutput {
+                    cursor: Some(if n == 0 { "c1" } else { "c2" }.into()),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_fires_do_not_let_an_older_run_overwrite_state() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let src = Arc::new(SlowThenFast {
+            calls: AtomicUsize::new(0),
+            given: Mutex::new(Vec::new()),
+        });
+        s.set_source_for_tests("stf", src.clone());
+        let mut j = job("j");
+        j.connector = "stf".into();
+        s.set_jobs_for_tests(vec![j]);
+
+        let t1 = Utc::now();
+        let t2 = t1 + chrono::Duration::seconds(1);
+        s.fire("j", t1).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        s.fire("j", t2).unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        assert_eq!(src.calls.load(Ordering::SeqCst), 2, "both fires ran");
+        let st = store.job_state("j").unwrap().unwrap();
+        assert_eq!(st.last_run_at, Some(t2), "the newer run's state stands");
+        assert_eq!(st.cursor.as_deref(), Some("c2"));
+        assert_eq!(
+            src.given.lock().unwrap().clone(),
+            vec![None, Some("c1".into())],
+            "the second run started from the first run's saved state"
+        );
     }
 
     #[tokio::test]
