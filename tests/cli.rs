@@ -305,22 +305,22 @@ fn herdr_flag_adds_and_removes_the_saved_machine_too() {
             .contains("pi-3")
     );
 
-    // Not saved in herdr: the flock edit still happens, a note says so, exit 0.
-    assert!(
-        run(&["machine", "add", "pi-9", "fleet@pi-9"])
-            .status
-            .success()
-    );
+    // Not saved in herdr under that label: the flock edit still happens, a
+    // note says so, exit 0. herdr does know the same host under another label
+    // (`other`, id-1), so the note names it with the command that removes it,
+    // and pastor does not remove it on its own.
+    assert!(run(&["machine", "add", "pi-9", "x@y"]).status.success());
     let out = run(&["machine", "remove", "pi-9", "--herdr"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no saved machine"), "{err}");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no saved machine"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        err.contains("other") && err.contains("herdr machine remove id-1"),
+        "the hint names the saved machine at the same target: {err}"
     );
     assert!(
         !calls()
