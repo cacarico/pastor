@@ -266,3 +266,11 @@ make build            # debug build of both binaries; cargo run -- --help works 
 
 `make check` is what a pull request has to pass. Nothing in the suite talks to
 a real herdr, so run `make smoke` on a fleet machine before trusting it there.
+
+## Open source
+
+- License: Apache License 2.0; see `LICENSE`.
+- Contributing: start with `CONTRIBUTING.md` and `AGENTS.md`.
+- Security: report vulnerabilities privately; see `SECURITY.md`.
+- AI governance: contributor and operator rules live in
+  `docs/AI_GOVERNANCE.md`.
