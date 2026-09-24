@@ -19,6 +19,10 @@ const HERDR_UNIT: &str = include_str!("../contrib/systemd/herdr.service");
 #[derive(clap::Subcommand, Debug)]
 pub enum SetupCmd {
     /// Install and manage a systemd user unit: pastor.service, or herdr.service with --herdr
+    ///
+    /// With no action flag, the unit is installed and then enabled and started
+    /// (`systemctl --user enable --now`). --enable, --start, --enable --start,
+    /// --enable --now and --stop choose a different systemctl action instead.
     Systemd {
         /// Install herdr.service (the herdr server) instead, for a flock machine
         #[arg(long)]
