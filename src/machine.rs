@@ -530,34 +530,24 @@ impl Actor {
     /// lost and reconnect, not just resubscribe. The task's own outcome
     /// (including `Failed`, as `dispatch()` records it) is left to the store.
     async fn run_dispatch(&mut self, task_id: i64) -> (anyhow::Result<Task>, bool) {
-        let mut task = match self.store.get_task(task_id) {
+        // The claim is the `Queued -> Starting` transition done as a conditional
+        // UPDATE: a task another pass already took, or that finished meanwhile,
+        // is simply not claimable. It also persists `machine` and `agent_name`
+        // before the first herdr call, so a daemon crash mid-dispatch leaves a
+        // row `reconcile` can adopt by agent name instead of one that still reads
+        // `Queued` and gets dispatched twice.
+        let mut task = match self.store.claim_task(task_id, &self.name) {
             Ok(Some(t)) => t,
-            Ok(None) => return (Err(anyhow::anyhow!("task {task_id} not found")), false),
+            Ok(None) => {
+                return (
+                    Err(anyhow::anyhow!(
+                        "task t-{task_id} is not queued (already claimed, finished, or unknown)"
+                    )),
+                    false,
+                );
+            }
             Err(e) => return (Err(e), false),
         };
-        if task.state != TaskState::Queued {
-            return (
-                Err(anyhow::anyhow!(
-                    "task {} is {}, not queued",
-                    task.display_id(),
-                    task.state
-                )),
-                false,
-            );
-        }
-        task.machine = Some(self.name.clone());
-        // Persist `Starting` with `machine` and `agent_name` set before the first
-        // herdr call below: a daemon crash mid-dispatch then leaves a row `reconcile`
-        // can find and adopt by agent name on restart, instead of one that still reads
-        // `Queued` (no machine, no pane, no name) and gets dispatched a second time.
-        // `dispatch()` below derives and assigns this same name again; setting it here
-        // too just makes it visible before `dispatch()` runs, not a second identity.
-        task.agent_name = Some(Task::agent_name_for(task.id));
-        task.state = next_state(&task, &Observed::DispatchStarting)
-            .expect("task.state == Queued was just checked above");
-        if let Err(err) = self.store.update_task(&task) {
-            return (Err(err), false);
-        }
         let timeout = self.settings.request_timeout;
         let outcome = match tokio::time::timeout(
             timeout,
@@ -578,7 +568,7 @@ impl Actor {
                 task.state = TaskState::Failed;
                 task.error = Some(message.clone());
                 task.finished_at = Some(Utc::now());
-                if let Err(err) = self.store.update_task(&task) {
+                if let Err(err) = self.store.update_task(&mut task) {
                     return (Err(err), true);
                 }
                 self.emit("task.failed", Some(task.id));
@@ -589,7 +579,7 @@ impl Actor {
             }
         };
         let dead = matches!(&outcome, Err(err) if err.is_transport());
-        if let Err(err) = self.store.update_task(&task) {
+        if let Err(err) = self.store.update_task(&mut task) {
             return (Err(err), dead);
         }
         match outcome {
@@ -699,7 +689,9 @@ impl Actor {
             }
         }
         self.pending_done.remove(&task.id);
-        self.store.update_task(&task)?;
+        // A Conflict here means the row moved on under us; the caller logs it
+        // and the next event or reconcile works from the fresh row.
+        self.store.update_task(&mut task)?;
         self.emit(&format!("task.{}", task.state), Some(task.id));
         self.refresh_live();
         Ok(true)
@@ -771,7 +763,7 @@ impl Actor {
         if to == TaskState::Failed && task.error.is_none() {
             task.error = Some("agent process exited".into());
         }
-        if let Err(err) = self.store.update_task(&task) {
+        if let Err(err) = self.store.update_task(&mut task) {
             tracing::error!(%err, "update task");
             return;
         }
@@ -837,7 +829,7 @@ impl Actor {
                             )
                             .expect("adopting a Starting task always reaches Running");
                         }
-                        if let Err(err) = self.store.update_task(&t) {
+                        if let Err(err) = self.store.update_task(&mut t) {
                             tracing::error!(%err, task = %t.display_id(), "adopt starting task");
                             continue;
                         }
@@ -902,7 +894,7 @@ impl Actor {
                     if timed_out && matches!(task.state, TaskState::Running | TaskState::Blocked) {
                         let mut t = task;
                         t.state = TaskState::Stale;
-                        self.store.update_task(&t)?;
+                        self.store.update_task(&mut t)?;
                         self.emit("task.stale", Some(t.id));
                         continue;
                     }
@@ -1198,7 +1190,7 @@ mod tests {
         wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
         let mut blocked = store.get_task(t.id).unwrap().unwrap();
         blocked.error = Some("agent blocked during startup; answer its prompt".into());
-        store.update_task(&blocked).unwrap();
+        store.update_task(&mut blocked).unwrap();
         fake.set_status(&pane, AgentStatus::Working, None);
         wait_for("running again", || {
             state_of(&store, t.id) == TaskState::Running
@@ -1260,7 +1252,7 @@ mod tests {
         t.machine = Some("m".into());
         t.pane_id = Some("w9:p1".into());
         t.agent_name = Some("t-1".into());
-        store.update_task(&t).unwrap();
+        store.update_task(&mut t).unwrap();
         let (_h, _events) = spawn(&fake, &store);
         wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
         assert!(
@@ -1284,7 +1276,7 @@ mod tests {
         t.pane_id = Some("w9:p1".into());
         t.agent_name = Some("t-1".into());
         t.last_completion_seq = Some(1);
-        store.update_task(&t).unwrap();
+        store.update_task(&mut t).unwrap();
         let (_h, _events) = spawn(&fake, &store);
         wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
         assert!(
@@ -1307,7 +1299,7 @@ mod tests {
         t.machine = Some("m".into());
         t.pane_id = Some(created.root_pane.pane_id.clone());
         t.agent_name = Some("t-1".into());
-        store.update_task(&t).unwrap();
+        store.update_task(&mut t).unwrap();
         let (_h, _events) = spawn(&fake, &store);
         wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
     }
@@ -1336,7 +1328,7 @@ mod tests {
         t.state = TaskState::Starting;
         t.machine = Some("m".into());
         // pane_id, workspace_id and agent_name are all left unset.
-        store.update_task(&t).unwrap();
+        store.update_task(&mut t).unwrap();
         let (_h, _events) = spawn_with_settings(
             &fake,
             &store,
@@ -1386,7 +1378,7 @@ mod tests {
         t.machine = Some("m".into());
         // agent_name is left unset: `reconcile` matches by the name it derives from
         // the task id, not by reading a persisted `agent_name` back.
-        store.update_task(&t).unwrap();
+        store.update_task(&mut t).unwrap();
         let (_h, _events) = spawn(&fake, &store);
         wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
         assert!(
