@@ -199,6 +199,28 @@ fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -
     argv
 }
 
+/// Reads the answer to `REMOTE_HOME_COMMAND`. Only ssh failing to reach the
+/// machine is an error, and so a transport failure; a machine that answered
+/// without a usable home is fine, its home is just unknown.
+fn remote_home(target: &str, out: &std::process::Output) -> Result<Option<String>, ConnectError> {
+    // 255 is ssh's own failure code; no code at all means it was killed.
+    if matches!(out.status.code(), Some(255) | None) {
+        return Err(ConnectError {
+            message: format!(
+                "ssh {target}: {} ({})",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                out.status
+            ),
+        });
+    }
+    let home = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() || !home.starts_with('/') {
+        tracing::warn!(%target, status = %out.status, stdout = %home, "no usable $HOME from the remote shell");
+        return Ok(None);
+    }
+    Ok(Some(home))
+}
+
 /// Asks the remote shell for `$HOME`. ssh is spawned without a local shell, so
 /// this string reaches the remote shell as written and it expands `$HOME`.
 const REMOTE_HOME_COMMAND: &str = "printf %s \"$HOME\"";
@@ -260,17 +282,7 @@ async fn home_dir(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
                 .map_err(|e| ConnectError {
                     message: format!("spawn ssh: {e}"),
                 })?;
-            let home = String::from_utf8_lossy(&out.stdout).into_owned();
-            if !out.status.success() || !home.starts_with('/') {
-                return Err(ConnectError {
-                    message: format!(
-                        "ssh {target}: reading $HOME failed ({}): {}",
-                        out.status,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ),
-                });
-            }
-            Ok(Some(home))
+            remote_home(target, &out)
         }
         // An arbitrary bridge command says nothing about where it lands.
         Endpoint::Command { .. } => Ok(None),
@@ -512,6 +524,34 @@ mod tests {
             argv: vec!["true".into()],
         };
         assert_eq!(command.home_dir().await.unwrap(), None);
+    }
+
+    /// Only ssh itself failing (255, or killed) means the machine was not
+    /// reached. An unset or relative `$HOME`, or a remote command that fails,
+    /// comes from a reachable machine and must not mark it lost.
+    #[test]
+    fn remote_home_separates_unreachable_from_unknown() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"boom".to_vec(),
+        };
+        assert_eq!(
+            remote_home("t", &out(0, "/home/pi")).unwrap(),
+            Some("/home/pi".into())
+        );
+        assert_eq!(remote_home("t", &out(0, "/")).unwrap(), Some("/".into()));
+        assert_eq!(remote_home("t", &out(0, "")).unwrap(), None);
+        assert_eq!(remote_home("t", &out(0, "home/pi")).unwrap(), None);
+        assert_eq!(remote_home("t", &out(1, "")).unwrap(), None);
+        assert!(remote_home("t", &out(255, "")).is_err());
+        let killed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: vec![],
+            stderr: vec![],
+        };
+        assert!(remote_home("t", &killed).is_err());
     }
 
     #[test]

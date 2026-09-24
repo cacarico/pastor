@@ -117,7 +117,8 @@ leading `~` means that machine's home: pastor asks an ssh machine for `$HOME`
 and uses its own for a local one, because herdr takes the path literally and
 opens the pane somewhere else when it does not exist. Quote it, or your shell
 expands it to the head's home first. A `command` machine cannot report a home,
-so give it absolute paths.
+and neither can one whose shell has no absolute `$HOME`; give those absolute
+paths.
 
 Without a real herdr, a fake one speaks the same protocol. It comes in the same
 two pieces the real thing does, because state has to outlive a single request:
