@@ -107,6 +107,10 @@ pub struct Task {
     pub state: TaskState,
     pub error: Option<String>,
     pub last_completion_seq: Option<u64>,
+    /// herdr refused the prompt at dispatch with `agent_blocked`, so the agent
+    /// has never seen it. The machine sends it once the agent leaves `blocked`.
+    #[serde(default)]
+    pub prompt_pending: bool,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -234,6 +238,7 @@ mod tests {
             state,
             error: None,
             last_completion_seq,
+            prompt_pending: false,
             created_at: now,
             started_at: Some(now),
             finished_at: None,

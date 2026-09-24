@@ -365,7 +365,12 @@ Dispatch steps, each its own request on its own connection:
    `agent.list`: the agent exited (usually it is not installed on that machine)
    and the task fails now. Bound elapsed: the task fails, and the message says
    a live agent may still be sitting on that machine. `agent_blocked` marks the
-   task `blocked`, not failed.
+   task `blocked`, not failed, and records the prompt as pending: herdr
+   rejected it without sending input. When the agent next reports a status
+   other than `blocked` or `unknown` (an event, or reconcile), the machine
+   sends the prompt and marks the task `running`; `agent_blocked` or
+   `agent_not_ready` there leaves it pending, any other API error fails the
+   task.
 6. Record ids, mark `running`.
 
 A failing step marks the task `failed` with herdr's error code and message.

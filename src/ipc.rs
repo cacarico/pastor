@@ -199,6 +199,7 @@ mod tests {
             state: crate::task::TaskState::Queued,
             error: None,
             last_completion_seq: None,
+            prompt_pending: false,
             created_at: now,
             started_at: None,
             finished_at: None,

@@ -97,6 +97,7 @@ pub async fn dispatch(
     task.agent_name = Some(name.clone());
     task.state = TaskState::Starting;
     task.error = None;
+    task.prompt_pending = false;
 
     let result = dispatch_steps(conn, task, &name, ready_timeout).await;
     match &result {
@@ -107,6 +108,9 @@ pub async fn dispatch(
         Ok(DispatchOutcome::Blocked) => {
             task.state = TaskState::Blocked;
             task.started_at = Some(Utc::now());
+            // herdr rejected the input rather than queueing it; see
+            // `Task::prompt_pending`.
+            task.prompt_pending = true;
             task.error = Some("agent blocked during startup; answer its prompt".into());
         }
         Err(err) => {
@@ -182,7 +186,8 @@ async fn prompt_when_ready(
         if agent.agent_status != AgentStatus::Unknown {
             match conn.agent_prompt(name, &task.prompt).await {
                 Ok(_) => return Ok(DispatchOutcome::Running),
-                // The agent is up and waiting for a human, not for us.
+                // The agent is up and waiting for a human, not for us. herdr
+                // did not send the prompt; the machine sends it after the block.
                 Err(err) if err.code() == Some("agent_blocked") => {
                     return Ok(DispatchOutcome::Blocked);
                 }
@@ -252,6 +257,7 @@ mod tests {
             state: TaskState::Queued,
             error: None,
             last_completion_seq: None,
+            prompt_pending: false,
             created_at: now,
             started_at: None,
             finished_at: None,

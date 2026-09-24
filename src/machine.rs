@@ -9,11 +9,28 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::MIN_HERDR_PROTOCOL;
 use crate::dispatch::dispatch;
 use crate::herdr::{
-    AgentInfo, Connector, ConnectorExt, EventStream, subscription_agent_status,
-    subscription_lifecycle,
+    AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, EventStream,
+    subscription_agent_status, subscription_lifecycle,
 };
 use crate::store::Store;
 use crate::task::{Observed, Task, TaskState, next_state};
+
+/// A herdr request that got no answer within `request_timeout`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0} timed out after {1:?}")]
+struct TimedOut(&'static str, Duration);
+
+/// Whether an error from the connected loop means the machine is gone. Only a
+/// transport failure or a request that never answered does; a herdr API error
+/// or a local store error leaves the machine reachable, and reporting it as
+/// `machine.lost` would announce an outage that is not happening.
+fn is_outage(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        e.is::<TimedOut>()
+            || e.downcast_ref::<CallError>()
+                .is_some_and(CallError::is_transport)
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -257,9 +274,12 @@ impl Actor {
                 continue;
             }
             if let Err(err) = self.reconcile().await {
-                self.connect_failed(format!("reconcile: {err}"), &mut backoff)
-                    .await;
-                continue;
+                if is_outage(&err) {
+                    self.connect_failed(format!("reconcile: {err}"), &mut backoff)
+                        .await;
+                    continue;
+                }
+                tracing::warn!(machine = %self.name, %err, "reconcile failed; staying connected");
             }
             let mut events = match self.open_events().await {
                 Ok(s) => s,
@@ -306,14 +326,25 @@ impl Actor {
                         }
                     }
                     ev = events.next() => match ev {
-                        Ok(ev) => self.handle_event(&ev),
+                        Ok(ev) => {
+                            if let Err(err) = self.handle_event(&ev).await {
+                                if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "event handling failed"); break; }
+                                tracing::warn!(machine = %self.name, %err, "event handling failed; staying connected");
+                            }
+                        }
                         Err(err) => { tracing::warn!(machine = %self.name, %err, "event stream ended"); break; }
                     },
                     _ = settle_tick.tick() => {
-                        if let Err(err) = self.confirm_pending_done().await { tracing::warn!(machine = %self.name, %err, "settle check failed"); break; }
+                        if let Err(err) = self.confirm_pending_done().await {
+                            if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "settle check failed"); break; }
+                            tracing::warn!(machine = %self.name, %err, "settle check failed; staying connected");
+                        }
                     }
                     _ = reconcile_tick.tick() => {
-                        if let Err(err) = self.reconcile().await { tracing::warn!(machine = %self.name, %err, "reconcile failed"); break; }
+                        if let Err(err) = self.reconcile().await {
+                            if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "reconcile failed"); break; }
+                            tracing::warn!(machine = %self.name, %err, "reconcile failed; staying connected");
+                        }
                     }
                 }
             }
@@ -427,7 +458,7 @@ impl Actor {
         Ok(
             tokio::time::timeout(timeout, self.connector.subscribe(subs))
                 .await
-                .map_err(|_| anyhow::anyhow!("events.subscribe timed out after {timeout:?}"))??,
+                .map_err(|_| TimedOut("events.subscribe", timeout))??,
         )
     }
 
@@ -576,10 +607,12 @@ impl Actor {
         }
     }
 
-    fn handle_event(&mut self, ev: &crate::herdr::Event) {
-        let Some(pane_id) = ev.pane_id() else { return };
+    async fn handle_event(&mut self, ev: &crate::herdr::Event) -> anyhow::Result<()> {
+        let Some(pane_id) = ev.pane_id() else {
+            return Ok(());
+        };
         let Ok(Some(task)) = self.store.find_by_pane(&self.name, pane_id) else {
-            return;
+            return Ok(());
         };
         let observed = if ev.is_pane_closed() {
             Observed::PaneClosed
@@ -593,8 +626,14 @@ impl Actor {
                 completion_seq: None,
             }
         } else {
-            return;
+            return Ok(());
         };
+        if let Observed::Status { status, .. } = &observed
+            && task.prompt_pending
+            && self.deliver_pending_prompt(task.clone(), *status).await?
+        {
+            return Ok(());
+        }
         match &observed {
             Observed::Status {
                 status: crate::herdr::AgentStatus::Idle | crate::herdr::AgentStatus::Done,
@@ -608,6 +647,62 @@ impl Actor {
                 self.apply(task, &observed);
             }
         }
+        Ok(())
+    }
+
+    /// Send the prompt herdr refused at dispatch (see `Task::prompt_pending`)
+    /// once the agent has left `blocked`. Returns whether it dealt with
+    /// `status`; `false` leaves the observation to the usual state machine.
+    ///
+    /// Without this, a human who clears the agent's startup question sees the
+    /// task flip to `running` while the agent sits idle, never having received
+    /// the work it was started for.
+    async fn deliver_pending_prompt(
+        &mut self,
+        mut task: Task,
+        status: AgentStatus,
+    ) -> anyhow::Result<bool> {
+        if matches!(status, AgentStatus::Blocked | AgentStatus::Unknown) {
+            return Ok(false);
+        }
+        let name = task
+            .agent_name
+            .clone()
+            .unwrap_or_else(|| Task::agent_name_for(task.id));
+        let timeout = self.settings.request_timeout;
+        let result =
+            tokio::time::timeout(timeout, self.connector.agent_prompt(&name, &task.prompt))
+                .await
+                .map_err(|_| TimedOut("agent.prompt", timeout))?;
+        match result {
+            Ok(agent) => {
+                task.prompt_pending = false;
+                task.state = TaskState::Running;
+                task.error = None;
+                task.finished_at = None;
+                // Work the agent completed before it had our prompt is not
+                // this task's work: count completions from here on.
+                task.last_completion_seq = agent.completion_seq;
+            }
+            // Blocked again, or between states: the next status event or
+            // reconcile tries again.
+            Err(err) if matches!(err.code(), Some("agent_blocked" | "agent_not_ready")) => {
+                return Ok(true);
+            }
+            Err(err) if err.is_transport() => return Err(err.into()),
+            Err(err) => {
+                task.state = TaskState::Failed;
+                task.error = Some(format!(
+                    "could not send the prompt after the block cleared: {err}"
+                ));
+                task.finished_at = Some(Utc::now());
+            }
+        }
+        self.pending_done.remove(&task.id);
+        self.store.update_task(&task)?;
+        self.emit(&format!("task.{}", task.state), Some(task.id));
+        self.refresh_live();
+        Ok(true)
     }
 
     /// After the settle window, confirm with agent.list that the agent is still idle and
@@ -625,7 +720,7 @@ impl Actor {
         let timeout = self.settings.request_timeout;
         let agents = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
-            .map_err(|_| anyhow::anyhow!("agent.list timed out after {timeout:?}"))??;
+            .map_err(|_| TimedOut("agent.list", timeout))??;
         for id in due {
             self.pending_done.remove(&id);
             let Ok(Some(task)) = self.store.get_task(id) else {
@@ -691,7 +786,7 @@ impl Actor {
         let timeout = self.settings.request_timeout;
         let agents: Vec<AgentInfo> = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
-            .map_err(|_| anyhow::anyhow!("agent.list timed out after {timeout:?}"))??;
+            .map_err(|_| TimedOut("agent.list", timeout))??;
         for task in self.store.tasks_on_machine(&self.name)? {
             let Some(pane_id) = task.pane_id.clone() else {
                 // Only a `Starting` task can occupy a pane slot with no pane recorded
@@ -791,6 +886,15 @@ impl Actor {
                     self.apply(t, &Observed::PaneExited);
                 }
                 Some(agent) => {
+                    // Before the timeout check: a task that sat blocked past its
+                    // timeout has not started its work yet.
+                    if task.prompt_pending
+                        && self
+                            .deliver_pending_prompt(task.clone(), agent.agent_status)
+                            .await?
+                    {
+                        continue;
+                    }
                     let timed_out = task
                         .started_at
                         .map(|s| (Utc::now() - s).num_seconds() as u64 > task.spec.timeout_secs)
@@ -989,6 +1093,85 @@ mod tests {
         wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
         wait_for("live 0", || h.snapshot().live == 0).await;
         let _ = h.read(t.id, 10).await.unwrap_err();
+    }
+
+    /// herdr rejects a prompt to a blocked agent instead of queueing it, so a
+    /// task blocked at dispatch has to get its prompt once a human clears the
+    /// block; flipping it to `running` alone leaves the agent with nothing to do.
+    #[tokio::test]
+    async fn a_prompt_refused_at_dispatch_is_sent_when_the_block_clears() {
+        let fake = FakeHerdr::new();
+        fake.set_ready_after(Duration::from_millis(150));
+        let watcher = fake.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(a) = watcher.agents().first() {
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked, None);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(store.get_task(t.id).unwrap().unwrap().prompt_pending);
+        let prompts = || {
+            fake.requests()
+                .iter()
+                .filter(|r| r.method == "agent.prompt")
+                .count()
+        };
+        let refused = prompts();
+
+        // The human answers the agent's startup question; it goes idle.
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle, None);
+        wait_for("running with the prompt sent", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Running && !t.prompt_pending
+        })
+        .await;
+        assert_eq!(
+            prompts(),
+            refused + 1,
+            "the prompt is sent exactly once more"
+        );
+        let t = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.error, None, "the blocked advice is gone");
+        assert_eq!(
+            fake.agents()[0].agent_status,
+            AgentStatus::Working,
+            "the agent took the prompt"
+        );
+    }
+
+    /// A store error in reconcile is pastor's problem, not the machine's: the
+    /// channel stays connected and no `machine.lost` goes out.
+    #[tokio::test]
+    async fn a_local_error_in_reconcile_is_not_an_outage() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        store.execute_raw(&format!(
+            "UPDATE tasks SET machine = 'm', state = 'running', created_at = 'not a date' WHERE id = {}",
+            t.id
+        ));
+        // Several reconcile ticks (200ms each) run into the corrupt row.
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while let Ok(ev) = tokio::time::timeout_at(deadline.into(), events.recv()).await {
+            assert_ne!(ev.unwrap().kind, "machine.lost");
+        }
+        assert_eq!(h.snapshot().channel, ChannelState::Connected);
     }
 
     /// Recovering from `Blocked` must not carry the startup advice onto a task

@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -57,6 +57,7 @@ impl Store {
                 state TEXT NOT NULL,
                 error TEXT,
                 last_completion_seq INTEGER,
+                prompt_pending INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT,
@@ -72,7 +73,15 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        match version.map(|v| v.parse::<i64>().unwrap_or(0)) {
+        // An unreadable version is not an old one: guessing would let the
+        // newer-schema guard below be skipped on a database of unknown shape.
+        let version = version
+            .map(|v| {
+                v.parse::<i64>()
+                    .with_context(|| format!("database schema_version {v:?} is not a number"))
+            })
+            .transpose()?;
+        match version {
             None => {
                 conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
@@ -81,7 +90,14 @@ impl Store {
             }
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) if v < SCHEMA_VERSION => {
-                // Future migrations go here, one `if v < N` block each.
+                // One `if v < N` block per migration. `CREATE TABLE IF NOT
+                // EXISTS` above left an older table as it was.
+                if v < 2 {
+                    conn.execute(
+                        "ALTER TABLE tasks ADD COLUMN prompt_pending INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
                 conn.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -123,7 +139,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE tasks SET machine = ?2, workspace_id = ?3, pane_id = ?4, agent_name = ?5, state = ?6, error = ?7,
-                last_completion_seq = ?8, started_at = ?9, finished_at = ?10, updated_at = ?11, prompt = ?12, spec = ?13
+                last_completion_seq = ?8, started_at = ?9, finished_at = ?10, updated_at = ?11, prompt = ?12, spec = ?13,
+                prompt_pending = ?14
              WHERE id = ?1",
             params![
                 t.id,
@@ -139,6 +156,7 @@ impl Store {
                 Utc::now().to_rfc3339(),
                 t.prompt,
                 serde_json::to_string(&t.spec)?,
+                t.prompt_pending,
             ],
         )?;
         anyhow::ensure!(n == 1, "task {} not found", t.id);
@@ -252,7 +270,10 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         error: row.get("error")?,
         last_completion_seq: row
             .get::<_, Option<i64>>("last_completion_seq")?
-            .map(|v| v as u64),
+            .map(u64::try_from)
+            .transpose()
+            .map_err(conversion_failure)?,
+        prompt_pending: row.get("prompt_pending")?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -423,10 +444,67 @@ mod tests {
         );
         assert!(s.get_task(1).is_err());
 
-        s.execute_raw("UPDATE tasks SET item = '{}' WHERE id = 1");
+        s.execute_raw("UPDATE tasks SET item = '{}', last_completion_seq = -1 WHERE id = 1");
+        assert!(s.get_task(1).is_err());
+
+        s.execute_raw("UPDATE tasks SET last_completion_seq = 3 WHERE id = 1");
+        assert_eq!(s.get_task(1).unwrap().unwrap().last_completion_seq, Some(3));
 
         let t2 = s.insert_task(new_task("run")).unwrap();
         assert!(s.get_task(t2.id).unwrap().is_some());
+    }
+
+    /// A v1 database predates `prompt_pending`; opening it adds the column
+    /// and keeps the rows.
+    #[test]
+    fn a_v1_database_is_migrated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN prompt_pending;
+                 UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let mut t = s.get_task(1).unwrap().unwrap();
+        assert!(!t.prompt_pending);
+        t.prompt_pending = true;
+        s.update_task(&t).unwrap();
+        assert!(s.get_task(1).unwrap().unwrap().prompt_pending);
+    }
+
+    #[test]
+    fn unreadable_schema_version_refuses_to_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        drop(Store::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE meta SET value = 'x' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        let err = Store::open(&path).err().expect("must not open");
+        assert!(err.to_string().contains("not a number"), "error was: {err}");
+        // Left alone for a human to look at, not relabelled as current.
+        let conn = Connection::open(&path).unwrap();
+        let v: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, "x");
     }
 
     #[test]

@@ -27,8 +27,10 @@ herdr holds open. Over these pastor creates a workspace, starts an agent named
 after the task, waits for the agent to come up (herdr's `agent.start` returns
 before it has), sends the prompt, and watches agent status events. An agent that
 never becomes ready within 30s fails the task; one that exits on start fails it
-straight away, usually because the agent is not installed on that machine. Task
-state lives in SQLite under `~/.local/state/pastor/`.
+straight away, usually because the agent is not installed on that machine. An
+agent that is blocked on its own startup question marks the task `blocked`;
+herdr drops the prompt then, so pastor sends it once someone answers and the
+agent leaves `blocked`. Task state lives in SQLite under `~/.local/state/pastor/`.
 
 The CLI talks to `pastor serve` over a unix socket (`pastor.sock`) with
 newline-delimited JSON; each response is `{"kind": ..., "data": ...}`.
