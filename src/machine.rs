@@ -591,13 +591,21 @@ impl Actor {
                     }
                 }
                 _ = poll.tick() => {
+                    // Same rule as the connected loop: only an outage (transport
+                    // failure or a request that never answered) means the machine
+                    // is gone. A herdr API error or a store error is logged and
+                    // the next tick tries again.
                     if let Err(err) = self.reconcile().await {
                         tracing::warn!(machine = %self.name, %err, "poll reconcile failed");
-                        return PollExit::Reconnect(format!("poll reconcile failed: {err}"));
+                        if is_outage(&err) {
+                            return PollExit::Reconnect(format!("poll reconcile failed: {err}"));
+                        }
                     }
                     if let Err(err) = self.confirm_pending_done().await {
                         tracing::warn!(machine = %self.name, %err, "settle check failed");
-                        return PollExit::Reconnect(format!("settle check failed: {err}"));
+                        if is_outage(&err) {
+                            return PollExit::Reconnect(format!("settle check failed: {err}"));
+                        }
                     }
                 }
                 // Only starts a new attempt once the previous one (if any) is
