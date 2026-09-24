@@ -15,7 +15,7 @@ use crate::config::{Paths, create_private_dir};
 const PASTOR_UNIT: &str = include_str!("../contrib/systemd/pastor.service");
 const HERDR_UNIT: &str = include_str!("../contrib/systemd/herdr.service");
 
-#[derive(clap::Subcommand)]
+#[derive(clap::Subcommand, Debug)]
 pub enum SetupCmd {
     /// Install and start a systemd user unit: pastor.service, or herdr.service with --herdr
     Systemd {
