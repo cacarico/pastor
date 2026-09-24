@@ -7,11 +7,15 @@ pub mod env;
 pub mod exec;
 pub mod manifest;
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
+use serde_json::Value;
 
 use crate::config::Paths;
+use crate::connector::{self, Builtins, Catalog, ItemSource};
 use env::Redactor;
 use manifest::{MANIFEST_FILE, Manifest};
 
@@ -141,6 +145,95 @@ impl Plugin {
     }
 }
 
+/// The built-in connectors plus every valid plugin that has a connector,
+/// read once from the plugins dir. Plugins change only through `plugin
+/// install|link|uninstall|unlink`, so a daemon rebuilds this on reload rather
+/// than watching the directory.
+pub struct PluginCatalog {
+    paths: Paths,
+    plugins: BTreeMap<String, Arc<Plugin>>,
+    /// id -> why it is unusable, so a job naming it says so.
+    invalid: BTreeMap<String, String>,
+    /// Sources handed out so far, keyed by (plugin, job): a stream connector
+    /// must be one process however often the scheduler asks for it.
+    sources: Mutex<HashMap<SourceKey, Arc<dyn ItemSource>>>,
+}
+
+/// (plugin id, job name).
+type SourceKey = (String, Option<String>);
+
+impl PluginCatalog {
+    pub fn load(paths: &Paths) -> anyhow::Result<PluginCatalog> {
+        let mut plugins = BTreeMap::new();
+        let mut invalid = BTreeMap::new();
+        for d in discover(paths)? {
+            match d {
+                Discovered::Valid(p) if connector::builtin(&p.id).is_some() => {
+                    invalid.insert(
+                        p.id.clone(),
+                        format!("id {:?} is reserved for the built-in connector", p.id),
+                    );
+                }
+                Discovered::Valid(p) => {
+                    plugins.insert(p.id.clone(), Arc::from(p));
+                }
+                Discovered::Invalid { id, error, .. } => {
+                    invalid.insert(id, error);
+                }
+            }
+        }
+        Ok(PluginCatalog {
+            paths: paths.clone(),
+            plugins,
+            invalid,
+            sources: Mutex::default(),
+        })
+    }
+
+    pub fn plugin(&self, id: &str) -> Option<&Arc<Plugin>> {
+        self.plugins.get(id)
+    }
+
+    /// The source for `id` running on behalf of `job`: `PASTOR_JOB`, the run
+    /// log and the scratch dir are the job's. What the scheduler should use.
+    pub fn source_for_job(&self, id: &str, job: &str) -> Option<Arc<dyn ItemSource>> {
+        self.source_keyed(id, Some(job))
+    }
+
+    fn source_keyed(&self, id: &str, job: Option<&str>) -> Option<Arc<dyn ItemSource>> {
+        if let Some(b) = connector::builtin(id) {
+            return Some(b);
+        }
+        let plugin = self.plugins.get(id)?;
+        plugin.manifest.connector.as_ref()?;
+        let key = (id.to_string(), job.map(str::to_string));
+        let mut sources = self.sources.lock().unwrap_or_else(|p| p.into_inner());
+        let src = sources.entry(key).or_insert_with(|| {
+            connector::process::source(plugin.clone(), self.paths.clone(), job.map(str::to_string))
+        });
+        Some(src.clone())
+    }
+}
+
+impl Catalog for PluginCatalog {
+    fn source(&self, id: &str) -> Option<Arc<dyn ItemSource>> {
+        self.source_keyed(id, None)
+    }
+
+    fn check(&self, id: &str, config: &Value) -> Result<(), String> {
+        if connector::builtin(id).is_some() {
+            return Builtins.check(id, config);
+        }
+        if let Some(p) = self.plugins.get(id) {
+            return p.manifest.check_config(config);
+        }
+        if let Some(why) = self.invalid.get(id) {
+            return Err(format!("plugin {id:?} is invalid: {why}"));
+        }
+        Builtins.check(id, config)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +287,50 @@ mod tests {
             error.contains("does not match the directory name"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_catalog_checks_config_and_reuses_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let root = paths.plugins_dir();
+        write_plugin(
+            &root.join("slack"),
+            "slack",
+            "[connector.config.channel]\nrequired = true\n",
+        );
+        write_plugin(&root.join("clock"), "clock", "");
+        write_plugin(&root.join("broken"), "nope", "");
+        std::fs::create_dir_all(root.join("ntfy")).unwrap();
+        std::fs::write(
+            root.join("ntfy").join(MANIFEST_FILE),
+            "id = \"ntfy\"\nversion = \"0.1.0\"\n[[events]]\non = [\"task.done\"]\ncommand = [\"x\"]\n",
+        )
+        .unwrap();
+        let cat = PluginCatalog::load(&paths).unwrap();
+        let cfg = serde_json::json!({"channel": "C1"});
+        assert!(cat.check("slack", &cfg).is_ok());
+        let err = cat.check("slack", &serde_json::json!({})).unwrap_err();
+        assert!(err.contains("requires connector.channel"), "{err}");
+        assert!(cat.check("clock", &serde_json::json!({})).is_ok());
+        assert_eq!(cat.source("clock").unwrap().id(), "clock");
+        let err = cat.check("broken", &cfg).unwrap_err();
+        assert!(
+            err.contains("is invalid") && err.contains("does not match"),
+            "{err}"
+        );
+        let err = cat.check("ntfy", &cfg).unwrap_err();
+        assert!(err.contains("no connector"), "{err}");
+        assert!(cat.source("ntfy").is_none());
+        let err = cat.check("asana", &cfg).unwrap_err();
+        assert!(err.contains("not available"), "{err}");
+
+        let a = cat.source_for_job("slack", "j1").unwrap();
+        let b = cat.source_for_job("slack", "j1").unwrap();
+        let c = cat.source_for_job("slack", "j2").unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "one source per (plugin, job)");
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(a.id(), "slack");
     }
 
     #[test]
