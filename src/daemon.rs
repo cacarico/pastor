@@ -10,13 +10,87 @@ use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
 use crate::machine::{MachineHandle, MachineSettings, PastorEvent, spawn_machine};
+use crate::scheduler::{Scheduler, SchedulerHandle};
 use crate::store::{NewTask, Store};
+
+/// The machines plus the one lock every dispatch pass takes. Shared by the
+/// daemon (a `pastor run` dispatches inline) and the scheduler (each tick, and
+/// after a job run queues tasks), so two passes never read the same capacity
+/// snapshot and both fill the last slot.
+pub struct Fleet {
+    pub machines: Vec<MachineHandle>,
+    store: Arc<Store>,
+    dispatch_lock: tokio::sync::Mutex<()>,
+}
+
+impl Fleet {
+    pub fn new(machines: Vec<MachineHandle>, store: Arc<Store>) -> Fleet {
+        Fleet {
+            machines,
+            store,
+            dispatch_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&MachineHandle> {
+        self.machines.iter().find(|h| h.name == name)
+    }
+
+    pub fn views(&self) -> Vec<MachineView> {
+        self.machines
+            .iter()
+            .map(|m| {
+                let s = m.snapshot();
+                MachineView {
+                    name: m.name.clone(),
+                    max_agents: m.max_agents,
+                    tags: m.tags.clone(),
+                    live: s.live,
+                    healthy: s.channel.accepts_dispatch(),
+                }
+            })
+            .collect()
+    }
+
+    /// Try to place every queued task, oldest first. Serialised: a pass sees the
+    /// live counts the previous pass left behind, because a machine actor
+    /// refreshes its count before it answers a dispatch (see
+    /// `Actor::handle_command`) and no two passes run at once. The claim inside
+    /// the actor (`Store::claim_task`) is the second line of defence: it makes a
+    /// double dispatch of one task impossible even if this lock were bypassed.
+    pub async fn dispatch_queued(&self) {
+        let _pass = self.dispatch_lock.lock().await;
+        let queued = match self.store.queued_tasks() {
+            Ok(q) => q,
+            Err(err) => {
+                tracing::error!(%err, "list queued");
+                return;
+            }
+        };
+        for task in queued {
+            let Some(name) = pick_machine(&self.views(), &task.spec) else {
+                continue;
+            };
+            let Some(handle) = self.get(&name) else {
+                continue;
+            };
+            match handle.dispatch(task.id).await {
+                Ok(t) => {
+                    tracing::info!(task = %t.display_id(), machine = %name, state = %t.state, "dispatched")
+                }
+                Err(err) => {
+                    tracing::warn!(task = %task.display_id(), machine = %name, %err, "dispatch failed")
+                }
+            }
+        }
+    }
+}
 
 pub struct Daemon {
     paths: Paths,
-    config: PastorConfig,
     store: Arc<Store>,
-    machines: Vec<MachineHandle>,
+    fleet: Arc<Fleet>,
+    scheduler: SchedulerHandle,
     events: broadcast::Sender<PastorEvent>,
 }
 
@@ -66,11 +140,20 @@ impl Daemon {
                 )
             })
             .collect();
+        let fleet = Arc::new(Fleet::new(machines, store.clone()));
+        let scheduler = Scheduler::new(
+            paths.clone(),
+            &config,
+            store.clone(),
+            fleet.clone(),
+            events.clone(),
+        )
+        .spawn();
         Ok(Daemon {
             paths,
-            config,
             store,
-            machines,
+            fleet,
+            scheduler,
             events,
         })
     }
@@ -83,6 +166,12 @@ impl Daemon {
     }
     pub fn subscribe(&self) -> broadcast::Receiver<PastorEvent> {
         self.events.subscribe()
+    }
+    pub fn fleet(&self) -> Arc<Fleet> {
+        self.fleet.clone()
+    }
+    pub fn scheduler(&self) -> SchedulerHandle {
+        self.scheduler.clone()
     }
 
     /// Take ownership of the daemon socket: refuse to steal it from a live or
@@ -147,7 +236,6 @@ impl Daemon {
     pub async fn run_with_listener(self, listener: tokio::net::UnixListener) -> anyhow::Result<()> {
         let socket = self.socket_path();
         let daemon = Arc::new(self);
-        let mut tick = tokio::time::interval(daemon.config.tick_duration());
         let mut events = daemon.events.subscribe();
         loop {
             tokio::select! {
@@ -167,7 +255,6 @@ impl Daemon {
                         let _ = w.write_all(out.as_bytes()).await;
                     });
                 }
-                _ = tick.tick() => daemon.dispatch_queued().await,
                 ev = events.recv() => match ev {
                     Ok(ev) => tracing::info!(kind = %ev.kind, task = ?ev.task_id, machine = ?ev.machine, job = ?ev.job, "pastor event"),
                     Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(n, "event log lagged"),
@@ -189,7 +276,7 @@ impl Daemon {
             },
             IpcRequest::Run { prompt, spec } => {
                 if let Some(m) = &spec.machine
-                    && !self.machines.iter().any(|h| &h.name == m)
+                    && self.fleet.get(m).is_none()
                 {
                     return IpcResponse::error(
                         "unknown_machine",
@@ -205,7 +292,7 @@ impl Daemon {
                     Ok(t) => t,
                     Err(err) => return IpcResponse::error("store_error", err),
                 };
-                self.dispatch_queued().await;
+                self.fleet.dispatch_queued().await;
                 match self.store.get_task(task.id) {
                     Ok(Some(t)) => IpcResponse::Task(t),
                     Ok(None) => IpcResponse::error("task_not_found", task.id),
@@ -227,11 +314,7 @@ impl Daemon {
                     Ok(None) => return IpcResponse::error("task_not_found", format!("t-{id}")),
                     Err(err) => return IpcResponse::error("store_error", err),
                 };
-                let Some(handle) = task
-                    .machine
-                    .as_ref()
-                    .and_then(|m| self.machines.iter().find(|h| &h.name == m))
-                else {
+                let Some(handle) = task.machine.as_ref().and_then(|m| self.fleet.get(m)) else {
                     return IpcResponse::error(
                         "no_machine",
                         format!("t-{id} is not on any machine"),
@@ -243,60 +326,26 @@ impl Daemon {
                 }
             }
             IpcRequest::FlockList => {
-                IpcResponse::Machines(self.machines.iter().map(|m| m.snapshot()).collect())
+                IpcResponse::Machines(self.fleet.machines.iter().map(|m| m.snapshot()).collect())
             }
+            IpcRequest::Tick { job, dry_run } => match self.scheduler.tick(job, dry_run).await {
+                Ok(runs) => IpcResponse::Runs(runs),
+                Err(err) => IpcResponse::error("scheduler_error", err),
+            },
+            IpcRequest::Reload => match self.scheduler.reload().await {
+                Ok(jobs) => IpcResponse::Jobs(jobs),
+                Err(err) => IpcResponse::error("scheduler_error", err),
+            },
+            IpcRequest::JobList => match self.scheduler.job_list().await {
+                Ok(jobs) => IpcResponse::Jobs(jobs),
+                Err(err) => IpcResponse::error("scheduler_error", err),
+            },
+            IpcRequest::JobRun { name } => match self.scheduler.fire(&name).await {
+                Ok(Ok(msg)) => IpcResponse::Text(msg),
+                Ok(Err(reason)) => IpcResponse::error("job_not_found", reason),
+                Err(err) => IpcResponse::error("scheduler_error", err),
+            },
         }
-    }
-
-    /// Try to place every queued task, oldest first. Called on each tick and after `run`,
-    /// and concurrent callers already exist today: each accepted IPC connection is its
-    /// own spawned task, so a tick and any number of in-flight `Run` requests can all be
-    /// awaiting this at once. No task is ever dispatched twice because `run_dispatch`
-    /// re-checks the task is still `Queued` inside the actor's own serialized command
-    /// loop, not because of anything here. The capacity snapshot this loop's
-    /// `pick_machine` reads can still be stale under that concurrency and over-dispatch
-    /// past `max_agents` before the next tick's `refresh_live` catches up; that's a known
-    /// gap, not something this comment claims is handled.
-    pub async fn dispatch_queued(&self) {
-        let queued = match self.store.queued_tasks() {
-            Ok(q) => q,
-            Err(err) => {
-                tracing::error!(%err, "list queued");
-                return;
-            }
-        };
-        for task in queued {
-            let Some(name) = pick_machine(&self.views(), &task.spec) else {
-                continue;
-            };
-            let Some(handle) = self.machines.iter().find(|h| h.name == name) else {
-                continue;
-            };
-            match handle.dispatch(task.id).await {
-                Ok(t) => {
-                    tracing::info!(task = %t.display_id(), machine = %name, state = %t.state, "dispatched")
-                }
-                Err(err) => {
-                    tracing::warn!(task = %task.display_id(), machine = %name, %err, "dispatch failed")
-                }
-            }
-        }
-    }
-
-    fn views(&self) -> Vec<MachineView> {
-        self.machines
-            .iter()
-            .map(|m| {
-                let s = m.snapshot();
-                MachineView {
-                    name: m.name.clone(),
-                    max_agents: m.max_agents,
-                    tags: m.tags.clone(),
-                    live: s.live,
-                    healthy: s.channel.accepts_dispatch(),
-                }
-            })
-            .collect()
     }
 }
 
@@ -308,7 +357,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
         "flock is empty; add a machine with `pastor machine add`"
     );
     let (daemon, listener) = Daemon::bind_and_start(paths, config, flock, None).await?;
-    tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.machines.len(), "pastor serve");
+    tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.fleet.machines.len(), "pastor serve");
     daemon.run_with_listener(listener).await
 }
 
@@ -317,6 +366,8 @@ mod tests {
     use super::*;
     use crate::config::flock::MachineConfig;
     use crate::herdr::fake::FakeHerdr;
+    use crate::scheduler::RunOutcome;
+    use crate::store::NewTask;
     use crate::store::TaskFilter;
     use crate::task::{DispatchSpec, TaskState};
     use std::time::{Duration, Instant};
@@ -364,7 +415,7 @@ mod tests {
             .await
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while d.views().iter().any(|v| !v.healthy) {
+        while d.fleet().views().iter().any(|v| !v.healthy) {
             assert!(Instant::now() < deadline, "machines never connected");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -429,7 +480,7 @@ mod tests {
             panic!()
         };
         assert_eq!(second.state, TaskState::Queued);
-        d.dispatch_queued().await;
+        d.fleet().dispatch_queued().await;
         assert_eq!(
             d.store.get_task(second.id).unwrap().unwrap().state,
             TaskState::Queued,
@@ -441,7 +492,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        d.dispatch_queued().await;
+        d.fleet().dispatch_queued().await;
         assert_eq!(
             d.store.get_task(second.id).unwrap().unwrap().state,
             TaskState::Running
@@ -583,5 +634,127 @@ mod tests {
             fake.requests().is_empty(),
             "the second daemon's machine actor must never have contacted its connector"
         );
+    }
+
+    /// Two passes at once (a tick and a `pastor run`) against one machine with
+    /// one free slot: the lock makes the second wait and see the first's task.
+    #[tokio::test]
+    async fn concurrent_dispatch_passes_do_not_over_dispatch() {
+        let fake = FakeHerdr::new();
+        fake.set_ready_after(Duration::from_millis(200));
+        let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+        for p in ["1", "2"] {
+            d.store()
+                .insert_task(NewTask {
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: p.into(),
+                    spec: spec(),
+                })
+                .unwrap();
+        }
+        let fleet = d.fleet();
+        tokio::join!(fleet.dispatch_queued(), fleet.dispatch_queued());
+        let states: Vec<TaskState> = d
+            .store()
+            .list_tasks(&TaskFilter::default())
+            .unwrap()
+            .iter()
+            .map(|t| t.state)
+            .collect();
+        assert_eq!(
+            states.iter().filter(|s| **s == TaskState::Running).count(),
+            1,
+            "{states:?}"
+        );
+        assert_eq!(
+            states.iter().filter(|s| **s == TaskState::Queued).count(),
+            1,
+            "{states:?}"
+        );
+        assert_eq!(
+            fake.agents().len(),
+            1,
+            "one agent on a max_agents = 1 machine"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_ipc_ticks_lists_and_reloads() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        std::fs::write(
+            paths.jobs_dir().join("clock.toml"),
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"tick {{ item.key }} {{ task.id }}\"\n",
+        )
+        .unwrap();
+        let IpcResponse::Jobs(jobs) = d.handle(IpcRequest::Reload).await else {
+            panic!()
+        };
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "clock");
+        let IpcResponse::Runs(runs) = d
+            .handle(IpcRequest::Tick {
+                job: Some("clock".into()),
+                dry_run: true,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(runs[0].outcome, RunOutcome::DryRun);
+        assert_eq!(runs[0].created.len(), 1);
+        let IpcResponse::Runs(runs) = d
+            .handle(IpcRequest::Tick {
+                job: Some("clock".into()),
+                dry_run: false,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(runs[0].outcome, RunOutcome::Ran);
+        // The task was created and, the fleet having room, dispatched.
+        let IpcResponse::Tasks(list) = d
+            .handle(IpcRequest::List {
+                filter: TaskFilter {
+                    job: Some("clock".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].state, TaskState::Running);
+        assert!(
+            list[0]
+                .prompt
+                .ends_with(&format!(" {}", list[0].display_id()))
+        );
+        let IpcResponse::Jobs(jobs) = d.handle(IpcRequest::JobList).await else {
+            panic!()
+        };
+        assert!(jobs[0].last_result.as_deref().unwrap().starts_with("ok:"));
+        let IpcResponse::Text(msg) = d
+            .handle(IpcRequest::JobRun {
+                name: "clock".into(),
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert!(msg.contains("started"), "{msg}");
+        let IpcResponse::Error { code, .. } = d
+            .handle(IpcRequest::JobRun {
+                name: "ghost".into(),
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(code, "job_not_found");
     }
 }
