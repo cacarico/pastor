@@ -593,3 +593,61 @@ fn tick_without_daemon_queues_tasks_for_later() {
     let out = run(&["job", "list"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("ok: 1 items, 1 tasks"));
 }
+
+/// `machine status` connects without the daemon, so nothing else has made the
+/// state dir yet. The ssh ControlMaster socket directory must exist, private,
+/// before ssh starts. A fake `ssh` first on PATH records that it did and fails
+/// the way an unreachable host does, so no real ssh runs.
+#[test]
+fn machine_status_creates_the_ssh_dir_private_before_ssh_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let seen = tmp.path().join("seen");
+    let script = format!(
+        "#!/bin/sh\n[ -d {ssh} ] && echo present > {seen}\necho 'no route to host' >&2\nexit 255\n",
+        ssh = state.join("ssh").display(),
+        seen = seen.display()
+    );
+    std::fs::write(bin.join("ssh"), script).unwrap();
+    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PATH", &path)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    assert!(
+        run(&["machine", "add", "pi-3", "fleet@pi-3"])
+            .status
+            .success()
+    );
+    let _ = std::fs::remove_dir_all(&state);
+
+    let out = run(&["machine", "status", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&seen).unwrap_or_default().trim(),
+        "present",
+        "ssh ran before its ControlPath directory existed"
+    );
+    for dir in [state.clone(), state.join("ssh")] {
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{} is {mode:o}", dir.display());
+    }
+}

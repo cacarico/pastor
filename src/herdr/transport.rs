@@ -268,6 +268,8 @@ async fn home_dir(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
             control_path,
             ..
         } => {
+            // May be the first ssh to this machine, so it may start the master.
+            ensure_control_dir(control_path.as_deref())?;
             let argv = ssh_argv_running(
                 target,
                 control_path.as_deref(),
@@ -309,21 +311,27 @@ pub async fn connect(ep: &Endpoint) -> Result<Connection, ConnectError> {
             session,
             control_path,
         } => {
-            // The master socket lives here; ssh creates the socket itself but not
-            // the directory, and it must not be world-readable. The path is in
-            // ssh's escaped form (`%%` for a literal `%`), so undo that before
-            // touching the filesystem or a `%` in the state dir would create one
-            // directory while ssh looks for another.
-            if let Some(parent) = control_path.as_ref().and_then(|p| p.parent()) {
-                let literal = PathBuf::from(parent.to_string_lossy().replace("%%", "%"));
-                crate::config::create_private_dir(&literal).map_err(|e| ConnectError {
-                    message: e.to_string(),
-                })?;
-            }
+            ensure_control_dir(control_path.as_deref())?;
             spawn(&ssh_argv(target, session, control_path.as_deref())).await
         }
         Endpoint::Command { argv } => spawn(argv).await,
     }
+}
+
+/// The master socket lives in the ControlPath's directory; ssh creates the
+/// socket itself but not the directory, and it must not be world-readable.
+/// Every ssh that carries a ControlPath can be the one that starts the master,
+/// so each of them calls this first. The path is in ssh's escaped form (`%%`
+/// for a literal `%`), so undo that before touching the filesystem or a `%` in
+/// the state dir would create one directory while ssh looks for another.
+fn ensure_control_dir(control_path: Option<&Path>) -> Result<(), ConnectError> {
+    let Some(parent) = control_path.and_then(|p| p.parent()) else {
+        return Ok(());
+    };
+    let literal = PathBuf::from(parent.to_string_lossy().replace("%%", "%"));
+    crate::config::create_private_dir(&literal).map_err(|e| ConnectError {
+        message: e.to_string(),
+    })
 }
 
 /// Spawn argv with piped stdio. The bridge is not proven alive here: that is the
@@ -552,6 +560,21 @@ mod tests {
             stderr: vec![],
         };
         assert!(remote_home("t", &killed).is_err());
+    }
+
+    #[test]
+    fn a_fresh_state_dir_gets_a_private_ssh_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // A `%` in the state dir is escaped in the ControlPath; the directory
+        // made must be the literal one ssh will look in.
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s%1"));
+        ensure_control_dir(Some(&paths.ssh_control_path("pi-3"))).unwrap();
+        let md = std::fs::metadata(paths.ssh_dir()).unwrap();
+        assert!(md.is_dir());
+        assert_eq!(md.permissions().mode() & 0o777, 0o700);
+        assert!(!tmp.path().join("s%%1").exists());
+        ensure_control_dir(None).unwrap();
     }
 
     #[test]

@@ -657,6 +657,9 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                     &format!("machine {n} is not in the flock"),
                 );
             }
+            // Connects without the daemon, so the state dir the ssh master
+            // sockets live under may not exist yet, and must be private.
+            paths.ensure()?;
             let mut rows = Vec::new();
             for m in f
                 .machines
