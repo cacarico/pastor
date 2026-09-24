@@ -148,12 +148,14 @@ impl Daemon {
             .collect();
         let fleet = Arc::new(Fleet::new(machines, store.clone()));
         // Subscribed in `start`, before any actor runs, so the log sees the
-        // first events too.
+        // first events too. The log holds the fleet weakly (see `spawn_log`),
+        // so dropping the daemon still winds the tasks down.
+        let lookup: Arc<dyn crate::events::MachineLookup> = fleet.clone();
         crate::events::spawn_log(
             paths.events_file(),
             crate::events::DEFAULT_MAX_BYTES,
             store.clone(),
-            Some(fleet.clone() as Arc<dyn crate::events::MachineLookup>),
+            Some(Arc::downgrade(&lookup)),
             log_rx,
         );
         let scheduler = Scheduler::new(
@@ -301,6 +303,12 @@ impl Daemon {
                     Ok(t) => t,
                     Err(err) => return IpcResponse::error("store_error", err),
                 };
+                let _ = self.events.send(PastorEvent {
+                    kind: "task.queued".into(),
+                    task_id: Some(task.id),
+                    machine: None,
+                    job: Some(task.job.clone()),
+                });
                 self.fleet.dispatch_queued().await;
                 match self.store.get_task(task.id) {
                     Ok(Some(t)) => IpcResponse::Task(t),
@@ -434,6 +442,7 @@ mod tests {
     #[tokio::test]
     async fn run_dispatches_immediately() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let mut events = d.subscribe();
         let resp = d
             .handle(IpcRequest::Run {
                 prompt: "hi".into(),
@@ -444,6 +453,12 @@ mod tests {
             panic!("{resp:?}")
         };
         assert_eq!(t.state, TaskState::Running);
+        // Queued before dispatch picked it up.
+        let ev = events.try_recv().expect("task.queued emitted");
+        assert_eq!(ev.kind, "task.queued");
+        assert_eq!(ev.task_id, Some(t.id));
+        assert_eq!(ev.job.as_deref(), Some("run"));
+        assert_eq!(events.try_recv().unwrap().kind, "task.running");
         assert_eq!(t.machine.as_deref(), Some("a"));
         let IpcResponse::Tasks(list) = d
             .handle(IpcRequest::List {

@@ -234,6 +234,12 @@ pub async fn run_job(
         match store.insert_job_task(&job.name, &value, |id| render_task(job, &value, id)) {
             Ok(t) => {
                 tracing::info!(job = %job.name, task = %t.display_id(), key = %item.key, "task queued");
+                let _ = events.send(PastorEvent {
+                    kind: "task.queued".into(),
+                    task_id: Some(t.id),
+                    machine: None,
+                    job: Some(t.job.clone()),
+                });
                 report.created.push(t.display_id());
             }
             Err(e) => {
@@ -938,10 +944,18 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let src = Scripted::with_keys(&["k1", "k2"]);
         *src.cursor.lock().unwrap() = Some("c1".into());
-        let (tx, _rx) = events();
+        let (tx, mut rx) = events();
         let now = Utc::now();
         let report = run_job(&store, &job("j"), &src, &tx, now, false).await;
         assert_eq!(report.outcome, RunOutcome::Ran);
+        for id in [1, 2] {
+            let ev = rx.try_recv().expect("task.queued emitted");
+            assert_eq!(ev.kind, "task.queued");
+            assert_eq!(ev.task_id, Some(id));
+            assert_eq!(ev.job.as_deref(), Some("j"));
+            assert!(ev.machine.is_none());
+        }
+        assert!(rx.try_recv().is_err(), "one event per created task");
         assert_eq!(report.items, 2);
         assert_eq!(report.created, vec!["t-1", "t-2"]);
         assert_eq!(report.skipped_seen, 0);
@@ -1055,6 +1069,7 @@ mod tests {
         *src.cursor.lock().unwrap() = Some("c1".into());
         let t0 = Utc::now();
         run_job(&store, &job("j"), &src, &tx, t0, false).await;
+        assert_eq!(rx.try_recv().unwrap().kind, "task.queued");
 
         *src.fail.lock().unwrap() = Some("boom: 503 from upstream".into());
         let t1 = t0 + chrono::Duration::seconds(60);
