@@ -363,7 +363,9 @@ impl SchedulerHandle {
     }
 }
 
-type Resolver = Box<dyn Fn(&str) -> Option<Arc<dyn ItemSource>> + Send + Sync>;
+/// Connector id -> source. The daemon uses `connector::builtin`; a plugin
+/// catalog (plan 3) or a test swaps its own in with `Scheduler::with_resolver`.
+pub type Resolver = Box<dyn Fn(&str) -> Option<Arc<dyn ItemSource>> + Send + Sync>;
 
 pub struct Scheduler {
     paths: Paths,
@@ -408,6 +410,13 @@ impl Scheduler {
             first_seen: HashMap::new(),
             warned_queued: HashSet::new(),
         }
+    }
+
+    /// Replace the connector lookup. Builder style so `Scheduler::new(..)
+    /// .with_resolver(..)` reads as one construction.
+    pub fn with_resolver(mut self, resolve: Resolver) -> Self {
+        self.resolve = resolve;
+        self
     }
 
     /// For the CLI when no daemon runs: no machines to dispatch to, nobody
@@ -807,6 +816,18 @@ fn fingerprint(dir: &std::path::Path) -> Vec<(PathBuf, Option<SystemTime>, u64)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_resolver_replaces_the_connector_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let s = Scheduler::standalone(paths, &PastorConfig::default(), store).with_resolver(
+            Box::new(|id| (id == "only-this").then(|| crate::connector::builtin("clock").unwrap())),
+        );
+        assert!((s.resolve)("only-this").is_some());
+        assert!((s.resolve)("clock").is_none(), "the default lookup is gone");
+    }
     use crate::connector::{Item, RunFuture, RunOutput};
     use crate::schedule::Schedule;
     use crate::store::TaskFilter;
