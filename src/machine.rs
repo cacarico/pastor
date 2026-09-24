@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -148,6 +149,25 @@ pub enum MachineCommand {
         lines: u32,
         reply: oneshot::Sender<anyhow::Result<String>>,
     },
+    /// `pastor task close`: close the task's pane (with `remove_worktree`,
+    /// remove its worktree instead, which closes the pane with it), then mark
+    /// the row closed. Also closes an orphaned agent `t-<task_id>`; with no
+    /// row at all the reply is an `OrphanClosed` error.
+    Close {
+        task_id: i64,
+        remove_worktree: bool,
+        reply: oneshot::Sender<anyhow::Result<Task>>,
+    },
+}
+
+/// `Close` found no task row, only an orphaned agent by that name, and closed
+/// it. There is no `Task` to reply with, so this is how success reads; the
+/// daemon turns it into a plain message.
+#[derive(Debug, thiserror::Error)]
+#[error("closed orphaned agent {agent} on {machine}; it had no task row")]
+pub struct OrphanClosed {
+    pub agent: String,
+    pub machine: String,
 }
 
 #[derive(Clone)]
@@ -168,6 +188,20 @@ impl MachineHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(MachineCommand::Dispatch { task_id, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("machine {} is gone", self.name))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("machine {} dropped the request", self.name))?
+    }
+
+    pub async fn close(&self, task_id: i64, remove_worktree: bool) -> anyhow::Result<Task> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(MachineCommand::Close {
+                task_id,
+                remove_worktree,
+                reply,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("machine {} is gone", self.name))?;
         rx.await
@@ -533,6 +567,7 @@ impl Actor {
                     None => return,
                     Some(MachineCommand::Dispatch { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Read { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::Close { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                 },
             }
         }
@@ -747,6 +782,19 @@ impl Actor {
                     (false, false) => CommandOutcome::Nothing,
                 }
             }
+            MachineCommand::Close {
+                task_id,
+                remove_worktree,
+                reply,
+            } => {
+                let (result, dead) = self.run_close(task_id, remove_worktree).await;
+                let _ = reply.send(result);
+                if dead {
+                    CommandOutcome::Reconnect
+                } else {
+                    CommandOutcome::Nothing
+                }
+            }
             MachineCommand::Read {
                 task_id,
                 lines,
@@ -795,6 +843,114 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// `MachineCommand::Close`. herdr first, the row second: a herdr refusal
+    /// (a dirty worktree, say) leaves the task as it was, so the command can
+    /// be repeated. Reports whether a request failed below the API, like
+    /// `run_dispatch`.
+    async fn run_close(
+        &mut self,
+        task_id: i64,
+        remove_worktree: bool,
+    ) -> (anyhow::Result<Task>, bool) {
+        match self.close_inner(task_id, remove_worktree).await {
+            Ok(t) => (Ok(t), false),
+            Err(err) => {
+                let dead = is_outage(&err);
+                (Err(err), dead)
+            }
+        }
+    }
+
+    async fn close_inner(&mut self, task_id: i64, remove_worktree: bool) -> anyhow::Result<Task> {
+        let row = self.store.get_task(task_id)?;
+        let name = Task::agent_name_for(task_id);
+        if let Some(t) = &row {
+            if remove_worktree && !t.spec.worktree {
+                anyhow::bail!("task {name} has no worktree to remove");
+            }
+            match t.machine.as_deref() {
+                // Never dispatched: nothing on any machine to close.
+                None => return self.finish_close(t.clone()),
+                Some(m) if m != self.name => {
+                    anyhow::bail!("task {name} is on machine {m}, not {}", self.name)
+                }
+                Some(_) => {}
+            }
+        }
+        let timeout = self.settings.request_timeout;
+        let agents = tokio::time::timeout(timeout, self.connector.agent_list())
+            .await
+            .map_err(|_| TimedOut("agent.list", timeout))??;
+        // The pane the row records while it owns one; otherwise (failed,
+        // closed, no row) whatever agent still carries the task's name.
+        let recorded = row
+            .as_ref()
+            .filter(|t| t.state.occupies_pane())
+            .and_then(|t| t.pane_id.clone().map(|p| (p, t.workspace_id.clone())));
+        let target = recorded.or_else(|| {
+            agents
+                .iter()
+                .find(|a| a.name.as_deref() == Some(name.as_str()))
+                .map(|a| (a.pane_id.clone(), Some(a.workspace_id.clone())))
+        });
+        let Some((pane, workspace)) = target else {
+            return match row {
+                Some(t) if remove_worktree => anyhow::bail!(
+                    "task {} has no open workspace left to remove the worktree from; remove the checkout with `git worktree remove`",
+                    t.display_id()
+                ),
+                Some(t) => self.finish_close(t),
+                None => anyhow::bail!("task {name} not found"),
+            };
+        };
+        if remove_worktree {
+            let ws = workspace.with_context(|| format!("task {name} recorded no workspace"))?;
+            // Closes the workspace, pane and agent with it: closing the pane
+            // first would close the workspace and leave no id to remove by.
+            tokio::time::timeout(timeout, self.connector.worktree_remove(&ws, false))
+                .await
+                .map_err(|_| TimedOut("worktree.remove", timeout))?
+                .with_context(|| format!("remove the worktree of {name}"))?;
+        } else {
+            match tokio::time::timeout(timeout, self.connector.pane_close(&pane))
+                .await
+                .map_err(|_| TimedOut("pane.close", timeout))?
+            {
+                Ok(()) => {}
+                // Already gone is what closing wanted.
+                Err(err) if err.code() == Some("pane_not_found") => {}
+                Err(err) => {
+                    return Err(
+                        anyhow::Error::from(err).context(format!("close the pane of {name}"))
+                    );
+                }
+            }
+        }
+        self.forget_orphan(&pane);
+        self.pending_done.remove(&task_id);
+        match row {
+            Some(t) => self.finish_close(t),
+            None => {
+                self.refresh_live();
+                Err(OrphanClosed {
+                    agent: name,
+                    machine: self.name.clone(),
+                }
+                .into())
+            }
+        }
+    }
+
+    fn finish_close(&mut self, t: Task) -> anyhow::Result<Task> {
+        let was = t.state;
+        let closed = self.store.close_task(t.id)?;
+        if was != TaskState::Closed {
+            self.emit("task.closed", Some(closed.id));
+        }
+        self.refresh_live();
+        Ok(closed)
     }
 
     /// Runs a dispatch and reports whether it failed below the API (a transport
@@ -1986,6 +2142,186 @@ mod tests {
         })
         .await;
         assert_eq!(h.snapshot().live, 1);
+    }
+
+    async fn connected(
+        fake: &FakeHerdr,
+        store: &Arc<Store>,
+    ) -> (MachineHandle, broadcast::Receiver<PastorEvent>) {
+        let (h, events) = spawn(fake, store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        (h, events)
+    }
+
+    fn calls(fake: &FakeHerdr, method: &str) -> Vec<serde_json::Value> {
+        fake.requests()
+            .into_iter()
+            .filter(|r| r.method == method)
+            .map(|r| r.params)
+            .collect()
+    }
+
+    fn worktree_task(store: &Store) -> Task {
+        store
+            .insert_task(NewTask {
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    repo: Some("/r".into()),
+                    worktree: true,
+                    ..spec()
+                },
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn close_closes_the_pane_then_the_row() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let closed = h.close(t.id, false).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert!(closed.finished_at.is_some());
+        assert_eq!(state_of(&store, t.id), TaskState::Closed);
+        assert_eq!(
+            calls(&fake, "pane.close"),
+            vec![serde_json::json!({"pane_id": t.pane_id.unwrap()})]
+        );
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        assert!(fake.agents().is_empty());
+        assert_eq!(h.snapshot().live, 0);
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if ev.kind == "task.closed" {
+                assert_eq!(ev.task_id, Some(t.id));
+                break;
+            }
+        }
+        // Again: nothing left to close, the row stays as it is.
+        let again = h.close(t.id, false).await.unwrap();
+        assert_eq!(again.updated_at, closed.updated_at);
+        assert_eq!(calls(&fake, "pane.close").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_with_remove_worktree_removes_it_and_a_dirty_one_is_refused() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let clean = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let dirty = h.dispatch(worktree_task(&store).id).await.unwrap();
+        fake.set_dirty(dirty.workspace_id.as_deref().unwrap());
+
+        let closed = h.close(clean.id, true).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(
+            calls(&fake, "worktree.remove"),
+            vec![serde_json::json!({"workspace_id": clean.workspace_id.unwrap(), "force": false})]
+        );
+        assert!(
+            calls(&fake, "pane.close").is_empty(),
+            "worktree.remove closes the pane itself"
+        );
+
+        let err = h.close(dirty.id, true).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("dirty_worktree_requires_force"),
+            "{err:#}"
+        );
+        assert_eq!(
+            state_of(&store, dirty.id),
+            TaskState::Running,
+            "a refusal changes nothing"
+        );
+        assert_eq!(
+            h.snapshot().channel,
+            ChannelState::Connected,
+            "an API error is not an outage"
+        );
+        assert_eq!(fake.agents().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_on_a_plain_workspace_is_refused_up_front() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let err = h.close(t.id, true).await.unwrap_err();
+        assert!(err.to_string().contains("no worktree"), "{err}");
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// `task close` is how an orphan goes: a failed row whose agent is still
+    /// alive, or an agent with no row at all.
+    #[tokio::test]
+    async fn close_takes_orphans_by_agent_name() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut failed = new_task(&store);
+        let pane = start_agent(&fake, &Task::agent_name_for(failed.id)).await;
+        failed.state = TaskState::Failed;
+        failed.machine = Some("m".into());
+        failed.finished_at = Some(Utc::now());
+        store.update_task(&mut failed).unwrap();
+        let ghost = start_agent(&fake, "t-99").await;
+        let (h, _events) = connected(&fake, &store).await;
+        wait_for("orphans", || h.snapshot().orphans.len() == 2).await;
+
+        let closed = h.close(failed.id, false).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(closed.finished_at, failed.finished_at);
+        let err = h.close(99, false).await.unwrap_err();
+        let orphan = err.downcast_ref::<OrphanClosed>().expect("an OrphanClosed");
+        assert_eq!(orphan.agent, "t-99");
+        let closed_panes: Vec<_> = calls(&fake, "pane.close")
+            .iter()
+            .map(|p| p["pane_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(closed_panes, vec![pane, ghost]);
+        assert!(h.snapshot().orphans.is_empty());
+        assert_eq!(h.snapshot().live, 0);
+
+        let err = h.close(99, false).await.unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn close_without_herdr_work() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        // Queued, never dispatched: only the row changes.
+        let queued = new_task(&store);
+        assert_eq!(
+            h.close(queued.id, false).await.unwrap().state,
+            TaskState::Closed
+        );
+        // Its pane already gone behind pastor's back: still closes the row.
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let mut gone = store.get_task(t.id).unwrap().unwrap();
+        gone.pane_id = Some("w77:p1".into());
+        store.update_task(&mut gone).unwrap();
+        assert_eq!(h.close(t.id, false).await.unwrap().state, TaskState::Closed);
+        // Another machine's task is not this machine's to close.
+        let mut other = new_task(&store);
+        other.state = TaskState::Running;
+        other.machine = Some("elsewhere".into());
+        other.pane_id = Some("w1:p1".into());
+        store.update_task(&mut other).unwrap();
+        let err = h.close(other.id, false).await.unwrap_err();
+        assert!(err.to_string().contains("elsewhere"), "{err}");
+        assert_eq!(state_of(&store, other.id), TaskState::Running);
     }
 
     #[tokio::test]
