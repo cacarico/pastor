@@ -29,6 +29,10 @@ struct Cli {
 enum Command {
     /// Run the daemon: scheduler, machine channels, dispatch
     Serve,
+    /// Create a one-off task and dispatch it
+    Run(RunArgs),
+    /// List tasks across the flock
+    List(ListArgs),
     /// Manage tasks
     Task {
         #[command(subcommand)]
@@ -41,6 +45,8 @@ enum Command {
     },
     /// Open the full herdr UI on a machine
     Open { machine: String },
+    /// Attach to a task's agent terminal (ctrl+b q detaches)
+    Attach { task: String },
     /// Run one scheduler pass now and report what it did
     Tick(TickArgs),
     /// Manage jobs (files in ~/.config/pastor/jobs/)
@@ -211,9 +217,12 @@ fn main() {
     let result = rt.block_on(async {
         match cli.command {
             Command::Serve => pastor::daemon::serve(paths).await,
+            Command::Run(args) => run(&paths, args).await,
+            Command::List(args) => list(&paths, args).await,
             Command::Task { cmd } => task(&paths, cmd).await,
             Command::Machine { cmd } => machine(&paths, cmd).await,
             Command::Open { machine } => open(&paths, &machine).await,
+            Command::Attach { task } => attach(&paths, &task).await,
             Command::Tick(args) => tick(&paths, args).await,
             Command::Job { cmd } => job(&paths, cmd).await,
             Command::Completions { shell } => {
@@ -1338,6 +1347,9 @@ mod tests {
     #[test]
     fn task_commands_parse_under_task() {
         for args in [
+            vec!["pastor", "run", "hi"],
+            vec!["pastor", "list", "--json"],
+            vec!["pastor", "attach", "t-1"],
             vec!["pastor", "task", "run", "hi"],
             vec!["pastor", "task", "list", "--json"],
             vec!["pastor", "task", "show", "t-1"],
@@ -1348,12 +1360,6 @@ mod tests {
                 panic!("{args:?}: {e}");
             }
         }
-        assert_eq!(
-            Cli::try_parse_from(["pastor", "run", "hi"])
-                .unwrap_err()
-                .exit_code(),
-            2
-        );
     }
 
     #[test]
