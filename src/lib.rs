@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod connector;
 pub mod daemon;
 pub mod dispatch;
 pub mod herdr;
