@@ -5,7 +5,9 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc,
+};
 
 use crate::config::parse_duration;
 
@@ -120,13 +122,18 @@ impl CronExpr {
     /// whole months, days and hours that cannot match, so a once-a-year
     /// expression is found in a few thousand steps rather than half a million.
     /// A wall-clock minute that does not exist (spring forward) is skipped; an
-    /// ambiguous one (fall back) fires at its first occurrence.
+    /// ambiguous one (fall back) fires at its earlier pass, unless `after` is
+    /// itself inside that same fold and already past the earlier pass, in
+    /// which case it fires at the later one — strictly-after holds either way.
     pub fn next_after_in<Tz: TimeZone>(&self, after: DateTime<Tz>) -> Option<DateTime<Tz>> {
         let tz = after.timezone();
         let mut t =
             after.naive_local().with_second(0)?.with_nanosecond(0)? + chrono::Duration::minutes(1);
-        // Five years covers the sparsest 5-field expression (29 February).
-        let limit = t + chrono::Duration::days(366 * 5);
+        // 29 February is the sparsest date a 5-field expression can name, and
+        // it can be up to 8 years between leap years (2100 is not one), so
+        // bound the walk there rather than at a round number that quietly
+        // misses it.
+        let limit = t + chrono::Duration::days(366 * 8);
         while t < limit {
             if !self.month[t.month() as usize] {
                 t = start_of_next_month(t);
@@ -144,10 +151,24 @@ impl CronExpr {
                 t += chrono::Duration::minutes(1);
                 continue;
             }
-            match tz.from_local_datetime(&t).earliest() {
-                Some(dt) => return Some(dt),
-                None => t += chrono::Duration::minutes(1),
+            // Ambiguous (fall-back) resolves to whichever pass is actually
+            // later than `after`: the naive walk can land back on a wall-clock
+            // minute that, read on its first (earlier) pass, is before
+            // `after`'s own (second-pass) instant, which would break
+            // strictly-after.
+            match tz.from_local_datetime(&t) {
+                LocalResult::Single(dt) if dt > after => return Some(dt),
+                LocalResult::Ambiguous(earliest, latest) => {
+                    if earliest > after {
+                        return Some(earliest);
+                    }
+                    if latest > after {
+                        return Some(latest);
+                    }
+                }
+                _ => {}
             }
+            t += chrono::Duration::minutes(1);
         }
         None
     }
@@ -188,10 +209,7 @@ fn parse_field(text: &str, min: u32, max: u32) -> Result<(Vec<bool>, bool), Stri
         let (range, step) = match part.split_once('/') {
             Some((r, s)) => (
                 r,
-                Some(
-                    s.parse::<u32>()
-                        .map_err(|_| format!("{part:?}: bad step"))?,
-                ),
+                Some(parse_u32_strict(s).map_err(|_| format!("{part:?}: bad step"))?),
             ),
             None => (part, None),
         };
@@ -209,6 +227,15 @@ fn parse_field(text: &str, min: u32, max: u32) -> Result<(Vec<bool>, bool), Stri
         if lo > hi {
             return Err(format!("{part:?}: range runs backwards"));
         }
+        // A step this side of the span can only ever mark `lo` and quickly
+        // exceed `hi`; a step past it (e.g. a typo'd huge number) would still
+        // do that on the first add, but bounding it here keeps `v += step`
+        // nowhere near u32's ceiling so it can never overflow.
+        if let Some(step) = step
+            && step > hi - lo + 1
+        {
+            return Err(format!("{part:?}: step must be at most {}", hi - lo + 1));
+        }
         let mut v = lo;
         while v <= hi {
             set[v as usize] = true;
@@ -219,8 +246,7 @@ fn parse_field(text: &str, min: u32, max: u32) -> Result<(Vec<bool>, bool), Stri
 }
 
 fn parse_num(s: &str, min: u32, max: u32) -> Result<u32, String> {
-    let n: u32 = s
-        .parse()
+    let n = parse_u32_strict(s)
         .map_err(|_| format!("{s:?}: expected a number between {min} and {max}"))?;
     if n < min || n > max {
         return Err(format!("{s:?}: must be between {min} and {max}"));
@@ -228,9 +254,20 @@ fn parse_num(s: &str, min: u32, max: u32) -> Result<u32, String> {
     Ok(n)
 }
 
+/// `u32::from_str` accepts a leading `+` (`"+5"` parses as `5`), which would
+/// let a plus sign slip past the digits-only cron grammar; require plain
+/// ASCII digits.
+fn parse_u32_strict(s: &str) -> Result<u32, String> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{s:?}: expected digits"));
+    }
+    s.parse().map_err(|_| format!("{s:?}: number too large"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::FixedOffset;
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -353,6 +390,8 @@ mod tests {
             "*/0 * * * *",
             "5-1 * * * *",
             "a * * * *",
+            // u32::from_str accepts a leading `+`; the grammar does not.
+            "+5 * * * *",
             "",
         ] {
             assert!(CronExpr::parse(bad).is_err(), "{bad:?} should not parse");
@@ -366,5 +405,103 @@ mod tests {
         assert_eq!(describe_duration(Duration::from_secs(7200)), "2h");
         assert_eq!(describe_duration(Duration::from_secs(90)), "90s");
         assert_eq!(describe_duration(Duration::from_secs(172800)), "2d");
+    }
+
+    #[test]
+    fn huge_steps_are_rejected_but_a_step_equal_to_the_span_still_parses() {
+        assert!(
+            CronExpr::parse("*/4294967295 * * * *").is_err(),
+            "a step this large would overflow the u32 walk in parse_field"
+        );
+        assert!(
+            CronExpr::parse("*/60 * * * *").is_ok(),
+            "60 values, step 60: still just fires on minute 0, same as before"
+        );
+    }
+
+    /// A time zone whose offset drops from +02:00 to +01:00 at a fixed UTC
+    /// instant, so the wall-clock hour 01:00-02:00 on 2026-01-01 happens
+    /// twice - a "fall back" fold, reproduced without depending on the
+    /// host's real zone database (which no test can pin to a chosen instant).
+    #[derive(Clone, Copy, Debug)]
+    struct FoldingZone;
+
+    impl FoldingZone {
+        fn transition() -> NaiveDateTime {
+            NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        }
+
+        fn before() -> FixedOffset {
+            FixedOffset::east_opt(2 * 3600).unwrap()
+        }
+
+        fn after() -> FixedOffset {
+            FixedOffset::east_opt(3600).unwrap()
+        }
+    }
+
+    impl TimeZone for FoldingZone {
+        type Offset = FixedOffset;
+
+        fn from_offset(_offset: &FixedOffset) -> Self {
+            FoldingZone
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> LocalResult<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<FixedOffset> {
+            let fold_start = Self::transition() + chrono::Duration::hours(1);
+            let fold_end = Self::transition() + chrono::Duration::hours(2);
+            if *local < fold_start {
+                LocalResult::Single(Self::before())
+            } else if *local < fold_end {
+                LocalResult::Ambiguous(Self::before(), Self::after())
+            } else {
+                LocalResult::Single(Self::after())
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            if *utc < Self::transition() {
+                Self::before()
+            } else {
+                Self::after()
+            }
+        }
+    }
+
+    #[test]
+    fn strictly_after_holds_across_a_fall_back_fold() {
+        let after = FoldingZone.from_utc_datetime(
+            &NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 15, 0)
+                .unwrap(),
+        );
+        let c = CronExpr::parse("*/5 * * * *").unwrap();
+        let next = c.next_after_in(after).unwrap();
+        assert!(
+            next > after,
+            "next_after_in must be strictly after `after`, got {next:?} for after={after:?}"
+        );
+        assert_eq!(
+            next,
+            FoldingZone.from_utc_datetime(
+                &NaiveDate::from_ymd_opt(2026, 1, 1)
+                    .unwrap()
+                    .and_hms_opt(0, 20, 0)
+                    .unwrap()
+            ),
+            "local 01:20 on its second pass, not its first (which is before `after`)"
+        );
     }
 }
