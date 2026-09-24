@@ -26,6 +26,11 @@
 //!   FAKE_HERDR_REQUEST_LOG=<path> as each request is received, write all
 //!                                requests so far to <path> as one JSON array,
 //!                                so a test can see what pastor sent.
+//!   FAKE_HERDR_DIRTY_WORKTREES=1 every worktree has uncommitted changes, so
+//!                                `worktree.remove` needs `force`.
+//!
+//! `pane.close` and `worktree.remove` answer as herdr 0.9.1 does; see
+//! `FakeHerdr::handle`.
 use std::path::PathBuf;
 
 use pastor::herdr::{AgentStatus, fake::FakeHerdr};
@@ -64,6 +69,9 @@ async fn listen(path: PathBuf) {
     auto_done(&fake);
     if let Some(path) = std::env::var_os("FAKE_HERDR_REQUEST_LOG") {
         fake.set_request_log(PathBuf::from(path));
+    }
+    if std::env::var("FAKE_HERDR_DIRTY_WORKTREES").as_deref() == Ok("1") {
+        fake.dirty_worktrees(true);
     }
     // A leftover socket from a previous run would make bind fail with EADDRINUSE.
     let _ = std::fs::remove_file(&path);

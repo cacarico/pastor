@@ -21,6 +21,14 @@ pub enum StartBehaviour {
 #[derive(Default)]
 struct State {
     next_ws: u32,
+    /// Open workspaces: id -> created by `worktree.create`. One pane each,
+    /// `<id>:p1`, as herdr gives a new workspace.
+    workspaces: HashMap<String, bool>,
+    /// Worktree workspaces whose checkout has changes, so `worktree.remove`
+    /// needs `force`.
+    dirty: HashSet<String>,
+    /// Every new worktree starts dirty (see `dirty_worktrees`).
+    all_dirty: bool,
     agents: HashMap<String, AgentInfo>,
     /// pane id -> when `agent.start` ran, for the `ready_after` window.
     started: HashMap<String, Instant>,
@@ -172,6 +180,28 @@ impl FakeHerdr {
     pub fn hang_method(&self, method: &str) {
         self.state.lock().unwrap().hang = Some(method.into());
     }
+    /// Mark one worktree workspace as holding uncommitted changes: herdr
+    /// then refuses `worktree.remove` without `force`.
+    pub fn set_dirty(&self, workspace_id: &str) {
+        self.state.lock().unwrap().dirty.insert(workspace_id.into());
+    }
+    /// Every worktree created from now on is dirty.
+    pub fn dirty_worktrees(&self, yes: bool) {
+        self.state.lock().unwrap().all_dirty = yes;
+    }
+    /// Open workspace ids, sorted.
+    pub fn workspaces(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .state
+            .lock()
+            .unwrap()
+            .workspaces
+            .keys()
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
     pub fn agents(&self) -> Vec<AgentInfo> {
         self.state
             .lock()
@@ -232,9 +262,20 @@ impl FakeHerdr {
         change_status(&mut self.state.lock().unwrap(), pane_id, status);
     }
 
+    /// The pane goes away, as when a human closes it. Its workspace had only
+    /// this pane, so it closes too, the way herdr closes a workspace whose
+    /// last pane closes.
     pub fn close_pane(&self, pane_id: &str) {
-        self.state.lock().unwrap().agents.remove(pane_id);
         let ws = pane_id.split(':').next().unwrap_or("w1").to_string();
+        {
+            let mut s = self.state.lock().unwrap();
+            s.agents.remove(pane_id);
+            s.workspaces.remove(&ws);
+        }
+        self.pane_closed_event(pane_id, &ws);
+    }
+
+    fn pane_closed_event(&self, pane_id: &str, ws: &str) {
         let _ = self.events.send(Event {
             event: "pane_closed".into(),
             data: json!({"type": "pane_closed", "pane_id": pane_id, "workspace_id": ws}),
@@ -374,6 +415,11 @@ impl FakeHerdr {
                 s.next_ws += 1;
                 let ws = format!("w{}", s.next_ws);
                 let pane = format!("{ws}:p1");
+                let is_worktree = req.method == "worktree.create";
+                s.workspaces.insert(ws.clone(), is_worktree);
+                if is_worktree && s.all_dirty {
+                    s.dirty.insert(ws.clone());
+                }
                 let label = p.get("label").cloned().unwrap_or(Value::Null);
                 let kind = if req.method == "worktree.create" {
                     "worktree_created"
@@ -399,7 +445,8 @@ impl FakeHerdr {
                 let ws_num = ws_part
                     .strip_prefix('w')
                     .and_then(|n| n.parse::<u32>().ok());
-                let known = matches!((ws_num, pane_part), (Some(n), Some("p1")) if n >= 1 && n <= s.next_ws);
+                let known = matches!((ws_num, pane_part), (Some(n), Some("p1")) if n >= 1 && n <= s.next_ws)
+                    && s.workspaces.contains_key(ws_part);
                 if !known {
                     return Err(("pane_not_found".into(), pane_id));
                 }
@@ -515,6 +562,49 @@ impl FakeHerdr {
                 Ok(json!({"type": "agent_list", "agents": agents}))
             }
             "agent.read" => Ok(json!({"type": "pane_read", "read": {"text": "fake output\n"}})),
+            // herdr 0.9.1: `pane.close {pane_id}` answers `{"type": "ok"}`, and
+            // closing a workspace's last pane closes the workspace.
+            "pane.close" => {
+                let pane_id = p["pane_id"].as_str().unwrap_or("").to_string();
+                let ws = pane_id.split(':').next().unwrap_or("").to_string();
+                if !pane_id.ends_with(":p1") || s.workspaces.remove(&ws).is_none() {
+                    return Err(("pane_not_found".into(), format!("pane {pane_id} not found")));
+                }
+                s.agents.remove(&pane_id);
+                s.dirty.remove(&ws);
+                drop(s);
+                self.pane_closed_event(&pane_id, &ws);
+                Ok(json!({"type": "ok"}))
+            }
+            // herdr 0.9.1: `worktree.remove {workspace_id, force}` deletes the
+            // checkout and closes its workspace. A workspace that is not a
+            // worktree is `workspace_not_found`, uncommitted changes without
+            // `force` are `dirty_worktree_requires_force`.
+            "worktree.remove" => {
+                let ws = p["workspace_id"].as_str().unwrap_or("").to_string();
+                let force = p["force"].as_bool().unwrap_or(false);
+                if s.workspaces.get(&ws) != Some(&true) {
+                    return Err((
+                        "workspace_not_found".into(),
+                        format!("workspace {ws} not found"),
+                    ));
+                }
+                if s.dirty.contains(&ws) && !force {
+                    return Err((
+                        "dirty_worktree_requires_force".into(),
+                        "contains modified or untracked files, use --force to delete it".into(),
+                    ));
+                }
+                s.workspaces.remove(&ws);
+                s.dirty.remove(&ws);
+                let pane_id = format!("{ws}:p1");
+                s.agents.remove(&pane_id);
+                drop(s);
+                self.pane_closed_event(&pane_id, &ws);
+                Ok(
+                    json!({"type": "worktree_removed", "workspace_id": ws, "forced": force, "path": format!("/fake/{ws}")}),
+                )
+            }
             other => Err(("unsupported_method".into(), other.into())),
         }
     }
@@ -608,6 +698,60 @@ mod tests {
                 "agent.prompt",
                 "agent.list"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_close_and_worktree_remove() {
+        let fake = FakeHerdr::new();
+        let plain = fake.workspace_create(None, "t-1").await.unwrap();
+        let wt = fake.worktree_create("/r", "b", "t-2").await.unwrap();
+        let dirty = fake.worktree_create("/r", "c", "t-3").await.unwrap();
+        fake.agent_start("t-1", "claude", &plain.root_pane.pane_id, &[])
+            .await
+            .unwrap();
+        fake.set_dirty(&dirty.workspace.workspace_id);
+        let mut stream = fake
+            .subscribe(vec![super::super::subscription_lifecycle("pane.closed")])
+            .await
+            .unwrap();
+
+        fake.pane_close(&plain.root_pane.pane_id).await.unwrap();
+        assert!(fake.agents().is_empty());
+        let ev = stream.next().await.unwrap();
+        assert!(ev.is_pane_closed());
+        assert_eq!(ev.pane_id(), Some(plain.root_pane.pane_id.as_str()));
+        let err = fake.pane_close(&plain.root_pane.pane_id).await.unwrap_err();
+        assert_eq!(err.code(), Some("pane_not_found"));
+
+        let err = fake
+            .worktree_remove(&plain.workspace.workspace_id, false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some("workspace_not_found"),
+            "closed, and no worktree"
+        );
+        fake.worktree_remove(&wt.workspace.workspace_id, false)
+            .await
+            .unwrap();
+        let err = fake
+            .worktree_remove(&dirty.workspace.workspace_id, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("dirty_worktree_requires_force"));
+        fake.worktree_remove(&dirty.workspace.workspace_id, true)
+            .await
+            .unwrap();
+        assert!(fake.workspaces().is_empty());
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|r| r.method == "worktree.remove")
+                .map(|r| r.params["force"].as_bool())
+                .collect::<Vec<_>>(),
+            [Some(false), Some(false), Some(false), Some(true)]
         );
     }
 

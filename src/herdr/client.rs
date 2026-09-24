@@ -427,6 +427,29 @@ pub trait ConnectorExt: Connector {
             .text)
     }
 
+    /// `pane.close` (herdr 0.9.1): closes the pane and, with it, the agent in
+    /// it. herdr closes a workspace whose last pane closes. `pane_not_found`
+    /// if it is already gone.
+    async fn pane_close(&self, pane_id: &str) -> Result<(), CallError> {
+        self.call("pane.close", serde_json::json!({"pane_id": pane_id}))
+            .await
+            .map(drop)
+    }
+
+    /// `worktree.remove` (herdr 0.9.1): deletes the worktree checkout behind a
+    /// workspace made by `worktree.create` and closes that workspace, panes
+    /// and agent included. Without `force`, a checkout with uncommitted or
+    /// untracked files is refused with `dirty_worktree_requires_force`; a
+    /// workspace that is not a worktree is `workspace_not_found`.
+    async fn worktree_remove(&self, workspace_id: &str, force: bool) -> Result<(), CallError> {
+        self.call(
+            "worktree.remove",
+            serde_json::json!({"workspace_id": workspace_id, "force": force}),
+        )
+        .await
+        .map(drop)
+    }
+
     /// Opens a connection and keeps it: the returned stream owns it until dropped.
     async fn subscribe(&self, subscriptions: Vec<Value>) -> Result<EventStream, CallError> {
         Ok(self.connect().await?.subscribe(subscriptions).await?)
