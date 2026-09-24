@@ -111,9 +111,26 @@ pub fn install(
         }
         None => git(&["clone", "--quiet", "--depth", "1", &source.url, &checkout_s])?,
     }
+    // Move the real directory, never a link: renaming a symlinked subdir
+    // would move the link, and dropping the scratch clone would then delete
+    // its target. A link that resolves outside the clone is refused, since
+    // the install would copy someone else's directory.
+    let root_real = std::fs::canonicalize(&checkout)
+        .with_context(|| format!("resolve {}", checkout.display()))?;
     let dir = match &source.subdir {
-        Some(s) => checkout.join(s),
-        None => checkout.clone(),
+        Some(s) => {
+            let dir = std::fs::canonicalize(checkout.join(s))
+                .with_context(|| format!("subdir {} is not in the repository", s.display()))?;
+            if !dir.starts_with(&root_real) {
+                bail!(
+                    "subdir {} resolves to {}, outside the repository; refusing to install it",
+                    s.display(),
+                    dir.display()
+                );
+            }
+            dir
+        }
+        None => root_real,
     };
     let manifest = load_manifest(&dir, None).map_err(anyhow::Error::msg)?;
     let target = root.join(&manifest.id);

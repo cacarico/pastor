@@ -367,6 +367,15 @@ impl Cli {
                 String::from_utf8_lossy(&st.stderr)
             );
         };
+        // Two symlinked subdirs: one to the plugin inside the repo, one to a
+        // plugin outside it.
+        std::os::unix::fs::symlink("echo", r.join("plugins/alias")).unwrap();
+        let outside = self.dir("elsewhere/echo");
+        std::fs::create_dir_all(&outside).unwrap();
+        for f in ["pastor-plugin.toml", "poll.sh"] {
+            std::fs::copy(fixture("echo").join(f), outside.join(f)).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, r.join("plugins/outside")).unwrap();
         git(&["init", "-q"]);
         git(&["add", "."]);
         git(&["commit", "-qm", "v1"]);
@@ -380,6 +389,30 @@ impl Cli {
         .unwrap();
         git(&["commit", "-qam", "v2"]);
     }
+}
+
+/// A subdir that is a symlink installs what it points at inside the repo,
+/// as a real directory that survives the clone's cleanup; one that points
+/// outside the repo is refused.
+#[test]
+fn install_resolves_a_symlinked_subdir_and_refuses_one_outside_the_repo() {
+    let cli = Cli::new();
+    cli.repo("acme", "tools");
+    let err = cli.fails(&["plugin", "install", "acme/tools/plugins/outside", "--yes"]);
+    assert!(err.contains("outside the repository"), "{err}");
+    assert!(!cli.dir("d/plugins/echo").exists());
+
+    let (out, _) = cli.ok(&["plugin", "install", "acme/tools/plugins/alias", "--yes"]);
+    assert!(out.contains("installed echo 0.2.0"), "{out}");
+    let installed = cli.dir("d/plugins/echo");
+    let md = std::fs::symlink_metadata(&installed).unwrap();
+    assert!(md.is_dir(), "a directory, not a moved link");
+    assert!(installed.join("pastor-plugin.toml").exists());
+    let (out, _) = cli.ok(&["plugin", "list", "--json"]);
+    let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(rows[0]["error"], serde_json::Value::Null, "{out}");
+    let (out, _) = cli.ok(&["plugin", "run", "echo", "--job", "try"]);
+    assert_eq!(out.lines().count(), 3, "the installed plugin runs: {out}");
 }
 
 #[test]
