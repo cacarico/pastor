@@ -24,16 +24,25 @@ impl Drop for Env {
 }
 
 fn start() -> Env {
+    start_with_jobs(&[])
+}
+
+/// Like `start()`, but writes each `(name, text)` to `config/jobs/<name>.toml`
+/// before spawning `pastor serve`, so the scheduler picks the jobs up at start.
+fn start_with_jobs(jobs: &[(&str, &str)]) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
-    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(config.join("jobs")).unwrap();
     // Fast tick/settle/reconcile so the test doesn't wait out the 60s defaults.
     std::fs::write(
         config.join("pastor.toml"),
         "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n",
     )
     .unwrap();
+    for (name, text) in jobs {
+        std::fs::write(config.join("jobs").join(format!("{name}.toml")), text).unwrap();
+    }
     // A herdr connection carries one request, so the `command` transport spawns a
     // bridge process per request. The state has to outlive those: `fake-herdr
     // --listen` is the server (herdr's role) and `--connect` is the bridge
@@ -341,4 +350,131 @@ fn herdr_flag_adds_and_removes_the_saved_machine_too() {
             .unwrap()
             .contains("name = \"boom\"")
     );
+}
+
+#[test]
+fn clock_job_creates_tasks_end_to_end() {
+    let env = start_with_jobs(&[(
+        "tick",
+        "every = \"1s\"\n[connector]\nuse = \"clock\"\n[dispatch]\nrepo = \"/tmp\"\nprompt = \"clock {{ item.key }} for {{ job.name }} as {{ task.id }}\"\n",
+    )]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let tasks: Vec<serde_json::Value> = loop {
+        let out = env.cmd(&["list", "--job", "tick", "--json"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+        if !tasks.is_empty() {
+            break tasks;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the clock job never queued a task"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let t = &tasks[tasks.len() - 1];
+    assert_eq!(t["job"], "tick");
+    let prompt = t["prompt"].as_str().unwrap();
+    assert!(prompt.starts_with("clock 20"), "{prompt}");
+    assert!(prompt.contains(" for tick as t-"), "{prompt}");
+    assert_eq!(t["item"]["key"], prompt.split(' ').nth(1).unwrap());
+
+    let out = env.cmd(&["job", "list"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("tick") && text.contains("every 1s") && text.contains("ok:"),
+        "{text}"
+    );
+
+    // The clock connector keys an item by the current wall-clock second, and
+    // the background scheduler (also "every 1s") is racing this forced dry
+    // run for that same second. Retry until it lands on one the background
+    // pass has not already claimed, rather than assume a fixed gap wins it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let runs: Vec<serde_json::Value> = loop {
+        let out = env.cmd(&["tick", "--dry-run", "--job", "tick", "--json"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let runs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+        if runs[0]["created"].as_array().unwrap().len() == 1 {
+            break runs;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dry run never landed on a second the background tick hadn't claimed: {runs:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(runs[0]["outcome"], "dry_run");
+
+    let out = env.cmd(&["job", "disable", "tick"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let file = std::fs::read_to_string(env.config.join("jobs/tick.toml")).unwrap();
+    assert!(file.contains("enabled = false\n"), "{file}");
+    let out = env.cmd(&["job", "list", "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        jobs[0]["enabled"], false,
+        "disable reloads the daemon at once"
+    );
+
+    let out = env.cmd(&["job", "run", "tick"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("started"));
+
+    let out = env.cmd(&["job", "run", "ghost"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("job_not_found"));
+}
+
+#[test]
+fn tick_without_daemon_queues_tasks_for_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(config.join("jobs")).unwrap();
+    std::fs::write(
+        config.join("jobs/tick.toml"),
+        "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p {{ task.id }}\"\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["tick", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not running"));
+    let runs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(runs[0]["outcome"], "ran");
+    let out = run(&["list", "--json"]);
+    let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["state"], "queued");
+    assert_eq!(tasks[0]["prompt"], "p t-1");
+    let out = run(&["job", "list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("ok: 1 items, 1 tasks"));
 }

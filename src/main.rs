@@ -1,15 +1,18 @@
 use std::os::unix::process::CommandExt;
+use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use pastor::config::flock::{Flock, MachineConfig};
+use pastor::config::job::{job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
 use pastor::herdr::{ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{IpcRequest, IpcResponse, daemon_running, request};
 use pastor::machine::{ChannelState, MachineStatus};
+use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
 use pastor::task::{DispatchSpec, Task, TaskState, parse_task_id};
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     name = "pastor",
     version,
@@ -20,7 +23,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Run the daemon: scheduler, machine channels, dispatch
     Serve,
@@ -42,11 +45,51 @@ enum Command {
     Attach { task: String },
     /// Open the full herdr UI on a machine
     Open { machine: String },
+    /// Run one scheduler pass now and report what it did
+    Tick(TickArgs),
+    /// Re-read the job files now instead of at the next tick
+    Reload,
+    /// Manage jobs (files in ~/.config/pastor/jobs/)
+    Job {
+        #[command(subcommand)]
+        cmd: JobCmd,
+    },
     /// Print a shell completion script (fish, bash, zsh, ...) to stdout
     Completions { shell: clap_complete::Shell },
 }
 
-#[derive(Args)]
+#[derive(Args, Debug)]
+struct TickArgs {
+    /// Run connectors and show what would be created; write nothing
+    #[arg(long)]
+    dry_run: bool,
+    /// Only this job, and run it whether or not it is due
+    #[arg(long)]
+    job: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum JobCmd {
+    /// Every job file: schedule, enabled, last run, next run, last result
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Enable {
+        name: String,
+    },
+    Disable {
+        name: String,
+    },
+    /// Fire a job now, ignoring its schedule, the overlap rule and `enabled`
+    Run {
+        name: String,
+    },
+}
+
+#[derive(Args, Debug)]
 struct RunArgs {
     prompt: String,
     #[arg(long)]
@@ -68,7 +111,7 @@ struct RunArgs {
     json: bool,
 }
 
-#[derive(Args)]
+#[derive(Args, Debug)]
 struct ListArgs {
     /// Only tasks from this job (omit for one-off `run` tasks)
     #[arg(long)]
@@ -90,7 +133,7 @@ struct ListArgs {
     json: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum TaskCmd {
     Show {
         task: String,
@@ -104,7 +147,7 @@ enum TaskCmd {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum MachineCmd {
     Add {
         name: String,
@@ -163,6 +206,9 @@ fn main() {
             Command::Machine { cmd } => machine(&paths, cmd).await,
             Command::Attach { task } => attach(&paths, &task).await,
             Command::Open { machine } => open(&paths, &machine).await,
+            Command::Tick(args) => tick(&paths, args).await,
+            Command::Reload => reload(&paths).await,
+            Command::Job { cmd } => job(&paths, cmd).await,
             Command::Completions { shell } => {
                 let mut cmd = <Cli as clap::CommandFactory>::command();
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
@@ -736,6 +782,121 @@ async fn open(paths: &Paths, machine: &str) -> anyhow::Result<()> {
     Err(anyhow::anyhow!("exec failed: {err}"))
 }
 
+fn print_runs(runs: &[JobRunReport], json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(runs)?);
+    } else if runs.is_empty() {
+        println!("no jobs");
+    } else {
+        println!(
+            "{}",
+            pastor::cli::table(&pastor::cli::RUN_HEADER, &pastor::cli::run_rows(runs))
+        );
+    }
+    Ok(())
+}
+
+fn print_jobs(jobs: &[JobStatus], json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(jobs)?);
+    } else if jobs.is_empty() {
+        println!("no jobs");
+    } else {
+        println!(
+            "{}",
+            pastor::cli::table(&pastor::cli::JOB_HEADER, &pastor::cli::job_rows(jobs))
+        );
+    }
+    Ok(())
+}
+
+/// Offline scheduler over the same store, for `tick` and `job list` when
+/// `pastor serve` is down. Tasks it queues wait for the daemon.
+fn standalone(paths: &Paths) -> anyhow::Result<Scheduler> {
+    let config = PastorConfig::load(&paths.config_file())?;
+    paths.ensure()?;
+    let store = Arc::new(Store::open(&paths.db_file())?);
+    Ok(Scheduler::standalone(paths.clone(), &config, store))
+}
+
+async fn tick(paths: &Paths, a: TickArgs) -> anyhow::Result<()> {
+    let runs = if daemon_running(&paths.socket_file()).await {
+        let IpcResponse::Runs(runs) = ask(
+            paths,
+            IpcRequest::Tick {
+                job: a.job,
+                dry_run: a.dry_run,
+            },
+        )
+        .await?
+        else {
+            unreachable!()
+        };
+        runs
+    } else {
+        eprintln!(
+            "pastor serve is not running; running the pass here (new tasks stay queued until it starts)"
+        );
+        let mut s = standalone(paths)?;
+        s.tick_now(a.job.as_deref(), a.dry_run, chrono::Utc::now())
+            .await
+    };
+    print_runs(&runs, a.json)
+}
+
+async fn reload(paths: &Paths) -> anyhow::Result<()> {
+    let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::Reload).await? else {
+        unreachable!()
+    };
+    print_jobs(&jobs, false)
+}
+
+async fn job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
+    match cmd {
+        JobCmd::List { json } => {
+            let jobs = if daemon_running(&paths.socket_file()).await {
+                let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::JobList).await? else {
+                    unreachable!()
+                };
+                jobs
+            } else {
+                eprintln!(
+                    "pastor serve is not running; showing the job files and the last known state"
+                );
+                let mut s = standalone(paths)?;
+                s.reload();
+                s.statuses(chrono::Utc::now())
+            };
+            print_jobs(&jobs, json)?;
+        }
+        JobCmd::Enable { name } => toggle(paths, &name, true).await?,
+        JobCmd::Disable { name } => toggle(paths, &name, false).await?,
+        JobCmd::Run { name } => {
+            let IpcResponse::Text(msg) = ask(paths, IpcRequest::JobRun { name }).await? else {
+                unreachable!()
+            };
+            println!("{msg}");
+        }
+    }
+    Ok(())
+}
+
+async fn toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> {
+    let path = job_path(&paths.jobs_dir(), name);
+    if !path.exists() {
+        fail("job_not_found", &format!("no job file {}", path.display()));
+    }
+    set_enabled(&path, enabled)?;
+    let verb = if enabled { "enabled" } else { "disabled" };
+    if daemon_running(&paths.socket_file()).await {
+        ask(paths, IpcRequest::Reload).await?;
+        println!("{verb} {name}");
+    } else {
+        println!("{verb} {name}; applies when pastor serve starts");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,6 +1080,29 @@ mod tests {
             "a label is not a target"
         );
         assert!(saved_machines_at("No saved SSH machines.\n", "x@y").is_empty());
+    }
+
+    #[test]
+    fn job_and_tick_commands_parse() {
+        for args in [
+            vec!["pastor", "tick"],
+            vec!["pastor", "tick", "--dry-run", "--job", "a", "--json"],
+            vec!["pastor", "reload"],
+            vec!["pastor", "job", "list", "--json"],
+            vec!["pastor", "job", "enable", "a"],
+            vec!["pastor", "job", "disable", "a"],
+            vec!["pastor", "job", "run", "a"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(&args) {
+                panic!("{args:?}: {e}");
+            }
+        }
+        assert_eq!(
+            Cli::try_parse_from(["pastor", "job", "enable"])
+                .unwrap_err()
+                .exit_code(),
+            2
+        );
     }
 
     #[test]

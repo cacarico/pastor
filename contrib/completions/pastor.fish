@@ -33,13 +33,16 @@ complete -c pastor -n "__fish_pastor_needs_command" -f -a "task" -d 'Inspect a t
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "machine" -d 'Manage the machines in the flock'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "open" -d 'Open the full herdr UI on a machine'
+complete -c pastor -n "__fish_pastor_needs_command" -f -a "tick" -d 'Run one scheduler pass now and report what it did'
+complete -c pastor -n "__fish_pastor_needs_command" -f -a "reload" -d 'Re-read the job files now instead of at the next tick'
+complete -c pastor -n "__fish_pastor_needs_command" -f -a "job" -d 'Manage jobs (files in ~/.config/pastor/jobs/)'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "completions" -d 'Print a shell completion script (fish, bash, zsh, ...) to stdout'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand serve" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l repo -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l machine -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l agent -r
-complete -c pastor -n "__fish_pastor_using_subcommand run" -l branch -r
+complete -c pastor -n "__fish_pastor_using_subcommand run" -l branch -d 'Branch for the worktree (needs --worktree; a plain workspace has no branch)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l tag -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l timeout -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l worktree
@@ -89,19 +92,47 @@ complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand attach" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand open" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand tick" -l job -d 'Only this job, and run it whether or not it is due' -r
+complete -c pastor -n "__fish_pastor_using_subcommand tick" -l dry-run -d 'Run connectors and show what would be created; write nothing'
+complete -c pastor -n "__fish_pastor_using_subcommand tick" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand tick" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand reload" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run help" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run help" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run help" -f -a "enable"
+complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run help" -f -a "disable"
+complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run help" -f -a "run" -d 'Fire a job now, ignoring its schedule, the overlap rule and `enabled`'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from enable" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from disable" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from run" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "enable"
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "disable"
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "run" -d 'Fire a job now, ignoring its schedule, the overlap rule and `enabled`'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand completions" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open completions help" -f -a "serve" -d 'Run the daemon: scheduler, machine channels, dispatch'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open completions help" -f -a "run" -d 'Create a one-off task and dispatch it'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open completions help" -f -a "list" -d 'List tasks across the flock'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open completions help" -f -a "task" -d 'Inspect a task'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open completions help" -f -a "machine" -d 'Manage the machines in the flock'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open completions help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open completions help" -f -a "open" -d 'Open the full herdr UI on a machine'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open completions help" -f -a "completions" -d 'Print a shell completion script (fish, bash, zsh, ...) to stdout'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open completions help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "serve" -d 'Run the daemon: scheduler, machine channels, dispatch'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "run" -d 'Create a one-off task and dispatch it'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "list" -d 'List tasks across the flock'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "task" -d 'Inspect a task'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "machine" -d 'Manage the machines in the flock'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "open" -d 'Open the full herdr UI on a machine'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "tick" -d 'Run one scheduler pass now and report what it did'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "reload" -d 'Re-read the job files now instead of at the next tick'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "job" -d 'Manage jobs (files in ~/.config/pastor/jobs/)'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "completions" -d 'Print a shell completion script (fish, bash, zsh, ...) to stdout'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve run list task machine attach open tick reload job completions help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "show"
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "read"
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "add"
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "remove"
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "list"
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "status"
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "enable"
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "disable"
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "run" -d 'Fire a job now, ignoring its schedule, the overlap rule and `enabled`'
