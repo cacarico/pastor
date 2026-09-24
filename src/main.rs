@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use pastor::config::flock::{Flock, MachineConfig};
-use pastor::config::job::{job_path, set_enabled};
+use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
 use pastor::herdr::{ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{IpcRequest, IpcResponse, daemon_running, request};
@@ -882,6 +882,12 @@ async fn job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
 }
 
 async fn toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> {
+    // Validate before joining: `job_path` just formats and joins, so an
+    // unchecked name like "../pastor" would resolve outside the jobs
+    // directory instead of failing not-found.
+    if let Err(e) = check_name(name) {
+        fail("job_not_found", &e);
+    }
     let path = job_path(&paths.jobs_dir(), name);
     if !path.exists() {
         fail("job_not_found", &format!("no job file {}", path.display()));
