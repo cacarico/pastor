@@ -577,17 +577,26 @@ impl FakeHerdr {
                 Ok(json!({"type": "ok"}))
             }
             // herdr 0.9.1: `worktree.remove {workspace_id, force}` deletes the
-            // checkout and closes its workspace. A workspace that is not a
-            // worktree is `workspace_not_found`, uncommitted changes without
-            // `force` are `dirty_worktree_requires_force`.
+            // checkout and closes its workspace. An unknown workspace is
+            // `workspace_not_found`, a plain one `not_linked_worktree`,
+            // uncommitted changes without `force` `dirty_worktree_requires_force`.
             "worktree.remove" => {
                 let ws = p["workspace_id"].as_str().unwrap_or("").to_string();
                 let force = p["force"].as_bool().unwrap_or(false);
-                if s.workspaces.get(&ws) != Some(&true) {
-                    return Err((
-                        "workspace_not_found".into(),
-                        format!("workspace {ws} not found"),
-                    ));
+                match s.workspaces.get(&ws) {
+                    None => {
+                        return Err((
+                            "workspace_not_found".into(),
+                            format!("workspace {ws} not found"),
+                        ));
+                    }
+                    Some(false) => {
+                        return Err((
+                            "not_linked_worktree".into(),
+                            "workspace is not a Herdr-managed worktree checkout".into(),
+                        ));
+                    }
+                    Some(true) => {}
                 }
                 if s.dirty.contains(&ws) && !force {
                     return Err((
@@ -728,11 +737,14 @@ mod tests {
             .worktree_remove(&plain.workspace.workspace_id, false)
             .await
             .unwrap_err();
-        assert_eq!(
-            err.code(),
-            Some("workspace_not_found"),
-            "closed, and no worktree"
-        );
+        assert_eq!(err.code(), Some("workspace_not_found"), "closed already");
+        let other = fake.workspace_create(None, "t-4").await.unwrap();
+        let err = fake
+            .worktree_remove(&other.workspace.workspace_id, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("not_linked_worktree"));
+        fake.pane_close(&other.root_pane.pane_id).await.unwrap();
         fake.worktree_remove(&wt.workspace.workspace_id, false)
             .await
             .unwrap();
@@ -751,7 +763,13 @@ mod tests {
                 .filter(|r| r.method == "worktree.remove")
                 .map(|r| r.params["force"].as_bool())
                 .collect::<Vec<_>>(),
-            [Some(false), Some(false), Some(false), Some(true)]
+            [
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true)
+            ]
         );
     }
 

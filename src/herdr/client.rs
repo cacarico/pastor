@@ -440,7 +440,8 @@ pub trait ConnectorExt: Connector {
     /// workspace made by `worktree.create` and closes that workspace, panes
     /// and agent included. Without `force`, a checkout with uncommitted or
     /// untracked files is refused with `dirty_worktree_requires_force`; a
-    /// workspace that is not a worktree is `workspace_not_found`.
+    /// plain workspace is `not_linked_worktree`, an unknown one
+    /// `workspace_not_found`.
     async fn worktree_remove(&self, workspace_id: &str, force: bool) -> Result<(), CallError> {
         self.call(
             "worktree.remove",

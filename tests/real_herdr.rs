@@ -17,11 +17,10 @@
 //! instead of failing, so the command above is still safe to run without herdr
 //! installed or a session up — the case on this machine today.
 //!
-//! pastor's herdr client has no workspace- or pane-close call (see
-//! `src/herdr/client.rs`), and pastor itself never closes panes on its own by
-//! design (see `docs/superpowers/specs/2026-09-23-pastor-design.md`, "Dispatch and
-//! tasks"), so the workspace this test creates is left in place, exactly as a real
-//! dispatch would leave it.
+//! The workspace this test creates is closed again at the end with `pane.close`
+//! (its only pane), which also checks the method `pastor task close` uses. A
+//! `worktree.remove` on that plain workspace checks the other one exists and
+//! answers `not_linked_worktree` for a workspace that is not a worktree.
 
 use pastor::MIN_HERDR_PROTOCOL;
 use pastor::herdr::{ConnectorExt, Endpoint};
@@ -73,4 +72,20 @@ async fn talks_to_a_real_herdr_session() {
         .agent_list()
         .await
         .expect("list agents after creating a workspace");
+
+    let err = endpoint
+        .worktree_remove(&created.workspace.workspace_id, false)
+        .await
+        .expect_err("a plain workspace is not a worktree");
+    assert_eq!(err.code(), Some("not_linked_worktree"), "{err}");
+
+    endpoint
+        .pane_close(&created.root_pane.pane_id)
+        .await
+        .expect("close the workspace's only pane");
+    let err = endpoint
+        .pane_close(&created.root_pane.pane_id)
+        .await
+        .expect_err("the pane is gone");
+    assert_eq!(err.code(), Some("pane_not_found"), "{err}");
 }
