@@ -209,6 +209,7 @@ impl Daemon {
             fleet.clone(),
             events.clone(),
         )
+        .with_plugins()
         .spawn();
         Ok(Daemon {
             paths,

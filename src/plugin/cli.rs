@@ -92,11 +92,13 @@ pub async fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
         PluginCmd::Uninstall { id } => {
             install::uninstall(paths, &id)?;
             println!("uninstalled {id}; jobs using it are invalid until it is back");
+            reload_daemon(paths).await;
             Ok(())
         }
         PluginCmd::Unlink { id } => {
             install::unlink(paths, &id)?;
             println!("unlinked {id}; jobs using it are invalid until it is back");
+            reload_daemon(paths).await;
             Ok(())
         }
         PluginCmd::List { json } => {
@@ -162,8 +164,25 @@ async fn after_change(paths: &Paths, p: &Plugin) {
             paths.plugin_env_file(&p.id).display()
         );
     }
-    if crate::ipc::daemon_running(&paths.socket_file()).await {
-        eprintln!("restart pastor serve to pick up the change");
+    reload_daemon(paths).await;
+}
+
+/// A running daemon re-reads its plugins only on `Reload`; send it so the
+/// change takes effect now. The change itself is already on disk, so a
+/// failed reload is a warning, not an error.
+async fn reload_daemon(paths: &Paths) {
+    let socket = paths.socket_file();
+    if !crate::ipc::daemon_running(&socket).await {
+        return;
+    }
+    let failed = match crate::ipc::request(&socket, &crate::ipc::IpcRequest::Reload).await {
+        Ok(crate::ipc::IpcResponse::Error { message, .. }) => Some(message),
+        Ok(_) => None,
+        Err(e) => Some(format!("{e:#}")),
+    };
+    match failed {
+        Some(why) => eprintln!("pastor serve did not reload ({why}); run `pastor reload`"),
+        None => eprintln!("pastor serve reloaded its plugins and jobs"),
     }
 }
 

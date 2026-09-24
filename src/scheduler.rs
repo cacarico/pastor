@@ -15,8 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::job::{Job, Loaded, load_dir};
 use crate::config::{Defaults, PastorConfig, Paths};
-use crate::connector;
-use crate::connector::{ItemSource, RunInput};
+use crate::connector::{Builtins, Catalog, ItemSource, RunInput};
 use crate::daemon::Fleet;
 use crate::machine::PastorEvent;
 use crate::schedule::Schedule;
@@ -420,8 +419,8 @@ impl SchedulerHandle {
     }
 }
 
-/// Connector id -> source. The daemon uses `connector::builtin`; a plugin
-/// catalog (plan 3) or a test swaps its own in with `Scheduler::with_resolver`.
+/// Connector id -> source, overriding the catalog's lookup. Tests use it to
+/// swap in scripted connectors with `Scheduler::with_resolver`.
 pub type Resolver = Box<dyn Fn(&str) -> Option<Arc<dyn ItemSource>> + Send + Sync>;
 
 pub struct Scheduler {
@@ -431,8 +430,14 @@ pub struct Scheduler {
     store: Arc<Store>,
     fleet: Arc<Fleet>,
     events: broadcast::Sender<PastorEvent>,
-    /// Connector id -> source. `connector::builtin` outside tests.
-    resolve: Resolver,
+    /// Which connectors exist: job files validate against it and runs
+    /// resolve through it. `Builtins` until `with_plugins`.
+    catalog: Arc<dyn Catalog>,
+    /// Re-read the plugins dir on a forced reload (`pastor reload`, which
+    /// `plugin install|link|uninstall|unlink` send).
+    plugins: bool,
+    /// Replaces the catalog's lookup when set.
+    resolve: Option<Resolver>,
     entries: HashMap<String, Entry>,
     /// (file name, mtime, size) of every job file at the last load; `None`
     /// until the first.
@@ -464,7 +469,9 @@ impl Scheduler {
             store,
             fleet,
             events,
-            resolve: Box::new(connector::builtin),
+            catalog: Arc::new(Builtins),
+            plugins: false,
+            resolve: None,
             entries: HashMap::new(),
             fingerprint: None,
             in_flight: Vec::new(),
@@ -477,8 +484,35 @@ impl Scheduler {
     /// Replace the connector lookup. Builder style so `Scheduler::new(..)
     /// .with_resolver(..)` reads as one construction.
     pub fn with_resolver(mut self, resolve: Resolver) -> Self {
-        self.resolve = resolve;
+        self.resolve = Some(resolve);
         self
+    }
+
+    /// Validate and resolve against the builtins plus the plugins installed
+    /// under the data dir. An unreadable plugins dir is logged and leaves the
+    /// builtins, so a bad plugin never keeps the daemon from starting.
+    pub fn with_plugins(mut self) -> Self {
+        self.plugins = true;
+        self.load_plugins();
+        self
+    }
+
+    fn load_plugins(&mut self) {
+        match crate::plugin::PluginCatalog::load(&self.paths) {
+            Ok(c) => self.catalog = Arc::new(c),
+            Err(err) => {
+                tracing::error!(%err, "read plugins; only built-in connectors are available");
+                self.catalog = Arc::new(Builtins);
+            }
+        }
+    }
+
+    /// The source a run of `job` uses for `connector`.
+    pub fn source_for(&self, connector: &str, job: &str) -> Option<Arc<dyn ItemSource>> {
+        match &self.resolve {
+            Some(r) => r(connector),
+            None => self.catalog.source_for_job(connector, job),
+        }
     }
 
     /// For the CLI when no daemon runs: no machines to dispatch to, nobody
@@ -547,9 +581,7 @@ impl Scheduler {
             return false;
         }
         self.fingerprint = Some(fp);
-        // Validated against the builtins, matching the default resolver;
-        // wiring in `PluginCatalog` is the plugins follow-up (see AGENTS.md).
-        let loaded = match load_dir(&dir, &self.defaults, &connector::Builtins) {
+        let loaded = match load_dir(&dir, &self.defaults, self.catalog.as_ref()) {
             Ok(l) => l,
             Err(err) => {
                 tracing::error!(%err, "read jobs directory");
@@ -593,6 +625,11 @@ impl Scheduler {
     /// fingerprint looks unchanged. What `pastor job reload` calls: the fingerprint
     /// is a cheap heuristic (mtime and size), not proof nothing changed.
     pub fn force_reload(&mut self) -> bool {
+        // Plugins change only by command, and those end in this reload. A new
+        // catalog also drops the old one's sources, which stops its streams.
+        if self.plugins {
+            self.load_plugins();
+        }
         self.fingerprint = None;
         self.reload()
     }
@@ -728,7 +765,8 @@ impl Scheduler {
     }
 
     fn start_run(&mut self, job: Job, now: DateTime<Utc>) -> Result<(), String> {
-        let source = (self.resolve)(&job.connector)
+        let source = self
+            .source_for(&job.connector, &job.name)
             .ok_or_else(|| format!("connector {:?} is not available", job.connector))?;
         let store = self.store.clone();
         let fleet = self.fleet.clone();
@@ -813,7 +851,7 @@ impl Scheduler {
                     continue;
                 }
             }
-            let Some(source) = (self.resolve)(&job.connector) else {
+            let Some(source) = self.source_for(&job.connector, &job.name) else {
                 let mut r = JobRunReport::new(name, RunOutcome::Invalid);
                 r.error = Some(format!("connector {:?} is not available", job.connector));
                 reports.push(r);
@@ -895,14 +933,18 @@ impl Scheduler {
     #[cfg(test)]
     fn set_source_for_tests(&mut self, id: &str, source: Arc<dyn ItemSource>) {
         let id = id.to_string();
-        let previous = std::mem::replace(&mut self.resolve, Box::new(|_| None));
-        self.resolve = Box::new(move |name| {
+        let previous = self.resolve.take();
+        let catalog = self.catalog.clone();
+        self.resolve = Some(Box::new(move |name| {
             if name == id {
                 Some(source.clone())
             } else {
-                previous(name)
+                match &previous {
+                    Some(p) => p(name),
+                    None => catalog.source(name),
+                }
             }
-        });
+        }));
     }
 
     #[cfg(test)]
@@ -963,8 +1005,63 @@ mod tests {
         let s = Scheduler::standalone(paths, &PastorConfig::default(), store).with_resolver(
             Box::new(|id| (id == "only-this").then(|| crate::connector::builtin("clock").unwrap())),
         );
-        assert!((s.resolve)("only-this").is_some());
-        assert!((s.resolve)("clock").is_none(), "the default lookup is gone");
+        assert!(s.source_for("only-this", "j").is_some());
+        assert!(
+            s.source_for("clock", "j").is_none(),
+            "the default lookup is gone"
+        );
+    }
+
+    /// With plugins on, job files validate against the plugin catalog: a job
+    /// on an installed plugin is valid and resolves to that plugin, scoped to
+    /// the job; one missing a required key is invalid with the manifest's
+    /// reason. A plugin linked later is seen after a forced reload.
+    #[test]
+    fn with_plugins_validates_and_resolves_against_the_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let jobs = paths.jobs_dir();
+        std::fs::create_dir_all(&jobs).unwrap();
+        let job = |conn: &str| {
+            format!("every = \"1h\"\n[connector]\n{conn}\n[dispatch]\nprompt = \"p\"\n")
+        };
+        std::fs::write(
+            jobs.join("ok.toml"),
+            job("use = \"echo\"\nchannel = \"C1\""),
+        )
+        .unwrap();
+        std::fs::write(jobs.join("bare.toml"), job("use = \"echo\"")).unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut s =
+            Scheduler::standalone(paths.clone(), &PastorConfig::default(), store).with_plugins();
+        s.reload();
+        let st = s.statuses(Utc::now());
+        assert!(
+            st.iter().all(|j| j
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not available"))),
+            "{st:?}"
+        );
+
+        std::fs::create_dir_all(paths.plugins_dir()).unwrap();
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin/echo");
+        std::os::unix::fs::symlink(fixture, paths.plugins_dir().join("echo")).unwrap();
+        s.force_reload();
+        let st = s.statuses(Utc::now());
+        let bare = st.iter().find(|j| j.name == "bare").unwrap();
+        assert!(
+            bare.error
+                .as_deref()
+                .unwrap()
+                .contains("requires connector.channel"),
+            "{bare:?}"
+        );
+        let ok = st.iter().find(|j| j.name == "ok").unwrap();
+        assert_eq!(ok.error, None);
+        assert_eq!(s.source_for("echo", "ok").unwrap().id(), "echo");
+        assert_eq!(s.source_for("clock", "ok").unwrap().id(), "clock");
     }
     use crate::connector::{Item, RunFuture, RunOutput};
     use crate::schedule::Schedule;

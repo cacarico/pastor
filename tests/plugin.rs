@@ -541,3 +541,60 @@ fn link_run_and_unlink() {
     let (out, _) = cli.ok(&["plugin", "list", "--json"]);
     assert_eq!(out.trim(), "[]");
 }
+
+/// A job whose connector is a plugin: `pastor tick` (no daemon, so the pass
+/// runs in the CLI) runs the fixture, dedups its items and queues one task
+/// per new key, and the job's cursor is the fixture's last one.
+#[test]
+fn a_job_on_a_plugin_connector_queues_tasks_through_tick() {
+    let cli = Cli::new();
+    cli.ok(&["plugin", "link", fixture("echo").to_str().unwrap()]);
+    let jobs = cli.dir("c/jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(
+        jobs.join("support.toml"),
+        "every = \"1h\"\n[connector]\nuse = \"echo\"\nchannel = \"C9\"\n[dispatch]\nprompt = \"look at {{ item.title }}\"\nbranch = \"pastor/{{ item.key }}\"\nrepo = \"~/work\"\nworktree = true\n",
+    )
+    .unwrap();
+    let (out, _) = cli.ok(&["job", "list", "--json"]);
+    let jobs: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(jobs[0]["name"], "support");
+    assert_eq!(
+        jobs[0]["error"],
+        serde_json::Value::Null,
+        "valid against the plugin: {out}"
+    );
+    assert_eq!(jobs[0]["connector"], "echo");
+    let (out, _) = cli.ok(&["tick", "--json"]);
+    let runs: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let run = &runs.as_array().unwrap()[0];
+    assert_eq!(run["job"], "support");
+    assert_eq!(run["outcome"], "ran", "{out}");
+    assert_eq!(run["items"], 3);
+    assert_eq!(
+        run["created"].as_array().unwrap().len(),
+        2,
+        "k1 twice is one task"
+    );
+
+    let (out, _) = cli.ok(&["list", "--job", "support", "--json"]);
+    let tasks: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+    let mut prompts: Vec<&str> = tasks
+        .iter()
+        .map(|t| t["prompt"].as_str().unwrap())
+        .collect();
+    prompts.sort();
+    assert_eq!(prompts, vec!["look at first", "look at second"]);
+    assert!(tasks.iter().all(|t| t["state"] == "queued"));
+    assert!(tasks.iter().any(|t| t["spec"]["branch"] == "pastor/k1"));
+    assert!(
+        cli.dir("s/runs/support").is_dir(),
+        "the run log is the job's"
+    );
+
+    // Seen keys are not queued again.
+    let (out, _) = cli.ok(&["tick", "--job", "support", "--json"]);
+    let runs: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(runs[0]["created"], serde_json::json!([]), "{out}");
+    assert_eq!(runs[0]["skipped_seen"], 2, "{out}");
+}

@@ -75,6 +75,12 @@ pub trait Catalog: Send + Sync {
     fn source(&self, id: &str) -> Option<Arc<dyn ItemSource>>;
     /// Err(reason) for a missing plugin or a config key the manifest requires.
     fn check(&self, id: &str, config: &Value) -> Result<(), String>;
+    /// The source for `id` running on behalf of `job`. A catalog whose
+    /// sources care which job they serve (plugins: `PASTOR_JOB`, run logs,
+    /// scratch) overrides this; the default ignores the job.
+    fn source_for_job(&self, id: &str, _job: &str) -> Option<Arc<dyn ItemSource>> {
+        self.source(id)
+    }
 }
 
 /// Only what ships in the binary: the clock. What a daemon with no plugins,

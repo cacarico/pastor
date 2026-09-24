@@ -196,12 +196,6 @@ impl PluginCatalog {
         self.plugins.get(id)
     }
 
-    /// The source for `id` running on behalf of `job`: `PASTOR_JOB`, the run
-    /// log and the scratch dir are the job's. What the scheduler should use.
-    pub fn source_for_job(&self, id: &str, job: &str) -> Option<Arc<dyn ItemSource>> {
-        self.source_keyed(id, Some(job))
-    }
-
     fn source_keyed(&self, id: &str, job: Option<&str>) -> Option<Arc<dyn ItemSource>> {
         if let Some(b) = connector::builtin(id) {
             return Some(b);
@@ -220,6 +214,12 @@ impl PluginCatalog {
 impl Catalog for PluginCatalog {
     fn source(&self, id: &str) -> Option<Arc<dyn ItemSource>> {
         self.source_keyed(id, None)
+    }
+
+    /// `PASTOR_JOB`, the run log and the scratch dir are the job's. What the
+    /// scheduler uses.
+    fn source_for_job(&self, id: &str, job: &str) -> Option<Arc<dyn ItemSource>> {
+        self.source_keyed(id, Some(job))
     }
 
     fn check(&self, id: &str, config: &Value) -> Result<(), String> {

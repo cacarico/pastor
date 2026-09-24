@@ -979,7 +979,7 @@ fn standalone(paths: &Paths) -> anyhow::Result<Scheduler> {
     let config = PastorConfig::load(&paths.config_file())?;
     paths.ensure()?;
     let store = Arc::new(Store::open(&paths.db_file())?);
-    Ok(Scheduler::standalone(paths.clone(), &config, store))
+    Ok(Scheduler::standalone(paths.clone(), &config, store).with_plugins())
 }
 
 async fn tick(paths: &Paths, a: TickArgs) -> anyhow::Result<()> {
