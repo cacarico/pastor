@@ -129,9 +129,12 @@ async fn dispatch_steps(
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
+    let repo = match spec.repo.as_deref() {
+        Some(repo) => Some(expand_home(conn, repo, task.machine.as_deref()).await?),
+        None => None,
+    };
     let created = if spec.worktree {
-        let repo = spec
-            .repo
+        let repo = repo
             .as_deref()
             .ok_or_else(|| HerdrError::Protocol("worktree = true needs repo".into()))?;
         let branch = spec
@@ -140,7 +143,7 @@ async fn dispatch_steps(
             .unwrap_or_else(|| format!("pastor/{name}"));
         conn.worktree_create(repo, &branch, name).await?
     } else {
-        conn.workspace_create(spec.repo.as_deref(), name).await?
+        conn.workspace_create(repo.as_deref(), name).await?
     };
     task.workspace_id = Some(created.workspace.workspace_id.clone());
     task.pane_id = Some(created.root_pane.pane_id.clone());
@@ -158,6 +161,36 @@ async fn dispatch_steps(
     .await?;
 
     prompt_when_ready(conn, task, name, ready_timeout).await
+}
+
+/// Expand a leading `~` in `repo` against the machine's home directory.
+///
+/// herdr takes `cwd` literally: `~/work` is a directory named `~` to it, and a
+/// `cwd` that does not exist silently opens the pane somewhere else. Job files
+/// and `pastor run --repo` both use `~` to mean the home on that machine, so
+/// pastor resolves it there before asking herdr.
+async fn expand_home(
+    conn: &dyn Connector,
+    repo: &str,
+    machine: Option<&str>,
+) -> Result<String, DispatchError> {
+    let rest = match repo.strip_prefix('~') {
+        None => return Ok(repo.to_string()),
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+        Some(_) => {
+            return Err(DispatchError::Task(format!(
+                "repo {repo}: only ~ and ~/ are expanded, not ~user; use an absolute path"
+            )));
+        }
+    };
+    let machine = machine.unwrap_or("this machine");
+    match conn.home_dir().await.map_err(CallError::from)? {
+        Some(home) => Ok(format!("{}{rest}", home.trim_end_matches('/'))),
+        None => Err(DispatchError::Task(format!(
+            "repo {repo}: pastor cannot tell the home directory on {machine} \
+             (a `command` machine); use an absolute path"
+        ))),
+    }
 }
 
 /// Poll `agent.list` until the agent herdr just started is up, then prompt it.
@@ -411,6 +444,72 @@ mod tests {
         assert_eq!(wt.params["cwd"], "/srv/app");
         assert_eq!(wt.params["branch"], "pastor/k1");
         assert_eq!(wt.params["label"], "t-7");
+    }
+
+    /// herdr takes `cwd` literally and opens the pane elsewhere when it does
+    /// not exist, so `~` is expanded against the machine's home first, for a
+    /// workspace and a worktree alike.
+    #[tokio::test]
+    async fn a_leading_tilde_is_the_machine_s_home() {
+        for (repo, cwd) in [("~/work/app", "/home/fake/work/app"), ("~", "/home/fake")] {
+            for worktree in [false, true] {
+                let fake = FakeHerdr::new();
+                let mut t = task(DispatchSpec {
+                    repo: Some(repo.into()),
+                    worktree,
+                    ..spec()
+                });
+                dispatch(&fake, &mut t, READY).await.unwrap();
+                let method = if worktree {
+                    "worktree.create"
+                } else {
+                    "workspace.create"
+                };
+                let req = fake
+                    .requests()
+                    .into_iter()
+                    .find(|r| r.method == method)
+                    .unwrap();
+                assert_eq!(req.params["cwd"], cwd, "{repo} via {method}");
+                assert_eq!(
+                    t.spec.repo.as_deref(),
+                    Some(repo),
+                    "the spec keeps what was asked"
+                );
+            }
+        }
+    }
+
+    /// Where `~` cannot be resolved the task fails up front with a reason,
+    /// instead of herdr quietly opening the pane in some other directory.
+    #[tokio::test]
+    async fn an_unresolvable_tilde_fails_the_task_before_herdr_is_asked() {
+        for (home, repo, needle) in [
+            (None, "~/work", "cannot tell the home directory"),
+            (Some("/home/fake"), "~bob/work", "not ~user"),
+        ] {
+            let fake = FakeHerdr::new();
+            fake.set_home(home);
+            let mut t = task(DispatchSpec {
+                repo: Some(repo.into()),
+                ..spec()
+            });
+            let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+            assert!(!err.is_transport(), "the machine is fine: {err}");
+            assert_eq!(t.state, TaskState::Failed);
+            assert!(
+                t.error.as_deref().unwrap().contains(needle),
+                "{:?}",
+                t.error
+            );
+            assert!(
+                !fake
+                    .requests()
+                    .iter()
+                    .any(|r| r.method == "workspace.create"),
+                "nothing was created"
+            );
+        }
     }
 
     /// herdr reports a managed agent as `unknown` and refuses prompts while it
