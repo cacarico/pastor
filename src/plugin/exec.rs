@@ -51,19 +51,7 @@ impl RunLog {
     ) -> anyhow::Result<RunLog> {
         create_private_dir(dir)?;
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
-        // Two runs in the same millisecond (a stream restarting at once) get
-        // a suffix rather than sharing a file.
-        let mut path = dir.join(format!("{stamp}.log"));
-        let mut n = 1;
-        while path.exists() {
-            path = dir.join(format!("{stamp}-{n}.log"));
-            n += 1;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("create {}", path.display()))?;
+        let (path, file) = open_unique(dir, &stamp)?;
         prune(dir, keep)?;
         Ok(RunLog {
             path,
@@ -109,6 +97,29 @@ impl RunLog {
     pub fn redact(&self, text: &str) -> String {
         self.redactor.redact(text)
     }
+}
+
+/// Create `<stamp>.log`, or `<stamp>-1.log`, `-2`, ... if it is taken. Two
+/// runs of one job in the same millisecond (a stream restarting at once)
+/// race for the name; `create_new` makes claiming it atomic, so the loser
+/// takes the next suffix instead of failing.
+fn open_unique(dir: &Path, stamp: &str) -> anyhow::Result<(PathBuf, std::fs::File)> {
+    for n in 0u32.. {
+        let path = match n {
+            0 => dir.join(format!("{stamp}.log")),
+            n => dir.join(format!("{stamp}-{n}.log")),
+        };
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+        }
+    }
+    unreachable!("u32 suffixes run out before a directory does")
 }
 
 /// Keep the newest `keep` `*.log` files in `dir`. Names sort by time.
@@ -395,6 +406,21 @@ mod tests {
         let done = run(inv, log.clone(), |_| {}).await;
         assert!(matches!(&done.exit, Exit::SpawnFailed(e) if e.contains("no-such-program")));
         assert!(!done.exit.success());
+    }
+
+    #[test]
+    fn a_taken_log_name_gets_the_next_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = "20260924T120000.000Z";
+        std::fs::write(tmp.path().join(format!("{stamp}.log")), "first").unwrap();
+        std::fs::write(tmp.path().join(format!("{stamp}-1.log")), "second").unwrap();
+        let (path, _file) = open_unique(tmp.path(), stamp).unwrap();
+        assert_eq!(path, tmp.path().join(format!("{stamp}-2.log")));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(format!("{stamp}.log"))).unwrap(),
+            "first",
+            "an existing log is never reopened"
+        );
     }
 
     #[test]
