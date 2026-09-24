@@ -1,31 +1,30 @@
 # Working on pastor
 
-Read this first, then `README.md` (how it works today) and
-`docs/superpowers/specs/2026-09-23-pastor-design.md` (what it must become).
-The spec is the source of truth for design; the code is the source of truth
-for behaviour. When they disagree, fix one and say which.
+Read this first, then `README.md` (how it works today) and the design spec
+on the `docs` branch, `docs/superpowers/specs/2026-09-23-pastor-design.md`
+(what it must become). The spec is the source of truth for design; the code
+is the source of truth for behaviour. When they disagree, fix one and say
+which.
 
 ## Status
 
-Plan 1 of 4 (core) is implemented on `feat/core`, PR #1. It covers the flock
-registry, the herdr client and transports, tasks and the SQLite store, one
-actor per machine, the `pastor serve` daemon, the CLI, README, Makefile and
-shell completions.
+Plans 1 (core) and 2 (jobs and schedules) are implemented: plan 1 on
+`feat/core` (PR #1), plan 2 on `feat/jobs`. Plan 2 added job files, the
+schedule (`every`/`cron`), the built-in `clock` connector behind the
+`ItemSource` seam, the seen-store and per-job state (schema v2), templates,
+the scheduler as its own task with one dispatch lock, SQL task claims and
+optimistic `update_task`, the `polling` channel state, readiness from herdr's
+launch flags, and `job list|enable|disable|run`, `tick`, `reload`.
 
-Plans 2 to 4 are not written yet:
+Plans 3 and 4 are not written yet:
 
-- Plan 2: jobs and schedules (connector plugin + schedule + prompt), the
-  seen-store, templates.
-- Plan 3: plugins and the connector protocol, event hooks, the events log,
-  `pastor events`.
+- Plan 3: plugins and the connector protocol (process connectors behind
+  `connector::ItemSource`), event hooks, the events log, `pastor events`.
 - Plan 4: systemd unit, `task retry|close|prune`, cleanup of orphaned
-  workspaces and agents.
+  workspaces and agents, hot reload of `flock.toml` and `pastor.toml`.
 
-`docs/superpowers/plans/2026-09-23-pastor-core.md` is the executed plan 1.
-It is history: several snippets in it describe behaviour that was changed
-after review (persistent request connections, prompting without a readiness
-wait, `agent_not_ready` marking a task blocked, `list` hiding failed tasks).
-Do not copy code from it.
+`docs/superpowers/plans/` on the `docs` branch holds the executed plans; they
+are history, not reference. Do not copy code from them.
 
 ## herdr facts that shaped the code
 
@@ -67,31 +66,26 @@ them too; they are repeated here because getting them wrong cost a day.
 
 ## Known gaps, parked for the next plans
 
-From the whole-branch review and the first run against a real machine. None
-of them blocks plan 1; each is a design decision for the plan named.
+From the whole-branch review and the live tour of the real fleet and the
+fake, both on 2026-09-24. None of them blocks plan 1 or plan 2; each is a
+design decision for the plan named.
 
-Plan 2 (scheduler and concurrency):
+Plan 2 (scheduler and concurrency): every item here was folded into plan 2 on
+this branch — the scheduler is its own task with one dispatch lock, tasks are
+claimed in SQL, `update_task` is optimistic, `request_timeout` and
+`agent_ready_timeout` are config keys, readiness reads herdr's
+`launch_pending`/`interactive_ready`, and the `polling` channel state exists.
+What plan 2 left behind is below.
 
-- `Daemon::run` awaits `dispatch_queued` inline in its `select!`, so a slow
-  dispatch (up to the 30s readiness wait) holds the accept loop. The
-  scheduler must run as its own task, and dispatch passes should be
-  serialised or claim tasks with a conditional `UPDATE ... WHERE state =
-  'queued'`.
-- Capacity is a snapshot; concurrent `dispatch_queued` callers can
-  over-dispatch past `max_agents`.
-- `update_task` writes every column with no optimistic concurrency.
-- `request_timeout` and `agent_ready_timeout` have no config keys.
-- The readiness poll is `agent_status != unknown`; herdr's `AgentInfo`
-  exposes `launch_pending`/`interactive_ready`, a plainer signal.
-- The spec's "warn after 1h queued" and the `polling` channel state are not
-  implemented.
-
-Plan 3 (events):
+Plan 3 (events and plugins):
 
 - A 30s unread events socket can overrun herdr's retained history; pastor
   reconnects and reconciles, at the cost of a `machine.lost` blip.
 - Adopted panes get no `agent_status` subscription until the next reconnect.
 - `pastor machine status` does unbounded connect/ping/list on the CLI path.
+- `pastor tick` runs jobs inline in the scheduler task so its report is
+  complete; a process connector that takes a minute holds the scheduler for
+  that minute. Move to spawned runs with a reply channel when plugins land.
 
 Plan 4 (cleanup and lifecycle):
 
@@ -101,13 +95,50 @@ Plan 4 (cleanup and lifecycle):
   persisted.
 - A machine removed from the flock leaves its open tasks `running` forever.
 - `apply` overwrites `finished_at` on `done -> closed`.
+- `flock.toml` and `pastor.toml` do not reload; a machine added with `pastor
+  machine add` needs a daemon restart. Job files do reload.
+- `pastor run --worktree` without `--repo` is accepted by the CLI and queued,
+  and only fails at dispatch. Reject it in the CLI (clap `requires`) and in
+  `Run`.
+- `machine add --command` is greedy (`num_args = 1..`): options placed after
+  it are taken as part of the command. Put options before it, or add `--`.
+- A repo that does not exist on the machine is not an error: herdr opened
+  t-5's workspace at `$HOME` instead of the requested path. Check herdr's
+  `workspace.create` behaviour and fail the task if the cwd is wrong.
+- Claude Code's "trust this folder" dialog blocks every agent started in a
+  folder it has not seen, on a fresh machine, until answered once per
+  machine; pastor cannot answer it, so use `pastor attach` to answer it by
+  hand, or document a one-time `claude` run per repo per machine.
+- The Pis lack git and lingering, and herdr's server does not survive a
+  reboot: start it with `herdr server`; a systemd user unit needs
+  `loginctl enable-linger`.
+- A hand edit of `flock.toml` leaves herdr's saved-machine list stale; only
+  `machine add|remove --herdr` touches it. Candidate: `machine sync --herdr`,
+  or reconciling the two lists on head start.
+- `tasks.id` has no `AUTOINCREMENT`, so ids can be reused after a rollback or
+  pruning; ids appear in branch names (`pastor/t-<n>`) and in
+  `seen.task_id`.
+- `pastor open` should detect a nested herdr and say so instead of herdr
+  refusing to start.
+- The whole dispatch pass runs under the fleet lock, so slow agent readiness
+  delays `job list`, `tick`, `reload` and `run` too. Move readiness waits out
+  of the lock.
+
+Not yet assigned a plan:
+
+- Cron minutes that do not exist on a spring-forward day are skipped;
+  Vixie cron runs them instead.
+- Proposed: herdr owns machine identity, and flock entries reference herdr's
+  saved-machine labels and carry only pastor's extra fields. A small plan of
+  its own, after plan 2.
 
 ## Where things live
 
 ```
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, defaults
 ~/.config/pastor/flock.toml       machines
-~/.local/state/pastor/pastor.db   tasks (SQLite)
+~/.config/pastor/jobs/<name>.toml one job per file
+~/.local/state/pastor/pastor.db   tasks, seen keys, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
 ```
