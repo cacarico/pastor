@@ -5,10 +5,10 @@ tasks while your laptop is closed. It sits on top of [herdr](https://herdr.dev):
 herdr owns the terminals and the agents, pastor owns the fleet and the
 bookkeeping. When you open the laptop you attach to the panes through herdr.
 
-Status: core, jobs and systemd setup. `pastor serve`, the head, runs one-off
-tasks and scheduled jobs end to end with the built-in `clock` connector.
-Connector plugins and event hooks are the next milestones; see the
-design spec on the `docs` branch,
+Status: version 0.2.0. `pastor serve`, the head, runs one-off tasks and
+scheduled jobs end to end with the built-in `clock` connector. See
+`CHANGELOG.md` for what changed in this release. Connector plugins and event
+hooks are the next milestones; see the design spec on the `docs` branch,
 `docs/superpowers/specs/2026-09-23-pastor-design.md`.
 
 ## How it works
