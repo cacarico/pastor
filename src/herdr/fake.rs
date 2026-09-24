@@ -34,6 +34,8 @@ struct State {
     /// `unknown` and `agent.prompt` answers `agent_not_ready`, the way herdr
     /// does while a managed agent is still launching. Zero by default.
     ready_after: Duration,
+    /// What `Connector::home_dir` reports; `None` like a `command` machine.
+    home: Option<String>,
     /// The started agent vanishes immediately, as it does when the agent binary
     /// is missing and the process exits the moment it is launched.
     exit_on_start: bool,
@@ -66,6 +68,7 @@ impl FakeHerdr {
         FakeHerdr {
             state: Arc::new(Mutex::new(State {
                 protocol: 22,
+                home: Some("/home/fake".into()),
                 ..Default::default()
             })),
             events,
@@ -75,6 +78,9 @@ impl FakeHerdr {
 
     pub fn set_start_behaviour(&self, b: StartBehaviour) {
         self.state.lock().unwrap().start = Some(b);
+    }
+    pub fn set_home(&self, home: Option<&str>) {
+        self.state.lock().unwrap().home = home.map(str::to_string);
     }
     pub fn set_protocol(&self, p: u32) {
         self.state.lock().unwrap().protocol = p;
@@ -419,6 +425,10 @@ impl super::transport::Connector for FakeHerdr {
     }
     fn describe(&self) -> String {
         "fake herdr".into()
+    }
+    fn home_dir(&self) -> super::transport::HomeFuture<'_> {
+        let home = self.state.lock().unwrap().home.clone();
+        Box::pin(async move { Ok(home) })
     }
 }
 

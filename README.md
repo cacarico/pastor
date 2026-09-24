@@ -91,7 +91,7 @@ pastor machine add pi-3 fleet@pi-3 --max-agents 2 --herdr   # --herdr also saves
 pastor machine add here --local
 pastor machine status                  # ssh, herdr version, protocol
 pastor serve &                       # or run it under systemd later
-pastor run "Fix the flaky test in ci.yml" --repo ~/work/api --machine pi-3
+pastor run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
 mkdir -p ~/.config/pastor/jobs
 cat > ~/.config/pastor/jobs/hourly.toml <<'EOF'
 every = "1h"
@@ -111,6 +111,13 @@ pastor task read t-1                 # recent pane output, without attaching
 pastor attach t-1                    # lands in the agent's pane; ctrl+b q detaches
 pastor open pi-3                     # the full herdr UI on that machine
 ```
+
+`--repo` and a job's `repo` are paths on the machine that runs the agent. A
+leading `~` means that machine's home: pastor asks an ssh machine for `$HOME`
+and uses its own for a local one, because herdr takes the path literally and
+opens the pane somewhere else when it does not exist. Quote it, or your shell
+expands it to the head's home first. A `command` machine cannot report a home,
+so give it absolute paths.
 
 Without a real herdr, a fake one speaks the same protocol. It comes in the same
 two pieces the real thing does, because state has to outlive a single request:

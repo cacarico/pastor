@@ -167,6 +167,12 @@ fn control_path_fits(path: &Path) -> bool {
 /// and only the remote command (which a remote shell does parse) is quoted, by
 /// `bridge_command`.
 fn ssh_argv(target: &str, session: &str, control_path: Option<&Path>) -> Vec<String> {
+    ssh_argv_running(target, control_path, bridge_command(session))
+}
+
+/// ssh argv that runs `remote` (parsed by the remote shell) over the shared
+/// master when there is one.
+fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -> Vec<String> {
     let mut argv = vec![
         "ssh".to_string(),
         "-o".into(),
@@ -189,16 +195,19 @@ fn ssh_argv(target: &str, session: &str, control_path: Option<&Path>) -> Vec<Str
             format!("ControlPersist={CONTROL_PERSIST_SECS}"),
         ]);
     }
-    argv.extend([
-        "-T".to_string(),
-        target.to_string(),
-        bridge_command(session),
-    ]);
+    argv.extend(["-T".to_string(), target.to_string(), remote]);
     argv
 }
 
+/// Asks the remote shell for `$HOME`. ssh is spawned without a local shell, so
+/// this string reaches the remote shell as written and it expands `$HOME`.
+const REMOTE_HOME_COMMAND: &str = "printf %s \"$HOME\"";
+
 pub type ConnectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Connection, ConnectError>> + Send + 'a>>;
+
+pub type HomeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<String>, ConnectError>> + Send + 'a>>;
 
 /// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
 ///
@@ -208,6 +217,12 @@ pub type ConnectFuture<'a> =
 pub trait Connector: Send + Sync {
     fn connect(&self) -> ConnectFuture<'_>;
     fn describe(&self) -> String;
+    /// The home directory on the machine, for expanding `~` in a repo path:
+    /// herdr takes a `cwd` literally and silently falls back to another
+    /// directory when it does not exist. `None` when it cannot be known.
+    fn home_dir(&self) -> HomeFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 impl Connector for Endpoint {
@@ -216,6 +231,49 @@ impl Connector for Endpoint {
     }
     fn describe(&self) -> String {
         Endpoint::describe(self)
+    }
+    fn home_dir(&self) -> HomeFuture<'_> {
+        Box::pin(home_dir(self))
+    }
+}
+
+async fn home_dir(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
+    match ep {
+        // The head and this herdr share a machine, and so a home.
+        Endpoint::Local { .. } => Ok(dirs::home_dir().map(|p| p.to_string_lossy().into_owned())),
+        Endpoint::Ssh {
+            target,
+            control_path,
+            ..
+        } => {
+            let argv = ssh_argv_running(
+                target,
+                control_path.as_deref(),
+                REMOTE_HOME_COMMAND.to_string(),
+            );
+            let out = tokio::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| ConnectError {
+                    message: format!("spawn ssh: {e}"),
+                })?;
+            let home = String::from_utf8_lossy(&out.stdout).into_owned();
+            if !out.status.success() || !home.starts_with('/') {
+                return Err(ConnectError {
+                    message: format!(
+                        "ssh {target}: reading $HOME failed ({}): {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                });
+            }
+            Ok(Some(home))
+        }
+        // An arbitrary bridge command says nothing about where it lands.
+        Endpoint::Command { .. } => Ok(None),
     }
 }
 
@@ -424,6 +482,36 @@ mod tests {
             "herdr --session default remote-api-bridge"
         );
         assert_eq!(argv[argv.len() - 2], "fleet@pi-3");
+    }
+
+    /// `~` in a repo path is the home on the machine: ssh asks the remote
+    /// shell, over the same master as every request; a local machine is the
+    /// head's own home; a bridge command cannot know.
+    #[tokio::test]
+    async fn home_dir_per_endpoint() {
+        let argv = ssh_argv_running(
+            "fleet@pi-3",
+            Some(Path::new("/tmp/s/ssh/pi-3-%C")),
+            REMOTE_HOME_COMMAND.to_string(),
+        );
+        assert_eq!(argv.last().unwrap(), "printf %s \"$HOME\"");
+        assert_eq!(argv[argv.len() - 2], "fleet@pi-3");
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ControlPath=/tmp/s/ssh/pi-3-%C")
+        );
+
+        let local = Endpoint::Local {
+            session: "default".into(),
+        };
+        assert_eq!(
+            local.home_dir().await.unwrap(),
+            dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
+        );
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.home_dir().await.unwrap(), None);
     }
 
     #[test]
