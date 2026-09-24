@@ -10,6 +10,26 @@ use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
 
 const SCHEMA_VERSION: i64 = 2;
 
+/// The tables schema 2 added: created on a fresh database and by the v1
+/// migration.
+const V2_TABLES: &str = "CREATE TABLE IF NOT EXISTS seen (
+        job TEXT NOT NULL,
+        key TEXT NOT NULL,
+        task_id INTEGER,
+        seen_at TEXT NOT NULL,
+        PRIMARY KEY (job, key)
+     );
+     CREATE TABLE IF NOT EXISTS job_state (
+        name TEXT PRIMARY KEY,
+        last_run_at TEXT,
+        last_ok_at TEXT,
+        last_result TEXT,
+        last_error TEXT,
+        cursor TEXT,
+        failures INTEGER NOT NULL DEFAULT 0,
+        backoff_until TEXT
+     );";
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -64,55 +84,27 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> anyhow::Result<Store> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY,
-                job TEXT NOT NULL,
-                item TEXT NOT NULL,
-                prompt TEXT NOT NULL,
-                spec TEXT NOT NULL,
-                machine TEXT,
-                workspace_id TEXT,
-                pane_id TEXT,
-                agent_name TEXT,
-                state TEXT NOT NULL,
-                error TEXT,
-                last_completion_seq INTEGER,
-                prompt_pending INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                finished_at TEXT,
-                updated_at TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state);
-             CREATE INDEX IF NOT EXISTS tasks_machine ON tasks(machine);
-             CREATE TABLE IF NOT EXISTS seen (
-                job TEXT NOT NULL,
-                key TEXT NOT NULL,
-                task_id INTEGER,
-                seen_at TEXT NOT NULL,
-                PRIMARY KEY (job, key)
-             );
-             CREATE TABLE IF NOT EXISTS job_state (
-                name TEXT PRIMARY KEY,
-                last_run_at TEXT,
-                last_ok_at TEXT,
-                last_result TEXT,
-                last_error TEXT,
-                cursor TEXT,
-                failures INTEGER NOT NULL DEFAULT 0,
-                backoff_until TEXT
-             );",
+    fn init(mut conn: Connection) -> anyhow::Result<Store> {
+        // Read the version before writing anything: a database from a newer
+        // pastor, or one whose version cannot be read, is refused untouched.
+        // An immediate transaction keeps a second process from migrating the
+        // same file between this read and the writes below.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_meta: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+            [],
+            |r| r.get(0),
         )?;
-        let version: Option<String> = conn
-            .query_row(
+        let version: Option<String> = if has_meta {
+            tx.query_row(
                 "SELECT value FROM meta WHERE key = 'schema_version'",
                 [],
                 |r| r.get(0),
             )
-            .optional()?;
+            .optional()?
+        } else {
+            None
+        };
         // An unreadable version is not an old one: guessing would let the
         // newer-schema guard below be skipped on a database of unknown shape.
         let version = version
@@ -123,24 +115,47 @@ impl Store {
             .transpose()?;
         match version {
             None => {
-                conn.execute(
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE IF NOT EXISTS tasks (
+                        id INTEGER PRIMARY KEY,
+                        job TEXT NOT NULL,
+                        item TEXT NOT NULL,
+                        prompt TEXT NOT NULL,
+                        spec TEXT NOT NULL,
+                        machine TEXT,
+                        workspace_id TEXT,
+                        pane_id TEXT,
+                        agent_name TEXT,
+                        state TEXT NOT NULL,
+                        error TEXT,
+                        last_completion_seq INTEGER,
+                        prompt_pending INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        started_at TEXT,
+                        finished_at TEXT,
+                        updated_at TEXT NOT NULL
+                     );
+                     CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state);
+                     CREATE INDEX IF NOT EXISTS tasks_machine ON tasks(machine);",
+                )?;
+                tx.execute_batch(V2_TABLES)?;
+                tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
                 )?;
             }
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) if v < SCHEMA_VERSION => {
-                // One `if v < N` block per migration. `CREATE TABLE IF NOT
-                // EXISTS` above left an older table as it was, so a v1 file
-                // gets `seen` and `job_state` from the statements above and
-                // only the new column needs an explicit ALTER here.
+                // One `if v < N` block per migration.
                 if v < 2 {
-                    conn.execute(
+                    tx.execute_batch(V2_TABLES)?;
+                    tx.execute(
                         "ALTER TABLE tasks ADD COLUMN prompt_pending INTEGER NOT NULL DEFAULT 0",
                         [],
                     )?;
                 }
-                conn.execute(
+                tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
                 )?;
@@ -149,6 +164,7 @@ impl Store {
                 "database schema {v} is newer than this pastor ({SCHEMA_VERSION}); refusing to touch it"
             ),
         }
+        tx.commit()?;
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -706,6 +722,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, "x");
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused_before_anything_is_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '99');",
+            )
+            .unwrap();
+        }
+        let err = Store::open(&path).err().expect("must not open");
+        assert!(err.to_string().contains("newer"), "error was: {err}");
+        let conn = Connection::open(&path).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(tables, vec!["meta"], "a newer database is left untouched");
     }
 
     #[test]
