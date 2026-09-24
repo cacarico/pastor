@@ -213,7 +213,7 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
   `key` set to the run time, for schedule-only jobs.
 - `pastor task run "<prompt>" [--repo P] [--machine M] [--agent K]
   [--worktree]` creates a one-off task with no job file. `pastor run` stays as
-  a compatibility alias.
+  a hidden alias (see the CLI summary).
 
 Commands:
 
@@ -400,8 +400,8 @@ pastor task attach t-123                    ssh -t <machine> herdr --session <s>
 pastor open <machine>                       herdr --remote <ssh-target> [--session S]
 ```
 
-`pastor list` and `pastor attach` stay as compatibility aliases for the nested
-task commands.
+`pastor list` and `pastor attach` stay as hidden aliases for the nested task
+commands (see the CLI summary).
 
 pastor never closes panes or removes worktrees on its own.
 
@@ -570,8 +570,10 @@ pastor events [--follow] [--task T]
 pastor setup systemd [--herdr] [--enable] [--start|--stop] [--now]
 ```
 
-`pastor run`, `pastor list` and `pastor attach` are compatibility aliases for
-the nested task commands.
+`pastor run`, `pastor list`, `pastor attach` and `pastor reload` are hidden
+aliases for `task run`, `task list`, `task attach` and `job reload`: absent from
+`--help` and the completions, they print a one-line hint to stderr (`pastor run
+is now pastor task run`) and otherwise behave exactly like the nested command.
 
 ## Later
 
