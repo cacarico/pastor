@@ -1261,11 +1261,13 @@ mod tests {
         let _ = h.read(t.id, 10).await.unwrap_err();
     }
 
-    /// herdr rejects a prompt to a blocked agent instead of queueing it, so a
-    /// task blocked at dispatch has to get its prompt once a human clears the
-    /// block; flipping it to `running` alone leaves the agent with nothing to do.
+    /// herdr rejects a prompt to a blocked agent instead of queueing it, so
+    /// dispatch must not send one: it leaves the task `blocked` with the
+    /// prompt pending. Flipping the task to `running` on its own would leave
+    /// the agent with nothing to do, so the prompt has to be sent once a
+    /// human clears the block.
     #[tokio::test]
-    async fn a_prompt_refused_at_dispatch_is_sent_when_the_block_clears() {
+    async fn a_blocked_agent_is_not_prompted_at_dispatch_but_is_once_it_clears() {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_millis(150));
         let watcher = fake.clone();
@@ -1293,7 +1295,7 @@ mod tests {
                 .filter(|r| r.method == "agent.prompt")
                 .count()
         };
-        let refused = prompts();
+        assert_eq!(prompts(), 0, "a blocked agent is not prompted at dispatch");
 
         // The human answers the agent's startup question; it goes idle.
         fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle, None);
@@ -1304,8 +1306,8 @@ mod tests {
         .await;
         assert_eq!(
             prompts(),
-            refused + 1,
-            "the prompt is sent exactly once more"
+            1,
+            "the prompt is sent exactly once, after the block clears"
         );
         let t = store.get_task(t.id).unwrap().unwrap();
         assert_eq!(t.error, None, "the blocked advice is gone");
@@ -1318,13 +1320,23 @@ mod tests {
 
     /// The folder trust dialog case end to end: the agent is blocked before it
     /// finishes launching, dispatch leaves the task `blocked` with the prompt
-    /// pending, and once a human answers, herdr may still refuse with
-    /// `agent_not_ready` for a moment. Reconcile keeps retrying until the
+    /// pending and never calls `agent.prompt`, and once a human answers,
+    /// herdr may still refuse with `agent_not_ready` for a moment (it is
+    /// still within its launching window). Reconcile keeps retrying until the
     /// prompt lands, then the task runs.
+    ///
+    /// `ready_after` is well above `READY_POLL` (`dispatch.rs`) and above
+    /// `agent_ready_timeout` in `settings()`: whichever `agent.list` poll
+    /// dispatch's readiness wait makes, the agent is still inside its
+    /// launching window, so `agent.list` reports it `blocked` with
+    /// `launch_pending: true` every time. That is what forces dispatch
+    /// through the blocked-while-launching path deterministically, instead
+    /// of racing to see whether the launching window happens to have closed
+    /// by the time dispatch polls again.
     #[tokio::test]
     async fn an_agent_blocked_at_launch_gets_its_prompt_once_answered() {
         let fake = FakeHerdr::new();
-        fake.set_ready_after(Duration::from_millis(400));
+        fake.set_ready_after(Duration::from_secs(2));
         let watcher = fake.clone();
         tokio::spawn(async move {
             loop {
@@ -1344,9 +1356,24 @@ mod tests {
         let t = h.dispatch(new_task(&store).id).await.unwrap();
         assert_eq!(t.state, TaskState::Blocked);
         assert!(t.prompt_pending);
+        let prompts = || {
+            fake.requests()
+                .iter()
+                .filter(|r| r.method == "agent.prompt")
+                .count()
+        };
+        assert_eq!(
+            prompts(),
+            0,
+            "a blocked-while-launching agent is not prompted at dispatch"
+        );
 
         // Answered while the fake still counts the agent as launching: the
-        // first delivery attempt is refused and has to be retried.
+        // first delivery attempt is refused and has to be retried. `seq`
+        // increments on `set_status` and on an *accepted* `agent.prompt`
+        // (fake.rs only bumps it past the checks), never on a refusal, so the
+        // delta below counts accepted state changes, not raw request counts.
+        let seq_before_clear = fake.agents()[0].state_change_seq;
         fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle, None);
         wait_for("running with the prompt sent", || {
             let t = store.get_task(t.id).unwrap().unwrap();
@@ -1354,6 +1381,19 @@ mod tests {
         })
         .await;
         assert_eq!(fake.agents()[0].agent_status, AgentStatus::Working);
+        assert_eq!(
+            fake.agents()[0].state_change_seq,
+            seq_before_clear + 2,
+            "exactly two accepted changes: the block clearing to idle, then \
+             one accepted prompt; every agent_not_ready retry in between left \
+             the sequence untouched"
+        );
+        let sent = fake
+            .requests()
+            .into_iter()
+            .rfind(|r| r.method == "agent.prompt")
+            .expect("at least one agent.prompt request was made");
+        assert_eq!(sent.params["text"], "hi", "our prompt, not a stray one");
     }
 
     /// A store error in reconcile is pastor's problem, not the machine's: the

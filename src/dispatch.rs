@@ -203,6 +203,9 @@ async fn expand_home(
 /// an agent that exited, e.g. because its binary is not installed on that
 /// machine. The two are told apart by whether the agent is still in
 /// `agent.list`: gone means failed now, present-but-`unknown` means wait.
+/// Present-and-`blocked` is a third case, checked before either: herdr answers
+/// that with `agent_blocked`, not `agent_not_ready`, and dispatch returns
+/// `Blocked` without prompting or waiting.
 async fn prompt_when_ready(
     conn: &dyn Connector,
     task: &Task,
@@ -219,24 +222,23 @@ async fn prompt_when_ready(
                 task.spec.agent
             )));
         };
+        if agent.agent_status == AgentStatus::Blocked {
+            // Waiting for a human, usually on the agent's own startup question
+            // (Claude's folder trust dialog). herdr checks `blocked` before
+            // `launch_pending`, answering `agent_blocked` even while the agent
+            // is still launching, so waiting here would only run out the
+            // bound. The machine sends the prompt once the block clears
+            // (`Task::prompt_pending`).
+            return Ok(DispatchOutcome::Blocked);
+        }
         // herdr 0.9.1 reports readiness with two flags, the same ones its own
         // `agent start --wait` reads: `launch_pending` while the process is
         // coming up, `interactive_ready` once it accepts input. A listed agent
-        // with neither, and not working or blocked, is a pane whose process
-        // already exited: prompting it answers `agent_not_ready` forever.
-        let can_prompt = agent.interactive_ready
-            || matches!(
-                agent.agent_status,
-                AgentStatus::Working | AgentStatus::Blocked
-            );
-        if agent.agent_status == AgentStatus::Blocked {
-            // Waiting for a human, usually on the agent's own startup question
-            // (Claude's folder trust dialog). herdr keeps `launch_pending` set
-            // meanwhile and refuses prompts with `agent_not_ready`, so waiting
-            // here would only run out the bound. The machine sends the prompt
-            // once the block clears (`Task::prompt_pending`).
-            return Ok(DispatchOutcome::Blocked);
-        } else if agent.launch_pending {
+        // with neither, not blocked (handled above) and not working, is a
+        // pane whose process already exited: prompting it answers
+        // `agent_not_ready` forever.
+        let can_prompt = agent.interactive_ready || agent.agent_status == AgentStatus::Working;
+        if agent.launch_pending {
             // still launching: fall through to the wait below
         } else if can_prompt {
             match conn.agent_prompt(name, &task.prompt).await {
