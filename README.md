@@ -51,7 +51,10 @@ for a local one) instead of showing pastor's own view; herdr refuses to start
 inside one of its own panes, so run it from a plain terminal. pastor's flock and
 herdr's saved machines are separate lists on purpose: `machine add --herdr` and
 `machine remove --herdr` keep them in step by running `herdr machine add|remove`
-for you, and without the flag `machine add` prints the command instead.
+for you, and without the flag `machine add` prints the command instead. `remove`
+matches herdr's entry by label only; when none matches but the same host is
+saved under another label, it prints that entry's remove command rather than
+guessing.
 
 Runtime errors print JSON on stderr with a stable `code` and exit 1; a
 malformed command line gets clap's plain usage text and exit 2.
