@@ -2,17 +2,24 @@
 //! render and queue a task per new item, record the run. `Scheduler` (below,
 //! Task 11) owns the loop that calls it.
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
-use crate::config::job::Job;
+use crate::config::job::{Job, Loaded, load_dir};
+use crate::config::{Defaults, PastorConfig, Paths};
+use crate::connector;
 use crate::connector::{ItemSource, RunInput};
+use crate::daemon::Fleet;
 use crate::machine::PastorEvent;
+use crate::schedule::Schedule;
 use crate::store::{JobState, Store};
 use crate::task::DispatchSpec;
 use crate::template;
@@ -262,6 +269,539 @@ pub async fn run_job(
         }
     }
     report
+}
+
+/// What `pastor job list` shows for one job file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStatus {
+    pub name: String,
+    /// `None` when the file never parsed (nothing to describe).
+    pub schedule: Option<String>,
+    pub enabled: bool,
+    pub connector: Option<String>,
+    /// The current file's problem. With `schedule` also set, the previous
+    /// good version is what runs.
+    pub error: Option<String>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_result: Option<String>,
+    pub next_due: Option<DateTime<Utc>>,
+    pub running: bool,
+}
+
+/// A job as the scheduler holds it: the last good parse, plus the current
+/// file's error if it stopped parsing. A file that never parsed has no `job`.
+#[derive(Debug, Clone)]
+struct Entry {
+    job: Option<Job>,
+    error: Option<String>,
+}
+
+enum Due {
+    Now,
+    At(DateTime<Utc>),
+    Never,
+}
+
+pub enum SchedulerCommand {
+    Tick {
+        job: Option<String>,
+        dry_run: bool,
+        reply: oneshot::Sender<Vec<JobRunReport>>,
+    },
+    Fire {
+        name: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    Reload {
+        reply: oneshot::Sender<Vec<JobStatus>>,
+    },
+    JobList {
+        reply: oneshot::Sender<Vec<JobStatus>>,
+    },
+}
+
+#[derive(Clone)]
+pub struct SchedulerHandle {
+    tx: mpsc::Sender<SchedulerCommand>,
+}
+
+impl SchedulerHandle {
+    async fn send<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<T>) -> SchedulerCommand,
+    ) -> anyhow::Result<T> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(make(reply))
+            .await
+            .map_err(|_| anyhow::anyhow!("scheduler is gone"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("scheduler dropped the request"))
+    }
+    pub async fn tick(
+        &self,
+        job: Option<String>,
+        dry_run: bool,
+    ) -> anyhow::Result<Vec<JobRunReport>> {
+        self.send(|reply| SchedulerCommand::Tick {
+            job,
+            dry_run,
+            reply,
+        })
+        .await
+    }
+    pub async fn fire(&self, name: &str) -> anyhow::Result<Result<String, String>> {
+        let name = name.to_string();
+        self.send(|reply| SchedulerCommand::Fire { name, reply })
+            .await
+    }
+    pub async fn reload(&self) -> anyhow::Result<Vec<JobStatus>> {
+        self.send(|reply| SchedulerCommand::Reload { reply }).await
+    }
+    pub async fn job_list(&self) -> anyhow::Result<Vec<JobStatus>> {
+        self.send(|reply| SchedulerCommand::JobList { reply }).await
+    }
+}
+
+type Resolver = Box<dyn Fn(&str) -> Option<Arc<dyn ItemSource>> + Send + Sync>;
+
+pub struct Scheduler {
+    paths: Paths,
+    defaults: Defaults,
+    tick: Duration,
+    store: Arc<Store>,
+    fleet: Arc<Fleet>,
+    events: broadcast::Sender<PastorEvent>,
+    /// Connector id -> source. `connector::builtin` outside tests.
+    resolve: Resolver,
+    entries: HashMap<String, Entry>,
+    /// (file name, mtime, size) of every job file at the last load; `None`
+    /// until the first.
+    fingerprint: Option<Vec<(PathBuf, Option<SystemTime>, u64)>>,
+    /// Runs in progress: a job may appear more than once only through `fire`.
+    in_flight: Vec<(String, JoinHandle<JobRunReport>)>,
+    /// When each job was first loaded; a cron job that never ran is due at its
+    /// first occurrence after this.
+    first_seen: HashMap<String, DateTime<Utc>>,
+    warned_queued: HashSet<i64>,
+}
+
+impl Scheduler {
+    pub fn new(
+        paths: Paths,
+        config: &PastorConfig,
+        store: Arc<Store>,
+        fleet: Arc<Fleet>,
+        events: broadcast::Sender<PastorEvent>,
+    ) -> Scheduler {
+        Scheduler {
+            paths,
+            defaults: config.defaults.clone(),
+            tick: config.tick_duration(),
+            store,
+            fleet,
+            events,
+            resolve: Box::new(connector::builtin),
+            entries: HashMap::new(),
+            fingerprint: None,
+            in_flight: Vec::new(),
+            first_seen: HashMap::new(),
+            warned_queued: HashSet::new(),
+        }
+    }
+
+    /// For the CLI when no daemon runs: no machines to dispatch to, nobody
+    /// listening for events. Tasks it queues wait for the next `pastor serve`.
+    pub fn standalone(paths: Paths, config: &PastorConfig, store: Arc<Store>) -> Scheduler {
+        let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()));
+        let (events, _) = broadcast::channel(1);
+        Scheduler::new(paths, config, store, fleet, events)
+    }
+
+    pub fn spawn(self) -> SchedulerHandle {
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(self.run(rx));
+        SchedulerHandle { tx }
+    }
+
+    async fn run(mut self, mut rx: mpsc::Receiver<SchedulerCommand>) {
+        let mut tick = tokio::time::interval(self.tick);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => self.pass(Utc::now()).await,
+                cmd = rx.recv() => {
+                    let Some(cmd) = cmd else { return };
+                    match cmd {
+                        SchedulerCommand::Tick { job, dry_run, reply } => {
+                            let reports = self.tick_now(job.as_deref(), dry_run, Utc::now()).await;
+                            let _ = reply.send(reports);
+                        }
+                        SchedulerCommand::Fire { name, reply } => {
+                            self.reload();
+                            let _ = reply.send(self.fire(&name, Utc::now()));
+                        }
+                        SchedulerCommand::Reload { reply } => {
+                            self.reload();
+                            let _ = reply.send(self.statuses(Utc::now()));
+                        }
+                        SchedulerCommand::JobList { reply } => {
+                            self.reload();
+                            let _ = reply.send(self.statuses(Utc::now()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-read the jobs directory if any file was added, removed or touched.
+    /// A file that stopped parsing keeps its last good version and carries the
+    /// error; a removed file removes the job. Returns whether anything was
+    /// reloaded.
+    pub fn reload(&mut self) -> bool {
+        let dir = self.paths.jobs_dir();
+        let fp = fingerprint(&dir);
+        if self.fingerprint.as_ref() == Some(&fp) {
+            return false;
+        }
+        self.fingerprint = Some(fp);
+        let loaded = match load_dir(&dir, &self.defaults) {
+            Ok(l) => l,
+            Err(err) => {
+                tracing::error!(%err, "read jobs directory");
+                return true;
+            }
+        };
+        let now = Utc::now();
+        let mut next: HashMap<String, Entry> = HashMap::new();
+        for l in loaded {
+            let name = l.name().to_string();
+            self.first_seen.entry(name.clone()).or_insert(now);
+            let entry = match l {
+                Loaded::Valid(job) => Entry {
+                    job: Some(*job),
+                    error: None,
+                },
+                Loaded::Invalid { error, .. } => {
+                    let previous = self.entries.get(&name).and_then(|e| e.job.clone());
+                    match &previous {
+                        Some(_) => {
+                            tracing::warn!(job = %name, %error, "job file invalid; previous version kept")
+                        }
+                        None => tracing::warn!(job = %name, %error, "job file invalid"),
+                    }
+                    Entry {
+                        job: previous,
+                        error: Some(error),
+                    }
+                }
+            };
+            next.insert(name, entry);
+        }
+        for gone in self.entries.keys().filter(|k| !next.contains_key(*k)) {
+            tracing::info!(job = %gone, "job file removed");
+        }
+        self.entries = next;
+        true
+    }
+
+    fn states(&self) -> HashMap<String, JobState> {
+        match self.store.job_states() {
+            Ok(v) => v.into_iter().map(|s| (s.name.clone(), s)).collect(),
+            Err(err) => {
+                tracing::error!(%err, "read job states");
+                HashMap::new()
+            }
+        }
+    }
+
+    fn is_running(&self, name: &str) -> bool {
+        self.in_flight.iter().any(|(n, _)| n == name)
+    }
+
+    fn due_of(&self, job: &Job, state: Option<&JobState>, now: DateTime<Utc>) -> Due {
+        if !job.enabled {
+            return Due::Never;
+        }
+        if let Some(until) = state.and_then(|s| s.backoff_until)
+            && now < until
+        {
+            return Due::At(until);
+        }
+        let last = state.and_then(|s| s.last_run_at);
+        let next = match (&job.schedule, last) {
+            // A new interval job runs at once (backfill says how far back it looks).
+            (Schedule::Every(_), None) => return Due::Now,
+            // A new cron job waits for its first occurrence; nothing was missed.
+            (Schedule::Cron(_), None) => {
+                let from = self.first_seen.get(&job.name).copied().unwrap_or(now);
+                job.schedule.next_after(from)
+            }
+            // Overdue (daemon was down, or the tick is late) is simply due: it
+            // runs once and the next occurrence is computed from now.
+            (_, Some(last)) => job.schedule.next_after(last),
+        };
+        match next {
+            Some(t) if t <= now => Due::Now,
+            Some(t) => Due::At(t),
+            None => Due::Never,
+        }
+    }
+
+    pub fn statuses(&self, now: DateTime<Utc>) -> Vec<JobStatus> {
+        let states = self.states();
+        let mut out: Vec<JobStatus> = self
+            .entries
+            .iter()
+            .map(|(name, e)| {
+                let state = states.get(name);
+                let next_due = e
+                    .job
+                    .as_ref()
+                    .and_then(|j| match self.due_of(j, state, now) {
+                        Due::Now => Some(now),
+                        Due::At(t) => Some(t),
+                        Due::Never => None,
+                    });
+                JobStatus {
+                    name: name.clone(),
+                    schedule: e.job.as_ref().map(|j| j.schedule.describe()),
+                    enabled: e.job.as_ref().is_some_and(|j| j.enabled),
+                    connector: e.job.as_ref().map(|j| j.connector.clone()),
+                    error: e.error.clone(),
+                    last_run_at: state.and_then(|s| s.last_run_at),
+                    last_result: state.and_then(|s| s.last_result.clone()),
+                    next_due,
+                    running: self.is_running(name),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// One tick: reload, reap finished runs, start due jobs, dispatch, warn.
+    pub async fn pass(&mut self, now: DateTime<Utc>) {
+        self.reload();
+        self.reap().await;
+        let states = self.states();
+        let due: Vec<Job> = self
+            .entries
+            .values()
+            .filter_map(|e| e.job.clone())
+            .filter(|j| matches!(self.due_of(j, states.get(&j.name), now), Due::Now))
+            .collect();
+        for job in due {
+            if self.is_running(&job.name) {
+                tracing::warn!(job = %job.name, "due, but the previous run is still going; skipped");
+                continue;
+            }
+            if let Err(reason) = self.start_run(job.clone(), now) {
+                tracing::warn!(job = %job.name, %reason, "run not started");
+            }
+        }
+        self.fleet.dispatch_queued().await;
+        self.warn_long_queued(now);
+    }
+
+    /// `pastor job run`: now, regardless of schedule, overlap and `enabled`.
+    pub fn fire(&mut self, name: &str, now: DateTime<Utc>) -> Result<String, String> {
+        let job = self
+            .entries
+            .get(name)
+            .and_then(|e| e.job.clone())
+            .ok_or_else(|| format!("no job named {name:?} (or its file has never parsed)"))?;
+        if self.is_running(name) {
+            tracing::info!(job = name, "fired while a previous run is still going");
+        }
+        self.start_run(job, now)?;
+        Ok(format!("started job {name}"))
+    }
+
+    fn start_run(&mut self, job: Job, now: DateTime<Utc>) -> Result<(), String> {
+        let source = (self.resolve)(&job.connector)
+            .ok_or_else(|| format!("connector {:?} is not available", job.connector))?;
+        let store = self.store.clone();
+        let fleet = self.fleet.clone();
+        let events = self.events.clone();
+        let name = job.name.clone();
+        let handle = tokio::spawn(async move {
+            let report = run_job(&store, &job, source.as_ref(), &events, now, false).await;
+            if !report.created.is_empty() {
+                // Do not wait for the next tick to place what this run queued.
+                fleet.dispatch_queued().await;
+            }
+            report
+        });
+        self.in_flight.push((name, handle));
+        Ok(())
+    }
+
+    /// Log the reports of runs that finished since the last pass.
+    async fn reap(&mut self) {
+        let mut still = Vec::new();
+        for (name, handle) in self.in_flight.drain(..) {
+            if !handle.is_finished() {
+                still.push((name, handle));
+                continue;
+            }
+            match handle.await {
+                Ok(r) => tracing::info!(
+                    job = %r.job, outcome = %r.outcome, items = r.items, created = r.created.len(),
+                    seen = r.skipped_seen, deferred = r.deferred, error = ?r.error, "job run finished"
+                ),
+                Err(err) => tracing::error!(job = %name, %err, "job run panicked"),
+            }
+        }
+        self.in_flight = still;
+    }
+
+    /// `pastor tick`: run due jobs (or the one named, forced) inline and report.
+    /// Inline so the reports are complete when this returns; a long connector
+    /// holds the scheduler for that long, which is acceptable for a debugging
+    /// command.
+    pub async fn tick_now(
+        &mut self,
+        only: Option<&str>,
+        dry_run: bool,
+        now: DateTime<Utc>,
+    ) -> Vec<JobRunReport> {
+        self.reload();
+        self.reap().await;
+        let states = self.states();
+        let mut names: Vec<&String> = self.entries.keys().collect();
+        names.sort();
+        let mut reports = Vec::new();
+        for name in names {
+            if only.is_some_and(|o| o != name) {
+                continue;
+            }
+            let entry = &self.entries[name];
+            let Some(job) = entry.job.clone() else {
+                let mut r = JobRunReport::new(name, RunOutcome::Invalid);
+                r.error = entry.error.clone();
+                reports.push(r);
+                continue;
+            };
+            let forced = only.is_some();
+            if !forced {
+                match self.due_of(&job, states.get(name), now) {
+                    Due::Now => {}
+                    Due::Never if !job.enabled => {
+                        reports.push(JobRunReport::new(name, RunOutcome::Disabled));
+                        continue;
+                    }
+                    _ => {
+                        reports.push(JobRunReport::new(name, RunOutcome::NotDue));
+                        continue;
+                    }
+                }
+                if self.is_running(name) {
+                    reports.push(JobRunReport::new(name, RunOutcome::Skipped));
+                    continue;
+                }
+            }
+            let Some(source) = (self.resolve)(&job.connector) else {
+                let mut r = JobRunReport::new(name, RunOutcome::Invalid);
+                r.error = Some(format!("connector {:?} is not available", job.connector));
+                reports.push(r);
+                continue;
+            };
+            reports.push(
+                run_job(
+                    &self.store,
+                    &job,
+                    source.as_ref(),
+                    &self.events,
+                    now,
+                    dry_run,
+                )
+                .await,
+            );
+        }
+        if let Some(o) = only
+            && !reports.iter().any(|r| r.job == o)
+        {
+            let mut r = JobRunReport::new(o, RunOutcome::Unknown);
+            r.error = Some(format!("no job named {o:?}"));
+            reports.push(r);
+        }
+        if !dry_run {
+            self.fleet.dispatch_queued().await;
+        }
+        reports
+    }
+
+    fn warn_long_queued(&mut self, now: DateTime<Utc>) {
+        let Ok(queued) = self.store.queued_tasks() else {
+            return;
+        };
+        let limit = chrono::Duration::from_std(QUEUED_WARN_AFTER).expect("1h fits");
+        for t in queued {
+            if now - t.created_at >= limit && self.warned_queued.insert(t.id) {
+                tracing::warn!(
+                    task = %t.display_id(),
+                    job = %t.job,
+                    queued_for = %crate::cli::age(t.created_at),
+                    "no machine has had capacity; still queued"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_source_for_tests(&mut self, id: &str, source: Arc<dyn ItemSource>) {
+        let id = id.to_string();
+        let previous = std::mem::replace(&mut self.resolve, Box::new(|_| None));
+        self.resolve = Box::new(move |name| {
+            if name == id {
+                Some(source.clone())
+            } else {
+                previous(name)
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn set_jobs_for_tests(&mut self, jobs: Vec<Job>) {
+        let now = Utc::now();
+        self.entries = jobs
+            .into_iter()
+            .map(|j| {
+                self.first_seen.entry(j.name.clone()).or_insert(now);
+                (
+                    j.name.clone(),
+                    Entry {
+                        job: Some(j),
+                        error: None,
+                    },
+                )
+            })
+            .collect();
+        // Pretend the directory was read, so `pass` does not overwrite these.
+        self.fingerprint = Some(fingerprint(&self.paths.jobs_dir()));
+    }
+}
+
+/// Cheap change detection for the jobs directory: names, mtimes and sizes.
+fn fingerprint(dir: &std::path::Path) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let md = entry.metadata().ok();
+            out.push((
+                path,
+                md.as_ref().and_then(|m| m.modified().ok()),
+                md.map(|m| m.len()).unwrap_or(0),
+            ));
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(test)]
@@ -546,5 +1086,281 @@ mod tests {
             Duration::from_secs(60),
             "defensive: never zero"
         );
+    }
+
+    use crate::daemon::Fleet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Takes a while and counts its runs: for the overlap rule.
+    struct Slow {
+        runs: Arc<AtomicUsize>,
+        hold: Duration,
+    }
+    impl ItemSource for Slow {
+        fn id(&self) -> &str {
+            "slow"
+        }
+        fn run<'a>(&'a self, _input: RunInput) -> RunFuture<'a> {
+            Box::pin(async move {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(self.hold).await;
+                Ok(RunOutput::default())
+            })
+        }
+    }
+
+    fn scheduler_with(store: &Arc<Store>) -> (Scheduler, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let config = PastorConfig {
+            tick: "1s".into(),
+            ..Default::default()
+        };
+        let fleet = Arc::new(Fleet::new(vec![], store.clone()));
+        let (events, _) = broadcast::channel(16);
+        (
+            Scheduler::new(paths, &config, store.clone(), fleet, events),
+            tmp,
+        )
+    }
+
+    fn write_job(paths: &Paths, name: &str, text: &str) {
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        std::fs::write(crate::config::job::job_path(&paths.jobs_dir(), name), text).unwrap();
+    }
+
+    const CLOCK_JOB: &str = "every = \"5m\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"tick {{ item.key }}\"\n";
+
+    #[tokio::test]
+    async fn overlapping_run_is_skipped() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let slow: Arc<dyn ItemSource> = Arc::new(Slow {
+            runs: runs.clone(),
+            hold: Duration::from_millis(300),
+        });
+        s.set_source_for_tests("slow", slow);
+        let mut j = job("j");
+        j.connector = "slow".into();
+        j.schedule = Schedule::Every(Duration::from_secs(1));
+        s.set_jobs_for_tests(vec![j]);
+
+        let t0 = Utc::now();
+        s.pass(t0).await;
+        s.pass(t0 + chrono::Duration::seconds(5)).await; // due again, but still running
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the second pass must not start a second run"
+        );
+        assert!(s.statuses(t0)[0].running);
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        s.pass(t0 + chrono::Duration::seconds(10)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "once finished, the next due pass runs it"
+        );
+    }
+
+    #[tokio::test]
+    async fn fire_ignores_schedule_overlap_and_enabled() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let runs = Arc::new(AtomicUsize::new(0));
+        s.set_source_for_tests(
+            "slow",
+            Arc::new(Slow {
+                runs: runs.clone(),
+                hold: Duration::from_millis(200),
+            }),
+        );
+        let mut j = job("j");
+        j.connector = "slow".into();
+        j.enabled = false;
+        s.set_jobs_for_tests(vec![j]);
+        s.pass(Utc::now()).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "disabled jobs never run on a pass"
+        );
+        assert!(s.fire("j", Utc::now()).is_ok());
+        assert!(
+            s.fire("j", Utc::now()).is_ok(),
+            "fire twice: overlap rule does not apply"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert!(s.fire("nope", Utc::now()).unwrap_err().contains("no job"));
+    }
+
+    #[tokio::test]
+    async fn invalid_edit_keeps_previous_job_and_reports_error() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, tmp) = scheduler_with(&store);
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        write_job(&paths, "a", CLOCK_JOB);
+        assert!(s.reload(), "first load counts as a change");
+        assert!(!s.reload(), "unchanged directory is not reloaded");
+        let now = Utc::now();
+        let st = &s.statuses(now)[0];
+        assert_eq!(st.name, "a");
+        assert!(st.error.is_none());
+        assert_eq!(st.schedule.as_deref(), Some("every 5m"));
+
+        // Break the file: the previous version keeps running, the error shows.
+        std::thread::sleep(Duration::from_millis(20)); // mtime granularity
+        write_job(&paths, "a", "every = \"5m\"\n[connector\n");
+        assert!(s.reload());
+        let st = &s.statuses(now)[0];
+        assert!(st.error.is_some(), "{st:?}");
+        assert_eq!(
+            st.schedule.as_deref(),
+            Some("every 5m"),
+            "previous version kept"
+        );
+        let reports = s.tick_now(Some("a"), true, now).await;
+        assert_eq!(
+            reports[0].outcome,
+            RunOutcome::DryRun,
+            "the kept version still runs"
+        );
+
+        // A brand-new invalid file has nothing to keep.
+        write_job(&paths, "b", "nonsense");
+        assert!(s.reload());
+        let sts = s.statuses(now);
+        assert_eq!(sts.len(), 2);
+        assert!(sts[1].schedule.is_none() && sts[1].error.is_some());
+        let reports = s.tick_now(Some("b"), false, now).await;
+        assert_eq!(reports[0].outcome, RunOutcome::Invalid);
+
+        // Removing a file removes the job.
+        std::fs::remove_file(crate::config::job::job_path(&paths.jobs_dir(), "a")).unwrap();
+        assert!(s.reload());
+        assert_eq!(s.statuses(now).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn overdue_on_start_runs_once_and_missed_runs_are_not_replayed() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, tmp) = scheduler_with(&store);
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        write_job(&paths, "a", CLOCK_JOB);
+        let now = Utc::now();
+        store
+            .save_job_state(&JobState {
+                name: "a".into(),
+                last_run_at: Some(now - chrono::Duration::hours(3)),
+                last_ok_at: Some(now - chrono::Duration::hours(3)),
+                ..Default::default()
+            })
+            .unwrap();
+        let reports = s.tick_now(None, false, now).await;
+        assert_eq!(
+            reports[0].outcome,
+            RunOutcome::Ran,
+            "three hours overdue: runs once"
+        );
+        assert_eq!(reports[0].created.len(), 1);
+        let reports = s
+            .tick_now(None, false, now + chrono::Duration::seconds(1))
+            .await;
+        assert_eq!(reports[0].outcome, RunOutcome::NotDue, "not 36 times");
+        let st = &s.statuses(now)[0];
+        assert_eq!(st.next_due, Some(now + chrono::Duration::minutes(5)));
+    }
+
+    #[tokio::test]
+    async fn a_new_every_job_runs_now_but_a_new_cron_job_waits() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, tmp) = scheduler_with(&store);
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        write_job(&paths, "e", CLOCK_JOB);
+        write_job(
+            &paths,
+            "c",
+            &CLOCK_JOB.replace("every = \"5m\"", "cron = \"0 0 1 1 *\""),
+        );
+        let now = Utc::now();
+        let reports = s.tick_now(None, false, now).await;
+        let of = |name: &str| reports.iter().find(|r| r.job == name).unwrap();
+        assert_eq!(of("e").outcome, RunOutcome::Ran);
+        assert_eq!(of("c").outcome, RunOutcome::NotDue);
+        let sts = s.statuses(now);
+        let c = sts.iter().find(|j| j.name == "c").unwrap();
+        assert!(c.next_due.unwrap() > now);
+        assert_eq!(c.schedule.as_deref(), Some("cron 0 0 1 1 *"));
+    }
+
+    #[tokio::test]
+    async fn backoff_gates_a_due_job() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, tmp) = scheduler_with(&store);
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        write_job(&paths, "a", CLOCK_JOB);
+        let now = Utc::now();
+        store
+            .save_job_state(&JobState {
+                name: "a".into(),
+                failures: 1,
+                backoff_until: Some(now + chrono::Duration::seconds(30)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            s.tick_now(None, false, now).await[0].outcome,
+            RunOutcome::NotDue
+        );
+        assert_eq!(
+            s.tick_now(None, false, now + chrono::Duration::seconds(31))
+                .await[0]
+                .outcome,
+            RunOutcome::Ran
+        );
+        assert_eq!(
+            s.tick_now(Some("a"), false, now).await[0].outcome,
+            RunOutcome::Ran,
+            "--job forces it regardless"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_job_on_tick_is_reported() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let reports = s.tick_now(Some("ghost"), false, Utc::now()).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, RunOutcome::Unknown);
+    }
+
+    #[tokio::test]
+    async fn queued_over_an_hour_is_warned_once() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let t = store
+            .insert_task(crate::store::NewTask {
+                job: "run".into(),
+                item: Value::Null,
+                prompt: "p".into(),
+                spec: job("j").spec,
+            })
+            .unwrap();
+        let now = Utc::now();
+        s.warn_long_queued(now);
+        assert!(
+            s.warned_queued.is_empty(),
+            "fresh tasks are not warned about"
+        );
+        let later = now + chrono::Duration::hours(2);
+        s.warn_long_queued(later);
+        s.warn_long_queued(later);
+        assert_eq!(s.warned_queued.len(), 1);
+        assert!(s.warned_queued.contains(&t.id));
     }
 }
