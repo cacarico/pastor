@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::machine::MachineStatus;
+use crate::scheduler::{JobRunReport, JobStatus};
 use crate::store::TaskFilter;
 use crate::task::{DispatchSpec, Task};
 
@@ -12,11 +13,33 @@ use crate::task::{DispatchSpec, Task};
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
     Ping,
-    Run { prompt: String, spec: DispatchSpec },
-    List { filter: TaskFilter },
-    TaskShow { id: i64 },
-    TaskRead { id: i64, lines: u32 },
+    Run {
+        prompt: String,
+        spec: DispatchSpec,
+    },
+    List {
+        filter: TaskFilter,
+    },
+    TaskShow {
+        id: i64,
+    },
+    TaskRead {
+        id: i64,
+        lines: u32,
+    },
     FlockList,
+    /// One scheduler pass now; `job` forces that job regardless of schedule.
+    Tick {
+        job: Option<String>,
+        dry_run: bool,
+    },
+    /// Re-read the jobs directory now.
+    Reload,
+    JobList,
+    /// Fire a job now, ignoring schedule, overlap and `enabled`.
+    JobRun {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +58,8 @@ pub enum IpcResponse {
     Tasks(Vec<Task>),
     Text(String),
     Machines(Vec<MachineStatus>),
+    Runs(Vec<JobRunReport>),
+    Jobs(Vec<JobStatus>),
     Error { code: String, message: String },
 }
 
@@ -223,12 +248,31 @@ mod tests {
             IpcResponse::Tasks(vec![minimal_task()]),
             IpcResponse::Text("hello".into()),
             IpcResponse::Machines(vec![]),
+            IpcResponse::Runs(vec![]),
+            IpcResponse::Jobs(vec![]),
             IpcResponse::error("some_code", "some message"),
         ];
         for resp in responses {
             let json = serde_json::to_string(&resp).unwrap();
             let back: IpcResponse = serde_json::from_str(&json).unwrap();
             assert_eq!(format!("{resp:?}"), format!("{back:?}"), "{json}");
+        }
+    }
+
+    #[test]
+    fn scheduler_requests_round_trip() {
+        for req in [
+            IpcRequest::Tick {
+                job: Some("j".into()),
+                dry_run: true,
+            },
+            IpcRequest::Reload,
+            IpcRequest::JobList,
+            IpcRequest::JobRun { name: "j".into() },
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            let back: IpcRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{req:?}"), format!("{back:?}"), "{json}");
         }
     }
 
