@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod machine;
 pub mod schedule;
 pub mod scheduler;
+pub mod setup;
 pub mod store;
 pub mod task;
 pub mod template;
