@@ -497,7 +497,9 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                 };
                 ms
             } else {
-                eprintln!("pastor serve is not running; showing the flock file only");
+                eprintln!(
+                    "no head is running (start one with `pastor serve`); showing the flock file only, nothing is connected"
+                );
                 Flock::load(&path)?
                     .machines
                     .iter()
@@ -507,7 +509,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                         channel: ChannelState::Connecting,
                         herdr_version: None,
                         protocol: None,
-                        error: Some("daemon down".into()),
+                        error: Some("no head running; start pastor serve".into()),
                         live: 0,
                         max_agents: m.max_agents,
                         tags: m.tags.clone(),

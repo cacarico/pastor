@@ -178,6 +178,18 @@ fn flock_add_and_remove_edit_the_file() {
     assert!(!out.status.success());
     let out = run(&["flock", "list"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("pi-3"));
+    // Without a head the table cannot know anything live; both the note and the
+    // ERROR column say so in pastor's own words rather than "daemon down".
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no head is running"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no head running"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     assert!(run(&["flock", "remove", "pi-3"]).status.success());
     assert!(!run(&["flock", "remove", "pi-3"]).status.success());
 }
