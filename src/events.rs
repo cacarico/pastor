@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -135,8 +135,20 @@ impl EventRecord {
         if let Some(e) = self.task.as_ref().and_then(|t| t.error.as_ref()) {
             cols.push(e.clone());
         }
-        cols.join("  ").trim_end().to_string()
+        cols.iter()
+            .map(|c| one_line(c))
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_string()
     }
+}
+
+/// Errors carry raw stderr, newlines included; one record must stay one
+/// output line. The escapes keep what was there visible, as JSON does,
+/// rather than folding it into spaces that read like the original text.
+fn one_line(s: &str) -> String {
+    s.replace('\r', "\\r").replace('\n', "\\n")
 }
 
 fn rotated(path: &Path) -> PathBuf {
@@ -179,11 +191,17 @@ impl LogWriter {
 /// The daemon's log task: every event on `rx`, built into a record and
 /// appended to `path`. A write that fails is logged and the task carries on;
 /// it ends when the broadcast channel closes.
+///
+/// The fleet is held weakly: it owns the machine actors' command senders, the
+/// actors own event senders, and this task only ends when every event sender
+/// is gone. A strong reference would keep all of them alive after the daemon
+/// is dropped. Once the fleet is gone, records are written without machine
+/// status.
 pub fn spawn_log(
     path: PathBuf,
     max_bytes: u64,
     store: Arc<Store>,
-    fleet: Option<Arc<dyn MachineLookup>>,
+    fleet: Option<Weak<dyn MachineLookup>>,
     mut rx: broadcast::Receiver<PastorEvent>,
 ) -> JoinHandle<()> {
     let writer = LogWriter::new(path, max_bytes);
@@ -192,7 +210,8 @@ pub fn spawn_log(
             match rx.recv().await {
                 Ok(ev) => {
                     tracing::info!(kind = %ev.kind, task = ?ev.task_id, machine = ?ev.machine, job = ?ev.job, "pastor event");
-                    let rec = EventRecord::build(&ev, &store, fleet.as_deref());
+                    let lookup = fleet.as_ref().and_then(Weak::upgrade);
+                    let rec = EventRecord::build(&ev, &store, lookup.as_deref());
                     if let Err(err) = writer.append(&rec) {
                         tracing::error!(%err, "events log: write failed");
                     }
@@ -226,12 +245,19 @@ fn parse_line(line: &str) -> Option<EventRecord> {
     }
 }
 
-fn read_file(path: &Path, task: Option<i64>, out: &mut Vec<EventRecord>) -> anyhow::Result<()> {
-    let f = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
+fn open_existing(path: &Path) -> std::io::Result<Option<File>> {
+    match File::open(path) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn ino(f: &File) -> std::io::Result<u64> {
+    Ok(f.metadata()?.ino())
+}
+
+fn read_file(f: File, task: Option<i64>, out: &mut Vec<EventRecord>) -> anyhow::Result<()> {
     for line in BufReader::new(f).lines() {
         if let Some(r) = parse_line(&line?)
             && matches(&r, task)
@@ -244,10 +270,50 @@ fn read_file(path: &Path, task: Option<i64>, out: &mut Vec<EventRecord>) -> anyh
 
 /// Every record in the log, oldest first, including the rotated generation.
 /// A missing log is an empty one.
+///
+/// The current file is opened before `.1`. The writer only renames current
+/// to `.1`, so `.1` opened second is either older than the handle we hold
+/// or, if a rotation fell between the two opens, the very same file. Opening
+/// `.1` first instead would miss a whole generation in that case.
 pub fn read(path: &Path, task: Option<i64>) -> anyhow::Result<Vec<EventRecord>> {
+    let current = open_existing(path)?;
+    let old = open_existing(&rotated(path))?;
+    read_generations(path, current, old, task)
+}
+
+/// `read` with both handles already open, in that order.
+fn read_generations(
+    path: &Path,
+    current: Option<File>,
+    old: Option<File>,
+    task: Option<i64>,
+) -> anyhow::Result<Vec<EventRecord>> {
     let mut out = Vec::new();
-    read_file(&rotated(path), task, &mut out)?;
-    read_file(path, task, &mut out)?;
+    let held = match (current, old) {
+        // Rotated between the opens: our current handle is now `.1`, and
+        // `path` is a newer generation.
+        (Some(cur), Some(old)) if ino(&cur)? == ino(&old)? => Some(cur),
+        (Some(cur), old) => {
+            if let Some(old) = old {
+                read_file(old, task, &mut out)?;
+            }
+            read_file(cur, task, &mut out)?;
+            return Ok(out);
+        }
+        // No current file when we looked: it may have been renamed away just
+        // before, with the new one not created yet.
+        (None, old) => old,
+    };
+    let Some(held) = held else {
+        return Ok(out);
+    };
+    let held_ino = ino(&held)?;
+    read_file(held, task, &mut out)?;
+    if let Some(new) = open_existing(path)?
+        && ino(&new)? != held_ino
+    {
+        read_file(new, task, &mut out)?;
+    }
     Ok(out)
 }
 
@@ -722,7 +788,13 @@ mod tests {
         let store = Arc::new(store);
         let (tx, rx) = broadcast::channel(16);
         let fleet: Arc<dyn MachineLookup> = Arc::new(vec![handle("m", ChannelState::Connected)]);
-        let log = spawn_log(path.clone(), DEFAULT_MAX_BYTES, store, Some(fleet), rx);
+        let log = spawn_log(
+            path.clone(),
+            DEFAULT_MAX_BYTES,
+            store,
+            Some(Arc::downgrade(&fleet)),
+            rx,
+        );
         tx.send(ev("task.queued", Some(t.id), None, None)).unwrap();
         tx.send(ev("machine.connected", None, Some("m"), None))
             .unwrap();
@@ -738,5 +810,100 @@ mod tests {
             recs[1].machine.as_ref().unwrap().channel,
             ChannelState::Connected
         );
+        drop(fleet);
+    }
+
+    /// The log task must not keep the fleet alive: the fleet holds the machine
+    /// actors' command senders and the actors hold event senders, so a strong
+    /// reference here is a cycle that keeps a dropped daemon's tasks running.
+    #[tokio::test]
+    async fn the_log_task_holds_the_fleet_weakly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (store, _) = store_with_task("triage");
+        let (tx, rx) = broadcast::channel(16);
+        let fleet: Arc<dyn MachineLookup> = Arc::new(vec![handle("m", ChannelState::Connected)]);
+        let weak = Arc::downgrade(&fleet);
+        let log = spawn_log(
+            path.clone(),
+            DEFAULT_MAX_BYTES,
+            Arc::new(store),
+            Some(weak.clone()),
+            rx,
+        );
+        drop(fleet);
+        assert!(
+            weak.upgrade().is_none(),
+            "the log task kept the fleet alive"
+        );
+        // With the fleet gone, events are still written, without machine status.
+        tx.send(ev("machine.lost", None, Some("m"), None)).unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), log)
+            .await
+            .unwrap()
+            .unwrap();
+        let recs = read(&path, None).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].kind, "machine.lost");
+        assert!(recs[0].machine.is_none());
+    }
+
+    #[test]
+    fn the_human_line_keeps_a_multiline_error_on_one_line() {
+        let (_, mut t) = store_with_task("triage");
+        t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
+        let line = record("task.failed", Some(&t)).line();
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        assert!(
+            line.contains(r"ssh failed:\nPermission denied\r\nbye"),
+            "{line}"
+        );
+        let fleet = vec![handle("pi-3", ChannelState::Reconnecting)];
+        fleet[0].status.write().unwrap().error = Some("lost\nstderr: boom".into());
+        let (store, _) = store_with_task("x");
+        let line = EventRecord::build(
+            &ev("machine.lost", None, Some("pi-3"), None),
+            &store,
+            Some(&fleet),
+        )
+        .line();
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(line.contains(r"lost\nstderr: boom"), "{line}");
+    }
+
+    /// A rotation between `read`'s two opens: the handle taken on the current
+    /// file now is `.1`. Both generations come back, in order, once each.
+    #[test]
+    fn read_across_a_rotation_between_the_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (_, t) = store_with_task("j");
+        let w = LogWriter::new(path.clone(), DEFAULT_MAX_BYTES);
+        // An older generation that the rotation replaces.
+        w.append(&record("task.queued", Some(&t))).unwrap();
+        std::fs::rename(&path, rotated(&path)).unwrap();
+        for kind in ["task.running", "task.done"] {
+            w.append(&record(kind, Some(&t))).unwrap();
+        }
+        let current = open_existing(&path).unwrap();
+        // The writer rotates now, and writes to a new file.
+        std::fs::rename(&path, rotated(&path)).unwrap();
+        w.append(&record("task.closed", Some(&t))).unwrap();
+        let old = open_existing(&rotated(&path)).unwrap();
+        let kinds: Vec<_> = read_generations(&path, current, old, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(kinds, ["task.running", "task.done", "task.closed"]);
+
+        // No race: `.1` then the current file, as `read` returns them.
+        let kinds: Vec<_> = read(&path, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(kinds, ["task.running", "task.done", "task.closed"]);
     }
 }
