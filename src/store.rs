@@ -95,13 +95,19 @@ impl Store {
             [],
             |r| r.get(0),
         )?;
+        // Only a missing meta table means a fresh database. One that exists
+        // without the row has lost its version: of unknown shape, so refused.
         let version: Option<String> = if has_meta {
-            tx.query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |r| r.get(0),
+            let v = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Some(
+                v.context("database has a meta table but no schema_version; refusing to touch it")?,
             )
-            .optional()?
         } else {
             None
         };
@@ -769,6 +775,36 @@ mod tests {
         assert!(!s.is_seen("j", "k").unwrap());
         assert!(s.job_state("j").unwrap().is_none());
         assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_meta_table_without_a_version_is_refused_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+        }
+        let err = Store::open(&path).err().expect("must not open");
+        assert!(
+            err.to_string().contains("schema_version"),
+            "error was: {err}"
+        );
+        assert_eq!(table_names(&path), vec!["meta"], "nothing created");
+        let conn = Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "not stamped with a version");
+
+        // No meta table at all is a fresh database and is created.
+        let fresh = tmp.path().join("fresh.db");
+        drop(Store::open(&fresh).unwrap());
+        assert_eq!(
+            table_names(&fresh),
+            vec!["job_state", "meta", "seen", "tasks"]
+        );
     }
 
     #[test]
