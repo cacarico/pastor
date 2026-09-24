@@ -463,7 +463,11 @@ async fn task(paths: &Paths, cmd: TaskCmd) -> anyhow::Result<()> {
                     .get_task(id)?
                     .unwrap_or_else(|| fail("task_not_found", &task))
             };
-            print_task(&t, json);
+            if json {
+                print_task(&t, true);
+            } else {
+                println!("{}", pastor::cli::task_detail(&t));
+            }
         }
         TaskCmd::Read { task, lines } => {
             let IpcResponse::Text(text) = ask(
