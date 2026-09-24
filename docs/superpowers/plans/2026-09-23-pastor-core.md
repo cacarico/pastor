@@ -1,5 +1,12 @@
 # pastor core implementation plan (plan 1 of 4)
 
+> **Executed on 2026-09-23; kept as history.** The code on `feat/core` is
+> the result, after review fixes that changed some of what is written here:
+> herdr answers one request per connection, so there is no persistent
+> request connection; dispatch waits for agent readiness before prompting;
+> `agent_not_ready` never marks a task blocked; `pastor list` shows failed
+> tasks. Do not copy code from this file. `AGENTS.md` says where to start.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A `pastor serve` daemon that dispatches one-off tasks (`pastor run`) to herdr agents on flock machines over SSH, tracks their state from herdr events, and shows them with `pastor list` and `pastor attach`.
