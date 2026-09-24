@@ -499,8 +499,9 @@ impl Daemon {
 
     /// `TaskClose`: through the actor of the task's machine, which closes the
     /// pane (or worktree) before the row. A task that never reached a machine
-    /// only has its row closed, and a closed one is answered as it is. With no row, the machines are asked for an
-    /// orphaned agent `t-<id>` (as their last reconcile found them).
+    /// only has its row closed, and a closed one is answered as it is. With
+    /// no row, the machines are asked for an orphaned agent `t-<id>` (as
+    /// their last reconcile found them).
     async fn close(&self, id: i64, remove_worktree: bool) -> IpcResponse {
         let row = match self.store.get_task(id) {
             Ok(r) => r,
