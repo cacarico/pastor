@@ -493,7 +493,7 @@ fn row_to_job_state(row: &Row<'_>) -> rusqlite::Result<JobState> {
         last_result: row.get("last_result")?,
         last_error: row.get("last_error")?,
         cursor: row.get("cursor")?,
-        failures: row.get::<_, i64>("failures")? as u32,
+        failures: u32::try_from(row.get::<_, i64>("failures")?).map_err(conversion_failure)?,
         backoff_until: parse_dt(row.get("backoff_until")?)?,
     })
 }
@@ -722,6 +722,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, "x");
+    }
+
+    #[test]
+    fn a_negative_failure_count_is_reported_not_wrapped() {
+        let s = Store::open_in_memory().unwrap();
+        s.save_job_state(&JobState {
+            name: "a".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        s.execute_raw("UPDATE job_state SET failures = -1 WHERE name = 'a'");
+        assert!(s.job_state("a").is_err(), "-1 must not read as 4294967295");
+        assert!(s.job_states().is_err());
     }
 
     #[test]
