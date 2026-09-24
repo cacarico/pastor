@@ -530,6 +530,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

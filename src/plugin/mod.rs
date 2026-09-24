@@ -4,6 +4,7 @@
 //! the user develops in (`plugin link`).
 
 pub mod env;
+pub mod exec;
 pub mod manifest;
 
 use std::path::{Path, PathBuf};
