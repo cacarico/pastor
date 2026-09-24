@@ -239,6 +239,9 @@ async fn the_daemon_writes_the_events_log() {
     let IpcResponse::Task(t) = resp else {
         panic!("{resp:?}")
     };
+    let queued = wait_for("task.queued").await;
+    assert_eq!(queued.task.unwrap().id, t.id);
+    assert_eq!(queued.job.as_deref(), Some("run"));
     let running = wait_for("task.running").await;
     assert_eq!(running.task.unwrap().id, t.id);
     assert_eq!(running.job.as_deref(), Some("run"));

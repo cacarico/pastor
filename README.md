@@ -102,7 +102,7 @@ A record, which is also what plugin event hooks will get on stdin:
 ```
 
 - `at`: when the daemon received the event, RFC 3339 UTC.
-- `type`: `task.queued|started|running|blocked|done|stale|failed|closed`,
+- `type`: `task.queued|running|blocked|done|stale|failed|closed`,
   `job.failed`, `machine.connected`, `machine.lost`.
 - `task`: the full task row (the same object as `pastor task show --json`) at
   that moment, on `task.*` events; `null` otherwise or if the row is gone.
