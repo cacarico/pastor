@@ -105,6 +105,10 @@ struct RunArgs {
     machine: Option<String>,
     #[arg(long)]
     agent: Option<String>,
+    /// One argument for the agent; repeat it, in order, for more. Replaces
+    /// `[defaults] agent_args`. The next word is always the value, dashes and all.
+    #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
+    agent_args: Vec<String>,
     #[arg(long)]
     worktree: bool,
     /// Branch for the worktree (needs --worktree; a plain workspace has no branch)
@@ -248,23 +252,7 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     let config = PastorConfig::load(&paths.config_file())?;
-    let timeout = a
-        .timeout
-        .as_deref()
-        .map(parse_duration)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!(e))?
-        .unwrap_or(config.timeout_duration());
-    let spec = DispatchSpec {
-        agent: a.agent.unwrap_or(config.defaults.agent),
-        agent_args: vec![],
-        repo: a.repo,
-        worktree: a.worktree,
-        branch: a.branch,
-        machine: a.machine,
-        tags: a.tags,
-        timeout_secs: timeout.as_secs(),
-    };
+    let spec = run_spec(&a, &config)?;
     let IpcResponse::Task(t) = ask(
         paths,
         IpcRequest::Run {
@@ -278,6 +266,29 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     };
     print_task(&t, a.json);
     Ok(())
+}
+
+/// What `pastor run`'s flags ask for, with pastor.toml's `[defaults]` filling
+/// in what they leave out.
+fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> {
+    let timeout = a
+        .timeout
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .unwrap_or(config.timeout_duration());
+    let given = (!a.agent_args.is_empty()).then(|| a.agent_args.clone());
+    Ok(DispatchSpec {
+        agent: a.agent.clone().unwrap_or(config.defaults.agent.clone()),
+        agent_args: config.defaults.agent_args_or(given),
+        repo: a.repo.clone(),
+        worktree: a.worktree,
+        branch: a.branch.clone(),
+        machine: a.machine.clone(),
+        tags: a.tags.clone(),
+        timeout_secs: timeout.as_secs(),
+    })
 }
 
 fn print_task(t: &Task, json: bool) {
@@ -915,6 +926,62 @@ async fn toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_args(argv: &[&str]) -> RunArgs {
+        let mut full = vec!["pastor", "run"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).unwrap().command {
+            Command::Run(a) => a,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An agent flag starts with `-`, so `--agent-arg` must take it as its
+    /// value in both spellings rather than read it as a pastor flag.
+    #[test]
+    fn agent_arg_takes_values_that_start_with_a_dash() {
+        for argv in [
+            &[
+                "hi",
+                "--agent-arg",
+                "--model",
+                "--agent-arg",
+                "claude-opus-5-5",
+            ][..],
+            &["hi", "--agent-arg=--model", "--agent-arg=claude-opus-5-5"][..],
+            &[
+                "--agent-arg",
+                "--model",
+                "--agent-arg",
+                "claude-opus-5-5",
+                "hi",
+            ][..],
+        ] {
+            let a = run_args(argv);
+            assert_eq!(a.agent_args, vec!["--model", "claude-opus-5-5"], "{argv:?}");
+            assert_eq!(a.prompt, "hi", "{argv:?}");
+        }
+        assert!(run_args(&["hi"]).agent_args.is_empty());
+        // One value per flag: the next word is the prompt, not a second arg.
+        let a = run_args(&["--agent-arg", "-v", "hi", "--json"]);
+        assert_eq!(a.agent_args, vec!["-v"]);
+        assert!(a.json);
+    }
+
+    #[test]
+    fn run_agent_args_fall_back_to_defaults_only_when_none_are_given() {
+        let config = PastorConfig {
+            defaults: pastor::config::Defaults {
+                agent_args: vec!["--model".into(), "claude-sonnet-5".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let spec = run_spec(&run_args(&["hi"]), &config).unwrap();
+        assert_eq!(spec.agent_args, vec!["--model", "claude-sonnet-5"]);
+        let spec = run_spec(&run_args(&["hi", "--agent-arg=--verbose"]), &config).unwrap();
+        assert_eq!(spec.agent_args, vec!["--verbose"]);
+    }
 
     #[test]
     fn default_list_states_hides_only_closed() {

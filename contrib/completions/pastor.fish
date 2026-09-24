@@ -44,6 +44,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand serve" -s h -l help -d 'Pr
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l repo -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l machine -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l agent -r
+complete -c pastor -n "__fish_pastor_using_subcommand run" -l agent-arg -d 'One argument for the agent; repeat it, in order, for more. Replaces `[defaults] agent_args`. The next word is always the value, dashes and all' -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l branch -d 'Branch for the worktree (needs --worktree; a plain workspace has no branch)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l tag -r
 complete -c pastor -n "__fish_pastor_using_subcommand run" -l timeout -r
