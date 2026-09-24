@@ -4,6 +4,7 @@
 //! already the transport; wherever a user sees it, it is a connector.
 
 pub mod clock;
+pub mod process;
 
 use std::future::Future;
 use std::pin::Pin;

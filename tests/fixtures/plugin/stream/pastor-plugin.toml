@@ -1,0 +1,9 @@
+# Test fixture: a stream connector that counts its starts in its state dir,
+# emits one item per start and a cursor, then stays up or crashes
+# (FIXTURE_MODE=crash in its .env).
+id = "stream"
+version = "0.1.0"
+
+[connector]
+mode = "stream"
+command = ["sh", "stream.sh"]

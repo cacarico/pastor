@@ -1,0 +1,20 @@
+# Test fixture: a poll connector that reports its handshake and environment,
+# emits items, a cursor and bad lines, and fails or hangs on demand
+# (FIXTURE_MODE in its .env).
+id = "echo"
+name = "Echo"
+version = "0.1.0"
+min_pastor_version = "0.1.0"
+description = "Fixture: emits items, a cursor, bad lines; fails on demand"
+
+[connector]
+mode = "poll"
+command = ["sh", "poll.sh"]
+timeout = "5s"
+
+[connector.config.channel]
+required = true
+description = "Echoed back in the first item"
+
+[secrets.FIXTURE_TOKEN]
+description = "Printed to stderr so redaction can be checked"
