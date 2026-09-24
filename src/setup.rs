@@ -219,21 +219,29 @@ impl Install {
         let text = render(self.unit.template(), &self.exec, &self.env);
         std::fs::create_dir_all(&self.unit_dir)
             .with_context(|| format!("create {}", self.unit_dir.display()))?;
-        let written = match std::fs::read_to_string(unit_path) {
+        let backup = match std::fs::read_to_string(unit_path) {
             Ok(old) if old == text => return Ok(Written::Unchanged),
-            Ok(_) => {
-                // Never destroy: the old file may carry hand edits.
-                let backup = unit_path.with_extension("service.bak");
-                std::fs::rename(unit_path, &backup)
-                    .with_context(|| format!("back up {}", unit_path.display()))?;
-                Written::Updated { backup }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Written::Created,
+            Ok(_) => Some(unit_path.with_extension("service.bak")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).with_context(|| format!("read {}", unit_path.display())),
         };
-        std::fs::write(unit_path, text)
-            .with_context(|| format!("write {}", unit_path.display()))?;
-        Ok(written)
+        // Write to a sibling temp file first and rename it into place last.
+        // A rename is atomic, so a failed or partial write (disk full,
+        // process killed) leaves either the old unit or the new one intact,
+        // never neither: the old unit only moves aside once the new
+        // contents are safely on disk.
+        let tmp_path = unit_path.with_extension("service.tmp");
+        std::fs::write(&tmp_path, text).with_context(|| format!("write {}", tmp_path.display()))?;
+        if let Some(backup) = &backup {
+            std::fs::rename(unit_path, backup)
+                .with_context(|| format!("back up {}", unit_path.display()))?;
+        }
+        std::fs::rename(&tmp_path, unit_path)
+            .with_context(|| format!("install {}", unit_path.display()))?;
+        Ok(match backup {
+            Some(backup) => Written::Updated { backup },
+            None => Written::Created,
+        })
     }
 }
 
@@ -324,15 +332,25 @@ fn which(name: &str, path_var: &str) -> Option<PathBuf> {
 
 /// Bring pastor's files to the modes the spec lists: config and state dirs
 /// 0700 (created if missing), the daemon socket and every plugin `.env` 0600.
-/// Returns one line per change. Symlinks are left alone: chmod would follow
-/// them to a file pastor does not own.
+/// Returns one line per change. Symlinks are left alone: `create_private_dir`
+/// and `chmod` both follow them, so a symlinked root (or plugin directory)
+/// is skipped entirely rather than tightening whatever it points at.
 pub fn secure(paths: &Paths) -> anyhow::Result<Vec<String>> {
     use std::os::unix::fs::PermissionsExt;
     let mut fixed = Vec::new();
+    // Whether config_dir turned out to be a symlink: the plugins scan below
+    // lives under it, so it is skipped too.
+    let mut config_dir_is_symlink = false;
     for dir in [&paths.config_dir, &paths.state_dir] {
-        let before = std::fs::symlink_metadata(dir)
-            .ok()
-            .map(|m| m.permissions().mode() & 0o777);
+        let before = std::fs::symlink_metadata(dir).ok();
+        if before.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+            fixed.push(format!("{}: is a symlink, left alone", dir.display()));
+            if dir == &paths.config_dir {
+                config_dir_is_symlink = true;
+            }
+            continue;
+        }
+        let before = before.map(|m| m.permissions().mode() & 0o777);
         create_private_dir(dir)?;
         match before {
             None => fixed.push(format!("created {} (0700)", dir.display())),
@@ -343,9 +361,18 @@ pub fn secure(paths: &Paths) -> anyhow::Result<Vec<String>> {
         }
     }
     let mut files = vec![paths.socket_file()];
-    if let Ok(entries) = std::fs::read_dir(paths.config_dir.join("plugins")) {
+    let plugins_dir = paths.config_dir.join("plugins");
+    let plugins_dir_is_symlink =
+        std::fs::symlink_metadata(&plugins_dir).is_ok_and(|m| m.file_type().is_symlink());
+    if !config_dir_is_symlink
+        && !plugins_dir_is_symlink
+        && let Ok(entries) = std::fs::read_dir(&plugins_dir)
+    {
         let mut envs: Vec<PathBuf> = entries
             .filter_map(Result::ok)
+            // read_dir does not follow symlinks to list entries, but a
+            // symlinked plugin directory must not be walked into either.
+            .filter(|e| !e.file_type().is_ok_and(|t| t.is_symlink()))
             .map(|e| e.path().join(".env"))
             .collect();
         envs.sort();
@@ -356,7 +383,7 @@ pub fn secure(paths: &Paths) -> anyhow::Result<Vec<String>> {
             continue;
         };
         let mode = md.permissions().mode() & 0o777;
-        if md.file_type().is_symlink() || mode & 0o077 == 0 {
+        if md.file_type().is_symlink() || mode == 0o600 {
             continue;
         }
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
@@ -619,6 +646,10 @@ mod tests {
                 .to_string()
                 .contains("systemctl --user restart pastor.service")
         );
+        assert!(
+            !dir.join("pastor.service.tmp").exists(),
+            "a successful install must not leave its temp file behind"
+        );
     }
 
     #[test]
@@ -666,15 +697,24 @@ mod tests {
         std::fs::create_dir_all(&quiet).unwrap();
         std::fs::write(quiet.join(".env"), "").unwrap();
         chmod(&quiet.join(".env"), 0o600);
+        // Owner-only modes other than 0600 (e.g. read-only 0400) still need
+        // tightening: the contract is exactly 0600, not merely "no group or
+        // other bits".
+        let readonly = e.paths.config_dir.join("plugins/jira");
+        std::fs::create_dir_all(&readonly).unwrap();
+        std::fs::write(readonly.join(".env"), "").unwrap();
+        chmod(&readonly.join(".env"), 0o400);
 
         let fixed = secure(&e.paths).unwrap();
-        assert_eq!(fixed.len(), 3, "{fixed:?}");
+        assert_eq!(fixed.len(), 4, "{fixed:?}");
         assert!(fixed[0].ends_with("0755 -> 0700"), "{fixed:?}");
         assert!(fixed[1].contains("pastor.sock: 0666 -> 0600"), "{fixed:?}");
         assert!(fixed[2].contains("github/.env: 0644 -> 0600"), "{fixed:?}");
+        assert!(fixed[3].contains("jira/.env: 0400 -> 0600"), "{fixed:?}");
         assert_eq!(mode(&e.paths.config_dir), 0o700);
         assert_eq!(mode(&e.paths.socket_file()), 0o600);
         assert_eq!(mode(&plugin.join(".env")), 0o600);
+        assert_eq!(mode(&readonly.join(".env")), 0o600);
     }
 
     #[test]
@@ -690,6 +730,40 @@ mod tests {
 
         assert!(secure(&e.paths).unwrap().is_empty());
         assert_eq!(mode(&outside), 0o644);
+    }
+
+    #[test]
+    fn secure_leaves_a_symlinked_root_alone() {
+        let e = env();
+        let real = e.tmp.path().join("real-config");
+        std::fs::create_dir_all(real.join("plugins/github")).unwrap();
+        chmod(&real, 0o755);
+        std::fs::write(real.join("plugins/github/.env"), "").unwrap();
+        chmod(&real.join("plugins/github/.env"), 0o644);
+        std::os::unix::fs::symlink(&real, &e.paths.config_dir).unwrap();
+
+        let fixed = secure(&e.paths).unwrap();
+        assert!(
+            fixed.iter().any(|l| l.contains("is a symlink, left alone")),
+            "{fixed:?}"
+        );
+        assert_eq!(mode(&real), 0o755);
+        assert_eq!(mode(&real.join("plugins/github/.env")), 0o644);
+    }
+
+    #[test]
+    fn secure_skips_symlinked_plugin_dirs() {
+        let e = env();
+        e.paths.ensure().unwrap();
+        let outside = e.tmp.path().join("outside-plugin");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join(".env"), "").unwrap();
+        chmod(&outside.join(".env"), 0o644);
+        std::fs::create_dir_all(e.paths.config_dir.join("plugins")).unwrap();
+        std::os::unix::fs::symlink(&outside, e.paths.config_dir.join("plugins/linked")).unwrap();
+
+        assert!(secure(&e.paths).unwrap().is_empty());
+        assert_eq!(mode(&outside.join(".env")), 0o644);
     }
 
     #[test]

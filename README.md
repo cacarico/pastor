@@ -5,9 +5,9 @@ tasks while your laptop is closed. It sits on top of [herdr](https://herdr.dev):
 herdr owns the terminals and the agents, pastor owns the fleet and the
 bookkeeping. When you open the laptop you attach to the panes through herdr.
 
-Status: core and jobs. `pastor serve`, the head, runs one-off tasks and
-scheduled jobs end to end with the built-in `clock` connector. Connector
-plugins, event hooks and systemd setup are the next milestones; see the
+Status: core, jobs and systemd setup. `pastor serve`, the head, runs one-off
+tasks and scheduled jobs end to end with the built-in `clock` connector.
+Connector plugins and event hooks are the next milestones; see the
 design spec on the `docs` branch,
 `docs/superpowers/specs/2026-09-23-pastor-design.md`.
 
@@ -183,7 +183,8 @@ and copies your shell's `PATH` into the unit, so `ssh`, `herdr` and the agents
 resolve under systemd the way they do in a terminal; re-run it after moving a
 binary. A unit that differs from what setup would write is kept as
 `<unit>.service.bak`, and a running service is not restarted, since
-restarting herdr stops its agents: run `systemctl --user restart` yourself.
+restarting herdr stops its agents: run `systemctl --user restart pastor`
+(or `herdr`) yourself.
 
 A user service stops at logout unless lingering is on. Setup checks
 `loginctl show-user` and prints `loginctl enable-linger` when it is off.
