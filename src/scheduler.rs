@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::job::{Job, Loaded, load_dir};
@@ -310,6 +310,32 @@ struct Entry {
     error: Option<String>,
 }
 
+/// A run's place in its job's line, handed out by the scheduler actor in
+/// command order. `wait` returns once the previous run of the job has ended;
+/// dropping the turn (the run finished, or panicked) lets the next one go.
+struct Turn {
+    prev: Option<oneshot::Receiver<()>>,
+    _done: oneshot::Sender<()>,
+}
+
+impl Turn {
+    /// Queue a run of `name` behind the one queued before it.
+    fn behind(last_turn: &mut HashMap<String, oneshot::Receiver<()>>, name: &str) -> Turn {
+        let (done, next) = oneshot::channel();
+        Turn {
+            prev: last_turn.insert(name.to_string(), next),
+            _done: done,
+        }
+    }
+
+    async fn wait(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            // Err means the sender was dropped, which is exactly the signal.
+            let _ = prev.await;
+        }
+    }
+}
+
 enum Due {
     Now,
     At(DateTime<Utc>),
@@ -396,10 +422,10 @@ pub struct Scheduler {
     fingerprint: Option<Vec<(PathBuf, Option<SystemTime>, u64)>>,
     /// Runs in progress: a job may appear more than once only through `fire`.
     in_flight: Vec<(String, JoinHandle<JobRunReport>)>,
-    /// One lock per job, held for a whole non-dry run. `run_job` reads the
-    /// job state and later replaces the row; two fired runs of one job must
-    /// not interleave, or the older one finishing last writes stale values.
-    run_locks: HashMap<String, Arc<AsyncMutex<()>>>,
+    /// Per job, the signal that its most recently queued run has ended.
+    /// `run_job` reads the job state and later replaces the row, so runs of
+    /// one job go one at a time in the order they were asked for; see `Turn`.
+    last_turn: HashMap<String, oneshot::Receiver<()>>,
     /// When each job was first loaded; a cron job that never ran is due at its
     /// first occurrence after this.
     first_seen: HashMap<String, DateTime<Utc>>,
@@ -425,7 +451,7 @@ impl Scheduler {
             entries: HashMap::new(),
             fingerprint: None,
             in_flight: Vec::new(),
-            run_locks: HashMap::new(),
+            last_turn: HashMap::new(),
             first_seen: HashMap::new(),
             warned_queued: HashSet::new(),
         }
@@ -562,8 +588,11 @@ impl Scheduler {
         }
     }
 
-    fn run_lock(&mut self, name: &str) -> Arc<AsyncMutex<()>> {
-        self.run_locks.entry(name.to_string()).or_default().clone()
+    /// Queue a run of `name` behind the one queued before it. Called in the
+    /// actor, before any spawn, so the order is the order of commands, not
+    /// whatever order tokio happens to poll the spawned runs in.
+    fn take_turn(&mut self, name: &str) -> Turn {
+        Turn::behind(&mut self.last_turn, name)
     }
 
     fn is_running(&self, name: &str) -> bool {
@@ -661,8 +690,8 @@ impl Scheduler {
     }
 
     /// `pastor job run`: now, regardless of schedule, overlap and `enabled`.
-    /// A fire while a run is going queues behind it on the job's run lock,
-    /// so the second run starts from the state the first one saved.
+    /// A fire while a run is going queues behind it (see `Turn`), so the
+    /// second run starts from the state the first one saved.
     pub fn fire(&mut self, name: &str, now: DateTime<Utc>) -> Result<String, String> {
         let job = self
             .entries
@@ -686,12 +715,11 @@ impl Scheduler {
         let fleet = self.fleet.clone();
         let events = self.events.clone();
         let name = job.name.clone();
-        let lock = self.run_lock(&name);
+        let mut turn = self.take_turn(&name);
         let handle = tokio::spawn(async move {
-            let report = {
-                let _run = lock.lock().await;
-                run_job(&store, &job, source.as_ref(), &events, now, false).await
-            };
+            turn.wait().await;
+            let report = run_job(&store, &job, source.as_ref(), &events, now, false).await;
+            drop(turn); // the next run of this job may start
             if !report.created.is_empty() {
                 // Do not wait for the next tick to place what this run queued.
                 fleet.dispatch_queued().await;
@@ -773,11 +801,12 @@ impl Scheduler {
                 continue;
             };
             // A dry run writes nothing, so it need not wait for a fired run.
-            let lock = (!dry_run).then(|| self.run_locks.entry(name.clone()).or_default().clone());
-            let _run = match &lock {
-                Some(l) => Some(l.lock().await),
-                None => None,
-            };
+            // `take_turn` would borrow all of `self` while `name` borrows
+            // `entries`, hence the field directly.
+            let mut turn = (!dry_run).then(|| Turn::behind(&mut self.last_turn, name));
+            if let Some(t) = turn.as_mut() {
+                t.wait().await;
+            }
             reports.push(
                 run_job(
                     &self.store,
@@ -1417,6 +1446,91 @@ mod tests {
             vec![None, Some("c1".into())],
             "the second run started from the first run's saved state"
         );
+    }
+
+    #[tokio::test]
+    async fn a_run_waits_its_turn_even_when_polled_first() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let first = s.take_turn("j");
+        let mut second = s.take_turn("j");
+        let mut other = s.take_turn("other");
+        // Poll the later turn before the earlier one has even started, as a
+        // tokio scheduler is free to do with two spawned runs.
+        let second_ran = Arc::new(AtomicUsize::new(0));
+        let flag = second_ran.clone();
+        let waiter = tokio::spawn(async move {
+            second.wait().await;
+            flag.store(1, Ordering::SeqCst);
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            second_ran.load(Ordering::SeqCst),
+            0,
+            "the later run must wait for the earlier one"
+        );
+        other.wait().await; // another job's line is independent
+        drop(first); // the earlier run ends (or panics: the drop is the same)
+        waiter.await.unwrap();
+        assert_eq!(second_ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// Holds its first run until the test opens the gate; later runs pass.
+    struct Gated {
+        gate: tokio::sync::Notify,
+        calls: AtomicUsize,
+    }
+    impl ItemSource for Gated {
+        fn id(&self) -> &str {
+            "gated"
+        }
+        fn run<'a>(&'a self, _input: RunInput) -> RunFuture<'a> {
+            Box::pin(async move {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    self.gate.notified().await;
+                }
+                Ok(RunOutput {
+                    cursor: Some(format!("c{}", n + 1)),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_fire_runs_after_the_earlier_one_and_its_state_wins() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let src = Arc::new(Gated {
+            gate: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+        });
+        s.set_source_for_tests("gated", src.clone());
+        let mut j = job("j");
+        j.connector = "gated".into();
+        s.set_jobs_for_tests(vec![j]);
+        let t1 = Utc::now();
+        let t2 = t1 + chrono::Duration::seconds(1);
+        s.fire("j", t1).unwrap();
+        s.fire("j", t2).unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            src.calls.load(Ordering::SeqCst),
+            1,
+            "the second fire has not started while the first is held"
+        );
+        src.gate.notify_one();
+        for (_, h) in s.in_flight.drain(..) {
+            h.await.unwrap();
+        }
+        let st = store.job_state("j").unwrap().unwrap();
+        assert_eq!(st.last_run_at, Some(t2), "the newer run wrote last");
+        assert_eq!(st.cursor.as_deref(), Some("c2"));
     }
 
     #[tokio::test]
