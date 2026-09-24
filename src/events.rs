@@ -344,7 +344,7 @@ pub async fn follow(
     }
 }
 
-#[derive(clap::Args)]
+#[derive(clap::Args, Debug)]
 pub struct EventsArgs {
     /// Keep printing new events as they are written (reads the file; works
     /// with the daemon down)
