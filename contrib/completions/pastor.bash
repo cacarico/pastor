@@ -1028,7 +1028,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__run)
-            opts="-h --repo --machine --agent --worktree --branch --tag --timeout --json --help"
+            opts="-h --repo --machine --agent --agent-arg --worktree --branch --tag --timeout --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1043,6 +1043,10 @@ _pastor() {
                     return 0
                     ;;
                 --agent)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --agent-arg)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
