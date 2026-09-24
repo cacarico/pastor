@@ -31,7 +31,7 @@ enum Command {
     Serve,
     /// Create a one-off task and dispatch it
     Run(RunArgs),
-    /// List tasks across the flock
+    /// List live tasks across the flock; --all adds finished ones
     List(ListArgs),
     /// Inspect a task
     Task {
@@ -138,7 +138,7 @@ struct ListArgs {
     /// Only done tasks
     #[arg(long, group = "list_filter")]
     done: bool,
-    /// Include closed tasks
+    /// Every task, finished ones too (done, failed, stale, closed)
     #[arg(long, group = "list_filter")]
     all: bool,
     /// Print full task records as JSON instead of a table
@@ -426,32 +426,41 @@ fn machine_status_row(
     }
 }
 
-/// Every state `pastor list` shows without `--all`: everything except `Closed`,
-/// matching the spec's CLI table ("hides closed by default"). `Failed` belongs
-/// here too — a failed task needs a human same as a blocked one, and hiding it by
-/// default was a plan defect, not a design choice.
-fn default_list_states() -> Vec<TaskState> {
-    vec![
-        TaskState::Queued,
-        TaskState::Starting,
-        TaskState::Running,
-        TaskState::Blocked,
-        TaskState::Done,
-        TaskState::Stale,
-        TaskState::Failed,
-    ]
-}
+/// The states a task can be in while it still needs pastor or a human:
+/// what `pastor list` shows by default. Done, failed, stale and closed tasks
+/// are finished; they appear only with `--all` (or `--done` for done ones).
+const LIVE_STATES: [TaskState; 4] = [
+    TaskState::Queued,
+    TaskState::Starting,
+    TaskState::Running,
+    TaskState::Blocked,
+];
 
-async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
-    let states = if a.blocked {
+/// The states `pastor list` selects, `None` meaning all of them. `--blocked`
+/// and `--done` are single-state views, `--all` is everything, and no flag is
+/// the live tasks. `--job` and `--machine` narrow whichever set this picks.
+fn list_states(a: &ListArgs) -> Option<Vec<TaskState>> {
+    if a.blocked {
         Some(vec![TaskState::Blocked])
     } else if a.done {
         Some(vec![TaskState::Done])
     } else if a.all {
         None
     } else {
-        Some(default_list_states())
-    };
+        Some(LIVE_STATES.to_vec())
+    }
+}
+
+/// What to say on stderr when the list comes back empty: only the default
+/// view hides anything a user might be looking for.
+fn list_empty_hint(a: &ListArgs) -> Option<&'static str> {
+    (list_states(a).as_deref() == Some(&LIVE_STATES[..]))
+        .then_some("no live tasks; pastor list --all shows finished ones")
+}
+
+async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
+    let states = list_states(&a);
+    let hint = list_empty_hint(&a);
     let filter = TaskFilter {
         job: a.job,
         machine: a.machine,
@@ -467,10 +476,17 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         paths.ensure()?;
         Store::open(&paths.db_file())?.list_tasks(&filter)?
     };
+    if tasks.is_empty()
+        && let Some(hint) = hint
+    {
+        eprintln!("{hint}");
+    }
     if a.json {
         println!("{}", serde_json::to_string_pretty(&tasks)?);
     } else if tasks.is_empty() {
-        println!("no tasks");
+        if hint.is_none() {
+            println!("no tasks");
+        }
     } else {
         println!(
             "{}",
@@ -1027,6 +1043,15 @@ mod tests {
         assert_eq!(spec.agent_args, vec!["--verbose"]);
     }
 
+    fn list_args(argv: &[&str]) -> ListArgs {
+        let mut full = vec!["pastor", "list"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).unwrap().command {
+            Command::List(a) => a,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn a_busy_head_is_a_timeout_not_a_missing_daemon() {
         let (code, message) =
@@ -1070,23 +1095,58 @@ mod tests {
     }
 
     #[test]
-    fn default_list_states_hides_only_closed() {
-        let states = default_list_states();
-        assert!(!states.contains(&TaskState::Closed), "{states:?}");
-        assert!(
-            states.contains(&TaskState::Failed),
-            "a failed task needs a human just as much as a blocked one: {states:?}"
+    fn default_list_shows_only_live_tasks() {
+        let states = list_states(&list_args(&[])).expect("the default view filters");
+        assert_eq!(
+            states,
+            vec![
+                TaskState::Queued,
+                TaskState::Starting,
+                TaskState::Running,
+                TaskState::Blocked,
+            ]
         );
         for s in [
-            TaskState::Queued,
-            TaskState::Starting,
-            TaskState::Running,
-            TaskState::Blocked,
             TaskState::Done,
+            TaskState::Failed,
             TaskState::Stale,
+            TaskState::Closed,
         ] {
-            assert!(states.contains(&s), "{s} missing from {states:?}");
+            assert!(!states.contains(&s), "{s} is finished, not live");
         }
+        // `--job` and `--machine` narrow the live set; they do not widen it.
+        let a = list_args(&["--job", "hourly", "--machine", "pi-3"]);
+        assert_eq!(list_states(&a), Some(states));
+        assert!(list_empty_hint(&a).is_some());
+    }
+
+    #[test]
+    fn list_all_shows_every_state() {
+        assert_eq!(list_states(&list_args(&["--all"])), None);
+        assert_eq!(list_states(&list_args(&["--all", "--job", "hourly"])), None);
+        assert_eq!(list_empty_hint(&list_args(&["--all"])), None);
+    }
+
+    #[test]
+    fn list_blocked_and_done_stay_single_state_views() {
+        let blocked = list_args(&["--blocked"]);
+        assert_eq!(list_states(&blocked), Some(vec![TaskState::Blocked]));
+        assert_eq!(list_empty_hint(&blocked), None);
+        let done = list_args(&["--done"]);
+        assert_eq!(list_states(&done), Some(vec![TaskState::Done]));
+        assert_eq!(list_empty_hint(&done), None);
+    }
+
+    #[test]
+    fn empty_default_list_points_at_all() {
+        assert_eq!(
+            list_empty_hint(&list_args(&[])),
+            Some("no live tasks; pastor list --all shows finished ones")
+        );
+        assert_eq!(
+            list_empty_hint(&list_args(&["--json"])),
+            list_empty_hint(&list_args(&[]))
+        );
     }
 
     fn pong() -> pastor::herdr::Pong {

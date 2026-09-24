@@ -166,9 +166,28 @@ fn run_list_show_read_end_to_end() {
         assert!(Instant::now() < deadline, "task never became done: {t}");
         std::thread::sleep(Duration::from_millis(100));
     }
+    // A done task is finished: the default list hides it and says where it
+    // went, `--all` shows it, and `--json` follows the same selection.
     let out = env.cmd(&["list"]);
     let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("t-1"), "{text}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("no live tasks; pastor list --all shows finished ones"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = env.cmd(&["list", "--all"]);
+    let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("t-1") && text.contains("done"), "{text}");
+    let out = env.cmd(&["list", "--json"]);
+    let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(tasks.is_empty(), "{tasks:?}");
+    let out = env.cmd(&["list", "--all", "--json"]);
+    let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(tasks.len(), 1, "{tasks:?}");
+    assert_eq!(tasks[0]["agent_name"], "t-1");
+    assert_eq!(tasks[0]["state"], "done");
 
     let out = env.cmd(&["task", "show", "t-9"]);
     assert!(!out.status.success());
@@ -206,7 +225,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
         text.contains("agent args: --model claude-opus-5-5"),
         "{text}"
     );
-    let out = env.cmd(&["list", "--json"]);
+    let out = env.cmd(&["list", "--all", "--json"]);
     let tasks: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(tasks[0]["spec"]["agent_args"], want, "{tasks}");
 
@@ -313,8 +332,22 @@ fn list_without_daemon_reads_the_database() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not running"), "{stderr}");
+    assert!(stderr.contains("no live tasks"), "{stderr}");
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = pastor()
+        .args(["list", "--all"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .output()
+        .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("no tasks"));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not running"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("no live tasks"));
 }
 
 /// `--herdr` keeps herdr's saved-machine list in step with the flock: `add`
@@ -443,7 +476,7 @@ fn clock_job_creates_tasks_end_to_end() {
     )]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let tasks: Vec<serde_json::Value> = loop {
-        let out = env.cmd(&["list", "--job", "tick", "--json"]);
+        let out = env.cmd(&["list", "--all", "--job", "tick", "--json"]);
         assert!(
             out.status.success(),
             "{}",
