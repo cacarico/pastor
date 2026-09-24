@@ -1,0 +1,25 @@
+# pastor serve as a systemd user unit, for the head.
+#
+# `pastor setup systemd` installs this to ~/.config/systemd/user/ and enables
+# it. On the way it points ExecStart at the pastor binary it was run as and
+# adds an Environment=PATH= line copied from that shell, so `ssh` and `herdr`
+# resolve the way they do interactively. Installing by hand works too: fix the
+# ExecStart path, then `systemctl --user enable --now pastor.service`.
+#
+# A user unit stops at logout unless lingering is on: `loginctl enable-linger`.
+
+[Unit]
+Description=pastor: run coding agents on machines you own
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/pastor serve
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

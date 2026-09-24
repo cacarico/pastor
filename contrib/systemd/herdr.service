@@ -1,0 +1,27 @@
+# The herdr server as a systemd user unit, for every machine in the flock.
+#
+# `pastor setup systemd --herdr` installs this to ~/.config/systemd/user/ and
+# enables it. On the way it points ExecStart at the herdr found on PATH and
+# adds an Environment=PATH= line copied from that shell, so the agents herdr
+# launches (claude, codex, ...) resolve the way they do interactively.
+# Installing by hand works too: fix the ExecStart path, then
+# `systemctl --user enable --now herdr.service`.
+#
+# Stopping this unit stops every agent it runs. A user unit stops at logout
+# unless lingering is on: `loginctl enable-linger`.
+
+[Unit]
+Description=herdr server: terminals and agents for pastor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/herdr server
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
