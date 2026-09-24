@@ -435,6 +435,10 @@ impl Scheduler {
 
     async fn run(mut self, mut rx: mpsc::Receiver<SchedulerCommand>) {
         let mut tick = tokio::time::interval(self.tick);
+        // A pass can wait on a whole dispatch round, and `Tick`/`Fire` run
+        // connectors inline; missed ticks must not replay back to back once
+        // the interval catches up.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = tick.tick() => self.pass(Utc::now()).await,
@@ -447,14 +451,21 @@ impl Scheduler {
                         }
                         SchedulerCommand::Fire { name, reply } => {
                             self.reload();
+                            self.reap().await;
                             let _ = reply.send(self.fire(&name, Utc::now()));
                         }
                         SchedulerCommand::Reload { reply } => {
-                            self.reload();
+                            // Force a re-read even if the fingerprint looks
+                            // unchanged: this is the escape hatch when an edit
+                            // lands within one mtime granule, or (before the
+                            // fingerprint fix) behind a symlink.
+                            self.force_reload();
+                            self.reap().await;
                             let _ = reply.send(self.statuses(Utc::now()));
                         }
                         SchedulerCommand::JobList { reply } => {
                             self.reload();
+                            self.reap().await;
                             let _ = reply.send(self.statuses(Utc::now()));
                         }
                     }
@@ -512,6 +523,14 @@ impl Scheduler {
         }
         self.entries = next;
         true
+    }
+
+    /// Like `reload`, but always re-reads the jobs directory even when the
+    /// fingerprint looks unchanged. What `pastor reload` calls: the fingerprint
+    /// is a cheap heuristic (mtime and size), not proof nothing changed.
+    pub fn force_reload(&mut self) -> bool {
+        self.fingerprint = None;
+        self.reload()
     }
 
     fn states(&self) -> HashMap<String, JobState> {
@@ -801,7 +820,11 @@ fn fingerprint(dir: &std::path::Path) -> Vec<(PathBuf, Option<SystemTime>, u64)>
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
-            let md = entry.metadata().ok();
+            // `std::fs::metadata` follows symlinks (unlike `DirEntry::metadata`,
+            // which reads the link itself on Unix); a job file managed as a
+            // symlink into a dotfiles repo must fingerprint the target, or an
+            // edit to the target is never noticed.
+            let md = std::fs::metadata(&path).ok();
             out.push((
                 path,
                 md.as_ref().and_then(|m| m.modified().ok()),
@@ -1358,6 +1381,100 @@ mod tests {
         let reports = s.tick_now(Some("ghost"), false, Utc::now()).await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].outcome, RunOutcome::Unknown);
+    }
+
+    #[tokio::test]
+    async fn reload_follows_a_symlinked_job_file() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, tmp) = scheduler_with(&store);
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+
+        // The job file lives outside the jobs dir; the jobs dir only holds a
+        // symlink to it, as a dotfiles-managed job would.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let target = elsewhere.join("a.toml");
+        std::fs::write(&target, CLOCK_JOB).unwrap();
+        let link = crate::config::job::job_path(&paths.jobs_dir(), "a");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(s.reload(), "first load counts as a change");
+        assert_eq!(
+            s.statuses(Utc::now())[0].schedule.as_deref(),
+            Some("every 5m")
+        );
+
+        // Edit the symlink's target, not the link. `DirEntry::metadata` (the
+        // bug) would report the link's own mtime/size, unchanged, and this
+        // edit would never be noticed.
+        std::thread::sleep(Duration::from_millis(20)); // mtime granularity
+        std::fs::write(
+            &target,
+            CLOCK_JOB.replace("every = \"5m\"", "every = \"10m\""),
+        )
+        .unwrap();
+        assert!(
+            s.reload(),
+            "an edit through a symlinked job file must be picked up"
+        );
+        assert_eq!(
+            s.statuses(Utc::now())[0].schedule.as_deref(),
+            Some("every 10m")
+        );
+    }
+
+    #[tokio::test]
+    async fn force_reload_re_reads_even_when_the_fingerprint_is_unchanged() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, tmp) = scheduler_with(&store);
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        write_job(&paths, "a", CLOCK_JOB);
+
+        assert!(s.reload(), "first load counts as a change");
+        assert!(
+            !s.reload(),
+            "nothing changed on disk: an ordinary reload is a no-op"
+        );
+        // `SchedulerCommand::Reload` (pastor reload) calls this instead of
+        // `reload()`, precisely so it is not fooled by an unchanged
+        // fingerprint (a symlinked target edited within one mtime granule,
+        // for instance).
+        assert!(
+            s.force_reload(),
+            "pastor reload must force a re-read regardless of the fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_list_reaps_a_finished_run_before_the_next_tick() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        // A long tick: if the running flag ever clears, it is because
+        // `JobList` reaped on demand, not because a tick happened to land.
+        let config = PastorConfig {
+            tick: "1h".into(),
+            ..Default::default()
+        };
+        let fleet = Arc::new(Fleet::new(vec![], store.clone()));
+        let (events, _) = broadcast::channel(16);
+        write_job(&paths, "a", CLOCK_JOB);
+        let scheduler = Scheduler::new(paths, &config, store.clone(), fleet, events);
+        let handle = scheduler.spawn();
+
+        let fired = handle.fire("a").await.unwrap();
+        assert!(fired.is_ok(), "{fired:?}");
+        // The clock connector's run is near-instant; give the spawned task a
+        // moment to finish without racing it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let statuses = handle.job_list().await.unwrap();
+        let a = statuses.iter().find(|s| s.name == "a").unwrap();
+        assert!(
+            !a.running,
+            "job list must reap a finished run itself, not wait for the next (1h) tick"
+        );
     }
 
     #[tokio::test]

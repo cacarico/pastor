@@ -136,7 +136,7 @@ pastor serve
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, defaults (all optional)
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks
+~/.local/state/pastor/pastor.db   tasks, seen keys, job state
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
 ```
