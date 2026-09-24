@@ -61,6 +61,12 @@ impl Paths {
         self.config_dir.join("pastor.toml")
     }
 
+    /// One TOML file per job. Created by the user; pastor only reads and, for
+    /// `job enable|disable`, rewrites one line of it.
+    pub fn jobs_dir(&self) -> PathBuf {
+        self.config_dir.join("jobs")
+    }
+
     /// Directory for the ssh `ControlMaster` sockets, one per machine. Created
     /// with mode 0700 by the transport when it first connects.
     pub fn ssh_dir(&self) -> PathBuf {
@@ -136,6 +142,12 @@ pub struct PastorConfig {
     pub tick: String,
     pub settle: String,
     pub reconcile_every: String,
+    /// Bound on one herdr request, connect included. A machine that does not
+    /// answer within it is treated as lost.
+    pub request_timeout: String,
+    /// How long dispatch waits between `agent.start` and a prompt herdr
+    /// accepts. Runs inside `request_timeout`, so it must be shorter.
+    pub agent_ready_timeout: String,
     pub defaults: Defaults,
 }
 
@@ -145,6 +157,8 @@ impl Default for PastorConfig {
             tick: "10s".into(),
             settle: "10s".into(),
             reconcile_every: "60s".into(),
+            request_timeout: "60s".into(),
+            agent_ready_timeout: "30s".into(),
             defaults: Defaults::default(),
         }
     }
@@ -166,6 +180,8 @@ impl PastorConfig {
             ("tick", &cfg.tick, false),
             ("settle", &cfg.settle, false),
             ("reconcile_every", &cfg.reconcile_every, false),
+            ("request_timeout", &cfg.request_timeout, false),
+            ("agent_ready_timeout", &cfg.agent_ready_timeout, false),
             ("defaults.timeout", &cfg.defaults.timeout, true),
         ] {
             let d = parse_duration(v)
@@ -173,6 +189,12 @@ impl PastorConfig {
             if !zero_ok && d.is_zero() {
                 anyhow::bail!("{}: {name}: must not be zero", path.display());
             }
+        }
+        if cfg.agent_ready_timeout_duration() >= cfg.request_timeout_duration() {
+            anyhow::bail!(
+                "{}: agent_ready_timeout must be shorter than request_timeout",
+                path.display()
+            );
         }
         Ok(cfg)
     }
@@ -192,6 +214,18 @@ impl PastorConfig {
         duration_or_default(
             &self.defaults.timeout,
             &PastorConfig::default().defaults.timeout,
+        )
+    }
+    pub fn request_timeout_duration(&self) -> Duration {
+        duration_or_default(
+            &self.request_timeout,
+            &PastorConfig::default().request_timeout,
+        )
+    }
+    pub fn agent_ready_timeout_duration(&self) -> Duration {
+        duration_or_default(
+            &self.agent_ready_timeout,
+            &PastorConfig::default().agent_ready_timeout,
         )
     }
 }
@@ -314,6 +348,52 @@ mod tests {
                 .to_string()
                 .contains("settle")
         );
+    }
+
+    #[test]
+    fn timeout_keys_default_and_parse() {
+        let cfg = PastorConfig::default();
+        assert_eq!(cfg.request_timeout_duration(), Duration::from_secs(60));
+        assert_eq!(cfg.agent_ready_timeout_duration(), Duration::from_secs(30));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "request_timeout = \"90s\"\nagent_ready_timeout = \"45s\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.request_timeout_duration(), Duration::from_secs(90));
+        assert_eq!(cfg.agent_ready_timeout_duration(), Duration::from_secs(45));
+    }
+
+    /// The readiness wait runs inside the request timeout that bounds a whole
+    /// dispatch; a config that inverts them would report every slow agent as
+    /// a wedged machine (see `MachineSettings::agent_ready_timeout`).
+    #[test]
+    fn ready_timeout_must_be_shorter_than_request_timeout_and_nonzero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "request_timeout = \"30s\"\nagent_ready_timeout = \"30s\"\n",
+        )
+        .unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("agent_ready_timeout"), "{err}");
+        assert!(err.contains("shorter than request_timeout"), "{err}");
+        std::fs::write(&path, "agent_ready_timeout = \"0s\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("must not be zero"), "{err}");
+        std::fs::write(&path, "request_timeout = \"0s\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("request_timeout"), "{err}");
+    }
+
+    #[test]
+    fn jobs_dir_lives_under_config() {
+        let p = Paths::new("/tmp/c", "/tmp/s");
+        assert_eq!(p.jobs_dir(), PathBuf::from("/tmp/c/jobs"));
     }
 
     #[test]
