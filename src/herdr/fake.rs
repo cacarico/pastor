@@ -401,7 +401,14 @@ impl FakeHerdr {
                     .map(|a| {
                         if is_launching(&s.started, &a.pane_id, ready_after) {
                             AgentInfo {
-                                agent_status: AgentStatus::Unknown,
+                                // herdr keeps `launch_pending` set while an agent
+                                // sits on its own startup question (a folder
+                                // trust dialog, say) and reports it `blocked`.
+                                agent_status: if a.agent_status == AgentStatus::Blocked {
+                                    AgentStatus::Blocked
+                                } else {
+                                    AgentStatus::Unknown
+                                },
                                 launch_pending: true,
                                 interactive_ready: false,
                                 ..a.clone()
