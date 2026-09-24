@@ -32,7 +32,11 @@ never becomes ready within 30s fails the task; one that exits on start fails it
 straight away, usually because the agent is not installed on that machine. An
 agent that is blocked on its own startup question marks the task `blocked`;
 herdr drops the prompt then, so pastor sends it once someone answers and the
-agent leaves `blocked`. Task state lives in SQLite under `~/.local/state/pastor/`.
+agent leaves `blocked`. A task is `done` when its agent has gone idle (herdr's
+`idle` or `done`) after working on the prompt and stays idle for `settle`: herdr
+counts each agent state change, and the count must have moved past its value
+when the prompt went in and not moved again during the window. Task state lives
+in SQLite under `~/.local/state/pastor/`.
 
 The CLI talks to `pastor serve` over a unix socket (`pastor.sock`) with
 newline-delimited JSON; each response is `{"kind": ..., "data": ...}`.
