@@ -58,6 +58,11 @@ enum Command {
     Completions { shell: clap_complete::Shell },
     /// Show the events log (task, job and machine events)
     Events(pastor::events::EventsArgs),
+    /// Install pastor or herdr as a systemd user service
+    Setup {
+        #[command(subcommand)]
+        cmd: pastor::setup::SetupCmd,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -217,6 +222,7 @@ fn main() {
                 Ok(())
             }
             Command::Events(args) => pastor::events::cli(&paths, args).await,
+            Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
         }
     });
     if let Err(err) = result {
