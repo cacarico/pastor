@@ -22,11 +22,10 @@
 //!   FAKE_HERDR_READY_MS=<n>      a started agent reports `unknown` and refuses
 //!                                prompts for n ms, the way herdr does while a
 //!                                managed agent is still launching.
-//!   FAKE_HERDR_REQUEST_LOG=<path> after every request, write all requests
-//!                                received so far to <path> as one JSON array,
+//!   FAKE_HERDR_REQUEST_LOG=<path> as each request is received, write all
+//!                                requests so far to <path> as one JSON array,
 //!                                so a test can see what pastor sent.
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use pastor::herdr::{AgentStatus, fake::FakeHerdr};
 use tokio::io::AsyncWriteExt;
@@ -62,11 +61,9 @@ async fn listen(path: PathBuf) {
     let fake = FakeHerdr::new();
     ready_after(&fake);
     auto_done(&fake);
-    let log: Option<Arc<PathBuf>> =
-        std::env::var_os("FAKE_HERDR_REQUEST_LOG").map(|p| Arc::new(PathBuf::from(p)));
-    // Serialises the log writers, so two connections that finish together
-    // cannot interleave their temp-file renames out of order.
-    let log_lock = Arc::new(tokio::sync::Mutex::new(()));
+    if let Some(path) = std::env::var_os("FAKE_HERDR_REQUEST_LOG") {
+        fake.set_request_log(PathBuf::from(path));
+    }
     // A leftover socket from a previous run would make bind fail with EADDRINUSE.
     let _ = std::fs::remove_file(&path);
     let listener = tokio::net::UnixListener::bind(&path)
@@ -76,26 +73,10 @@ async fn listen(path: PathBuf) {
             return;
         };
         let fake = fake.clone();
-        let log = log.clone();
-        let log_lock = log_lock.clone();
         tokio::spawn(async move {
             let (r, w) = stream.into_split();
             fake.serve(Box::new(r), Box::new(w)).await;
-            if let Some(path) = log {
-                let _held = log_lock.lock().await;
-                write_log(&path, &fake);
-            }
         });
-    }
-}
-
-/// Write every request so far to `path`, via a rename so a reader never sees
-/// a half-written file.
-fn write_log(path: &std::path::Path, fake: &FakeHerdr) {
-    let tmp = path.with_extension("tmp");
-    let text = serde_json::to_string(&fake.requests()).expect("requests serialise");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
     }
 }
 
