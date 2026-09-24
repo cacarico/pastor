@@ -142,7 +142,14 @@ impl Env {
 #[test]
 fn run_list_show_read_end_to_end() {
     let env = start();
-    let out = env.cmd(&["run", "say hello\nthen stop", "--repo", "/tmp", "--json"]);
+    let out = env.cmd(&[
+        "task",
+        "run",
+        "say hello\nthen stop",
+        "--repo",
+        "/tmp",
+        "--json",
+    ]);
     assert!(
         out.status.success(),
         "{}",
@@ -168,22 +175,22 @@ fn run_list_show_read_end_to_end() {
     }
     // A done task is finished: the default list hides it and says where it
     // went, `--all` shows it, and `--json` follows the same selection.
-    let out = env.cmd(&["list"]);
+    let out = env.cmd(&["task", "list"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains("t-1"), "{text}");
     assert!(
         String::from_utf8_lossy(&out.stderr)
-            .contains("no live tasks; pastor list --all shows finished ones"),
+            .contains("no live tasks; pastor task list --all shows finished ones"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = env.cmd(&["list", "--all"]);
+    let out = env.cmd(&["task", "list", "--all"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("t-1") && text.contains("done"), "{text}");
-    let out = env.cmd(&["list", "--json"]);
+    let out = env.cmd(&["task", "list", "--json"]);
     let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
     assert!(tasks.is_empty(), "{tasks:?}");
-    let out = env.cmd(&["list", "--all", "--json"]);
+    let out = env.cmd(&["task", "list", "--all", "--json"]);
     let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(tasks.len(), 1, "{tasks:?}");
     assert_eq!(tasks[0]["agent_name"], "t-1");
@@ -195,11 +202,12 @@ fn run_list_show_read_end_to_end() {
 }
 
 /// `--agent-arg` reaches herdr's `agent.start` as `args`, in order, and shows
-/// in `task show` and `list --json`; without it, `[defaults] agent_args` does.
+/// in `task show` and `task list --json`; without it, `[defaults] agent_args` does.
 #[test]
 fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     let env = start();
     let out = env.cmd(&[
+        "task",
         "run",
         "hi",
         "--agent-arg=--model",
@@ -225,18 +233,18 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
         text.contains("agent args: --model claude-opus-5-5"),
         "{text}"
     );
-    let out = env.cmd(&["list", "--all", "--json"]);
+    let out = env.cmd(&["task", "list", "--all", "--json"]);
     let tasks: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(tasks[0]["spec"]["agent_args"], want, "{tasks}");
 
-    // `pastor run` reads pastor.toml itself, so the daemon need not restart.
+    // `pastor task run` reads pastor.toml itself, so the daemon need not restart.
     std::fs::write(
         env.config.join("pastor.toml"),
         "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
          [defaults]\nagent_args = [\"--model\", \"claude-sonnet-5\"]\n",
     )
     .unwrap();
-    let out = env.cmd(&["run", "hi again", "--json"]);
+    let out = env.cmd(&["task", "run", "hi again", "--json"]);
     assert!(
         out.status.success(),
         "{}",
@@ -310,7 +318,7 @@ fn machine_add_and_remove_edit_the_file() {
     );
     // `--branch` only means something for a worktree; clap rejects it alone
     // before any daemon is asked.
-    let out = run(&["run", "hi", "--branch", "b"]);
+    let out = run(&["task", "run", "hi", "--branch", "b"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(run(&["machine", "remove", "pi-3"]).status.success());
     assert!(!run(&["machine", "remove", "pi-3"]).status.success());
@@ -322,7 +330,7 @@ fn list_without_daemon_reads_the_database() {
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
     let out = pastor()
-        .args(["list"])
+        .args(["task", "list"])
         .env("PASTOR_CONFIG_DIR", &config)
         .env("PASTOR_STATE_DIR", &state)
         .output()
@@ -341,7 +349,7 @@ fn list_without_daemon_reads_the_database() {
         String::from_utf8_lossy(&out.stdout)
     );
     let out = pastor()
-        .args(["list", "--all"])
+        .args(["task", "list", "--all"])
         .env("PASTOR_CONFIG_DIR", &config)
         .env("PASTOR_STATE_DIR", &state)
         .output()
@@ -476,7 +484,7 @@ fn clock_job_creates_tasks_end_to_end() {
     )]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let tasks: Vec<serde_json::Value> = loop {
-        let out = env.cmd(&["list", "--all", "--job", "tick", "--json"]);
+        let out = env.cmd(&["task", "list", "--all", "--job", "tick", "--json"]);
         assert!(
             out.status.success(),
             "{}",
@@ -605,7 +613,7 @@ fn tick_without_daemon_queues_tasks_for_later() {
     let runs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(runs[0]["outcome"], "dry_run");
     assert_eq!(runs[0]["created"].as_array().unwrap().len(), 1);
-    let out = run(&["list", "--json"]);
+    let out = run(&["task", "list", "--json"]);
     let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
     assert!(tasks.is_empty(), "--dry-run must write nothing: {tasks:?}");
 
@@ -618,7 +626,7 @@ fn tick_without_daemon_queues_tasks_for_later() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not running"));
     let runs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(runs[0]["outcome"], "ran");
-    let out = run(&["list", "--json"]);
+    let out = run(&["task", "list", "--json"]);
     let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0]["state"], "queued");

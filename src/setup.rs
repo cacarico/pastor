@@ -1,5 +1,5 @@
-//! `pastor setup systemd [--herdr]`: install the shipped user unit, enable and
-//! start it, and check what a unit needs to outlive a login (lingering) and
+//! `pastor setup systemd [--herdr]`: install the shipped user unit, apply the
+//! requested systemd action, and check what a unit needs to outlive a login (lingering) and
 //! what the spec requires of pastor's own files (config and state dirs 0700,
 //! socket and plugin `.env` files 0600).
 //!
@@ -17,18 +17,37 @@ const HERDR_UNIT: &str = include_str!("../contrib/systemd/herdr.service");
 
 #[derive(clap::Subcommand, Debug)]
 pub enum SetupCmd {
-    /// Install and start a systemd user unit: pastor.service, or herdr.service with --herdr
+    /// Install and manage a systemd user unit: pastor.service, or herdr.service with --herdr
     Systemd {
         /// Install herdr.service (the herdr server) instead, for a flock machine
         #[arg(long)]
         herdr: bool,
+        /// Enable the unit at login
+        #[arg(long)]
+        enable: bool,
+        /// Start the unit now
+        #[arg(long, conflicts_with = "stop")]
+        start: bool,
+        /// With --enable, start the unit now too (`systemctl --user enable --now`)
+        #[arg(long, requires = "enable", conflicts_with_all = ["start", "stop"])]
+        now: bool,
+        /// Stop the unit now
+        #[arg(long, conflicts_with_all = ["enable", "start", "now"])]
+        stop: bool,
     },
 }
 
 /// Entry point for `pastor setup`.
 pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
-    let SetupCmd::Systemd { herdr } = cmd;
+    let SetupCmd::Systemd {
+        herdr,
+        enable,
+        start,
+        now,
+        stop,
+    } = cmd;
     let unit = if herdr { Unit::Herdr } else { Unit::Pastor };
+    let action = Action::from_flags(enable, start, now, stop);
     let path_var = std::env::var("PATH").unwrap_or_default();
     let exec = match unit {
         Unit::Pastor => std::env::current_exe().context("locate the pastor binary")?,
@@ -57,9 +76,27 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
         unit_dir,
         exec,
         env,
+        action,
     };
+    confirm(&install)?;
     let report = install.run(&SystemRunner, paths)?;
     print!("{report}");
+    Ok(())
+}
+
+fn confirm(install: &Install) -> anyhow::Result<()> {
+    eprintln!("About to install {}", install.unit.file_name());
+    eprintln!("  unit dir: {}", install.unit_dir.display());
+    eprintln!("  ExecStart: {}", install.exec.display());
+    eprintln!("  action: {}", install.action);
+    eprint!("Continue? Type 'yes' to proceed: ");
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("read confirmation")?;
+    if answer.trim() != "yes" {
+        anyhow::bail!("aborted");
+    }
     Ok(())
 }
 
@@ -67,6 +104,51 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
 pub enum Unit {
     Pastor,
     Herdr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Enable,
+    Start,
+    EnableStart,
+    EnableNow,
+    Stop,
+}
+
+impl Action {
+    fn from_flags(enable: bool, start: bool, now: bool, stop: bool) -> Action {
+        match (enable, start, now, stop) {
+            (_, _, _, true) => Action::Stop,
+            (true, _, true, _) => Action::EnableNow,
+            (true, true, false, _) => Action::EnableStart,
+            (true, false, false, _) => Action::Enable,
+            (false, true, false, _) => Action::Start,
+            (false, false, false, false) => Action::EnableNow,
+            _ => unreachable!("clap rejects conflicting setup systemd flags"),
+        }
+    }
+
+    fn systemctl_args(self, unit: &str) -> Vec<Vec<&str>> {
+        match self {
+            Action::Enable => vec![vec!["enable", unit]],
+            Action::Start => vec![vec!["start", unit]],
+            Action::EnableStart => vec![vec!["enable", unit], vec!["start", unit]],
+            Action::EnableNow => vec![vec!["enable", "--now", unit]],
+            Action::Stop => vec![vec!["stop", unit]],
+        }
+    }
+}
+
+impl std::fmt::Display for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Action::Enable => f.write_str("enable"),
+            Action::Start => f.write_str("start"),
+            Action::EnableStart => f.write_str("enable, start"),
+            Action::EnableNow => f.write_str("enable --now"),
+            Action::Stop => f.write_str("stop"),
+        }
+    }
 }
 
 impl Unit {
@@ -124,6 +206,7 @@ pub struct Install {
     pub exec: PathBuf,
     /// `Environment=` assignments added to `[Service]`, in order.
     pub env: Vec<(String, String)>,
+    pub action: Action,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +234,7 @@ pub struct Report {
     pub written: Written,
     /// One line per permission pastor tightened.
     pub fixed: Vec<String>,
+    pub action: Action,
     pub linger: Linger,
 }
 
@@ -176,7 +260,7 @@ impl std::fmt::Display for Report {
                 )?;
             }
         }
-        writeln!(f, "enabled and started {name}")?;
+        writeln!(f, "ran systemd action: {} {name}", self.action)?;
         match &self.linger {
             Linger::On => writeln!(f, "lingering is on: {name} runs without a login session"),
             Linger::Off => writeln!(
@@ -192,8 +276,8 @@ impl std::fmt::Display for Report {
 }
 
 impl Install {
-    /// Tighten permissions (pastor.service only), write the unit, enable and
-    /// start it, then check lingering. Fails only on a file or `systemctl`
+    /// Tighten permissions (pastor.service only), write the unit, run the
+    /// requested systemd action, then check lingering. Fails only on a file or `systemctl`
     /// error; a lingering check that cannot run is reported, not fatal.
     pub fn run(&self, runner: &dyn Runner, paths: &Paths) -> anyhow::Result<Report> {
         // herdr.service goes on flock machines that may never run pastor
@@ -205,12 +289,15 @@ impl Install {
         let unit_path = self.unit_dir.join(self.unit.file_name());
         let written = self.write(&unit_path)?;
         systemctl(runner, &["daemon-reload"])?;
-        systemctl(runner, &["enable", "--now", self.unit.file_name()])?;
+        for args in self.action.systemctl_args(self.unit.file_name()) {
+            systemctl(runner, &args)?;
+        }
         Ok(Report {
             unit: self.unit,
             unit_path,
             written,
             fixed,
+            action: self.action,
             linger: linger(runner),
         })
     }
@@ -467,8 +554,31 @@ mod tests {
                 unit_dir: self.tmp.path().join("systemd/user"),
                 exec: PathBuf::from("/opt/bin/pastor"),
                 env: vec![("PATH".into(), "/usr/bin:/opt/bin".into())],
+                action: Action::EnableNow,
             }
         }
+    }
+
+    #[test]
+    fn actions_follow_systemctl_style_flags() {
+        assert_eq!(
+            Action::from_flags(false, false, false, false),
+            Action::EnableNow
+        );
+        assert_eq!(
+            Action::from_flags(true, false, false, false),
+            Action::Enable
+        );
+        assert_eq!(Action::from_flags(false, true, false, false), Action::Start);
+        assert_eq!(
+            Action::from_flags(true, true, false, false),
+            Action::EnableStart
+        );
+        assert_eq!(
+            Action::from_flags(true, false, true, false),
+            Action::EnableNow
+        );
+        assert_eq!(Action::from_flags(false, false, false, true), Action::Stop);
     }
 
     #[test]
@@ -550,8 +660,53 @@ mod tests {
         let shown = report.to_string();
         assert!(shown.contains("\n  loginctl enable-linger\n"), "{shown}");
         assert!(
-            shown.contains("enabled and started pastor.service"),
+            shown.contains("ran systemd action: enable --now pastor.service"),
             "{shown}"
+        );
+    }
+
+    #[test]
+    fn enable_and_start_are_separate_actions_without_now() {
+        let e = env();
+        let mut install = e.install(Unit::Pastor);
+        install.action = Action::EnableStart;
+        let runner = FakeRunner::ok("yes");
+
+        install.run(&runner, &e.paths).unwrap();
+
+        assert!(
+            runner
+                .calls()
+                .contains(&"systemctl --user enable pastor.service".into())
+        );
+        assert!(
+            runner
+                .calls()
+                .contains(&"systemctl --user start pastor.service".into())
+        );
+    }
+
+    #[test]
+    fn start_and_stop_use_the_requested_systemctl_action() {
+        let e = env();
+        let runner = FakeRunner::ok("yes");
+        let mut install = e.install(Unit::Pastor);
+        install.action = Action::Start;
+        install.run(&runner, &e.paths).unwrap();
+        assert!(
+            runner
+                .calls()
+                .contains(&"systemctl --user start pastor.service".into())
+        );
+
+        let runner = FakeRunner::ok("yes");
+        let mut install = e.install(Unit::Pastor);
+        install.action = Action::Stop;
+        install.run(&runner, &e.paths).unwrap();
+        assert!(
+            runner
+                .calls()
+                .contains(&"systemctl --user stop pastor.service".into())
         );
     }
 
@@ -657,6 +812,7 @@ mod tests {
         let e = env();
         let mut install = e.install(Unit::Herdr);
         install.exec = PathBuf::from("/home/u/.local/bin/herdr");
+        install.action = Action::Enable;
         let runner = FakeRunner::ok("yes");
         let report = install.run(&runner, &e.paths).unwrap();
 
@@ -666,7 +822,7 @@ mod tests {
         assert!(
             runner
                 .calls()
-                .contains(&"systemctl --user enable --now herdr.service".into())
+                .contains(&"systemctl --user enable herdr.service".into())
         );
         assert!(!e.paths.config_dir.exists());
         assert!(!e.paths.state_dir.exists());

@@ -167,7 +167,7 @@ async fn dispatch_steps(
 ///
 /// herdr takes `cwd` literally: `~/work` is a directory named `~` to it, and a
 /// `cwd` that does not exist silently opens the pane somewhere else. Job files
-/// and `pastor run --repo` both use `~` to mean the home on that machine, so
+/// and `pastor task run --repo` both use `~` to mean the home on that machine, so
 /// pastor resolves it there before asking herdr.
 async fn expand_home(
     conn: &dyn Connector,
