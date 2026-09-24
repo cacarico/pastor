@@ -145,7 +145,9 @@ impl Store {
                     params![SCHEMA_VERSION.to_string()],
                 )?;
             }
-            Some(v) if v == SCHEMA_VERSION => {}
+            // The pastor before plan 2 already wrote version 2 without the
+            // job tables, so a current file still gets them if missing.
+            Some(v) if v == SCHEMA_VERSION => tx.execute_batch(V2_TABLES)?,
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration.
                 if v < 2 {
@@ -735,6 +737,38 @@ mod tests {
         s.execute_raw("UPDATE job_state SET failures = -1 WHERE name = 'a'");
         assert!(s.job_state("a").is_err(), "-1 must not read as 4294967295");
         assert!(s.job_states().is_err());
+    }
+
+    fn table_names(path: &Path) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// The pastor before plan 2 already wrote schema 2 (with prompt_pending)
+    /// but had no seen or job_state tables.
+    #[test]
+    fn a_v2_database_without_the_job_tables_gains_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw("DROP TABLE seen; DROP TABLE job_state;");
+        }
+        assert_eq!(table_names(&path), vec!["meta", "tasks"]);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            table_names(&path),
+            vec!["job_state", "meta", "seen", "tasks"]
+        );
+        assert!(!s.is_seen("j", "k").unwrap());
+        assert!(s.job_state("j").unwrap().is_none());
+        assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), 1);
     }
 
     #[test]
