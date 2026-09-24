@@ -513,6 +513,7 @@ mod tests {
                 live: 1,
                 max_agents: 2,
                 tags: vec![],
+                orphans: vec![],
             })),
         }
     }

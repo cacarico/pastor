@@ -85,6 +85,12 @@ pub struct MachineStatus {
     pub live: usize,
     pub max_agents: u32,
     pub tags: Vec<String>,
+    /// Agents named like a task (`t-<id>`) that no open task on this machine
+    /// owns: the row is failed, closed or gone (a dispatch that failed after
+    /// `agent.start`, a daemon killed mid-dispatch, a pruned row). Counted in
+    /// `live`, never closed unless `pastor task close` asks.
+    #[serde(default)]
+    pub orphans: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +211,7 @@ pub fn spawn_machine(
         live: 0,
         max_agents,
         tags: tags.clone(),
+        orphans: vec![],
     }));
     let actor = Actor {
         name: name.clone(),
@@ -219,6 +226,7 @@ pub fn spawn_machine(
         was_connected: false,
         failures: 0,
         lost_announced: false,
+        orphans: vec![],
     };
     tokio::spawn(actor.run());
     MachineHandle {
@@ -258,6 +266,19 @@ struct Actor {
     /// Set once `machine.lost` has been emitted for the outage in progress, so it
     /// is never repeated; cleared by `announce_connected`.
     lost_announced: bool,
+    /// Orphaned agents from the last reconcile, as (agent name, pane id).
+    /// See `MachineStatus::orphans`.
+    orphans: Vec<(String, String)>,
+}
+
+/// The task id in an agent name pastor gives (`t-<id>`), and nothing looser:
+/// `parse_task_id` also takes a bare number, which a human could name an agent.
+fn task_id_of_agent(name: &str) -> Option<i64> {
+    let digits = name.strip_prefix("t-")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// What the inner loop should do after a command: nothing, reopen the event
@@ -525,7 +546,13 @@ impl Actor {
 
     fn refresh_live(&self) {
         match self.store.tasks_on_machine(&self.name) {
-            Ok(v) => self.status.write().unwrap().live = v.len(),
+            Ok(v) => {
+                // An orphan holds a pane and an agent just like a task does;
+                // leaving it out would let the picker over-dispatch.
+                let mut s = self.status.write().unwrap();
+                s.live = v.len() + self.orphans.len();
+                s.orphans = self.orphans.iter().map(|(name, _)| name.clone()).collect();
+            }
             Err(err) => {
                 // A store error is not "zero live agents": that reads as idle
                 // capacity and would let the picker over-dispatch. Leave the
@@ -848,6 +875,9 @@ impl Actor {
             return Ok(());
         };
         let Ok(Some(task)) = self.store.find_by_pane(&self.name, pane_id) else {
+            if (ev.is_pane_closed() || ev.is_pane_exited()) && self.forget_orphan(pane_id) {
+                self.refresh_live();
+            }
             return Ok(());
         };
         let observed = if ev.is_pane_closed() {
@@ -1251,8 +1281,43 @@ impl Actor {
                 }
             }
         }
+        self.find_orphans(&agents)?;
         self.refresh_live();
         Ok(adopted)
+    }
+
+    /// Agents named `t-<id>` that no pane-owning task on this machine owns.
+    /// Read after the reconcile pass above, so a task it just failed or closed
+    /// counts as not owning its agent any more.
+    fn find_orphans(&mut self, agents: &[AgentInfo]) -> anyhow::Result<()> {
+        let owned: std::collections::HashSet<i64> = self
+            .store
+            .tasks_on_machine(&self.name)?
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        let found: Vec<(String, String)> = agents
+            .iter()
+            .filter_map(|a| {
+                let name = a.name.as_deref()?;
+                let id = task_id_of_agent(name)?;
+                (!owned.contains(&id)).then(|| (name.to_string(), a.pane_id.clone()))
+            })
+            .collect();
+        for (name, pane) in &found {
+            if !self.orphans.iter().any(|(n, _)| n == name) {
+                tracing::warn!(machine = %self.name, agent = %name, %pane, "orphaned agent: no open task owns it; `pastor task close` closes it");
+            }
+        }
+        self.orphans = found;
+        Ok(())
+    }
+
+    /// Drop the orphan in `pane_id`, if there is one. Returns whether it did.
+    fn forget_orphan(&mut self, pane_id: &str) -> bool {
+        let before = self.orphans.len();
+        self.orphans.retain(|(_, p)| p != pane_id);
+        self.orphans.len() != before
     }
 }
 
@@ -1835,6 +1900,92 @@ mod tests {
             })
         })
         .await;
+    }
+
+    /// Start an agent named `name` in a fresh workspace; returns its pane.
+    async fn start_agent(fake: &FakeHerdr, name: &str) -> String {
+        let created = fake.workspace_create(None, name).await.unwrap();
+        fake.agent_start(name, "claude", &created.root_pane.pane_id, &[])
+            .await
+            .unwrap();
+        created.root_pane.pane_id
+    }
+
+    #[test]
+    fn only_task_shaped_names_are_task_agents() {
+        assert_eq!(task_id_of_agent("t-12"), Some(12));
+        for name in ["12", "t-", "t-1a", "t-+1", "x-1", "t-1 "] {
+            assert_eq!(task_id_of_agent(name), None, "{name:?}");
+        }
+    }
+
+    /// An agent named like a task that no open task owns is an orphan: its
+    /// row failed, closed or is gone. It holds a pane, so it counts in `live`,
+    /// and it is named in the status; nothing closes it.
+    #[tokio::test]
+    async fn reconcile_reports_orphaned_agents() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut failed = new_task(&store);
+        let mut running = new_task(&store);
+        let failed_pane = start_agent(&fake, &Task::agent_name_for(failed.id)).await;
+        let running_pane = start_agent(&fake, &Task::agent_name_for(running.id)).await;
+        let ghost_pane = start_agent(&fake, "t-99").await;
+        start_agent(&fake, "mine").await;
+        start_agent(&fake, "7").await;
+        failed.state = TaskState::Failed;
+        failed.machine = Some("m".into());
+        failed.pane_id = Some(failed_pane.clone());
+        store.update_task(&mut failed).unwrap();
+        running.state = TaskState::Running;
+        running.machine = Some("m".into());
+        running.pane_id = Some(running_pane);
+        running.agent_name = Some(Task::agent_name_for(running.id));
+        store.update_task(&mut running).unwrap();
+
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("orphans", || !h.snapshot().orphans.is_empty()).await;
+        let mut orphans = h.snapshot().orphans;
+        orphans.sort();
+        assert_eq!(
+            orphans,
+            vec![Task::agent_name_for(failed.id), "t-99".into()]
+        );
+        assert_eq!(h.snapshot().live, 3, "one running task plus two orphans");
+        assert_eq!(state_of(&store, failed.id), TaskState::Failed, "left alone");
+        assert!(
+            fake.agents().iter().any(|a| a.pane_id == ghost_pane),
+            "never closed on its own"
+        );
+
+        fake.close_pane(&ghost_pane);
+        wait_for("the closed orphan dropped", || {
+            h.snapshot().orphans.len() == 1
+        })
+        .await;
+        assert_eq!(h.snapshot().live, 2);
+    }
+
+    /// The case orphans exist for: dispatch failed after `agent.start`, so the
+    /// task is failed while its agent is still in its pane.
+    #[tokio::test]
+    async fn a_dispatch_that_fails_after_agent_start_leaves_an_orphan() {
+        let fake = FakeHerdr::new();
+        fake.exit_agents_listed(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        h.dispatch(t.id).await.unwrap_err();
+        assert_eq!(state_of(&store, t.id), TaskState::Failed);
+        wait_for("orphan", || {
+            h.snapshot().orphans == vec![Task::agent_name_for(t.id)]
+        })
+        .await;
+        assert_eq!(h.snapshot().live, 1);
     }
 
     #[tokio::test]

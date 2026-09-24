@@ -213,6 +213,9 @@ pub struct MachineRow {
     pub live: Option<usize>,
     pub max_agents: u32,
     pub tags: Vec<String>,
+    /// `MachineStatus::orphans`; empty from a probe, which has no store to
+    /// tell an orphan from a task's agent.
+    pub orphans: Vec<String>,
 }
 
 impl From<&MachineStatus> for MachineRow {
@@ -229,12 +232,14 @@ impl From<&MachineStatus> for MachineRow {
             live: Some(m.live),
             max_agents: m.max_agents,
             tags: m.tags.clone(),
+            orphans: m.orphans.clone(),
         }
     }
 }
 
-pub const MACHINE_HEADER: [&str; 8] = [
-    "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "TAGS", "ERROR",
+/// AGENTS counts orphans too; ORPHANS names them (see `MachineStatus::orphans`).
+pub const MACHINE_HEADER: [&str; 9] = [
+    "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS", "ERROR",
 ];
 
 /// The head's row, then one per machine.
@@ -246,6 +251,7 @@ pub fn machine_rows(head: &HeadRow, ms: &[MachineRow]) -> Vec<Vec<String>> {
         head.channel.clone(),
         head.herdr_version.clone().unwrap_or_else(dash),
         head.pastor_version.clone(),
+        dash(),
         dash(),
         dash(),
         String::new(),
@@ -263,6 +269,11 @@ pub fn machine_rows(head: &HeadRow, ms: &[MachineRow]) -> Vec<Vec<String>> {
                     m.live.map_or_else(dash, |n| n.to_string()),
                     m.max_agents
                 ),
+                if m.orphans.is_empty() {
+                    dash()
+                } else {
+                    m.orphans.join(",")
+                },
                 if m.tags.is_empty() {
                     dash()
                 } else {
@@ -396,6 +407,7 @@ mod tests {
             live: 1,
             max_agents: 3,
             tags: vec!["fast".into(), "arm".into()],
+            orphans: vec![],
         }
     }
 
@@ -419,7 +431,7 @@ mod tests {
         assert_eq!(
             cells(0),
             [
-                "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "TAGS", "ERROR"
+                "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS", "ERROR"
             ]
         );
         assert_eq!(
@@ -430,6 +442,7 @@ mod tests {
                 "head",
                 "0.9.1",
                 env!("CARGO_PKG_VERSION"),
+                "-",
                 "-",
                 "-"
             ]
@@ -443,6 +456,7 @@ mod tests {
                 "0.9.1",
                 "0.2.0",
                 "1/3",
+                "-",
                 "fast,arm"
             ]
         );
@@ -473,6 +487,7 @@ mod tests {
                 "-",
                 "-",
                 "-/3",
+                "-",
                 "-",
                 "no route to host"
             ]
@@ -651,5 +666,25 @@ mod tests {
         assert_eq!(in_(now + chrono::Duration::seconds(250)), "in 4m");
         assert_eq!(in_(now - chrono::Duration::seconds(12)), "12s ago");
         assert_eq!(in_(now), "now");
+    }
+
+    #[test]
+    fn machine_rows_name_orphans() {
+        let m = MachineStatus {
+            live: 3,
+            max_agents: 4,
+            orphans: vec!["t-4".into(), "t-9".into()],
+            ..status("pi", "local")
+        };
+        let none = MachineStatus {
+            orphans: vec![],
+            ..m.clone()
+        };
+        let rows = machine_rows(&head(), &[MachineRow::from(&m), MachineRow::from(&none)]);
+        assert_eq!(rows[1][5], "3/4");
+        assert_eq!(rows[1][6], "t-4,t-9");
+        assert_eq!(rows[2][6], "-");
+        assert_eq!(rows[0].len(), MACHINE_HEADER.len());
+        assert_eq!(rows[1].len(), MACHINE_HEADER.len());
     }
 }

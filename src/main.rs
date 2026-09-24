@@ -523,6 +523,7 @@ async fn probe_machine(m: &MachineConfig, paths: &Paths) -> pastor::cli::Machine
         live,
         max_agents: m.max_agents,
         tags: m.tags.clone(),
+        orphans: vec![],
     }
 }
 
