@@ -25,6 +25,8 @@ struct State {
     /// pane id -> when `agent.start` ran, for the `ready_after` window.
     started: HashMap<String, Instant>,
     requests: Vec<Request>,
+    /// Where `requests` is written, whole, each time one is received.
+    request_log: Option<std::path::PathBuf>,
     start: Option<StartBehaviour>,
     protocol: u32,
     /// A method name that, once received, gets no reply at all: the connection
@@ -119,6 +121,14 @@ impl FakeHerdr {
             .cloned()
             .collect()
     }
+    /// Write every request received so far to `path` as one JSON array, each
+    /// time one arrives. Written when the request is recorded, before any
+    /// reply, so a subscribe that stays open or a request that hangs is in the
+    /// log as soon as it was received. Via a rename, so a reader never sees
+    /// half a file; under the state lock, so two writers cannot reorder.
+    pub fn set_request_log(&self, path: std::path::PathBuf) {
+        self.state.lock().unwrap().request_log = Some(path);
+    }
     pub fn requests(&self) -> Vec<Request> {
         self.state.lock().unwrap().requests.clone()
     }
@@ -209,7 +219,13 @@ impl FakeHerdr {
         let Ok(req) = serde_json::from_str::<Request>(line.trim()) else {
             return;
         };
-        self.state.lock().unwrap().requests.push(req.clone());
+        {
+            let mut s = self.state.lock().unwrap();
+            s.requests.push(req.clone());
+            if let Some(path) = &s.request_log {
+                write_request_log(path, &s.requests);
+            }
+        }
         let hung = {
             let mut s = self.state.lock().unwrap();
             if s.hang.as_deref() == Some(req.method.as_str()) {
@@ -462,6 +478,14 @@ fn subscription_matches(subs: &[Value], ev: &Event) -> bool {
     })
 }
 
+fn write_request_log(path: &std::path::Path, requests: &[Request]) {
+    let tmp = path.with_extension("tmp");
+    let text = serde_json::to_string(requests).expect("requests serialise");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +580,26 @@ mod tests {
         let e2 = stream.next().await.unwrap();
         assert!(e2.is_pane_closed());
         assert_eq!(e2.pane_id(), Some(b.root_pane.pane_id.as_str()));
+    }
+
+    /// The request log is written when a request is received, not when its
+    /// connection ends: `events.subscribe` holds its connection open for as
+    /// long as the subscription lives, and a hung request never ends at all.
+    #[tokio::test]
+    async fn request_log_lists_a_subscribe_while_it_is_still_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("requests.json");
+        let fake = FakeHerdr::new();
+        fake.set_request_log(path.clone());
+        let _stream = fake
+            .connect()
+            .subscribe(vec![super::super::subscription_lifecycle("pane.closed")])
+            .await
+            .unwrap();
+        let logged: Vec<Request> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let methods: Vec<&str> = logged.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(methods, ["events.subscribe"]);
     }
 
     /// herdr's API server answers exactly one request per connection and then
