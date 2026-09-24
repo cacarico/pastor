@@ -147,6 +147,7 @@ Not yet assigned a plan:
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
+~/.config/systemd/user/*.service  from `pastor setup systemd [--herdr]`
 ```
 
 `PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override these; tests always set
