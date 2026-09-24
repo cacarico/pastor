@@ -37,6 +37,21 @@ pub struct TaskFilter {
     pub states: Option<Vec<TaskState>>,
 }
 
+/// Per-job bookkeeping the scheduler needs across restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JobState {
+    pub name: String,
+    /// Start of the last attempt, successful or not; drives the schedule.
+    pub last_run_at: Option<DateTime<Utc>>,
+    /// Start of the last successful run; the next run's `since`.
+    pub last_ok_at: Option<DateTime<Utc>>,
+    pub last_result: Option<String>,
+    pub last_error: Option<String>,
+    pub cursor: Option<String>,
+    pub failures: u32,
+    pub backoff_until: Option<DateTime<Utc>>,
+}
+
 impl Store {
     pub fn open(path: &Path) -> anyhow::Result<Store> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -72,7 +87,24 @@ impl Store {
                 updated_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state);
-             CREATE INDEX IF NOT EXISTS tasks_machine ON tasks(machine);",
+             CREATE INDEX IF NOT EXISTS tasks_machine ON tasks(machine);
+             CREATE TABLE IF NOT EXISTS seen (
+                job TEXT NOT NULL,
+                key TEXT NOT NULL,
+                task_id INTEGER,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY (job, key)
+             );
+             CREATE TABLE IF NOT EXISTS job_state (
+                name TEXT PRIMARY KEY,
+                last_run_at TEXT,
+                last_ok_at TEXT,
+                last_result TEXT,
+                last_error TEXT,
+                cursor TEXT,
+                failures INTEGER NOT NULL DEFAULT 0,
+                backoff_until TEXT
+             );",
         )?;
         let version: Option<String> = conn
             .query_row(
@@ -99,7 +131,9 @@ impl Store {
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. `CREATE TABLE IF NOT
-                // EXISTS` above left an older table as it was.
+                // EXISTS` above left an older table as it was, so a v1 file
+                // gets `seen` and `job_state` from the statements above and
+                // only the new column needs an explicit ALTER here.
                 if v < 2 {
                     conn.execute(
                         "ALTER TABLE tasks ADD COLUMN prompt_pending INTEGER NOT NULL DEFAULT 0",
@@ -272,11 +306,107 @@ impl Store {
             .find(|t| t.pane_id.as_deref() == Some(pane_id)))
     }
 
+    pub fn job_state(&self, name: &str) -> anyhow::Result<Option<JobState>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT * FROM job_state WHERE name = ?1",
+                params![name],
+                row_to_job_state,
+            )
+            .optional()?)
+    }
+
+    pub fn job_states(&self) -> anyhow::Result<Vec<JobState>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM job_state ORDER BY name")?;
+        let rows = stmt.query_map([], row_to_job_state)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn save_job_state(&self, s: &JobState) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO job_state (name, last_run_at, last_ok_at, last_result, last_error, cursor, failures, backoff_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                s.name,
+                s.last_run_at.map(|d| d.to_rfc3339()),
+                s.last_ok_at.map(|d| d.to_rfc3339()),
+                s.last_result,
+                s.last_error,
+                s.cursor,
+                s.failures as i64,
+                s.backoff_until.map(|d| d.to_rfc3339()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_seen(&self, job: &str, key: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM seen WHERE job = ?1 AND key = ?2",
+            params![job, key],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Insert a queued task for `item`, render its prompt and spec with the id
+    /// it was given, and record `(job, key)` as seen: one transaction, so no
+    /// reader ever sees an unrendered task and a render failure leaves the key
+    /// unseen. A key already in `seen` violates the primary key and nothing is
+    /// written.
+    pub fn insert_job_task(
+        &self,
+        job: &str,
+        item: &Value,
+        render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
+    ) -> anyhow::Result<Task> {
+        let key = item
+            .get("key")
+            .and_then(Value::as_str)
+            .context("item has no string key")?
+            .to_string();
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tasks (job, item, prompt, spec, state, created_at, updated_at) VALUES (?1, ?2, '', '{}', 'queued', ?3, ?3)",
+            params![job, serde_json::to_string(item)?, now],
+        )?;
+        let id = tx.last_insert_rowid();
+        let (prompt, spec) =
+            render(id).map_err(|e| anyhow::anyhow!("render task t-{id} for job {job}: {e}"))?;
+        tx.execute(
+            "UPDATE tasks SET prompt = ?2, spec = ?3 WHERE id = ?1",
+            params![id, prompt, serde_json::to_string(&spec)?],
+        )?;
+        tx.execute(
+            "INSERT INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
+            params![job, key, id, now],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        self.get_task(id)?.context("task vanished after insert")
+    }
+
     /// Test-only escape hatch to corrupt rows directly and check that reads
     /// surface it instead of reinterpreting it.
     #[cfg(test)]
     pub(crate) fn execute_raw(&self, sql: &str) {
         self.conn.lock().unwrap().execute_batch(sql).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 }
 
@@ -327,6 +457,28 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
         updated_at: parse_dt(&updated_at)?,
+    })
+}
+
+fn row_to_job_state(row: &Row<'_>) -> rusqlite::Result<JobState> {
+    let parse_dt = |s: Option<String>| -> rusqlite::Result<Option<DateTime<Utc>>> {
+        s.as_deref()
+            .map(|s| {
+                DateTime::parse_from_rfc3339(s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .map_err(conversion_failure)
+            })
+            .transpose()
+    };
+    Ok(JobState {
+        name: row.get("name")?,
+        last_run_at: parse_dt(row.get("last_run_at")?)?,
+        last_ok_at: parse_dt(row.get("last_ok_at")?)?,
+        last_result: row.get("last_result")?,
+        last_error: row.get("last_error")?,
+        cursor: row.get("cursor")?,
+        failures: row.get::<_, i64>("failures")? as u32,
+        backoff_until: parse_dt(row.get("backoff_until")?)?,
     })
 }
 
@@ -628,5 +780,138 @@ mod tests {
         let mut c = claimed;
         c.state = TaskState::Running;
         s.update_task(&mut c).unwrap();
+    }
+
+    #[test]
+    fn job_state_round_trips_and_lists() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.job_state("a").unwrap().is_none());
+        let now = Utc::now();
+        let st = JobState {
+            name: "a".into(),
+            last_run_at: Some(now),
+            last_ok_at: Some(now),
+            last_result: Some("ok: 1 items, 1 tasks".into()),
+            last_error: None,
+            cursor: Some("c1".into()),
+            failures: 0,
+            backoff_until: None,
+        };
+        s.save_job_state(&st).unwrap();
+        let got = s.job_state("a").unwrap().unwrap();
+        assert_eq!(got.cursor.as_deref(), Some("c1"));
+        assert_eq!(
+            got.last_run_at.unwrap().timestamp_millis(),
+            now.timestamp_millis()
+        );
+        let failed = JobState {
+            failures: 2,
+            backoff_until: Some(now),
+            last_error: Some("boom".into()),
+            ..st.clone()
+        };
+        s.save_job_state(&failed).unwrap();
+        assert_eq!(
+            s.job_state("a").unwrap().unwrap().failures,
+            2,
+            "replace, not duplicate"
+        );
+        s.save_job_state(&JobState {
+            name: "b".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            s.job_states()
+                .unwrap()
+                .iter()
+                .map(|j| j.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn insert_job_task_renders_with_its_id_and_marks_seen() {
+        let s = Store::open_in_memory().unwrap();
+        let item = serde_json::json!({"key": "k1", "title": "t"});
+        assert!(!s.is_seen("j", "k1").unwrap());
+        let t = s
+            .insert_job_task("j", &item, |id| {
+                Ok((
+                    format!("prompt for t-{id}"),
+                    DispatchSpec {
+                        branch: Some(format!("pastor/t-{id}")),
+                        ..spec()
+                    },
+                ))
+            })
+            .unwrap();
+        assert_eq!(t.job, "j");
+        assert_eq!(t.state, TaskState::Queued);
+        assert_eq!(t.prompt, format!("prompt for t-{}", t.id));
+        assert_eq!(
+            t.spec.branch.as_deref(),
+            Some(format!("pastor/t-{}", t.id).as_str())
+        );
+        assert_eq!(t.item["key"], "k1");
+        assert!(s.is_seen("j", "k1").unwrap());
+        assert!(!s.is_seen("other", "k1").unwrap(), "seen is per job");
+
+        // The same key again: refused, nothing written.
+        let before = s.list_tasks(&TaskFilter::default()).unwrap().len();
+        assert!(
+            s.insert_job_task("j", &item, |_| Ok(("x".into(), spec())))
+                .is_err()
+        );
+        assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), before);
+
+        // A render failure rolls the whole thing back: no task, key still unseen.
+        let item2 = serde_json::json!({"key": "k2"});
+        let err = s
+            .insert_job_task("j", &item2, |_| Err("nope".into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
+        assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), before);
+        assert!(!s.is_seen("j", "k2").unwrap());
+
+        // No string key: refused up front.
+        assert!(
+            s.insert_job_task("j", &serde_json::json!({"title": "no key"}), |_| Ok((
+                "x".into(),
+                spec()
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_v1_databases_are_migrated_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            // A genuine v1 file has neither the plan-2 tables nor the
+            // prompt_pending column; v2 gained both.
+            s.execute_raw(
+                "DROP TABLE seen; DROP TABLE job_state;
+                 ALTER TABLE tasks DROP COLUMN prompt_pending;
+                 UPDATE meta SET value = '1' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.list_tasks(&TaskFilter::default()).unwrap().len(),
+            1,
+            "data survives"
+        );
+        assert!(!s.is_seen("j", "k").unwrap(), "the new tables exist");
+        assert!(
+            !s.get_task(1).unwrap().unwrap().prompt_pending,
+            "the new column exists with its default"
+        );
+        let v: String = s.meta("schema_version").unwrap().unwrap();
+        assert_eq!(v, "2");
     }
 }
