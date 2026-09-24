@@ -75,7 +75,7 @@ impl Paths {
     }
 
     /// Directory for the ssh `ControlMaster` sockets, one per machine. Created
-    /// with mode 0700 by the transport when it first connects.
+    /// with mode 0700 by the transport before any ssh that carries a ControlPath.
     pub fn ssh_dir(&self) -> PathBuf {
         self.state_dir.join("ssh")
     }
