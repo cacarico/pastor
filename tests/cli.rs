@@ -190,6 +190,17 @@ fn machine_add_and_remove_edit_the_file() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
+    let out = run(&["machine", "status", "pi-4"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("\"unknown_machine\""),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `--branch` only means something for a worktree; clap rejects it alone
+    // before any daemon is asked.
+    let out = run(&["run", "hi", "--branch", "b"]);
+    assert_eq!(out.status.code(), Some(2));
     assert!(run(&["machine", "remove", "pi-3"]).status.success());
     assert!(!run(&["machine", "remove", "pi-3"]).status.success());
 }

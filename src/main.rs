@@ -57,7 +57,8 @@ struct RunArgs {
     agent: Option<String>,
     #[arg(long)]
     worktree: bool,
-    #[arg(long)]
+    /// Branch for the worktree (needs --worktree; a plain workspace has no branch)
+    #[arg(long, requires = "worktree")]
     branch: Option<String>,
     #[arg(long = "tag")]
     tags: Vec<String>,
@@ -530,6 +531,16 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
         }
         MachineCmd::Status { name, json } => {
             let f = Flock::load(&path)?;
+            // A typo would otherwise filter every row out and print an empty
+            // table with exit 0; name it the way run, attach and open do.
+            if let Some(n) = &name
+                && f.get(n).is_none()
+            {
+                fail(
+                    "unknown_machine",
+                    &format!("machine {n} is not in the flock"),
+                );
+            }
             let mut rows = Vec::new();
             for m in f
                 .machines
