@@ -3,6 +3,7 @@ pub mod config;
 pub mod connector;
 pub mod daemon;
 pub mod dispatch;
+pub mod events;
 pub mod herdr;
 pub mod ipc;
 pub mod machine;
