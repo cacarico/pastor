@@ -5,6 +5,7 @@ pub mod dispatch;
 pub mod herdr;
 pub mod ipc;
 pub mod machine;
+pub mod schedule;
 pub mod store;
 pub mod task;
 
