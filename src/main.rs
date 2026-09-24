@@ -472,6 +472,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
         }
         MachineCmd::Remove { name, herdr } => {
             let mut f = Flock::load(&path)?;
+            let target = f.get(&name).and_then(|m| m.ssh.clone());
             anyhow::ensure!(f.remove(&name), "machine {name} not found");
             f.save(&path)?;
             println!(
@@ -480,14 +481,31 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
             );
             if herdr {
                 // herdr removes by profile id; the label is all pastor knows.
-                match saved_machine_id(&herdr_cmd(&["machine", "list"]), &name) {
+                let list = herdr_cmd(&["machine", "list"]);
+                match saved_machine_id(&list, &name) {
                     Some(id) => {
                         herdr_cmd(&["machine", "remove", &id]);
                         println!("removed {name} from herdr's sidebar");
                     }
-                    None => eprintln!(
-                        "herdr has no saved machine labelled {name}; nothing to remove there"
-                    ),
+                    None => {
+                        eprintln!(
+                            "herdr has no saved machine labelled {name}; nothing to remove there"
+                        );
+                        // The same host is often saved under another label (added
+                        // by hand, or from an earlier flock name). Point at it
+                        // rather than remove it: one host can legitimately be
+                        // saved several times, for different sessions.
+                        let same_host = target
+                            .as_deref()
+                            .map(|t| saved_machines_at(&list, t))
+                            .unwrap_or_default();
+                        if !same_host.is_empty() {
+                            eprintln!("herdr does have this host saved under another label:");
+                            for (id, label) in same_host {
+                                eprintln!("  {label}: herdr machine remove {id}");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -634,6 +652,19 @@ fn saved_machine_id(list: &str, label: &str) -> Option<String> {
         let id = cols.next()?;
         (cols.next()? == label).then(|| id.to_string())
     })
+}
+
+/// Every saved herdr machine whose target column equals `target`, as
+/// `(id, label)`, from the same `herdr machine list` output.
+fn saved_machines_at(list: &str, target: &str) -> Vec<(String, String)> {
+    list.lines()
+        .filter_map(|line| {
+            let mut cols = line.split('\t');
+            let id = cols.next()?;
+            let label = cols.next()?;
+            (cols.next()? == target).then(|| (id.to_string(), label.to_string()))
+        })
+        .collect()
 }
 
 /// The command run on the remote host by `ssh -t target <this>`. `session` and
@@ -869,6 +900,25 @@ mod tests {
         );
         assert_eq!(saved_machine_id("", "pi-3"), None);
         assert_eq!(saved_machine_id("No saved SSH machines.\n", "pi-3"), None);
+    }
+
+    /// When no label matches, the hint lists every saved machine that points at
+    /// the removed machine's SSH target, so the user can see what herdr calls it.
+    #[test]
+    fn saved_machines_at_target_lists_id_and_label() {
+        let list = "id-1\tother\tx@y\tdefault\tenabled\nid-2\tpi-3\tfleet@pi-3\tdefault\tenabled\nid-3\tpi-3-alt\tfleet@pi-3\twork\tenabled\n";
+        assert_eq!(
+            saved_machines_at(list, "fleet@pi-3"),
+            vec![
+                ("id-2".to_string(), "pi-3".to_string()),
+                ("id-3".to_string(), "pi-3-alt".to_string())
+            ]
+        );
+        assert!(
+            saved_machines_at(list, "pi-3").is_empty(),
+            "a label is not a target"
+        );
+        assert!(saved_machines_at("No saved SSH machines.\n", "x@y").is_empty());
     }
 
     #[test]
