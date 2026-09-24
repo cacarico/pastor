@@ -152,8 +152,8 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
-/// Tell the user what is left to do. A running daemon keeps its catalog until
-/// it reloads, which `pastor reload` will do once it exists.
+/// Tell the user what is left to do, and have a running daemon reload its
+/// catalog.
 async fn after_change(paths: &Paths, p: &Plugin) {
     let env = p.env(paths).unwrap_or_default();
     let missing = p.missing_secrets(&env);
@@ -171,19 +171,34 @@ async fn after_change(paths: &Paths, p: &Plugin) {
 /// change takes effect now. The change itself is already on disk, so a
 /// failed reload is a warning, not an error.
 async fn reload_daemon(paths: &Paths) {
-    let socket = paths.socket_file();
-    if !crate::ipc::daemon_running(&socket).await {
-        return;
+    if let Some(note) = reload_note(&paths.socket_file()).await {
+        eprintln!("{note}");
     }
-    let failed = match crate::ipc::request(&socket, &crate::ipc::IpcRequest::Reload).await {
-        Ok(crate::ipc::IpcResponse::Error { message, .. }) => Some(message),
-        Ok(_) => None,
-        Err(e) => Some(format!("{e:#}")),
-    };
-    match failed {
-        Some(why) => eprintln!("pastor serve did not reload ({why}); run `pastor reload`"),
-        None => eprintln!("pastor serve reloaded its plugins and jobs"),
+}
+
+/// What to tell the user about the reload: nothing when no daemon runs, a
+/// warning when one is there but did not answer or did not reload.
+async fn reload_note(socket: &std::path::Path) -> Option<String> {
+    use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
+    match crate::ipc::probe_daemon(socket).await {
+        DaemonProbe::NotRunning => return None,
+        DaemonProbe::Unresponsive => {
+            return Some(
+                "pastor serve is not responding, so it did not reload; run `pastor reload` once it answers"
+                    .into(),
+            );
+        }
+        DaemonProbe::Running => {}
     }
+    Some(
+        match crate::ipc::request(socket, &IpcRequest::Reload).await {
+            Ok(IpcResponse::Error { message, .. }) => {
+                format!("pastor serve did not reload ({message}); run `pastor reload`")
+            }
+            Ok(_) => "pastor serve reloaded its plugins and jobs".into(),
+            Err(e) => format!("pastor serve did not reload ({e:#}); run `pastor reload`"),
+        },
+    )
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -356,4 +371,34 @@ async fn run_once(
         out.cursor.as_deref().unwrap_or("unchanged")
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reload_is_quiet_without_a_daemon_and_warns_when_it_does_not_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("pastor.sock");
+        assert_eq!(
+            reload_note(&socket).await,
+            None,
+            "no daemon, nothing to say"
+        );
+
+        // Something accepts on the socket and never answers.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let note = reload_note(&socket).await.expect("a warning");
+        assert!(
+            note.contains("not responding") && note.contains("pastor reload"),
+            "{note}"
+        );
+    }
 }

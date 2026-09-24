@@ -268,7 +268,8 @@ characters; such an item is skipped and reported.
 
 `plugin install|link|uninstall|unlink` tell a running daemon to reload, so a
 new plugin is usable without a restart (this also restarts stream
-connectors).
+connectors). A daemon that is running but does not answer gets a warning to
+run `pastor reload` yourself.
 
 ### Event hooks
 
