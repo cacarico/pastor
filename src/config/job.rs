@@ -374,14 +374,14 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
             ..Defaults::default()
         };
         let absent = SPEC_EXAMPLE.replace("agent_args = []\n", "");
-        let job = Job::parse(&absent, "support-slack", &d).unwrap();
+        let job = Job::parse(&absent, "support-slack", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent_args, vec!["--model", "claude-opus-5-5"]);
 
-        let empty = Job::parse(SPEC_EXAMPLE, "support-slack", &d).unwrap();
+        let empty = Job::parse(SPEC_EXAMPLE, "support-slack", &d, &Builtins).unwrap();
         assert!(empty.spec.agent_args.is_empty(), "explicit [] opts out");
 
         let own = SPEC_EXAMPLE.replace("agent_args = []", "agent_args = [\"--model\", \"x\"]");
-        let job = Job::parse(&own, "support-slack", &d).unwrap();
+        let job = Job::parse(&own, "support-slack", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent_args, vec!["--model", "x"]);
     }
 
