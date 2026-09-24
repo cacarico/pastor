@@ -285,9 +285,16 @@ pub fn set_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
     // does not know yet), which is not what "leave a broken edit alone" means.
     toml::from_str::<toml::Value>(&new_text)
         .with_context(|| format!("{} would not parse after the edit", path.display()))?;
-    let tmp = path.with_extension("toml.tmp");
+    // Resolve the real file first: `path` may be a symlink (e.g. into a
+    // dotfiles repo), and writing the temp file next to `path` then renaming
+    // over it would replace the link with a plain file. Writing beside, and
+    // renaming onto, the canonical target keeps the link and edits what it
+    // points to.
+    let target =
+        std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    let tmp = target.with_extension("toml.tmp");
     std::fs::write(&tmp, &new_text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    std::fs::rename(&tmp, &target).with_context(|| format!("rename to {}", target.display()))?;
     Ok(())
 }
 
@@ -536,5 +543,37 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             std::fs::read_to_string(&path).unwrap(),
             "every = \"1h\"\n[connector\n"
         );
+    }
+
+    #[test]
+    fn set_enabled_on_a_symlink_edits_the_target_and_keeps_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The job file lives elsewhere (e.g. a dotfiles repo); the jobs dir
+        // only holds a symlink to it.
+        let real_dir = tmp.path().join("dotfiles");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let target = real_dir.join("j.toml");
+        let original = "name = \"j\"\nevery = \"1h\"\nenabled = true\n\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n";
+        std::fs::write(&target, original).unwrap();
+        let link = tmp.path().join("jobs").join("j.toml");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        set_enabled(&link, false).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "enable/disable must not replace the symlink with a regular file"
+        );
+        let via_target = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            via_target,
+            original.replace("enabled = true", "enabled = false")
+        );
+        let via_link = std::fs::read_to_string(&link).unwrap();
+        assert_eq!(via_link, via_target, "the link still resolves to the edit");
     }
 }
