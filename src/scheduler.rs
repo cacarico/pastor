@@ -531,9 +531,9 @@ impl Scheduler {
 
     async fn run(mut self, mut rx: mpsc::Receiver<SchedulerCommand>) {
         let mut tick = tokio::time::interval(self.tick);
-        // A pass can wait on a whole dispatch round, and `Tick`/`Fire` run
-        // connectors inline; missed ticks must not replay back to back once
-        // the interval catches up.
+        // A pass can wait on a whole dispatch round (connector runs are
+        // spawned, but dispatch is awaited); missed ticks must not replay
+        // back to back once the interval catches up.
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -542,8 +542,13 @@ impl Scheduler {
                     let Some(cmd) = cmd else { return };
                     match cmd {
                         SchedulerCommand::Tick { job, dry_run, reply } => {
-                            let reports = self.tick_now(job.as_deref(), dry_run, Utc::now()).await;
-                            let _ = reply.send(reports);
+                            // The runs are spawned; only collecting their
+                            // reports waits, and that waits off this loop.
+                            self.reap().await;
+                            let reports = self.tick_start(job.as_deref(), dry_run, Utc::now());
+                            tokio::spawn(async move {
+                                let _ = reply.send(reports.await);
+                            });
                         }
                         SchedulerCommand::Fire { name, reply } => {
                             self.reload();
@@ -768,23 +773,44 @@ impl Scheduler {
         let source = self
             .source_for(&job.connector, &job.name)
             .ok_or_else(|| format!("connector {:?} is not available", job.connector))?;
+        self.spawn_run(job, source, now, false, true);
+        Ok(())
+    }
+
+    /// Run `job` in its own task, tracked in `in_flight` for the overlap rule
+    /// and `running`. The report also goes to the returned receiver, for a
+    /// caller that wants it (`pastor tick`). With `dispatch`, what the run
+    /// queued is placed at once instead of on the next tick.
+    fn spawn_run(
+        &mut self,
+        job: Job,
+        source: Arc<dyn ItemSource>,
+        now: DateTime<Utc>,
+        dry_run: bool,
+        dispatch: bool,
+    ) -> oneshot::Receiver<JobRunReport> {
         let store = self.store.clone();
         let fleet = self.fleet.clone();
         let events = self.events.clone();
         let name = job.name.clone();
-        let mut turn = self.take_turn(&name);
+        // A dry run writes nothing, so it need not wait for a fired run.
+        let mut turn = (!dry_run).then(|| self.take_turn(&name));
+        let (tx, rx) = oneshot::channel();
         let handle = tokio::spawn(async move {
-            turn.wait().await;
-            let report = run_job(&store, &job, source.as_ref(), &events, now, false).await;
+            if let Some(t) = turn.as_mut() {
+                t.wait().await;
+            }
+            let report = run_job(&store, &job, source.as_ref(), &events, now, dry_run).await;
             drop(turn); // the next run of this job may start
-            if !report.created.is_empty() {
+            if dispatch && !dry_run && !report.created.is_empty() {
                 // Do not wait for the next tick to place what this run queued.
                 fleet.dispatch_queued().await;
             }
+            let _ = tx.send(report.clone());
             report
         });
         self.in_flight.push((name, handle));
-        Ok(())
+        rx
     }
 
     /// Log the reports of runs that finished since the last pass.
@@ -806,23 +832,42 @@ impl Scheduler {
         self.in_flight = still;
     }
 
-    /// `pastor tick`: run due jobs (or the one named, forced) inline and report.
-    /// Inline so the reports are complete when this returns; a long connector
-    /// holds the scheduler for that long, which is acceptable for a debugging
-    /// command.
+    /// `pastor tick`, awaited in place: what the CLI's standalone scheduler
+    /// and the tests use.
     pub async fn tick_now(
         &mut self,
         only: Option<&str>,
         dry_run: bool,
         now: DateTime<Utc>,
     ) -> Vec<JobRunReport> {
-        self.reload();
         self.reap().await;
+        self.tick_start(only, dry_run, now).await
+    }
+
+    /// `pastor tick`: start due jobs (or the one named, forced) and return a
+    /// future of their reports, in job order. Each run is spawned, so the
+    /// scheduler is free again as soon as this returns; a process connector
+    /// can take a minute, and the loop must keep ticking and answering
+    /// meanwhile. The future dispatches what the runs queued once they are
+    /// all done. Call `reap` first, as `tick_now` does, so a finished run
+    /// does not count as still going.
+    pub fn tick_start(
+        &mut self,
+        only: Option<&str>,
+        dry_run: bool,
+        now: DateTime<Utc>,
+    ) -> impl std::future::Future<Output = Vec<JobRunReport>> + Send + 'static {
+        enum Slot {
+            Ready(JobRunReport),
+            Running(String, oneshot::Receiver<JobRunReport>),
+        }
+        self.reload();
         let states = self.states();
-        let mut names: Vec<&String> = self.entries.keys().collect();
+        let mut names: Vec<String> = self.entries.keys().cloned().collect();
         names.sort();
-        let mut reports = Vec::new();
-        for name in names {
+        let mut reports: Vec<Slot> = Vec::new();
+        for name in &names {
+            let name = name.as_str();
             if only.is_some_and(|o| o != name) {
                 continue;
             }
@@ -830,7 +875,7 @@ impl Scheduler {
             let Some(job) = entry.job.clone() else {
                 let mut r = JobRunReport::new(name, RunOutcome::Invalid);
                 r.error = entry.error.clone();
-                reports.push(r);
+                reports.push(Slot::Ready(r));
                 continue;
             };
             let forced = only.is_some();
@@ -838,55 +883,55 @@ impl Scheduler {
                 match self.due_of(&job, states.get(name), now) {
                     Due::Now => {}
                     Due::Never if !job.enabled => {
-                        reports.push(JobRunReport::new(name, RunOutcome::Disabled));
+                        reports.push(Slot::Ready(JobRunReport::new(name, RunOutcome::Disabled)));
                         continue;
                     }
                     _ => {
-                        reports.push(JobRunReport::new(name, RunOutcome::NotDue));
+                        reports.push(Slot::Ready(JobRunReport::new(name, RunOutcome::NotDue)));
                         continue;
                     }
                 }
                 if self.is_running(name) {
-                    reports.push(JobRunReport::new(name, RunOutcome::Skipped));
+                    reports.push(Slot::Ready(JobRunReport::new(name, RunOutcome::Skipped)));
                     continue;
                 }
             }
             let Some(source) = self.source_for(&job.connector, &job.name) else {
                 let mut r = JobRunReport::new(name, RunOutcome::Invalid);
                 r.error = Some(format!("connector {:?} is not available", job.connector));
-                reports.push(r);
+                reports.push(Slot::Ready(r));
                 continue;
             };
-            // A dry run writes nothing, so it need not wait for a fired run.
-            // `take_turn` would borrow all of `self` while `name` borrows
-            // `entries`, hence the field directly.
-            let mut turn = (!dry_run).then(|| Turn::behind(&mut self.last_turn, name));
-            if let Some(t) = turn.as_mut() {
-                t.wait().await;
-            }
-            reports.push(
-                run_job(
-                    &self.store,
-                    &job,
-                    source.as_ref(),
-                    &self.events,
-                    now,
-                    dry_run,
-                )
-                .await,
-            );
+            // `spawn_run` takes this run's turn now, in command order, so a
+            // tick queues behind a fired run of the same job.
+            let rx = self.spawn_run(job, source, now, dry_run, false);
+            reports.push(Slot::Running(name.to_string(), rx));
         }
         if let Some(o) = only
-            && !reports.iter().any(|r| r.job == o)
+            && !names.iter().any(|n| n == o)
         {
             let mut r = JobRunReport::new(o, RunOutcome::Unknown);
             r.error = Some(format!("no job named {o:?}"));
-            reports.push(r);
+            reports.push(Slot::Ready(r));
         }
-        if !dry_run {
-            self.fleet.dispatch_queued().await;
+        let fleet = self.fleet.clone();
+        async move {
+            let mut out = Vec::with_capacity(reports.len());
+            for slot in reports {
+                out.push(match slot {
+                    Slot::Ready(r) => r,
+                    Slot::Running(name, rx) => rx.await.unwrap_or_else(|_| {
+                        let mut r = JobRunReport::new(&name, RunOutcome::Failed);
+                        r.error = Some("the run panicked".into());
+                        r
+                    }),
+                });
+            }
+            if !dry_run {
+                fleet.dispatch_queued().await;
+            }
+            out
         }
-        reports
     }
 
     fn warn_long_queued(&mut self, now: DateTime<Utc>) {
@@ -1528,6 +1573,41 @@ mod tests {
             2,
             "once finished, the next due pass runs it"
         );
+    }
+
+    /// `pastor tick` against a slow connector must not hold the scheduler:
+    /// while the tick waits for its run, other requests are answered and the
+    /// run shows as `running` (so a pass would not start it again).
+    #[tokio::test]
+    async fn a_tick_waiting_on_a_slow_connector_does_not_block_the_scheduler() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let runs = Arc::new(AtomicUsize::new(0));
+        s.set_source_for_tests(
+            "slow",
+            Arc::new(Slow {
+                runs: runs.clone(),
+                hold: Duration::from_millis(800),
+            }),
+        );
+        let mut j = job("j");
+        j.connector = "slow".into();
+        s.set_jobs_for_tests(vec![j]);
+        let handle = s.spawn();
+        let h = handle.clone();
+        let tick = tokio::spawn(async move { h.tick(Some("j".into()), false).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        let jobs = tokio::time::timeout(Duration::from_millis(400), handle.job_list())
+            .await
+            .expect("job list answered while the tick runs")
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert!(jobs[0].running, "the tick's run counts as in flight");
+        let reports = tick.await.unwrap().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, RunOutcome::Ran);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
