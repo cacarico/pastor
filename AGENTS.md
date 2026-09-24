@@ -89,6 +89,8 @@ them too; they are repeated here because getting them wrong cost a day.
   usage errors stay plain text with exit 2.
 - Rust edition 2024, toolchain from mise. No new runtime dependencies without
   a reason in the commit body.
+- Releases are tagged `vX.Y.Z` on `main` with a signed tag. `CHANGELOG.md`
+  gets one section per release.
 
 ## Known gaps, parked for the next plans
 
