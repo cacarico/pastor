@@ -18,3 +18,9 @@ description = "Echoed back in the first item"
 
 [secrets.FIXTURE_TOKEN]
 description = "Printed to stderr so redaction can be checked"
+
+# Records what it hears about its own tasks, in the job's scratch dir.
+[[events]]
+on = ["task.queued", "task.done"]
+only_own = true
+command = ["sh", "hook.sh"]

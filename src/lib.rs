@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod dispatch;
 pub mod events;
 pub mod herdr;
+pub mod hooks;
 pub mod ipc;
 pub mod machine;
 pub mod plugin;

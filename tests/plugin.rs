@@ -340,7 +340,7 @@ impl Cli {
         let r = self.dir("repos").join(owner).join(format!("{repo}.git"));
         let sub = r.join("plugins/echo");
         std::fs::create_dir_all(&sub).unwrap();
-        for f in ["pastor-plugin.toml", "poll.sh"] {
+        for f in ["pastor-plugin.toml", "poll.sh", "hook.sh"] {
             std::fs::copy(fixture("echo").join(f), sub.join(f)).unwrap();
         }
         let git = |args: &[&str]| {
@@ -372,7 +372,7 @@ impl Cli {
         std::os::unix::fs::symlink("echo", r.join("plugins/alias")).unwrap();
         let outside = self.dir("elsewhere/echo");
         std::fs::create_dir_all(&outside).unwrap();
-        for f in ["pastor-plugin.toml", "poll.sh"] {
+        for f in ["pastor-plugin.toml", "poll.sh", "hook.sh"] {
             std::fs::copy(fixture("echo").join(f), outside.join(f)).unwrap();
         }
         std::os::unix::fs::symlink(&outside, r.join("plugins/outside")).unwrap();
@@ -597,4 +597,147 @@ fn a_job_on_a_plugin_connector_queues_tasks_through_tick() {
     let runs: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(runs[0]["created"], serde_json::json!([]), "{out}");
     assert_eq!(runs[0]["skipped_seen"], 2, "{out}");
+}
+
+// ---- against a running daemon ----
+
+/// `pastor serve` with one fake-herdr machine whose agents finish on their
+/// own, and the plugin env of `Cli`.
+struct Serve {
+    cli: Cli,
+    children: Vec<std::process::Child>,
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        for c in &mut self.children {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+fn serve() -> Serve {
+    use std::process::{Command, Stdio};
+    let cli = Cli::new();
+    let config = cli.dir("c");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n",
+    )
+    .unwrap();
+    let socket = cli.dir("herdr.sock");
+    let herdr = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+        .arg("--listen")
+        .arg(&socket)
+        .env("FAKE_HERDR_AUTO_DONE_MS", "300")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        format!(
+            "[[machine]]\nname = \"fake\"\ncommand = [\"{}\", \"--connect\", \"{}\"]\nmax_agents = 4\n",
+            env!("CARGO_BIN_EXE_fake-herdr"),
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let daemon = Command::new(env!("CARGO_BIN_EXE_pastor"))
+        .arg("serve")
+        .env("PASTOR_CONFIG_DIR", cli.dir("c"))
+        .env("PASTOR_STATE_DIR", cli.dir("s"))
+        .env("PASTOR_DATA_DIR", cli.dir("d"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let s = Serve {
+        cli,
+        children: vec![herdr, daemon],
+    };
+    wait(10, "the machine connects", || {
+        let out = s.cli.pastor(&["machine", "list", "--json"]);
+        String::from_utf8_lossy(&out.stdout).contains("\"connected\"")
+    });
+    s
+}
+
+fn wait(secs: u64, what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !ok() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn records(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// The whole path: plugins linked while the daemon runs (link reloads it), a
+/// job on the plugin's connector ticked through the daemon, its tasks
+/// dispatched and done, and each plugin's hooks hearing about it: `echo`
+/// only about its own job's tasks, `notify` about every task.
+#[test]
+fn a_daemon_runs_plugin_jobs_and_hooks_hear_their_events() {
+    let s = serve();
+    let cli = &s.cli;
+    let (_, err) = cli.ok(&["plugin", "link", fixture("echo").to_str().unwrap()]);
+    assert!(err.contains("reloaded"), "{err}");
+    cli.ok(&["plugin", "link", fixture("notify").to_str().unwrap()]);
+    let jobs = cli.dir("c/jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(
+        jobs.join("support.toml"),
+        "every = \"1h\"\nenabled = false\n[connector]\nuse = \"echo\"\nchannel = \"C9\"\n[dispatch]\nrepo = \"/tmp\"\nprompt = \"look at {{ item.title }}\"\n",
+    )
+    .unwrap();
+    let (out, _) = cli.ok(&["tick", "--job", "support", "--json"]);
+    let runs: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(runs[0]["outcome"], "ran", "{out}");
+    assert_eq!(runs[0]["created"].as_array().unwrap().len(), 2, "{out}");
+
+    let echo = cli.dir("s/plugins/support/hook-records.jsonl");
+    let notify = cli.dir("s/plugins/support/notify.jsonl");
+    wait(20, "both tasks are done and every hook heard it", || {
+        records(&echo)
+            .iter()
+            .filter(|r| r["type"] == "task.done")
+            .count()
+            == 2
+            && records(&notify).len() == 2
+    });
+    let got = records(&echo);
+    assert_eq!(
+        got.iter().filter(|r| r["type"] == "task.queued").count(),
+        2,
+        "{got:?}"
+    );
+    for r in &got {
+        assert_eq!(r["job"], "support");
+        assert_eq!(r["task"]["job"], "support");
+        assert!(r["at"].is_string());
+    }
+    let done = got.iter().find(|r| r["type"] == "task.done").unwrap();
+    assert_eq!(done["task"]["state"], "done");
+    assert_eq!(done["task"]["machine"], "fake");
+
+    // A one-off task is nobody's: notify hears of it, echo (only_own) not.
+    cli.ok(&["run", "one-off", "--repo", "/tmp"]);
+    // `run` is not a job, so the hook gets no PASTOR_JOB and its own scratch.
+    let notify_run = cli.dir("s/plugins/@notify/notify.jsonl");
+    wait(20, "notify hears the one-off task end", || {
+        !records(&notify_run).is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!cli.dir("s/plugins/@echo/hook-records.jsonl").exists());
+    assert_eq!(records(&echo).len(), 4, "echo heard nothing more");
+    assert_eq!(records(&notify_run)[0]["task"]["job"], "run");
 }

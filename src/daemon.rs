@@ -154,6 +154,9 @@ impl Daemon {
         paths.ensure()?;
         let store = Arc::new(Store::open(&paths.db_file())?);
         let (events, log_rx) = broadcast::channel(1024);
+        // Plugin event hooks read the broadcast on their own, subscribed here
+        // for the same reason as the log: before any actor can emit.
+        let hooks_rx = events.subscribe();
         let settings = MachineSettings {
             settle: config.settle_duration(),
             reconcile_every: config.reconcile_duration(),
@@ -201,6 +204,12 @@ impl Daemon {
             store.clone(),
             Some(Arc::downgrade(&lookup)),
             log_rx,
+        );
+        crate::hooks::spawn(
+            paths.clone(),
+            store.clone(),
+            Some(Arc::downgrade(&lookup)),
+            hooks_rx,
         );
         let scheduler = Scheduler::new(
             paths.clone(),
