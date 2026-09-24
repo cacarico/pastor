@@ -9,9 +9,10 @@ use crate::config::{PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
-use crate::machine::{MachineHandle, MachineSettings, PastorEvent, spawn_machine};
+use crate::machine::{MachineHandle, MachineSettings, OrphanClosed, PastorEvent, spawn_machine};
 use crate::scheduler::{Scheduler, SchedulerHandle};
 use crate::store::{NewTask, Store};
+use crate::task::TaskState;
 
 /// The machines plus the one lock every dispatch pass takes. Shared by the
 /// daemon (a `pastor task run` dispatches inline) and the scheduler (each tick, and
@@ -353,6 +354,14 @@ impl Daemon {
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             IpcRequest::Run { prompt, spec } => {
+                // clap refuses this too; checked here as well so no other
+                // client can queue a task dispatch can only fail.
+                if spec.worktree && spec.repo.is_none() {
+                    return IpcResponse::error(
+                        "worktree_needs_repo",
+                        "a worktree task needs a repo to branch from",
+                    );
+                }
                 if let Some(m) = &spec.machine
                     && self.fleet.get(m).is_none()
                 {
@@ -429,6 +438,136 @@ impl Daemon {
                 Ok(Err(reason)) => IpcResponse::error("job_not_found", reason),
                 Err(err) => IpcResponse::error("scheduler_error", err),
             },
+            IpcRequest::TaskRetry { id } => self.retry(id).await,
+            IpcRequest::TaskClose {
+                id,
+                remove_worktree,
+            } => self.close(id, remove_worktree).await,
+            IpcRequest::TaskPrune {
+                states,
+                older_than_secs,
+            } => {
+                if let Some(s) = states.iter().find(|s| !s.is_prunable()) {
+                    return IpcResponse::error(
+                        "not_prunable",
+                        format!("{s} tasks cannot be pruned; only done, failed and closed"),
+                    );
+                }
+                match self
+                    .store
+                    .prune(&states, std::time::Duration::from_secs(older_than_secs))
+                {
+                    Ok(n) => IpcResponse::Text(n.to_string()),
+                    Err(err) => IpcResponse::error("store_error", err),
+                }
+            }
+        }
+    }
+
+    /// `TaskRetry`: a new queued row copying `id` (see `Store::insert_retry`),
+    /// dispatched at once like a `Run`. Answers the new row as it stands after
+    /// the dispatch pass.
+    async fn retry(&self, id: i64) -> IpcResponse {
+        match self.store.get_task(id) {
+            Ok(Some(t)) if !t.state.is_retryable() => {
+                return IpcResponse::error(
+                    "not_retryable",
+                    format!(
+                        "{} is {}; only failed or stale tasks can be retried",
+                        t.display_id(),
+                        t.state
+                    ),
+                );
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return IpcResponse::error("task_not_found", format!("t-{id}")),
+            Err(err) => return IpcResponse::error("store_error", err),
+        }
+        // The check above only picks the error code; the insert re-checks the
+        // state atomically, so a task closed in between is still refused.
+        let task = match self.store.insert_retry(id) {
+            Ok(t) => t,
+            Err(err) => return IpcResponse::error("not_retryable", err),
+        };
+        let _ = self.events.send(PastorEvent {
+            kind: "task.queued".into(),
+            task_id: Some(task.id),
+            machine: None,
+            job: Some(task.job.clone()),
+        });
+        self.fleet.dispatch_queued().await;
+        match self.store.get_task(task.id) {
+            Ok(Some(t)) => IpcResponse::Task(t),
+            Ok(None) => IpcResponse::error("task_not_found", task.display_id()),
+            Err(err) => IpcResponse::error("store_error", err),
+        }
+    }
+
+    /// `TaskClose`: through the actor of the task's machine, which closes the
+    /// pane (or worktree) before the row. A task that never reached a machine
+    /// only has its row closed. With no row, the machines are asked for an
+    /// orphaned agent `t-<id>` (as their last reconcile found them).
+    async fn close(&self, id: i64, remove_worktree: bool) -> IpcResponse {
+        let row = match self.store.get_task(id) {
+            Ok(r) => r,
+            Err(err) => return IpcResponse::error("store_error", err),
+        };
+        let Some(t) = row else {
+            let name = crate::task::Task::agent_name_for(id);
+            let Some(handle) = self
+                .fleet
+                .machines()
+                .iter()
+                .find(|m| m.snapshot().orphans.contains(&name))
+            else {
+                return IpcResponse::error(
+                    "task_not_found",
+                    format!("{name}: no task row, and no machine reports an agent by that name"),
+                );
+            };
+            return match handle.close(id, remove_worktree).await {
+                Err(err) if err.downcast_ref::<OrphanClosed>().is_some() => {
+                    IpcResponse::Text(err.to_string())
+                }
+                Ok(t) => IpcResponse::Task(t),
+                Err(err) => IpcResponse::error("close_failed", format!("{err:#}")),
+            };
+        };
+        if remove_worktree && !t.spec.worktree {
+            return IpcResponse::error(
+                "no_worktree",
+                format!("{} has no worktree to remove", t.display_id()),
+            );
+        }
+        let Some(machine) = t.machine.clone() else {
+            let was = t.state;
+            return match self.store.close_task(id) {
+                Ok(closed) => {
+                    if was != TaskState::Closed {
+                        let _ = self.events.send(PastorEvent {
+                            kind: "task.closed".into(),
+                            task_id: Some(id),
+                            machine: None,
+                            job: Some(closed.job.clone()),
+                        });
+                    }
+                    IpcResponse::Task(closed)
+                }
+                Err(err) => IpcResponse::error("store_error", err),
+            };
+        };
+        let Some(handle) = self.fleet.get(&machine) else {
+            return IpcResponse::error(
+                "unknown_machine",
+                format!(
+                    "{} is on machine {machine}, which is not in the flock",
+                    t.display_id()
+                ),
+            );
+        };
+        match handle.close(id, remove_worktree).await {
+            Ok(t) => IpcResponse::Task(t),
+            Err(err) => IpcResponse::error("close_failed", format!("{err:#}")),
         }
     }
 }
@@ -449,11 +588,12 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::config::flock::MachineConfig;
+    use crate::herdr::ConnectorExt;
     use crate::herdr::fake::FakeHerdr;
     use crate::scheduler::RunOutcome;
     use crate::store::NewTask;
     use crate::store::TaskFilter;
-    use crate::task::{DispatchSpec, TaskState};
+    use crate::task::DispatchSpec;
     use std::time::{Duration, Instant};
 
     fn machine(name: &str, max: u32) -> MachineConfig {
@@ -854,5 +994,215 @@ mod tests {
             panic!()
         };
         assert_eq!(code, "job_not_found");
+    }
+
+    fn error_code(resp: IpcResponse) -> String {
+        match resp {
+            IpcResponse::Error { code, .. } => code,
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    async fn wait_until(what: &str, f: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn insert(d: &Daemon, state: TaskState) -> crate::task::Task {
+        let mut t = d
+            .store
+            .insert_task(NewTask {
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "p".into(),
+                spec: spec(),
+            })
+            .unwrap();
+        if state != TaskState::Queued {
+            t.state = state;
+            t.machine = Some("a".into());
+            t.finished_at = Some(chrono::Utc::now() - chrono::Duration::days(5));
+            d.store.update_task(&mut t).unwrap();
+        }
+        t
+    }
+
+    #[tokio::test]
+    async fn retry_queues_a_copy_and_dispatches_it() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let failed = insert(&d, TaskState::Failed);
+        let mut events = d.subscribe();
+        let resp = d.handle(IpcRequest::TaskRetry { id: failed.id }).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_ne!(t.id, failed.id);
+        assert_eq!(t.retry_of, Some(failed.id));
+        assert_eq!(t.state, TaskState::Running, "dispatched right away");
+        let ev = events.try_recv().unwrap();
+        assert_eq!((ev.kind.as_str(), ev.task_id), ("task.queued", Some(t.id)));
+
+        assert_eq!(
+            error_code(d.handle(IpcRequest::TaskRetry { id: t.id }).await),
+            "not_retryable"
+        );
+        assert_eq!(
+            error_code(d.handle(IpcRequest::TaskRetry { id: 99 }).await),
+            "task_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_goes_through_the_task_s_machine() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
+        let IpcResponse::Task(t) = d
+            .handle(IpcRequest::Run {
+                prompt: "x".into(),
+                spec: spec(),
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(
+            error_code(
+                d.handle(IpcRequest::TaskClose {
+                    id: t.id,
+                    remove_worktree: true
+                })
+                .await
+            ),
+            "no_worktree"
+        );
+        let resp = d
+            .handle(IpcRequest::TaskClose {
+                id: t.id,
+                remove_worktree: false,
+            })
+            .await;
+        let IpcResponse::Task(closed) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(closed.state, TaskState::Closed);
+        assert!(fake.agents().is_empty());
+
+        // Never dispatched: only the row changes.
+        let queued = insert(&d, TaskState::Queued);
+        let IpcResponse::Task(c) = d
+            .handle(IpcRequest::TaskClose {
+                id: queued.id,
+                remove_worktree: false,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(c.state, TaskState::Closed);
+
+        // On a machine the flock no longer has.
+        let mut gone = insert(&d, TaskState::Running);
+        gone.machine = Some("zzz".into());
+        d.store.update_task(&mut gone).unwrap();
+        assert_eq!(
+            error_code(
+                d.handle(IpcRequest::TaskClose {
+                    id: gone.id,
+                    remove_worktree: false
+                })
+                .await
+            ),
+            "unknown_machine"
+        );
+        assert_eq!(
+            error_code(
+                d.handle(IpcRequest::TaskClose {
+                    id: 99,
+                    remove_worktree: false
+                })
+                .await
+            ),
+            "task_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_finds_an_orphan_with_no_row() {
+        let fake = FakeHerdr::new();
+        let ws = fake.workspace_create(None, "t-42").await.unwrap();
+        fake.agent_start("t-42", "claude", &ws.root_pane.pane_id, &[])
+            .await
+            .unwrap();
+        let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
+        let fleet = d.fleet();
+        wait_until("orphan", || {
+            fleet.get("a").unwrap().snapshot().orphans == vec!["t-42".to_string()]
+        })
+        .await;
+        let resp = d
+            .handle(IpcRequest::TaskClose {
+                id: 42,
+                remove_worktree: false,
+            })
+            .await;
+        let IpcResponse::Text(msg) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(msg.contains("t-42") && msg.contains("orphan"), "{msg}");
+        assert!(fake.agents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_answers_the_count() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let old_done = insert(&d, TaskState::Done);
+        let old_failed = insert(&d, TaskState::Failed);
+        let resp = d
+            .handle(IpcRequest::TaskPrune {
+                states: vec![TaskState::Done],
+                older_than_secs: 3 * 86400,
+            })
+            .await;
+        let IpcResponse::Text(n) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(n, "1");
+        assert!(d.store.get_task(old_done.id).unwrap().is_none());
+        assert!(d.store.get_task(old_failed.id).unwrap().is_some());
+        assert_eq!(
+            error_code(
+                d.handle(IpcRequest::TaskPrune {
+                    states: vec![TaskState::Running],
+                    older_than_secs: 1
+                })
+                .await
+            ),
+            "not_prunable"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_refuses_a_worktree_without_a_repo() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let resp = d
+            .handle(IpcRequest::Run {
+                prompt: "x".into(),
+                spec: DispatchSpec {
+                    worktree: true,
+                    ..spec()
+                },
+            })
+            .await;
+        assert_eq!(error_code(resp), "worktree_needs_repo");
+        assert!(
+            d.store
+                .list_tasks(&TaskFilter::default())
+                .unwrap()
+                .is_empty(),
+            "no row for a refused run"
+        );
     }
 }

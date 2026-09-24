@@ -134,7 +134,8 @@ struct RunArgs {
     /// `[defaults] agent_args`. The next word is always the value, dashes and all.
     #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
     agent_args: Vec<String>,
-    #[arg(long)]
+    /// A git worktree per task, branched from --repo (so it needs --repo)
+    #[arg(long, requires = "repo")]
     worktree: bool,
     /// Branch for the worktree (needs --worktree; a plain workspace has no branch)
     #[arg(long, requires = "worktree")]

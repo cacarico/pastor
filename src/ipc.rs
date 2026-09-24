@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::store::TaskFilter;
-use crate::task::{DispatchSpec, Task};
+use crate::task::{DispatchSpec, Task, TaskState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -39,6 +39,24 @@ pub enum IpcRequest {
     /// Fire a job now, ignoring schedule, overlap and `enabled`.
     JobRun {
         name: String,
+    },
+    /// Queue a new task copying a failed or stale one, then dispatch.
+    /// Answers `Task` (the new row).
+    TaskRetry {
+        id: i64,
+    },
+    /// Close the task's pane (or, with `remove_worktree`, its worktree) and
+    /// mark it closed. Answers `Task`, or `Text` for an orphaned agent with no
+    /// row.
+    TaskClose {
+        id: i64,
+        remove_worktree: bool,
+    },
+    /// Delete rows in `states` that finished more than `older_than_secs`
+    /// ago. Answers `Text` with the count.
+    TaskPrune {
+        states: Vec<TaskState>,
+        older_than_secs: u64,
     },
 }
 
@@ -340,6 +358,32 @@ mod tests {
         assert_eq!(v["kind"], "tasks");
         assert!(v["data"].is_array(), "{v}");
         assert_eq!(v["data"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn task_lifecycle_requests_round_trip() {
+        for req in [
+            IpcRequest::TaskRetry { id: 4 },
+            IpcRequest::TaskClose {
+                id: 4,
+                remove_worktree: true,
+            },
+            IpcRequest::TaskPrune {
+                states: vec![crate::task::TaskState::Done, crate::task::TaskState::Closed],
+                older_than_secs: 3 * 86400,
+            },
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            let back: IpcRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{req:?}"), format!("{back:?}"), "{json}");
+        }
+        let v = serde_json::to_value(IpcRequest::TaskPrune {
+            states: vec![crate::task::TaskState::Failed],
+            older_than_secs: 1,
+        })
+        .unwrap();
+        assert_eq!(v["op"], "task_prune");
+        assert_eq!(v["states"][0], "failed");
     }
 
     #[tokio::test]
