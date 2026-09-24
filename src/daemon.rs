@@ -82,8 +82,14 @@ impl Daemon {
         self.events.subscribe()
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
-        let socket = self.socket_path();
+    /// Take ownership of the daemon socket: refuse to steal it from a live or
+    /// merely unresponsive daemon, replace it if nothing answers, bind and lock
+    /// down its permissions. Split out of `run` so a second `pastor serve` can
+    /// be refused here, before `start` spawns a single machine actor or touches
+    /// the shared database — not after, which is what let a second daemon
+    /// reconcile and mutate the store for up to the probe timeout before it
+    /// finally bailed.
+    async fn bind_socket(socket: &std::path::Path) -> anyhow::Result<tokio::net::UnixListener> {
         if socket.exists() {
             // Staleness is a property of the connect, not of the reply: a live
             // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
@@ -91,7 +97,7 @@ impl Daemon {
             // looks exactly like a wedged one from the outside. Only a refused (or
             // absent) connect means nothing is actually listening; anything else
             // must be left alone rather than unlinked and stolen.
-            match crate::ipc::probe_daemon(&socket).await {
+            match crate::ipc::probe_daemon(socket).await {
                 DaemonProbe::Running => anyhow::bail!(
                     "another pastor daemon is already running on {}",
                     socket.display()
@@ -101,14 +107,42 @@ impl Daemon {
                      remove the socket file by hand only if that daemon is dead",
                     socket.display()
                 ),
-                DaemonProbe::NotRunning => std::fs::remove_file(&socket)?,
+                DaemonProbe::NotRunning => std::fs::remove_file(socket)?,
             }
         }
-        let listener = tokio::net::UnixListener::bind(&socket)?;
+        let listener = tokio::net::UnixListener::bind(socket)?;
         std::fs::set_permissions(
-            &socket,
+            socket,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         )?;
+        Ok(listener)
+    }
+
+    /// Own the socket, then build the daemon: machine actors are only spawned
+    /// once the socket is ours, so a second `pastor serve` bails on a live
+    /// daemon before it ever reconciles or dispatches against the shared
+    /// database. Used by both `serve` and anything that needs the same
+    /// ordering under test.
+    pub async fn bind_and_start(
+        paths: Paths,
+        config: PastorConfig,
+        flock: Flock,
+        connectors: Option<Vec<Arc<dyn Connector>>>,
+    ) -> anyhow::Result<(Daemon, tokio::net::UnixListener)> {
+        paths.ensure()?;
+        let listener = Daemon::bind_socket(&paths.socket_file()).await?;
+        let daemon = Daemon::start(paths, config, flock, connectors).await?;
+        Ok((daemon, listener))
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        let listener = Daemon::bind_socket(&self.socket_path()).await?;
+        self.run_with_listener(listener).await
+    }
+
+    /// The accept/tick/event loop, given a socket this daemon already owns.
+    pub async fn run_with_listener(self, listener: tokio::net::UnixListener) -> anyhow::Result<()> {
+        let socket = self.socket_path();
         let daemon = Arc::new(self);
         let mut tick = tokio::time::interval(daemon.config.tick_duration());
         let mut events = daemon.events.subscribe();
@@ -270,9 +304,9 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
         !flock.machines.is_empty(),
         "flock is empty; add a machine with `pastor flock add`"
     );
-    let daemon = Daemon::start(paths, config, flock, None).await?;
+    let (daemon, listener) = Daemon::bind_and_start(paths, config, flock, None).await?;
     tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.machines.len(), "pastor serve");
-    daemon.run().await
+    daemon.run_with_listener(listener).await
 }
 
 #[cfg(test)]
@@ -509,6 +543,42 @@ mod tests {
         assert!(
             socket.exists(),
             "an unresponsive daemon's socket file must not be removed"
+        );
+    }
+
+    /// A second `pastor serve` must own the socket before it spawns a single
+    /// machine actor: reconciling and mutating the shared database for up to
+    /// the probe timeout before bailing (the old order) is the bug. With a
+    /// live, responding daemon already on the socket, `bind_and_start` must
+    /// fail before its own connectors are ever contacted.
+    #[tokio::test]
+    async fn bind_and_start_bails_before_spawning_actors_when_a_daemon_is_already_running() {
+        let (first, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let socket = first.socket_path();
+        tokio::spawn(first.run());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::ipc::daemon_running(&socket).await {
+            assert!(Instant::now() < deadline, "first daemon never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let flock = Flock {
+            machines: vec![machine("a", 2)],
+        };
+        let fake = FakeHerdr::new();
+        let connectors: Vec<Arc<dyn Connector>> = vec![Arc::new(fake.clone())];
+        let err =
+            match Daemon::bind_and_start(paths, PastorConfig::default(), flock, Some(connectors))
+                .await
+            {
+                Ok(_) => panic!("expected bind_and_start to bail on a live socket"),
+                Err(e) => e,
+            };
+        assert!(err.to_string().contains("already running"), "{err}");
+        assert!(
+            fake.requests().is_empty(),
+            "the second daemon's machine actor must never have contacted its connector"
         );
     }
 }
