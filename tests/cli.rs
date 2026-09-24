@@ -201,3 +201,121 @@ fn list_without_daemon_reads_the_database() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("no tasks"));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not running"));
 }
+
+/// `--herdr` keeps herdr's saved-machine list in step with the flock: `add`
+/// runs `herdr machine add`, `remove` resolves the label to a profile id via
+/// `herdr machine list` and runs `herdr machine remove`. A fake `herdr` script
+/// first on PATH records what pastor asked of it.
+#[test]
+fn herdr_flag_adds_and_removes_the_saved_machine_too() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = tmp.path().join("herdr.log");
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$*\" in *boom*) echo 'herdr says no' >&2; exit 1;; esac\n\
+         if [ \"$1 $2\" = \"machine list\" ]; then printf 'id-1\\tother\\tx@y\\tdefault\\tenabled\\nid-2\\tpi-3\\tfleet@pi-3\\tdefault\\tenabled\\n'; fi\n",
+        log = log.display()
+    );
+    std::fs::write(bin.join("herdr"), script).unwrap();
+    std::fs::set_permissions(bin.join("herdr"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PATH", &path)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let calls = || std::fs::read_to_string(&log).unwrap_or_default();
+
+    let out = run(&[
+        "flock",
+        "add",
+        "pi-3",
+        "fleet@pi-3",
+        "--session",
+        "work",
+        "--herdr",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        calls().trim(),
+        "machine add fleet@pi-3 --label pi-3 --remote-session work"
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("to see it in your laptop"),
+        "the hint is replaced by the action: {text}"
+    );
+    assert!(text.contains("saved in herdr"), "{text}");
+
+    let out = run(&["flock", "remove", "pi-3", "--herdr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = calls();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[1], "machine list");
+    assert_eq!(
+        lines[2], "machine remove id-2",
+        "resolved by label, not by name"
+    );
+    assert!(
+        !std::fs::read_to_string(config.join("flock.toml"))
+            .unwrap()
+            .contains("pi-3")
+    );
+
+    // Not saved in herdr: the flock edit still happens, a note says so, exit 0.
+    assert!(
+        run(&["flock", "add", "pi-9", "fleet@pi-9"])
+            .status
+            .success()
+    );
+    let out = run(&["flock", "remove", "pi-9", "--herdr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no saved machine"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !calls()
+            .lines()
+            .any(|l| l.starts_with("machine remove id-") && l != "machine remove id-2")
+    );
+
+    // herdr failing: the flock edit is kept, the failure is reported with herdr's stderr, exit 1.
+    let out = run(&["flock", "add", "boom", "fleet@boom", "--herdr"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("herdr_error") && err.contains("herdr says no"),
+        "{err}"
+    );
+    assert!(
+        std::fs::read_to_string(config.join("flock.toml"))
+            .unwrap()
+            .contains("name = \"boom\"")
+    );
+}

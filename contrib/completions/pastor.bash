@@ -199,7 +199,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__flock__subcmd__add)
-            opts="-h --local --command --session --max-agents --tag --help"
+            opts="-h --local --command --session --max-agents --tag --herdr --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -327,7 +327,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__flock__subcmd__remove)
-            opts="-h --help"
+            opts="-h --herdr --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

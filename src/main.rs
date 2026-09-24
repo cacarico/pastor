@@ -118,9 +118,15 @@ enum FlockCmd {
         max_agents: u32,
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Also save it in herdr's sidebar (runs `herdr machine add`)
+        #[arg(long, conflicts_with_all = ["local", "command"])]
+        herdr: bool,
     },
     Remove {
         name: String,
+        /// Also remove herdr's saved machine with this label
+        #[arg(long)]
+        herdr: bool,
     },
     List {
         #[arg(long)]
@@ -421,6 +427,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
             session,
             max_agents,
             tags,
+            herdr,
         } => {
             let mut f = Flock::load(&path)?;
             let m = MachineConfig {
@@ -435,18 +442,47 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
             f.add(m).map_err(|e| anyhow::anyhow!(e))?;
             f.save(&path)?;
             println!("added {name} to {}", path.display());
-            if let Some(target) = f.get(&name).and_then(|m| m.ssh.clone()) {
-                println!(
-                    "to see it in your laptop's herdr sidebar: herdr machine add {target} --label {name}"
-                );
+            let target = f.get(&name).and_then(|m| m.ssh.clone());
+            match (herdr, target) {
+                // The flock file is already written: a herdr failure below is
+                // reported, not rolled back, so the two lists never diverge
+                // silently in the other direction either.
+                (true, Some(target)) => {
+                    herdr_cmd(&[
+                        "machine",
+                        "add",
+                        &target,
+                        "--label",
+                        &name,
+                        "--remote-session",
+                        &f.get(&name).map(|m| m.session.clone()).unwrap_or_default(),
+                    ]);
+                    println!("saved in herdr's sidebar as {name}");
+                }
+                (false, Some(target)) => println!(
+                    "to see it in your laptop's herdr sidebar: herdr machine add {target} --label {name} (or pass --herdr)"
+                ),
+                _ => {}
             }
             println!("restart pastor serve to pick it up");
         }
-        FlockCmd::Remove { name } => {
+        FlockCmd::Remove { name, herdr } => {
             let mut f = Flock::load(&path)?;
             anyhow::ensure!(f.remove(&name), "machine {name} not found");
             f.save(&path)?;
             println!("removed {name}; restart pastor serve to apply");
+            if herdr {
+                // herdr removes by profile id; the label is all pastor knows.
+                match saved_machine_id(&herdr_cmd(&["machine", "list"]), &name) {
+                    Some(id) => {
+                        herdr_cmd(&["machine", "remove", &id]);
+                        println!("removed {name} from herdr's sidebar");
+                    }
+                    None => eprintln!(
+                        "herdr has no saved machine labelled {name}; nothing to remove there"
+                    ),
+                }
+            }
         }
         FlockCmd::List { json } => {
             let statuses: Vec<MachineStatus> = if daemon_running(&paths.socket_file()).await {
@@ -533,6 +569,41 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run the local `herdr` CLI and return its stdout. Any failure (not on PATH,
+/// non-zero exit) is a runtime error carrying herdr's stderr, so the user sees
+/// herdr's own words rather than a generic exit status.
+fn herdr_cmd(args: &[&str]) -> String {
+    let out = match std::process::Command::new("herdr").args(args).output() {
+        Ok(out) => out,
+        Err(err) => fail("herdr_error", &format!("cannot run herdr: {err}")),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            out.status.to_string()
+        } else {
+            stderr
+        };
+        fail(
+            "herdr_error",
+            &format!("herdr {}: {detail}", args.join(" ")),
+        );
+    }
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The profile id of the saved herdr machine labelled `label`, from the output
+/// of `herdr machine list` (`id<TAB>label<TAB>target<TAB>session<TAB>enabled`
+/// per line). Only the label column is matched: an id or a target that happens
+/// to equal the name is not the same machine.
+fn saved_machine_id(list: &str, label: &str) -> Option<String> {
+    list.lines().find_map(|line| {
+        let mut cols = line.split('\t');
+        let id = cols.next()?;
+        (cols.next()? == label).then(|| id.to_string())
+    })
 }
 
 /// The command run on the remote host by `ssh -t target <this>`. `session` and
@@ -706,6 +777,55 @@ mod tests {
                 panic!("{args:?}: {e}");
             }
         }
+    }
+
+    #[test]
+    fn herdr_flag_needs_an_ssh_machine() {
+        fn err(args: &[&str]) -> clap::Error {
+            match Cli::try_parse_from(args) {
+                Ok(_) => panic!("{args:?}: expected a usage error"),
+                Err(e) => e,
+            }
+        }
+        assert_eq!(
+            err(&["pastor", "flock", "add", "x", "--local", "--herdr"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            err(&[
+                "pastor",
+                "flock",
+                "add",
+                "x",
+                "--herdr",
+                "--command",
+                "fake"
+            ])
+            .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        Cli::try_parse_from(["pastor", "flock", "add", "x", "user@h", "--herdr"]).unwrap();
+        Cli::try_parse_from(["pastor", "flock", "remove", "x", "--herdr"]).unwrap();
+    }
+
+    /// `herdr machine remove` wants the profile id; pastor knows the label.
+    /// `herdr machine list` prints `id<TAB>label<TAB>target<TAB>session<TAB>enabled`.
+    #[test]
+    fn saved_machine_id_matches_the_label_column() {
+        let list = "id-1\tother\tx@y\tdefault\tenabled\nid-2\tpi-3\tfleet@pi-3\tdefault\tenabled\n";
+        assert_eq!(saved_machine_id(list, "pi-3").as_deref(), Some("id-2"));
+        assert_eq!(
+            saved_machine_id(list, "fleet@pi-3"),
+            None,
+            "a target is not a label"
+        );
+        assert_eq!(
+            saved_machine_id(list, "id-1"),
+            None,
+            "an id is not a label either"
+        );
+        assert_eq!(saved_machine_id("", "pi-3"), None);
+        assert_eq!(saved_machine_id("No saved SSH machines.\n", "pi-3"), None);
     }
 
     #[test]

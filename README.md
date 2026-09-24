@@ -17,7 +17,9 @@ connection and then closes it, so pastor opens a connection per request: an
 socket protocol over stdio. Those connections are cheap because all of a
 machine's share one multiplexed ssh master
 (`ControlMaster=auto`, `ControlPath=~/.local/state/pastor/ssh/<machine>-%C`,
-`ControlPersist=600`), so only the first one authenticates. A master lingers for
+`ControlPersist=600`), so only the first one authenticates. A long machine name
+is shortened inside that socket name so it stays under the unix socket path
+limit; `%C` is what tells machines apart. A master lingers for
 up to 10 minutes after `pastor serve` exits; end one by hand with `ssh -O exit -o
 ControlPath=~/.local/state/pastor/ssh/<machine>-%C <target>`. Alongside them each
 machine keeps one long-lived connection for `events.subscribe`, the one thing
@@ -43,7 +45,11 @@ and failed tasks; `--all` adds closed tasks back, and `--blocked`/`--done`
 narrow to just those. `pastor task read t-1` fetches recent output from the
 task's pane over the machine channel. `pastor open pi-3` execs the full herdr
 UI against a flock machine (`herdr --remote` for an SSH one, `herdr` directly
-for a local one) instead of showing pastor's own view.
+for a local one) instead of showing pastor's own view; herdr refuses to start
+inside one of its own panes, so run it from a plain terminal. pastor's flock and
+herdr's saved machines are separate lists on purpose: `flock add --herdr` and
+`flock remove --herdr` keep them in step by running `herdr machine add|remove`
+for you, and without the flag `flock add` prints the command instead.
 
 Runtime errors print JSON on stderr with a stable `code` and exit 1; a
 malformed command line gets clap's plain usage text and exit 2.
@@ -56,7 +62,7 @@ ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
 
 ```bash
 make install                         # pastor and fake-herdr into ~/.cargo/bin
-pastor flock add pi-3 fleet@pi-3 --max-agents 2
+pastor flock add pi-3 fleet@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
 pastor flock add here --local
 pastor flock status                  # ssh, herdr version, protocol
 pastor serve &                       # or run it under systemd later
