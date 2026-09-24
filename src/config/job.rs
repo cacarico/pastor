@@ -44,7 +44,8 @@ pub struct ConnectorTable {
 #[serde(default, deny_unknown_fields)]
 pub struct DispatchTable {
     pub agent: Option<String>,
-    pub agent_args: Vec<String>,
+    /// `None` (no key) takes `[defaults] agent_args`; `[]` means none.
+    pub agent_args: Option<Vec<String>>,
     pub repo: Option<String>,
     pub worktree: bool,
     pub branch: Option<String>,
@@ -146,7 +147,7 @@ impl Job {
             backfill,
             spec: DispatchSpec {
                 agent: d.agent.unwrap_or_else(|| defaults.agent.clone()),
-                agent_args: d.agent_args,
+                agent_args: defaults.agent_args_or(d.agent_args),
                 repo: d.repo,
                 worktree: d.worktree,
                 branch: d.branch,
@@ -357,6 +358,26 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert!(job.prompt.contains("{{ item.author }}"));
     }
 
+    /// `[defaults] agent_args` fills in for a job file that has no
+    /// `agent_args` key; a key that is there, even `[]`, is the job's choice.
+    #[test]
+    fn agent_args_fall_back_to_defaults_only_when_the_key_is_absent() {
+        let d = Defaults {
+            agent_args: vec!["--model".into(), "claude-opus-5-5".into()],
+            ..Defaults::default()
+        };
+        let absent = SPEC_EXAMPLE.replace("agent_args = []\n", "");
+        let job = Job::parse(&absent, "support-slack", &d).unwrap();
+        assert_eq!(job.spec.agent_args, vec!["--model", "claude-opus-5-5"]);
+
+        let empty = Job::parse(SPEC_EXAMPLE, "support-slack", &d).unwrap();
+        assert!(empty.spec.agent_args.is_empty(), "explicit [] opts out");
+
+        let own = SPEC_EXAMPLE.replace("agent_args = []", "agent_args = [\"--model\", \"x\"]");
+        let job = Job::parse(&own, "support-slack", &d).unwrap();
+        assert_eq!(job.spec.agent_args, vec!["--model", "x"]);
+    }
+
     #[test]
     fn a_connector_without_a_plugin_is_invalid_for_now() {
         let text = SPEC_EXAMPLE.replace("use = \"clock\"", "use = \"slack\"");
@@ -402,6 +423,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
 "#;
         let d = Defaults {
             agent: "codex".into(),
+            agent_args: vec![],
             max_tasks_per_run: 2,
             timeout: "30m".into(),
         };
