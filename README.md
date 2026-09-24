@@ -62,9 +62,11 @@ A machine whose requests answer but whose event subscription will not open is
 passes never run at once, and a task moves from `queued` to `starting` with a
 conditional update, so a machine is never given more than `max_agents`.
 
-`pastor list` shows every task except closed ones, including blocked, stale
-and failed tasks; `--all` adds closed tasks back, and `--blocked`/`--done`
-narrow to just those. `pastor task read t-1` fetches recent output from the
+`pastor list` shows live tasks only: queued, starting, running and blocked.
+Finished ones (done, failed, stale, closed) appear with `--all`, and an empty
+default list says so on stderr. `--blocked` and `--done` narrow to just that
+state, `--job` and `--machine` narrow whichever set is shown, and `--json`
+prints the same selection. `pastor task read t-1` fetches recent output from the
 task's pane over the machine channel. `pastor open pi-3` execs the full herdr
 UI against a flock machine (`herdr --remote` for an SSH one, `herdr` directly
 for a local one) instead of showing pastor's own view; herdr refuses to start
@@ -145,9 +147,9 @@ EOF
 pastor job list                      # picked up at the next tick
 pastor tick --dry-run --job hourly   # what a run would create, without creating it
 pastor job run hourly                # fire it now
-pastor list --job hourly
+pastor list --job hourly             # live tasks only
 pastor job disable hourly
-pastor list
+pastor list --all                    # finished tasks too
 pastor task read t-1                 # recent pane output, without attaching
 pastor attach t-1                    # lands in the agent's pane; ctrl+b q detaches
 pastor open pi-3                     # the full herdr UI on that machine
