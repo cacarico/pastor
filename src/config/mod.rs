@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 pub struct Paths {
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,
+    /// Managed plugin checkouts live here (`~/.local/share/pastor`).
+    pub data_dir: PathBuf,
 }
 
 impl Paths {
@@ -27,17 +29,34 @@ impl Paths {
                 .context("no state dir")?
                 .join("pastor"),
         };
+        let data_dir = match std::env::var_os("PASTOR_DATA_DIR") {
+            Some(v) => PathBuf::from(v),
+            None => dirs::data_dir()
+                .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
+                .context("no data dir")?
+                .join("pastor"),
+        };
         Ok(Paths {
             config_dir,
             state_dir,
+            data_dir,
         })
     }
 
+    /// The data dir defaults to `<state>/data`, so the many tests that build
+    /// `Paths` from two temp dirs never reach into the real data dir.
     pub fn new(config_dir: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Paths {
+        let state_dir = state_dir.into();
         Paths {
             config_dir: config_dir.into(),
-            state_dir: state_dir.into(),
+            data_dir: state_dir.join("data"),
+            state_dir,
         }
+    }
+
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Paths {
+        self.data_dir = data_dir.into();
+        self
     }
 
     /// Create both directories with mode 0700. Idempotent.
@@ -106,6 +125,32 @@ impl Paths {
             .collect();
         let dir = self.ssh_dir().to_string_lossy().replace('%', "%%");
         PathBuf::from(format!("{dir}/{safe}-%C"))
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone()
+    }
+
+    /// One directory per plugin: a managed checkout, or a symlink made by
+    /// `plugin link`.
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.data_dir.join("plugins")
+    }
+
+    /// Secrets and settings for one plugin, written by the user.
+    pub fn plugin_env_file(&self, id: &str) -> PathBuf {
+        self.config_dir.join("plugins").join(id).join(".env")
+    }
+
+    /// Per-job scratch a connector may use; pastor owns the directory, the
+    /// plugin owns what is in it.
+    pub fn plugin_state_dir(&self, job: &str) -> PathBuf {
+        self.state_dir.join("plugins").join(job)
+    }
+
+    /// Captured connector and hook output for one job, `<ts>.log` per run.
+    pub fn runs_dir(&self, job: &str) -> PathBuf {
+        self.state_dir.join("runs").join(job)
     }
 }
 
@@ -290,13 +335,16 @@ mod tests {
         unsafe {
             std::env::set_var("PASTOR_CONFIG_DIR", tmp.path().join("c"));
             std::env::set_var("PASTOR_STATE_DIR", tmp.path().join("s"));
+            std::env::set_var("PASTOR_DATA_DIR", tmp.path().join("d"));
         }
         let p = Paths::from_env().unwrap();
         assert_eq!(p.config_dir, tmp.path().join("c"));
         assert_eq!(p.state_dir, tmp.path().join("s"));
+        assert_eq!(p.data_dir(), tmp.path().join("d"));
         unsafe {
             std::env::remove_var("PASTOR_CONFIG_DIR");
             std::env::remove_var("PASTOR_STATE_DIR");
+            std::env::remove_var("PASTOR_DATA_DIR");
         }
     }
 
@@ -426,6 +474,24 @@ mod tests {
         std::fs::write(&path, "request_timeout = \"0s\"\n").unwrap();
         let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("request_timeout"), "{err}");
+    }
+
+    #[test]
+    fn plugin_paths() {
+        let p = Paths::new("/tmp/c", "/tmp/s");
+        assert_eq!(p.data_dir(), PathBuf::from("/tmp/s/data"));
+        assert_eq!(p.plugins_dir(), PathBuf::from("/tmp/s/data/plugins"));
+        let p = p.with_data_dir("/tmp/d");
+        assert_eq!(p.plugins_dir(), PathBuf::from("/tmp/d/plugins"));
+        assert_eq!(
+            p.plugin_env_file("slack"),
+            PathBuf::from("/tmp/c/plugins/slack/.env")
+        );
+        assert_eq!(
+            p.plugin_state_dir("support"),
+            PathBuf::from("/tmp/s/plugins/support")
+        );
+        assert_eq!(p.runs_dir("support"), PathBuf::from("/tmp/s/runs/support"));
     }
 
     #[test]
