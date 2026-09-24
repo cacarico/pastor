@@ -258,7 +258,13 @@ pub async fn run_job(
             "max_tasks_per_run reached; the rest stay unseen for the next run"
         );
     }
+    if insert_failed {
+        report.outcome = RunOutcome::Failed;
+    }
     if !dry_run {
+        // The connector answered, so its failure count and backoff reset even
+        // when an insert failed: backoff is for a connector that errors, and a
+        // local insert failure is retried on the next scheduled run instead.
         state.failures = 0;
         state.backoff_until = None;
         state.last_run_at = Some(now);
@@ -272,12 +278,23 @@ pub async fn run_job(
                 state.cursor = output.cursor;
             }
         }
-        state.last_result = Some(format!(
-            "ok: {} items, {} tasks",
-            report.items,
-            report.created.len()
-        ));
-        state.last_error = None;
+        if insert_failed {
+            let err = report.error.clone().unwrap_or_default();
+            state.last_result = Some(format!(
+                "failed: {} items, {} tasks: {}",
+                report.items,
+                report.created.len(),
+                first_line(&err)
+            ));
+            state.last_error = Some(err);
+        } else {
+            state.last_result = Some(format!(
+                "ok: {} items, {} tasks",
+                report.items,
+                report.created.len()
+            ));
+            state.last_error = None;
+        }
         if let Err(e) = store.save_job_state(&state) {
             tracing::error!(job = %job.name, %e, "save job state");
         }
@@ -1173,6 +1190,42 @@ mod tests {
         assert!(s.cursor.is_none(), "{s:?}");
         assert!(s.last_ok_at.is_none());
         assert_eq!(s.last_run_at, Some(t1));
+    }
+
+    #[tokio::test]
+    async fn a_failed_insert_fails_the_run_without_backing_off() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (tx, mut rx) = events();
+        let mut j = job("j");
+        j.prompt = "{{ unclosed".into();
+        let src = Scripted::with_keys(&["k1"]);
+        let t1 = Utc::now();
+        let report = run_job(&store, &j, &src, &tx, t1, false).await;
+        assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
+        let s = store.job_state("j").unwrap().unwrap();
+        assert!(s.last_error.as_deref().unwrap().contains("k1"), "{s:?}");
+        assert!(
+            s.last_result.as_deref().unwrap().starts_with("failed"),
+            "{s:?}"
+        );
+        assert_eq!(
+            s.failures, 0,
+            "an insert failure is not a connector failure"
+        );
+        assert!(s.backoff_until.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "job.failed is for connector failures"
+        );
+
+        let (sched, _tmp) = scheduler_with(&store);
+        assert!(
+            matches!(
+                sched.due_of(&j, Some(&s), t1 + chrono::Duration::seconds(30)),
+                Due::At(u) if u == t1 + chrono::Duration::seconds(60)
+            ),
+            "the next run is due on schedule"
+        );
     }
 
     #[tokio::test]
