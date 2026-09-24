@@ -106,6 +106,11 @@ pub struct Task {
     pub agent_name: Option<String>,
     pub state: TaskState,
     pub error: Option<String>,
+    /// herdr's `state_change_seq` for this task's agent when it was given the
+    /// task (the reply to `agent.prompt`), or when it last finished: the
+    /// baseline a completion must move past. The name predates herdr 0.9.1,
+    /// which has no `completion_seq`; the column is kept to keep the schema.
+    /// `None` on rows written before this was recorded, read as 0.
     pub last_completion_seq: Option<u64>,
     /// herdr refused the prompt at dispatch with `agent_blocked`, so the agent
     /// has never seen it. The machine sends it once the agent leaves `blocked`.
@@ -134,6 +139,12 @@ pub fn parse_task_id(s: &str) -> Option<i64> {
 pub enum Observed {
     Status {
         status: AgentStatus,
+        /// herdr's server-wide counter, stamped on the agent at each change of
+        /// its detected state (idle, working, blocked, unknown). `None` when
+        /// the observation carries none, as subscription events do.
+        state_change_seq: Option<u64>,
+        /// The change that made this idle a completion, in the same sequence.
+        /// herdr 0.9.1 never reports it; used when a later herdr does.
         completion_seq: Option<u64>,
     },
     PaneClosed,
@@ -143,6 +154,29 @@ pub enum Observed {
     /// task may start) lives with the rest of the state machine instead of being
     /// hard-coded where dispatch happens.
     DispatchStarting,
+}
+
+/// Did an agent now idle (or done) finish work it was given? herdr 0.9.1 has
+/// no completion counter; `agent_status` is idle or done either way (`done`
+/// only means nobody has looked at the pane since). What shows work happened
+/// is `state_change_seq` moving past the value it had when the prompt went
+/// in: to be idle again at a newer sequence the agent must have left idle.
+/// herdr's own `agent.prompt` wait uses the same test (`src/api/wait.rs`,
+/// `after_state_change_seq`). A prompt that was never delivered has nothing
+/// to complete. A `completion_seq`, when herdr reports one, is the same
+/// sequence stamped only on real completions, so it is preferred.
+fn completed_since_prompt(
+    task: &Task,
+    state_change_seq: Option<u64>,
+    completion_seq: Option<u64>,
+) -> bool {
+    if task.prompt_pending {
+        return false;
+    }
+    let baseline = task.last_completion_seq.unwrap_or(0);
+    completion_seq
+        .or(state_change_seq)
+        .is_some_and(|seq| seq > baseline)
 }
 
 /// Pure transition. `None` means no change. The settle window for `Done` is the
@@ -170,6 +204,7 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
         }
         Observed::Status {
             status,
+            state_change_seq,
             completion_seq,
         } => match status {
             // Stale is sticky: a working/blocked observation after a timeout must not
@@ -182,12 +217,7 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
             AgentStatus::Blocked => Blocked,
             AgentStatus::Unknown => return None,
             AgentStatus::Idle | AgentStatus::Done => {
-                let advanced = match (completion_seq, task.last_completion_seq) {
-                    (Some(new), Some(old)) => *new > old,
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                };
-                if advanced {
+                if completed_since_prompt(task, *state_change_seq, *completion_seq) {
                     Done
                 } else if task.state == Blocked {
                     // The human answered the prompt; the agent is idle again but has not
@@ -246,10 +276,13 @@ mod tests {
         }
     }
 
+    /// An observation as `agent.list` reports it on herdr 0.9.1: a
+    /// `state_change_seq`, no `completion_seq`.
     fn status(s: AgentStatus, seq: Option<u64>) -> Observed {
         Observed::Status {
             status: s,
-            completion_seq: seq,
+            state_change_seq: seq,
+            completion_seq: None,
         }
     }
 
@@ -286,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_is_done_only_when_completion_seq_advances() {
+    fn idle_is_done_only_when_state_change_seq_passes_the_baseline() {
         assert_eq!(
             next_state(
                 &task(TaskState::Running, None),
@@ -317,11 +350,56 @@ mod tests {
         );
     }
 
+    /// A prompt herdr refused has not reached the agent, so nothing it does
+    /// while the prompt is pending is this task's work.
+    #[test]
+    fn a_pending_prompt_is_never_done() {
+        let mut t = task(TaskState::Blocked, None);
+        t.prompt_pending = true;
+        assert_ne!(
+            next_state(&t, &status(AgentStatus::Idle, Some(7))),
+            Some(TaskState::Done)
+        );
+        let mut t = task(TaskState::Running, Some(3));
+        t.prompt_pending = true;
+        assert_eq!(next_state(&t, &status(AgentStatus::Done, Some(9))), None);
+    }
+
+    /// herdr after 0.9.1 reports `completion_seq`, in the same sequence as
+    /// `state_change_seq` and only on idle transitions that completed work.
+    /// When present it decides; when absent `state_change_seq` does.
+    #[test]
+    fn completion_seq_is_preferred_when_herdr_reports_it() {
+        let seen = |state_change_seq, completion_seq| Observed::Status {
+            status: AgentStatus::Idle,
+            state_change_seq: Some(state_change_seq),
+            completion_seq,
+        };
+        let t = task(TaskState::Running, Some(5));
+        assert_eq!(next_state(&t, &seen(6, Some(6))), Some(TaskState::Done));
+        assert_eq!(next_state(&t, &seen(6, Some(4))), None);
+        assert_eq!(next_state(&t, &seen(6, None)), Some(TaskState::Done));
+        assert_eq!(next_state(&t, &seen(5, None)), None);
+    }
+
+    /// A subscription event carries no sequence at all; it is never enough on
+    /// its own to call a task done.
+    #[test]
+    fn an_observation_without_a_sequence_is_not_a_completion() {
+        assert_eq!(
+            next_state(
+                &task(TaskState::Running, None),
+                &status(AgentStatus::Done, None)
+            ),
+            None
+        );
+    }
+
     /// A `Starting` task adopted after a crash (see `Actor::reconcile`) can be
     /// found idle before it ever produces completed work: dispatch reached at
     /// least `agent.start`, so that counts as reaching `Running`, the same as a
     /// successful dispatch would have recorded, not as reaching `Done` (that
-    /// still requires completion_seq to advance) or being left stuck.
+    /// still requires `state_change_seq` to pass the baseline) or being left stuck.
     #[test]
     fn starting_found_idle_or_done_means_running_unless_already_advanced() {
         assert_eq!(
@@ -338,11 +416,11 @@ mod tests {
             ),
             Some(TaskState::Running)
         );
-        // A real completion_seq advance still wins: an adopted agent that has
+        // A sequence past the baseline still wins: an adopted agent that has
         // already finished its work goes straight to Done, same as any other
         // state (this is `next_state`'s call; `Actor::reconcile` never lets an
-        // adopted agent's real completion_seq reach here directly — it passes
-        // `None` and routes the real value through the settle window instead).
+        // adopted agent's sequence reach here directly — it passes `None` and
+        // routes the real value through the settle window instead).
         assert_eq!(
             next_state(
                 &task(TaskState::Starting, None),
@@ -433,7 +511,7 @@ mod tests {
             ),
             None
         );
-        // Idle/done with no new completion_seq is not a real completion either.
+        // Idle/done with no newer state_change_seq is not a real completion either.
         assert_eq!(
             next_state(
                 &task(TaskState::Stale, Some(1)),
@@ -441,7 +519,7 @@ mod tests {
             ),
             None
         );
-        // A real completion (completion_seq advances) still moves it to Done.
+        // A real completion (state_change_seq moves on) still moves it to Done.
         assert_eq!(
             next_state(
                 &task(TaskState::Stale, Some(1)),

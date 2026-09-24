@@ -46,6 +46,42 @@ struct State {
     /// The started agent's process dies at once but herdr keeps its pane in
     /// `agent.list`, with neither launch flag set, instead of dropping it.
     exit_listed: bool,
+    /// `agent.prompt` is accepted but the agent never acts on it: it stays idle
+    /// and its `state_change_seq` does not move.
+    ignore_prompts: bool,
+    /// herdr's `next_agent_state_change_seq`: one counter for the whole server,
+    /// bumped on every agent state change and stamped on the agent that changed.
+    seq: u64,
+}
+
+/// herdr 0.9.1 derives `agent_status` from a detected state (idle, working,
+/// blocked, unknown) plus a per-pane `seen` flag: `done` is idle after a
+/// completion nobody has looked at yet, `idle` is idle and seen. Only a change
+/// of the detected state bumps `state_change_seq`; `done` -> `idle` (someone
+/// looked) does not.
+fn detected(status: AgentStatus) -> u8 {
+    match status {
+        AgentStatus::Idle | AgentStatus::Done => 0,
+        AgentStatus::Working => 1,
+        AgentStatus::Blocked => 2,
+        AgentStatus::Unknown => 3,
+    }
+}
+
+/// Set an agent's status the way herdr does, bumping the server-wide sequence
+/// when the detected state changes. Returns the agent after the change.
+fn change_status(s: &mut State, pane_id: &str, status: AgentStatus) -> Option<AgentInfo> {
+    let bump = detected(s.agents.get(pane_id)?.agent_status) != detected(status);
+    if bump {
+        s.seq += 1;
+    }
+    let seq = s.seq;
+    let a = s.agents.get_mut(pane_id)?;
+    a.agent_status = status;
+    if bump {
+        a.state_change_seq = seq;
+    }
+    Some(a.clone())
 }
 
 #[derive(Clone)]
@@ -147,20 +183,29 @@ impl FakeHerdr {
         Connection::new(Box::new(ar), Box::new(aw))
     }
 
-    pub fn set_status(&self, pane_id: &str, status: AgentStatus, completion_seq: Option<u64>) {
-        let mut s = self.state.lock().unwrap();
-        if let Some(a) = s.agents.get_mut(pane_id) {
-            a.agent_status = status;
-            a.state_change_seq += 1;
-            if completion_seq.is_some() {
-                a.completion_seq = completion_seq;
-            }
-        }
+    /// `agent.prompt` is accepted from now on, but the agent never starts
+    /// working on it, as if the text never reached it.
+    pub fn ignore_prompts(&self, yes: bool) {
+        self.state.lock().unwrap().ignore_prompts = yes;
+    }
+
+    /// Change an agent's status and publish `pane.agent_status_changed`, as
+    /// herdr does. There is no `completion_seq` in herdr 0.9.1: a finished
+    /// task shows up as `idle` or `done` with a newer `state_change_seq`.
+    pub fn set_status(&self, pane_id: &str, status: AgentStatus) {
+        self.set_status_silently(pane_id, status);
         let ws = pane_id.split(':').next().unwrap_or("w1").to_string();
         let _ = self.events.send(Event {
             event: "pane.agent_status_changed".into(),
             data: json!({"pane_id": pane_id, "workspace_id": ws, "agent_status": status}),
         });
+    }
+
+    /// Change an agent's status without publishing an event, the way a change
+    /// looks to a client whose event stream fell behind: only `agent.list`
+    /// shows it.
+    pub fn set_status_silently(&self, pane_id: &str, status: AgentStatus) {
+        change_status(&mut self.state.lock().unwrap(), pane_id, status);
     }
 
     pub fn close_pane(&self, pane_id: &str) {
@@ -339,6 +384,8 @@ impl FakeHerdr {
                     StartBehaviour::Fail(code) => return Err((code, "start failed".into())),
                     StartBehaviour::Ready => {}
                 }
+                // The launch itself (unknown -> idle) is a state change.
+                s.seq += 1;
                 let info = AgentInfo {
                     pane_id: pane_id.clone(),
                     workspace_id: ws.clone(),
@@ -347,7 +394,7 @@ impl FakeHerdr {
                     agent: p["kind"].as_str().map(str::to_string),
                     agent_status: AgentStatus::Idle,
                     completion_seq: None,
-                    state_change_seq: 1,
+                    state_change_seq: s.seq,
                     launch_pending: false,
                     interactive_ready: true,
                 };
@@ -398,13 +445,11 @@ impl FakeHerdr {
                         format!("agent {target} is not an active named agent"),
                     ));
                 }
-                let a = s
-                    .agents
-                    .get_mut(&found.pane_id)
+                if s.ignore_prompts {
+                    return Ok(json!({"type": "agent_prompted", "agent": found}));
+                }
+                let info = change_status(&mut s, &found.pane_id, AgentStatus::Working)
                     .expect("found above, under the same lock");
-                a.agent_status = AgentStatus::Working;
-                a.state_change_seq += 1;
-                let info = a.clone();
                 let _ = self.events.send(Event {
                     event: "pane.agent_status_changed".into(),
                     data: json!({"pane_id": info.pane_id, "workspace_id": info.workspace_id, "agent_status": "working"}),
@@ -548,7 +593,7 @@ mod tests {
         fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
-        fake.set_status(&created.root_pane.pane_id, AgentStatus::Blocked, None);
+        fake.set_status(&created.root_pane.pane_id, AgentStatus::Blocked);
         let err = fake.agent_prompt("t-1", "hi").await.unwrap_err();
         assert_eq!(err.code(), Some("agent_blocked"));
     }
@@ -571,8 +616,8 @@ mod tests {
             ])
             .await
             .unwrap();
-        fake.set_status(&b.root_pane.pane_id, AgentStatus::Blocked, None); // filtered out
-        fake.set_status(&a.root_pane.pane_id, AgentStatus::Working, None);
+        fake.set_status(&b.root_pane.pane_id, AgentStatus::Blocked); // filtered out
+        fake.set_status(&a.root_pane.pane_id, AgentStatus::Working);
         fake.close_pane(&b.root_pane.pane_id);
         let e1 = stream.next().await.unwrap();
         assert_eq!(e1.pane_id(), Some(a.root_pane.pane_id.as_str()));

@@ -160,7 +160,12 @@ async fn dispatch_steps(
     )
     .await?;
 
-    prompt_when_ready(conn, task, name, ready_timeout).await
+    let (outcome, prompted_at) = prompt_when_ready(conn, task, name, ready_timeout).await?;
+    // The baseline a completion must move past; see `task::completed_since_prompt`.
+    if let Some(seq) = prompted_at {
+        task.last_completion_seq = Some(seq);
+    }
+    Ok(outcome)
 }
 
 /// Expand a leading `~` in `repo` against the machine's home directory.
@@ -211,7 +216,7 @@ async fn prompt_when_ready(
     task: &Task,
     name: &str,
     ready_timeout: Duration,
-) -> Result<DispatchOutcome, DispatchError> {
+) -> Result<(DispatchOutcome, Option<u64>), DispatchError> {
     let machine = task.machine.as_deref().unwrap_or("that machine");
     let deadline = Instant::now() + ready_timeout;
     loop {
@@ -229,7 +234,7 @@ async fn prompt_when_ready(
             // is still launching, so waiting here would only run out the
             // bound. The machine sends the prompt once the block clears
             // (`Task::prompt_pending`).
-            return Ok(DispatchOutcome::Blocked);
+            return Ok((DispatchOutcome::Blocked, None));
         }
         // herdr 0.9.1 reports readiness with two flags, the same ones its own
         // `agent start --wait` reads: `launch_pending` while the process is
@@ -242,11 +247,13 @@ async fn prompt_when_ready(
             // still launching: fall through to the wait below
         } else if can_prompt {
             match conn.agent_prompt(name, &task.prompt).await {
-                Ok(_) => return Ok(DispatchOutcome::Running),
+                // The reply carries the agent's `state_change_seq` as the
+                // prompt went in.
+                Ok(agent) => return Ok((DispatchOutcome::Running, Some(agent.state_change_seq))),
                 // The agent is up and waiting for a human, not for us. herdr
                 // did not send the prompt; the machine sends it after the block.
                 Err(err) if err.code() == Some("agent_blocked") => {
-                    return Ok(DispatchOutcome::Blocked);
+                    return Ok((DispatchOutcome::Blocked, None));
                 }
                 // Raced the flag: herdr still refuses. Keep waiting inside the bound.
                 Err(err) if err.code() == Some("agent_not_ready") => {}
@@ -619,7 +626,7 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 if let Some(a) = watcher.agents().first() {
-                    watcher.set_status(&a.pane_id, AgentStatus::Blocked, None);
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked);
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -650,7 +657,7 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 if let Some(a) = watcher.agents().first() {
-                    watcher.set_status(&a.pane_id, AgentStatus::Blocked, None);
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked);
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;

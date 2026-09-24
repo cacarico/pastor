@@ -83,8 +83,13 @@ pub struct AgentInfo {
     #[serde(default)]
     pub agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// Not in herdr 0.9.1 (protocol 22); newer herdr sets it to the
+    /// `state_change_seq` of an idle transition that completed work.
     #[serde(default)]
     pub completion_seq: Option<u64>,
+    /// herdr's server-wide counter, stamped on this agent each time its
+    /// detected state (idle, working, blocked, unknown) changes. 0 until the
+    /// first change.
     #[serde(default)]
     pub state_change_seq: u64,
     /// herdr 0.9.1: the managed agent is still in its pending phase (or blocked
