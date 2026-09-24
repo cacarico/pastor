@@ -32,7 +32,9 @@ struct State {
     hang: Option<String>,
     /// How long a freshly started agent stays unready: `agent.list` reports it
     /// `unknown` and `agent.prompt` answers `agent_not_ready`, the way herdr
-    /// does while a managed agent is still launching. Zero by default.
+    /// does while a managed agent is still launching — unless the agent was
+    /// set `blocked`, which `agent.list` and `agent.prompt` report as such
+    /// even during this window. Zero by default.
     ready_after: Duration,
     /// What `Connector::home_dir` reports; `None` like a `command` machine.
     home: Option<String>,
@@ -86,7 +88,8 @@ impl FakeHerdr {
         self.state.lock().unwrap().protocol = p;
     }
     /// A started agent reports `unknown` and refuses prompts for this long,
-    /// like a managed agent herdr is still launching.
+    /// like a managed agent herdr is still launching — except a `blocked`
+    /// agent, which stays `blocked` and refuses with `agent_blocked` instead.
     pub fn set_ready_after(&self, d: Duration) {
         self.state.lock().unwrap().ready_after = d;
     }
@@ -357,33 +360,32 @@ impl FakeHerdr {
             "agent.prompt" => {
                 let target = p["target"].as_str().unwrap_or("");
                 let ready_after = s.ready_after;
-                let launching = s
+                let Some(found) = s
                     .agents
                     .values()
                     .find(|a| a.name.as_deref() == Some(target) || a.pane_id == target)
-                    .is_some_and(|a| is_launching(&s.started, &a.pane_id, ready_after));
-                if launching {
-                    return Err((
-                        "agent_not_ready".into(),
-                        format!("agent {target} is not an active named agent"),
-                    ));
-                }
-                let Some(a) = s
-                    .agents
-                    .values_mut()
-                    .find(|a| a.name.as_deref() == Some(target) || a.pane_id == target)
+                    .cloned()
                 else {
                     return Err(("agent_not_found".into(), target.into()));
                 };
-                if !a.interactive_ready {
+                // herdr checks `blocked` before it checks launch-pending or
+                // readiness (`src/app/api/agents.rs`): an agent stuck on its
+                // own startup question answers `agent_blocked` even while
+                // herdr still counts it as launching.
+                if found.agent_status == AgentStatus::Blocked {
+                    return Err(("agent_blocked".into(), "agent is blocked".into()));
+                }
+                let launching = is_launching(&s.started, &found.pane_id, ready_after);
+                if launching || !found.interactive_ready {
                     return Err((
                         "agent_not_ready".into(),
                         format!("agent {target} is not an active named agent"),
                     ));
                 }
-                if a.agent_status == AgentStatus::Blocked {
-                    return Err(("agent_blocked".into(), "agent is blocked".into()));
-                }
+                let a = s
+                    .agents
+                    .get_mut(&found.pane_id)
+                    .expect("found above, under the same lock");
                 a.agent_status = AgentStatus::Working;
                 a.state_change_seq += 1;
                 let info = a.clone();
