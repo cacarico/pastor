@@ -18,7 +18,7 @@ use crate::store::{NewTask, Store};
 /// after a job run queues tasks), so two passes never read the same capacity
 /// snapshot and both fill the last slot.
 pub struct Fleet {
-    pub machines: Vec<MachineHandle>,
+    machines: Vec<MachineHandle>,
     store: Arc<Store>,
     dispatch_lock: tokio::sync::Mutex<()>,
 }
@@ -30,6 +30,12 @@ impl Fleet {
             store,
             dispatch_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Every machine in flock order. Read-only: the set is fixed for the
+    /// daemon's lifetime, so callers iterate and never hold a slot.
+    pub fn machines(&self) -> &[MachineHandle] {
+        &self.machines
     }
 
     pub fn get(&self, name: &str) -> Option<&MachineHandle> {
@@ -326,7 +332,7 @@ impl Daemon {
                 }
             }
             IpcRequest::FlockList => {
-                IpcResponse::Machines(self.fleet.machines.iter().map(|m| m.snapshot()).collect())
+                IpcResponse::Machines(self.fleet.machines().iter().map(|m| m.snapshot()).collect())
             }
             IpcRequest::Tick { job, dry_run } => match self.scheduler.tick(job, dry_run).await {
                 Ok(runs) => IpcResponse::Runs(runs),
@@ -357,7 +363,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
         "flock is empty; add a machine with `pastor machine add`"
     );
     let (daemon, listener) = Daemon::bind_and_start(paths, config, flock, None).await?;
-    tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.fleet.machines.len(), "pastor serve");
+    tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.fleet.machines().len(), "pastor serve");
     daemon.run_with_listener(listener).await
 }
 
