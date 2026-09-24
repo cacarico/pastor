@@ -1,4 +1,5 @@
 pub mod flock;
+pub mod job;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
