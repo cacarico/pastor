@@ -14,6 +14,7 @@ pub mod scheduler;
 pub mod setup;
 pub mod store;
 pub mod task;
+pub mod task_cli;
 pub mod template;
 
 /// Lowest herdr socket protocol pastor speaks. herdr 0.9.0 and 0.9.1 ship 22.

@@ -5,6 +5,26 @@ use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::task::Task;
 
+/// A runtime CLI error with a stable code. A library command handler returns
+/// it (inside `anyhow::Error`) and `main` prints it as the usual JSON on
+/// stderr with that code, instead of the generic `runtime_error`.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct CliError {
+    pub code: String,
+    pub message: String,
+}
+
+impl CliError {
+    pub fn err(code: &str, message: impl std::fmt::Display) -> anyhow::Error {
+        CliError {
+            code: code.into(),
+            message: message.to_string(),
+        }
+        .into()
+    }
+}
+
 pub fn age(from: chrono::DateTime<Utc>) -> String {
     let secs = (Utc::now() - from).num_seconds().max(0);
     if secs < 60 {
@@ -158,6 +178,20 @@ pub fn task_detail(t: &Task) -> String {
 
 pub const TASK_HEADER: [&str; 7] = ["ID", "STATE", "MACHINE", "AGENT", "JOB", "AGE", "NOTE"];
 
+/// One line per orphaned agent, for under the `pastor list` table.
+pub fn orphan_lines(ms: &[MachineStatus]) -> Vec<String> {
+    ms.iter()
+        .flat_map(|m| {
+            m.orphans.iter().map(move |o| {
+                format!(
+                    "orphan {o} on {}: an agent no open task owns; `pastor task close {o}` closes it",
+                    m.name
+                )
+            })
+        })
+        .collect()
+}
+
 /// The first row of `machine list`: the head itself. It runs no tasks, so it
 /// is not a machine and has no agents, tags or error of its own. Its
 /// `pastor_version` is this binary's, which is always known.
@@ -213,8 +247,8 @@ pub struct MachineRow {
     pub live: Option<usize>,
     pub max_agents: u32,
     pub tags: Vec<String>,
-    /// `MachineStatus::orphans`; empty from a probe, which has no store to
-    /// tell an orphan from a task's agent.
+    /// `MachineStatus::orphans`; a probe works them out itself from
+    /// `agent.list` and the store, and leaves them empty when it cannot.
     pub orphans: Vec<String>,
 }
 
@@ -680,6 +714,10 @@ mod tests {
             orphans: vec![],
             ..m.clone()
         };
+        let lines = orphan_lines(&[m.clone(), none.clone()]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("orphan t-4 on pi:"), "{}", lines[0]);
+        assert!(lines[1].contains("pastor task close t-9"));
         let rows = machine_rows(&head(), &[MachineRow::from(&m), MachineRow::from(&none)]);
         assert_eq!(rows[1][5], "3/4");
         assert_eq!(rows[1][6], "t-4,t-9");

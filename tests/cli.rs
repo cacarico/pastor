@@ -1117,7 +1117,7 @@ fn machine_list_shows_the_head_then_the_machines() {
     assert_eq!(
         lines[0],
         [
-            "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "TAGS", "ERROR"
+            "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS", "ERROR"
         ],
         "{stdout}"
     );
@@ -1126,7 +1126,7 @@ fn machine_list_shows_the_head_then_the_machines() {
     // HERDR is whatever herdr this host has, so only the columns after it.
     assert_eq!(
         &lines[1][4..],
-        [env!("CARGO_PKG_VERSION"), "-", "-"],
+        [env!("CARGO_PKG_VERSION"), "-", "-", "-"],
         "{stdout}"
     );
     assert_eq!(
@@ -1235,14 +1235,14 @@ fn machine_list_without_daemon_probes_each_machine() {
     assert_eq!(lines[1][0], "pastor", "{stdout}");
     assert_eq!(lines[1][2], "head", "{stdout}");
     assert_eq!(lines[2][..3], ["fake", "fake-herdr", "probed"], "{stdout}");
-    assert_eq!(&lines[2][4..], ["-", "0/2", "arm"], "{stdout}");
+    assert_eq!(&lines[2][4..], ["-", "0/2", "-", "arm"], "{stdout}");
     assert_eq!(
         lines[3][..3],
         ["gone", "no-such-bridge", "unreachable"],
         "{stdout}"
     );
     assert_eq!(lines[3][3..6], ["-", "-", "-/1"], "{stdout}");
-    assert!(lines[3].len() > 7, "ERROR should say why: {stdout}");
+    assert!(lines[3].len() > 8, "ERROR should say why: {stdout}");
 
     // The same JSON shape as with a head.
     let out = run(&["machine", "list", "--json"]);
@@ -1478,4 +1478,165 @@ fn machine_list_treats_an_unresponsive_daemon_as_running_not_absent() {
         !message.contains("not running"),
         "an unresponsive daemon must not be reported as absent: {message}"
     );
+}
+
+impl Env {
+    fn json(&self, args: &[&str]) -> serde_json::Value {
+        let out = self.cmd(args);
+        assert!(
+            out.status.success(),
+            "pastor {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "pastor {args:?}: {e}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    /// A runtime error: exit 1 and the JSON error on stderr with this code.
+    fn fails_with(&self, args: &[&str], code: &str) {
+        let out = self.cmd(args);
+        assert_eq!(out.status.code(), Some(1), "pastor {args:?}");
+        let err: serde_json::Value = serde_json::from_slice(&out.stderr)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
+        assert_eq!(err["code"], code, "pastor {args:?}: {err}");
+    }
+
+    fn wait_for(&self, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let out = self.cmd(args);
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            if ok(&text) {
+                return text;
+            }
+            assert!(Instant::now() < deadline, "never saw {what}: {text}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Force a task's row into `state` behind the daemon's back, as a
+    /// dispatch that failed after `agent.start` would leave it. Retried: the
+    /// daemon may write the same row in between (optimistic update).
+    fn set_state(&self, id: i64, state: pastor::task::TaskState) {
+        let store = pastor::store::Store::open(&self.state.join("pastor.db")).unwrap();
+        for _ in 0..50 {
+            let mut t = store.get_task(id).unwrap().unwrap();
+            t.state = state;
+            if store.update_task(&mut t).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("could not set t-{id} to {state}");
+    }
+}
+
+#[test]
+fn task_retry_close_and_prune_end_to_end() {
+    let env = start();
+    let t1 = env.json(&["run", "first", "--json"]);
+    assert_eq!(t1["state"], "running");
+    env.wait_for("t-1 done", &["task", "show", "t-1", "--json"], |t| {
+        t.contains("\"done\"")
+    });
+    // Only failed or stale tasks retry.
+    env.fails_with(&["task", "retry", "t-1"], "not_retryable");
+    env.fails_with(&["task", "retry", "t-99"], "task_not_found");
+
+    // A failed row whose agent is still up: retry makes a new task, and the
+    // old agent is an orphan until it is closed.
+    env.set_state(1, pastor::task::TaskState::Failed);
+    let t2 = env.json(&["task", "retry", "t-1", "--json"]);
+    assert_eq!(t2["id"], 2);
+    assert_eq!(t2["retry_of"], 1);
+    assert_eq!(t2["state"], "running");
+    let list = env.wait_for("the orphan in list", &["list"], |t| t.contains("orphan"));
+    assert!(list.contains("t-1") && list.contains("fake"), "{list}");
+    let status = env.json(&["machine", "list", "--json"]);
+    assert_eq!(
+        status["machines"][0]["orphans"],
+        serde_json::json!(["t-1"]),
+        "{status}"
+    );
+
+    let closed = env.json(&["task", "close", "t-1", "--json"]);
+    assert_eq!(closed["state"], "closed");
+    env.wait_for("no orphan", &["list"], |t| !t.contains("orphan"));
+
+    // Close with and without --remove-worktree.
+    env.fails_with(
+        &["task", "close", "t-2", "--remove-worktree"],
+        "no_worktree",
+    );
+    let out = env.cmd(&["task", "close", "t-2"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("closed"));
+    let t3 = env.json(&["run", "third", "--worktree", "--repo", "/tmp/r", "--json"]);
+    assert_eq!(t3["state"], "running");
+    let closed = env.json(&["task", "close", "t-3", "--remove-worktree", "--json"]);
+    assert_eq!(closed["state"], "closed");
+    let out = env.cmd(&["run", "no repo", "--worktree"]);
+    assert_eq!(out.status.code(), Some(2), "clap refuses --worktree alone");
+
+    // Prune: every closed task finished before "now minus 0s".
+    let out = env.cmd(&["task", "prune", "--older-than", "3d"]);
+    assert_eq!(out.status.code(), Some(2), "a state flag is required");
+    let pruned = env.json(&["task", "prune", "--done", "--older-than", "3d", "--json"]);
+    assert_eq!(pruned["pruned"], 0);
+    let pruned = env.json(&["task", "prune", "--closed", "--older-than", "0s", "--json"]);
+    assert_eq!(pruned["pruned"], 3);
+    env.fails_with(&["task", "show", "t-1"], "task_not_found");
+    let out = env.cmd(&[
+        "task",
+        "prune",
+        "--failed",
+        "--closed",
+        "--older-than",
+        "1d",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("pruned 0"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Without a head, prune still works on the database; retry and close need
+/// the daemon and say so with a stable code.
+#[test]
+fn prune_works_without_a_daemon_and_retry_does_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", tmp.path().join("c"))
+            .env("PASTOR_STATE_DIR", tmp.path().join("s"))
+            .output()
+            .unwrap()
+    };
+    let out = run(&["task", "prune", "--done", "--older-than", "1d", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["pruned"], 0);
+    for args in [["task", "retry", "t-1"], ["task", "close", "t-1"]] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(1));
+        let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(err["code"], "daemon_not_running", "{err}");
+    }
+    let out = run(&["task", "retry", "x-1"]);
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["code"], "usage_error");
 }

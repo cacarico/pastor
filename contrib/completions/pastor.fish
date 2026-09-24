@@ -39,13 +39,16 @@ complete -c pastor -n "__fish_pastor_needs_command" -f -a "setup" -d 'Install pa
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "plugin" -d 'Install, link, list and try out plugins'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand serve" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach help" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach help" -f -a "run" -d 'Create a one-off task and dispatch it'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach help" -f -a "show" -d 'Show one task row'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach help" -f -a "read" -d 'Read recent output from a task\'s pane'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "run" -d 'Create a one-off task and dispatch it'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "show" -d 'Show one task row'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "read" -d 'Read recent output from a task\'s pane'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l repo -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l machine -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l agent -r
@@ -53,7 +56,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l branch -d 'Branch for the worktree (needs --worktree; a plain workspace has no branch)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l tag -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l timeout -r
-complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l worktree
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l worktree -d 'A git worktree per task, branched from --repo (so it needs --repo)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l json
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l job -d 'Only tasks from this job (omit for one-off `run` tasks)' -r
@@ -68,11 +71,25 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from read" -l lines -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from read" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from attach" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from retry" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from retry" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -l remove-worktree -d 'Remove the task\'s worktree too (refused if it has uncommitted changes)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l older-than -d 'Only tasks that finished longer ago than this (30m, 12h, 3d)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l done -d 'Prune done tasks'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l failed -d 'Prune failed tasks'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l closed -d 'Prune closed tasks'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "run" -d 'Create a one-off task and dispatch it'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "show" -d 'Show one task row'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "read" -d 'Read recent output from a task\'s pane'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove list help" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove list help" -f -a "add"
@@ -177,6 +194,9 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "show" -d 'Show one task row'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "read" -d 'Read recent output from a task\'s pane'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "add"
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "remove"
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "list" -d 'The head, then each machine: host, channel, herdr, agents'

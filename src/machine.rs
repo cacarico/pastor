@@ -305,6 +305,21 @@ struct Actor {
     orphans: Vec<(String, String)>,
 }
 
+/// Agents named `t-<id>` that none of `owned` (the pane-owning tasks on the
+/// machine, `Store::tasks_on_machine`) accounts for, as (agent name, pane id).
+/// Shared by the actor's reconcile and the daemon-less `machine status`.
+pub fn orphan_agents(agents: &[AgentInfo], owned: &[Task]) -> Vec<(String, String)> {
+    let owned: std::collections::HashSet<i64> = owned.iter().map(|t| t.id).collect();
+    agents
+        .iter()
+        .filter_map(|a| {
+            let name = a.name.as_deref()?;
+            let id = task_id_of_agent(name)?;
+            (!owned.contains(&id)).then(|| (name.to_string(), a.pane_id.clone()))
+        })
+        .collect()
+}
+
 /// The task id in an agent name pastor gives (`t-<id>`), and nothing looser:
 /// `parse_task_id` also takes a bare number, which a human could name an agent.
 fn task_id_of_agent(name: &str) -> Option<i64> {
@@ -1446,20 +1461,7 @@ impl Actor {
     /// Read after the reconcile pass above, so a task it just failed or closed
     /// counts as not owning its agent any more.
     fn find_orphans(&mut self, agents: &[AgentInfo]) -> anyhow::Result<()> {
-        let owned: std::collections::HashSet<i64> = self
-            .store
-            .tasks_on_machine(&self.name)?
-            .iter()
-            .map(|t| t.id)
-            .collect();
-        let found: Vec<(String, String)> = agents
-            .iter()
-            .filter_map(|a| {
-                let name = a.name.as_deref()?;
-                let id = task_id_of_agent(name)?;
-                (!owned.contains(&id)).then(|| (name.to_string(), a.pane_id.clone()))
-            })
-            .collect();
+        let found = orphan_agents(agents, &self.store.tasks_on_machine(&self.name)?);
         for (name, pane) in &found {
             if !self.orphans.iter().any(|(n, _)| n == name) {
                 tracing::warn!(machine = %self.name, agent = %name, %pane, "orphaned agent: no open task owns it; `pastor task close` closes it");

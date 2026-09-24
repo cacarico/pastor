@@ -190,6 +190,12 @@ enum TaskCmd {
     },
     /// Attach to a task's agent terminal (ctrl+b q detaches)
     Attach { task: String },
+    /// Re-dispatch a failed or stale task as a new task (retry_of points back)
+    Retry(pastor::task_cli::RetryArgs),
+    /// Close a task's pane (and with --remove-worktree its worktree), or an orphaned agent
+    Close(pastor::task_cli::CloseArgs),
+    /// Delete old finished tasks; their items stay seen
+    Prune(pastor::task_cli::PruneArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -289,6 +295,9 @@ fn main() {
         }
     });
     if let Err(err) = result {
+        if let Some(e) = err.downcast_ref::<pastor::cli::CliError>() {
+            fail(&e.code, &e.message);
+        }
         fail("runtime_error", &format!("{err:#}"));
     }
 }
@@ -496,14 +505,27 @@ fn probe_fields(
 
 /// One machine's row from a probe made here, without the head. Two ordinary
 /// calls, each on its own connection, exactly as the head makes them: herdr
-/// answers one request per connection.
-async fn probe_machine(m: &MachineConfig, paths: &Paths) -> pastor::cli::MachineRow {
+/// answers one request per connection. Orphans are agents no open task owns;
+/// the rows live in the store here even with no head running.
+async fn probe_machine(
+    m: &MachineConfig,
+    paths: &Paths,
+    store: &Store,
+) -> anyhow::Result<pastor::cli::MachineRow> {
     let ep = Endpoint::from_machine(m, paths);
     let ping = ep.ping().await;
-    let agent_count = match &ping {
-        Ok(_) => Some(ep.agent_list().await.map(|a| a.len())),
+    let agents = match &ping {
+        Ok(_) => Some(ep.agent_list().await),
         Err(_) => None,
     };
+    let orphans: Vec<String> = match &agents {
+        Some(Ok(list)) => pastor::machine::orphan_agents(list, &store.tasks_on_machine(&m.name)?)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect(),
+        _ => vec![],
+    };
+    let agent_count = agents.map(|r| r.map(|a| a.len()));
     // Only a machine that answered is worth the extra ssh. A failure here
     // leaves the version unknown and the probe's verdict alone, as it does
     // on the head.
@@ -512,7 +534,7 @@ async fn probe_machine(m: &MachineConfig, paths: &Paths) -> pastor::cli::Machine
         Err(_) => None,
     };
     let (channel, herdr_version, protocol, live, error) = probe_fields(ping, agent_count);
-    pastor::cli::MachineRow {
+    Ok(pastor::cli::MachineRow {
         name: m.name.clone(),
         host: ep.host(),
         endpoint: ep.describe(),
@@ -524,8 +546,8 @@ async fn probe_machine(m: &MachineConfig, paths: &Paths) -> pastor::cli::Machine
         live,
         max_agents: m.max_agents,
         tags: m.tags.clone(),
-        orphans: vec![],
-    }
+        orphans,
+    })
 }
 
 /// The head's row: this machine's hostname and the herdr it has, if any. Read
@@ -599,9 +621,10 @@ async fn machine_list(paths: &Paths, json: bool, only: Option<String>) -> anyhow
             // Connects without the head, so the state dir the ssh master sockets
             // live under may not exist yet, and must be private.
             paths.ensure()?;
+            let store = Store::open(&paths.db_file())?;
             let mut rows = Vec::new();
             for m in f.machines.iter().filter(|m| wanted(&m.name)) {
-                rows.push(probe_machine(m, paths).await);
+                rows.push(probe_machine(m, paths, &store).await?);
             }
             (
                 rows,
@@ -670,7 +693,8 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         machine: a.machine,
         states,
     };
-    let tasks = if daemon_running(&paths.socket_file()).await {
+    let daemon_up = daemon_running(&paths.socket_file()).await;
+    let tasks = if daemon_up {
         let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
             unreachable!()
         };
@@ -696,6 +720,17 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
             "{}",
             pastor::cli::table(&pastor::cli::TASK_HEADER, &pastor::cli::task_rows(&tasks))
         );
+    }
+    // Orphans have no row to list, so they get a line each under the table.
+    // Only a running head knows them (its last reconcile); `--json` stays a
+    // plain task array, and `machine list --json` carries them instead.
+    if daemon_up && !a.json {
+        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
+            unreachable!()
+        };
+        for line in pastor::cli::orphan_lines(&ms) {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -743,6 +778,9 @@ async fn task(paths: &Paths, cmd: TaskCmd) -> anyhow::Result<()> {
             print!("{text}");
         }
         TaskCmd::Attach { task } => attach(paths, &task).await?,
+        TaskCmd::Retry(a) => pastor::task_cli::retry(paths, a).await?,
+        TaskCmd::Close(a) => pastor::task_cli::close(paths, a).await?,
+        TaskCmd::Prune(a) => pastor::task_cli::prune(paths, a).await?,
     }
     Ok(())
 }
