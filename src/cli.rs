@@ -84,6 +84,14 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Errors carry raw stderr, newlines included; a human line (an events
+/// record, a `task show` field) must stay one line. The escapes keep what was
+/// there visible, as JSON does, rather than folding it into spaces that read
+/// like the original text.
+pub fn one_line(s: &str) -> String {
+    s.replace('\r', "\\r").replace('\n', "\\n")
+}
+
 /// `pastor task show`: every field a human asks about one task, one per line,
 /// then the prompt. The agent args are shell-quoted, so the line reads as the
 /// command herdr runs.
@@ -132,7 +140,7 @@ pub fn task_detail(t: &Task) -> String {
         ("finished", when(t.finished_at)),
     ];
     if let Some(e) = &t.error {
-        fields.push(("error", e.clone()));
+        fields.push(("error", one_line(e)));
     }
     let mut out: Vec<String> = fields
         .into_iter()
@@ -297,6 +305,29 @@ mod tests {
             ..spec
         }));
         assert!(bare.contains("agent args: -"), "{bare}");
+    }
+
+    /// An error can be raw multi-line stderr; it must stay one field on one
+    /// line, escaped the way the events log's human lines escape it.
+    #[test]
+    fn task_detail_keeps_a_multiline_error_on_its_line() {
+        let mut t = task_with(crate::task::DispatchSpec {
+            agent: "claude".into(),
+            agent_args: vec![],
+            repo: None,
+            worktree: false,
+            branch: None,
+            machine: None,
+            tags: vec![],
+            timeout_secs: 60,
+        });
+        t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("\nerror:      ssh failed:\\nPermission denied\\r\\nbye\nprompt:"),
+            "{out}"
+        );
+        assert!(!out.contains('\r'), "{out:?}");
     }
 
     #[test]

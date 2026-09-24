@@ -136,19 +136,12 @@ impl EventRecord {
             cols.push(e.clone());
         }
         cols.iter()
-            .map(|c| one_line(c))
+            .map(|c| crate::cli::one_line(c))
             .collect::<Vec<_>>()
             .join("  ")
             .trim_end()
             .to_string()
     }
-}
-
-/// Errors carry raw stderr, newlines included; one record must stay one
-/// output line. The escapes keep what was there visible, as JSON does,
-/// rather than folding it into spaces that read like the original text.
-fn one_line(s: &str) -> String {
-    s.replace('\r', "\\r").replace('\n', "\\n")
 }
 
 fn rotated(path: &Path) -> PathBuf {
