@@ -38,7 +38,18 @@ pub enum ChannelState {
     Connecting,
     Connected,
     Reconnecting,
+    /// Requests answer but `events.subscribe` will not open: tasks are tracked
+    /// by `agent.list` every `poll_every` until a subscribe succeeds.
+    Polling,
     Incompatible,
+}
+
+impl ChannelState {
+    /// May the dispatcher place a task here? Only states in which requests are
+    /// known to answer.
+    pub fn accepts_dispatch(&self) -> bool {
+        matches!(self, ChannelState::Connected | ChannelState::Polling)
+    }
 }
 
 impl std::fmt::Display for ChannelState {
@@ -47,6 +58,7 @@ impl std::fmt::Display for ChannelState {
             ChannelState::Connecting => "connecting",
             ChannelState::Connected => "connected",
             ChannelState::Reconnecting => "reconnecting",
+            ChannelState::Polling => "polling",
             ChannelState::Incompatible => "incompatible",
         })
     }
@@ -80,6 +92,9 @@ pub struct MachineSettings {
     /// a whole: otherwise a slow agent surfaces as "request timed out" (and a
     /// reconnect) instead of the readiness failure it is.
     pub agent_ready_timeout: Duration,
+    /// While `Polling`, how often `agent.list` reconciles. The daemon passes its
+    /// `tick`, the spec's "each tick for a polling machine".
+    pub poll_every: Duration,
 }
 
 impl Default for MachineSettings {
@@ -91,6 +106,7 @@ impl Default for MachineSettings {
             max_backoff: Duration::from_secs(60),
             request_timeout: Duration::from_secs(60),
             agent_ready_timeout: Duration::from_secs(30),
+            poll_every: Duration::from_secs(10),
         }
     }
 }
@@ -98,8 +114,12 @@ impl Default for MachineSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PastorEvent {
     pub kind: String,
+    #[serde(default)]
     pub task_id: Option<i64>,
-    pub machine: String,
+    #[serde(default)]
+    pub machine: Option<String>,
+    #[serde(default)]
+    pub job: Option<String>,
 }
 
 pub enum MachineCommand {
@@ -284,9 +304,28 @@ impl Actor {
             let mut events = match self.open_events().await {
                 Ok(s) => s,
                 Err(err) => {
-                    self.connect_failed(format!("events: {err}"), &mut backoff)
-                        .await;
-                    continue;
+                    // ping and reconcile just succeeded: requests answer, only
+                    // the subscription is missing. That is a machine to poll,
+                    // not one to declare lost.
+                    tracing::warn!(machine = %self.name, %err, "events will not open; polling");
+                    self.set_channel(ChannelState::Polling, Some(format!("events: {err}")));
+                    self.announce_connected();
+                    self.refresh_live();
+                    match self.poll_until_subscribed(&mut backoff).await {
+                        Some(s) => s,
+                        None => {
+                            // A request failed while polling: the machine is gone
+                            // after all. Fall through to the reconnect path.
+                            self.set_channel(
+                                ChannelState::Reconnecting,
+                                Some("connection lost".into()),
+                            );
+                            self.announce_lost();
+                            self.drain_commands_while_down(backoff).await;
+                            backoff = (backoff * 2).min(self.settings.max_backoff);
+                            continue;
+                        }
+                    }
                 }
             };
             // Connected. `backoff` is deliberately left alone here: a flappy
@@ -433,7 +472,8 @@ impl Actor {
         let _ = self.events.send(PastorEvent {
             kind: kind.into(),
             task_id,
-            machine: self.name.clone(),
+            machine: Some(self.name.clone()),
+            job: None,
         });
     }
 
@@ -462,13 +502,58 @@ impl Actor {
         )
     }
 
+    /// The `Polling` loop: serve commands, reconcile every `poll_every`, retry
+    /// the subscription with backoff. `Some(stream)` once a subscribe succeeds;
+    /// `None` when a request failed below the API, which means a full reconnect.
+    async fn poll_until_subscribed(&mut self, backoff: &mut Duration) -> Option<EventStream> {
+        let mut poll = tokio::time::interval(self.settings.poll_every);
+        poll.tick().await; // fires immediately; we reconciled a moment ago
+        let retry = tokio::time::sleep(*backoff);
+        tokio::pin!(retry);
+        loop {
+            tokio::select! {
+                cmd = self.rx.recv() => {
+                    let cmd = cmd?;
+                    match self.handle_command(cmd).await {
+                        // A resubscribe request is what the retry timer does anyway.
+                        CommandOutcome::Nothing | CommandOutcome::Resubscribe => {}
+                        CommandOutcome::Reconnect => return None,
+                    }
+                }
+                _ = poll.tick() => {
+                    if let Err(err) = self.reconcile().await {
+                        tracing::warn!(machine = %self.name, %err, "poll reconcile failed");
+                        return None;
+                    }
+                    if let Err(err) = self.confirm_pending_done().await {
+                        tracing::warn!(machine = %self.name, %err, "settle check failed");
+                        return None;
+                    }
+                }
+                _ = &mut retry => {
+                    match self.open_events().await {
+                        Ok(s) => {
+                            *backoff = self.settings.initial_backoff;
+                            return Some(s);
+                        }
+                        Err(err) => {
+                            *backoff = (*backoff * 2).min(self.settings.max_backoff);
+                            tracing::debug!(machine = %self.name, %err, next_in = ?backoff, "subscribe still failing");
+                            retry.as_mut().reset(tokio::time::Instant::now() + *backoff);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn handle_command(&mut self, cmd: MachineCommand) -> CommandOutcome {
         match cmd {
             MachineCommand::Dispatch { task_id, reply } => {
                 let (result, dead) = self.run_dispatch(task_id).await;
                 let changed = result.is_ok();
-                let _ = reply.send(result);
                 self.refresh_live();
+                let _ = reply.send(result);
                 match (dead, changed) {
                     (true, _) => CommandOutcome::Reconnect,
                     (false, true) => CommandOutcome::Resubscribe,
@@ -937,6 +1022,7 @@ mod tests {
             max_backoff: Duration::from_millis(200),
             request_timeout: Duration::from_secs(5),
             agent_ready_timeout: Duration::from_millis(500),
+            poll_every: Duration::from_millis(200),
         }
     }
 
@@ -1519,12 +1605,14 @@ mod tests {
     }
 
     /// Every request is served by the fake except `events.subscribe`, which gets
-    /// a connection that closes without answering. Selecting by method, not by
-    /// call parity: a connect attempt makes several ordinary calls (ping,
-    /// reconcile's `agent.list`) before it subscribes, so a parity rule would
-    /// fail one of those instead and never reach `open_events` at all.
+    /// a connection that closes without answering until `subscribes` reaches
+    /// `fail_until`. Selecting by method, not by call parity: a connect attempt
+    /// makes several ordinary calls (ping, reconcile's `agent.list`) before it
+    /// subscribes, so a parity rule would fail one of those instead and never
+    /// reach `open_events` at all.
     struct FlakyEvents {
         subscribes: Arc<std::sync::atomic::AtomicUsize>,
+        fail_until: usize,
         fake: FakeHerdr,
     }
 
@@ -1532,6 +1620,7 @@ mod tests {
         fn connect(&self) -> ConnectFuture<'_> {
             let fake = self.fake.clone();
             let subscribes = self.subscribes.clone();
+            let fail_until = self.fail_until;
             Box::pin(async move {
                 let (a, b) = tokio::io::duplex(64 * 1024);
                 let (ar, aw) = tokio::io::split(a);
@@ -1548,8 +1637,43 @@ mod tests {
                         return;
                     };
                     if req.method == "events.subscribe" {
-                        subscribes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        return; // dropping `writer` is the EOF the subscribe sees
+                        let n = subscribes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if n < fail_until {
+                            return; // dropping `writer` is the EOF the subscribe sees
+                        }
+                        // Past the failures: hand the subscription to the fake for real.
+                        let mut stream = match fake
+                            .subscribe(
+                                req.params
+                                    .get("subscriptions")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                            .await
+                        {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+                        let ack = serde_json::json!({"id": req.id, "result": {"type": "subscription_started"}});
+                        if writer
+                            .write_all(format!("{ack}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        while let Ok(ev) = stream.next().await {
+                            let line = serde_json::to_string(&ev).unwrap();
+                            if writer
+                                .write_all(format!("{line}\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        return;
                     }
                     // Anything else is relayed to the fake on a connection of its
                     // own and the reply is handed back with the caller's id.
@@ -1578,6 +1702,7 @@ mod tests {
         let subscribes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let connector = FlakyEvents {
             subscribes: subscribes.clone(),
+            fail_until: usize::MAX,
             fake,
         };
         let _h = spawn_machine(
@@ -1600,6 +1725,94 @@ mod tests {
             (2..12).contains(&n),
             "events.subscribe attempted {n} times in 300ms: expected a few, backing off"
         );
+    }
+
+    /// Requests work (ping, agent.list) but the event subscription will not open:
+    /// the spec's `polling` state. The machine stays dispatchable, tasks are
+    /// tracked by reconcile every `poll_every`, no `machine.lost` is announced,
+    /// and the first successful subscribe returns it to `connected`.
+    #[tokio::test]
+    async fn a_machine_whose_events_will_not_open_polls_instead_of_dropping() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, mut rx) = broadcast::channel(64);
+        let subscribes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut settings = settings();
+        settings.poll_every = Duration::from_millis(100);
+        let h = spawn_machine(
+            "m".into(),
+            2,
+            vec![],
+            Arc::new(FlakyEvents {
+                subscribes: subscribes.clone(),
+                fail_until: 3,
+                fake: fake.clone(),
+            }),
+            store.clone(),
+            settings,
+            events,
+        );
+        wait_for("polling", || h.snapshot().channel == ChannelState::Polling).await;
+        assert!(
+            h.snapshot()
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("events"),
+            "{:?}",
+            h.snapshot().error
+        );
+
+        // Dispatch works while polling.
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        // Without an event stream, only the poll can see this change.
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Blocked, None);
+        wait_for("blocked via poll", || {
+            state_of(&store, t.id) == TaskState::Blocked
+        })
+        .await;
+
+        wait_for("connected once the subscribe succeeds", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        // Never lost: the machine answered every request throughout.
+        while let Ok(ev) = rx.try_recv() {
+            assert_ne!(ev.kind, "machine.lost", "{ev:?}");
+        }
+    }
+
+    /// The reply to a dispatch must carry an already-refreshed live count: a
+    /// caller that reads `snapshot().live` the moment `dispatch` returns is the
+    /// serialised dispatch pass deciding whether the machine has room left.
+    #[tokio::test]
+    async fn live_count_is_current_when_dispatch_replies() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        for expected in 1..=2 {
+            h.dispatch(new_task(&store).id).await.unwrap();
+            assert_eq!(h.snapshot().live, expected, "live count lagged the reply");
+        }
+    }
+
+    #[test]
+    fn channel_states_that_accept_dispatch() {
+        assert!(ChannelState::Connected.accepts_dispatch());
+        assert!(ChannelState::Polling.accepts_dispatch());
+        for s in [
+            ChannelState::Connecting,
+            ChannelState::Reconnecting,
+            ChannelState::Incompatible,
+        ] {
+            assert!(!s.accepts_dispatch(), "{s}");
+        }
+        assert_eq!(ChannelState::Polling.to_string(), "polling");
     }
 
     /// Wraps a fake and can be broken: while broken, every connection it hands
