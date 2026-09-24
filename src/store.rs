@@ -501,7 +501,16 @@ fn row_to_job_state(row: &Row<'_>) -> rusqlite::Result<JobState> {
         last_result: row.get("last_result")?,
         last_error: row.get("last_error")?,
         cursor: row.get("cursor")?,
-        failures: u32::try_from(row.get::<_, i64>("failures")?).map_err(conversion_failure)?,
+        failures: {
+            let idx = row.as_ref().column_index("failures")?;
+            u32::try_from(row.get::<_, i64>(idx)?).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    idx,
+                    rusqlite::types::Type::Integer,
+                    format!("failures: {e}").into(),
+                )
+            })?
+        },
         backoff_until: parse_dt(row.get("backoff_until")?)?,
     })
 }
@@ -743,6 +752,26 @@ mod tests {
         s.execute_raw("UPDATE job_state SET failures = -1 WHERE name = 'a'");
         assert!(s.job_state("a").is_err(), "-1 must not read as 4294967295");
         assert!(s.job_states().is_err());
+    }
+
+    #[test]
+    fn a_negative_failure_count_names_its_column_and_type() {
+        let s = Store::open_in_memory().unwrap();
+        s.save_job_state(&JobState {
+            name: "a".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        s.execute_raw("UPDATE job_state SET failures = -1 WHERE name = 'a'");
+        let err = s.job_state("a").unwrap_err();
+        match err.downcast_ref::<rusqlite::Error>() {
+            Some(rusqlite::Error::FromSqlConversionFailure(idx, ty, _)) => {
+                assert_eq!(*idx, 6, "failures is column 6 of job_state");
+                assert_eq!(*ty, rusqlite::types::Type::Integer);
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
+        assert!(err.to_string().contains("failures"), "{err}");
     }
 
     fn table_names(path: &Path) -> Vec<String> {
