@@ -9,7 +9,7 @@ use crate::config::{PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
-use crate::machine::{ChannelState, MachineHandle, MachineSettings, PastorEvent, spawn_machine};
+use crate::machine::{MachineHandle, MachineSettings, PastorEvent, spawn_machine};
 use crate::store::{NewTask, Store};
 
 pub struct Daemon {
@@ -35,6 +35,7 @@ impl Daemon {
             reconcile_every: config.reconcile_duration(),
             request_timeout: config.request_timeout_duration(),
             agent_ready_timeout: config.agent_ready_timeout_duration(),
+            poll_every: config.tick_duration(),
             ..Default::default()
         };
         let connectors: Vec<Arc<dyn Connector>> = match connectors {
@@ -168,7 +169,7 @@ impl Daemon {
                 }
                 _ = tick.tick() => daemon.dispatch_queued().await,
                 ev = events.recv() => match ev {
-                    Ok(ev) => tracing::info!(kind = %ev.kind, task = ?ev.task_id, machine = %ev.machine, "pastor event"),
+                    Ok(ev) => tracing::info!(kind = %ev.kind, task = ?ev.task_id, machine = ?ev.machine, job = ?ev.job, "pastor event"),
                     Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(n, "event log lagged"),
                     Err(_) => {}
                 },
@@ -292,7 +293,7 @@ impl Daemon {
                     max_agents: m.max_agents,
                     tags: m.tags.clone(),
                     live: s.live,
-                    healthy: s.channel == ChannelState::Connected,
+                    healthy: s.channel.accepts_dispatch(),
                 }
             })
             .collect()
