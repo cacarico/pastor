@@ -166,17 +166,21 @@ pub enum DaemonProbe {
     Unresponsive,
 }
 
+/// Whether a failed connect to the daemon socket shows that no daemon is there.
+/// Only a refused connect or a missing path does; anything else, such as
+/// permission denied, may hide a live daemon. `probe_daemon` and the CLI's
+/// "not running" advice both use this so they cannot disagree.
+pub fn connect_error_means_no_daemon(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    )
+}
+
 pub async fn probe_daemon(socket: &Path) -> DaemonProbe {
     let stream = match tokio::net::UnixStream::connect(socket).await {
         Ok(s) => s,
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            return DaemonProbe::NotRunning;
-        }
+        Err(err) if connect_error_means_no_daemon(&err) => return DaemonProbe::NotRunning,
         Err(_) => return DaemonProbe::Unresponsive,
     };
     match tokio::time::timeout(PING_TIMEOUT, round_trip(stream, &IpcRequest::Ping)).await {
