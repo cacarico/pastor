@@ -37,9 +37,14 @@ them too; they are repeated here because getting them wrong cost a day.
   the state dir, `ControlPersist=600`) plus one long-lived events connection.
 - `agent.start` returns before the agent process is up. `agent.prompt`
   answers `agent_not_ready` while it launches, and also when the agent has
-  exited. pastor polls `agent.list` until the agent is ready (30s bound),
-  fails fast if it vanishes, and treats `agent_blocked` as the only route to
-  the `blocked` state.
+  exited. pastor polls `agent.list` until the agent is ready (30s bound)
+  and fails fast if it vanishes or exits.
+- An agent stuck on its own startup question (Claude's folder trust dialog)
+  shows `agent_status: blocked` with `launch_pending: true`; herdr's
+  `agent.prompt` checks `blocked` before `launch_pending`, so it answers
+  `agent_blocked`. pastor marks the task `blocked` without prompting, and
+  once the block clears the agent goes straight to active and the pending
+  prompt is sent.
 - A herdr error reply is an API error with a code, never a dead connection.
   Only EOF before a reply, spawn failure or a non-zero exit with no reply are
   transport failures, and only those make a machine `lost`.
