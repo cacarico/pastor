@@ -145,6 +145,7 @@ Not yet assigned a plan:
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.local/state/pastor/pastor.db   tasks, seen keys, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
 ```
 
