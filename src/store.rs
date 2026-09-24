@@ -43,6 +43,25 @@ pub struct Conflict {
     pub id: i64,
 }
 
+/// Why `insert_retry` made no copy. Each has its own stable IPC code, so a
+/// row pruned under a concurrent retry, or a storage failure, is not
+/// reported as `not_retryable`.
+#[derive(Debug, thiserror::Error)]
+pub enum RetryError {
+    #[error("task t-{0} not found")]
+    NotFound(i64),
+    #[error("t-{id} is {state}; only failed or stale tasks can be retried")]
+    NotRetryable { id: i64, state: TaskState },
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
+impl From<rusqlite::Error> for RetryError {
+    fn from(err: rusqlite::Error) -> Self {
+        RetryError::Store(err.into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NewTask {
     pub job: String,
@@ -290,7 +309,7 @@ impl Store {
     /// old one: the agent is named after the id, and the old agent `t-<of>`
     /// may still be alive on its machine (a stale task always is). Refused
     /// unless `of` is failed or stale. The `seen` row keeps pointing at `of`.
-    pub fn insert_retry(&self, of: i64) -> anyhow::Result<Task> {
+    pub fn insert_retry(&self, of: i64) -> Result<Task, RetryError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         // Check and copy in one statement, so a task closed, pruned or
@@ -307,16 +326,17 @@ impl Store {
                     r.get(0)
                 })
                 .optional()?;
-            match state {
-                None => anyhow::bail!("task t-{of} not found"),
-                Some(state) => anyhow::bail!(
-                    "task t-{of} is {state}; only failed or stale tasks can be retried"
-                ),
-            }
+            return Err(match state {
+                None => RetryError::NotFound(of),
+                Some(state) => RetryError::NotRetryable {
+                    id: of,
+                    state: state.parse().map_err(anyhow::Error::msg)?,
+                },
+            });
         }
         let id = conn.last_insert_rowid();
         drop(conn);
-        self.get_task(id)?.context("task vanished after insert")
+        Ok(self.get_task(id)?.context("task vanished after insert")?)
     }
 
     /// Mark task `id` closed, keeping the finish time of a task that already
@@ -1328,9 +1348,16 @@ mod tests {
         ] {
             set_state(&s, old.id, state);
             let err = s.insert_retry(old.id).unwrap_err();
+            assert!(
+                matches!(err, RetryError::NotRetryable { id, state: st } if id == old.id && st == state),
+                "{err}"
+            );
             assert!(err.to_string().contains("only failed or stale"), "{err}");
         }
-        assert!(s.insert_retry(99).is_err());
+        assert!(matches!(
+            s.insert_retry(99).unwrap_err(),
+            RetryError::NotFound(99)
+        ));
 
         for state in [TaskState::Failed, TaskState::Stale] {
             let mut o = set_state(&s, old.id, state);
@@ -1354,6 +1381,20 @@ mod tests {
             "the old row is left alone"
         );
         assert!(s.is_seen("j", "k1").unwrap());
+    }
+
+    #[test]
+    fn insert_retry_reports_a_storage_failure_as_such() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        set_state(&s, t.id, TaskState::Failed);
+        s.execute_raw(
+            "CREATE TRIGGER no_insert BEFORE INSERT ON tasks BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        );
+        assert!(matches!(
+            s.insert_retry(t.id).unwrap_err(),
+            RetryError::Store(_)
+        ));
     }
 
     #[test]

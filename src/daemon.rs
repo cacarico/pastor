@@ -11,7 +11,7 @@ use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
 use crate::machine::{MachineHandle, MachineSettings, OrphanClosed, PastorEvent, spawn_machine};
 use crate::scheduler::{Scheduler, SchedulerHandle};
-use crate::store::{NewTask, Store};
+use crate::store::{NewTask, RetryError, Store};
 use crate::task::TaskState;
 
 /// The machines plus the one lock every dispatch pass takes. Shared by the
@@ -468,26 +468,20 @@ impl Daemon {
     /// dispatched at once like a `Run`. Answers the new row as it stands after
     /// the dispatch pass.
     async fn retry(&self, id: i64) -> IpcResponse {
-        match self.store.get_task(id) {
-            Ok(Some(t)) if !t.state.is_retryable() => {
-                return IpcResponse::error(
-                    "not_retryable",
-                    format!(
-                        "{} is {}; only failed or stale tasks can be retried",
-                        t.display_id(),
-                        t.state
-                    ),
-                );
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => return IpcResponse::error("task_not_found", format!("t-{id}")),
-            Err(err) => return IpcResponse::error("store_error", err),
-        }
-        // The check above only picks the error code; the insert re-checks the
-        // state atomically, so a task closed in between is still refused.
+        // The store checks the state and copies in one statement; its error
+        // says which check failed, so a row pruned by a concurrent request is
+        // `task_not_found` and a storage failure is `store_error`.
         let task = match self.store.insert_retry(id) {
             Ok(t) => t,
-            Err(err) => return IpcResponse::error("not_retryable", err),
+            Err(err @ RetryError::NotFound(_)) => {
+                return IpcResponse::error("task_not_found", err);
+            }
+            Err(err @ RetryError::NotRetryable { .. }) => {
+                return IpcResponse::error("not_retryable", err);
+            }
+            Err(RetryError::Store(err)) => {
+                return IpcResponse::error("store_error", format!("{err:#}"));
+            }
         };
         let _ = self.events.send(PastorEvent {
             kind: "task.queued".into(),
@@ -1052,6 +1046,20 @@ mod tests {
         assert_eq!(
             error_code(d.handle(IpcRequest::TaskRetry { id: 99 }).await),
             "task_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_answers_a_storage_failure_as_store_error() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let failed = insert(&d, TaskState::Failed);
+        // Reads work, only the insert fails: the way a full disk looks.
+        d.store.execute_raw(
+            "CREATE TRIGGER no_insert BEFORE INSERT ON tasks BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        );
+        assert_eq!(
+            error_code(d.handle(IpcRequest::TaskRetry { id: failed.id }).await),
+            "store_error"
         );
     }
 
