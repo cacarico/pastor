@@ -688,6 +688,16 @@ impl Scheduler {
         for gone in self.entries.keys().filter(|k| !next.contains_key(*k)) {
             tracing::info!(job = %gone, "job file removed");
         }
+        // A removed or disabled job, or one moved to another connector, no
+        // longer needs its source; a stream's would otherwise keep running
+        // and buffering until the next forced reload.
+        let keep: HashSet<(String, String)> = next
+            .values()
+            .filter_map(|e| e.job.as_ref())
+            .filter(|j| j.enabled)
+            .map(|j| (j.connector.clone(), j.name.clone()))
+            .collect();
+        self.catalog.retain_jobs(&keep);
         self.entries = next;
         true
     }
@@ -1733,6 +1743,73 @@ mod tests {
         assert_eq!(r.created, vec!["t-1"], "{r:?}");
         let st = store.job_state("j").unwrap().unwrap();
         assert_eq!(st.cursor.as_deref(), Some("cur-1"));
+    }
+
+    /// A stream belongs to its job: when the job file goes, the next reload
+    /// drops the job's source and its process stops, without waiting for a
+    /// forced plugin reload or a restart.
+    #[tokio::test]
+    async fn a_removed_job_stops_its_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_stream(tmp.path());
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"))
+            .with_data_dir(tmp.path().join("d"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        let job_file = paths.jobs_dir().join("j.toml");
+        std::fs::write(
+            &job_file,
+            "every = \"1m\"\n[connector]\nuse = \"stream\"\n[dispatch]\nprompt = \"p\"\n",
+        )
+        .unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut s =
+            Scheduler::standalone(paths.clone(), &PastorConfig::default(), store).with_plugins();
+        s.reload();
+        let src = s.source_for("stream", "j").unwrap();
+        let _ = src
+            .run(RunInput {
+                config: json!({}),
+                cursor: None,
+                since: Utc::now(),
+                now: Utc::now(),
+            })
+            .await;
+        drop(src);
+        let pid_file = paths.plugin_state_dir("j").join("pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let pid = loop {
+            if let Ok(p) = std::fs::read_to_string(&pid_file)
+                && !p.trim().is_empty()
+            {
+                break p.trim().to_string();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // Alive, or a zombie not yet reaped: either way not running.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|st| {
+                st.rsplit(')')
+                    .next()
+                    .is_some_and(|r| !r.trim_start().starts_with('Z'))
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(running(), "up while its job exists");
+
+        std::fs::remove_file(&job_file).unwrap();
+        assert!(s.reload());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stream {pid} still running"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[test]

@@ -6,6 +6,7 @@
 pub mod clock;
 pub mod process;
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -93,6 +94,10 @@ pub trait Catalog: Send + Sync {
     fn source_for_job(&self, id: &str, _job: &str) -> Option<Arc<dyn ItemSource>> {
         self.source(id)
     }
+    /// Forget the job-scoped sources whose (connector, job) is not in `keep`:
+    /// the scheduler's jobs after a reload. Dropping a stream's source stops
+    /// its process once no run holds it.
+    fn retain_jobs(&self, _keep: &HashSet<(String, String)>) {}
 }
 
 /// Only what ships in the binary: the clock. What a daemon with no plugins,

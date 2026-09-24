@@ -9,7 +9,7 @@ pub mod exec;
 pub mod install;
 pub mod manifest;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -245,6 +245,14 @@ impl Catalog for PluginCatalog {
         self.source_keyed(id, Some(job))
     }
 
+    fn retain_jobs(&self, keep: &HashSet<(String, String)>) {
+        let mut sources = self.sources.lock().unwrap_or_else(|p| p.into_inner());
+        sources.retain(|(id, job), _| match job {
+            Some(job) => keep.contains(&(id.clone(), job.clone())),
+            None => true,
+        });
+    }
+
     fn check(&self, id: &str, config: &Value) -> Result<(), String> {
         if connector::builtin(id).is_some() {
             return Builtins.check(id, config);
@@ -356,6 +364,14 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b), "one source per (plugin, job)");
         assert!(!Arc::ptr_eq(&a, &c));
         assert_eq!(a.id(), "slack");
+
+        // Only the jobs the scheduler still has keep their sources.
+        cat.retain_jobs(&HashSet::from([("slack".to_string(), "j1".to_string())]));
+        assert!(Arc::ptr_eq(&a, &cat.source_for_job("slack", "j1").unwrap()));
+        assert!(!Arc::ptr_eq(
+            &c,
+            &cat.source_for_job("slack", "j2").unwrap()
+        ));
     }
 
     #[test]

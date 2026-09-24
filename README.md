@@ -261,7 +261,8 @@ A job uses a plugin's connector by its id (`[connector] use = "slack"`);
 keys the manifest marks `required`, and `job list` shows a job whose plugin is
 missing or unhappy as invalid, with the reason. A poll connector runs once per
 job run and must finish within its `timeout` (60s by default); a stream
-connector is started once, restarted with backoff when it exits, and each job
+connector is started once, restarted with backoff when it exits (and stopped
+when its job file is removed, disabled or moved to another connector), and each job
 run takes what it emitted since the last; the stream holds a batch until a
 run has persisted it, so a dry run or a failed insert hands it out again.
 A stream lives in `pastor serve`: `pastor tick` with no daemon running is a
