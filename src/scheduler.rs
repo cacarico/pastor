@@ -574,10 +574,15 @@ impl Scheduler {
         if !job.enabled {
             return Due::Never;
         }
-        if let Some(until) = state.and_then(|s| s.backoff_until)
-            && now < until
-        {
-            return Due::At(until);
+        // A backoff is a retry time, not only a gate: the failed attempt set
+        // `last_run_at`, so falling through to the schedule would wait a whole
+        // interval after the failure. A success clears it.
+        if let Some(until) = state.and_then(|s| s.backoff_until) {
+            return if now < until {
+                Due::At(until)
+            } else {
+                Due::Now
+            };
         }
         let last = state.and_then(|s| s.last_run_at);
         let next = match (&job.schedule, last) {
@@ -1543,6 +1548,44 @@ mod tests {
             RunOutcome::Ran,
             "--job forces it regardless"
         );
+    }
+
+    #[tokio::test]
+    async fn an_elapsed_backoff_retries_before_the_next_interval() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let mut j = job("j");
+        j.schedule = Schedule::Every(Duration::from_secs(3600));
+        s.set_jobs_for_tests(vec![j.clone()]);
+        let t = Utc::now();
+        let failed = JobState {
+            name: "j".into(),
+            last_run_at: Some(t),
+            failures: 1,
+            backoff_until: Some(t + chrono::Duration::minutes(1)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.due_of(&j, Some(&failed), t + chrono::Duration::seconds(30)),
+            Due::At(u) if u == t + chrono::Duration::minutes(1)
+        ));
+        assert!(
+            matches!(
+                s.due_of(&j, Some(&failed), t + chrono::Duration::minutes(2)),
+                Due::Now
+            ),
+            "the retry is due when the backoff ends, not an hour after the failure"
+        );
+        // Once a run succeeds (backoff cleared), the interval rules again.
+        let ok = JobState {
+            name: "j".into(),
+            last_run_at: Some(t),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.due_of(&j, Some(&ok), t + chrono::Duration::minutes(2)),
+            Due::At(_)
+        ));
     }
 
     #[tokio::test]
