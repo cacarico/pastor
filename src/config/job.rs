@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::{Defaults, parse_duration};
+use crate::connector::Catalog;
 use crate::schedule::Schedule;
 use crate::task::DispatchSpec;
 use crate::template;
@@ -77,7 +78,13 @@ pub struct Job {
 impl Job {
     /// Parse and validate one file's text. `stem` is the file name without
     /// `.toml`: it is the job's name, and a `name` key must agree with it.
-    pub fn parse(text: &str, stem: &str, defaults: &Defaults) -> Result<Job, String> {
+    /// `catalog` decides whether `connector.use` exists and its config suits it.
+    pub fn parse(
+        text: &str,
+        stem: &str,
+        defaults: &Defaults,
+        catalog: &dyn Catalog,
+    ) -> Result<Job, String> {
         let file: JobFile = toml::from_str(text).map_err(|e| e.to_string())?;
         let name = file.name.clone().unwrap_or_else(|| stem.to_string());
         if name != stem {
@@ -90,12 +97,9 @@ impl Job {
         if file.connector.use_.is_empty() {
             return Err("connector.use is required".into());
         }
-        if !crate::connector::is_available(&file.connector.use_) {
-            return Err(format!(
-                "connector {:?} is not available (only the built-in clock exists until plugins ship)",
-                file.connector.use_
-            ));
-        }
+        let connector_config =
+            serde_json::to_value(&file.connector.config).map_err(|e| e.to_string())?;
+        catalog.check(&file.connector.use_, &connector_config)?;
         let d = file.dispatch;
         if d.prompt.trim().is_empty() {
             return Err("dispatch.prompt is required".into());
@@ -134,8 +138,6 @@ impl Job {
         if max_tasks_per_run == 0 {
             return Err("dispatch.max_tasks_per_run must be at least 1".into());
         }
-        let connector_config =
-            serde_json::to_value(&file.connector.config).map_err(|e| e.to_string())?;
         Ok(Job {
             name,
             schedule,
@@ -208,7 +210,11 @@ pub fn job_path(dir: &Path, name: &str) -> PathBuf {
 
 /// Every `*.toml` in `dir`, sorted by name, each valid or invalid with its
 /// reason. A missing directory is simply no jobs.
-pub fn load_dir(dir: &Path, defaults: &Defaults) -> anyhow::Result<Vec<Loaded>> {
+pub fn load_dir(
+    dir: &Path,
+    defaults: &Defaults,
+    catalog: &dyn Catalog,
+) -> anyhow::Result<Vec<Loaded>> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -223,16 +229,16 @@ pub fn load_dir(dir: &Path, defaults: &Defaults) -> anyhow::Result<Vec<Loaded>> 
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        out.push(load_file(&path, stem, defaults));
+        out.push(load_file(&path, stem, defaults, catalog));
     }
     out.sort_by(|a, b| a.name().cmp(b.name()));
     Ok(out)
 }
 
-pub fn load_file(path: &Path, stem: &str, defaults: &Defaults) -> Loaded {
+pub fn load_file(path: &Path, stem: &str, defaults: &Defaults, catalog: &dyn Catalog) -> Loaded {
     let parsed = std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
-        .and_then(|text| Job::parse(&text, stem, defaults));
+        .and_then(|text| Job::parse(&text, stem, defaults, catalog));
     match parsed {
         Ok(job) => Loaded::Valid(Box::new(job)),
         Err(error) => Loaded::Invalid {
@@ -302,6 +308,7 @@ pub fn set_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::Builtins;
 
     const SPEC_EXAMPLE: &str = r#"
 name = "support-slack"
@@ -337,7 +344,7 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
 
     #[test]
     fn parses_the_spec_example() {
-        let job = Job::parse(SPEC_EXAMPLE, "support-slack", &defaults()).unwrap();
+        let job = Job::parse(SPEC_EXAMPLE, "support-slack", &defaults(), &Builtins).unwrap();
         assert_eq!(job.name, "support-slack");
         assert_eq!(job.schedule, Schedule::Every(Duration::from_secs(300)));
         assert!(job.enabled);
@@ -379,33 +386,58 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
     }
 
     #[test]
-    fn a_connector_without_a_plugin_is_invalid_for_now() {
+    fn a_connector_the_catalog_lacks_is_invalid() {
         let text = SPEC_EXAMPLE.replace("use = \"clock\"", "use = \"slack\"");
-        let err = Job::parse(&text, "support-slack", &defaults()).unwrap_err();
+        let err = Job::parse(&text, "support-slack", &defaults(), &Builtins).unwrap_err();
         assert!(err.contains("slack"), "{err}");
         assert!(err.contains("not available"), "{err}");
+    }
+
+    /// A catalog's reason (a plugin that is missing, or a config key its
+    /// manifest requires) is the job's `invalid` reason, and the config it
+    /// checks is the table minus `use`.
+    #[test]
+    fn the_catalog_checks_the_connector_config() {
+        struct NeedsChannel;
+        impl Catalog for NeedsChannel {
+            fn source(&self, _: &str) -> Option<std::sync::Arc<dyn crate::connector::ItemSource>> {
+                None
+            }
+            fn check(&self, id: &str, config: &Value) -> Result<(), String> {
+                assert!(config.get("use").is_none());
+                match config.get("channel") {
+                    Some(_) => Ok(()),
+                    None => Err(format!("{id}: connector.channel is required")),
+                }
+            }
+        }
+        let text = SPEC_EXAMPLE.replace("use = \"clock\"", "use = \"slack\"");
+        assert!(Job::parse(&text, "support-slack", &defaults(), &NeedsChannel).is_ok());
+        let text = text.replace("channel = \"C0123ABC\"\n", "");
+        let err = Job::parse(&text, "support-slack", &defaults(), &NeedsChannel).unwrap_err();
+        assert_eq!(err, "slack: connector.channel is required");
     }
 
     #[test]
     fn exactly_one_schedule_and_name_must_match_stem() {
         let both = SPEC_EXAMPLE.replace("every = \"5m\"", "every = \"5m\"\ncron = \"* * * * *\"");
         assert!(
-            Job::parse(&both, "support-slack", &defaults())
+            Job::parse(&both, "support-slack", &defaults(), &Builtins)
                 .unwrap_err()
                 .contains("not both")
         );
         let neither = SPEC_EXAMPLE.replace("every = \"5m\"\n", "");
         assert!(
-            Job::parse(&neither, "support-slack", &defaults())
+            Job::parse(&neither, "support-slack", &defaults(), &Builtins)
                 .unwrap_err()
                 .contains("every or cron")
         );
-        let err = Job::parse(SPEC_EXAMPLE, "other", &defaults()).unwrap_err();
+        let err = Job::parse(SPEC_EXAMPLE, "other", &defaults(), &Builtins).unwrap_err();
         assert!(err.contains("does not match the file name"), "{err}");
         // No name: the stem is the name.
         let unnamed = SPEC_EXAMPLE.replace("name = \"support-slack\"\n", "");
         assert_eq!(
-            Job::parse(&unnamed, "anything-9", &defaults())
+            Job::parse(&unnamed, "anything-9", &defaults(), &Builtins)
                 .unwrap()
                 .name,
             "anything-9"
@@ -427,7 +459,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             max_tasks_per_run: 2,
             timeout: "30m".into(),
         };
-        let job = Job::parse(text, "hourly", &d).unwrap();
+        let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");
         assert_eq!(job.max_tasks_per_run, 2);
         assert_eq!(job.spec.timeout_secs, 1800);
@@ -449,31 +481,54 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             ("-x", "must match"),
             ("a b", "must match"),
         ] {
-            let err = Job::parse(&base(name, ""), name, &defaults()).unwrap_err();
+            let err = Job::parse(&base(name, ""), name, &defaults(), &Builtins).unwrap_err();
             assert!(err.contains(needle), "{name}: {err}");
         }
         let err = Job::parse(
             &base("ok", "branch = \"pastor/{{ job.nope }}\"\n"),
             "ok",
             &defaults(),
+            &Builtins,
         )
         .unwrap_err();
         assert!(
             err.contains("dispatch.branch") && err.contains("job.nope"),
             "{err}"
         );
-        let err =
-            Job::parse(&base("ok", "repo = \"{{ item.repo \"\n"), "ok", &defaults()).unwrap_err();
+        let err = Job::parse(
+            &base("ok", "repo = \"{{ item.repo \"\n"),
+            "ok",
+            &defaults(),
+            &Builtins,
+        )
+        .unwrap_err();
         assert!(
             err.contains("dispatch.repo") && err.contains("unterminated"),
             "{err}"
         );
-        let err = Job::parse(&base("ok", "worktree = true\n"), "ok", &defaults()).unwrap_err();
+        let err = Job::parse(
+            &base("ok", "worktree = true\n"),
+            "ok",
+            &defaults(),
+            &Builtins,
+        )
+        .unwrap_err();
         assert!(err.contains("needs dispatch.repo"), "{err}");
-        let err =
-            Job::parse(&base("ok", "max_tasks_per_run = 0\n"), "ok", &defaults()).unwrap_err();
+        let err = Job::parse(
+            &base("ok", "max_tasks_per_run = 0\n"),
+            "ok",
+            &defaults(),
+            &Builtins,
+        )
+        .unwrap_err();
         assert!(err.contains("max_tasks_per_run"), "{err}");
-        let err = Job::parse(&base("ok", "colour = \"blue\"\n"), "ok", &defaults()).unwrap_err();
+        let err = Job::parse(
+            &base("ok", "colour = \"blue\"\n"),
+            "ok",
+            &defaults(),
+            &Builtins,
+        )
+        .unwrap_err();
         assert!(
             err.contains("colour"),
             "unknown keys must be reported: {err}"
@@ -482,6 +537,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"  \"\n",
             "ok",
             &defaults(),
+            &Builtins,
         )
         .unwrap_err();
         assert!(err.contains("prompt is required"), "{err}");
@@ -492,7 +548,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("jobs");
         assert!(
-            load_dir(&dir, &defaults()).unwrap().is_empty(),
+            load_dir(&dir, &defaults(), &Builtins).unwrap().is_empty(),
             "missing dir is no jobs"
         );
         std::fs::create_dir_all(&dir).unwrap();
@@ -508,7 +564,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         .unwrap();
         std::fs::write(job_path(&dir, "broken"), "every = \"1h\"\n[connector\n").unwrap();
         std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
-        let loaded = load_dir(&dir, &defaults()).unwrap();
+        let loaded = load_dir(&dir, &defaults(), &Builtins).unwrap();
         assert_eq!(
             loaded.iter().map(Loaded::name).collect::<Vec<_>>(),
             vec!["alpha", "broken", "zeta"]
@@ -539,8 +595,12 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             original.replace("enabled = true", "enabled = false"),
             "only the top-level enabled line changes"
         );
-        assert!(Job::parse(&text, "j", &defaults()).is_ok());
-        assert!(!Job::parse(&text, "j", &defaults()).unwrap().enabled);
+        assert!(Job::parse(&text, "j", &defaults(), &Builtins).is_ok());
+        assert!(
+            !Job::parse(&text, "j", &defaults(), &Builtins)
+                .unwrap()
+                .enabled
+        );
 
         // Absent: inserted before the first table so it stays top-level.
         let without = "name = \"k\"\nevery = \"1h\"\n\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n";

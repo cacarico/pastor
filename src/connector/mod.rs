@@ -1,6 +1,6 @@
-//! The seam between the scheduler and whatever produces items. This plan ships
-//! the built-in `clock`; plan 3 adds process connectors from plugins behind the
-//! same trait. Named `ItemSource` in code only because `herdr::Connector` is
+//! The seam between the scheduler and whatever produces items: the built-in
+//! `clock`, and process connectors from plugins (`process`) behind the same
+//! trait. A `Catalog` says which connector ids exist. Named `ItemSource` in code only because `herdr::Connector` is
 //! already the transport; wherever a user sees it, it is a connector.
 
 pub mod clock;
@@ -67,8 +67,32 @@ pub fn builtin(id: &str) -> Option<Arc<dyn ItemSource>> {
     }
 }
 
-pub fn is_available(id: &str) -> bool {
-    builtin(id).is_some()
+/// Which connectors exist and whether a job's `[connector]` table suits one.
+/// Job files are validated against it at load, the scheduler resolves through
+/// it at run time.
+pub trait Catalog: Send + Sync {
+    fn source(&self, id: &str) -> Option<Arc<dyn ItemSource>>;
+    /// Err(reason) for a missing plugin or a config key the manifest requires.
+    fn check(&self, id: &str, config: &Value) -> Result<(), String>;
+}
+
+/// Only what ships in the binary: the clock. What a daemon with no plugins,
+/// and most tests, use.
+pub struct Builtins;
+
+impl Catalog for Builtins {
+    fn source(&self, id: &str) -> Option<Arc<dyn ItemSource>> {
+        builtin(id)
+    }
+
+    fn check(&self, id: &str, _config: &Value) -> Result<(), String> {
+        match builtin(id) {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "connector {id:?} is not available: no built-in connector or installed plugin has that id"
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -77,9 +101,15 @@ mod tests {
 
     #[test]
     fn only_the_clock_is_built_in() {
-        assert!(is_available("clock"));
-        assert_eq!(builtin("clock").unwrap().id(), "clock");
-        assert!(!is_available("slack"));
+        let none = serde_json::json!({});
+        assert!(Builtins.check("clock", &none).is_ok());
+        assert_eq!(Builtins.source("clock").unwrap().id(), "clock");
+        let err = Builtins.check("slack", &none).unwrap_err();
+        assert!(
+            err.contains("slack") && err.contains("not available"),
+            "{err}"
+        );
+        assert!(Builtins.source("slack").is_none());
         assert!(builtin("").is_none());
     }
 

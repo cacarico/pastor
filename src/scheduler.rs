@@ -547,7 +547,9 @@ impl Scheduler {
             return false;
         }
         self.fingerprint = Some(fp);
-        let loaded = match load_dir(&dir, &self.defaults) {
+        // Validated against the builtins, matching the default resolver;
+        // wiring in `PluginCatalog` is the plugins follow-up (see AGENTS.md).
+        let loaded = match load_dir(&dir, &self.defaults, &connector::Builtins) {
             Ok(l) => l,
             Err(err) => {
                 tracing::error!(%err, "read jobs directory");
