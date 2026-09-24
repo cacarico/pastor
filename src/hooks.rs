@@ -6,10 +6,10 @@
 //! retried. Hooks read the daemon's broadcast on their own; they never write
 //! the events log.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, Weak};
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::config::Paths;
@@ -115,18 +115,100 @@ struct Work {
     rec: Arc<EventRecord>,
 }
 
+/// Records a plugin's queue holds while its hooks run. A hook may take its
+/// whole timeout per record, so without a bound a slow or stuck hook under
+/// a steady stream of events would grow the daemon without limit.
+pub const HOOK_QUEUE_MAX: usize = 256;
+
+/// One plugin's pending records. Full, it drops the oldest: hooks are
+/// notifications, and the newest state matters more than a backlog.
+struct Queue {
+    plugin: String,
+    max: usize,
+    state: Mutex<QueueState>,
+    ready: Notify,
+}
+
+#[derive(Default)]
+struct QueueState {
+    items: VecDeque<Work>,
+    /// Dropped since the queue was last empty; one warning per episode.
+    dropped: usize,
+    /// The dispatcher is gone: finish what is queued, then stop.
+    closed: bool,
+}
+
+impl Queue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn push(&self, work: Work) {
+        let mut st = self.lock();
+        if st.items.len() >= self.max {
+            st.items.pop_front();
+            st.dropped += 1;
+            if st.dropped == 1 {
+                tracing::warn!(
+                    plugin = %self.plugin, max = self.max,
+                    "hook queue full; dropping the oldest events until its hooks catch up"
+                );
+            }
+        }
+        st.items.push_back(work);
+        drop(st);
+        self.ready.notify_one();
+    }
+
+    /// The next record, waiting for one; `None` once closed and empty.
+    async fn next(&self) -> Option<Work> {
+        loop {
+            {
+                let mut st = self.lock();
+                if let Some(w) = st.items.pop_front() {
+                    if st.items.is_empty() && st.dropped > 0 {
+                        tracing::info!(
+                            plugin = %self.plugin, dropped = st.dropped,
+                            "hook queue caught up"
+                        );
+                        st.dropped = 0;
+                    }
+                    return Some(w);
+                }
+                if st.closed {
+                    return None;
+                }
+            }
+            // `notify_one` keeps a permit when nobody waits, so a push
+            // between the check above and this await is not lost.
+            self.ready.notified().await;
+        }
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+        self.ready.notify_one();
+    }
+}
+
 /// Hands each record to one worker per plugin. Plugins are re-read for every
 /// record: events are rare next to a directory listing, and it means an
 /// install or uninstall takes effect for hooks without a reload.
 pub struct Dispatcher {
     paths: Paths,
-    workers: HashMap<String, mpsc::UnboundedSender<Work>>,
+    queue_max: usize,
+    workers: HashMap<String, (Arc<Queue>, JoinHandle<()>)>,
 }
 
 impl Dispatcher {
     pub fn new(paths: Paths) -> Dispatcher {
+        Dispatcher::with_queue_max(paths, HOOK_QUEUE_MAX)
+    }
+
+    pub fn with_queue_max(paths: Paths, queue_max: usize) -> Dispatcher {
         Dispatcher {
             paths,
+            queue_max: queue_max.max(1),
             workers: HashMap::new(),
         }
     }
@@ -155,36 +237,49 @@ impl Dispatcher {
             if hooks.is_empty() {
                 continue;
             }
-            let work = Work {
+            let (queue, worker) = self.workers.entry(plugin.id.clone()).or_insert_with(|| {
+                let q = Arc::new(Queue {
+                    plugin: plugin.id.clone(),
+                    max: self.queue_max,
+                    state: Mutex::default(),
+                    ready: Notify::new(),
+                });
+                let w = spawn_worker(self.paths.clone(), q.clone());
+                (q, w)
+            });
+            // A worker only ends by panicking; a fresh one takes over the
+            // same queue.
+            if worker.is_finished() {
+                *worker = spawn_worker(self.paths.clone(), queue.clone());
+            }
+            queue.push(Work {
                 plugin: plugin.clone(),
                 hooks,
                 rec: rec.clone(),
-            };
-            let tx = self
-                .workers
-                .entry(plugin.id.clone())
-                .or_insert_with(|| spawn_worker(self.paths.clone()));
-            if let Err(mpsc::error::SendError(work)) = tx.send(work) {
-                // A worker only ends by panicking; start a fresh one.
-                let tx = spawn_worker(self.paths.clone());
-                let _ = tx.send(work);
-                self.workers.insert(plugin.id.clone(), tx);
-            }
+            });
         }
     }
 }
 
-/// One plugin's queue: its hooks, one after another, in event order.
-fn spawn_worker(paths: Paths) -> mpsc::UnboundedSender<Work> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Work>();
+/// Queued hooks still run after the dispatcher goes; the workers stop once
+/// their queues are empty.
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        for (queue, _) in self.workers.values() {
+            queue.close();
+        }
+    }
+}
+
+/// One plugin's worker: its hooks, one after another, in event order.
+fn spawn_worker(paths: Paths, queue: Arc<Queue>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(w) = rx.recv().await {
+        while let Some(w) = queue.next().await {
             for hook in &w.hooks {
                 run_hook(&paths, &w.plugin, hook, &w.rec).await;
             }
         }
-    });
-    tx
+    })
 }
 
 /// The daemon's hook runner: subscribe before any actor runs, build a record
@@ -487,6 +582,48 @@ mod tests {
             std::fs::read_to_string(e.out.join("fails")).unwrap(),
             "x\n",
             "one event, one run"
+        );
+    }
+
+    /// A plugin whose hook is slower than its events keeps only the newest
+    /// `queue_max` waiting; the oldest go, so a stuck hook cannot grow the
+    /// daemon's memory. (A current-thread runtime: the worker takes nothing
+    /// until the test awaits, so all five are queued first.)
+    #[tokio::test]
+    async fn a_full_queue_drops_the_oldest_events() {
+        let e = env();
+        e.plugin(
+            "a",
+            false,
+            &[(
+                "\"task.done\"",
+                false,
+                "5s",
+                "r=$(cat); while [ ! -e \"$OUT/go\" ]; do sleep 0.02; done; echo \"$r\" | grep -o '\"job\":\"j[0-9]*\"' >> \"$OUT/ran\"",
+            )],
+        );
+        let mut d = Dispatcher::with_queue_max(e.paths.clone(), 2);
+        for i in 0..5 {
+            let mut rec = machine_record("task.done");
+            rec.job = Some(format!("j{i}"));
+            d.deliver(rec);
+        }
+        std::fs::write(e.out.join("go"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(e.out.join("ran"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < 2
+        {
+            assert!(Instant::now() < deadline, "the hooks never ran");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read_to_string(e.out.join("ran")).unwrap(),
+            "\"job\":\"j3\"\n\"job\":\"j4\"\n",
+            "the newest two ran, once each"
         );
     }
 

@@ -290,8 +290,9 @@ timeout = "60s"                     # the default
 ```
 
 Hooks of different plugins run at the same time; one plugin's hooks run one
-after another, in event order. A hook that fails or times out is logged and
-not retried. Its output goes to `~/.local/state/pastor/runs/@<id>/`, redacted
+after another, in event order, from a queue that holds 256 events; when a
+plugin's hooks fall that far behind, the oldest waiting events are dropped
+and logged. A hook that fails or times out is logged and not retried. Its output goes to `~/.local/state/pastor/runs/@<id>/`, redacted
 like connector logs.
 
 ## Files
