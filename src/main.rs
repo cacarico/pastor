@@ -6,7 +6,9 @@ use pastor::config::flock::{Flock, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
 use pastor::herdr::{ConnectorExt, Endpoint, shell_quote};
-use pastor::ipc::{IpcRequest, IpcResponse, RequestError, daemon_running, request};
+use pastor::ipc::{
+    IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, daemon_running, request,
+};
 use pastor::machine::{ChannelState, MachineStatus};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
@@ -254,17 +256,22 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
     Ok(resp)
 }
 
-/// The stable code and message for a request that got no reply. Only a failed
-/// connect means nothing is listening; a head that took the connection and
-/// then sat on it is running but busy, and telling the user to start it would
-/// send them the wrong way. The head handles each request in a detached task,
+/// The stable code and message for a request that got no reply. Only a connect
+/// that was refused or found no socket means nothing is listening; one denied
+/// for permissions may hide a live head, as `probe_daemon` also assumes. A head
+/// that took the connection and then sat on it is running but busy. Telling
+/// the user to start a head in either case would send them the wrong way. The head handles each request in a detached task,
 /// so a timed-out `run`, `tick` or `job run` may still land; sending it again
 /// blindly can queue a duplicate.
 fn request_failure(err: &RequestError) -> (&'static str, String) {
     match err {
-        RequestError::Connect(e) => (
+        RequestError::Connect(e) if connect_error_means_no_daemon(e) => (
             "runtime_error",
             format!("pastor serve is not running ({e}); start it with `pastor serve`"),
+        ),
+        RequestError::Connect(e) => (
+            "runtime_error",
+            format!("could not connect to pastor serve: {e}"),
         ),
         RequestError::Timeout(bound) => (
             "timeout",
@@ -1033,10 +1040,33 @@ mod tests {
         assert!(!message.contains("try again"), "{message}");
         assert!(!message.contains("not running"), "{message}");
 
-        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        let (code, message) = request_failure(&RequestError::Connect(refused));
-        assert_eq!(code, "runtime_error");
-        assert!(message.contains("not running"), "{message}");
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NotFound,
+        ] {
+            let err = std::io::Error::from(kind);
+            let (code, message) = request_failure(&RequestError::Connect(err));
+            assert_eq!(code, "runtime_error");
+            assert!(message.contains("not running"), "{kind:?}: {message}");
+            assert!(message.contains("start it with"), "{kind:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_connect_that_is_not_refused_does_not_say_the_head_is_down() {
+        // probe_daemon treats these as "something may be there", so the CLI
+        // must not tell the user to start a second head.
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let err = std::io::Error::from(kind);
+            let (code, message) = request_failure(&RequestError::Connect(err));
+            assert_eq!(code, "runtime_error");
+            assert!(!message.contains("not running"), "{kind:?}: {message}");
+            assert!(!message.contains("start it"), "{kind:?}: {message}");
+            assert!(message.contains("could not connect"), "{kind:?}: {message}");
+        }
     }
 
     #[test]
