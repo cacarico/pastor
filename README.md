@@ -128,3 +128,11 @@ issues into tasks, and event hooks that run when a task finishes or blocks.
 
 Development: `make check` runs fmt, clippy and the whole suite against a fake
 herdr; `make help` lists the rest. Issues and pull requests are welcome.
+
+## Open source
+
+- License: Apache License 2.0; see `LICENSE`.
+- Contributing: start with `CONTRIBUTING.md` and `AGENTS.md`.
+- Security: report vulnerabilities privately; see `SECURITY.md`.
+- AI governance: contributor and operator rules live in
+  `docs/AI_GOVERNANCE.md`.
