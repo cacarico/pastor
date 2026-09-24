@@ -17,8 +17,9 @@
 //!
 //! Env, for the `--listen` server (the only mode that outlives a request):
 //!   FAKE_HERDR_AUTO_DONE_MS=<n>  after `agent.prompt` flips an agent to
-//!                                `working`, flip it back to `idle` n ms later
-//!                                with `completion_seq` incremented.
+//!                                `working`, flip it to `done` n ms later, as
+//!                                herdr 0.9.1 reports finished work: a new
+//!                                `state_change_seq` and no `completion_seq`.
 //!   FAKE_HERDR_READY_MS=<n>      a started agent reports `unknown` and refuses
 //!                                prompts for n ms, the way herdr does while a
 //!                                managed agent is still launching.
@@ -132,11 +133,7 @@ fn auto_done(fake: &FakeHerdr) {
                     let w = watcher.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                        w.set_status(
-                            &a.pane_id,
-                            AgentStatus::Idle,
-                            Some(a.completion_seq.unwrap_or(0) + 1),
-                        );
+                        w.set_status(&a.pane_id, AgentStatus::Done);
                     });
                 }
             }
