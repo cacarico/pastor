@@ -255,6 +255,8 @@ async fn run_once(
     job_name: &str,
     since: Option<&str>,
 ) -> anyhow::Result<()> {
+    // The name becomes the job-file, run-log and scratch paths below.
+    job::check_name(job_name).map_err(anyhow::Error::msg)?;
     let catalog = PluginCatalog::load(paths)?;
     let Some(plugin) = catalog.plugin(id).cloned() else {
         // Let the catalog explain: invalid, hooks only, or absent.

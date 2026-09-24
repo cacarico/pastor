@@ -330,6 +330,7 @@ impl Cli {
         let last = stderr.lines().last().unwrap_or("");
         let err: serde_json::Value =
             serde_json::from_str(last).unwrap_or_else(|_| panic!("{stderr}"));
+        assert_eq!(err["code"], "runtime_error", "{stderr}");
         err["message"].as_str().unwrap().to_string()
     }
 
@@ -489,6 +490,14 @@ fn link_run_and_unlink() {
     let err = cli.fails(&["plugin", "run", "echo", "--job", "try"]);
     assert!(err.contains("exit 4: failing on purpose"), "{err}");
 
+    // The job name becomes paths under jobs/, runs/ and plugins/; one that
+    // could walk out of them is refused before anything is touched.
+    for bad in ["../x", "a/b", "Upper"] {
+        let err = cli.fails(&["plugin", "run", "echo", "--job", bad]);
+        assert!(err.contains("must match"), "{bad}: {err}");
+    }
+    assert!(!cli.dir("s/x").exists() && !cli.dir("s/runs/../x").exists());
+    assert!(!cli.dir("x").exists());
     let err = cli.fails(&["plugin", "run", "nope", "--job", "try"]);
     assert!(err.contains("not available"), "{err}");
     cli.ok(&["plugin", "unlink", "echo"]);
