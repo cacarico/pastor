@@ -58,9 +58,9 @@ pub enum IpcResponse {
     Tasks(Vec<Task>),
     Text(String),
     Machines(Vec<MachineStatus>),
+    Error { code: String, message: String },
     Runs(Vec<JobRunReport>),
     Jobs(Vec<JobStatus>),
-    Error { code: String, message: String },
 }
 
 impl IpcResponse {
