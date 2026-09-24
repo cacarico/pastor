@@ -148,3 +148,99 @@ fn events_follow_streams_new_records() {
         "{line}"
     );
 }
+
+/// The daemon's log task: a dispatched task lands in events.jsonl with its row
+/// and job. (machine.connected only follows an announced outage, so the
+/// machine record is covered by the unit tests in `events`.)
+#[tokio::test]
+async fn the_daemon_writes_the_events_log() {
+    use std::sync::Arc;
+
+    use pastor::config::flock::{Flock, MachineConfig};
+    use pastor::config::{PastorConfig, Paths};
+    use pastor::daemon::Daemon;
+    use pastor::herdr::Connector;
+    use pastor::herdr::fake::FakeHerdr;
+    use pastor::ipc::{IpcRequest, IpcResponse};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+    let flock = Flock {
+        machines: vec![MachineConfig {
+            name: "m".into(),
+            local: false,
+            ssh: None,
+            command: Some(vec!["fake".into()]),
+            session: "default".into(),
+            max_agents: 1,
+            tags: vec![],
+        }],
+    };
+    let fake: Arc<dyn Connector> = Arc::new(FakeHerdr::new());
+    let (daemon, listener) = Daemon::bind_and_start(
+        paths.clone(),
+        PastorConfig::default(),
+        flock,
+        Some(vec![fake]),
+    )
+    .await
+    .unwrap();
+    let socket = daemon.socket_path();
+    let serve = tokio::spawn(daemon.run_with_listener(listener));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(IpcResponse::Machines(ms)) =
+            pastor::ipc::request(&socket, &IpcRequest::FlockList).await
+            && ms.iter().all(|m| m.channel.accepts_dispatch())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "machine never connected"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let log = paths.events_file();
+    let wait_for = async |kind: &str| -> EventRecord {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(r) = pastor::events::read(&log, None)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.kind == kind)
+            {
+                return r;
+            }
+            assert!(std::time::Instant::now() < deadline, "no {kind} in the log");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    let resp = pastor::ipc::request(
+        &socket,
+        &IpcRequest::Run {
+            prompt: "hi".into(),
+            spec: DispatchSpec {
+                agent: "claude".into(),
+                agent_args: vec![],
+                repo: None,
+                worktree: false,
+                branch: None,
+                machine: None,
+                tags: vec![],
+                timeout_secs: 60,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let IpcResponse::Task(t) = resp else {
+        panic!("{resp:?}")
+    };
+    let running = wait_for("task.running").await;
+    assert_eq!(running.task.unwrap().id, t.id);
+    assert_eq!(running.job.as_deref(), Some("run"));
+    serve.abort();
+}
