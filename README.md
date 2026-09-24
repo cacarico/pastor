@@ -263,7 +263,10 @@ missing or unhappy as invalid, with the reason. A poll connector runs once per
 job run and must finish within its `timeout` (60s by default); a stream
 connector is started once, restarted with backoff when it exits, and each job
 run takes what it emitted since the last; the stream holds a batch until a
-run has persisted it, so a dry run or a failed insert hands it out again. Item fields that a job puts into
+run has persisted it, so a dry run or a failed insert hands it out again.
+A stream lives in `pastor serve`: `pastor tick` with no daemon running is a
+one-pass process that would kill the stream on exit, so it reports a stream
+job as failed, saying it needs `pastor serve`, and leaves it alone. Item fields that a job puts into
 `repo` or `branch` may not contain `/`, `\`, `..`, a leading `-` or control
 characters; such an item is skipped and reported.
 

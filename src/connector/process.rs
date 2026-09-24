@@ -394,6 +394,10 @@ impl ItemSource for StreamSource {
     fn ack(&self) {
         lock(&self.buffer).ack();
     }
+
+    fn long_lived(&self) -> bool {
+        true
+    }
 }
 
 async fn supervise(runner: Runner, first: RunInput, buffer: Arc<Mutex<Buffer>>, base: Duration) {

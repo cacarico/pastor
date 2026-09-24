@@ -64,6 +64,12 @@ pub trait ItemSource: Send + Sync {
     /// insert does not lose them. A source that re-reads from the job's
     /// cursor ignores it.
     fn ack(&self) {}
+    /// A process that outlives a run and emits between runs (a stream). Only
+    /// `pastor serve` can host one: a process that exits after one pass
+    /// would stop it before anything it emitted is drained.
+    fn long_lived(&self) -> bool {
+        false
+    }
 }
 
 /// The connectors pastor ships inside the binary.

@@ -506,6 +506,44 @@ fn plugin_run_collects_a_stream_and_prints_each_item_once() {
     assert!(err.contains("1 items, cursor cur-1"), "{err}");
 }
 
+/// Without a daemon, `pastor tick` is a process that exits when the pass
+/// does: a stream it started would die with it and take what it emitted
+/// along. It refuses the job instead, and touches neither the stream nor
+/// the job's state.
+#[test]
+fn a_standalone_tick_refuses_a_stream_job() {
+    let cli = Cli::new();
+    link_quick_stream(&cli);
+    let jobs = cli.dir("c/jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(
+        jobs.join("live.toml"),
+        "every = \"1m\"\n[connector]\nuse = \"stream\"\n[dispatch]\nprompt = \"p\"\n",
+    )
+    .unwrap();
+    for args in [
+        &["tick", "--json"][..],
+        &["tick", "--job", "live", "--dry-run", "--json"],
+    ] {
+        let (out, _) = cli.ok(args);
+        let runs: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(runs[0]["job"], "live", "{out}");
+        assert_eq!(runs[0]["outcome"], "failed", "{out}");
+        let err = runs[0]["error"].as_str().unwrap();
+        assert!(
+            err.contains("stream") && err.contains("pastor serve"),
+            "{err}"
+        );
+    }
+    assert!(
+        !cli.dir("s/plugins/live/starts").exists(),
+        "the stream was never started"
+    );
+    let (out, _) = cli.ok(&["job", "list", "--json"]);
+    let jobs: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(jobs[0]["last_run_at"], serde_json::Value::Null, "{out}");
+}
+
 #[test]
 fn link_run_and_unlink() {
     let cli = Cli::new();

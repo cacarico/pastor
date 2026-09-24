@@ -497,6 +497,9 @@ pub struct Scheduler {
     plugins: bool,
     /// Replaces the catalog's lookup when set.
     resolve: Option<Resolver>,
+    /// The CLI's one-pass scheduler: it exits after the pass, so it cannot
+    /// host a stream connector.
+    standalone: bool,
     entries: HashMap<String, Entry>,
     /// (file name, mtime, size) of every job file at the last load; `None`
     /// until the first.
@@ -531,6 +534,7 @@ impl Scheduler {
             catalog: Arc::new(Builtins),
             plugins: false,
             resolve: None,
+            standalone: false,
             entries: HashMap::new(),
             fingerprint: None,
             in_flight: Vec::new(),
@@ -579,7 +583,10 @@ impl Scheduler {
     pub fn standalone(paths: Paths, config: &PastorConfig, store: Arc<Store>) -> Scheduler {
         let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()));
         let (events, _) = broadcast::channel(1);
-        Scheduler::new(paths, config, store, fleet, events)
+        Scheduler {
+            standalone: true,
+            ..Scheduler::new(paths, config, store, fleet, events)
+        }
     }
 
     pub fn spawn(self) -> SchedulerHandle {
@@ -961,6 +968,15 @@ impl Scheduler {
                 reports.push(Slot::Ready(r));
                 continue;
             };
+            if self.standalone && source.long_lived() {
+                let mut r = JobRunReport::new(name, RunOutcome::Failed);
+                r.error = Some(format!(
+                    "connector {:?} is a stream; its jobs run only under pastor serve",
+                    job.connector
+                ));
+                reports.push(Slot::Ready(r));
+                continue;
+            }
             // `spawn_run` takes this run's turn now, in command order, so a
             // tick queues behind a fired run of the same job.
             let rx = self.spawn_run(job, source, now, dry_run, false);
