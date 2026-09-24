@@ -499,7 +499,7 @@ impl Daemon {
 
     /// `TaskClose`: through the actor of the task's machine, which closes the
     /// pane (or worktree) before the row. A task that never reached a machine
-    /// only has its row closed. With no row, the machines are asked for an
+    /// only has its row closed, and a closed one is answered as it is. With no row, the machines are asked for an
     /// orphaned agent `t-<id>` (as their last reconcile found them).
     async fn close(&self, id: i64, remove_worktree: bool) -> IpcResponse {
         let row = match self.store.get_task(id) {
@@ -532,6 +532,12 @@ impl Daemon {
                 "no_worktree",
                 format!("{} has no worktree to remove", t.display_id()),
             );
+        }
+        // A closed task has no pane left to close, so repeating the close
+        // answers the row without its machine, which may be gone or down.
+        // A worktree removal still routes: the checkout may remain.
+        if t.state == TaskState::Closed && !remove_worktree {
+            return IpcResponse::Task(t);
         }
         let Some(machine) = t.machine.clone() else {
             let was = t.state;
@@ -1134,6 +1140,44 @@ mod tests {
                 .await
             ),
             "task_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_closed_task_again_needs_no_machine() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let mut t = insert(&d, TaskState::Closed);
+        t.machine = Some("zzz".into());
+        d.store.update_task(&mut t).unwrap();
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        let mut events = d.subscribe();
+        let resp = d
+            .handle(IpcRequest::TaskClose {
+                id: t.id,
+                remove_worktree: false,
+            })
+            .await;
+        let IpcResponse::Task(again) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(again.state, TaskState::Closed);
+        assert_eq!(again.updated_at, t.updated_at, "the row is unchanged");
+        assert!(events.try_recv().is_err(), "no second task.closed");
+
+        // Its checkout may still be there, so removing it still needs the machine.
+        let mut wt = insert(&d, TaskState::Closed);
+        wt.spec.worktree = true;
+        wt.machine = Some("zzz".into());
+        d.store.update_task(&mut wt).unwrap();
+        assert_eq!(
+            error_code(
+                d.handle(IpcRequest::TaskClose {
+                    id: wt.id,
+                    remove_worktree: true
+                })
+                .await
+            ),
+            "unknown_machine"
         );
     }
 
