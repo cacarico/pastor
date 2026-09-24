@@ -58,6 +58,12 @@ impl Paths {
         self.state_dir.join("pastor.sock")
     }
 
+    /// The events log, one JSON `EventRecord` per line. Rotated by size to
+    /// `events.jsonl.1`; read by `pastor events` straight from disk.
+    pub fn events_file(&self) -> PathBuf {
+        self.state_dir.join("events.jsonl")
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("pastor.toml")
     }

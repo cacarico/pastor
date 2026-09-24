@@ -483,13 +483,24 @@ impl Actor {
         }
     }
 
+    /// Task events carry the task's job, read from its row, so a consumer that
+    /// only filters by job (hooks, `pastor events`) needs no store lookup of its
+    /// own. A row that cannot be read leaves `job` empty rather than dropping
+    /// the event.
     fn emit(&self, kind: &str, task_id: Option<i64>) {
-        tracing::info!(machine = %self.name, kind, ?task_id, "event");
+        let job = task_id.and_then(|id| match self.store.get_task(id) {
+            Ok(t) => t.map(|t| t.job),
+            Err(err) => {
+                tracing::warn!(machine = %self.name, %err, id, "emit: cannot read task row");
+                None
+            }
+        });
+        tracing::info!(machine = %self.name, kind, ?task_id, ?job, "event");
         let _ = self.events.send(PastorEvent {
             kind: kind.into(),
             task_id,
             machine: Some(self.name.clone()),
-            job: None,
+            job,
         });
     }
 
@@ -1238,6 +1249,11 @@ mod tests {
             );
         };
         assert_eq!(ev.task_id, Some(t.id));
+        assert_eq!(
+            ev.job.as_deref(),
+            Some("run"),
+            "task events carry the row's job"
+        );
 
         fake.set_status(&pane, AgentStatus::Working, None);
         wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
