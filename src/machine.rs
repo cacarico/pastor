@@ -559,8 +559,30 @@ impl Actor {
                 cmd = self.rx.recv() => {
                     let Some(cmd) = cmd else { return PollExit::Shutdown };
                     match self.handle_command(cmd).await {
-                        // A resubscribe request is what the retry timer does anyway.
-                        CommandOutcome::Nothing | CommandOutcome::Resubscribe => {}
+                        CommandOutcome::Nothing => {}
+                        CommandOutcome::Resubscribe => {
+                            // The tracked pane set changed (a dispatch added one).
+                            // If nothing is in flight, the pending retry timer
+                            // covers it: `subscribe_future` reads the store fresh
+                            // whenever it is called, so the next attempt already
+                            // includes the new pane. But an attempt already in
+                            // flight was built from the pane set as it stood
+                            // before this command; left alone, it would land the
+                            // machine on `Connected` with a subscription missing
+                            // the new pane, seen only at the next `reconcile_tick`
+                            // (60s default). Drop it and start a fresh one now.
+                            if subscribing.is_some() {
+                                subscribing = None;
+                                match self.subscribe_future() {
+                                    Ok(fut) => subscribing = Some(fut),
+                                    Err(err) => {
+                                        retry_delay = (retry_delay * 2).min(self.settings.max_backoff);
+                                        tracing::debug!(machine = %self.name, %err, next_in = ?retry_delay, "could not prepare the subscribe request");
+                                        retry.as_mut().reset(tokio::time::Instant::now() + retry_delay);
+                                    }
+                                }
+                            }
+                        }
                         CommandOutcome::Reconnect => {
                             let reason = "a request failed at the transport level while polling".to_string();
                             tracing::warn!(machine = %self.name, "{reason}");
@@ -1674,10 +1696,17 @@ mod tests {
     /// for real; `true` accepts the connection and then never acknowledges the
     /// subscribe at all — the shape of a herdr that is permanently wedged, not
     /// just failing, used to prove a stuck subscribe cannot block the poll loop.
+    ///
+    /// `slow_ack`, independent of `wedge_forever`, adds a fixed delay before
+    /// acking and proxying to the fake: long enough for a test to act (e.g.
+    /// dispatch a task) while this attempt is still in flight but not wedged
+    /// forever, to prove a *later* attempt (built from the pane set as it
+    /// stands then) is the one that actually lands the subscription.
     struct FlakyEvents {
         subscribes: Arc<std::sync::atomic::AtomicUsize>,
         fail_until: usize,
         wedge_forever: bool,
+        slow_ack: Option<Duration>,
         fake: FakeHerdr,
     }
 
@@ -1687,6 +1716,7 @@ mod tests {
             let subscribes = self.subscribes.clone();
             let fail_until = self.fail_until;
             let wedge_forever = self.wedge_forever;
+            let slow_ack = self.slow_ack;
             Box::pin(async move {
                 let (a, b) = tokio::io::duplex(64 * 1024);
                 let (ar, aw) = tokio::io::split(a);
@@ -1713,7 +1743,10 @@ mod tests {
                             // the test.
                             std::future::pending::<()>().await;
                         }
-                        // Past the failures: hand the subscription to the fake for real.
+                        if let Some(delay) = slow_ack {
+                            tokio::time::sleep(delay).await;
+                        }
+                        // Past the failures (and any delay): hand the subscription to the fake for real.
                         let mut stream = match fake
                             .subscribe(
                                 req.params
@@ -1776,6 +1809,7 @@ mod tests {
             subscribes: subscribes.clone(),
             fail_until: usize::MAX,
             wedge_forever: false,
+            slow_ack: None,
             fake,
         };
         let _h = spawn_machine(
@@ -1828,6 +1862,7 @@ mod tests {
                 subscribes: subscribes.clone(),
                 fail_until: 6,
                 wedge_forever: false,
+                slow_ack: None,
                 fake: fake.clone(),
             }),
             store.clone(),
@@ -1894,6 +1929,7 @@ mod tests {
                 subscribes: subscribes.clone(),
                 fail_until: 1,
                 wedge_forever: true,
+                slow_ack: None,
                 fake,
             }),
             store.clone(),
@@ -1921,6 +1957,68 @@ mod tests {
             ChannelState::Polling,
             "a wedged subscribe attempt must not be mistaken for a lost machine"
         );
+    }
+
+    /// A dispatch that adds a pane while a subscribe attempt is already in
+    /// flight must not let that attempt land the machine on `Connected` with a
+    /// stale subscription. The in-flight attempt was built (by
+    /// `subscribe_future`) from the pane set as it stood *before* the dispatch;
+    /// left alone, it would ack with a subscription missing the new pane, and
+    /// that pane's status changes would go unseen until the next
+    /// `reconcile_tick` — set to 30s here, far past this test's `wait_for`
+    /// bound, so only the event stream delivering the Blocked transition can
+    /// make the test pass.
+    ///
+    /// `slow_ack: 300ms` (not `wedge_forever`) is used so the attempt actually
+    /// completes on its own if the resubscribe-on-`Dispatch` fix is missing:
+    /// a wedged attempt would just hang forever and this test would time out
+    /// either way, proving nothing about *which* subscription landed.
+    #[tokio::test]
+    async fn a_pane_added_mid_subscribe_is_not_lost_to_a_stale_subscription() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, _rx) = broadcast::channel(64);
+        let subscribes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut settings = settings();
+        settings.reconcile_every = Duration::from_secs(30);
+        let h = spawn_machine(
+            "m".into(),
+            2,
+            vec![],
+            Arc::new(FlakyEvents {
+                subscribes: subscribes.clone(),
+                fail_until: 1,
+                wedge_forever: false,
+                slow_ack: Some(Duration::from_millis(300)),
+                fake: fake.clone(),
+            }),
+            store.clone(),
+            settings,
+            events,
+        );
+        wait_for("polling", || h.snapshot().channel == ChannelState::Polling).await;
+        // The attempt past `fail_until` (its request line has been read
+        // server-side, so it is now in its 300ms `slow_ack` sleep) is the one
+        // built without the pane the dispatch below is about to add.
+        wait_for("subscribe attempt in flight", || {
+            subscribes.load(std::sync::atomic::Ordering::SeqCst) >= 2
+        })
+        .await;
+
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+
+        wait_for("connected once a subscribe lands", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Blocked, None);
+        wait_for(
+            "blocked via the event stream, not the 30s reconcile",
+            || state_of(&store, t.id) == TaskState::Blocked,
+        )
+        .await;
     }
 
     /// The reply to a dispatch must carry an already-refreshed live count: a
@@ -2046,6 +2144,7 @@ mod tests {
             subscribes: subscribes.clone(),
             fail_until: usize::MAX,
             wedge_forever: false,
+            slow_ack: None,
             fake,
         });
         let h = spawn_machine(
