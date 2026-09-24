@@ -92,6 +92,10 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
                         .take(60)
                         .collect()
                 });
+            let note = match t.retry_of {
+                Some(of) => format!("retry of t-{of}: {note}"),
+                None => note,
+            };
             vec![
                 t.display_id(),
                 t.state.to_string(),

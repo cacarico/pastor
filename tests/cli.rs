@@ -1556,6 +1556,10 @@ fn task_retry_close_and_prune_end_to_end() {
     assert_eq!(t2["state"], "running");
     let list = env.wait_for("the orphan in list", &["list"], |t| t.contains("orphan"));
     assert!(list.contains("t-1") && list.contains("fake"), "{list}");
+    assert!(
+        list.contains("retry of t-1"),
+        "the new row points back: {list}"
+    );
     let status = env.json(&["machine", "list", "--json"]);
     assert_eq!(
         status["machines"][0]["orphans"],
