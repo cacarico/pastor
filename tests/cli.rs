@@ -78,7 +78,7 @@ fn start() -> Env {
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let out = env.cmd(&["flock", "list", "--json"]);
+        let out = env.cmd(&["machine", "list", "--json"]);
         if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("\"connected\"") {
             break;
         }
@@ -140,7 +140,7 @@ fn run_list_show_read_end_to_end() {
 }
 
 #[test]
-fn flock_add_and_remove_edit_the_file() {
+fn machine_add_and_remove_edit_the_file() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
@@ -153,7 +153,7 @@ fn flock_add_and_remove_edit_the_file() {
             .unwrap()
     };
     let out = run(&[
-        "flock",
+        "machine",
         "add",
         "pi-3",
         "fleet@pi-3",
@@ -174,9 +174,9 @@ fn flock_add_and_remove_edit_the_file() {
             && text.contains("max_agents = 3"),
         "{text}"
     );
-    let out = run(&["flock", "add", "pi-3", "fleet@pi-3"]);
+    let out = run(&["machine", "add", "pi-3", "fleet@pi-3"]);
     assert!(!out.status.success());
-    let out = run(&["flock", "list"]);
+    let out = run(&["machine", "list"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("pi-3"));
     // Without a head the table cannot know anything live; both the note and the
     // ERROR column say so in pastor's own words rather than "daemon down".
@@ -190,8 +190,8 @@ fn flock_add_and_remove_edit_the_file() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert!(run(&["flock", "remove", "pi-3"]).status.success());
-    assert!(!run(&["flock", "remove", "pi-3"]).status.success());
+    assert!(run(&["machine", "remove", "pi-3"]).status.success());
+    assert!(!run(&["machine", "remove", "pi-3"]).status.success());
 }
 
 #[test]
@@ -251,7 +251,7 @@ fn herdr_flag_adds_and_removes_the_saved_machine_too() {
     let calls = || std::fs::read_to_string(&log).unwrap_or_default();
 
     let out = run(&[
-        "flock",
+        "machine",
         "add",
         "pi-3",
         "fleet@pi-3",
@@ -275,7 +275,7 @@ fn herdr_flag_adds_and_removes_the_saved_machine_too() {
     );
     assert!(text.contains("saved in herdr"), "{text}");
 
-    let out = run(&["flock", "remove", "pi-3", "--herdr"]);
+    let out = run(&["machine", "remove", "pi-3", "--herdr"]);
     assert!(
         out.status.success(),
         "{}",
@@ -296,11 +296,11 @@ fn herdr_flag_adds_and_removes_the_saved_machine_too() {
 
     // Not saved in herdr: the flock edit still happens, a note says so, exit 0.
     assert!(
-        run(&["flock", "add", "pi-9", "fleet@pi-9"])
+        run(&["machine", "add", "pi-9", "fleet@pi-9"])
             .status
             .success()
     );
-    let out = run(&["flock", "remove", "pi-9", "--herdr"]);
+    let out = run(&["machine", "remove", "pi-9", "--herdr"]);
     assert!(
         out.status.success(),
         "{}",
@@ -318,7 +318,7 @@ fn herdr_flag_adds_and_removes_the_saved_machine_too() {
     );
 
     // herdr failing: the flock edit is kept, the failure is reported with herdr's stderr, exit 1.
-    let out = run(&["flock", "add", "boom", "fleet@boom", "--herdr"]);
+    let out = run(&["machine", "add", "boom", "fleet@boom", "--herdr"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(

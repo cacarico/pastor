@@ -302,7 +302,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     let flock = Flock::load(&paths.flock_file())?;
     anyhow::ensure!(
         !flock.machines.is_empty(),
-        "flock is empty; add a machine with `pastor flock add`"
+        "flock is empty; add a machine with `pastor machine add`"
     );
     let (daemon, listener) = Daemon::bind_and_start(paths, config, flock, None).await?;
     tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.machines.len(), "pastor serve");

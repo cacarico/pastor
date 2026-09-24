@@ -22,14 +22,14 @@ _pastor() {
             pastor,completions)
                 cmd="pastor__subcmd__completions"
                 ;;
-            pastor,flock)
-                cmd="pastor__subcmd__flock"
-                ;;
             pastor,help)
                 cmd="pastor__subcmd__help"
                 ;;
             pastor,list)
                 cmd="pastor__subcmd__list"
+                ;;
+            pastor,machine)
+                cmd="pastor__subcmd__machine"
                 ;;
             pastor,open)
                 cmd="pastor__subcmd__open"
@@ -43,50 +43,20 @@ _pastor() {
             pastor,task)
                 cmd="pastor__subcmd__task"
                 ;;
-            pastor__subcmd__flock,add)
-                cmd="pastor__subcmd__flock__subcmd__add"
-                ;;
-            pastor__subcmd__flock,help)
-                cmd="pastor__subcmd__flock__subcmd__help"
-                ;;
-            pastor__subcmd__flock,list)
-                cmd="pastor__subcmd__flock__subcmd__list"
-                ;;
-            pastor__subcmd__flock,remove)
-                cmd="pastor__subcmd__flock__subcmd__remove"
-                ;;
-            pastor__subcmd__flock,status)
-                cmd="pastor__subcmd__flock__subcmd__status"
-                ;;
-            pastor__subcmd__flock__subcmd__help,add)
-                cmd="pastor__subcmd__flock__subcmd__help__subcmd__add"
-                ;;
-            pastor__subcmd__flock__subcmd__help,help)
-                cmd="pastor__subcmd__flock__subcmd__help__subcmd__help"
-                ;;
-            pastor__subcmd__flock__subcmd__help,list)
-                cmd="pastor__subcmd__flock__subcmd__help__subcmd__list"
-                ;;
-            pastor__subcmd__flock__subcmd__help,remove)
-                cmd="pastor__subcmd__flock__subcmd__help__subcmd__remove"
-                ;;
-            pastor__subcmd__flock__subcmd__help,status)
-                cmd="pastor__subcmd__flock__subcmd__help__subcmd__status"
-                ;;
             pastor__subcmd__help,attach)
                 cmd="pastor__subcmd__help__subcmd__attach"
                 ;;
             pastor__subcmd__help,completions)
                 cmd="pastor__subcmd__help__subcmd__completions"
                 ;;
-            pastor__subcmd__help,flock)
-                cmd="pastor__subcmd__help__subcmd__flock"
-                ;;
             pastor__subcmd__help,help)
                 cmd="pastor__subcmd__help__subcmd__help"
                 ;;
             pastor__subcmd__help,list)
                 cmd="pastor__subcmd__help__subcmd__list"
+                ;;
+            pastor__subcmd__help,machine)
+                cmd="pastor__subcmd__help__subcmd__machine"
                 ;;
             pastor__subcmd__help,open)
                 cmd="pastor__subcmd__help__subcmd__open"
@@ -100,23 +70,53 @@ _pastor() {
             pastor__subcmd__help,task)
                 cmd="pastor__subcmd__help__subcmd__task"
                 ;;
-            pastor__subcmd__help__subcmd__flock,add)
-                cmd="pastor__subcmd__help__subcmd__flock__subcmd__add"
+            pastor__subcmd__help__subcmd__machine,add)
+                cmd="pastor__subcmd__help__subcmd__machine__subcmd__add"
                 ;;
-            pastor__subcmd__help__subcmd__flock,list)
-                cmd="pastor__subcmd__help__subcmd__flock__subcmd__list"
+            pastor__subcmd__help__subcmd__machine,list)
+                cmd="pastor__subcmd__help__subcmd__machine__subcmd__list"
                 ;;
-            pastor__subcmd__help__subcmd__flock,remove)
-                cmd="pastor__subcmd__help__subcmd__flock__subcmd__remove"
+            pastor__subcmd__help__subcmd__machine,remove)
+                cmd="pastor__subcmd__help__subcmd__machine__subcmd__remove"
                 ;;
-            pastor__subcmd__help__subcmd__flock,status)
-                cmd="pastor__subcmd__help__subcmd__flock__subcmd__status"
+            pastor__subcmd__help__subcmd__machine,status)
+                cmd="pastor__subcmd__help__subcmd__machine__subcmd__status"
                 ;;
             pastor__subcmd__help__subcmd__task,read)
                 cmd="pastor__subcmd__help__subcmd__task__subcmd__read"
                 ;;
             pastor__subcmd__help__subcmd__task,show)
                 cmd="pastor__subcmd__help__subcmd__task__subcmd__show"
+                ;;
+            pastor__subcmd__machine,add)
+                cmd="pastor__subcmd__machine__subcmd__add"
+                ;;
+            pastor__subcmd__machine,help)
+                cmd="pastor__subcmd__machine__subcmd__help"
+                ;;
+            pastor__subcmd__machine,list)
+                cmd="pastor__subcmd__machine__subcmd__list"
+                ;;
+            pastor__subcmd__machine,remove)
+                cmd="pastor__subcmd__machine__subcmd__remove"
+                ;;
+            pastor__subcmd__machine,status)
+                cmd="pastor__subcmd__machine__subcmd__status"
+                ;;
+            pastor__subcmd__machine__subcmd__help,add)
+                cmd="pastor__subcmd__machine__subcmd__help__subcmd__add"
+                ;;
+            pastor__subcmd__machine__subcmd__help,help)
+                cmd="pastor__subcmd__machine__subcmd__help__subcmd__help"
+                ;;
+            pastor__subcmd__machine__subcmd__help,list)
+                cmd="pastor__subcmd__machine__subcmd__help__subcmd__list"
+                ;;
+            pastor__subcmd__machine__subcmd__help,remove)
+                cmd="pastor__subcmd__machine__subcmd__help__subcmd__remove"
+                ;;
+            pastor__subcmd__machine__subcmd__help,status)
+                cmd="pastor__subcmd__machine__subcmd__help__subcmd__status"
                 ;;
             pastor__subcmd__task,help)
                 cmd="pastor__subcmd__task__subcmd__help"
@@ -143,7 +143,7 @@ _pastor() {
 
     case "${cmd}" in
         pastor)
-            opts="-h -V --help --version serve run list task flock attach open completions help"
+            opts="-h -V --help --version serve run list task machine attach open completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -184,178 +184,8 @@ _pastor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        pastor__subcmd__flock)
-            opts="-h --help add remove list status help"
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__add)
-            opts="-h --local --command --session --max-agents --tag --herdr --help"
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                --command)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --session)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --max-agents)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --tag)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__help)
-            opts="add remove list status help"
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__help__subcmd__add)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__help__subcmd__help)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__help__subcmd__list)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__help__subcmd__remove)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__help__subcmd__status)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__list)
-            opts="-h --json --help"
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__remove)
-            opts="-h --herdr --help"
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__flock__subcmd__status)
-            opts="-h --json --help"
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
         pastor__subcmd__help)
-            opts="serve run list task flock attach open completions help"
+            opts="serve run list task machine attach open completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -396,76 +226,6 @@ _pastor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        pastor__subcmd__help__subcmd__flock)
-            opts="add remove list status"
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__help__subcmd__flock__subcmd__add)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__help__subcmd__flock__subcmd__list)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__help__subcmd__flock__subcmd__remove)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        pastor__subcmd__help__subcmd__flock__subcmd__status)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
         pastor__subcmd__help__subcmd__help)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -483,6 +243,76 @@ _pastor() {
         pastor__subcmd__help__subcmd__list)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__machine)
+            opts="add remove list status"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__machine__subcmd__add)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__machine__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__machine__subcmd__remove)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__machine__subcmd__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -593,6 +423,176 @@ _pastor() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine)
+            opts="-h --help add remove list status help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__add)
+            opts="-h --local --command --session --max-agents --tag --herdr --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --command)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --session)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --max-agents)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --tag)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__help)
+            opts="add remove list status help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__help__subcmd__add)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__help__subcmd__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__help__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__help__subcmd__remove)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__help__subcmd__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__list)
+            opts="-h --json --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__remove)
+            opts="-h --herdr --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__status)
+            opts="-h --json --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 *)
                     COMPREPLY=()
                     ;;

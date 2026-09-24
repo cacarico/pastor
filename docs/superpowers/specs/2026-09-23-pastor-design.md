@@ -49,7 +49,7 @@ Reuse herdr's words where they exist. Add only what herdr lacks.
 | word | meaning |
 |---|---|
 | machine | one host running a herdr server (herdr's word) |
-| flock | the set of machines pastor dispatches to |
+| flock | the set of machines pastor dispatches to; `pastor machine add|remove|list|status` manages its members |
 | head | the one machine running `pastor serve`; otherwise an ordinary machine |
 | job | a recurring definition: schedule, connector, prompt, placement |
 | task | one dispatched unit: an item, the machine it landed on, the agent running it |
@@ -141,7 +141,7 @@ tags = ["fast"]
   work.
 - `max_agents` caps concurrent pastor tasks on the machine. `tags` are free
   strings that jobs can require.
-- herdr's own saved-machine catalog is a viewer concern. `pastor flock add`
+- herdr's own saved-machine catalog is a viewer concern. `pastor machine add`
   prints the matching `herdr machine add` command as a hint and does nothing
   with it.
 
@@ -152,11 +152,11 @@ head. Nothing else about the host is pastor's business.
 Commands:
 
 ```
-pastor flock add <name> <ssh-target> [--session S] [--max-agents N] [--tag T]...
-pastor flock add <name> --local [--max-agents N] [--tag T]...
-pastor flock remove <name>
-pastor flock list        name, target, enabled, channel state, tasks live/max
-pastor flock status [name]   fresh check: ssh, herdr version, server up, protocol
+pastor machine add <name> <ssh-target> [--session S] [--max-agents N] [--tag T]...
+pastor machine add <name> --local [--max-agents N] [--tag T]...
+pastor machine remove <name>
+pastor machine list        name, target, enabled, channel state, tasks live/max
+pastor machine status [name]   fresh check: ssh, herdr version, server up, protocol
 ```
 
 Channel state is one of `connected`, `reconnecting`, `polling`,
@@ -494,7 +494,7 @@ socket protocol version checked by the CLI.
 | no machine with capacity | `queued`, retried each tick, warn after 1h |
 | herdr call fails in dispatch | `failed` with herdr code, partial state kept, no auto retry |
 | machine channel drops | `machine.lost` after backoff, polling fallback, reconcile on return |
-| herdr protocol unsupported | machine `incompatible`, no dispatch, version in `flock status` |
+| herdr protocol unsupported | machine `incompatible`, no dispatch, version in `machine status` |
 | hook fails | logged, never retried |
 | daemon crashes | systemd restarts; reconcile open tasks on start |
 | head reboots | same; overdue jobs run once |
@@ -523,7 +523,7 @@ CLI errors: runtime errors are JSON on stderr with a stable `code` and exit 1. U
   session on the developer machine, exercising `pastor run` on a `local`
   machine. It needs a real agent kind installed locally, named by an env
   var, and checks pane creation, agent name and the state transitions.
-- A manual checklist for the fleet path: `flock add`, `flock status`,
+- A manual checklist for the fleet path: `machine add`, `machine status`,
   `pastor run` to a remote machine, close the laptop, `pastor attach` from a
   phone, blocked notification arrives.
 
@@ -538,7 +538,7 @@ pastor list [--job NAME] [--machine M] [--blocked|--done|--all]
 pastor attach <task>
 pastor open <machine>
 pastor task show|retry|close|prune ...
-pastor flock add|remove|list|status ...
+pastor machine add|remove|list|status ...
 pastor job list|enable|disable|run ...
 pastor plugin install|link|uninstall|unlink|list|run ...
 pastor events [--follow] [--task T]

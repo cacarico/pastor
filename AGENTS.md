@@ -91,7 +91,7 @@ Plan 3 (events):
 - A 30s unread events socket can overrun herdr's retained history; pastor
   reconnects and reconciles, at the cost of a `machine.lost` blip.
 - Adopted panes get no `agent_status` subscription until the next reconnect.
-- `pastor flock status` does unbounded connect/ping/list on the CLI path.
+- `pastor machine status` does unbounded connect/ping/list on the CLI path.
 
 Plan 4 (cleanup and lifecycle):
 

@@ -47,9 +47,9 @@ task's pane over the machine channel. `pastor open pi-3` execs the full herdr
 UI against a flock machine (`herdr --remote` for an SSH one, `herdr` directly
 for a local one) instead of showing pastor's own view; herdr refuses to start
 inside one of its own panes, so run it from a plain terminal. pastor's flock and
-herdr's saved machines are separate lists on purpose: `flock add --herdr` and
-`flock remove --herdr` keep them in step by running `herdr machine add|remove`
-for you, and without the flag `flock add` prints the command instead.
+herdr's saved machines are separate lists on purpose: `machine add --herdr` and
+`machine remove --herdr` keep them in step by running `herdr machine add|remove`
+for you, and without the flag `machine add` prints the command instead.
 
 Runtime errors print JSON on stderr with a stable `code` and exit 1; a
 malformed command line gets clap's plain usage text and exit 2.
@@ -62,9 +62,9 @@ ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
 
 ```bash
 make install                         # pastor and fake-herdr into ~/.cargo/bin
-pastor flock add pi-3 fleet@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
-pastor flock add here --local
-pastor flock status                  # ssh, herdr version, protocol
+pastor machine add pi-3 fleet@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
+pastor machine add here --local
+pastor machine status                  # ssh, herdr version, protocol
 pastor serve &                       # or run it under systemd later
 pastor run "Fix the flaky test in ci.yml" --repo ~/work/api --machine pi-3
 pastor list
@@ -79,7 +79,7 @@ a server, and a bridge per request.
 
 ```bash
 FAKE_HERDR_AUTO_DONE_MS=500 fake-herdr --listen /tmp/fake-herdr.sock &
-pastor flock add fake --command fake-herdr --connect /tmp/fake-herdr.sock
+pastor machine add fake --command fake-herdr --connect /tmp/fake-herdr.sock
 pastor serve
 ```
 

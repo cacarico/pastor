@@ -33,10 +33,10 @@ enum Command {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
-    /// Manage machines
-    Flock {
+    /// Manage the machines in the flock
+    Machine {
         #[command(subcommand)]
-        cmd: FlockCmd,
+        cmd: MachineCmd,
     },
     /// Attach to a task's agent terminal (ctrl+b q detaches)
     Attach { task: String },
@@ -104,7 +104,7 @@ enum TaskCmd {
 }
 
 #[derive(Subcommand)]
-enum FlockCmd {
+enum MachineCmd {
     Add {
         name: String,
         ssh: Option<String>,
@@ -159,7 +159,7 @@ fn main() {
             Command::Run(args) => run(&paths, args).await,
             Command::List(args) => list(&paths, args).await,
             Command::Task { cmd } => task(&paths, cmd).await,
-            Command::Flock { cmd } => flock(&paths, cmd).await,
+            Command::Machine { cmd } => machine(&paths, cmd).await,
             Command::Attach { task } => attach(&paths, &task).await,
             Command::Open { machine } => open(&paths, &machine).await,
             Command::Completions { shell } => {
@@ -238,7 +238,7 @@ fn print_task(t: &Task, json: bool) {
     }
 }
 
-/// Turn a `flock status` probe into a table/JSON row's fields. Pure so the
+/// Turn a `machine status` probe into a table/JSON row's fields. Pure so the
 /// classification (including the agent.list-failed case) is unit-testable
 /// without a live herdr.
 ///
@@ -249,7 +249,7 @@ fn print_task(t: &Task, json: bool) {
 /// Connect/ping failure classification (server down / unreachable / error) is
 /// unchanged; only the ping-succeeded, agent.list-failed case is new: it must
 /// not report the row as reachable with zero agents.
-type FlockStatusRow = (
+type MachineStatusRow = (
     &'static str,
     Option<String>,
     Option<u32>,
@@ -257,10 +257,10 @@ type FlockStatusRow = (
     Option<String>,
 );
 
-fn flock_status_row(
+fn machine_status_row(
     ping: Result<pastor::herdr::Pong, pastor::herdr::CallError>,
     agent_count: Option<Result<usize, pastor::herdr::CallError>>,
-) -> FlockStatusRow {
+) -> MachineStatusRow {
     match ping {
         Ok(p) => {
             let compatible = p.protocol >= pastor::MIN_HERDR_PROTOCOL;
@@ -416,10 +416,10 @@ async fn task(paths: &Paths, cmd: TaskCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
+async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
     let path = paths.flock_file();
     match cmd {
-        FlockCmd::Add {
+        MachineCmd::Add {
             name,
             ssh,
             local,
@@ -466,16 +466,16 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
             }
             println!(
                 "{}",
-                flock_edit_hint(daemon_running(&paths.socket_file()).await)
+                machine_edit_hint(daemon_running(&paths.socket_file()).await)
             );
         }
-        FlockCmd::Remove { name, herdr } => {
+        MachineCmd::Remove { name, herdr } => {
             let mut f = Flock::load(&path)?;
             anyhow::ensure!(f.remove(&name), "machine {name} not found");
             f.save(&path)?;
             println!(
                 "removed {name}; {}",
-                flock_edit_hint(daemon_running(&paths.socket_file()).await)
+                machine_edit_hint(daemon_running(&paths.socket_file()).await)
             );
             if herdr {
                 // herdr removes by profile id; the label is all pastor knows.
@@ -490,7 +490,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                 }
             }
         }
-        FlockCmd::List { json } => {
+        MachineCmd::List { json } => {
             let statuses: Vec<MachineStatus> = if daemon_running(&paths.socket_file()).await {
                 let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
                     unreachable!()
@@ -528,7 +528,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                 );
             }
         }
-        FlockCmd::Status { name, json } => {
+        MachineCmd::Status { name, json } => {
             let f = Flock::load(&path)?;
             let mut rows = Vec::new();
             for m in f
@@ -545,7 +545,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                     Err(_) => None,
                 };
                 let (status, version, protocol, agents, error) =
-                    flock_status_row(ping, agent_count);
+                    machine_status_row(ping, agent_count);
                 rows.push(serde_json::json!({"name": m.name, "endpoint": ep.describe(), "status": status, "herdr_version": version, "protocol": protocol, "agents": agents, "error": error}));
             }
             if json {
@@ -582,7 +582,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
 /// What to do after editing the flock. The daemon reads `flock.toml` only at
 /// start (hot reload is a later plan), so a running one must be restarted;
 /// with none running, "restart" reads as "already picked up" and misleads.
-fn flock_edit_hint(daemon_up: bool) -> &'static str {
+fn machine_edit_hint(daemon_up: bool) -> &'static str {
     if daemon_up {
         "restart pastor serve to pick it up (the flock does not reload while it runs)"
     } else {
@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn agent_list_failure_is_surfaced_not_hidden_as_zero_agents() {
         let (status, version, protocol, agents, error) =
-            flock_status_row(Ok(pong()), Some(Err(agent_list_error())));
+            machine_status_row(Ok(pong()), Some(Err(agent_list_error())));
         assert_eq!(status, "error");
         assert_eq!(version, Some("0.9.1".into()));
         assert_eq!(protocol, Some(pastor::MIN_HERDR_PROTOCOL));
@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn agent_list_success_still_reports_reachable() {
-        let (status, _, _, agents, error) = flock_status_row(Ok(pong()), Some(Ok(3)));
+        let (status, _, _, agents, error) = machine_status_row(Ok(pong()), Some(Ok(3)));
         assert_eq!(status, "reachable");
         assert_eq!(agents, Some(3));
         assert_eq!(error, None);
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn ping_failure_classification_is_unchanged() {
         let err = pastor::herdr::CallError::from(pastor::herdr::HerdrError::Closed);
-        let (status, version, protocol, agents, error) = flock_status_row(Err(err), None);
+        let (status, version, protocol, agents, error) = machine_status_row(Err(err), None);
         assert_eq!(status, "unreachable");
         assert_eq!(version, None);
         assert_eq!(protocol, None);
@@ -803,12 +803,12 @@ mod tests {
     /// user reads "restart" as "it is already known". Say start or restart
     /// depending on what is actually running.
     #[test]
-    fn flock_edit_hint_matches_daemon_state() {
+    fn machine_edit_hint_matches_daemon_state() {
         assert_eq!(
-            flock_edit_hint(true),
+            machine_edit_hint(true),
             "restart pastor serve to pick it up (the flock does not reload while it runs)"
         );
-        assert_eq!(flock_edit_hint(false), "start pastor serve to use it");
+        assert_eq!(machine_edit_hint(false), "start pastor serve to use it");
     }
 
     #[test]
@@ -820,13 +820,13 @@ mod tests {
             }
         }
         assert_eq!(
-            err(&["pastor", "flock", "add", "x", "--local", "--herdr"]).kind(),
+            err(&["pastor", "machine", "add", "x", "--local", "--herdr"]).kind(),
             clap::error::ErrorKind::ArgumentConflict
         );
         assert_eq!(
             err(&[
                 "pastor",
-                "flock",
+                "machine",
                 "add",
                 "x",
                 "--herdr",
@@ -836,8 +836,8 @@ mod tests {
             .kind(),
             clap::error::ErrorKind::ArgumentConflict
         );
-        Cli::try_parse_from(["pastor", "flock", "add", "x", "user@h", "--herdr"]).unwrap();
-        Cli::try_parse_from(["pastor", "flock", "remove", "x", "--herdr"]).unwrap();
+        Cli::try_parse_from(["pastor", "machine", "add", "x", "user@h", "--herdr"]).unwrap();
+        Cli::try_parse_from(["pastor", "machine", "remove", "x", "--herdr"]).unwrap();
     }
 
     /// `herdr machine remove` wants the profile id; pastor knows the label.
