@@ -37,6 +37,9 @@ struct State {
     /// The started agent vanishes immediately, as it does when the agent binary
     /// is missing and the process exits the moment it is launched.
     exit_on_start: bool,
+    /// The started agent's process dies at once but herdr keeps its pane in
+    /// `agent.list`, with neither launch flag set, instead of dropping it.
+    exit_listed: bool,
 }
 
 #[derive(Clone)]
@@ -85,6 +88,12 @@ impl FakeHerdr {
     /// succeeds and `agent.list` never shows them again.
     pub fn exit_agents_on_start(&self, yes: bool) {
         self.state.lock().unwrap().exit_on_start = yes;
+    }
+    /// The next started agents die at once but their pane stays in `agent.list`
+    /// with neither `launch_pending` nor `interactive_ready`, as herdr reports a
+    /// managed agent whose process exited before becoming interactive.
+    pub fn exit_agents_listed(&self, yes: bool) {
+        self.state.lock().unwrap().exit_listed = yes;
     }
     /// The next request for `method` gets no reply; the connection just stops
     /// answering, as if the herdr process wedged. Lets tests exercise a client-side
@@ -314,8 +323,22 @@ impl FakeHerdr {
                     agent_status: AgentStatus::Idle,
                     completion_seq: None,
                     state_change_seq: 1,
+                    launch_pending: false,
                     interactive_ready: true,
                 };
+                if s.exit_listed {
+                    // The agent process died on launch, but herdr keeps the pane
+                    // in `agent.list` with neither launch flag set, the way it
+                    // reports a managed agent that exited before becoming
+                    // interactive.
+                    let dead = AgentInfo {
+                        interactive_ready: false,
+                        launch_pending: false,
+                        ..info.clone()
+                    };
+                    s.agents.insert(pane_id, dead.clone());
+                    return Ok(json!({"type": "agent_started", "agent": dead, "argv": []}));
+                }
                 if s.exit_on_start {
                     // The agent process died on launch: herdr still reports the
                     // start it performed, and the agent is gone from then on.
@@ -346,6 +369,12 @@ impl FakeHerdr {
                 else {
                     return Err(("agent_not_found".into(), target.into()));
                 };
+                if !a.interactive_ready {
+                    return Err((
+                        "agent_not_ready".into(),
+                        format!("agent {target} is not an active named agent"),
+                    ));
+                }
                 if a.agent_status == AgentStatus::Blocked {
                     return Err(("agent_blocked".into(), "agent is blocked".into()));
                 }
@@ -367,6 +396,7 @@ impl FakeHerdr {
                         if is_launching(&s.started, &a.pane_id, ready_after) {
                             AgentInfo {
                                 agent_status: AgentStatus::Unknown,
+                                launch_pending: true,
                                 interactive_ready: false,
                                 ..a.clone()
                             }
@@ -611,6 +641,41 @@ mod tests {
         let c = fake.connect();
         fake.disconnect_all();
         assert!(c.call("ping", json!({})).await.is_err());
+    }
+
+    /// herdr keeps a pane whose managed agent died in `agent.list`, with neither
+    /// launch flag set. The fake must model that shape, distinct from
+    /// `exit_agents_on_start` (gone from the list altogether).
+    #[tokio::test]
+    async fn an_exited_agent_can_stay_listed_without_flags() {
+        let fake = FakeHerdr::new();
+        fake.exit_agents_listed(true);
+        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
+            .await
+            .unwrap();
+        let list = fake.agent_list().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].launch_pending);
+        assert!(!list[0].interactive_ready);
+        assert_eq!(list[0].agent_status, AgentStatus::Idle);
+        let err = fake.agent_prompt("t-1", "hi").await.unwrap_err();
+        assert_eq!(err.code(), Some("agent_not_ready"));
+    }
+
+    #[tokio::test]
+    async fn launch_flags_follow_the_ready_window() {
+        let fake = FakeHerdr::new();
+        fake.set_ready_after(Duration::from_millis(200));
+        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
+            .await
+            .unwrap();
+        let a = &fake.agent_list().await.unwrap()[0];
+        assert!(a.launch_pending && !a.interactive_ready, "{a:?}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let a = &fake.agent_list().await.unwrap()[0];
+        assert!(!a.launch_pending && a.interactive_ready, "{a:?}");
     }
 
     #[tokio::test]

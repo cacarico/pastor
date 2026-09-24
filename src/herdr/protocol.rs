@@ -87,6 +87,11 @@ pub struct AgentInfo {
     pub completion_seq: Option<u64>,
     #[serde(default)]
     pub state_change_seq: u64,
+    /// herdr 0.9.1: the managed agent is still in its pending phase (or blocked
+    /// at startup); `agent.prompt` answers `agent_not_ready` while this is set.
+    #[serde(default)]
+    pub launch_pending: bool,
+    /// herdr 0.9.1: the managed agent is active and accepts prompts.
     #[serde(default)]
     pub interactive_ready: bool,
 }
