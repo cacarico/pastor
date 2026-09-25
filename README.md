@@ -253,7 +253,9 @@ that file in its environment plus `PASTOR_PLUGIN_ID`, `PASTOR_JOB`,
 `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_PLUGIN_STATE_DIR` (the
 job's scratch directory). What a run writes to stderr lands in
 `~/.local/state/pastor/runs/<job>/<ts>.log`, with the values of the secrets
-the manifest declares replaced by `[redacted:NAME]`; each log is cut at
+the manifest declares replaced by `[redacted:NAME]`. Redaction works line by
+line, so a declared secret may not contain a line break (a double-quoted
+`\n`): pastor refuses such a `.env` and names the variable. Each log is cut at
 256 KiB and the newest 20 per job are kept. A stdout or stderr line longer
 than 256 KiB is cut there and the rest of it dropped.
 

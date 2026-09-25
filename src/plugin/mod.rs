@@ -127,9 +127,22 @@ pub fn discover(paths: &Paths) -> anyhow::Result<Vec<Discovered>> {
 }
 
 impl Plugin {
-    /// The plugin's `.env`, as loaded into its commands.
+    /// The plugin's `.env`, as loaded into its commands. A declared secret
+    /// with a line break is refused: output is redacted one line at a time,
+    /// so no line would ever contain the whole value and it would reach the
+    /// logs in pieces.
     pub fn env(&self, paths: &Paths) -> anyhow::Result<Vec<(String, String)>> {
-        env::load(&paths.plugin_env_file(&self.id))
+        let file = paths.plugin_env_file(&self.id);
+        let env = env::load(&file)?;
+        for (name, value) in &env {
+            if self.manifest.secrets.contains_key(name) && value.contains(['\n', '\r']) {
+                anyhow::bail!(
+                    "{}: secret {name} contains a line break; it could not be redacted from output line by line",
+                    file.display()
+                );
+            }
+        }
+        Ok(env)
     }
 
     /// Declared secrets the `.env` does not set, or sets empty.
@@ -393,6 +406,37 @@ mod tests {
         assert_eq!(
             p.redactor(&env).redact("xoxb-9999 abcdef"),
             "[redacted:TOKEN] abcdef"
+        );
+    }
+
+    /// Output is redacted a line at a time, so a secret with a line break in
+    /// it could never match and would reach the logs whole. Such a `.env` is
+    /// refused when it is loaded; an undeclared multiline setting is fine.
+    #[test]
+    fn a_multiline_declared_secret_is_refused_at_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let dir = paths.plugins_dir().join("slack");
+        write_plugin(&dir, "slack", "[secrets.TOKEN]\n");
+        let Discovered::Valid(p) = discover(&paths).unwrap().remove(0) else {
+            panic!()
+        };
+        let env_file = paths.plugin_env_file("slack");
+        std::fs::create_dir_all(env_file.parent().unwrap()).unwrap();
+        for value in [r#""part-one\npart-two""#, "\"part-one\rpart-two\""] {
+            std::fs::write(&env_file, format!("TOKEN={value}\n")).unwrap();
+            let err = format!("{:#}", p.env(&paths).unwrap_err());
+            assert!(
+                err.contains("TOKEN") && err.contains("line break"),
+                "{value}: {err}"
+            );
+            assert!(p.command_env(&paths, None).is_err());
+        }
+        std::fs::write(&env_file, "TOKEN=xoxb-9999\nNOTE=\"a\\nb\"\n").unwrap();
+        let env = p.env(&paths).unwrap();
+        assert_eq!(
+            p.redactor(&env).redact("auth xoxb-9999"),
+            "auth [redacted:TOKEN]"
         );
     }
 }
