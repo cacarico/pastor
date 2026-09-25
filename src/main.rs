@@ -251,7 +251,7 @@ enum FlockCmd {
         #[arg(long)]
         default: bool,
     },
-    /// Remove a flock; refused while it has machines or is the default
+    /// Remove a flock; refused while it has machines or queued tasks, or is the default
     Remove { name: String },
     /// Make another flock the default; machines stay in their flocks
     Default { name: String },
@@ -885,7 +885,13 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
             }
         }
         FlockCmd::Remove { name } => {
-            edit(&|d| d.remove_flock(&name))?;
+            let queued: Vec<String> = queued_tasks(paths)
+                .await?
+                .iter()
+                .filter(|t| t.flock.as_deref() == Some(name.as_str()))
+                .map(|t| t.display_id())
+                .collect();
+            edit(&|d| d.remove_flock(&name, &queued))?;
             format!("removed flock {name}")
         }
         FlockCmd::Default { name } => {
@@ -901,22 +907,16 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
 /// the live agents on each flock's machines.
 async fn flock_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
     let f = Flock::load(&paths.flock_file())?;
-    let filter = TaskFilter {
-        states: Some(vec![TaskState::Queued]),
-        ..Default::default()
-    };
-    let (live, queued) = if daemon_running(&paths.socket_file()).await {
+    let live = if daemon_running(&paths.socket_file()).await {
         let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
             unreachable!()
         };
-        let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
-            unreachable!()
-        };
-        (Some(ms), ts)
+        Some(ms)
     } else {
         eprintln!("pastor serve is not running; agents are unknown");
-        (None, open_store(paths)?.list_tasks(&filter)?)
+        None
     };
+    let queued = queued_tasks(paths).await?;
     let rows = pastor::cli::flock_list(&f, live.as_deref(), &queued);
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -927,6 +927,22 @@ async fn flock_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The queued tasks, from the head when one runs, else from the store.
+async fn queued_tasks(paths: &Paths) -> anyhow::Result<Vec<Task>> {
+    let filter = TaskFilter {
+        states: Some(vec![TaskState::Queued]),
+        ..Default::default()
+    };
+    if daemon_running(&paths.socket_file()).await {
+        let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
+            unreachable!()
+        };
+        Ok(ts)
+    } else {
+        Ok(open_store(paths)?.list_tasks(&filter)?)
+    }
 }
 
 /// After `machine add|remove` rewrote flock.toml, a running head re-reads it

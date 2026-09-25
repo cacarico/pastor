@@ -1878,7 +1878,8 @@ fn flock_commands_edit_the_file_and_keep_its_comments() {
 }
 
 /// `task run --flock` against a running head: the task waits for a machine
-/// of its flock, `--machine` outside it is refused, `task list --flock`
+/// of its flock, the flock cannot be removed under it, `--machine` outside
+/// it is refused, `task list --flock`
 /// narrows to it, and moving a machine in hands it the task.
 #[test]
 fn a_task_waits_for_its_flock_end_to_end() {
@@ -1897,6 +1898,11 @@ fn a_task_waits_for_its_flock_end_to_end() {
     assert_eq!(
         error_code(&env.cmd(&["task", "run", "x", "--flock", "nope"])),
         "unknown_flock"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["flock", "remove", "work"])),
+        "flock_has_tasks",
+        "a removed flock would strand its queued task"
     );
     let id = t["id"].as_i64().unwrap();
     let listed = |flock: &str| -> Vec<i64> {

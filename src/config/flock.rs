@@ -273,6 +273,8 @@ pub enum EditError {
         flock: String,
         machines: Vec<String>,
     },
+    #[error("flock {flock} still has queued tasks: {}; close them first", tasks.join(", "))]
+    FlockHasTasks { flock: String, tasks: Vec<String> },
     #[error("flock {0} is the default; make another flock the default first")]
     RemovingDefault(String),
     #[error("{0}")]
@@ -287,6 +289,7 @@ impl EditError {
             EditError::FlockExists(_) => "flock_exists",
             EditError::UnknownFlock(_) => "unknown_flock",
             EditError::FlockHasMachines { .. } => "flock_not_empty",
+            EditError::FlockHasTasks { .. } => "flock_has_tasks",
             EditError::RemovingDefault(_) => "flock_is_default",
             EditError::Invalid(_) => "config_error",
         }
@@ -533,8 +536,11 @@ impl FlockDoc {
         Ok(())
     }
 
-    /// `flock remove`: refused while machines are in it or it is the default.
-    pub fn remove_flock(&mut self, name: &str) -> Result<(), EditError> {
+    /// `flock remove`: refused while machines are in it, while `queued`
+    /// (the ids of the queued tasks that name it) is not empty, or while it
+    /// is the default. Dispatch only looks in declared flocks, so a queued
+    /// task left naming a removed one would wait forever.
+    pub fn remove_flock(&mut self, name: &str, queued: &[String]) -> Result<(), EditError> {
         let f = self.current()?;
         if !f.flocks.iter().any(|e| e.name == name) {
             return Err(EditError::UnknownFlock(name.into()));
@@ -552,6 +558,12 @@ impl FlockDoc {
             return Err(EditError::FlockHasMachines {
                 flock: name.into(),
                 machines,
+            });
+        }
+        if !queued.is_empty() {
+            return Err(EditError::FlockHasTasks {
+                flock: name.into(),
+                tasks: queued.to_vec(),
             });
         }
         self.remove_named("flock", name);
@@ -850,27 +862,34 @@ flock = "work"
     }
 
     #[test]
-    fn a_flock_is_removed_only_when_empty_and_not_the_default() {
+    fn a_flock_is_removed_only_when_empty_idle_and_not_the_default() {
         let mut d = FlockDoc::parse(COMMENTED).unwrap();
         d.add_flock("work", false).unwrap();
         d.move_machine("pi-3", "work").unwrap();
         assert_eq!(
-            d.remove_flock("work").unwrap_err(),
+            d.remove_flock("work", &[]).unwrap_err(),
             EditError::FlockHasMachines {
                 flock: "work".into(),
                 machines: vec!["pi-3".into()],
             }
         );
         assert_eq!(
-            d.remove_flock("default").unwrap_err(),
+            d.remove_flock("default", &[]).unwrap_err(),
             EditError::RemovingDefault("default".into())
         );
         assert_eq!(
-            d.remove_flock("nope").unwrap_err(),
+            d.remove_flock("nope", &[]).unwrap_err(),
             EditError::UnknownFlock("nope".into())
         );
         d.move_machine("pi-3", "default").unwrap();
-        d.remove_flock("work").unwrap();
+        assert_eq!(
+            d.remove_flock("work", &["t-7".into()]).unwrap_err(),
+            EditError::FlockHasTasks {
+                flock: "work".into(),
+                tasks: vec!["t-7".into()],
+            }
+        );
+        d.remove_flock("work", &[]).unwrap();
         assert_eq!(d.flock().unwrap().flock_names(), ["default"]);
     }
 

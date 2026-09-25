@@ -133,7 +133,7 @@ pastor machine list        # connects to each machine now: ssh, herdr version, a
 pastor flock list          # each flock: default, machines, live agents, queued tasks
 pastor flock add work [--default]
 pastor flock default work  # new tasks and jobs go there; machines stay put
-pastor flock remove work   # refused while it has machines or is the default
+pastor flock remove work   # refused while it has machines or queued tasks, or is the default
 ```
 
 These commands edit `flock.toml` in place, keeping its comments.
