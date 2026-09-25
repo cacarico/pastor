@@ -246,7 +246,9 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
             Done => Closed,
             // An agent that ends between turns has finished what it was
             // given; one that ends while starting, blocked or working has not.
-            Running if *agent_idle && !task.prompt_pending => Done,
+            // It must also have been seen working since its prompt: a prompt
+            // it ignored, or went idle on at once, is not finished work.
+            Running if *agent_idle && !task.prompt_pending && task.activity_seen => Done,
             _ => Failed,
         },
         Observed::Status {
@@ -664,11 +666,16 @@ mod tests {
     fn pane_exited_is_done_only_for_an_idle_running_agent() {
         let exited = |agent_idle| Observed::PaneExited { agent_idle };
         assert_eq!(
-            next_state(&task(TaskState::Running, Some(1)), &exited(true)),
+            next_state(&active(TaskState::Running, Some(1)), &exited(true)),
             Some(TaskState::Done)
         );
+        // Idle but never seen working: the prompt was not acted on.
         assert_eq!(
-            next_state(&task(TaskState::Running, Some(1)), &exited(false)),
+            next_state(&task(TaskState::Running, Some(1)), &exited(true)),
+            Some(TaskState::Failed)
+        );
+        assert_eq!(
+            next_state(&active(TaskState::Running, Some(1)), &exited(false)),
             Some(TaskState::Failed)
         );
         for state in [TaskState::Starting, TaskState::Blocked, TaskState::Stale] {
