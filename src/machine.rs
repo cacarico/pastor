@@ -846,7 +846,7 @@ impl Actor {
     /// the work it was started for.
     async fn deliver_pending_prompt(
         &mut self,
-        mut task: Task,
+        task: Task,
         status: AgentStatus,
     ) -> anyhow::Result<bool> {
         if matches!(status, AgentStatus::Blocked | AgentStatus::Unknown) {
@@ -861,17 +861,26 @@ impl Actor {
             tokio::time::timeout(timeout, self.connector.agent_prompt(&name, &task.prompt))
                 .await
                 .map_err(|_| TimedOut("agent.prompt", timeout))?;
-        match result {
-            Ok(agent) => {
-                task.prompt_pending = false;
-                task.state = TaskState::Running;
-                task.error = None;
-                task.finished_at = None;
+        let id = task.id;
+        // Only a row still waiting for this prompt, on a live pane, takes the
+        // outcome. A row closed or failed meanwhile is left as it is.
+        let still_pending = |t: &Task| t.prompt_pending && t.state.occupies_pane();
+        let written = match result {
+            Ok(agent) => write_task(&self.store, task, |t| {
+                if !still_pending(t) {
+                    return false;
+                }
+                t.prompt_pending = false;
+                t.state = TaskState::Running;
+                t.error = None;
+                t.finished_at = None;
                 // State changes before the agent had our prompt (its launch,
                 // its startup question) are not this task's work: count from here.
-                task.last_completion_seq = Some(agent.state_change_seq);
-                task.activity_seen = agent.agent_status.is_activity();
-            }
+                t.last_completion_seq = Some(agent.state_change_seq);
+                // Set on the fresh row too: a re-read row never carries it.
+                t.activity_seen = agent.agent_status.is_activity();
+                true
+            })?,
             // Blocked again, or between states: the next status event or
             // reconcile tries again.
             Err(err) if matches!(err.code(), Some("agent_blocked" | "agent_not_ready")) => {
@@ -879,17 +888,27 @@ impl Actor {
             }
             Err(err) if err.is_transport() => return Err(err.into()),
             Err(err) => {
-                task.state = TaskState::Failed;
-                task.error = Some(format!("could not send the pending prompt: {err}"));
-                task.finished_at = Some(Utc::now());
+                let message = format!("could not send the pending prompt: {err}");
+                let now = Utc::now();
+                write_task(&self.store, task, |t| {
+                    if !still_pending(t) {
+                        return false;
+                    }
+                    t.state = TaskState::Failed;
+                    t.error = Some(message.clone());
+                    t.finished_at = Some(now);
+                    t.activity_seen = false;
+                    true
+                })?
             }
+        };
+        self.pending_done.remove(&id);
+        // A row left alone keeps whatever the actor knew of it: nothing it saw
+        // while the prompt was pending counted as activity (see `apply`).
+        if let Some(t) = written {
+            self.set_activity(&t);
+            self.emit(&format!("task.{}", t.state), Some(t.id));
         }
-        self.pending_done.remove(&task.id);
-        self.set_activity(&task);
-        // A Conflict here means the row moved on under us; the caller logs it
-        // and the next event or reconcile works from the fresh row.
-        self.store.update_task(&mut task)?;
-        self.emit(&format!("task.{}", task.state), Some(task.id));
         self.refresh_live();
         Ok(true)
     }
@@ -1133,10 +1152,20 @@ impl Actor {
                         .map(|s| (Utc::now() - s).num_seconds() as u64 > task.spec.timeout_secs)
                         .unwrap_or(false);
                     if timed_out && matches!(task.state, TaskState::Running | TaskState::Blocked) {
-                        let mut t = task;
-                        t.state = TaskState::Stale;
-                        self.store.update_task(&mut t)?;
-                        self.emit("task.stale", Some(t.id));
+                        let written = write_task(&self.store, task, |t| {
+                            let open = matches!(t.state, TaskState::Running | TaskState::Blocked);
+                            if open {
+                                t.state = TaskState::Stale;
+                            }
+                            open
+                        });
+                        match written {
+                            Ok(Some(t)) => self.emit("task.stale", Some(t.id)),
+                            Ok(None) => {}
+                            // One row must not stop the rest of the pass, nor
+                            // the live count after it.
+                            Err(err) => tracing::error!(machine = %self.name, %err, "mark stale"),
+                        }
                         continue;
                     }
                     if matches!(
@@ -1163,6 +1192,39 @@ impl Actor {
         self.refresh_live();
         Ok(())
     }
+}
+
+/// `update_task` with one retry. On `Conflict` (the row was written since it
+/// was read, e.g. by `pastor task close` or `retry`), re-read it and apply
+/// `change` to the fresh copy. `change` returns `false` when the row no
+/// longer wants the change; then nothing is written. Returns the row as
+/// written, or `None` when nothing was. A second conflict, or any other
+/// store error, is returned.
+///
+/// The fresh copy comes from the store, so its unstored fields
+/// (`Task::activity_seen`) are at their defaults: `change` must set any it
+/// relies on rather than expect them carried over.
+fn write_task(
+    store: &Store,
+    mut task: Task,
+    change: impl Fn(&mut Task) -> bool,
+) -> anyhow::Result<Option<Task>> {
+    if !change(&mut task) {
+        return Ok(None);
+    }
+    match store.update_task(&mut task) {
+        Ok(()) => return Ok(Some(task)),
+        Err(err) if err.downcast_ref::<crate::store::Conflict>().is_none() => return Err(err),
+        Err(_) => {}
+    }
+    let Some(mut fresh) = store.get_task(task.id)? else {
+        return Ok(None);
+    };
+    if !change(&mut fresh) {
+        return Ok(None);
+    }
+    store.update_task(&mut fresh)?;
+    Ok(Some(fresh))
 }
 
 /// What `agent.list` says about an agent, as a state machine observation.
@@ -1281,6 +1343,102 @@ mod tests {
 
     fn state_of(store: &Store, id: i64) -> TaskState {
         store.get_task(id).unwrap().unwrap().state
+    }
+
+    /// Someone else wrote the row (task close, retry) between our read and
+    /// our write: the change is re-applied to the fresh row, keeping their
+    /// fields.
+    #[test]
+    fn write_task_retries_a_conflict_once_on_the_fresh_row() {
+        let store = Store::open_in_memory().unwrap();
+        let t = new_task(&store);
+        let stale = t.clone();
+        let mut other = t.clone();
+        other.error = Some("written by someone else".into());
+        store.update_task(&mut other).unwrap();
+
+        let written = write_task(&store, stale, |t| {
+            t.state = TaskState::Stale;
+            true
+        })
+        .unwrap()
+        .expect("the fresh row still wanted the change");
+        assert_eq!(written.state, TaskState::Stale);
+        assert_eq!(written.error.as_deref(), Some("written by someone else"));
+        assert_eq!(state_of(&store, t.id), TaskState::Stale);
+    }
+
+    /// A row that moved on to a state the change does not apply to is left
+    /// alone: a task closed meanwhile is never reopened.
+    #[test]
+    fn write_task_leaves_a_row_that_moved_on() {
+        let store = Store::open_in_memory().unwrap();
+        let t = new_task(&store);
+        let stale = t.clone();
+        // What `pastor task close` does, outside the actor.
+        let mut closed = t.clone();
+        closed.state = TaskState::Closed;
+        closed.finished_at = Some(Utc::now());
+        store.update_task(&mut closed).unwrap();
+        let written = write_task(&store, stale, |t| {
+            let open = t.state != TaskState::Closed;
+            if open {
+                t.state = TaskState::Stale;
+            }
+            open
+        })
+        .unwrap();
+        assert!(written.is_none());
+        assert_eq!(state_of(&store, t.id), TaskState::Closed);
+    }
+
+    /// `activity_seen` is not stored, so a re-read row always comes back
+    /// without it. The retried write carries what the change set, which is
+    /// what the caller copies into the actor's in-memory set.
+    #[test]
+    fn write_task_keeps_the_unstored_activity_flag_on_the_retry() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = new_task(&store);
+        t.prompt_pending = true;
+        store.update_task(&mut t).unwrap();
+        let stale = t.clone();
+        let mut other = t.clone();
+        other.error = Some("written by someone else".into());
+        store.update_task(&mut other).unwrap();
+
+        let written = write_task(&store, stale, |t| {
+            t.prompt_pending = false;
+            t.activity_seen = true;
+            true
+        })
+        .unwrap()
+        .expect("the fresh row still wanted the change");
+        assert!(written.activity_seen);
+        assert!(!store.get_task(t.id).unwrap().unwrap().prompt_pending);
+    }
+
+    /// A second conflict is not retried again: it is returned to the caller.
+    #[test]
+    fn write_task_returns_a_second_conflict() {
+        let store = Store::open_in_memory().unwrap();
+        let t = new_task(&store);
+        let stale = t.clone();
+        let mut other = t.clone();
+        store.update_task(&mut other).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let err = write_task(&store, stale, |t| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                // Someone writes again between the re-read and the retry.
+                let mut again = store.get_task(t.id).unwrap().unwrap();
+                store.update_task(&mut again).unwrap();
+            }
+            t.state = TaskState::Stale;
+            true
+        })
+        .unwrap_err();
+        assert!(err.downcast_ref::<crate::store::Conflict>().is_some());
+        assert_eq!(calls.get(), 2);
     }
 
     #[tokio::test]
