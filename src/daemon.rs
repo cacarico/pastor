@@ -92,6 +92,7 @@ impl FlockDiff {
     }
 }
 
+#[derive(Clone)]
 struct Member {
     handle: MachineHandle,
     /// What the actor was spawned from; `None` for handles given to
@@ -193,36 +194,53 @@ impl Fleet {
     ///
     /// Takes the dispatch lock, so no pass is holding a handle that is being
     /// stopped. Stopping an actor touches nothing on its machine; tasks left
-    /// there keep their last state.
+    /// there keep their last state. Every stopped actor has ended before a
+    /// replacement is spawned or the new set is published, so a removed
+    /// machine writes no row afterwards and a retargeted one never has two
+    /// actors on the same tasks.
     pub async fn apply_flock(&self, flock: &Flock, settings: &MachineSettings) -> FlockDiff {
         let Some(spawner) = &self.spawner else {
             return FlockDiff::default();
         };
         let _pass = self.dispatch_lock.lock().await;
         let mut diff = FlockDiff::default();
-        let mut members = self.members.write().unwrap();
-        let mut old: Vec<Member> = std::mem::take(&mut *members);
+        // A copy: readers keep seeing the old set until the new one is ready,
+        // and the lock is not held across the waits below. The dispatch lock
+        // keeps any other `apply_flock` out meanwhile.
+        let mut old: Vec<Member> = self.members.read().unwrap().clone();
+        // `None`: spawn once the stopped actors have ended.
+        let mut plan: Vec<Option<Member>> = Vec::new();
+        let mut stop: Vec<MachineHandle> = Vec::new();
         for m in &flock.machines {
             let want = (m.clone(), settings.clone());
             match old.iter().position(|o| o.handle.name == m.name) {
                 Some(i) if old[i].spawned_from.as_ref() == Some(&want) => {
-                    members.push(old.remove(i));
+                    plan.push(Some(old.remove(i)));
                 }
                 Some(i) => {
-                    old.remove(i).handle.shutdown();
+                    stop.push(old.remove(i).handle);
                     diff.retargeted.push(m.name.clone());
-                    members.push(self.spawn(spawner, m, settings));
+                    plan.push(None);
                 }
                 None => {
                     diff.added.push(m.name.clone());
-                    members.push(self.spawn(spawner, m, settings));
+                    plan.push(None);
                 }
             }
         }
         for gone in old {
-            gone.handle.shutdown();
             diff.removed.push(gone.handle.name.clone());
+            stop.push(gone.handle);
         }
+        for h in &stop {
+            h.shutdown().await;
+        }
+        let members: Vec<Member> = plan
+            .into_iter()
+            .zip(&flock.machines)
+            .map(|(kept, m)| kept.unwrap_or_else(|| self.spawn(spawner, m, settings)))
+            .collect();
+        *self.members.write().unwrap() = members;
         diff
     }
 
@@ -916,16 +934,18 @@ mod tests {
         let b = fleet.get("b").unwrap();
 
         let d = fleet.apply_flock(&flock_of(&[("a", 3)]), &fast()).await;
+        // The old actors have ended by the time `apply_flock` returns: a
+        // removed machine cannot touch its rows afterwards, and a retargeted
+        // one never has two actors at once.
+        assert!(a.actor_finished() && b.actor_finished());
+        assert!(a.tx.is_closed() && b.tx.is_closed());
+        assert!(!fleet.get("a").unwrap().actor_finished());
         assert_eq!(d.removed, vec!["b".to_string()]);
         assert_eq!(d.retargeted, vec!["a".to_string()], "max_agents changed");
         assert!(d.added.is_empty());
         assert!(fleet.get("b").is_none());
         assert_eq!(fleet.get("a").unwrap().max_agents, 3);
         assert_eq!(fleet.flock(), flock_of(&[("a", 3)]));
-        wait_until("old actors stopped", || {
-            a.tx.is_closed() && b.tx.is_closed()
-        })
-        .await;
     }
 
     /// Review Focus 2: an editor re-save, or `machine add other`, must not

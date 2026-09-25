@@ -515,7 +515,7 @@ mod tests {
                 tags: vec![],
                 orphans: vec![],
             })),
-            abort: None,
+            task: None,
         }
     }
 

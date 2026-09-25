@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -186,20 +186,58 @@ pub struct MachineHandle {
     pub tags: Vec<String>,
     pub tx: mpsc::Sender<MachineCommand>,
     pub status: Arc<RwLock<MachineStatus>>,
-    /// Stops the actor task (`shutdown`). `None` only for handles built by
-    /// hand in tests, which have no actor.
-    pub abort: Option<tokio::task::AbortHandle>,
+    /// The actor task, for `shutdown`. `None` only for handles built by hand
+    /// in tests, which have no actor.
+    pub task: Option<Arc<ActorTask>>,
+}
+
+/// How long `shutdown` waits for an aborted actor to end. An abort lands at
+/// the actor's next await, so this is only reached if a poll blocks.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+
+/// The running actor, shared by every clone of its handle. The join handle
+/// is kept, not just an abort handle, because aborting only asks the task to
+/// stop: until it has ended it can still write a row.
+pub struct ActorTask {
+    abort: tokio::task::AbortHandle,
+    /// Taken by the first `shutdown` to wait on it.
+    join: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl MachineHandle {
-    /// Stop the actor now, at whatever it is awaiting. A flock reload calls
-    /// this for a machine it removes or replaces. Nothing on the machine is
-    /// touched: agents keep running, rows keep their state, and a replacement
-    /// actor reconciles them. A request in flight answers "dropped the request".
-    pub fn shutdown(&self) {
-        if let Some(abort) = &self.abort {
-            abort.abort();
+    /// Stop the actor and wait until its task has ended. A flock reload calls
+    /// this for a machine it removes or replaces, before it spawns the
+    /// replacement, so a removed actor cannot write a row after removal and a
+    /// retargeted machine never has two actors racing on its tasks.
+    ///
+    /// Nothing on the machine is touched: agents keep running, rows keep their
+    /// state, and a replacement actor reconciles them. A request in flight
+    /// answers "dropped the request". Waits at most `SHUTDOWN_WAIT`, then
+    /// warns and returns.
+    pub async fn shutdown(&self) {
+        let Some(task) = &self.task else { return };
+        task.abort.abort();
+        // Taken out first: a std guard must not be held across the await.
+        let join = task.join.lock().unwrap().take();
+        let Some(join) = join else {
+            // Another clone is already waiting on it.
+            return;
+        };
+        match tokio::time::timeout(SHUTDOWN_WAIT, join).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) if err.is_cancelled() => {}
+            Ok(Err(err)) => tracing::warn!(machine = %self.name, %err, "actor ended with an error"),
+            Err(_) => tracing::warn!(
+                machine = %self.name,
+                wait = ?SHUTDOWN_WAIT,
+                "actor did not stop in time"
+            ),
         }
+    }
+
+    /// Whether the actor task has ended. True for a handle with no actor.
+    pub fn actor_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(|t| t.abort.is_finished())
     }
 
     pub fn snapshot(&self) -> MachineStatus {
@@ -291,7 +329,10 @@ pub fn spawn_machine(
         tags,
         tx,
         status,
-        abort: Some(task.abort_handle()),
+        task: Some(Arc::new(ActorTask {
+            abort: task.abort_handle(),
+            join: Mutex::new(Some(task)),
+        })),
     }
 }
 
@@ -1763,8 +1804,11 @@ mod tests {
         h.dispatch(t.id).await.unwrap();
         assert_eq!(state_of(&store, t.id), TaskState::Running);
 
-        h.shutdown();
-        wait_for("actor gone", || h.tx.is_closed()).await;
+        h.shutdown().await;
+        // No waiting here: once `shutdown` returns the actor task has ended,
+        // so it can neither write a row nor ask herdr anything.
+        assert!(h.actor_finished(), "shutdown waits for the task to end");
+        assert!(h.tx.is_closed());
         let sent = fake.requests().len();
         // `settings()` reconciles every 200ms: a live actor would have called
         // agent.list at least twice in this window.
