@@ -261,7 +261,8 @@ to (`--machine`, a job's `machine`); else the default flock. `--machine` with
 a `--flock` the machine is not in is refused (`flock_mismatch`), as is a flock
 that does not exist (`unknown_flock`). A job whose flock does not fit fails
 its run before the connector is asked for anything, with the reason in
-`pastor job list`. `pastor task retry` keeps the flock of the task it copies. A head
+`pastor job list`. `pastor task retry` keeps the flock of the task it copies, and is refused
+(`unknown_flock`) once that flock has been removed. A head
 started from a pastor before flocks would ignore `--flock`, so `task run` and
 `task list` refuse it there (`head_too_old`): restart `pastor serve` after an
 upgrade.

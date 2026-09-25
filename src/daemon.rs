@@ -529,17 +529,26 @@ impl Fleet {
     }
 
     /// `queue_task` for a retry of task `id` (`Store::insert_retry`). The
-    /// copy keeps the original's pin, so the pin gets the same check under
-    /// the same lock. A row that is missing or not retryable is left for
-    /// `insert_retry` to name.
+    /// copy keeps the original's pin and flock, so both get the same checks
+    /// under the same lock: a failed task outlives `flock remove`, which only
+    /// counts queued ones, and a copy in a removed flock would wait forever.
+    /// A row that is missing or not retryable is left for `insert_retry` to
+    /// name.
     pub async fn queue_retry(&self, id: i64) -> Result<Task, QueueError<RetryError>> {
         let _pass = self.dispatch_lock.lock().await;
         if let Ok(Some(t)) = self.store.get_task(id)
             && t.state.is_retryable()
-            && let Some(m) = &t.spec.machine
-            && !self.in_flock(m)
         {
-            return Err(QueueError::UnknownMachine(m.clone()));
+            if let Some(m) = &t.spec.machine
+                && !self.in_flock(m)
+            {
+                return Err(QueueError::UnknownMachine(m.clone()));
+            }
+            if let Some(f) = &t.flock
+                && !self.flock().has_flock(f)
+            {
+                return Err(QueueError::Flock(TaskFlockError::UnknownFlock(f.clone())));
+            }
         }
         self.store.insert_retry(id).map_err(QueueError::Store)
     }
@@ -1880,6 +1889,35 @@ mod tests {
         assert!(
             matches!(&resp, IpcResponse::Error { code, .. } if code == "flock_is_default"),
             "{resp:?}"
+        );
+    }
+
+    /// A retry copies the flock of the task it retries. A failed task keeps
+    /// its flock after `flock remove` (only queued tasks block that), so its
+    /// retry is refused with `unknown_flock` rather than queued in a flock
+    /// dispatch never serves.
+    #[tokio::test]
+    async fn retry_in_a_removed_flock_is_unknown() {
+        let (d, _tmp) = spare_daemon().await;
+        let IpcResponse::Task(mut t) = d.handle(run_in(Some("spare"), None)).await else {
+            panic!()
+        };
+        t.state = TaskState::Failed;
+        t.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut t).unwrap();
+        let resp = d
+            .handle(IpcRequest::FlockRemove {
+                name: "spare".into(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            error_code(d.handle(IpcRequest::TaskRetry { id: t.id }).await),
+            "unknown_flock"
+        );
+        assert!(
+            d.store.queued_tasks().unwrap().is_empty(),
+            "no copy left queued"
         );
     }
 
