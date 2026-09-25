@@ -9,6 +9,16 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
 const READY_POLL: Duration = Duration::from_millis(500);
 
+/// How many times dispatch tries `agent.start` on a pane herdr calls busy, and
+/// how long it waits between tries. A new pane's shell can still be starting
+/// a second after `workspace.create` returns; herdr then answers
+/// `agent_pane_busy` and the same start works a moment later (t-42, t-50 on
+/// 2026-09-25). herdr 0.9.1 has no request that says whether a pane's shell is
+/// ready, so this is a timed retry. Five tries 500ms apart add at most 2s,
+/// well inside `request_timeout`, which still bounds the whole dispatch.
+const PANE_BUSY_ATTEMPTS: u32 = 5;
+const PANE_BUSY_WAIT: Duration = Duration::from_millis(500);
+
 #[derive(Debug, Clone)]
 pub struct MachineView {
     pub name: String,
@@ -156,13 +166,7 @@ async fn dispatch_steps(
     // pane; it never reports `agent_not_ready` (its errors are about the name,
     // the kind and the pane). Readiness shows up afterwards, in `agent.list` and
     // in whether `agent.prompt` is accepted.
-    conn.agent_start(
-        name,
-        &spec.agent,
-        &created.root_pane.pane_id,
-        &spec.agent_args,
-    )
-    .await?;
+    start_agent(conn, name, &spec, &created.root_pane.pane_id).await?;
 
     let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
@@ -173,6 +177,51 @@ async fn dispatch_steps(
         task.activity_seen = agent.agent_status.is_activity();
     }
     Ok(outcome)
+}
+
+/// `agent.start`, retried while herdr says the pane is busy: its shell has not
+/// finished starting yet (see `PANE_BUSY_ATTEMPTS`). Matched on the code, not
+/// the message. Every other error fails at once.
+async fn start_agent(
+    conn: &dyn Connector,
+    name: &str,
+    spec: &DispatchSpec,
+    pane_id: &str,
+) -> Result<(), DispatchError> {
+    let mut attempt = 1;
+    loop {
+        match conn
+            .agent_start(name, &spec.agent, pane_id, &spec.agent_args)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) if err.code() == Some("agent_pane_busy") => {
+                if attempt >= PANE_BUSY_ATTEMPTS {
+                    // Keep the code so the error still reads as herdr's; add
+                    // how long pastor tried.
+                    let message = match err {
+                        CallError::Herdr(HerdrError::Api { message, .. }) => message,
+                        other => other.to_string(),
+                    };
+                    return Err(HerdrError::Api {
+                        code: "agent_pane_busy".into(),
+                        message: format!("{message} after {attempt} attempts"),
+                    }
+                    .into());
+                }
+                tracing::debug!(
+                    agent = name,
+                    pane = pane_id,
+                    attempt,
+                    %err,
+                    "pane busy, retrying agent.start"
+                );
+                attempt += 1;
+                tokio::time::sleep(PANE_BUSY_WAIT).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 /// Expand a leading `~` in `repo` against the machine's home directory.
@@ -763,6 +812,66 @@ mod tests {
             "created workspace is recorded even on failure"
         );
         assert!(!fake.requests().iter().any(|r| r.method == "agent.prompt"));
+    }
+
+    /// herdr answers `agent_pane_busy` while the new pane's shell is still
+    /// starting; on the real fleet the same dispatch works a moment later
+    /// (t-42, t-50). Dispatch retries `agent.start` instead of failing.
+    #[tokio::test]
+    async fn a_busy_pane_is_retried_until_the_shell_is_up() {
+        let fake = FakeHerdr::new();
+        fake.set_pane_busy_for(2);
+        let mut t = task(spec());
+        let out = dispatch(&fake, &mut t, READY).await.unwrap();
+        assert_eq!(out, DispatchOutcome::Running);
+        assert_eq!(t.state, TaskState::Running);
+        let reqs = fake.requests();
+        let starts = reqs.iter().filter(|r| r.method == "agent.start").count();
+        assert_eq!(starts, 3, "two busy answers, then the start that worked");
+        assert!(reqs.iter().any(|r| r.method == "agent.prompt"));
+    }
+
+    /// A pane that stays busy past the last attempt fails the task with
+    /// herdr's own words and the attempt count, and nothing is prompted.
+    #[tokio::test]
+    async fn a_pane_busy_past_the_last_attempt_fails_the_task() {
+        let fake = FakeHerdr::new();
+        fake.set_pane_busy_for(PANE_BUSY_ATTEMPTS + 1);
+        let mut t = task(spec());
+        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        assert_eq!(err.code(), Some("agent_pane_busy"));
+        assert!(!err.is_transport(), "a busy pane is not a dead machine");
+        let message = err.to_string();
+        assert!(
+            message.contains("agent target pane w1:p1 is not an available shell"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(&format!("after {PANE_BUSY_ATTEMPTS} attempts")),
+            "{message}"
+        );
+        assert_eq!(t.state, TaskState::Failed);
+        assert_eq!(t.error.as_deref(), Some(message.as_str()));
+        let reqs = fake.requests();
+        let starts = reqs.iter().filter(|r| r.method == "agent.start").count();
+        assert_eq!(starts, PANE_BUSY_ATTEMPTS as usize);
+        assert!(!reqs.iter().any(|r| r.method == "agent.prompt"));
+    }
+
+    /// Only `agent_pane_busy` is retried; any other start error fails at once.
+    #[tokio::test]
+    async fn other_start_errors_are_not_retried() {
+        let fake = FakeHerdr::new();
+        fake.set_start_behaviour(StartBehaviour::Fail("agent_name_taken".into()));
+        let mut t = task(spec());
+        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        assert_eq!(err.code(), Some("agent_name_taken"));
+        let starts = fake
+            .requests()
+            .iter()
+            .filter(|r| r.method == "agent.start")
+            .count();
+        assert_eq!(starts, 1);
     }
 
     /// The pane is still listed but the agent process died before becoming

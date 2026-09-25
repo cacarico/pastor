@@ -44,6 +44,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A dispatch no longer fails when the new pane's shell is still starting.
+  herdr answered `agent.start` with `agent_pane_busy` about a second after
+  `workspace.create`, and pastor failed the task at once; it now retries up
+  to 5 times, 500ms apart, and only then fails with herdr's message plus
+  `after 5 attempts`.
 - `pastor serve` now also shuts down cleanly on SIGTERM and SIGHUP, not just
   SIGINT (ctrl-c). systemd counts all three as a clean exit; the head used to
   handle only SIGINT, so a SIGTERM (a plain `kill`, `systemctl stop` of a

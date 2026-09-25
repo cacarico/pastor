@@ -27,7 +27,10 @@ ControlPath=~/.local/state/pastor/ssh/<machine>-%C <target>`. Alongside them eac
 machine keeps one long-lived connection for `events.subscribe`, the one thing
 herdr holds open. Over these pastor creates a workspace, starts an agent named
 after the task, waits for the agent to come up (herdr's `agent.start` returns
-before it has), sends the prompt, and watches agent status events. An agent that
+before it has), sends the prompt, and watches agent status events. herdr answers
+`agent.start` with `agent_pane_busy` while a new pane's shell is still
+starting, so pastor retries the start up to 5 times, 500ms apart, before it
+fails the task. An agent that
 never becomes ready within 30s fails the task; one that exits on start fails it
 straight away, usually because the agent is not installed on that machine. An
 agent that is blocked on its own startup question marks the task `blocked`;

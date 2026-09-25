@@ -53,6 +53,9 @@ struct State {
     /// `agent.prompt` is accepted but the agent never acts on it: it stays idle
     /// and its `state_change_seq` does not move.
     ignore_prompts: bool,
+    /// How many of the next `agent.start` calls answer `agent_pane_busy`, as
+    /// herdr does while a new pane's shell is still starting.
+    pane_busy_for: u32,
     /// herdr's `next_agent_state_change_seq`: one counter for the whole server,
     /// bumped on every agent state change and stamped on the agent that changed.
     seq: u64,
@@ -156,6 +159,12 @@ impl FakeHerdr {
     /// managed agent whose process exited before becoming interactive.
     pub fn exit_agents_listed(&self, yes: bool) {
         self.state.lock().unwrap().exit_listed = yes;
+    }
+    /// The next `n` `agent.start` calls answer `agent_pane_busy`, the way
+    /// herdr refuses a pane whose shell has not finished starting (t-42 and
+    /// t-50 on the real fleet, 2026-09-25).
+    pub fn set_pane_busy_for(&self, n: u32) {
+        self.state.lock().unwrap().pane_busy_for = n;
     }
     /// The next request for `method` gets no reply; the connection just stops
     /// answering, as if the herdr process wedged. Lets tests exercise a client-side
@@ -393,6 +402,13 @@ impl FakeHerdr {
                 let known = matches!((ws_num, pane_part), (Some(n), Some("p1")) if n >= 1 && n <= s.next_ws);
                 if !known {
                     return Err(("pane_not_found".into(), pane_id));
+                }
+                if s.pane_busy_for > 0 {
+                    s.pane_busy_for -= 1;
+                    return Err((
+                        "agent_pane_busy".into(),
+                        format!("agent target pane {pane_id} is not an available shell"),
+                    ));
                 }
                 let ws = ws_part.to_string();
                 match s.start.clone().unwrap_or(StartBehaviour::Ready) {
