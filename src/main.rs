@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use pastor::config::flock::{Flock, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
-use pastor::herdr::{ConnectorExt, Endpoint, shell_quote};
+use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{
     DaemonProbe, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon,
     daemon_running, probe_daemon, request,
@@ -503,6 +503,13 @@ async fn probe_machine(m: &MachineConfig, paths: &Paths) -> pastor::cli::Machine
         Ok(_) => Some(ep.agent_list().await.map(|a| a.len())),
         Err(_) => None,
     };
+    // Only a machine that answered is worth the extra ssh. A failure here
+    // leaves the version unknown and the probe's verdict alone, as it does
+    // on the head.
+    let pastor_version = match &ping {
+        Ok(_) => ep.pastor_version().await.unwrap_or(None),
+        Err(_) => None,
+    };
     let (channel, herdr_version, protocol, live, error) = probe_fields(ping, agent_count);
     pastor::cli::MachineRow {
         name: m.name.clone(),
@@ -510,6 +517,7 @@ async fn probe_machine(m: &MachineConfig, paths: &Paths) -> pastor::cli::Machine
         endpoint: ep.describe(),
         channel: channel.into(),
         herdr_version,
+        pastor_version,
         protocol,
         error,
         live,

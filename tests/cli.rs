@@ -1117,28 +1117,36 @@ fn machine_list_shows_the_head_then_the_machines() {
     assert_eq!(
         lines[0],
         [
-            "NAME", "HOST", "CHANNEL", "HERDR", "AGENTS", "TAGS", "ERROR"
+            "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "TAGS", "ERROR"
         ],
         "{stdout}"
     );
     assert_eq!(lines[1][0], "pastor", "{stdout}");
     assert_eq!(lines[1][2], "head", "{stdout}");
-    assert_eq!(&lines[1][4..], ["-", "-"], "{stdout}");
+    // HERDR is whatever herdr this host has, so only the columns after it.
+    assert_eq!(
+        &lines[1][4..],
+        [env!("CARGO_PKG_VERSION"), "-", "-"],
+        "{stdout}"
+    );
     assert_eq!(
         lines[2][..3],
         ["fake", "fake-herdr", "connected"],
         "{stdout}"
     );
-    assert_eq!(lines[2][4], "0/2", "{stdout}");
+    // A command bridge cannot say which pastor is behind it.
+    assert_eq!(lines[2][4..6], ["-", "0/2"], "{stdout}");
     assert_eq!(lines.len(), 3, "{stdout}");
 
     let out = env.cmd(&["machine", "list", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["head"]["name"], "pastor");
     assert_eq!(v["head"]["channel"], "head");
+    assert_eq!(v["head"]["pastor_version"], env!("CARGO_PKG_VERSION"));
     let ms = v["machines"].as_array().unwrap();
     assert_eq!(ms.len(), 1, "{v}");
     assert_eq!(ms[0]["name"], "fake");
+    assert!(ms[0]["pastor_version"].is_null(), "{v}");
     assert_eq!(ms[0]["host"], "fake-herdr");
     assert_eq!(ms[0]["channel"], "connected");
 
@@ -1227,14 +1235,14 @@ fn machine_list_without_daemon_probes_each_machine() {
     assert_eq!(lines[1][0], "pastor", "{stdout}");
     assert_eq!(lines[1][2], "head", "{stdout}");
     assert_eq!(lines[2][..3], ["fake", "fake-herdr", "probed"], "{stdout}");
-    assert_eq!(&lines[2][4..], ["0/2", "arm"], "{stdout}");
+    assert_eq!(&lines[2][4..], ["-", "0/2", "arm"], "{stdout}");
     assert_eq!(
         lines[3][..3],
         ["gone", "no-such-bridge", "unreachable"],
         "{stdout}"
     );
-    assert_eq!(lines[3][3..5], ["-", "-/1"], "{stdout}");
-    assert!(lines[3].len() > 6, "ERROR should say why: {stdout}");
+    assert_eq!(lines[3][3..6], ["-", "-", "-/1"], "{stdout}");
+    assert!(lines[3].len() > 7, "ERROR should say why: {stdout}");
 
     // The same JSON shape as with a head.
     let out = run(&["machine", "list", "--json"]);
@@ -1323,6 +1331,83 @@ fn machine_list_without_daemon_reads_a_local_machine_with_no_server_as_down() {
     assert_eq!(ms[0]["channel"], "server down", "{v}");
     let error = ms[0]["error"].as_str().expect("error string");
     assert!(error.contains("herdr.sock"), "{error}");
+}
+
+/// With no head, a `--local` machine that answers is the head's own host, so
+/// its PASTOR is this binary's version. `XDG_CONFIG_HOME` points
+/// `local_socket_path` at a fake herdr listening where herdr's default
+/// session would.
+#[test]
+fn machine_list_without_daemon_shows_a_local_machine_s_pastor_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    let xdg = tmp.path().join("xdg");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(xdg.join("herdr")).unwrap();
+    let socket = xdg.join("herdr").join("herdr.sock");
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _herdr = Server(
+        Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+            .arg("--listen")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "fake herdr never listened");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"here\"\nlocal = true\nsession = \"default\"\nmax_agents = 1\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["machine", "list"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<Vec<&str>> = stdout
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(lines[0][3..5], ["HERDR", "PASTOR"], "{stdout}");
+    assert_eq!(
+        lines[2][..5],
+        ["here", "local", "probed", "fake", env!("CARGO_PKG_VERSION")],
+        "{stdout}"
+    );
+
+    let out = run(&["machine", "list", "--json"]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["machines"][0]["pastor_version"],
+        env!("CARGO_PKG_VERSION"),
+        "{v}"
+    );
 }
 
 /// `probe_daemon` reads a socket that accepts connections but never answers

@@ -29,6 +29,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   instead of printing the flock file with no live data. CHANNEL reads
   `probed`, `server down`, `unreachable` or `error`. `pastor machine status`
   is folded into it and stays as a hidden alias.
+- `pastor machine list` has a PASTOR column after HERDR: the pastor installed
+  on each machine (`-` when there is none or it cannot be known), and the
+  head's own version on the head row. The head asks each machine once per
+  connect; `--json` carries it as `pastor_version`.
 
 ### Changed
 

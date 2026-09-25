@@ -30,7 +30,7 @@ Runtime errors are one JSON object on stderr, `{"code": ..., "message": ...}`, w
 pastor machine list
 ```
 
-With a head running, it prints one row per machine: `NAME`, `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `AGENTS` (live tasks over `max_agents`), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head, it says so on stderr and lists the flock file with nothing connected; say that to the user rather than starting `pastor serve` yourself, which is a long-running daemon.
+With a head running, it prints one row per machine: `NAME`, `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `PASTOR` (the pastor installed there, `-` when unknown), `AGENTS` (live tasks over `max_agents`), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head, it says so on stderr and lists the flock file with nothing connected; say that to the user rather than starting `pastor serve` yourself, which is a long-running daemon.
 
 ```bash
 pastor task list          # live tasks: queued, starting, running, blocked

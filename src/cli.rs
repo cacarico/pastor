@@ -159,13 +159,15 @@ pub fn task_detail(t: &Task) -> String {
 pub const TASK_HEADER: [&str; 7] = ["ID", "STATE", "MACHINE", "AGENT", "JOB", "AGE", "NOTE"];
 
 /// The first row of `machine list`: the head itself. It runs no tasks, so it
-/// is not a machine and has no agents, tags or error of its own.
+/// is not a machine and has no agents, tags or error of its own. Its
+/// `pastor_version` is this binary's, which is always known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HeadRow {
     pub name: String,
     pub host: String,
     pub channel: String,
     pub herdr_version: Option<String>,
+    pub pastor_version: String,
 }
 
 impl HeadRow {
@@ -175,6 +177,7 @@ impl HeadRow {
             host,
             channel: "head".into(),
             herdr_version,
+            pastor_version: env!("CARGO_PKG_VERSION").into(),
         }
     }
 }
@@ -194,7 +197,9 @@ pub fn herdr_version_from(output: &str) -> Option<String> {
 /// JSON matches what the events log carries; `channel` is a plain string
 /// because a probe reports one of `probed`, `server down`, `unreachable` or
 /// `error`, none of which is a live channel state, and `live` is absent when
-/// a probe could not count the agents.
+/// a probe could not count the agents. `pastor_version` is the pastor
+/// installed on the machine, `null` when there is none or it cannot be known
+/// (always for a `command` machine).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MachineRow {
     pub name: String,
@@ -202,6 +207,7 @@ pub struct MachineRow {
     pub endpoint: String,
     pub channel: String,
     pub herdr_version: Option<String>,
+    pub pastor_version: Option<String>,
     pub protocol: Option<u32>,
     pub error: Option<String>,
     pub live: Option<usize>,
@@ -217,6 +223,7 @@ impl From<&MachineStatus> for MachineRow {
             endpoint: m.endpoint.clone(),
             channel: m.channel.to_string(),
             herdr_version: m.herdr_version.clone(),
+            pastor_version: m.pastor_version.clone(),
             protocol: m.protocol,
             error: m.error.clone(),
             live: Some(m.live),
@@ -226,8 +233,8 @@ impl From<&MachineStatus> for MachineRow {
     }
 }
 
-pub const MACHINE_HEADER: [&str; 7] = [
-    "NAME", "HOST", "CHANNEL", "HERDR", "AGENTS", "TAGS", "ERROR",
+pub const MACHINE_HEADER: [&str; 8] = [
+    "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "TAGS", "ERROR",
 ];
 
 /// The head's row, then one per machine.
@@ -238,6 +245,7 @@ pub fn machine_rows(head: &HeadRow, ms: &[MachineRow]) -> Vec<Vec<String>> {
         head.host.clone(),
         head.channel.clone(),
         head.herdr_version.clone().unwrap_or_else(dash),
+        head.pastor_version.clone(),
         dash(),
         dash(),
         String::new(),
@@ -249,6 +257,7 @@ pub fn machine_rows(head: &HeadRow, ms: &[MachineRow]) -> Vec<Vec<String>> {
                 m.host.clone(),
                 m.channel.clone(),
                 m.herdr_version.clone().unwrap_or_else(dash),
+                m.pastor_version.clone().unwrap_or_else(dash),
                 format!(
                     "{}/{}",
                     m.live.map_or_else(dash, |n| n.to_string()),
@@ -409,10 +418,21 @@ mod tests {
         assert_eq!(
             cells(0),
             [
-                "NAME", "HOST", "CHANNEL", "HERDR", "AGENTS", "TAGS", "ERROR"
+                "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "TAGS", "ERROR"
             ]
         );
-        assert_eq!(cells(1), ["pastor", "darkbeat", "head", "0.9.1", "-", "-"]);
+        assert_eq!(
+            cells(1),
+            [
+                "pastor",
+                "darkbeat",
+                "head",
+                "0.9.1",
+                env!("CARGO_PKG_VERSION"),
+                "-",
+                "-"
+            ]
+        );
         assert_eq!(
             cells(2),
             [
@@ -420,6 +440,7 @@ mod tests {
                 "fleet@pi-3",
                 "connected",
                 "0.9.1",
+                "0.2.0",
                 "1/3",
                 "fast,arm"
             ]
@@ -433,6 +454,7 @@ mod tests {
         let row = MachineRow {
             channel: "unreachable".into(),
             herdr_version: None,
+            pastor_version: None,
             live: None,
             error: Some("no route to host".into()),
             tags: vec![],
@@ -447,6 +469,7 @@ mod tests {
                 "pi-3",
                 "fleet@pi-3",
                 "unreachable",
+                "-",
                 "-",
                 "-/3",
                 "-",
@@ -466,11 +489,13 @@ mod tests {
         assert_eq!(v["head"]["host"], "darkbeat");
         assert_eq!(v["head"]["channel"], "head");
         assert_eq!(v["head"]["herdr_version"], "0.9.1");
+        assert_eq!(v["head"]["pastor_version"], env!("CARGO_PKG_VERSION"));
         let ms = v["machines"].as_array().unwrap();
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0]["name"], "pi-3");
         assert_eq!(ms[0]["host"], "fleet@pi-3");
         assert_eq!(ms[0]["channel"], "connected");
+        assert_eq!(ms[0]["pastor_version"], "0.2.0");
         assert_eq!(ms[0]["live"], 1);
         assert_eq!(ms[0]["max_agents"], 3);
     }
