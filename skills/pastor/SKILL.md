@@ -75,7 +75,7 @@ States:
 - `done`: the agent went idle after pastor saw it work, and stayed idle for `settle` (10s by default). It means the agent stopped, not that the work is good; read the output.
 - `stale`: the timeout passed without `done`. The agent is left running.
 - `failed`: dispatch failed or the agent exited before it was done. `task show` has the error.
-- `closed`: the pane closed, by pastor after the grace period or by `task close`.
+- `closed`: finished for good, by pastor after the grace period or by `task close`. Usually the pane is gone, but a task that never reached a machine, or whose machine left the flock, is closed as a row only: no pane was closed and its worktree may still be on disk.
 
 pastor closes a done task's pane after `close_done_after` (`pastor.toml`, default `15m`; `never` disables it): a worktree pastor created is removed if it is clean, kept with a note on the task if it is not, and the task then shows as `closed`. Failed, stale and blocked tasks are never closed on their own; use `pastor task retry` or `pastor task close`. The check runs on each reconcile while the machine is connected; an agent herdr shows working or blocked again at that moment is left alone, and its task goes back to `running` or `blocked`.
 
@@ -83,7 +83,7 @@ pastor closes a done task's pane after `close_done_after` (`pastor.toml`, defaul
 
 ```bash
 pastor task retry t-4                      # queues a copy of a failed or stale task, new id, retry_of t-4
-pastor task close t-4                      # closes the pane, marks the task closed
+pastor task close t-4                      # closes the pane if there is one, marks the task closed
 pastor task close t-4 --remove-worktree    # removes the worktree too; refused if it has uncommitted changes
 pastor task prune --done --older-than 3d   # deletes finished rows; --failed and --closed add those states
 ```
