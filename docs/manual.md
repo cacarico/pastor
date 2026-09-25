@@ -208,8 +208,9 @@ flock = "work"
 `[[flock]]` entries declare the flocks, so a flock can have no machines yet.
 Names are unique and exactly one has `default = true`. A machine naming an
 undeclared flock, two defaults, or none makes the file fail to load, like any
-other bad flock file: `pastor serve` refuses to start on it, and a running
-head keeps the previous version. A file with no `[[flock]]` entry at all is
+other bad flock file: `pastor serve` refuses to start on it, `pastor tick`
+and `pastor job list` without a head refuse it too, and a running head keeps
+the previous version. A file with no `[[flock]]` entry at all is
 one flock named `default` holding every machine, so files from before flocks
 load unchanged.
 

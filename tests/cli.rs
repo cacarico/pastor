@@ -888,6 +888,41 @@ fn tick_without_daemon_queues_tasks_for_later() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("ok: 1 items, 1 tasks"));
 }
 
+/// Offline `tick` takes each task's flock from flock.toml. One that does not
+/// load (here, two defaults) is refused, as the head refuses to start on it,
+/// rather than read as the implicit `default` flock, which would queue the
+/// job's task for machines the file never put it on.
+#[test]
+fn tick_without_daemon_refuses_a_flock_file_that_does_not_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(config.join("jobs")).unwrap();
+    std::fs::write(
+        config.join("jobs/tick.toml"),
+        "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"work\"\ndefault = true\n[[flock]]\nname = \"home\"\ndefault = true\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    assert_eq!(error_code(&run(&["tick", "--json"])), "runtime_error");
+    std::fs::remove_file(config.join("flock.toml")).unwrap();
+    let out = run(&["task", "list", "--all", "--json"]);
+    let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(tasks.is_empty(), "nothing queued: {tasks:?}");
+}
+
 /// `machine list` without a head connects directly, so nothing else has made the
 /// state dir yet. The ssh ControlMaster socket directory must exist, private,
 /// before ssh starts. A fake `ssh` first on PATH records that it did and fails

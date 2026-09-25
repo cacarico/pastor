@@ -690,20 +690,22 @@ impl Scheduler {
 
     /// For the CLI when no daemon runs: no machines to dispatch to, nobody
     /// listening for events. Tasks it queues wait for the next `pastor serve`.
-    pub fn standalone(paths: Paths, config: &PastorConfig, store: Arc<Store>) -> Scheduler {
-        // The tasks a pass queues take their flock from the file; one that
-        // does not load leaves the implicit default flock, as the head would
-        // refuse to start on it anyway.
-        let flock = Flock::load(&paths.flock_file()).unwrap_or_else(|err| {
-            tracing::warn!(%err, "flock.toml does not load; tasks go to the default flock");
-            Flock::default()
-        });
+    /// The tasks a pass queues take their flock from flock.toml, so a file
+    /// that does not load is an error, as it is for `pastor serve`: reading
+    /// it as the implicit `default` flock would queue work for machines the
+    /// file never put in it. A missing file is the implicit flock.
+    pub fn standalone(
+        paths: Paths,
+        config: &PastorConfig,
+        store: Arc<Store>,
+    ) -> anyhow::Result<Scheduler> {
+        let flock = Flock::load(&paths.flock_file())?;
         let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()).with_flock(flock));
         let (events, _) = broadcast::channel(1);
-        Scheduler {
+        Ok(Scheduler {
             standalone: true,
             ..Scheduler::new(paths, config, store, fleet, events)
-        }
+        })
     }
 
     pub fn spawn(self) -> SchedulerHandle {
@@ -1444,9 +1446,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let s = Scheduler::standalone(paths, &PastorConfig::default(), store).with_resolver(
-            Box::new(|id| (id == "only-this").then(|| crate::connector::builtin("clock").unwrap())),
-        );
+        let s = Scheduler::standalone(paths, &PastorConfig::default(), store)
+            .unwrap()
+            .with_resolver(Box::new(|id| {
+                (id == "only-this").then(|| crate::connector::builtin("clock").unwrap())
+            }));
         assert!(s.source_for("only-this", "j").is_some());
         assert!(
             s.source_for("clock", "j").is_none(),
@@ -1474,8 +1478,9 @@ mod tests {
         .unwrap();
         std::fs::write(jobs.join("bare.toml"), job("use = \"echo\"")).unwrap();
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let mut s =
-            Scheduler::standalone(paths.clone(), &PastorConfig::default(), store).with_plugins();
+        let mut s = Scheduler::standalone(paths.clone(), &PastorConfig::default(), store)
+            .unwrap()
+            .with_plugins();
         s.reload();
         let st = s.statuses(Utc::now());
         assert!(
@@ -2209,8 +2214,9 @@ mod tests {
         )
         .unwrap();
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let mut s =
-            Scheduler::standalone(paths.clone(), &PastorConfig::default(), store).with_plugins();
+        let mut s = Scheduler::standalone(paths.clone(), &PastorConfig::default(), store)
+            .unwrap()
+            .with_plugins();
         s.reload();
         let src = s.source_for("stream", "j").unwrap();
         let _ = src
@@ -3364,7 +3370,7 @@ mod tests {
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         paths.ensure().unwrap();
         std::fs::write(paths.flock_file(), HOME_AND_WORK).unwrap();
-        let s = Scheduler::standalone(paths, &PastorConfig::default(), store);
+        let s = Scheduler::standalone(paths, &PastorConfig::default(), store).unwrap();
         assert_eq!(s.fleet.flock().default_flock(), "home");
     }
 

@@ -1136,7 +1136,7 @@ fn print_jobs(jobs: &[JobStatus], json: bool) -> anyhow::Result<()> {
 fn standalone(paths: &Paths) -> anyhow::Result<Scheduler> {
     let config = PastorConfig::load(&paths.config_file())?;
     let store = Arc::new(open_store(paths)?);
-    Ok(Scheduler::standalone(paths.clone(), &config, store).with_plugins())
+    Ok(Scheduler::standalone(paths.clone(), &config, store)?.with_plugins())
 }
 
 async fn tick(paths: &Paths, a: TickArgs) -> anyhow::Result<()> {
@@ -1154,10 +1154,10 @@ async fn tick(paths: &Paths, a: TickArgs) -> anyhow::Result<()> {
         };
         runs
     } else {
+        let mut s = standalone(paths)?;
         eprintln!(
             "pastor serve is not running; running the pass here (new tasks stay queued until it starts)"
         );
-        let mut s = standalone(paths)?;
         s.tick_now(a.job.as_deref(), a.dry_run, chrono::Utc::now())
             .await
     };
