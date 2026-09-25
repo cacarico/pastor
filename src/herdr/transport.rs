@@ -213,12 +213,15 @@ fn remote_home(target: &str, out: &std::process::Output) -> Result<Option<String
             ),
         });
     }
-    let home = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.status.success() || !home.starts_with('/') {
-        tracing::warn!(%target, status = %out.status, stdout = %home, "no usable $HOME from the remote shell");
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let home = raw.trim_end();
+    // `?raw` logs stdout escaped, so a control character cannot garble the
+    // journal line.
+    if !out.status.success() || !home.starts_with('/') || home.chars().any(char::is_control) {
+        tracing::warn!(%target, status = %out.status, stdout = ?raw, "no usable $HOME from the remote shell");
         return Ok(None);
     }
-    Ok(Some(home))
+    Ok(Some(home.to_string()))
 }
 
 /// Asks the remote shell for `$HOME`. ssh is spawned without a local shell, so
@@ -694,6 +697,21 @@ mod tests {
         assert_eq!(remote_home("t", &out(0, "home/pi")).unwrap(), None);
         assert_eq!(remote_home("t", &out(1, "")).unwrap(), None);
         assert!(remote_home("t", &out(255, "")).is_err());
+        // A trailing newline or CRLF is trimmed; any other control character
+        // makes the home unknown rather than part of a path handed to herdr.
+        assert_eq!(
+            remote_home("t", &out(0, "/home/pi\n")).unwrap(),
+            Some("/home/pi".into())
+        );
+        assert_eq!(
+            remote_home("t", &out(0, "/home/pi\r\n")).unwrap(),
+            Some("/home/pi".into())
+        );
+        assert_eq!(
+            remote_home("t", &out(0, "/home/p\u{1b}[0mi")).unwrap(),
+            None
+        );
+        assert_eq!(remote_home("t", &out(0, "/home/pi\nmotd")).unwrap(), None);
         let killed = std::process::Output {
             status: std::process::ExitStatus::from_raw(9),
             stdout: vec![],
