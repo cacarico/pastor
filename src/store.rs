@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
@@ -37,6 +38,14 @@ pub struct Store {
 
 /// `update_task` found the row changed since this copy was read. The caller holds
 /// stale data; reload and decide again rather than overwrite.
+/// What `Store::prune` did: how many rows it deleted, and the ids of old
+/// rows it kept because their worktree may still be on disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneOutcome {
+    pub pruned: usize,
+    pub kept_worktrees: Vec<i64>,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("task t-{id} changed underneath this update; reload it and apply again")]
 pub struct Conflict {
@@ -381,10 +390,17 @@ impl Store {
     /// (`finished_at`, or `updated_at` for a row that never recorded one).
     /// Their `seen` rows stay, so the items never trigger again. Only
     /// finished states may be pruned, and never the newest task (so ids are
-    /// not reused). Returns how many rows went.
-    pub fn prune(&self, states: &[TaskState], older_than: Duration) -> anyhow::Result<usize> {
+    /// not reused). A worktree task that still records a workspace stays
+    /// too: a plain close leaves its checkout on disk, and the row is the
+    /// only record of it. `task close --remove-worktree` clears the
+    /// workspace, after which prune takes the row.
+    pub fn prune(
+        &self,
+        states: &[TaskState],
+        older_than: Duration,
+    ) -> anyhow::Result<PruneOutcome> {
         if states.is_empty() {
-            return Ok(0);
+            return Ok(PruneOutcome::default());
         }
         if let Some(s) = states.iter().find(|s| !s.is_prunable()) {
             anyhow::bail!("{s} tasks cannot be pruned; only done, failed and closed");
@@ -404,14 +420,35 @@ impl Store {
         // The newest row always stays: `id` has no AUTOINCREMENT, so SQLite
         // gives the next task MAX(id) + 1, and deleting the newest row would
         // hand its id (and its agent name t-<id>) out again.
-        let sql = format!(
-            "DELETE FROM tasks WHERE state IN ({})
+        let old = format!(
+            "state IN ({})
              AND julianday(COALESCE(finished_at, updated_at)) < julianday(?1)
              AND id < (SELECT MAX(id) FROM tasks)",
             placeholders.join(",")
         );
-        let conn = self.conn.lock().unwrap();
-        Ok(conn.execute(&sql, rusqlite::params_from_iter(args.iter()))?)
+        // `spec` is JSON text; `worktree` is left out of specs that predate
+        // it, which is false.
+        let on_disk = "COALESCE(json_extract(spec, '$.worktree'), 0) != 0
+             AND workspace_id IS NOT NULL";
+        // List and delete under one lock and transaction, so the list
+        // matches what the delete left behind.
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let kept_worktrees = tx
+            .prepare(&format!(
+                "SELECT id FROM tasks WHERE {old} AND {on_disk} ORDER BY id"
+            ))?
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        let pruned = tx.execute(
+            &format!("DELETE FROM tasks WHERE {old} AND NOT ({on_disk})"),
+            rusqlite::params_from_iter(args.iter()),
+        )?;
+        tx.commit()?;
+        Ok(PruneOutcome {
+            pruned,
+            kept_worktrees,
+        })
     }
 
     pub fn list_tasks(&self, f: &TaskFilter) -> anyhow::Result<Vec<Task>> {
@@ -1325,7 +1362,8 @@ mod tests {
         }
         let n = s
             .prune(&[TaskState::Closed], Duration::from_secs(86400))
-            .unwrap();
+            .unwrap()
+            .pruned;
         assert_eq!(n, 2);
         assert!(s.get_task(3).unwrap().is_some(), "the newest row stays");
         assert_eq!(s.insert_task(new_task("run")).unwrap().id, 4);
@@ -1460,6 +1498,50 @@ mod tests {
         assert!(s.close_queued(99).unwrap().is_none());
     }
 
+    /// A worktree task's checkout outlives a plain `task close`, which only
+    /// closes the pane; the row is then the only record of which workspace
+    /// to remove. Prune keeps such a row until `--remove-worktree` has
+    /// cleared its workspace, and says how many it kept.
+    #[test]
+    fn prune_keeps_a_row_whose_worktree_may_still_be_on_disk() {
+        let s = Store::open_in_memory().unwrap();
+        let old = Utc::now() - chrono::Duration::days(4);
+        let mk = |worktree: bool, workspace: Option<&str>| {
+            let t = s
+                .insert_task(NewTask {
+                    spec: DispatchSpec { worktree, ..spec() },
+                    ..new_task("run")
+                })
+                .unwrap();
+            let mut t = set_state(&s, t.id, TaskState::Closed);
+            t.workspace_id = workspace.map(str::to_string);
+            t.finished_at = Some(old);
+            s.update_task(&mut t).unwrap();
+            t.id
+        };
+        let on_disk = mk(true, Some("w1"));
+        let removed = mk(true, None);
+        let plain = mk(false, Some("w3"));
+        let _newest = mk(false, None);
+
+        let out = s
+            .prune(&[TaskState::Closed], Duration::from_secs(86400))
+            .unwrap();
+        assert_eq!(
+            out,
+            PruneOutcome {
+                pruned: 2,
+                kept_worktrees: vec![on_disk]
+            }
+        );
+        assert!(
+            s.get_task(on_disk).unwrap().is_some(),
+            "its checkout may remain"
+        );
+        assert!(s.get_task(removed).unwrap().is_none());
+        assert!(s.get_task(plain).unwrap().is_none());
+    }
+
     #[test]
     fn prune_deletes_old_finished_rows_and_keeps_seen() {
         let s = Store::open_in_memory().unwrap();
@@ -1481,19 +1563,20 @@ mod tests {
         let running = mk("e", TaskState::Running, None);
         let three_days = Duration::from_secs(3 * 86400);
 
-        assert_eq!(s.prune(&[TaskState::Done], three_days).unwrap(), 1);
+        assert_eq!(s.prune(&[TaskState::Done], three_days).unwrap().pruned, 1);
         assert!(s.get_task(old_done).unwrap().is_none());
         assert!(s.get_task(new_done).unwrap().is_some());
         assert!(s.get_task(old_closed).unwrap().is_some());
         assert_eq!(
             s.prune(&[TaskState::Closed, TaskState::Failed], three_days)
-                .unwrap(),
+                .unwrap()
+                .pruned,
             2
         );
         assert!(s.get_task(old_failed).unwrap().is_none());
         assert!(s.get_task(running).unwrap().is_some());
         assert!(s.is_seen("j", "a").unwrap(), "a pruned item stays seen");
-        assert_eq!(s.prune(&[], three_days).unwrap(), 0);
+        assert_eq!(s.prune(&[], three_days).unwrap().pruned, 0);
         let err = s.prune(&[TaskState::Running], three_days).unwrap_err();
         assert!(err.to_string().contains("cannot be pruned"), "{err}");
         assert!(s.get_task(running).unwrap().is_some());

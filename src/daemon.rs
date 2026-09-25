@@ -458,7 +458,7 @@ impl Daemon {
                     .store
                     .prune(&states, std::time::Duration::from_secs(older_than_secs))
                 {
-                    Ok(n) => IpcResponse::Text(n.to_string()),
+                    Ok(out) => IpcResponse::Pruned(out),
                     Err(err) => IpcResponse::error("store_error", err),
                 }
             }
@@ -1337,10 +1337,11 @@ mod tests {
                 older_than_secs: 3 * 86400,
             })
             .await;
-        let IpcResponse::Text(n) = resp else {
+        let IpcResponse::Pruned(out) = resp else {
             panic!("{resp:?}")
         };
-        assert_eq!(n, "1");
+        assert_eq!(out.pruned, 1);
+        assert!(out.kept_worktrees.is_empty());
         assert!(d.store.get_task(old_done.id).unwrap().is_none());
         assert!(d.store.get_task(old_failed.id).unwrap().is_some());
         assert_eq!(

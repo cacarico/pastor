@@ -934,6 +934,11 @@ impl Actor {
                 }
                 Some(_) => {}
             }
+            // A closed row with no workspace had its worktree removed (or
+            // noted for manual cleanup) already: nothing is left to do.
+            if remove_worktree && t.state == TaskState::Closed && t.workspace_id.is_none() {
+                return Ok(t.clone());
+            }
         }
         let timeout = self.settings.request_timeout;
         let agents = tokio::time::timeout(timeout, self.connector.agent_list())
@@ -987,8 +992,9 @@ impl Actor {
                     self.forget_orphan(&pane);
                     self.pending_done.remove(&task_id);
                     return match row {
-                        Some(t) => {
+                        Some(mut t) => {
                             let note = manual_worktree_cleanup(&t.display_id());
+                            t.workspace_id = None;
                             self.finish_close_with_note(t, note)
                         }
                         None => {
@@ -1025,6 +1031,14 @@ impl Actor {
         self.forget_orphan(&pane);
         self.pending_done.remove(&task_id);
         match row {
+            // The workspace is gone with the worktree. Clearing it is how
+            // the row says so: prune keeps a worktree row that still
+            // records one, since a plain close leaves the checkout on disk.
+            Some(mut t) if remove_worktree => {
+                t.workspace_id = None;
+                self.store.update_task(&mut t)?;
+                self.finish_close(t)
+            }
             Some(t) => self.finish_close(t),
             None => {
                 self.refresh_live();
@@ -2386,6 +2400,10 @@ mod tests {
         let closed = h.close(clean.id, true).await.unwrap();
         assert_eq!(closed.state, TaskState::Closed);
         assert_eq!(
+            closed.workspace_id, None,
+            "a removed worktree leaves no workspace, so prune may take the row"
+        );
+        assert_eq!(
             calls(&fake, "worktree.remove"),
             vec![serde_json::json!({"workspace_id": clean.workspace_id.unwrap(), "force": false})]
         );
@@ -2557,6 +2575,40 @@ mod tests {
             closed.error.as_deref(),
             Some(manual_worktree_cleanup(&closed.display_id()).as_str())
         );
+        assert_eq!(
+            closed.workspace_id, None,
+            "herdr has nothing left to remove; the note carries the rest"
+        );
+    }
+
+    /// A plain close only closes the pane (herdr closes the workspace with
+    /// its last pane) and leaves the checkout on disk, so the row keeps its
+    /// workspace and prune will not take it. `--remove-worktree` afterwards
+    /// finds the workspace gone, gives the manual-cleanup note and clears
+    /// the workspace; running it again has nothing left to do.
+    #[tokio::test]
+    async fn close_keeps_the_workspace_until_the_worktree_is_dealt_with() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let workspace = t.workspace_id.clone().unwrap();
+
+        let closed = h.close(t.id, false).await.unwrap();
+        assert_eq!(closed.workspace_id.as_deref(), Some(workspace.as_str()));
+
+        let removed = h.close(t.id, true).await.unwrap();
+        assert_eq!(removed.state, TaskState::Closed);
+        assert_eq!(removed.workspace_id, None);
+        assert_eq!(
+            removed.error.as_deref(),
+            Some(manual_worktree_cleanup(&removed.display_id()).as_str())
+        );
+
+        let again = h.close(t.id, true).await.unwrap();
+        assert_eq!(again.workspace_id, None);
+        assert_eq!(again.updated_at, removed.updated_at, "nothing changed");
+        assert_eq!(calls(&fake, "worktree.remove").len(), 1);
     }
 
     #[tokio::test]

@@ -146,7 +146,12 @@ so commit or clean up and run it again. `pastor task prune --done --older-than
 3d` deletes done tasks that finished more than three days ago; `--failed` and
 `--closed` add those states. A pruned task's item stays seen, so a job never
 queues it again, and the newest task is always kept so its id is never handed
-out twice. Prune works without `pastor serve`, but not behind one that holds
+out twice. Prune also keeps a worktree task whose checkout may still be on
+disk: a plain close only closes the pane, and the row is then the only record
+of that checkout. It names each one it keeps; `task close --remove-worktree`
+on it removes the worktree (or, when herdr has already lost the workspace,
+says to run `git worktree remove`) and clears the recorded workspace, and the
+next prune takes the row. Prune works without `pastor serve`, but not behind one that holds
 the socket and does not answer (`daemon_unresponsive`): that head may still be
 writing tasks. Retry and close need it.
 `task run --worktree` needs `--repo`.

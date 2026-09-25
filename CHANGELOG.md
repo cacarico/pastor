@@ -58,6 +58,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Restart=always` instead of `Restart=on-failure`, so a head or herdr
   server killed by a signal systemd treats as clean restarts too.
   `systemctl --user stop` still stops it for good.
+- `pastor task prune` no longer deletes a worktree task whose checkout may
+  still be on disk. It keeps the row, names it, and points at
+  `pastor task close t-N --remove-worktree`, which clears the recorded
+  workspace so the next prune takes it. `--json` reports the kept ids as
+  `kept_worktrees`.
 
 ## 0.2.0 - 2026-09-25
 

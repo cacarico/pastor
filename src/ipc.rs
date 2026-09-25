@@ -53,7 +53,7 @@ pub enum IpcRequest {
         remove_worktree: bool,
     },
     /// Delete rows in `states` that finished more than `older_than_secs`
-    /// ago. Answers `Text` with the count.
+    /// ago. Answers `Pruned`.
     TaskPrune {
         states: Vec<TaskState>,
         older_than_secs: u64,
@@ -79,6 +79,7 @@ pub enum IpcResponse {
     Error { code: String, message: String },
     Runs(Vec<JobRunReport>),
     Jobs(Vec<JobStatus>),
+    Pruned(crate::store::PruneOutcome),
 }
 
 impl IpcResponse {
@@ -311,6 +312,10 @@ mod tests {
             IpcResponse::Machines(vec![]),
             IpcResponse::Runs(vec![]),
             IpcResponse::Jobs(vec![]),
+            IpcResponse::Pruned(crate::store::PruneOutcome {
+                pruned: 2,
+                kept_worktrees: vec![3],
+            }),
             IpcResponse::error("some_code", "some message"),
         ];
         for resp in responses {

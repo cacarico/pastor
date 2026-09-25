@@ -8,7 +8,7 @@ use crate::ipc::{
     DaemonProbe, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon,
     probe_daemon, request,
 };
-use crate::store::Store;
+use crate::store::{PruneOutcome, Store};
 use crate::task::{Task, TaskState, parse_task_id};
 
 #[derive(Args, Debug)]
@@ -149,16 +149,14 @@ pub async fn prune(paths: &Paths, a: PruneArgs) -> anyhow::Result<()> {
     let older_than = parse_duration(&a.older_than).map_err(|e| CliError::err("usage_error", e))?;
     let states = a.states();
     let socket = paths.socket_file();
-    let n = match probe_daemon(&socket).await {
+    let out = match probe_daemon(&socket).await {
         DaemonProbe::Running => {
             let req = IpcRequest::TaskPrune {
                 states,
                 older_than_secs: older_than.as_secs(),
             };
             match ask(paths, req).await? {
-                IpcResponse::Text(n) => n
-                    .parse::<usize>()
-                    .map_err(|_| CliError::err("internal", format!("prune count {n:?}")))?,
+                IpcResponse::Pruned(out) => out,
                 other => return Err(unexpected(other)),
             }
         }
@@ -177,17 +175,31 @@ pub async fn prune(paths: &Paths, a: PruneArgs) -> anyhow::Result<()> {
         }
     };
     if a.json {
-        println!("{}", serde_json::json!({ "pruned": n }));
+        println!("{}", serde_json::to_string(&out)?);
     } else {
-        let what: Vec<&str> = a.states().iter().map(TaskState::as_str).collect();
-        println!(
-            "pruned {n} {} task{} older than {}",
-            what.join("/"),
-            if n == 1 { "" } else { "s" },
-            a.older_than
-        );
+        print!("{}", prune_summary(&a, &out));
     }
     Ok(())
+}
+
+/// What `task prune` prints. The kept line says why and what to run, since
+/// a row kept for its worktree stays kept until someone acts on it.
+fn prune_summary(a: &PruneArgs, out: &PruneOutcome) -> String {
+    let what: Vec<&str> = a.states().iter().map(TaskState::as_str).collect();
+    let n = out.pruned;
+    let mut s = format!(
+        "pruned {n} {} task{} older than {}\n",
+        what.join("/"),
+        if n == 1 { "" } else { "s" },
+        a.older_than
+    );
+    for id in &out.kept_worktrees {
+        s.push_str(&format!(
+            "kept t-{id}: its worktree may still be on disk; \
+             `pastor task close t-{id} --remove-worktree` removes it or says how, then prune takes the row\n"
+        ));
+    }
+    s
 }
 
 #[cfg(test)]
@@ -206,6 +218,21 @@ mod tests {
         assert!(P::try_parse_from(["p", "--older-than", "3d"]).is_err());
         let p = P::try_parse_from(["p", "--done", "--closed", "--older-than", "3d"]).unwrap();
         assert_eq!(p.a.states(), vec![TaskState::Done, TaskState::Closed]);
+    }
+
+    #[test]
+    fn prune_summary_names_each_kept_worktree_task() {
+        let p = P::try_parse_from(["p", "--closed", "--older-than", "3d"]).unwrap();
+        let out = PruneOutcome {
+            pruned: 1,
+            kept_worktrees: vec![4],
+        };
+        let s = prune_summary(&p.a, &out);
+        assert!(s.starts_with("pruned 1 closed task older than 3d\n"), "{s}");
+        assert!(s.contains("kept t-4"), "{s}");
+        assert!(s.contains("pastor task close t-4 --remove-worktree"), "{s}");
+        let none = prune_summary(&p.a, &PruneOutcome::default());
+        assert!(!none.contains("kept"), "{none}");
     }
 
     /// A retry that timed out may still land, so telling the user pastor
