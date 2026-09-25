@@ -260,7 +260,18 @@ impl Drop for GroupGuard {
 /// Run `inv`, calling `on_line` for each stdout line as it arrives. Never
 /// fails: a command that cannot start is an `Exit::SpawnFailed`. The end of
 /// the run is written to `log` too.
-pub async fn run(inv: Invocation, log: SharedLog, mut on_line: impl FnMut(&str)) -> Finished {
+pub async fn run(inv: Invocation, log: SharedLog, on_line: impl FnMut(&str)) -> Finished {
+    run_started(inv, log, || {}, on_line).await
+}
+
+/// `run`, calling `on_spawn` once the command has started: a stream's
+/// supervisor reports it running then, and not a moment before.
+pub async fn run_started(
+    inv: Invocation,
+    log: SharedLog,
+    on_spawn: impl FnOnce(),
+    mut on_line: impl FnMut(&str),
+) -> Finished {
     let Some(program) = inv.argv.first() else {
         return Finished {
             exit: Exit::SpawnFailed("empty command".into()),
@@ -295,6 +306,7 @@ pub async fn run(inv: Invocation, log: SharedLog, mut on_line: impl FnMut(&str))
         }
     };
     let mut guard = GroupGuard(child.id().map(|p| p as i32));
+    on_spawn();
 
     let mut stdin = child.stdin.take().expect("piped");
     let input = inv.stdin;

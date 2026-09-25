@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use chrono::SecondsFormat;
 use serde_json::Value;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::{Item, ItemSource, RunFuture, RunInput, RunOutput};
@@ -346,14 +347,15 @@ impl StreamSource {
     }
 
     /// (Re)start the supervisor when nothing runs or the job's config
-    /// changed since it was started.
-    fn ensure_started(&self, input: &RunInput) {
+    /// changed since it was started. A fresh start returns the receiver
+    /// that turns true once the supervisor knows whether the process is up.
+    fn ensure_started(&self, input: &RunInput) -> Option<watch::Receiver<bool>> {
         let mut running = lock(&self.running);
         if let Some(r) = running.as_ref()
             && r.config == input.config
             && !r.task.is_finished()
         {
-            return;
+            return None;
         }
         if let Some(old) = running.take() {
             old.task.abort();
@@ -364,16 +366,19 @@ impl StreamSource {
                 b.latest_cursor = input.cursor.clone();
             }
         }
+        let (reported, known) = watch::channel(false);
         let task = tokio::spawn(supervise(
             self.runner.clone(),
             input.clone(),
             self.buffer.clone(),
             self.base,
+            reported,
         ));
         *running = Some(Running {
             config: input.config.clone(),
             task,
         });
+        Some(known)
     }
 }
 
@@ -392,9 +397,22 @@ impl ItemSource for StreamSource {
 
     /// Drain the buffer. A stream that is down with nothing buffered is a
     /// failed run, so `job.failed` and the job's backoff apply to it too.
+    /// The run that starts the process first waits, up to the connector's
+    /// timeout, to hear whether it came up: otherwise a missing program or
+    /// a broken `.env` would read as an empty, successful first run and
+    /// only fail the next one.
     fn run<'a>(&'a self, input: RunInput) -> RunFuture<'a> {
         Box::pin(async move {
-            self.ensure_started(&input);
+            if let Some(mut known) = self.ensure_started(&input) {
+                let bound = self
+                    .runner
+                    .plugin
+                    .manifest
+                    .connector
+                    .as_ref()
+                    .map_or(STREAM_START_WAIT, |c| c.timeout);
+                let _ = tokio::time::timeout(bound, known.wait_for(|k| *k)).await;
+            }
             let mut b = lock(&self.buffer);
             if b.items.is_empty()
                 && b.pending.is_empty()
@@ -417,7 +435,19 @@ impl ItemSource for StreamSource {
     }
 }
 
-async fn supervise(runner: Runner, first: RunInput, buffer: Arc<Mutex<Buffer>>, base: Duration) {
+/// How long a stream's first run waits to hear whether it started, when
+/// the plugin has no connector table to take the timeout from.
+const STREAM_START_WAIT: Duration = Duration::from_secs(60);
+
+/// Keep the stream's process running. `reported` turns true the first time
+/// the process is up or has failed to start, whichever comes first.
+async fn supervise(
+    runner: Runner,
+    first: RunInput,
+    buffer: Arc<Mutex<Buffer>>,
+    base: Duration,
+    reported: watch::Sender<bool>,
+) {
     let mut backoff = base;
     loop {
         let input = RunInput {
@@ -428,10 +458,13 @@ async fn supervise(runner: Runner, first: RunInput, buffer: Arc<Mutex<Buffer>>, 
         let reason = match runner.prepare(&input, None) {
             Err(e) => e,
             Ok((inv, log)) => {
-                lock(&buffer).down = None;
                 let mut n = 0usize;
                 let line_log = log.clone();
-                let done = exec::run(inv, log.clone(), |raw| {
+                let up = || {
+                    lock(&buffer).down = None;
+                    reported.send_replace(true);
+                };
+                let done = exec::run_started(inv, log.clone(), up, |raw| {
                     n += 1;
                     let mut b = lock(&buffer);
                     match parse_line(raw) {
@@ -469,6 +502,7 @@ async fn supervise(runner: Runner, first: RunInput, buffer: Arc<Mutex<Buffer>>, 
             ));
             b.down = Some(reason);
         }
+        reported.send_replace(true);
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(STREAM_BACKOFF_MAX);
     }

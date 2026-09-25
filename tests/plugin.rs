@@ -282,6 +282,40 @@ async fn a_crashing_stream_is_restarted_with_backoff() {
     assert!(logs.iter().any(|l| l.contains("crashing on purpose")));
 }
 
+#[tokio::test]
+async fn a_stream_whose_program_is_missing_fails_its_first_run() {
+    let env = env_with(&[]);
+    let dir = env.paths.plugins_dir().join("ghost");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("pastor-plugin.toml"),
+        "id = \"ghost\"\nversion = \"0.1.0\"\n[connector]\nmode = \"stream\"\ncommand = [\"./no-such-program\"]\n",
+    )
+    .unwrap();
+    let src = process::source(env.plugin("ghost"), env.paths.clone(), Some("g".into()));
+    let err = src.run(input(json!({}), None)).await.unwrap_err();
+    assert!(
+        err.starts_with("stream connector stopped: could not start: ./no-such-program"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_with_a_broken_env_file_fails_its_first_run() {
+    let env = env_with(&["stream"]);
+    env.dotenv("stream", "not an assignment\n");
+    let src = process::source(env.plugin("stream"), env.paths.clone(), Some("s".into()));
+    let err = src.run(input(json!({}), None)).await.unwrap_err();
+    assert!(err.contains(".env") && err.contains("line 1"), "{err}");
+}
+
+#[tokio::test]
+async fn a_healthy_stream_first_run_succeeds() {
+    let env = env_with(&["stream"]);
+    let src = process::source(env.plugin("stream"), env.paths.clone(), Some("s".into()));
+    assert!(src.run(input(json!({}), None)).await.is_ok());
+}
+
 // ---- the `pastor plugin` commands, through the binary ----
 
 struct Cli {
