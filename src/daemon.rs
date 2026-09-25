@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -61,21 +62,37 @@ pub fn tasks_on_removed_machines(store: &Store, flock: &Flock) -> anyhow::Result
         .collect())
 }
 
-/// One warning per task left on a removed machine: at daemon start (a
-/// machine taken out while pastor was down) and after a reload removed one.
-pub fn warn_removed(store: &Store, flock: &Flock) {
+/// One warning per task left on a removed machine, the first time `warned`
+/// (task ids already reported) is told about it: at daemon start (a machine
+/// taken out while pastor was down, `&mut HashSet::new()` so every task is
+/// fresh) and after a reload took a machine out of the flock or is still
+/// waiting for its actor to stop. A machine stuck `shutting_down` across
+/// several reload passes keeps handing back the same task ids, so a caller
+/// that keeps `warned` across passes (`Scheduler::warned_removed`) still
+/// warns about each task only once. Returns the ids it warned about this
+/// call, so a test can assert on that instead of captured logs.
+pub fn warn_removed(store: &Store, flock: &Flock, warned: &mut HashSet<i64>) -> Vec<i64> {
     match tasks_on_removed_machines(store, flock) {
         Ok(tasks) => {
+            warned.retain(|id| tasks.iter().any(|t| t.id == *id));
+            let mut newly_warned = Vec::new();
             for t in tasks {
-                tracing::warn!(
-                    task = %t.display_id(),
-                    machine = t.machine.as_deref().unwrap_or("-"),
-                    state = %t.state,
-                    "task on a machine that is not in the flock: left as it was"
-                );
+                if warned.insert(t.id) {
+                    tracing::warn!(
+                        task = %t.display_id(),
+                        machine = t.machine.as_deref().unwrap_or("-"),
+                        state = %t.state,
+                        "task on a machine that is not in the flock: left as it was"
+                    );
+                    newly_warned.push(t.id);
+                }
             }
+            newly_warned
         }
-        Err(err) => tracing::error!(%err, "list tasks on removed machines"),
+        Err(err) => {
+            tracing::error!(%err, "list tasks on removed machines");
+            Vec::new()
+        }
     }
 }
 
@@ -520,7 +537,9 @@ impl Daemon {
         let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone()));
         let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
         fleet.apply_flock(&flock, &machine_settings(&config)).await;
-        warn_removed(&store, &flock);
+        // Fresh set: nothing has been warned about yet, so every task on a
+        // machine `flock` does not have is reported.
+        warn_removed(&store, &flock, &mut HashSet::new());
         // Subscribed in `start`, before any actor runs, so the log sees the
         // first events too. The log holds the fleet weakly (see `spawn_log`),
         // so dropping the daemon still winds the tasks down.

@@ -567,6 +567,12 @@ pub struct Scheduler {
     /// first occurrence after this.
     first_seen: HashMap<String, DateTime<Utc>>,
     warned_queued: HashSet<i64>,
+    /// Task ids already warned about because their machine is not in the
+    /// current flock (removed, or still `shutting_down`). Kept across
+    /// reload passes so a machine wedged in `shutting_down` for several
+    /// passes still warns about each of its tasks only once (Copilot
+    /// 4103936306).
+    warned_removed: HashSet<i64>,
     /// `pastor.toml` as last applied. `tick`, `defaults` and the machine
     /// timings (`daemon::machine_settings`) all come from it.
     config: PastorConfig,
@@ -601,6 +607,7 @@ impl Scheduler {
             last_turn: HashMap::new(),
             first_seen: HashMap::new(),
             warned_queued: HashSet::new(),
+            warned_removed: HashSet::new(),
             config: config.clone(),
             config_fingerprint: None,
         }
@@ -873,7 +880,7 @@ impl Scheduler {
         Some(diff)
     }
 
-    fn report(&self, diff: &FlockDiff, flock: &Flock) {
+    fn report(&mut self, diff: &FlockDiff, flock: &Flock) {
         if diff.is_empty() {
             return;
         }
@@ -884,8 +891,14 @@ impl Scheduler {
             shutting_down = ?diff.shutting_down,
             "flock reloaded"
         );
-        if !diff.removed.is_empty() {
-            crate::daemon::warn_removed(&self.store, flock);
+        // A `shutting_down` name is also absent from `flock` (its actor just
+        // has not stopped yet), so its tasks match `tasks_on_removed_machines`
+        // too: without this arm a machine whose actor is wedged never gets
+        // past `shutting_down` and the promised warning never fires (Copilot
+        // 4103936306). `warned_removed` keeps the warning to once per task
+        // across the passes a wedged machine spends `shutting_down`.
+        if !diff.removed.is_empty() || !diff.shutting_down.is_empty() {
+            crate::daemon::warn_removed(&self.store, flock, &mut self.warned_removed);
         }
     }
 
@@ -2322,6 +2335,83 @@ mod tests {
         assert!(
             s.reload_config(false).await.is_none(),
             "and then left alone"
+        );
+    }
+
+    /// Copilot 4103936306: a removal whose actor misses the shutdown
+    /// deadline appears only in `diff.shutting_down`, not `diff.removed`, so
+    /// the per-task warning must fire from that arm too. A machine wedged in
+    /// `shutting_down` across several reload passes still warns about its
+    /// task only once (`warned_removed` de-dupes by task id, not by pass).
+    /// Asserts on `warned_removed` rather than captured logs, which is
+    /// flaky under parallel tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removed_machine_stuck_shutting_down_warns_once_about_its_tasks() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (s, _tmp) = managed_scheduler(&store);
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let connect: crate::daemon::ConnectorFactory = {
+            let fake = fake.clone();
+            Arc::new(move |_m: &crate::config::flock::MachineConfig| {
+                Arc::new(fake.clone()) as Arc<dyn crate::herdr::Connector>
+            })
+        };
+        let (events, _) = broadcast::channel(16);
+        let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
+        let mut s = Scheduler::new(s.paths.clone(), &s.config, store.clone(), fleet, events);
+
+        fake.wedge_connects(true);
+        std::fs::write(s.paths.flock_file(), FLOCK_A).unwrap();
+        s.reload_config(false).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fake.wedged() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actor never reached connect"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A running task left on "a" while its actor is wedged.
+        let t = store
+            .insert_task(crate::store::NewTask {
+                job: "run".into(),
+                item: Value::Null,
+                prompt: "p".into(),
+                spec: job("j").spec,
+            })
+            .unwrap();
+        store.claim_task(t.id, "a").unwrap().unwrap();
+
+        std::fs::write(s.paths.flock_file(), "").unwrap();
+        let d = s.reload_config(false).await.unwrap();
+        assert_eq!(d.shutting_down, vec!["a".to_string()], "{d:?}");
+        assert_eq!(
+            s.warned_removed,
+            HashSet::from([t.id]),
+            "the shutting_down arm warns about the task, not only `removed`"
+        );
+
+        // Another pass while still stuck: the same task, warned about
+        // before, must not be warned about again.
+        let d = s.reload_config(false).await.unwrap();
+        assert_eq!(d.shutting_down, vec!["a".to_string()], "{d:?}");
+        assert_eq!(
+            s.warned_removed,
+            HashSet::from([t.id]),
+            "still just the one warning across repeated shutting_down passes"
+        );
+
+        fake.wedge_connects(false);
+        let d = s
+            .reload_config(false)
+            .await
+            .expect("an unfinished swap is retried with nothing changed on disk");
+        assert_eq!(d.removed, vec!["a".to_string()], "{d:?}");
+        assert_eq!(
+            s.warned_removed,
+            HashSet::from([t.id]),
+            "the actor finishing does not warn about the same task again"
         );
     }
 
