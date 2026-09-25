@@ -75,9 +75,20 @@ States:
 - `done`: the agent went idle after pastor saw it work, and stayed idle for `settle` (10s by default). It means the agent stopped, not that the work is good; read the output.
 - `stale`: the timeout passed without `done`. The agent is left running.
 - `failed`: dispatch failed or the agent exited before it was done. `task show` has the error.
-- `closed`: the pane of a done task went away.
+- `closed`: the pane closed, by pastor after the grace period or by `task close`.
 
-pastor never closes panes and never removes worktrees on its own in this version. Finished tasks keep their pane and worktree until a human cleans them up. Do not do it for them unless asked.
+pastor closes a done task's pane after `close_done_after` (`pastor.toml`, default `15m`; `never` disables it): a worktree pastor created is removed if it is clean, kept with a note on the task if it is not, and the task then shows as `closed`. Failed, stale and blocked tasks are never closed on their own; use `pastor task retry` or `pastor task close`. The check runs on each reconcile while the machine is connected; an agent herdr shows working or blocked again at that moment is left alone, and its task goes back to `running` or `blocked`.
+
+## Closing and retrying tasks
+
+```bash
+pastor task retry t-4                      # queues a copy of a failed or stale task, new id, retry_of t-4
+pastor task close t-4                      # closes the pane, marks the task closed
+pastor task close t-4 --remove-worktree    # removes the worktree too; refused if it has uncommitted changes
+pastor task prune --done --older-than 3d   # deletes finished rows; --failed and --closed add those states
+```
+
+`retry` re-dispatches the task's job, item, prompt and dispatch settings as a new task; the old agent may still be running under its own id. `close` also closes an orphaned agent, a `t-N` pane with no open task. `prune` never deletes a row whose worktree may still be on disk; it names the ones it keeps, and `task close t-N --remove-worktree` clears them so the next prune takes them. A pruned task's item stays seen, so a job never queues it again.
 
 ## Jobs
 
