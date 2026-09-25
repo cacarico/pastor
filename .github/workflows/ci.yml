@@ -21,6 +21,8 @@ on:
       - "Cargo.lock"
       - "Makefile"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
+      - "install.sh"
       - ".github/actions/**"
   workflow_dispatch:
 

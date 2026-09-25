@@ -70,8 +70,9 @@ exit 1. Clap usage errors should stay plain text and exit 2.
 - To release: bump the version in `Cargo.toml`, turn `Unreleased` in
   `CHANGELOG.md` into `## X.Y.Z - date`, merge, and push the signed tag
   `vX.Y.Z` on `main`. `.github/workflows/release.yml` builds the tarballs
-  and drafts the GitHub release with that section as notes; read it, then
-  publish.
+  and drafts the GitHub release with that section as notes. Before
+  publishing the draft, check the tag's signature with `git tag -v vX.Y.Z`;
+  an unsigned or unverified tag is deleted, not published.
 - Artifacts are never replaced and a tag is never moved. A bad release gets
   a new patch release and a warning in its own notes.
 - Before 1.0, only the latest minor gets fixes.

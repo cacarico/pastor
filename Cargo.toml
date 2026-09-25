@@ -54,6 +54,10 @@ bin-dir = "{ name }-{ version }-x86_64-unknown-linux-musl/{ bin }"
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-aarch64-unknown-linux-musl.tar.gz"
 bin-dir = "{ name }-{ version }-aarch64-unknown-linux-musl/{ bin }"
 
+[package.metadata.binstall.overrides.riscv64gc-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-riscv64gc-unknown-linux-musl.tar.gz"
+bin-dir = "{ name }-{ version }-riscv64gc-unknown-linux-musl/{ bin }"
+
 [package.metadata.binstall.overrides.armv7-unknown-linux-gnueabihf]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-armv7-unknown-linux-musleabihf.tar.gz"
 bin-dir = "{ name }-{ version }-armv7-unknown-linux-musleabihf/{ bin }"

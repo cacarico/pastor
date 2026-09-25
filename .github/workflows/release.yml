@@ -16,8 +16,9 @@ name: release
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-*"
+      # Globs, not regexes. The verify job checks the tag names Cargo.toml's
+      # version exactly, so a loose glob here cannot release the wrong thing.
+      - "v*.*.*"
 
 permissions:
   contents: read
@@ -30,9 +31,10 @@ jobs:
   # have that version's section because the release notes come from it; a
   # prerelease (v1.2.3-rc.1) may still be under "Unreleased". `make check`
   # runs again here because a tag can point at a commit that never went
-  # through a pull request. The tag's signature is not checked: that needs
-  # an allowed-signers file in the repository, which is a decision of its
-  # own; `--verify-tag` below only checks that the tag exists on GitHub.
+  # through a pull request. The tag's signature is not checked here: the
+  # release stays a draft, and the maintainer runs `git tag -v` before
+  # publishing it (see CONTRIBUTING.md). `--verify-tag` below only checks that
+  # the tag exists on GitHub.
   verify:
     runs-on: ubuntu-24.04
     outputs:
