@@ -10,7 +10,7 @@ use tokio::io::{
 use super::transport::{ConnectError, Connector};
 use super::{
     AgentInfo, AgentList, AgentResult, Created, Event, HerdrError, Incoming, PaneRead, Pong,
-    Request, Response,
+    Request, Response, WorktreeRemoved,
 };
 
 pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
@@ -447,7 +447,7 @@ pub trait ConnectorExt: Connector {
     /// plain workspace is `not_linked_worktree`, an unknown one
     /// `workspace_not_found`.
     async fn worktree_remove(&self, workspace_id: &str, force: bool) -> Result<(), CallError> {
-        self.call(
+        self.call_as::<WorktreeRemoved>(
             "worktree.remove",
             serde_json::json!({"workspace_id": workspace_id, "force": force}),
         )

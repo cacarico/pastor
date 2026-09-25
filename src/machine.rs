@@ -1188,8 +1188,11 @@ impl Actor {
                     };
                 }
                 // Never forced: an agent's uncommitted work is worth more than
-                // a clean disk. The pane still goes; the checkout stays.
-                Err(err) if by == CloseBy::AutoClose && !err.is_transport() => {
+                // a clean disk. The pane still goes; the checkout stays. Only
+                // for an API refusal, where herdr actually answered with a
+                // code: a protocol or decoding error is not herdr saying no,
+                // so it falls to the branch below and is retried whole.
+                Err(err) if by == CloseBy::AutoClose && err.code().is_some() => {
                     let t = row.as_ref().expect("auto-close has a row");
                     let branch = t
                         .spec
@@ -3219,6 +3222,41 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(count(&mut events, "task.closed", t.id).len(), 1);
         assert_eq!(calls(&fake, "worktree.remove").len(), 1, "not retried");
+    }
+
+    /// A malformed `worktree.remove` reply is a decoding failure, not herdr
+    /// refusing the call: `code()` is `None`, so it must not be mistaken for
+    /// the "keep the worktree, close the pane anyway" path. Nothing closes;
+    /// the next reconcile, with a proper reply, closes it.
+    #[tokio::test]
+    async fn auto_close_retries_after_a_malformed_worktree_remove_reply() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        fake.set_malformed_reply("worktree.remove");
+        let t = run_to_done(&h, &fake, &store, worktree_task(&store)).await;
+        // First reconcile: the reply fails to decode, so nothing closes. Checked
+        // right after that one attempt, before the next reconcile (100ms later)
+        // can retry with a proper reply and close it.
+        wait_for("the malformed attempt", || {
+            !calls(&fake, "worktree.remove").is_empty()
+        })
+        .await;
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert_eq!(
+            calls(&fake, "worktree.remove").len(),
+            1,
+            "the first attempt, malformed"
+        );
+        // Next reconcile: a proper reply closes it.
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        assert_eq!(calls(&fake, "worktree.remove").len(), 2);
+        assert!(store.get_task(t.id).unwrap().unwrap().error.is_none());
     }
 
     /// A done task whose pane the user already closed in herdr ends closed,

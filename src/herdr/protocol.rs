@@ -141,6 +141,15 @@ pub struct AgentResult {
     pub agent: AgentInfo,
 }
 
+/// `worktree.remove`'s result. Nothing here is read; the type exists so the
+/// reply is decoded rather than just dropped, catching a malformed or
+/// wrong-shaped response as `HerdrError::Protocol` instead of silently
+/// treating it as success.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeRemoved {
+    pub workspace_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentList {
     pub agents: Vec<AgentInfo>,

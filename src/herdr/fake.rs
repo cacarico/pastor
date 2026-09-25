@@ -40,6 +40,10 @@ struct State {
     /// A method name that, once received, gets no reply at all: the connection
     /// just stops answering, simulating a wedged herdr.
     hang: Option<String>,
+    /// A method name whose next reply parses as JSON-RPC but whose `result`
+    /// decodes into nothing pastor expects: a garbled response, not herdr
+    /// refusing the call. See `set_malformed_reply`.
+    malformed_reply: Option<String>,
     /// How long a freshly started agent stays unready: `agent.list` reports it
     /// `unknown` and `agent.prompt` answers `agent_not_ready`, the way herdr
     /// does while a managed agent is still launching — unless the agent was
@@ -197,6 +201,14 @@ impl FakeHerdr {
     /// request timeout instead of a transport-level error.
     pub fn hang_method(&self, method: &str) {
         self.state.lock().unwrap().hang = Some(method.into());
+    }
+    /// The next request for `method` gets a reply that is valid JSON-RPC but
+    /// whose `result` cannot be decoded into the type the caller expects, as
+    /// a truncated or version-skewed herdr response might. One-shot, like
+    /// `hang_method`. Lets tests exercise a decoding failure apart from an
+    /// API error (which carries a code) or a transport outage.
+    pub fn set_malformed_reply(&self, method: &str) {
+        self.state.lock().unwrap().malformed_reply = Some(method.into());
     }
     /// Mark one worktree workspace as holding uncommitted changes: herdr
     /// then refuses `worktree.remove` without `force`.
@@ -424,6 +436,24 @@ impl FakeHerdr {
             // Wedged herdr: never reply, never close. Only the kill channel (a
             // test disconnecting the fake) ends this.
             let _ = kill.recv().await;
+            return;
+        }
+        let malformed = {
+            let mut s = self.state.lock().unwrap();
+            if s.malformed_reply.as_deref() == Some(req.method.as_str()) {
+                // One-shot: only this one request gets the bad reply.
+                s.malformed_reply = None;
+                true
+            } else {
+                false
+            }
+        };
+        if malformed {
+            // A reply herdr's API server never sends for real, but a decoding
+            // bug or protocol skew could hand pastor: syntactically fine,
+            // shaped nothing like the result any caller decodes.
+            let reply = json!({"id": req.id, "result": {"malformed": true}});
+            let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
             return;
         }
         if req.method == "events.subscribe" {
