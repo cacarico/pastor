@@ -102,10 +102,32 @@ pub struct JobState {
 }
 
 impl Store {
+    /// How long one connection waits for another's lock before giving up.
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     pub fn open(path: &Path) -> anyhow::Result<Store> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "busy_timeout", Self::BUSY_TIMEOUT.as_millis() as i64)?;
+        // SQLite does not run the busy handler while it switches the journal
+        // mode, so a lock another connection holds at that moment (a CLI that
+        // opened the file a moment before `pastor serve` did, or the other
+        // way round) fails the switch at once with "database is locked".
+        // Retry it for as long as the busy handler would have waited.
+        let deadline = std::time::Instant::now() + Self::BUSY_TIMEOUT;
+        loop {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if matches!(
+                        e.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => return Err(e).context("switch the database to WAL"),
+            }
+        }
         Self::init(conn)
     }
 
@@ -1580,5 +1602,26 @@ mod tests {
         let err = s.prune(&[TaskState::Running], three_days).unwrap_err();
         assert!(err.to_string().contains("cannot be pruned"), "{err}");
         assert!(s.get_task(running).unwrap().is_some());
+    }
+
+    /// `pastor machine list` and `pastor task list` open the database while
+    /// `pastor serve` may be creating it; whichever comes second must wait
+    /// for the other's transaction, not fail with "database is locked".
+    #[test]
+    fn open_waits_for_another_connections_write_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        let mut holder = Connection::open(&path).unwrap();
+        let tx = holder
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let opener = {
+            let path = path.clone();
+            std::thread::spawn(move || Store::open(&path).map(|_| ()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        tx.commit().unwrap();
+        let opened = opener.join().unwrap();
+        assert!(opened.is_ok(), "{:#}", opened.unwrap_err());
     }
 }
