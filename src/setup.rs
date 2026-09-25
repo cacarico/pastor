@@ -290,7 +290,7 @@ impl std::fmt::Display for Report {
         }
         writeln!(f, "ran systemd action: {} {name}", self.action)?;
         match &self.linger {
-            Linger::On => writeln!(f, "lingering is on: {name} runs without a login session"),
+            Linger::On => writeln!(f, "lingering is on: {name} can run without a login session"),
             Linger::Off => writeln!(
                 f,
                 "lingering is off, so {name} stops when you log out; turn it on with:\n  loginctl enable-linger"
@@ -764,6 +764,21 @@ mod tests {
             .unwrap();
         assert_eq!(report.linger, Linger::On);
         assert!(!report.to_string().contains("enable-linger"));
+    }
+
+    #[test]
+    fn lingering_on_after_stop_states_a_capability_not_that_the_unit_runs() {
+        let e = env();
+        let mut install = e.install(Unit::Pastor);
+        install.action = Action::Stop;
+        let report = install.run(&FakeRunner::ok("yes"), &e.paths).unwrap();
+        assert_eq!(report.linger, Linger::On);
+        let shown = report.to_string();
+        assert!(!shown.contains("pastor.service runs"), "{shown}");
+        assert!(
+            shown.contains("pastor.service can run without a login session"),
+            "{shown}"
+        );
     }
 
     #[test]
