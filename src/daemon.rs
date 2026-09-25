@@ -244,6 +244,19 @@ impl Fleet {
             .collect()
     }
 
+    /// Every machine's status with the flock it is in (see `flock_of`), in
+    /// flock order: what `machine list` and `machine.*` events report.
+    pub fn statuses(&self) -> Vec<crate::machine::MachineStatus> {
+        let wanted = self.flock();
+        self.machines()
+            .iter()
+            .map(|h| crate::machine::MachineStatus {
+                flock: Some(flock_of(&wanted, &h.name)),
+                ..h.snapshot()
+            })
+            .collect()
+    }
+
     pub fn get(&self, name: &str) -> Option<MachineHandle> {
         self.members
             .read()
@@ -840,9 +853,7 @@ impl Daemon {
                     Err(err) => IpcResponse::error("read_failed", err),
                 }
             }
-            IpcRequest::FlockList => {
-                IpcResponse::Machines(self.fleet.machines().iter().map(|m| m.snapshot()).collect())
-            }
+            IpcRequest::FlockList => IpcResponse::Machines(self.fleet.statuses()),
             IpcRequest::Tick { job, dry_run } => match self.scheduler.tick(job, dry_run).await {
                 Ok(runs) => IpcResponse::Runs(runs),
                 Err(err) => IpcResponse::error("scheduler_error", err),

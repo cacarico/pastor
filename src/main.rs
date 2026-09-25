@@ -228,8 +228,11 @@ enum MachineCmd {
     },
     /// Put a machine in another flock; tasks already on it stay there
     Move { name: String, flock: String },
-    /// The head, then each machine: host, channel, herdr, agents
+    /// A line about the head, then each machine: host, flock, channel, herdr, agents
     List {
+        /// Only the machines of this flock
+        #[arg(long)]
+        flock: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -451,6 +454,7 @@ fn probe_fields(
 /// the rows live in the store here even with no head running.
 async fn probe_machine(
     m: &MachineConfig,
+    flock: &str,
     paths: &Paths,
     store: &Store,
 ) -> anyhow::Result<pastor::cli::MachineRow> {
@@ -480,6 +484,7 @@ async fn probe_machine(
         name: m.name.clone(),
         host: ep.host(),
         endpoint: ep.describe(),
+        flock: flock.to_string(),
         channel: channel.into(),
         herdr_version,
         pastor_version,
@@ -520,7 +525,7 @@ fn head_row() -> pastor::cli::HeadRow {
 /// machine in flock.toml. The note that says so is printed only once
 /// everything worked, since a failure must leave exactly one JSON value on
 /// stderr.
-async fn machine_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
+async fn machine_list(paths: &Paths, flock: Option<&str>, json: bool) -> anyhow::Result<()> {
     // Only `NotRunning` means nothing is listening; `Unresponsive` covers a
     // head that is up but busy (mid-dispatch, or wedged), and probing
     // machines around it would print the "not running" note for a head that
@@ -543,8 +548,13 @@ async fn machine_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
             paths.ensure()?;
             let store = Store::open(&paths.db_file())?;
             let mut rows = Vec::new();
-            for m in f.machines.iter() {
-                rows.push(probe_machine(m, paths, &store).await?);
+            // Only the machines asked for: a probe is an ssh round trip each.
+            for m in f
+                .machines
+                .iter()
+                .filter(|m| flock.is_none_or(|n| f.flock_of(m) == n))
+            {
+                rows.push(probe_machine(m, f.flock_of(m), paths, &store).await?);
             }
             (
                 rows,
@@ -552,6 +562,11 @@ async fn machine_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
             )
         }
     };
+    let mut rows: Vec<pastor::cli::MachineRow> = rows
+        .into_iter()
+        .filter(|m| flock.is_none_or(|n| m.flock == n))
+        .collect();
+    pastor::cli::head_machine_first(&mut rows);
     let head = head_row();
     if let Some(note) = note {
         eprintln!("{note}");
@@ -562,11 +577,15 @@ async fn machine_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
             serde_json::to_string_pretty(&pastor::cli::machine_list_json(&head, &rows))?
         );
     } else {
+        // Without a head the notice on stderr stands in for the line.
+        if note.is_none() {
+            println!("{}\n", pastor::cli::head_line(&head, &rows));
+        }
         println!(
             "{}",
             pastor::cli::table(
                 &pastor::cli::MACHINE_HEADER,
-                &pastor::cli::machine_rows(&head, &rows)
+                &pastor::cli::machine_rows(&rows)
             )
         );
     }
@@ -838,7 +857,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 reload_running_head(paths).await
             );
         }
-        MachineCmd::List { json } => machine_list(paths, json).await?,
+        MachineCmd::List { flock, json } => machine_list(paths, flock.as_deref(), json).await?,
     }
     Ok(())
 }

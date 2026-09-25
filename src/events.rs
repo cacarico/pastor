@@ -63,7 +63,7 @@ impl MachineLookup for Vec<MachineHandle> {
 
 impl MachineLookup for crate::daemon::Fleet {
     fn machine_status(&self, name: &str) -> Option<MachineStatus> {
-        self.machines().machine_status(name)
+        self.statuses().into_iter().find(|m| m.name == name)
     }
 }
 
@@ -525,6 +525,7 @@ mod tests {
                 max_agents: 2,
                 tags: vec![],
                 orphans: vec![],
+                flock: None,
             })),
             task: None,
         }

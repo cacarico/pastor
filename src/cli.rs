@@ -1,7 +1,7 @@
 use chrono::Utc;
 use serde::Serialize;
 
-use crate::config::flock::Flock;
+use crate::config::flock::{DEFAULT_FLOCK, Flock};
 use crate::ipc::{RequestError, connect_error_means_no_daemon};
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
@@ -319,8 +319,9 @@ pub fn orphan_lines(ms: &[MachineStatus], machine: Option<&str>) -> Vec<String> 
         .collect()
 }
 
-/// The first row of `machine list`: the head itself. It runs no tasks, so it
-/// is not a machine and has no agents, tags or error of its own. Its
+/// The head itself, for the line `machine list` opens with and the `head`
+/// key of its JSON. The head runs no tasks of its own; when it is also a
+/// machine (a `local` one), that machine has its own row. Its
 /// `pastor_version` is this binary's, which is always known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HeadRow {
@@ -366,6 +367,8 @@ pub struct MachineRow {
     pub name: String,
     pub host: String,
     pub endpoint: String,
+    /// The flock the machine is in.
+    pub flock: String,
     pub channel: String,
     pub herdr_version: Option<String>,
     pub pastor_version: Option<String>,
@@ -385,6 +388,8 @@ impl From<&MachineStatus> for MachineRow {
             name: m.name.clone(),
             host: m.host.clone(),
             endpoint: m.endpoint.clone(),
+            // A head from before flocks has only the one.
+            flock: m.flock.clone().unwrap_or_else(|| DEFAULT_FLOCK.into()),
             channel: m.channel.to_string(),
             herdr_version: m.herdr_version.clone(),
             pastor_version: m.pastor_version.clone(),
@@ -399,29 +404,51 @@ impl From<&MachineStatus> for MachineRow {
 }
 
 /// AGENTS counts orphans too; ORPHANS names them (see `MachineStatus::orphans`).
-pub const MACHINE_HEADER: [&str; 9] = [
-    "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS", "ERROR",
+pub const MACHINE_HEADER: [&str; 10] = [
+    "NAME", "HOST", "FLOCK", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS", "ERROR",
 ];
 
-/// The head's row, then one per machine.
-pub fn machine_rows(head: &HeadRow, ms: &[MachineRow]) -> Vec<Vec<String>> {
+/// The machine that is the head itself: the first `local` one, whose herdr
+/// runs on this host.
+fn is_head_machine(m: &MachineRow) -> bool {
+    m.host == "local"
+}
+
+/// Move the head's own machine, if it is one, to the front; the rest keep
+/// flock order.
+pub fn head_machine_first(rows: &mut [MachineRow]) {
+    if let Some(i) = rows.iter().position(is_head_machine) {
+        rows[..=i].rotate_right(1);
+    }
+}
+
+/// The line `machine list` opens with when a head runs: its version, its
+/// host and the herdr there, how many machines follow, and, when the head
+/// is itself one of them, which.
+pub fn head_line(head: &HeadRow, rows: &[MachineRow]) -> String {
+    let n = rows.len();
+    let mut line = format!(
+        "pastor {} on {} (herdr {}), {n} machine{}",
+        head.pastor_version,
+        head.host,
+        head.herdr_version.as_deref().unwrap_or("-"),
+        if n == 1 { "" } else { "s" }
+    );
+    if let Some(m) = rows.iter().find(|m| is_head_machine(m)) {
+        line.push_str(&format!(", {} is the head of the flock", m.name));
+    }
+    line
+}
+
+/// One row per machine, in the order given.
+pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
     let dash = || "-".to_string();
-    let head_row = vec![
-        head.name.clone(),
-        head.host.clone(),
-        head.channel.clone(),
-        head.herdr_version.clone().unwrap_or_else(dash),
-        head.pastor_version.clone(),
-        dash(),
-        dash(),
-        dash(),
-        String::new(),
-    ];
-    std::iter::once(head_row)
-        .chain(ms.iter().map(|m| {
+    ms.iter()
+        .map(|m| {
             vec![
                 m.name.clone(),
                 m.host.clone(),
+                m.flock.clone(),
                 m.channel.clone(),
                 m.herdr_version.clone().unwrap_or_else(dash),
                 m.pastor_version.clone().unwrap_or_else(dash),
@@ -442,7 +469,7 @@ pub fn machine_rows(head: &HeadRow, ms: &[MachineRow]) -> Vec<Vec<String>> {
                 },
                 m.error.clone().unwrap_or_default(),
             ]
-        }))
+        })
         .collect()
 }
 
@@ -572,6 +599,7 @@ mod tests {
             max_agents: 3,
             tags: vec!["fast".into(), "arm".into()],
             orphans: vec![],
+            flock: None,
         }
     }
 
@@ -579,43 +607,40 @@ mod tests {
         HeadRow::new("darkbeat".into(), Some("0.9.1".into()))
     }
 
+    fn row(name: &str, host: &str) -> MachineRow {
+        MachineRow::from(&status(name, host))
+    }
+
+    /// The head's own machine (the `local` one) comes first; the others
+    /// keep flock order. FLOCK follows HOST.
     #[test]
-    fn machine_table_puts_the_head_first_then_each_machine_with_its_host() {
-        let rows: Vec<MachineRow> = [
-            status("pi-3", "fleet@pi-3"),
-            status("here", "local"),
-            status("fake", "fake-herdr"),
-        ]
-        .iter()
-        .map(MachineRow::from)
-        .collect();
-        let out = table(&MACHINE_HEADER, &machine_rows(&head(), &rows));
+    fn machine_table_puts_the_heads_machine_first_with_its_flock() {
+        let mut rows = vec![
+            MachineRow {
+                flock: "work".into(),
+                ..row("pi-3", "user@pi-3")
+            },
+            row("here", "local"),
+            row("fake", "fake-herdr"),
+        ];
+        head_machine_first(&mut rows);
+        let out = table(&MACHINE_HEADER, &machine_rows(&rows));
         let lines: Vec<&str> = out.lines().collect();
         let cells = |i: usize| lines[i].split_whitespace().collect::<Vec<_>>();
         assert_eq!(
             cells(0),
             [
-                "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS", "ERROR"
+                "NAME", "HOST", "FLOCK", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
+                "ERROR"
             ]
         );
-        assert_eq!(
-            cells(1),
-            [
-                "pastor",
-                "darkbeat",
-                "head",
-                "0.9.1",
-                env!("CARGO_PKG_VERSION"),
-                "-",
-                "-",
-                "-"
-            ]
-        );
+        assert_eq!(cells(1)[..3], ["here", "local", "default"]);
         assert_eq!(
             cells(2),
             [
                 "pi-3",
-                "fleet@pi-3",
+                "user@pi-3",
+                "work",
                 "connected",
                 "0.9.1",
                 "0.2.0",
@@ -624,29 +649,50 @@ mod tests {
                 "fast,arm"
             ]
         );
-        assert_eq!(cells(3)[1], "local");
-        assert_eq!(cells(4)[1], "fake-herdr");
+        assert_eq!(cells(3)[1], "fake-herdr");
+    }
+
+    #[test]
+    fn the_head_line_names_the_head_when_it_is_a_machine() {
+        let v = env!("CARGO_PKG_VERSION");
+        let mut rows = vec![row("pi-3", "user@pi-3"), row("darkbeat", "local")];
+        assert_eq!(
+            head_line(&head(), &rows),
+            format!(
+                "pastor {v} on darkbeat (herdr 0.9.1), 2 machines, darkbeat is the head of the flock"
+            )
+        );
+        rows.remove(1);
+        let bare = HeadRow::new("darkbeat".into(), None);
+        assert_eq!(
+            head_line(&bare, &rows),
+            format!("pastor {v} on darkbeat (herdr -), 1 machine"),
+            "a head that runs no agents: no ending, and no herdr is a dash"
+        );
+        assert_eq!(
+            head_line(&head(), &[]),
+            format!("pastor {v} on darkbeat (herdr 0.9.1), 0 machines")
+        );
     }
 
     #[test]
     fn a_probed_machine_without_a_count_shows_a_dash_and_its_error() {
-        let row = MachineRow {
+        let r = MachineRow {
             channel: "unreachable".into(),
             herdr_version: None,
             pastor_version: None,
             live: None,
             error: Some("no route to host".into()),
             tags: vec![],
-            ..MachineRow::from(&status("pi-3", "fleet@pi-3"))
+            ..row("pi-3", "user@pi-3")
         };
-        let head = HeadRow::new("darkbeat".into(), None);
-        let rows = machine_rows(&head, &[row]);
-        assert_eq!(rows[0][3], "-", "no herdr on the head reads as a dash");
+        let rows = machine_rows(&[r]);
         assert_eq!(
-            rows[1],
+            rows[0],
             [
                 "pi-3",
-                "fleet@pi-3",
+                "user@pi-3",
+                "default",
                 "unreachable",
                 "-",
                 "-",
@@ -678,6 +724,7 @@ mod tests {
         assert_eq!(ms[0]["pastor_version"], "0.2.0");
         assert_eq!(ms[0]["live"], 1);
         assert_eq!(ms[0]["max_agents"], 3);
+        assert_eq!(ms[0]["flock"], "default");
     }
 
     #[test]
@@ -911,11 +958,10 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("orphan t-5 on pi-2:"), "{}", lines[0]);
         assert!(orphan_lines(&both, Some("nope")).is_empty());
-        let rows = machine_rows(&head(), &[MachineRow::from(&m), MachineRow::from(&none)]);
-        assert_eq!(rows[1][5], "3/4");
-        assert_eq!(rows[1][6], "t-4,t-9");
-        assert_eq!(rows[2][6], "-");
+        let rows = machine_rows(&[MachineRow::from(&m), MachineRow::from(&none)]);
+        assert_eq!(rows[0][6], "3/4");
+        assert_eq!(rows[0][7], "t-4,t-9");
+        assert_eq!(rows[1][7], "-");
         assert_eq!(rows[0].len(), MACHINE_HEADER.len());
-        assert_eq!(rows[1].len(), MACHINE_HEADER.len());
     }
 }

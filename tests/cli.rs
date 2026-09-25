@@ -1078,7 +1078,7 @@ fn sighup_shuts_the_daemon_down_cleanly() {
 /// With a head running, `machine list` starts with the head's own row and
 /// gives each machine its host; `--json` keeps the head out of `machines`.
 #[test]
-fn machine_list_shows_the_head_then_the_machines() {
+fn machine_list_opens_with_a_line_about_the_head() {
     let env = start();
     let out = env.cmd(&["machine", "list"]);
     assert!(
@@ -1092,33 +1092,38 @@ fn machine_list_shows_the_head_then_the_machines() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
+    // The head runs no agents here (its one machine is a command bridge), so
+    // the line does not end by naming it. The hostname and herdr version
+    // are this host's.
+    let first = stdout.lines().next().unwrap();
+    assert!(
+        first.starts_with(&format!("pastor {} on ", env!("CARGO_PKG_VERSION"))),
+        "{stdout}"
+    );
+    assert!(first.contains(" (herdr "), "{stdout}");
+    assert!(first.ends_with("), 1 machine"), "{stdout}");
+    assert_eq!(stdout.lines().nth(1), Some(""), "{stdout}");
     let lines: Vec<Vec<&str>> = stdout
         .lines()
+        .skip(2)
         .map(|l| l.split_whitespace().collect())
         .collect();
     assert_eq!(
         lines[0],
         [
-            "NAME", "HOST", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS", "ERROR"
+            "NAME", "HOST", "FLOCK", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
+            "ERROR"
         ],
         "{stdout}"
     );
-    assert_eq!(lines[1][0], "pastor", "{stdout}");
-    assert_eq!(lines[1][2], "head", "{stdout}");
-    // HERDR is whatever herdr this host has, so only the columns after it.
     assert_eq!(
-        &lines[1][4..],
-        [env!("CARGO_PKG_VERSION"), "-", "-", "-"],
-        "{stdout}"
-    );
-    assert_eq!(
-        lines[2][..3],
-        ["fake", "fake-herdr", "connected"],
+        lines[1][..4],
+        ["fake", "fake-herdr", "default", "connected"],
         "{stdout}"
     );
     // A command bridge cannot say which pastor is behind it.
-    assert_eq!(lines[2][4..6], ["-", "0/2"], "{stdout}");
-    assert_eq!(lines.len(), 3, "{stdout}");
+    assert_eq!(lines[1][5..7], ["-", "0/2"], "{stdout}");
+    assert_eq!(lines.len(), 2, "{stdout}");
 
     let out = env.cmd(&["machine", "list", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -1131,6 +1136,21 @@ fn machine_list_shows_the_head_then_the_machines() {
     assert!(ms[0]["pastor_version"].is_null(), "{v}");
     assert_eq!(ms[0]["host"], "fake-herdr");
     assert_eq!(ms[0]["channel"], "connected");
+    assert_eq!(ms[0]["flock"], "default");
+
+    // --flock narrows the machines, and the line counts what it shows.
+    ok(env.cmd(&["flock", "add", "work"]));
+    let out = ok(env.cmd(&["machine", "list", "--flock", "work"]));
+    assert!(
+        out.lines().next().unwrap().ends_with("), 0 machines"),
+        "{out}"
+    );
+    assert_eq!(out.lines().count(), 3, "the header only: {out}");
+    let v: serde_json::Value = serde_json::from_str(&ok(
+        env.cmd(&["machine", "list", "--json", "--flock", "default"])
+    ))
+    .unwrap();
+    assert_eq!(v["machines"].as_array().unwrap().len(), 1, "{v}");
 }
 
 /// With no head, `machine list` probes each machine itself: a reachable one
@@ -1201,18 +1221,25 @@ fn machine_list_without_daemon_probes_each_machine() {
         .lines()
         .map(|l| l.split_whitespace().collect())
         .collect();
-    assert_eq!(lines[0][..3], ["NAME", "HOST", "CHANNEL"], "{stdout}");
-    assert_eq!(lines[1][0], "pastor", "{stdout}");
-    assert_eq!(lines[1][2], "head", "{stdout}");
-    assert_eq!(lines[2][..3], ["fake", "fake-herdr", "probed"], "{stdout}");
-    assert_eq!(&lines[2][4..], ["-", "0/2", "-", "arm"], "{stdout}");
+    // No head, no line about it: the stderr notice says so instead.
     assert_eq!(
-        lines[3][..3],
-        ["gone", "no-such-bridge", "unreachable"],
+        lines[0][..4],
+        ["NAME", "HOST", "FLOCK", "CHANNEL"],
         "{stdout}"
     );
-    assert_eq!(lines[3][3..6], ["-", "-", "-/1"], "{stdout}");
-    assert!(lines[3].len() > 8, "ERROR should say why: {stdout}");
+    assert_eq!(
+        lines[1][..4],
+        ["fake", "fake-herdr", "default", "probed"],
+        "{stdout}"
+    );
+    assert_eq!(&lines[1][5..], ["-", "0/2", "-", "arm"], "{stdout}");
+    assert_eq!(
+        lines[2][..4],
+        ["gone", "no-such-bridge", "default", "unreachable"],
+        "{stdout}"
+    );
+    assert_eq!(lines[2][4..7], ["-", "-", "-/1"], "{stdout}");
+    assert!(lines[2].len() > 9, "ERROR should say why: {stdout}");
 
     // The same JSON shape as with a head.
     let out = run(&["machine", "list", "--json"]);
@@ -1271,9 +1298,9 @@ fn machine_list_without_daemon_reads_a_local_machine_with_no_server_as_down() {
         .lines()
         .map(|l| l.split_whitespace().collect())
         .collect();
-    assert_eq!(lines[2][..2], ["loopback", "local"], "{stdout}");
+    assert_eq!(lines[1][..2], ["loopback", "local"], "{stdout}");
     // "server down" has a space, so it lands split across two columns.
-    assert_eq!(lines[2][2..4], ["server", "down"], "{stdout}");
+    assert_eq!(lines[1][3..5], ["server", "down"], "{stdout}");
 
     let out = pastor()
         .args(["machine", "list", "--json"])
@@ -1351,10 +1378,17 @@ fn machine_list_without_daemon_shows_a_local_machine_s_pastor_version() {
         .lines()
         .map(|l| l.split_whitespace().collect())
         .collect();
-    assert_eq!(lines[0][3..5], ["HERDR", "PASTOR"], "{stdout}");
+    assert_eq!(lines[0][4..6], ["HERDR", "PASTOR"], "{stdout}");
     assert_eq!(
-        lines[2][..5],
-        ["here", "local", "probed", "fake", env!("CARGO_PKG_VERSION")],
+        lines[1][..6],
+        [
+            "here",
+            "local",
+            "default",
+            "probed",
+            "fake",
+            env!("CARGO_PKG_VERSION")
+        ],
         "{stdout}"
     );
 

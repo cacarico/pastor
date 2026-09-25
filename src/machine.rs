@@ -143,6 +143,11 @@ pub struct MachineStatus {
     /// `live`, never closed unless `pastor task close` asks.
     #[serde(default)]
     pub orphans: Vec<String>,
+    /// The flock the machine is in, as the head last applied flock.toml.
+    /// The actor does not know it; `Fleet::statuses` fills it in. `None`
+    /// from an actor, and from a head that predates flocks.
+    #[serde(default)]
+    pub flock: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -410,6 +415,7 @@ pub fn spawn_machine(
         max_agents,
         tags: tags.clone(),
         orphans: vec![],
+        flock: None,
     }));
     let actor = Actor {
         name: name.clone(),
