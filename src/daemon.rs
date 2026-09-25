@@ -103,6 +103,15 @@ impl FlockDiff {
     }
 }
 
+/// Why `Fleet::queue_task` did not queue a task.
+#[derive(Debug)]
+pub enum QueueError<E = anyhow::Error> {
+    /// Pinned to a machine that is not in the flock.
+    UnknownMachine(String),
+    /// The insert failed; for `queue_retry`, the `RetryError` that says why.
+    Store(E),
+}
+
 #[derive(Clone)]
 struct Member {
     handle: MachineHandle,
@@ -352,6 +361,38 @@ impl Fleet {
                 }
             })
             .collect()
+    }
+
+    /// Queue `new`, first checking that a machine it is pinned to is in the
+    /// flock. Both happen under the dispatch lock, so an `apply_flock` cannot
+    /// drop the machine between the check and the insert. The check reads
+    /// the wanted flock, not the running set: a removed machine held only
+    /// until its old actor ends is not in it, and would never take the task.
+    /// A fixed fleet has no wanted flock, so its machines are the flock.
+    pub async fn queue_task(&self, new: NewTask) -> Result<Task, QueueError> {
+        let _pass = self.dispatch_lock.lock().await;
+        if let Some(m) = &new.spec.machine
+            && !self.in_flock(m)
+        {
+            return Err(QueueError::UnknownMachine(m.clone()));
+        }
+        self.store.insert_task(new).map_err(QueueError::Store)
+    }
+
+    /// `queue_task` for a retry of task `id` (`Store::insert_retry`). The
+    /// copy keeps the original's pin, so the pin gets the same check under
+    /// the same lock. A row that is missing or not retryable is left for
+    /// `insert_retry` to name.
+    pub async fn queue_retry(&self, id: i64) -> Result<Task, QueueError<RetryError>> {
+        let _pass = self.dispatch_lock.lock().await;
+        if let Ok(Some(t)) = self.store.get_task(id)
+            && t.state.is_retryable()
+            && let Some(m) = &t.spec.machine
+            && !self.in_flock(m)
+        {
+            return Err(QueueError::UnknownMachine(m.clone()));
+        }
+        self.store.insert_retry(id).map_err(QueueError::Store)
     }
 
     /// Try to place every queued task, oldest first. Serialised: a pass sees the
@@ -630,22 +671,23 @@ impl Daemon {
                         "a worktree task needs a repo to branch from",
                     );
                 }
-                if let Some(m) = &spec.machine
-                    && self.fleet.get(m).is_none()
-                {
-                    return IpcResponse::error(
-                        "unknown_machine",
-                        format!("machine {m} is not in the flock"),
-                    );
-                }
-                let task = match self.store.insert_task(NewTask {
+                let new = NewTask {
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt,
                     spec,
-                }) {
+                };
+                let task = match self.fleet.queue_task(new).await {
                     Ok(t) => t,
-                    Err(err) => return IpcResponse::error("store_error", err),
+                    Err(QueueError::UnknownMachine(m)) => {
+                        return IpcResponse::error(
+                            "unknown_machine",
+                            format!("machine {m} is not in the flock"),
+                        );
+                    }
+                    Err(QueueError::Store(err)) => {
+                        return IpcResponse::error("store_error", err);
+                    }
                 };
                 let _ = self.events.send(PastorEvent {
                     kind: "task.queued".into(),
@@ -747,15 +789,21 @@ impl Daemon {
         // The store checks the state and copies in one statement; its error
         // says which check failed, so a row pruned by a concurrent request is
         // `task_not_found` and a storage failure is `store_error`.
-        let task = match self.store.insert_retry(id) {
+        let task = match self.fleet.queue_retry(id).await {
             Ok(t) => t,
-            Err(err @ RetryError::NotFound(_)) => {
+            Err(QueueError::UnknownMachine(m)) => {
+                return IpcResponse::error(
+                    "unknown_machine",
+                    format!("t-{id} is pinned to machine {m}, which is not in the flock"),
+                );
+            }
+            Err(QueueError::Store(err @ RetryError::NotFound(_))) => {
                 return IpcResponse::error("task_not_found", err);
             }
-            Err(err @ RetryError::NotRetryable { .. }) => {
+            Err(QueueError::Store(err @ RetryError::NotRetryable { .. })) => {
                 return IpcResponse::error("not_retryable", err);
             }
-            Err(RetryError::Store(err)) => {
+            Err(QueueError::Store(RetryError::Store(err))) => {
                 return IpcResponse::error("store_error", format!("{err:#}"));
             }
         };
@@ -1423,6 +1471,80 @@ mod tests {
             panic!()
         };
         assert_eq!(code, "task_not_found");
+    }
+
+    /// A valid pin still queues, and dispatches to that machine.
+    #[tokio::test]
+    async fn run_pinned_to_a_known_machine_queues() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new()), ("b", 2, FakeHerdr::new())]).await;
+        let resp = d
+            .handle(IpcRequest::Run {
+                prompt: "x".into(),
+                spec: DispatchSpec {
+                    machine: Some("b".into()),
+                    ..spec()
+                },
+            })
+            .await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.machine.as_deref(), Some("b"));
+        assert_eq!(t.state, TaskState::Running);
+    }
+
+    /// Copilot 4103544623: a machine a reload removed but whose old actor
+    /// has not ended is still in the fleet, out of dispatch. A run pinned to
+    /// it must be refused, not queued for a machine that will never take it.
+    /// The pin is checked against the wanted flock, under the lock
+    /// `apply_flock` takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_pinned_to_a_removed_machine_shutting_down_is_unknown() {
+        let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(false).await;
+        let resp = d
+            .handle(IpcRequest::Run {
+                prompt: "x".into(),
+                spec: DispatchSpec {
+                    machine: Some("b".into()),
+                    ..spec()
+                },
+            })
+            .await;
+        let IpcResponse::Error { code, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "unknown_machine");
+        assert!(
+            d.store.queued_tasks().unwrap().is_empty(),
+            "no row left queued"
+        );
+    }
+
+    /// A retry copies the pin, so it is checked like a run's: against the
+    /// wanted flock, under the dispatch lock. A removed machine held only
+    /// while its old actor ends would never take the copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_pinned_to_a_removed_machine_shutting_down_is_unknown() {
+        let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(false).await;
+        let mut failed = insert(&d, TaskState::Failed);
+        failed.spec.machine = Some("b".into());
+        d.store.update_task(&mut failed).unwrap();
+        assert_eq!(
+            error_code(d.handle(IpcRequest::TaskRetry { id: failed.id }).await),
+            "unknown_machine"
+        );
+        assert!(
+            d.store.queued_tasks().unwrap().is_empty(),
+            "no copy left queued"
+        );
+        // The state is still checked first.
+        let mut running = insert(&d, TaskState::Running);
+        running.spec.machine = Some("b".into());
+        d.store.update_task(&mut running).unwrap();
+        assert_eq!(
+            error_code(d.handle(IpcRequest::TaskRetry { id: running.id }).await),
+            "not_retryable"
+        );
     }
 
     #[tokio::test]
