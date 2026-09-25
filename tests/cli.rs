@@ -2632,6 +2632,9 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
         &["machine", "add", "pi-2", "--local"],
         &["machine", "remove", "pi-1"],
         &["job", "disable", "nightly"],
+        // Both apply pastor.toml and flock.toml, head or no head.
+        &["job", "reload"],
+        &["tick", "--dry-run"],
     ] {
         assert_eq!(error_code(&run(args)), "agent_refused", "{args:?}");
     }

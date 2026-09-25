@@ -923,8 +923,10 @@ So:
   `pastor.sock`, an agent on the head included. pastor sets `PASTOR_TASK=t-N`
   in the pane of every agent it starts, and refuses a command from such a
   pane that changes the fleet: `task run`, `send`, `retry`, `close` and
-  `prune`, `tick` and `job run`, and edits of machines, flocks and jobs
-  (`agent_refused`). Reads still work. `agents_change_fleet = true` in
+  `prune`, `tick` (`--dry-run` too), `job run` and `job reload`, and edits
+  of machines, flocks and jobs (`agent_refused`). A dry tick and a reload
+  count because both apply `pastor.toml` and `flock.toml` first. Reads
+  still work. `agents_change_fleet = true` in
   `pastor.toml` turns this off. It stops an agent acting on its own, not a
   determined one: it runs as the same user and can unset the variable.
 

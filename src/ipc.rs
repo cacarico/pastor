@@ -110,8 +110,9 @@ pub enum IpcRequest {
 
 impl IpcRequest {
     /// Whether the request can start, stop, feed or reshape work: anything
-    /// but a read, a dry tick or a reload (which only re-reads the files). An
-    /// agent pastor started is refused these (`TASK_ENV`).
+    /// but a read. A reload and a tick, dry or not, count: both apply
+    /// pastor.toml and flock.toml first. An agent pastor started is refused
+    /// these (`TASK_ENV`).
     pub fn changes_fleet(&self) -> bool {
         match self {
             IpcRequest::Ping
@@ -119,10 +120,10 @@ impl IpcRequest {
             | IpcRequest::TaskShow { .. }
             | IpcRequest::TaskRead { .. }
             | IpcRequest::FlockList
-            | IpcRequest::JobList
-            | IpcRequest::Reload => false,
-            IpcRequest::Tick { dry_run, .. } => !dry_run,
-            IpcRequest::Run { .. }
+            | IpcRequest::JobList => false,
+            IpcRequest::Reload
+            | IpcRequest::Tick { .. }
+            | IpcRequest::Run { .. }
             | IpcRequest::FlockRemove { .. }
             | IpcRequest::JobRun { .. }
             | IpcRequest::TaskRetry { .. }
@@ -543,9 +544,9 @@ mod tests {
         assert_eq!(v["states"][0], "failed");
     }
 
-    /// What an agent pastor started may still ask for: reads, a dry tick
-    /// and a reload, which only re-reads files. Everything else changes the
-    /// fleet (`IpcRequest::changes_fleet`).
+    /// What an agent pastor started may still ask for: reads. Everything
+    /// else changes the fleet (`IpcRequest::changes_fleet`), a reload and a
+    /// dry tick included, since both apply pastor.toml and flock.toml.
     #[test]
     fn only_reads_leave_the_fleet_alone() {
         let reads = [
@@ -557,11 +558,6 @@ mod tests {
             IpcRequest::TaskRead { id: 1, lines: 5 },
             IpcRequest::FlockList,
             IpcRequest::JobList,
-            IpcRequest::Reload,
-            IpcRequest::Tick {
-                job: None,
-                dry_run: true,
-            },
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -591,6 +587,11 @@ mod tests {
                 job: None,
                 dry_run: false,
             },
+            IpcRequest::Tick {
+                job: None,
+                dry_run: true,
+            },
+            IpcRequest::Reload,
             IpcRequest::JobRun { name: "j".into() },
         ];
         for req in changes {

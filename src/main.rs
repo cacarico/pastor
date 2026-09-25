@@ -442,8 +442,9 @@ fn head_use(command: &Command) -> Option<bool> {
 
 /// Whether `command` changes the fleet: the CLI's side of
 /// `IpcRequest::changes_fleet`, for the edits it makes without the head
-/// (machines, flocks, jobs, an offline tick). An agent pastor started
-/// (`ipc::TASK_ENV`) is refused these up front, head or no head.
+/// (machines, flocks, jobs, an offline tick). A tick, dry or not, and a job
+/// reload apply pastor.toml and flock.toml, so they count. An agent pastor
+/// started (`ipc::TASK_ENV`) is refused these up front, head or no head.
 fn changes_fleet(command: &Command) -> bool {
     match command {
         Command::Task { cmd } => matches!(
@@ -456,8 +457,8 @@ fn changes_fleet(command: &Command) -> bool {
         ),
         Command::Machine { cmd } => !matches!(cmd, MachineCmd::List { .. }),
         Command::Flock { cmd } => !matches!(cmd, FlockCmd::List { .. }),
-        Command::Tick(a) => !a.dry_run,
-        Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. } | JobCmd::Reload),
+        Command::Tick(_) => true,
+        Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. }),
         _ => false,
     }
 }
