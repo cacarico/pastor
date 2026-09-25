@@ -64,7 +64,7 @@ issues into tasks, and event hooks that run when a task finishes or blocks.
   one multiplexed ssh connection each. A machine takes up to `max_agents`
   tasks at once; tags steer a task to the right one.
 - **A task** is one agent in one herdr pane, in a repo or a fresh worktree of
-  it. Its states are `queued`, `running`, `blocked`, `done`, `stale`, `failed`
+  it. Its states are `queued`, `starting`, `running`, `blocked`, `done`, `stale`, `failed`
   and `closed`; `done` means the agent stopped, not that the work is good.
 - **herdr** owns the terminals and detects what the agent is doing. pastor
   never reads the agent's screen itself.
