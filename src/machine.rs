@@ -1240,6 +1240,20 @@ impl Actor {
             return (Err(err.into()), false);
         }
         let (text, keys, detail) = if input.trust {
+            // Only the startup prompt: keys sent while the agent starts can
+            // land before the dialog, and would claim the task and save the
+            // repo; keys sent to a working agent go into its own UI.
+            if task.state != TaskState::Blocked || !task.prompt_pending {
+                let err = SendRefused {
+                    code: "not_at_trust_prompt",
+                    message: format!(
+                        "{} is {} and not waiting on its startup prompt; --trust answers only a task blocked while it starts",
+                        task.display_id(),
+                        task.state
+                    ),
+                };
+                return (Err(err.into()), false);
+            }
             let Some(keys) = self.settings.agents.trust_keys(&task.spec.agent) else {
                 let err = SendRefused {
                     code: "no_trust_keys",
@@ -3539,9 +3553,50 @@ mod tests {
         );
     }
 
+    /// `--trust` answers only the startup prompt: a task that is starting,
+    /// running, or blocked on something else is refused, and nothing is
+    /// sent, saved or claimed, so saved trust can still answer it later.
+    #[tokio::test]
+    async fn send_trust_refuses_a_task_not_at_its_startup_prompt() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let running = h
+            .dispatch(repo_task(&store, "claude", Some("/r")).id)
+            .await
+            .unwrap();
+        assert_eq!(running.state, TaskState::Running);
+        let blocked_later = h
+            .dispatch(repo_task(&store, "claude", Some("/r")).id)
+            .await
+            .unwrap();
+        fake.set_status(
+            blocked_later.pane_id.as_deref().unwrap(),
+            AgentStatus::Blocked,
+        );
+        wait_for("blocked", || {
+            state_of(&store, blocked_later.id) == TaskState::Blocked
+        })
+        .await;
+        for t in [&running, &blocked_later] {
+            let err = h.send(t.id, trust()).await.unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<SendRefused>().map(|r| r.code),
+                Some("not_at_trust_prompt"),
+                "{err:#}"
+            );
+            // Not claimed: the first claim still wins.
+            assert!(store.claim_trust_sent(t.id).unwrap());
+        }
+        assert!(calls(&fake, "pane.send_keys").is_empty());
+        assert!(store.trusted_repos().unwrap().is_empty());
+        assert!(input_events(&mut events).is_empty());
+    }
+
     #[tokio::test]
     async fn send_trust_needs_trust_keys_and_saves_nothing_without_a_repo() {
         let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
         let store = Arc::new(Store::open_in_memory().unwrap());
         let (h, _events) = connected(&fake, &store).await;
         let codex = h

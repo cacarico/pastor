@@ -155,7 +155,9 @@ prompt, and a worktree is always a new folder. `pastor task send t-3
 --trust` presses the agent's trust keys (`trust_keys` under `[agents.<name>]`
 in `pastor.toml`; Claude's are built in as `Down`, `Enter`) and saves the
 task's machine and repo, the `--repo` as given, so every worktree of that
-repo counts. An agent without trust keys answers `no_trust_keys`, and a task
+repo counts. It answers only a task blocked on its startup prompt; any other
+task answers `not_at_trust_prompt`, and nothing is sent or saved. An agent
+without trust keys answers `no_trust_keys`, and a task
 without `--repo` gets the keys but nothing is saved. From then on, when a task
 of a saved repo is blocked during startup on that machine, the head presses
 the trust keys itself, once per task, and emits `task.trusted`; a task still

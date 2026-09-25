@@ -28,9 +28,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`task_not_live`). Each send emits `task.input`, which records the key
   names and the text length, never the text.
 - Saved repo trust. `pastor task send <task> --trust` presses the agent's
-  folder-trust keys and saves the task's machine and repo; the head then
-  answers the trust prompt of that repo's later tasks on that machine on its
-  own, once per task, and emits `task.trusted`. `[agents.<name>] trust_keys`
+  folder-trust keys to a task blocked on its startup prompt
+  (`not_at_trust_prompt` otherwise) and saves the task's machine and repo;
+  the head then answers the trust prompt of that repo's later tasks on that
+  machine on its own, once per task, and emits `task.trusted`. `[agents.<name>] trust_keys`
   in `pastor.toml` sets the keys (Claude's, `Down` then `Enter`, are built
   in). `pastor trust list [--json]` and `pastor trust remove <machine>
   <repo>` show and revoke it.

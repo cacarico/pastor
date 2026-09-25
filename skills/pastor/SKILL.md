@@ -102,7 +102,7 @@ pastor task send t-12 --trust               # accept the folder-trust prompt, an
 pastor trust list                           # saved (machine, repo) pairs; pastor trust remove <machine> <repo>
 ```
 
-Only starting, running and blocked tasks take input (`task_not_live` otherwise). Read the pane before you answer; never send what a human should decide. Once a repo is trusted on a machine, the head answers the trust prompt of its later tasks there by itself, once per task (`task.trusted`), worktrees included. `--trust` needs `trust_keys` for the agent (Claude has them built in); `no_trust_keys` otherwise.
+Only starting, running and blocked tasks take input (`task_not_live` otherwise). Read the pane before you answer; never send what a human should decide. Once a repo is trusted on a machine, the head answers the trust prompt of its later tasks there by itself, once per task (`task.trusted`), worktrees included. `--trust` answers only a task blocked on its startup prompt (`not_at_trust_prompt` otherwise) and needs `trust_keys` for the agent (Claude has them built in); `no_trust_keys` otherwise.
 
 ## Jobs
 
