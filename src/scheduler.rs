@@ -1234,12 +1234,11 @@ impl Scheduler {
     }
 }
 
-/// Cheap change detection for the jobs directory: names, mtimes and sizes.
-/// (path, mtime, size) of each file. Like `fingerprint`, it follows
-/// symlinks, so a config file linked from a dotfiles repo is seen when its
-/// target changes. A missing file is `(path, None, 0)`.
 /// (path, mtime, size) of `pastor.toml` and `flock.toml`: what
 /// `Scheduler::reload_config` compares to decide whether either changed.
+/// The jobs directory has its own check (`fingerprint`). Like that one, it
+/// follows symlinks, so a config file linked from a dotfiles repo is seen
+/// when its target changes. A missing file is `(path, None, 0)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigFingerprint(Vec<(PathBuf, Option<SystemTime>, u64)>);
 
