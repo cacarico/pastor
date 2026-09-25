@@ -1,9 +1,29 @@
-name: ci
-
+# A commit is only ever checked once: `pull_request` covers every commit on
+# a branch, and this project merges by fast-forwarding a PR's exact head sha
+# to main after CI passed on that same sha in the PR, so a push to main
+# never carries an unchecked commit through the normal flow. Running `check`
+# again on push to main would just repeat that same run for runner time, so
+# it is dropped; `workflow_dispatch` keeps a manual way to run it (for a
+# direct push to main that skipped a PR, or to re-check main by hand).
+# `check` and `test-machine` only exercise what they build or read, so
+# `paths:` skips docs-only changes; gitleaks has no such filter because a
+# secret can land in any file.
 on:
-  push:
-    branches: [main]
   pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "skills/pastor/SKILL.md"
+      - "contrib/systemd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

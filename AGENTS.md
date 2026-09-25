@@ -82,13 +82,20 @@ them too; they are repeated here because getting them wrong cost a day.
 
 - `make check` is the gate: fmt check, clippy with warnings as errors, the
   full suite. Run it before every commit. `make help` lists the rest.
-- CI (`.github/workflows/ci.yml`) runs `make check` and `make test-machine`
-  on every pull request and on pushes to `main`.
+- CI (`.github/workflows/ci.yml`) runs `make check` and `make test-machine` on
+  every pull request that touches code (`paths:` skips docs-only diffs), or
+  by hand (`workflow_dispatch`). Since this project merges by fast-forwarding
+  a PR's exact head sha to main, that sha was already checked on its PR, so
+  push-to-main does not run `check` again; a direct push that skips a PR goes
+  unchecked unless someone dispatches it by hand.
 - The repository is public. `.github/workflows/gitleaks.yml` scans the whole
-  history on every push and pull request, and `make leaks` runs the same scan
-  here. Nothing from the fleet goes into a commit: no addresses, hostnames,
-  user names, tokens or home paths; examples use placeholders such as
-  `user@pi-1`.
+  history of every ref on every pull request, on push to `main`, and weekly,
+  and `make leaks` runs the same scan here. It does not run on push to other
+  branches, to save runner time; GitHub's push protection is the front line
+  for a secret landing on a branch with no open PR yet, until a PR opens or
+  the weekly sweep runs. Nothing from the fleet goes into a commit: no
+  addresses, hostnames, user names, tokens or home paths; examples use
+  placeholders such as `user@pi-1`.
 - Nothing in the suite talks to a real herdr. `make smoke SESSION=s` runs the
   opt-in test against one on the same host; do it on a fleet machine before
   trusting a change to the transport or dispatch.

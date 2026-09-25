@@ -1,21 +1,42 @@
 name: gitleaks
 
-# The repository is public. Every push and pull request scans the whole
-# history of every ref, so a secret cannot sit quietly in an old
-# commit. gitleaks-action only scans the commits of the triggering event, so
-# the binary runs here directly, pinned by version and checksum. The rules
-# come from gitleaks' own default config at that same version, fetched
-# outside the checkout, the checkout's own gitleaks files are deleted before
-# the scan (gitleaks reads ./.gitleaksignore whatever --gitleaks-ignore-path
-# says) and inline gitleaks:allow comments are ignored, so a pull request
-# cannot loosen the policy it is checked against. The workflow file itself is
-# what a pull request may change; the owner reads that diff, and GitHub's
-# own secret scanning and push protection run server side regardless.
+# The repository is public and every commit gets one scan: `pull_request`
+# covers every commit on a branch, and this project merges by
+# fast-forwarding a PR's exact head sha to main, so a push to main is
+# already-scanned history, kept here only so a direct push that skipped a PR
+# is not silently unchecked. Pushing to every other branch is not a trigger
+# any more, to save runner time; the gap that leaves is a secret landing on
+# a branch with no open PR yet, which sits unscanned by this workflow until
+# a PR opens or the Monday sweep runs. GitHub secret scanning with push
+# protection (server side, on every push, regardless of this workflow) is
+# the front line for that gap, but it only catches the provider patterns it
+# recognises, not gitleaks' broader default ruleset, so the gap is real, not
+# just theoretical.
+#
+# --log-opts="--all" still scans the whole history of every ref on each of
+# these runs (pull_request, push to main, and the weekly sweep), so a secret
+# cannot sit quietly in an old commit once any of them runs: that property
+# never depended on triggering on every branch push, only on scanning `--all`
+# once it runs at all. gitleaks-action only scans the commits of the
+# triggering event, so the binary runs here directly, pinned by version and
+# checksum. The rules come from gitleaks' own default config at that same
+# version, fetched outside the checkout, the checkout's own gitleaks files
+# are deleted before the scan (gitleaks reads ./.gitleaksignore whatever
+# --gitleaks-ignore-path says) and inline gitleaks:allow comments are
+# ignored, so a pull request cannot loosen the policy it is checked against.
+# The workflow file itself is what a pull request may change; the owner
+# reads that diff.
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: gitleaks-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
