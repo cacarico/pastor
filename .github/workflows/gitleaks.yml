@@ -5,8 +5,9 @@ name: gitleaks
 # commit. gitleaks-action only scans the commits of the triggering event, so
 # the binary runs here directly, pinned by version and checksum. The rules
 # come from gitleaks' own default config at that same version, fetched
-# outside the checkout, and no .gitleaksignore is read, so a pull request
-# cannot loosen the policy it is checked against.
+# outside the checkout, no .gitleaksignore is read and inline gitleaks:allow
+# comments are ignored, so a pull request cannot loosen the policy it is
+# checked against.
 on:
   push:
   pull_request:
@@ -39,7 +40,7 @@ jobs:
       - name: Scan every ref
         run: |
           git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*'
-          "${RUNNER_TEMP}/gitleaks" git --redact --no-banner --exit-code 1 \
+          "${RUNNER_TEMP}/gitleaks" git --redact --no-banner --exit-code 1 --ignore-gitleaks-allow \
             --config "${RUNNER_TEMP}/gitleaks.toml" \
             --gitleaks-ignore-path "${RUNNER_TEMP}/no-ignore" \
             --log-opts="--all" .
