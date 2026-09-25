@@ -505,6 +505,7 @@ pub fn spawn_machine(
         rx,
         pending_done: HashMap::new(),
         activity_seen: HashSet::new(),
+        idle_agents: HashSet::new(),
         was_connected: false,
         failures: 0,
         lost_announced: false,
@@ -544,6 +545,10 @@ struct Actor {
     /// transition. A restarted daemon starts empty; reconcile refills it for
     /// agents it finds at work.
     activity_seen: HashSet<i64>,
+    /// Tasks whose agent this actor last saw `idle` or `done` (`unknown`
+    /// changes nothing). Decides what an exit means: an agent that ends
+    /// between turns finished its task; see `Observed::PaneExited`.
+    idle_agents: HashSet<i64>,
     /// Has the actor connected successfully at least once (ever)?
     was_connected: bool,
     /// Consecutive connect-attempt failures since the last success. Only decides
@@ -1757,8 +1762,11 @@ impl Actor {
         let observed = if ev.is_pane_closed() {
             Observed::PaneClosed
         } else if ev.is_pane_exited() {
-            Observed::PaneExited
+            Observed::PaneExited {
+                agent_idle: self.idle_agents.contains(&task.id),
+            }
         } else if let Some(status) = ev.agent_status() {
+            self.note_status(task.id, status);
             // Subscription events carry no sequence; treat idle as a candidate and let
             // the settle check read the real one from agent.list.
             Observed::Status {
@@ -1911,6 +1919,7 @@ impl Actor {
             else {
                 continue;
             };
+            self.note_status(id, agent.agent_status);
             let idle_like = matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done);
             // No sequence yet (the candidate came from an event) is as good as a
             // moved one: the agent may have worked again inside the window.
@@ -1922,6 +1931,20 @@ impl Actor {
             self.apply(task, &observed_from(agent));
         }
         Ok(())
+    }
+
+    /// Remember whether the agent of task `id` is between turns; see
+    /// `Actor::idle_agents`.
+    fn note_status(&mut self, id: i64, status: AgentStatus) {
+        match status {
+            AgentStatus::Idle | AgentStatus::Done => {
+                self.idle_agents.insert(id);
+            }
+            AgentStatus::Working | AgentStatus::Blocked => {
+                self.idle_agents.remove(&id);
+            }
+            AgentStatus::Unknown => {}
+        }
     }
 
     /// Record whether `task` (just prompted, so its flag is fresh) has shown
@@ -1951,6 +1974,9 @@ impl Actor {
         if to == TaskState::Done || !to.is_open() {
             // The next completion needs activity of its own.
             self.activity_seen.remove(&task.id);
+        }
+        if !to.is_open() {
+            self.idle_agents.remove(&task.id);
         }
         if let Observed::Status {
             state_change_seq,
@@ -2089,7 +2115,7 @@ impl Actor {
                             "dispatch of {} was interrupted before an agent started",
                             t.display_id()
                         ));
-                        self.apply(t, &Observed::PaneExited);
+                        self.apply(t, &Observed::PaneExited { agent_idle: false });
                     }
                 }
                 continue;
@@ -2101,7 +2127,10 @@ impl Actor {
                     // finished its work and must close cleanly, not be reported as
                     // failed.
                     let mut t = task;
-                    if next_state(&t, &Observed::PaneExited) == Some(TaskState::Failed) {
+                    let exited = Observed::PaneExited {
+                        agent_idle: self.idle_agents.contains(&t.id),
+                    };
+                    if next_state(&t, &exited) == Some(TaskState::Failed) {
                         t.error = Some(format!(
                             "agent {} not found on machine {}",
                             t.agent_name
@@ -2110,9 +2139,10 @@ impl Actor {
                             self.name
                         ));
                     }
-                    self.apply(t, &Observed::PaneExited);
+                    self.apply(t, &exited);
                 }
                 Some(agent) => {
+                    self.note_status(task.id, agent.agent_status);
                     // Before the timeout check: a task that sat blocked past its
                     // timeout has not started its work yet.
                     if task.prompt_pending
@@ -4348,6 +4378,53 @@ mod tests {
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
         assert!(saw(&mut events, "task.done", t.id), "task.done was emitted");
         assert_eq!(h.snapshot().live, 1, "done keeps its pane until it closes");
+    }
+
+    /// The agent finished, sat idle, and the human typed `/exit` before the
+    /// settle window confirmed it: the process exiting is the end of work
+    /// that was done, not a failure.
+    #[tokio::test]
+    async fn an_idle_agent_that_exits_leaves_its_task_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) =
+            spawn_with_settings(&fake, &store, settings_with_settle(Duration::from_secs(30)));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        fake.exit_pane(&pane);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert!(row.error.is_none(), "{:?}", row.error);
+        assert!(row.finished_at.is_some());
+        assert!(saw(&mut events, "task.done", t.id));
+    }
+
+    /// An agent that exits while working crashed, or was killed: that task
+    /// did fail.
+    #[tokio::test]
+    async fn a_working_agent_that_exits_fails_its_task() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        fake.set_status(&pane, AgentStatus::Working);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fake.exit_pane(&pane);
+        wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().error.as_deref(),
+            Some("agent process exited")
+        );
     }
 
     /// herdr's `done` status (idle, not yet looked at) finishes a task the same

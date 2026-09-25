@@ -34,7 +34,10 @@ from an event or from `agent.list`; `unknown` does not count. herdr also counts
 each agent state change, and the count must have moved past its value when the
 prompt went in and not moved again during the window. What pastor has seen is
 kept in memory, so after a daemon restart an agent found idle stays `running`
-until its task goes `stale`. Task state lives in SQLite under
+until its task goes `stale`. An agent whose process exits while it sits idle
+between turns (someone typed `/exit` after the work) leaves its task `done`;
+one that exits while starting, blocked or working fails it with "agent process
+exited". Task state lives in SQLite under
 `~/.local/state/pastor/`.
 
 Before creating a workspace, pastor checks that the repo directory is

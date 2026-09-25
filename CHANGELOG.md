@@ -61,6 +61,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   before flocks join the default flock. Schema 5 adds the `trusted_repos`
   table and a `trust_sent` flag on each task.
 
+### Fixed
+
+- An agent that exits between turns (a human typing `/exit` once the work
+  is done) leaves a running task `done`, not `failed` with "agent process
+  exited". An exit while starting, blocked or working still fails the task.
+
 ## 0.3.0 - 2026-09-25
 
 ### Changed

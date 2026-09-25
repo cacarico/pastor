@@ -183,7 +183,12 @@ pub enum Observed {
         completion_seq: Option<u64>,
     },
     PaneClosed,
-    PaneExited,
+    /// The agent's process ended. `agent_idle`: the last status pastor saw
+    /// for it was `idle` or `done`, so it exited between turns (a human typed
+    /// `/exit` after the work) rather than in the middle of one.
+    PaneExited {
+        agent_idle: bool,
+    },
     /// Dispatch is about to make its first herdr call. Not something herdr reports;
     /// the actor emits it itself so the one legal source transition (only a queued
     /// task may start) lives with the rest of the state machine instead of being
@@ -238,13 +243,13 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
             }
         }
         Observed::PaneClosed => Closed,
-        Observed::PaneExited => {
-            if task.state == Done {
-                Closed
-            } else {
-                Failed
-            }
-        }
+        Observed::PaneExited { agent_idle } => match task.state {
+            Done => Closed,
+            // An agent that ends between turns has finished what it was
+            // given; one that ends while starting, blocked or working has not.
+            Running if *agent_idle && !task.prompt_pending => Done,
+            _ => Failed,
+        },
         Observed::Status {
             status,
             state_change_seq,
@@ -564,7 +569,10 @@ mod tests {
             None
         );
         assert_eq!(
-            next_state(&task(TaskState::Closed, None), &Observed::PaneExited),
+            next_state(
+                &task(TaskState::Closed, None),
+                &Observed::PaneExited { agent_idle: false }
+            ),
             None
         );
     }
@@ -580,11 +588,17 @@ mod tests {
             Some(TaskState::Closed)
         );
         assert_eq!(
-            next_state(&task(TaskState::Running, None), &Observed::PaneExited),
+            next_state(
+                &task(TaskState::Running, None),
+                &Observed::PaneExited { agent_idle: false }
+            ),
             Some(TaskState::Failed)
         );
         assert_eq!(
-            next_state(&task(TaskState::Done, Some(1)), &Observed::PaneExited),
+            next_state(
+                &task(TaskState::Done, Some(1)),
+                &Observed::PaneExited { agent_idle: false }
+            ),
             Some(TaskState::Closed)
         );
     }
@@ -637,8 +651,42 @@ mod tests {
             Some(TaskState::Closed)
         );
         assert_eq!(
-            next_state(&task(TaskState::Stale, None), &Observed::PaneExited),
+            next_state(
+                &task(TaskState::Stale, None),
+                &Observed::PaneExited { agent_idle: false }
+            ),
             Some(TaskState::Failed)
+        );
+    }
+
+    /// An exit between turns ends a running task as done; an exit from
+    /// anywhere else is a failure.
+    #[test]
+    fn pane_exited_is_done_only_for_an_idle_running_agent() {
+        let exited = |agent_idle| Observed::PaneExited { agent_idle };
+        assert_eq!(
+            next_state(&task(TaskState::Running, Some(1)), &exited(true)),
+            Some(TaskState::Done)
+        );
+        assert_eq!(
+            next_state(&task(TaskState::Running, Some(1)), &exited(false)),
+            Some(TaskState::Failed)
+        );
+        for state in [TaskState::Starting, TaskState::Blocked, TaskState::Stale] {
+            assert_eq!(
+                next_state(&task(state, Some(1)), &exited(true)),
+                Some(TaskState::Failed),
+                "{state}"
+            );
+        }
+        let pending = Task {
+            prompt_pending: true,
+            ..task(TaskState::Running, Some(1))
+        };
+        assert_eq!(next_state(&pending, &exited(true)), Some(TaskState::Failed));
+        assert_eq!(
+            next_state(&task(TaskState::Done, Some(1)), &exited(true)),
+            Some(TaskState::Closed)
         );
     }
 
