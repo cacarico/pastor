@@ -86,10 +86,15 @@ pub fn backoff_for(failures: u32) -> Duration {
 }
 
 /// Why `value`, substituted from an item into `repo` or `branch`, is unsafe:
-/// it would climb or cross directories, read as an option to git or ssh, or
-/// carry control characters to the machine's shell.
+/// it would climb or cross directories, stay in the parent (an empty or `.`
+/// value, or a missing one, which renders empty), read as an option to git
+/// or ssh, or carry control characters to the machine's shell.
 fn path_value_problem(value: &str) -> Option<&'static str> {
-    if value.contains('/') || value.contains('\\') {
+    if value.is_empty() {
+        Some("is empty")
+    } else if value == "." {
+        Some("is \".\"")
+    } else if value.contains('/') || value.contains('\\') {
         Some("contains a path separator")
     } else if value.contains("..") {
         Some("contains \"..\"")
@@ -173,7 +178,8 @@ fn check_rendered(field: &str, template: &str, rendered: &str) -> Result<(), Str
 
 /// Render prompt, repo and branch for one task. A placeholder with no value
 /// renders empty and is logged: an item that failed to render would stay
-/// unseen and fail again every run.
+/// unseen and fail again every run. In `repo` and `branch` an empty value is
+/// refused instead (see `path_value_problem`).
 pub fn render_task(job: &Job, item: &Value, id: i64) -> Result<(String, DispatchSpec), String> {
     let ctx = |item: Value| {
         serde_json::json!({
@@ -1955,6 +1961,8 @@ mod tests {
             ("repo", "a/b"),
             ("repo", "a\\b"),
             ("repo", ".."),
+            ("repo", "."),
+            ("repo", ""),
             ("key", "-oProxyCommand=x"),
             ("key", "x\ny"),
             ("key", "bell\u{7}"),
@@ -1968,6 +1976,15 @@ mod tests {
                 "{value:?}: {err}"
             );
         }
+        // A missing value renders empty, which would point `repo` at
+        // `~/work` itself: it is refused like an empty one.
+        let mut item = ok.clone();
+        item.as_object_mut().unwrap().remove("repo");
+        let err = render_task(&j, &item, 1).unwrap_err();
+        assert!(
+            err.contains("repo") && err.contains("item.repo") && err.contains("empty"),
+            "{err}"
+        );
         // The prompt is free text: anything goes there.
         let mut item = ok.clone();
         item["title"] = json!("../../etc\n-rf");
@@ -1996,40 +2013,38 @@ mod tests {
         );
     }
 
-    /// Each value can pass on its own and still assemble into something
-    /// unsafe: `.` next to `.` is `..`, and an empty value in front of a `/`
-    /// makes the path absolute. The rendered path is checked too, but only
-    /// where placeholders put text; the job's literal text is trusted.
+    /// Values can assemble into something unsafe: `.` next to `.` is `..`,
+    /// and an empty value in front of a `/` makes the path absolute. Empty
+    /// and `.` values are refused one by one now, so the check of the whole
+    /// rendered path is a second line; it looks only where placeholders put
+    /// text, since the job's literal text is trusted.
     #[test]
     fn render_task_rejects_unsafe_paths_assembled_from_several_values() {
         let item = json!({"a": ".", "b": ".", "owner": "cacarico", "repo": "pastor", "empty": ""});
-        for (repo, why) in [
-            ("{{ item.a }}{{ item.b }}", "\"..\""),
-            ("~/work/{{ item.a }}{{ item.b }}/x", "\"..\""),
-            ("{{ item.empty }}/etc", "absolute"),
-            ("{{ item.empty }}~/x", "absolute"),
+        for (repo, rendered, why) in [
+            ("{{ item.a }}{{ item.b }}", "..", "\"..\""),
+            ("~/work/{{ item.a }}{{ item.b }}/x", "~/work/../x", "\"..\""),
+            ("{{ item.empty }}/etc", "/etc", "absolute"),
+            ("{{ item.empty }}~/x", "~/x", "absolute"),
         ] {
             let mut j = job("j");
             j.spec.repo = Some(repo.into());
             let err = render_task(&j, &item, 1).unwrap_err();
-            assert!(
-                err.starts_with("repo:") && err.contains(why),
-                "{repo}: {err}"
-            );
+            assert!(err.starts_with("repo:"), "{repo}: {err}");
             assert_eq!(check_item_paths(&j, &item).unwrap_err(), err, "{repo}");
+            let problem = rendered_path_problem(repo, rendered).unwrap();
+            assert!(problem.contains(why), "{repo}: {problem}");
         }
         let mut j = job("j");
         j.spec.branch = Some("pastor/{{ item.a }}{{ item.b }}".into());
         let err = render_task(&j, &item, 1).unwrap_err();
-        assert!(
-            err.starts_with("branch:") && err.contains("\"..\""),
-            "{err}"
-        );
+        assert!(err.starts_with("branch:"), "{err}");
 
         // A `..` in one of two values is still caught, by the per-value check.
         let mut j = job("j");
         j.spec.repo = Some("{{ item.a }}/{{ item.b }}".into());
         let mut bad = item.clone();
+        bad["a"] = json!("x");
         bad["b"] = json!("..");
         let err = render_task(&j, &bad, 1).unwrap_err();
         assert!(err.contains("item.b") && err.contains("\"..\""), "{err}");

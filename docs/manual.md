@@ -124,7 +124,11 @@ and `branch` with `{{ item.* }}`, `{{ job.name }}` and `{{ task.id }}`, and
 queues one task per new item up to `max_tasks_per_run`. The rest stay unseen
 for the next run. Item text comes from outside, so an item's control
 characters, other than newline and tab, are dropped before its values go
-into the prompt, which is typed into the agent's terminal. A job never overlaps itself; `pastor job run <name>` fires
+into the prompt, which is typed into the agent's terminal. An item value put
+into `repo` or `branch` must be one plain path component: not empty (a missing
+field renders empty), not `.` or `..`, no `/` or `\`, no leading `-` and no
+control characters. An item that breaks this is skipped and shown in the job's
+last result; the job's cursor still moves. A job never overlaps itself; `pastor job run <name>` fires
 one regardless, and it starts once a run already going has finished. `every = "5m"` or `cron = "*/5 9-18 * * 1-5"` (local time)
 says when. The built-in connector is `clock`, one item per run keyed by the
 run time; any other is an installed connector (see Connectors), and a job
@@ -859,8 +863,8 @@ come up, so a missing program or a broken `.env` fails that first run.
 A stream lives in `pastor serve`: `pastor tick` with no daemon running is a
 one-pass process that would kill the stream on exit, so it reports a stream
 job as failed, saying it needs `pastor serve`, and leaves it alone. Item fields that a job puts into
-`repo` or `branch` may not contain `/`, `\`, `..`, a leading `-` or control
-characters; such an item is skipped and reported.
+`repo` or `branch` may not be empty or `.`, or contain `/`, `\`, `..`, a
+leading `-` or control characters; such an item is skipped and reported.
 
 ### Event hooks
 
