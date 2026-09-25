@@ -29,6 +29,17 @@ struct TimedOut(&'static str, Duration);
 #[error("the agent is {0:?}, not idle")]
 struct NotIdle(AgentStatus);
 
+/// The pane a task recorded holds an agent under another name: herdr handed
+/// the pane id out again after the task's own pane closed. Not the task's pane
+/// any more, so nothing of it is closed.
+#[derive(Debug, thiserror::Error)]
+#[error("pane {pane} now holds agent {agent:?}, not {expected}")]
+struct PaneReused {
+    pane: String,
+    agent: Option<String>,
+    expected: String,
+}
+
 /// Whether an error from the connected loop means the machine is gone. Only a
 /// transport failure or a request that never answered does; a herdr API error
 /// or a local store error leaves the machine reachable, and reporting it as
@@ -1115,10 +1126,36 @@ impl Actor {
         // recorded can still be removed by even after the row is closed.
         // Otherwise (closed, no ids, no row) whatever agent still carries
         // the task's name.
-        let recorded = row
+        let mut recorded = row
             .as_ref()
             .filter(|t| t.state != TaskState::Closed || remove_worktree)
             .and_then(|t| t.pane_id.clone().map(|p| (p, t.workspace_id.clone())));
+        // herdr hands a pane id out again once the pane closes, and its
+        // workspace id with it. A recorded pane that now holds an agent under
+        // another name is someone else's: closing it or removing its workspace
+        // would take their work. An empty pane is still the task's (the failed
+        // `agent.start` above). Auto-close leaves the row as it is; `task
+        // close` looks for the task's agent by name instead, which is gone, so
+        // it closes the row alone.
+        let expected = row
+            .as_ref()
+            .and_then(|t| t.agent_name.clone())
+            .unwrap_or_else(|| name.clone());
+        if let Some((pane, _)) = &recorded
+            && let Some(agent) = agents.iter().find(|a| &a.pane_id == pane)
+            && agent.name.as_deref() != Some(expected.as_str())
+        {
+            let reused = PaneReused {
+                pane: pane.clone(),
+                agent: agent.name.clone(),
+                expected,
+            };
+            if by == CloseBy::AutoClose {
+                return Err(reused.into());
+            }
+            tracing::debug!(machine = %self.name, task = %name, %reused, "not closing a reused pane");
+            recorded = None;
+        }
         let target = recorded.or_else(|| {
             agents
                 .iter()
@@ -1331,6 +1368,9 @@ impl Actor {
                 Err(err) if dead => return Err(err),
                 Err(err) if err.is::<NotIdle>() => {
                     tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed: the agent went back to work");
+                }
+                Err(err) if err.is::<PaneReused>() => {
+                    tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed: its pane holds another agent now");
                 }
                 Err(err) => {
                     tracing::warn!(machine = %self.name, task = %t.display_id(), err = format!("{err:#}"), "auto-close failed; trying again at the next reconcile");
@@ -2854,6 +2894,34 @@ mod tests {
         assert!(err.to_string().contains("not found"), "{err}");
     }
 
+    /// `task close` has the same guard: a failed task whose recorded pane now
+    /// holds another agent closes its row and leaves that pane and its
+    /// workspace alone.
+    #[tokio::test]
+    async fn close_leaves_a_pane_reused_by_another_agent() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut failed = worktree_task(&store);
+        let other = start_agent(&fake, "t-99").await;
+        failed.state = TaskState::Failed;
+        failed.machine = Some("m".into());
+        failed.workspace_id = Some(other.split(':').next().unwrap().into());
+        failed.pane_id = Some(other.clone());
+        failed.agent_name = Some(Task::agent_name_for(failed.id));
+        failed.finished_at = Some(Utc::now());
+        store.update_task(&mut failed).unwrap();
+        let (h, _events) = connected(&fake, &store).await;
+
+        let err = h.close(failed.id, true).await.unwrap_err();
+        assert!(err.to_string().contains("git worktree remove"), "{err}");
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        let closed = h.close(failed.id, false).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert_eq!(fake.agents().len(), 1);
+        assert_eq!(fake.agents()[0].pane_id, other);
+    }
+
     /// A dispatch that fails at `agent.start` records the workspace and pane
     /// and leaves them open with no agent in them. Close must use those ids:
     /// looking for an agent by name finds nothing and would leak the pane,
@@ -3284,6 +3352,40 @@ mod tests {
         let closed = store.get_task(t.id).unwrap().unwrap();
         assert!(closed.error.is_none(), "{:?}", closed.error);
         assert_eq!(count(&mut events, "task.closed", t.id).len(), 1);
+    }
+
+    /// herdr hands out pane ids again: the pane a done task recorded now holds
+    /// another agent, idle. Auto-close must neither close that pane nor remove
+    /// its workspace, since pastor never closes a pane it did not open for the
+    /// task. The row is left `Done`, for reconcile to move on.
+    #[tokio::test]
+    async fn auto_close_skips_a_pane_reused_by_another_agent() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut t = worktree_task(&store);
+        let other = start_agent(&fake, "t-99").await;
+        fake.set_status_silently(&other, AgentStatus::Idle);
+        t.state = TaskState::Done;
+        t.machine = Some("m".into());
+        t.workspace_id = Some(other.split(':').next().unwrap().into());
+        t.pane_id = Some(other.clone());
+        t.agent_name = Some(Task::agent_name_for(t.id));
+        t.last_completion_seq = Some(fake.agents()[0].state_change_seq);
+        t.finished_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.update_task(&mut t).unwrap();
+        let (h, mut events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let before = lists(&fake);
+        wait_for("a few reconciles", || lists(&fake) >= before + 4).await;
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
+        assert_eq!(fake.agents().len(), 1);
+        assert_eq!(fake.agents()[0].pane_id, other);
+        assert!(count(&mut events, "task.closed", t.id).is_empty());
     }
 
     /// A done task, past its grace period, whose agent is idle in herdr but
