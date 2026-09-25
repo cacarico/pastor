@@ -590,8 +590,9 @@ records and in the reason a failed run reports, the value of every declared
 secret is replaced by `[redacted:NAME]` (a value shorter than four characters
 is left alone, since hiding it would mangle the log and protect nothing). Redaction works line by line, so a
 declared secret may not contain a line break (a double-quoted `\n`): pastor
-refuses such a `.env` and names the variable. Each log is cut at 256 KiB and
-the newest 20 per job are kept. A stdout or stderr line longer than 256 KiB is
+refuses such a `.env` and names the variable. Each log is cut at 256 KiB, and
+each run directory keeps its newest 20: `runs/<job>/` for a job's connector
+runs, and `runs/@<id>/` for all of a plugin's hook runs together. A stdout or stderr line longer than 256 KiB is
 cut there and the rest of it dropped.
 
 ### Plugin commands
