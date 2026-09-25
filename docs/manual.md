@@ -272,7 +272,9 @@ These commands edit `flock.toml` in place: comments, order and layout that
 the edit does not touch stay as they were, and a running head picks the
 change up at once, as it does for `machine add|remove`. The first `flock add`
 on a file with no `[[flock]]` entry writes the implicit flock down as
-`default` first. `flock default` writes the old default flock onto every
+`default` first, and the machines stay in it; with `--default` the new flock
+takes the implicit one's place instead, and the machines that name no flock
+move to it. `flock add` says which flock those machines are in afterwards. `flock default` writes the old default flock onto every
 machine that named none, so changing where new work goes moves no machine.
 AGENTS in `flock list` needs a running head and is `-` without one.
 

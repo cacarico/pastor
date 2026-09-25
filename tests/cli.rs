@@ -2125,7 +2125,11 @@ fn flock_commands_edit_the_file_and_keep_its_comments() {
             .unwrap()
     };
     let file = || std::fs::read_to_string(config.join("flock.toml")).unwrap();
-    ok(run(&["flock", "add", "work"]));
+    let out = ok(run(&["flock", "add", "work"]));
+    assert!(
+        out.starts_with("added flock work; machine pi-1 stays in flock default;"),
+        "{out}"
+    );
     let text = file();
     assert!(text.starts_with("# the fleet\n"), "{text}");
     assert!(text.contains("name = \"pi-1\"   # desk"), "{text}");
@@ -2186,7 +2190,11 @@ fn flock_commands_edit_the_file_and_keep_its_comments() {
     );
 
     // A new default takes new work; the machines stay where they were.
-    ok(run(&["flock", "add", "play", "--default"]));
+    let out = ok(run(&["flock", "add", "play", "--default"]));
+    assert!(
+        out.starts_with("added flock play, now the default; machine pi-1 stays in flock default;"),
+        "{out}"
+    );
     let list: serde_json::Value =
         serde_json::from_str(&ok(run(&["flock", "list", "--json"]))).unwrap();
     assert_eq!(list[1]["name"], "play");
@@ -2198,6 +2206,40 @@ fn flock_commands_edit_the_file_and_keep_its_comments() {
         "unknown_flock"
     );
     assert!(file().contains("# desk"), "{}", file());
+}
+
+/// The first flock added as the default takes the machines that name no
+/// flock along, and says so; no empty `default` flock is left behind.
+#[test]
+fn a_first_default_flock_takes_the_machines_along() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"pi-1\"\nlocal = true\n\n[[machine]]\nname = \"pi-2\"\nlocal = true\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let out = ok(run(&["flock", "add", "personal", "--default"]));
+    assert!(
+        out.starts_with("added flock personal, now the default; machines pi-1, pi-2 moved to it;"),
+        "{out}"
+    );
+    let list: serde_json::Value =
+        serde_json::from_str(&ok(run(&["flock", "list", "--json"]))).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list[0]["name"], "personal");
+    assert_eq!(list[0]["default"], true);
+    assert_eq!(list[0]["machines"], serde_json::json!(["pi-1", "pi-2"]));
 }
 
 /// `task run --flock` against a running head: the task waits for a machine

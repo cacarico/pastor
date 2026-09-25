@@ -1048,12 +1048,27 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
     let done = match cmd {
         FlockCmd::List { json } => return flock_list(paths, json, head).await,
         FlockCmd::Add { name, default } => {
-            edit(&|d| d.add_flock(&name, default))?;
-            if default {
+            let mut doc = FlockDoc::open(&path)?;
+            let added = doc.add_flock(&name, default).map_err(edit_error)?;
+            doc.save(&path)?;
+            let mut done = if default {
                 format!("added flock {name}, now the default")
             } else {
                 format!("added flock {name}")
+            };
+            if !added.machines.is_empty() {
+                let (noun, verb) = match added.machines.len() {
+                    1 => ("machine", "stays"),
+                    _ => ("machines", "stay"),
+                };
+                let machines = added.machines.join(", ");
+                if added.moved {
+                    done += &format!("; {noun} {machines} moved to it");
+                } else {
+                    done += &format!("; {noun} {machines} {verb} in flock {}", added.flock);
+                }
             }
+            done
         }
         FlockCmd::Remove { name } => {
             // With a head, the head checks and edits under the lock `task
