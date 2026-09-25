@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::MIN_HERDR_PROTOCOL;
 use crate::dispatch::dispatch;
@@ -179,6 +179,15 @@ pub struct OrphanClosed {
     pub machine: String,
 }
 
+/// The machine's actor was stopped (a flock reload removed or replaced the
+/// machine) before it answered. An aborted actor stuck in a poll never reads
+/// its queue again, so a request fails with this instead of waiting for it.
+#[derive(Debug, thiserror::Error)]
+#[error("machine {machine} is shutting down; try again later")]
+pub struct ActorStopped {
+    pub machine: String,
+}
+
 #[derive(Clone)]
 pub struct MachineHandle {
     pub name: String,
@@ -200,6 +209,10 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 /// stop: until it has ended it can still write a row.
 pub struct ActorTask {
     abort: tokio::task::AbortHandle,
+    /// Set by `shutdown` before it aborts. Requests wait on it next to their
+    /// reply: an aborted actor stuck in a poll never drops its queue, so its
+    /// replies would otherwise never come.
+    stopping: watch::Sender<bool>,
     /// `None` once a `shutdown` has seen the task end. A tokio mutex, held
     /// across the wait, so a second caller waits too instead of guessing.
     join: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -224,14 +237,15 @@ impl MachineHandle {
     /// retargeted machine never has two actors racing on its tasks.
     ///
     /// Nothing on the machine is touched: agents keep running, rows keep their
-    /// state, and a replacement actor reconciles them. A request in flight
-    /// answers "dropped the request". Waits at most `SHUTDOWN_WAIT`; if the
+    /// state, and a replacement actor reconciles them. A request in flight,
+    /// or sent from now on, fails with `ActorStopped`. Waits at most `SHUTDOWN_WAIT`; if the
     /// task has not ended by then it warns and returns `StillRunning`, and
     /// keeps the task so a later call can wait for it again.
     pub async fn shutdown(&self) -> ShutdownOutcome {
         let Some(task) = &self.task else {
             return ShutdownOutcome::Finished;
         };
+        task.stopping.send_replace(true);
         task.abort.abort();
         let mut join = task.join.lock().await;
         let Some(handle) = join.as_mut() else {
@@ -269,40 +283,61 @@ impl MachineHandle {
 
     pub async fn dispatch(&self, task_id: i64) -> anyhow::Result<Task> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(MachineCommand::Dispatch { task_id, reply })
+        self.request(MachineCommand::Dispatch { task_id, reply }, rx)
             .await
-            .map_err(|_| anyhow::anyhow!("machine {} is gone", self.name))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("machine {} dropped the request", self.name))?
     }
 
     pub async fn close(&self, task_id: i64, remove_worktree: bool) -> anyhow::Result<Task> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(MachineCommand::Close {
-                task_id,
-                remove_worktree,
-                reply,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("machine {} is gone", self.name))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("machine {} dropped the request", self.name))?
+        let cmd = MachineCommand::Close {
+            task_id,
+            remove_worktree,
+            reply,
+        };
+        self.request(cmd, rx).await
     }
 
     pub async fn read(&self, task_id: i64, lines: u32) -> anyhow::Result<String> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(MachineCommand::Read {
-                task_id,
-                lines,
-                reply,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("machine {} is gone", self.name))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("machine {} dropped the request", self.name))?
+        let cmd = MachineCommand::Read {
+            task_id,
+            lines,
+            reply,
+        };
+        self.request(cmd, rx).await
+    }
+
+    /// Send `cmd` and wait for its reply, or fail with `ActorStopped` once
+    /// `shutdown` has begun. An aborted actor stuck in a poll neither reads
+    /// the queue nor drops it, so without this a request sent just before
+    /// the abort would wait for the caller's own timeout.
+    async fn request<T>(
+        &self,
+        cmd: MachineCommand,
+        rx: oneshot::Receiver<anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        let exchange = async {
+            self.tx
+                .send(cmd)
+                .await
+                .map_err(|_| anyhow::anyhow!("machine {} is gone", self.name))?;
+            rx.await
+                .map_err(|_| anyhow::anyhow!("machine {} dropped the request", self.name))?
+        };
+        let Some(task) = &self.task else {
+            return exchange.await;
+        };
+        let mut stopping = task.stopping.subscribe();
+        // `biased`, exchange first: an actor that has ended answers "is gone"
+        // or "dropped the request" at once, as before.
+        tokio::select! {
+            biased;
+            res = exchange => res,
+            _ = stopping.wait_for(|s| *s) => Err(ActorStopped {
+                machine: self.name.clone(),
+            }
+            .into()),
+        }
     }
 }
 
@@ -354,6 +389,7 @@ pub fn spawn_machine(
         status,
         task: Some(Arc::new(ActorTask {
             abort: task.abort_handle(),
+            stopping: watch::Sender::new(false),
             join: tokio::sync::Mutex::new(Some(task)),
         })),
     }
@@ -1871,6 +1907,46 @@ mod tests {
         assert!(h.actor_finished());
         assert!(h.tx.is_closed());
         assert_eq!(h.shutdown().await, ShutdownOutcome::Finished, "idempotent");
+    }
+
+    /// A request already queued on an actor that is then aborted but stays
+    /// stuck in a poll must not wait for that actor: nothing will ever read
+    /// it. It fails as soon as the shutdown starts, and so does one sent
+    /// afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_on_a_stopped_actor_fails_promptly() {
+        let fake = FakeHerdr::new();
+        fake.wedge_connects(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        // Unwedged even when an assert fails, or the runtime never shuts down.
+        struct Unwedge(FakeHerdr);
+        impl Drop for Unwedge {
+            fn drop(&mut self) {
+                self.0.wedge_connects(false);
+            }
+        }
+        let _unwedge = Unwedge(fake.clone());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("actor wedged in connect", || fake.wedged() == 1).await;
+
+        let queued = tokio::spawn({
+            let h = h.clone();
+            async move { h.read(1, 10).await }
+        });
+        wait_for("read queued", || h.tx.capacity() < h.tx.max_capacity()).await;
+        assert_eq!(h.shutdown().await, ShutdownOutcome::StillRunning);
+        let err = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("a queued request fails once the actor is stopped")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.downcast_ref::<ActorStopped>().is_some(), "{err:#}");
+
+        let err = tokio::time::timeout(Duration::from_secs(1), h.close(1, false))
+            .await
+            .expect("a request after the stop fails at once")
+            .unwrap_err();
+        assert!(err.downcast_ref::<ActorStopped>().is_some(), "{err:#}");
     }
 
     #[test]

@@ -10,7 +10,8 @@ use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
 use crate::machine::{
-    MachineHandle, MachineSettings, OrphanClosed, PastorEvent, ShutdownOutcome, spawn_machine,
+    ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, ShutdownOutcome,
+    spawn_machine,
 };
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{NewTask, RetryError, Store, TaskFilter};
@@ -278,6 +279,24 @@ impl Fleet {
             });
         }
         let gone = old;
+        // Published before any actor is aborted, under the lock readers take,
+        // so a request that checks `shutting_down` from now on is refused
+        // instead of queued on an actor that will never answer. One that got
+        // past the check just before fails with `ActorStopped` once
+        // `shutdown` starts.
+        let stopping: Vec<String> = plan
+            .iter()
+            .filter_map(|s| match s {
+                Step::Replace(o) => Some(o.handle.name.clone()),
+                _ => None,
+            })
+            .chain(gone.iter().map(|o| o.handle.name.clone()))
+            .collect();
+        for m in self.members.write().unwrap().iter_mut() {
+            if stopping.contains(&m.handle.name) {
+                m.shutting_down = true;
+            }
+        }
         let mut members: Vec<Member> = Vec::new();
         for (step, m) in plan.into_iter().zip(&flock.machines) {
             members.push(match step {
@@ -733,6 +752,9 @@ impl Daemon {
                 }
                 match handle.read(id, lines).await {
                     Ok(text) => IpcResponse::Text(text),
+                    Err(err) if err.downcast_ref::<ActorStopped>().is_some() => {
+                        IpcResponse::error("machine_shutting_down", err)
+                    }
                     Err(err) => IpcResponse::error("read_failed", err),
                 }
             }
@@ -848,7 +870,7 @@ impl Daemon {
                     IpcResponse::Text(err.to_string())
                 }
                 Ok(t) => IpcResponse::Task(t),
-                Err(err) => IpcResponse::error("close_failed", format!("{err:#}")),
+                Err(err) => stopped_or(err, "close_failed"),
             };
         };
         self.close_row(t, remove_worktree).await
@@ -953,9 +975,18 @@ impl Daemon {
         }
         match handle.close(id, remove_worktree).await {
             Ok(t) => IpcResponse::Task(t),
-            Err(err) => IpcResponse::error("close_failed", format!("{err:#}")),
+            Err(err) => stopped_or(err, "close_failed"),
         }
     }
+}
+
+/// A request that lost the race with a reload stopping its machine's actor
+/// answers like one refused up front; any other failure keeps `code`.
+fn stopped_or(err: anyhow::Error, code: &str) -> IpcResponse {
+    if let Some(stopped) = err.downcast_ref::<ActorStopped>() {
+        return IpcResponse::error("machine_shutting_down", stopped);
+    }
+    IpcResponse::error(code, format!("{err:#}"))
 }
 
 pub async fn serve(paths: Paths) -> anyhow::Result<()> {
@@ -2084,6 +2115,24 @@ mod tests {
     /// then taken out of the flock (`keep_b` false) or retargeted (true), so
     /// `b` is shutting down. Needs a multi-thread runtime.
     async fn daemon_with_b_shutting_down(keep_b: bool) -> (Daemon, tempfile::TempDir, Unwedge) {
+        let (d, tmp, unwedge) = daemon_with_b_wedged().await;
+        let next = if keep_b {
+            flock_of(&[("a", 2), ("b", 3)])
+        } else {
+            flock_of(&[("a", 2)])
+        };
+        let diff = d
+            .fleet()
+            .apply_flock(&next, &machine_settings(&test_config()))
+            .await;
+        assert_eq!(diff.shutting_down, vec!["b".to_string()], "{diff:?}");
+        assert!(d.fleet().get("b").is_some(), "still held while it stops");
+        (d, tmp, unwedge)
+    }
+
+    /// A daemon running `a`, and `b` whose actor is stuck in connect. Needs a
+    /// multi-thread runtime.
+    async fn daemon_with_b_wedged() -> (Daemon, tempfile::TempDir, Unwedge) {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let flock = flock_of(&[("a", 2)]);
@@ -2115,15 +2164,39 @@ mod tests {
             assert!(Instant::now() < deadline, "actor never reached connect");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let next = if keep_b {
-            flock_of(&[("a", 2), ("b", 3)])
-        } else {
-            flock
-        };
-        let diff = d.fleet().apply_flock(&next, &settings).await;
-        assert_eq!(diff.shutting_down, vec!["b".to_string()], "{diff:?}");
-        assert!(d.fleet().get("b").is_some(), "still held while it stops");
         (d, tmp, unwedge)
+    }
+
+    /// While a reload is still waiting for a removed machine's actor to end,
+    /// a read of a task on that machine is refused at once: the actor was
+    /// aborted and will never answer, so the read must not wait for the IPC
+    /// timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reading_a_task_on_a_machine_being_removed_fails_at_once() {
+        let (d, _tmp, _unwedge) = daemon_with_b_wedged().await;
+        let mut t = insert(&d, TaskState::Running);
+        t.machine = Some("b".into());
+        d.store.update_task(&mut t).unwrap();
+        let fleet = d.fleet();
+        let settings = machine_settings(&test_config());
+        let reload =
+            tokio::spawn(async move { fleet.apply_flock(&flock_of(&[("a", 2)]), &settings).await });
+        // `apply_flock` waits up to `SHUTDOWN_WAIT` (2s) for b's actor; read
+        // well inside that window.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!reload.is_finished(), "still waiting for b's actor");
+        let resp = tokio::time::timeout(
+            Duration::from_secs(1),
+            d.handle(IpcRequest::TaskRead {
+                id: t.id,
+                lines: 10,
+            }),
+        )
+        .await
+        .expect("the read does not wait on an aborted actor");
+        assert_eq!(error_code(resp), "machine_shutting_down");
+        let diff = reload.await.unwrap();
+        assert_eq!(diff.shutting_down, vec!["b".to_string()], "{diff:?}");
     }
 
     /// A task on a removed machine held only while its old actor ends is
