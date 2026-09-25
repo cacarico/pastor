@@ -448,6 +448,12 @@ fn print_task(t: &Task, json: bool) {
 /// `Some(Ok(n))` for the normal case. A machine that answered the ping is
 /// `probed`; anything wrong past that (old protocol, agent.list failing) goes
 /// in the error, and a failed agent.list never reads as zero agents.
+///
+/// A failed connect/ping is classified the same three ways the removed
+/// `machine_status_row` used: `server down` when the connect error's own
+/// message names `herdr.sock` (a `Local` endpoint with nothing listening),
+/// `unreachable` for any other transport failure, and `error` otherwise. The
+/// message is kept in the error field regardless.
 type ProbeFields = (
     &'static str,
     Option<String>,
@@ -472,7 +478,17 @@ fn probe_fields(
             };
             ("probed", Some(p.version), Some(p.protocol), agents, error)
         }
-        Err(e) => ("unreachable", None, None, None, Some(e.to_string())),
+        Err(e) => {
+            let message = e.to_string();
+            let channel = if message.contains("herdr.sock") {
+                "server down"
+            } else if e.is_transport() {
+                "unreachable"
+            } else {
+                "error"
+            };
+            (channel, None, None, None, Some(message))
+        }
     }
 }
 
@@ -1286,6 +1302,35 @@ mod tests {
         assert_eq!(protocol, None);
         assert_eq!(agents, None);
         assert!(error.is_some());
+    }
+
+    /// A `Local` endpoint's own connect error names its `herdr.sock`, the way
+    /// `connect` in `herdr/transport.rs` formats it; that reads as `server
+    /// down`, not the generic `unreachable` a network failure gets.
+    /// `tests/cli.rs`'s `machine_list_without_daemon_reads_a_local_machine_with_no_server_as_down`
+    /// covers the same case end to end.
+    #[test]
+    fn a_local_connect_failure_naming_its_socket_reads_as_server_down() {
+        let err = pastor::herdr::CallError::from(pastor::herdr::ConnectError {
+            message: "connect /home/fake/.config/herdr/herdr.sock: connection refused".into(),
+        });
+        let (channel, _, _, _, error) = probe_fields(Err(err), None);
+        assert_eq!(channel, "server down");
+        assert!(error.unwrap().contains("herdr.sock"));
+    }
+
+    /// A ping that fails without being a transport failure (herdr answered
+    /// with an API error rather than the connection dying) is `error`, not
+    /// `unreachable`.
+    #[test]
+    fn a_non_transport_ping_failure_reads_as_error() {
+        let err = pastor::herdr::CallError::from(pastor::herdr::HerdrError::Api {
+            code: "internal_error".into(),
+            message: "boom".into(),
+        });
+        let (channel, _, _, _, error) = probe_fields(Err(err), None);
+        assert_eq!(channel, "error");
+        assert!(error.unwrap().contains("boom"));
     }
 
     #[test]

@@ -1268,3 +1268,59 @@ fn machine_list_without_daemon_probes_each_machine() {
         .unwrap_or_else(|e| panic!("stderr is not one JSON value ({e})"));
     assert!(err["code"].is_string(), "{err}");
 }
+
+/// A `--local` machine with no herdr listening fails to connect with a message
+/// naming its own `herdr.sock`, which `probe_fields` reads as `server down`
+/// rather than the generic `unreachable` a network-level failure gets.
+/// `XDG_CONFIG_HOME` points `local_socket_path` at a directory with nothing
+/// listening, so the connect fails the same way it would on a machine that has
+/// never run `herdr server`.
+#[test]
+fn machine_list_without_daemon_reads_a_local_machine_with_no_server_as_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    let xdg = tmp.path().join("xdg");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"loopback\"\nlocal = true\nsession = \"default\"\nmax_agents = 1\n",
+    )
+    .unwrap();
+
+    let out = pastor()
+        .args(["machine", "list"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<Vec<&str>> = stdout
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(lines[2][..2], ["loopback", "local"], "{stdout}");
+    // "server down" has a space, so it lands split across two columns.
+    assert_eq!(lines[2][2..4], ["server", "down"], "{stdout}");
+
+    let out = pastor()
+        .args(["machine", "list", "--json"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ms = v["machines"].as_array().unwrap();
+    assert_eq!(ms.len(), 1, "{v}");
+    assert_eq!(ms[0]["channel"], "server down", "{v}");
+    let error = ms[0]["error"].as_str().expect("error string");
+    assert!(error.contains("herdr.sock"), "{error}");
+}
