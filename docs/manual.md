@@ -265,7 +265,9 @@ its run before the connector is asked for anything, with the reason in
 (`unknown_flock`) once that flock has been removed. A head
 started from a pastor before flocks would ignore `--flock`, so `task run` and
 `task list` refuse it there (`head_too_old`): restart `pastor serve` after an
-upgrade.
+upgrade. It would also reload `flock.toml` and ignore the flocks in it, so
+`flock add|default|remove` and `machine add|move` refuse to edit the file
+while such a head runs.
 
 `pastor machine move` changes the flock of tasks dispatched after it; tasks
 already on the machine keep running there, and its connection stays up. A

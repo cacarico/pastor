@@ -358,6 +358,16 @@ async fn require_flock_head(paths: &Paths) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Before a flock.toml edit that changes which flock a machine is in, when a
+/// head runs: the reload after it would reach a head from before flocks,
+/// which reads every machine as one flock and dispatches across the edit.
+async fn require_flock_head_if_running(paths: &Paths) -> anyhow::Result<()> {
+    if daemon_running(&paths.socket_file()).await {
+        require_flock_head(paths).await?;
+    }
+    Ok(())
+}
+
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     let config = PastorConfig::load(&paths.config_file())?;
     let spec = run_spec(&a, &config)?;
@@ -797,6 +807,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
             flock,
             herdr,
         } => {
+            require_flock_head_if_running(paths).await?;
             let mut doc = FlockDoc::open(&path)?;
             let m = MachineConfig {
                 name: name.clone(),
@@ -881,6 +892,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
             }
         }
         MachineCmd::Move { name, flock } => {
+            require_flock_head_if_running(paths).await?;
             let mut doc = FlockDoc::open(&path)?;
             doc.move_machine(&name, &flock).map_err(edit_error)?;
             doc.save(&path)?;
@@ -909,6 +921,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
     let done = match cmd {
         FlockCmd::List { json } => return flock_list(paths, json).await,
         FlockCmd::Add { name, default } => {
+            require_flock_head_if_running(paths).await?;
             edit(&|d| d.add_flock(&name, default))?;
             if default {
                 format!("added flock {name}, now the default")
@@ -941,6 +954,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
             format!("removed flock {name}")
         }
         FlockCmd::Default { name } => {
+            require_flock_head_if_running(paths).await?;
             edit(&|d| d.set_default(&name))?;
             format!("{name} is the default flock; machines stay in their flocks")
         }

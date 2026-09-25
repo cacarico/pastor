@@ -1448,7 +1448,8 @@ fn machine_list_without_daemon_shows_a_local_machine_s_pastor_version() {
 /// (serde skips unknown fields) and would queue the task in any flock. The
 /// CLI asks the head's IPC protocol first and refuses `--flock` on an old
 /// one, before anything is queued; `task list --flock` likewise, since an
-/// old head would list every flock's tasks.
+/// old head would list every flock's tasks. Flock edits to flock.toml are
+/// refused too, since the old head would reload them as one flock.
 #[test]
 fn flock_flags_refuse_a_head_from_before_flocks() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1492,6 +1493,23 @@ fn flock_flags_refuse_a_head_from_before_flocks() {
         error_code(&run(&["task", "list", "--flock", "work"])),
         "head_too_old"
     );
+
+    // Copilot 4106204671: flock.toml edits the old head would reload but not
+    // honour (it reads every machine as one flock) are refused before the
+    // file is written.
+    let flock_file = config.join("flock.toml");
+    let before = "[[machine]]\nname = \"pi-1\"\nlocal = true\n";
+    std::fs::write(&flock_file, before).unwrap();
+    for args in [
+        &["flock", "add", "work"][..],
+        &["flock", "add", "work", "--default"],
+        &["flock", "default", "default"],
+        &["machine", "add", "pi-2", "--local"],
+        &["machine", "move", "pi-1", "default"],
+    ] {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+        assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), before);
+    }
     let ops = ops.lock().unwrap();
     assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
 }
