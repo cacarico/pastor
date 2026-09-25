@@ -2028,16 +2028,100 @@ mod tests {
         );
     }
 
-    /// Every `pastor ...` command the skill shows, in inline code or a code
-    /// block, must be a real command with real long flags, so the skill
+    /// Every `pastor ...` command a skill shows, in inline code or a code
+    /// block, must be a real command with real long flags, so the skills
     /// cannot drift from the CLI. Words that are not commands end the walk
     /// (`t-12`, a quoted prompt); flags are checked on the command reached.
+    /// Every Markdown file under `skills/` counts: the reference files and
+    /// worked examples are read by agents as much as the SKILL.md itself.
     #[test]
-    fn skill_mentions_only_real_commands_and_flags() {
+    fn skills_mention_only_real_commands_and_flags() {
+        let mut files = Vec::new();
+        markdown_files(&skills_dir(), &mut files);
+        assert!(files.len() > 1, "found only {files:?}");
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let checked = check_commands(&text);
+            if file.ends_with("pastor/SKILL.md") {
+                assert!(checked > 20, "only {checked} commands found in {file:?}");
+            }
+        }
+        // The binary prints the copy it was built with; it is the same file.
+        assert!(check_commands(SKILL) > 20);
+    }
+
+    /// Each skill is loaded by its frontmatter alone until it triggers, so a
+    /// name that does not match its directory, or a description past the
+    /// 1,024 characters Claude Code reads, breaks it without an error.
+    #[test]
+    fn skills_have_valid_frontmatter() {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(skills_dir()).unwrap() {
+            let dir = entry.unwrap().path();
+            let text = std::fs::read_to_string(dir.join("SKILL.md"))
+                .unwrap_or_else(|e| panic!("{dir:?}: {e}"));
+            let front = text
+                .strip_prefix("---\n")
+                .and_then(|rest| rest.split_once("\n---\n"))
+                .unwrap_or_else(|| panic!("{dir:?}: no frontmatter"))
+                .0;
+            let field = |key: &str| {
+                front
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+                    .map(|v| v.trim_matches('"').to_string())
+                    .unwrap_or_else(|| panic!("{dir:?}: no {key}"))
+            };
+            let name = field("name");
+            assert_eq!(Some(name.as_str()), dir.file_name().unwrap().to_str());
+            let description = field("description");
+            assert!(
+                !description.is_empty() && description.len() <= 1024,
+                "{dir:?}: description is {} characters",
+                description.len()
+            );
+            assert!(text.lines().count() < 500, "{dir:?}: SKILL.md too long");
+            names.push(name);
+        }
+        names.sort();
+        assert_eq!(names, ["pastor", "spec"]);
+    }
+
+    /// The repository installs as a Claude Code plugin named `pastor`, which
+    /// is what makes the skills `/pastor:spec` and friends.
+    #[test]
+    fn plugin_manifest_names_the_plugin_pastor() {
+        let path = skills_dir()
+            .parent()
+            .unwrap()
+            .join(".claude-plugin/plugin.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(manifest["name"], "pastor", "{manifest}");
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"), "{manifest}");
+    }
+
+    fn skills_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills")
+    }
+
+    fn markdown_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                markdown_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Checks every `pastor` command in `text`; returns how many it saw.
+    fn check_commands(text: &str) -> usize {
         use clap::CommandFactory;
         let root = Cli::command();
         let mut checked = 0;
-        for code in code_spans(SKILL) {
+        for code in code_spans(text) {
             for line in code.lines() {
                 let line = line.split(" # ").next().unwrap_or(line);
                 let words: Vec<&str> = line.split_whitespace().collect();
@@ -2047,7 +2131,7 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 20, "only {checked} commands found in the skill");
+        checked
     }
 
     /// Inline code spans and fenced blocks of a Markdown text, in order.

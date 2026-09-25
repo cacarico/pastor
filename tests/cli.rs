@@ -2661,3 +2661,91 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
     std::fs::write(config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();
     ok(run(&["flock", "add", "work"]));
 }
+
+/// The spec skill's worked example is a plan whose first task must run as
+/// written: its Dispatch command goes through `pastor task run` unchanged
+/// apart from the paths. In a real repo the prompt file sits under
+/// `docs/superpowers/plans/`, and the repo is a path on the flock machine.
+#[test]
+fn spec_example_plan_runs_its_first_task() {
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/spec/example");
+    let plan = std::fs::read_dir(&example)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.extension().is_some_and(|e| e == "md") && !p.to_string_lossy().ends_with(".ledger.md")
+        })
+        .expect("an example plan");
+    let text = std::fs::read_to_string(&plan).unwrap();
+    let words = first_dispatch_command(&text);
+    assert_eq!(&words[..3], ["pastor", "task", "run"], "{words:?}");
+    let mut args: Vec<String> = words[1..].to_vec();
+    let at = args.iter().position(|w| w == "--prompt-file").unwrap() + 1;
+    let in_repo = args[at].clone();
+    let file = example.join(
+        in_repo
+            .strip_prefix("docs/superpowers/plans/")
+            .unwrap_or_else(|| panic!("prompt file {in_repo} is outside the plans dir")),
+    );
+    args[at] = file.to_string_lossy().into_owned();
+    // The fake is a `command` machine with no home for a `~` to name.
+    let at = args.iter().position(|w| w == "--repo").unwrap() + 1;
+    assert!(args[at].starts_with('~'), "{args:?}");
+    args[at] = "/tmp/pastor".to_string();
+    assert!(args.iter().any(|w| w == "--json"), "{args:?}");
+
+    let env = start();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&refs))).unwrap();
+    let prompt = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(t["prompt"], prompt.trim_end(), "{t}");
+    // The prompt owns the branch handling, so it must say where to push.
+    assert!(prompt.contains("git push origin HEAD:"), "{prompt}");
+    let last = prompt.trim_end().lines().last().unwrap();
+    assert!(last.contains("DONE"), "{prompt}");
+    env.wait_done(&format!("t-{}", t["id"]));
+}
+
+/// The first fenced block after the first `**Dispatch:**` line, joined across
+/// trailing backslashes and split into words the way sh would for the plain
+/// and single-quoted words a plan uses.
+fn first_dispatch_command(plan: &str) -> Vec<String> {
+    let after = plan
+        .split_once("**Dispatch:**")
+        .expect("a Dispatch block")
+        .1;
+    let block = after
+        .split_once("```bash\n")
+        .expect("a bash block")
+        .1
+        .split_once("```")
+        .unwrap()
+        .0;
+    let line = block.replace("\\\n", " ");
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut any = false;
+    for c in line.chars() {
+        match c {
+            '\'' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    words.push(std::mem::take(&mut word));
+                    any = false;
+                }
+            }
+            c => {
+                word.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        words.push(word);
+    }
+    words
+}
