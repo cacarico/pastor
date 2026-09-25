@@ -933,6 +933,23 @@ fn machine_status_creates_the_ssh_dir_private_before_ssh_runs() {
 /// a real `pastor serve` child (no fake-herdr machine is needed: an empty
 /// flock is enough to bind the socket), sends it SIGTERM and checks that it
 /// exits cleanly, removes its socket, and logs which signal it got.
+/// Kills `serve` and `herdr` on drop, mirroring `Env::drop` above, so a
+/// failing assertion anywhere in the test never leaves either process
+/// running.
+struct SigtermEnv {
+    serve: std::process::Child,
+    herdr: std::process::Child,
+}
+
+impl Drop for SigtermEnv {
+    fn drop(&mut self) {
+        for child in [&mut self.serve, &mut self.herdr] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[test]
 fn sigterm_shuts_the_daemon_down_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
@@ -944,7 +961,7 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
     // `command` machine backed by fake-herdr is the cheapest way to get one
     // without a real fleet.
     let socket = tmp.path().join("herdr.sock");
-    let mut herdr = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+    let herdr = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
         .arg("--listen")
         .arg(&socket)
         .stdout(Stdio::null())
@@ -962,7 +979,7 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
     .unwrap();
 
     let stderr_path = tmp.path().join("serve.stderr");
-    let mut serve = pastor()
+    let serve = pastor()
         .args(["serve"])
         .env("PASTOR_CONFIG_DIR", &config)
         .env("PASTOR_STATE_DIR", &state)
@@ -970,6 +987,7 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
         .stderr(std::fs::File::create(&stderr_path).unwrap())
         .spawn()
         .unwrap();
+    let mut env = SigtermEnv { serve, herdr };
 
     let cmd = |args: &[&str]| -> std::process::Output {
         pastor()
@@ -993,13 +1011,13 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let pid = serve.id().to_string();
+    let pid = env.serve.id().to_string();
     let killed = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
     assert!(killed.success(), "kill -TERM {pid} failed to run");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let exit = loop {
-        if let Some(status) = serve.try_wait().unwrap() {
+        if let Some(status) = env.serve.try_wait().unwrap() {
             break status;
         }
         assert!(
@@ -1021,7 +1039,4 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
         log.contains("SIGTERM"),
         "log did not mention SIGTERM: {log}"
     );
-
-    let _ = herdr.kill();
-    let _ = herdr.wait();
 }
