@@ -982,6 +982,15 @@ mod tests {
         let flock = Flock {
             machines: fakes.iter().map(|(n, max, _)| machine(n, *max)).collect(),
         };
+        // On disk too, as `serve` would have found them: a `pastor job reload`
+        // re-reads both, and a missing file would read as an empty flock and
+        // default timings.
+        flock.save(&paths.flock_file()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            toml::to_string(&test_config()).unwrap(),
+        )
+        .unwrap();
         let named: Vec<(&str, FakeHerdr)> = fakes.iter().map(|(n, _, f)| (*n, f.clone())).collect();
         let d = Daemon::start(paths, test_config(), flock, Some(factory(&named)))
             .await

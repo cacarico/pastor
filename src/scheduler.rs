@@ -13,10 +13,11 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::config::flock::Flock;
 use crate::config::job::{Job, Loaded, load_dir};
 use crate::config::{Defaults, PastorConfig, Paths};
 use crate::connector::{Builtins, Catalog, ItemSource, RunInput};
-use crate::daemon::Fleet;
+use crate::daemon::{Fleet, FlockDiff, machine_settings};
 use crate::machine::PastorEvent;
 use crate::schedule::Schedule;
 use crate::store::{JobState, Store};
@@ -566,6 +567,13 @@ pub struct Scheduler {
     /// first occurrence after this.
     first_seen: HashMap<String, DateTime<Utc>>,
     warned_queued: HashSet<i64>,
+    /// `pastor.toml` as last applied. `tick`, `defaults` and the machine
+    /// timings (`daemon::machine_settings`) all come from it.
+    config: PastorConfig,
+    /// (path, mtime, size) of `pastor.toml` and `flock.toml` as last
+    /// applied. Taken in `new`: the caller (`Daemon::start`) has just loaded
+    /// both files, so only a later edit counts as a change.
+    config_fingerprint: Option<Vec<(PathBuf, Option<SystemTime>, u64)>>,
 }
 
 impl Scheduler {
@@ -576,6 +584,7 @@ impl Scheduler {
         fleet: Arc<Fleet>,
         events: broadcast::Sender<PastorEvent>,
     ) -> Scheduler {
+        let config_fingerprint = Some(file_fingerprint(&[paths.config_file(), paths.flock_file()]));
         Scheduler {
             paths,
             defaults: config.defaults.clone(),
@@ -593,6 +602,8 @@ impl Scheduler {
             last_turn: HashMap::new(),
             first_seen: HashMap::new(),
             warned_queued: HashSet::new(),
+            config: config.clone(),
+            config_fingerprint,
         }
     }
 
@@ -655,7 +666,10 @@ impl Scheduler {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = tick.tick() => self.pass(Utc::now()).await,
+                _ = tick.tick() => {
+                    self.pass(Utc::now()).await;
+                    retime(&mut tick, self.tick);
+                }
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { return };
                     match cmd {
@@ -674,13 +688,16 @@ impl Scheduler {
                             let _ = reply.send(self.fire(&name, Utc::now()));
                         }
                         SchedulerCommand::Reload { reply } => {
-                            // Force a re-read even if the fingerprint looks
-                            // unchanged: this is the escape hatch when an edit
-                            // lands within one mtime granule, or (before the
-                            // fingerprint fix) behind a symlink.
+                            // Force a re-read of every config file even if
+                            // its fingerprint looks unchanged: this is the
+                            // escape hatch when an edit lands within one
+                            // mtime granule, or (before the fingerprint fix)
+                            // behind a symlink.
+                            self.reload_config(true).await;
                             self.force_reload();
                             self.reap().await;
                             let _ = reply.send(self.statuses(Utc::now()));
+                            retime(&mut tick, self.tick);
                         }
                         SchedulerCommand::JobList { reply } => {
                             self.reload();
@@ -765,6 +782,51 @@ impl Scheduler {
         }
         self.fingerprint = None;
         self.reload()
+    }
+
+    /// Re-read `pastor.toml` and `flock.toml` if either changed on disk (or
+    /// always, with `force`) and apply them. Machines are added, removed or
+    /// replaced in the fleet (`Fleet::apply_flock`). `tick` sets the period
+    /// from the next tick on. A change to `[defaults]` makes the job files
+    /// re-parse. A file that does not load is logged and its previous version
+    /// stays in use, the same rule as a job file. Returns `None` when nothing
+    /// changed on disk, else what the fleet did (often nothing).
+    pub async fn reload_config(&mut self, force: bool) -> Option<FlockDiff> {
+        let files = [self.paths.config_file(), self.paths.flock_file()];
+        let fp = file_fingerprint(&files);
+        if !force && self.config_fingerprint.as_ref() == Some(&fp) {
+            return None;
+        }
+        self.config_fingerprint = Some(fp);
+        match PastorConfig::load(&files[0]) {
+            Ok(config) => {
+                if config.defaults != self.config.defaults {
+                    self.defaults = config.defaults.clone();
+                    // Jobs were parsed with the old defaults.
+                    self.fingerprint = None;
+                }
+                self.tick = config.tick_duration();
+                self.config = config;
+            }
+            Err(err) => {
+                tracing::error!(%err, "pastor.toml does not load; the previous version stays in use")
+            }
+        }
+        let flock = match Flock::load(&files[1]) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::error!(%err, "flock.toml does not load; the previous flock stays in use");
+                self.fleet.flock()
+            }
+        };
+        let diff = self
+            .fleet
+            .apply_flock(&flock, &machine_settings(&self.config))
+            .await;
+        if !diff.is_empty() {
+            tracing::info!(added = ?diff.added, removed = ?diff.removed, retargeted = ?diff.retargeted, "flock reloaded");
+        }
+        Some(diff)
     }
 
     fn states(&self) -> HashMap<String, JobState> {
@@ -856,6 +918,8 @@ impl Scheduler {
 
     /// One tick: reload, reap finished runs, start due jobs, dispatch, warn.
     pub async fn pass(&mut self, now: DateTime<Utc>) {
+        // pastor.toml first, so new defaults reach the job files this pass.
+        self.reload_config(false).await;
         self.reload();
         self.reap().await;
         let states = self.states();
@@ -1151,6 +1215,32 @@ impl Scheduler {
 }
 
 /// Cheap change detection for the jobs directory: names, mtimes and sizes.
+/// (path, mtime, size) of each file. Like `fingerprint`, it follows
+/// symlinks, so a config file linked from a dotfiles repo is seen when its
+/// target changes. A missing file is `(path, None, 0)`.
+fn file_fingerprint(files: &[PathBuf]) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
+    files
+        .iter()
+        .map(|p| {
+            let md = std::fs::metadata(p).ok();
+            (
+                p.clone(),
+                md.as_ref().and_then(|m| m.modified().ok()),
+                md.map(|m| m.len()).unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+/// A reload that changed `tick` takes effect from the next tick on, not
+/// after one more tick at the old period.
+fn retime(tick: &mut tokio::time::Interval, period: Duration) {
+    if tick.period() != period {
+        *tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    }
+}
+
 fn fingerprint(dir: &std::path::Path) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -1963,6 +2053,140 @@ mod tests {
             Scheduler::new(paths, &config, store.clone(), fleet, events),
             tmp,
         )
+    }
+
+    const FLOCK_A: &str = "[[machine]]\nname = \"a\"\ncommand = [\"fake\"]\n";
+    const FLOCK_AB: &str = "[[machine]]\nname = \"a\"\ncommand = [\"fake\"]\n\n[[machine]]\nname = \"b\"\ncommand = [\"fake\"]\n";
+
+    /// A scheduler over a fleet `reload_config` can change, every machine a
+    /// fresh fake. pastor.toml is written with the scheduler's own config, so
+    /// the first reload does not read as a timing change.
+    fn managed_scheduler(store: &Arc<Store>) -> (Scheduler, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(tmp.path().join("c")).unwrap();
+        std::fs::write(paths.config_file(), "tick = \"1s\"\n").unwrap();
+        let config = PastorConfig {
+            tick: "1s".into(),
+            ..Default::default()
+        };
+        let (events, _) = broadcast::channel(16);
+        let connect: crate::daemon::ConnectorFactory =
+            Arc::new(|_m: &crate::config::flock::MachineConfig| {
+                Arc::new(crate::herdr::fake::FakeHerdr::new()) as Arc<dyn crate::herdr::Connector>
+            });
+        let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
+        (
+            Scheduler::new(paths, &config, store.clone(), fleet, events),
+            tmp,
+        )
+    }
+
+    #[tokio::test]
+    async fn flock_edits_apply_on_the_next_pass() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = managed_scheduler(&store);
+        std::fs::write(s.paths.flock_file(), FLOCK_A).unwrap();
+        let d = s
+            .reload_config(false)
+            .await
+            .expect("flock.toml did not exist when the scheduler was built");
+        assert_eq!(d.added, vec!["a".to_string()]);
+        assert!(
+            s.reload_config(false).await.is_none(),
+            "nothing changed on disk"
+        );
+        std::fs::write(s.paths.flock_file(), FLOCK_AB).unwrap();
+        let d = s.reload_config(false).await.expect("flock.toml grew");
+        assert_eq!(d.added, vec!["b".to_string()]);
+        assert!(d.removed.is_empty() && d.retargeted.is_empty(), "{d:?}");
+    }
+
+    /// Review Focus 1: a flock.toml that stops loading while the daemon runs
+    /// keeps the previous flock; it must never read as "no machines".
+    #[tokio::test]
+    async fn invalid_flock_keeps_previous_machines() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = managed_scheduler(&store);
+        std::fs::write(s.paths.flock_file(), FLOCK_AB).unwrap();
+        s.reload_config(false).await.unwrap();
+        for bad in [
+            "[[machine]\nname = ",
+            "[[machine]]\nname = \"a\"\nlocal = true\nssh = \"x@y\"\n",
+        ] {
+            std::fs::write(s.paths.flock_file(), bad).unwrap();
+            let d = s.reload_config(true).await.unwrap();
+            assert!(d.is_empty(), "{bad:?}: {d:?}");
+            assert!(
+                s.fleet.get("a").is_some() && s.fleet.get("b").is_some(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Review Focus 2: an editor re-save of either file restarts nothing.
+    #[tokio::test]
+    async fn unchanged_save_respawns_nothing() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = managed_scheduler(&store);
+        std::fs::write(s.paths.flock_file(), FLOCK_A).unwrap();
+        s.reload_config(false).await.unwrap();
+        let a = s.fleet.get("a").unwrap();
+        std::fs::write(s.paths.flock_file(), FLOCK_A).unwrap();
+        std::fs::write(s.paths.config_file(), "tick = \"1s\"\n").unwrap();
+        let d = s.reload_config(true).await.unwrap();
+        assert!(d.is_empty(), "{d:?}");
+        assert!(a.tx.same_channel(&s.fleet.get("a").unwrap().tx));
+    }
+
+    #[tokio::test]
+    async fn pastor_toml_edits_apply() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = managed_scheduler(&store);
+        std::fs::write(s.paths.flock_file(), FLOCK_A).unwrap();
+        s.reload_config(false).await.unwrap();
+        s.reload();
+        assert!(s.fingerprint.is_some());
+
+        std::fs::write(
+            s.paths.config_file(),
+            "tick = \"30s\"\n[defaults]\nagent = \"codex\"\n",
+        )
+        .unwrap();
+        let d = s.reload_config(true).await.unwrap();
+        assert_eq!(s.tick, Duration::from_secs(30));
+        assert_eq!(s.defaults.agent, "codex");
+        assert!(
+            s.fingerprint.is_none(),
+            "job files are re-read with the new defaults"
+        );
+        assert_eq!(
+            d.retargeted,
+            vec!["a".to_string()],
+            "tick is also the polling period, so the actors are replaced"
+        );
+
+        std::fs::write(s.paths.config_file(), "tick = \"0s\"\n").unwrap();
+        let d = s.reload_config(true).await.unwrap();
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            s.tick,
+            Duration::from_secs(30),
+            "a pastor.toml that does not load leaves the last good one in use"
+        );
+    }
+
+    /// `pastor job reload` (IPC Reload) applies flock.toml at once.
+    #[tokio::test]
+    async fn job_reload_also_reloads_the_flock() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (s, _tmp) = managed_scheduler(&store);
+        let fleet = s.fleet.clone();
+        let flock_file = s.paths.flock_file();
+        let handle = s.spawn();
+        std::fs::write(&flock_file, FLOCK_A).unwrap();
+        handle.reload().await.unwrap();
+        assert!(fleet.get("a").is_some());
     }
 
     fn write_job(paths: &Paths, name: &str, text: &str) {
