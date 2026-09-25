@@ -3,10 +3,10 @@
 [[machine]]
 name = "pi-1"
 ssh = "pi-1"
-max_agents = 2
+max_agents = 3
 tags = ["fast"]
 
 [[machine]]
 name = "pi-2"
 ssh = "pi-2"
-max_agents = 2
+max_agents = 3

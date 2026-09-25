@@ -2,7 +2,7 @@
 # Recorded by `make demo`, which starts the demo head and sets PASTOR_* for
 # this shell (see flock.example.toml).
 
-Output docs/demo/pastor.gif
+Output docs/demo/tasks.gif
 
 Set Shell fish
 Set FontSize 15
@@ -16,7 +16,7 @@ Type "pastor machine list"
 Enter
 Sleep 2.5s
 
-Type 'pastor task run "Run the test suite and fix what broke" --repo ~/work/api'
+Type 'pastor task run "Explain what this repository does, in three lines" --repo ~/ghq/github.com/cacarico/pastor'
 Enter
 Sleep 8s
 

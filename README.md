@@ -8,8 +8,9 @@ opens a terminal there through [herdr](https://herdr.dev), starts the agent,
 sends the prompt, and tells you when the agent stops. When you come back you
 attach to the agent's terminal and carry on.
 
-A recorded demo goes here once `make demo` has run on a machine with
-[vhs](https://github.com/charmbracelet/vhs); the tapes are in `docs/demo/`.
+<p align="center">
+  <img src="docs/demo/tasks.gif" alt="pastor machine list, task run, task list and task read in a terminal" width="800">
+</p>
 
 ## Install
 
@@ -50,6 +51,10 @@ prompt = "It is {{ item.key }}. Run the test suite and fix what broke."
 
 Plugins add other connectors, so a job can turn Slack messages or GitHub
 issues into tasks, and event hooks that run when a task finishes or blocks.
+
+<p align="center">
+  <img src="docs/demo/jobs.gif" alt="a job file, pastor job list, job run and the task it made" width="800">
+</p>
 
 ## How it fits together
 

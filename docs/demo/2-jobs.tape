@@ -12,7 +12,7 @@ Set Padding 16
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 35ms
 
-Type "cat docs/demo/local/jobs/hourly.toml"
+Type "cat docs/demo/local/jobs/morning.toml"
 Enter
 Sleep 3s
 
@@ -20,10 +20,10 @@ Type "pastor job list"
 Enter
 Sleep 2.5s
 
-Type "pastor job run hourly"
+Type "pastor job run morning"
 Enter
 Sleep 8s
 
-Type "pastor task list --job hourly"
+Type "pastor task list --job morning"
 Enter
 Sleep 4s

@@ -71,7 +71,7 @@ install: ## install pastor and fake-herdr into ~/.cargo/bin
 demo: build ## record the README gifs with vhs against a demo head
 	mkdir -p docs/demo/local/jobs
 	cp -n docs/demo/flock.example.toml docs/demo/local/flock.toml
-	cp -n docs/demo/jobs.example/hourly.toml docs/demo/local/jobs/hourly.toml
+	cp -n docs/demo/jobs.example/morning.toml docs/demo/local/jobs/morning.toml
 	rm -rf docs/demo/local/state docs/demo/local/data
 	@set -e; \
 	export PASTOR_CONFIG_DIR=$(CURDIR)/docs/demo/local PASTOR_STATE_DIR=$(CURDIR)/docs/demo/local/state \
