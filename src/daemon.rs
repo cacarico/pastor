@@ -545,6 +545,11 @@ mod tests {
             panic!()
         };
         assert_eq!(ms[0].live, 1);
+        assert_eq!(
+            ms[0].pastor_version.as_deref(),
+            Some("fake"),
+            "the flock list carries what the machine answered on connect"
+        );
     }
 
     #[tokio::test]

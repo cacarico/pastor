@@ -76,6 +76,10 @@ pub struct MachineStatus {
     pub endpoint: String,
     pub channel: ChannelState,
     pub herdr_version: Option<String>,
+    /// `Connector::pastor_version`, asked once per connect. Defaulted so a
+    /// CLI can still read a head that predates the field.
+    #[serde(default)]
+    pub pastor_version: Option<String>,
     pub protocol: Option<u32>,
     pub error: Option<String>,
     pub live: usize,
@@ -195,6 +199,7 @@ pub fn spawn_machine(
         endpoint: connector.describe(),
         channel: ChannelState::Connecting,
         herdr_version: None,
+        pastor_version: None,
         protocol: None,
         error: None,
         live: 0,
@@ -281,6 +286,29 @@ enum PollExit {
 }
 
 impl Actor {
+    /// The machine's pastor version, for `machine list` only. The ping just
+    /// proved the machine reachable, so a failure here, even an ssh one, is
+    /// logged and read as unknown rather than failing the connect: the next
+    /// request finds out soon enough if the machine really went away.
+    async fn ask_pastor_version(&self) -> Option<String> {
+        match tokio::time::timeout(
+            self.settings.request_timeout,
+            self.connector.pastor_version(),
+        )
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(err)) => {
+                tracing::warn!(machine = %self.name, %err, "could not ask for the pastor version");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(machine = %self.name, "pastor version check timed out");
+                None
+            }
+        }
+    }
+
     async fn run(mut self) {
         let mut backoff = self.settings.initial_backoff;
         loop {
@@ -309,9 +337,11 @@ impl Actor {
                         continue;
                     }
                 };
+            let pastor_version = self.ask_pastor_version().await;
             {
                 let mut s = self.status.write().unwrap();
                 s.herdr_version = Some(pong.version.clone());
+                s.pastor_version = pastor_version;
                 s.protocol = Some(pong.protocol);
             }
             if pong.protocol < MIN_HERDR_PROTOCOL {
@@ -2376,6 +2406,40 @@ mod tests {
         fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Blocked);
         wait_for("blocked after resubscribe", || {
             state_of(&store, t.id) == TaskState::Blocked
+        })
+        .await;
+    }
+
+    /// A CLI talks to whatever head is running, which may predate the field.
+    #[test]
+    fn a_status_from_an_older_head_reads_without_a_pastor_version() {
+        let s: MachineStatus = serde_json::from_value(serde_json::json!({
+            "name": "pi-3", "host": "fleet@pi-3", "endpoint": "ssh fleet@pi-3",
+            "channel": "connected", "herdr_version": "0.9.1", "protocol": 22,
+            "error": null, "live": 0, "max_agents": 2, "tags": []
+        }))
+        .unwrap();
+        assert_eq!(s.pastor_version, None);
+    }
+
+    /// Each connect asks the machine for its pastor version once, and the
+    /// status carries the answer until the next connect asks again.
+    #[tokio::test]
+    async fn status_carries_the_pastor_version_from_each_connect() {
+        let fake = FakeHerdr::new();
+        fake.set_pastor_version(Some("0.2.0"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        assert_eq!(h.snapshot().pastor_version.as_deref(), Some("0.2.0"));
+
+        fake.set_pastor_version(None);
+        fake.disconnect_all();
+        wait_for("unknown after a reconnect", || {
+            h.snapshot().pastor_version.is_none() && h.snapshot().channel == ChannelState::Connected
         })
         .await;
     }

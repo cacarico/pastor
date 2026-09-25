@@ -380,6 +380,7 @@ mod tests {
             endpoint: format!("ssh {host} (session default)"),
             channel: crate::machine::ChannelState::Connected,
             herdr_version: Some("0.9.1".into()),
+            pastor_version: Some("0.2.0".into()),
             protocol: Some(22),
             error: None,
             live: 1,
