@@ -1697,6 +1697,7 @@ impl Actor {
             dispatch(
                 self.connector.as_ref(),
                 &mut task,
+                &self.settings.agents,
                 self.settings.agent_ready_timeout,
             ),
         )
@@ -2361,6 +2362,8 @@ mod tests {
         DispatchSpec {
             agent: "claude".into(),
             agent_args: vec![],
+            allow: vec![],
+            deny: vec![],
             repo: None,
             worktree: false,
             branch: None,

@@ -18,6 +18,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   flock's, then `[defaults]`, then the built-in `claude`; `--agent` and
   `--agent-arg` always win. The head settles the agent when it queues the
   task, and `pastor task show` prints what it resolved to.
+- Tool allow and deny lists: `allow` and `deny` (tool patterns such as
+  `"Bash(git:*)"`) under `[defaults]`, a `[[flock]]` entry and a job's
+  `[dispatch]`. They add up across the three and deny wins over allow. pastor
+  passes them as the agent's own flags, `--allowedTools` and
+  `--disallowedTools` for Claude, and leaves its permission mode alone;
+  `[agents.<name>] allow_flag` and `deny_flag` name them for another agent,
+  and a task whose agent has none for a list it carries is refused
+  (`agent_tools_unsupported`). `pastor task show` prints both lists.
+- A Trust model section in the manual, and a warning there on agent args
+  that turn permission checks off, such as `--dangerously-skip-permissions`.
 
 - A release workflow (`.github/workflows/release.yml`). Pushing a `vX.Y.Z`
   tag builds static musl binaries for x86_64, aarch64, armv7 and riscv64
@@ -41,6 +51,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Agent args follow the agent they were written for: `[defaults] agent_args`
   no longer reach a task that runs another agent than `[defaults] agent`
   (`pastor task run --agent codex` used to get Claude's `--model`).
+- The head protocol is 2. `pastor task run` and `pastor task retry` refuse a
+  head below it (`head_too_old`), which would start the agent without its
+  tool lists: restart `pastor serve` after upgrading.
 - The head, not the CLI, settles a `pastor task run` task's agent, since only
   it knows the task's flock. It still reads `pastor.toml` afresh for each run.
 

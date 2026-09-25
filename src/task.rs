@@ -88,6 +88,14 @@ pub struct DispatchSpec {
     pub agent: String,
     #[serde(default)]
     pub agent_args: Vec<String>,
+    /// Tool patterns the agent may use without asking, and those it must
+    /// never use, as resolved when the task was queued
+    /// (`Defaults::resolve_agent`); dispatch turns them into the agent's
+    /// own flags (`Agents::launch_args`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
     #[serde(default)]
     pub repo: Option<String>,
     #[serde(default)]
@@ -330,6 +338,8 @@ mod tests {
             spec: DispatchSpec {
                 agent: "claude".into(),
                 agent_args: vec![],
+                allow: vec![],
+                deny: vec![],
                 repo: None,
                 worktree: false,
                 branch: None,

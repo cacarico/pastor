@@ -55,6 +55,7 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 - `--worktree` makes a git worktree of `--repo` for the task, on `--branch` or `pastor/t-N`. It needs `--repo` and the repo cloned on that machine.
 - `--agent-arg` passes one argument to the agent and always takes the next word, dashes included. Repeat it, in order.
 - Without `--agent` and `--agent-arg`, the task takes its flock's `agent` and `agent_args` from `flock.toml`, then `[defaults]` in `pastor.toml`, then `claude`. Args follow the agent they were written for: a flock's args for codex never reach a task run with `--agent claude`. `pastor task show t-N` prints what the task resolved to.
+- Tool permissions: the agent keeps its own permission mode. `allow` and `deny` lists of tool patterns (`"Bash(git:*)"`) in `[defaults]`, a `[[flock]]` entry or a job's `[dispatch]` add up, and deny wins over allow; pastor passes them as the agent's own flags (`--allowedTools`, `--disallowedTools` for Claude). An agent with no such flags refuses tasks that carry a list (`agent_tools_unsupported`). Never add `--dangerously-skip-permissions` or similar to `--agent-arg` on your own: a prompt-injected agent would then act as the machine's user with nothing to stop it. Leave that decision to the user.
 - `--timeout` bounds the task; past it the task goes `stale`.
 - `--prompt-file PATH` takes the prompt from a file on the machine running the CLI (`-` is stdin) in place of the argument; give exactly one of the two. Use it for a long prompt: quotes, backticks and `$` need no escaping, and trailing newlines are dropped. An unreadable file fails with `prompt_file_unreadable`, an empty one with `prompt_file_empty`.
 
@@ -120,7 +121,7 @@ tags = ["arm"]
 prompt = "It is {{ item.key }}. Run the suite and fix what broke. Task {{ task.id }}."
 ```
 
-`[dispatch]` takes the same things as `pastor task run`: `agent`, `agent_args`, `repo`, `worktree`, `branch`, `tags`, `flock`, `machine`, `timeout`, plus `max_tasks_per_run` and the `prompt` template.
+`[dispatch]` takes the same things as `pastor task run`, plus tool lists: `agent`, `agent_args`, `allow`, `deny`, `repo`, `worktree`, `branch`, `tags`, `flock`, `machine`, `timeout`, plus `max_tasks_per_run` and the `prompt` template.
 
 ```bash
 pastor job list            # schedule, enabled, last and next run, errors
@@ -135,7 +136,7 @@ The head picks up job file edits by itself. A file that stops parsing keeps its 
 
 ## The fleet
 
-`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2), `tags` and `flock`. `[[flock]]` entries (`name`, `default = true` on one of them, and optionally the `agent` and `agent_args` its tasks and jobs get when they name none) declare the flocks; a machine with no `flock` is in the default one, and a file with no `[[flock]]` has a single flock named `default`.
+`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2), `tags` and `flock`. `[[flock]]` entries (`name`, `default = true` on one of them, and optionally the `agent` and `agent_args` its tasks and jobs get when they name none, and `allow` and `deny` tool lists added to theirs) declare the flocks; a machine with no `flock` is in the default one, and a file with no `[[flock]]` has a single flock named `default`.
 
 ```bash
 pastor machine add pi-3 user@pi-3 --max-agents 2 --tag arm --herdr

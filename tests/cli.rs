@@ -396,8 +396,9 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
         "{start}"
     );
 
-    // A flock's own agent_args come before `[defaults]`, and `task show`
-    // prints what the task resolved to.
+    // A flock's own agent_args come before `[defaults]`, its deny list
+    // reaches claude as --disallowedTools, and `task show` prints what the
+    // task resolved to.
     let flock = env.config.join("flock.toml");
     // A third slot, so t-3 need not wait for the first two to settle.
     let machines = std::fs::read_to_string(&flock)
@@ -406,7 +407,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     std::fs::write(
         &flock,
         format!(
-            "[[flock]]\nname = \"default\"\ndefault = true\nagent_args = [\"--model\", \"claude-haiku-4-5\"]\n\n{machines}"
+            "[[flock]]\nname = \"default\"\ndefault = true\nagent_args = [\"--model\", \"claude-haiku-4-5\"]\ndeny = [\"WebFetch\"]\n\n{machines}"
         ),
     )
     .unwrap();
@@ -420,7 +421,12 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     let start = env.agent_start_params("t-3");
     assert_eq!(
         start["args"],
-        serde_json::json!(["--model", "claude-haiku-4-5"]),
+        serde_json::json!([
+            "--model",
+            "claude-haiku-4-5",
+            "--disallowedTools",
+            "WebFetch"
+        ]),
         "{start}"
     );
     let out = env.cmd(&["task", "show", "t-3"]);
@@ -430,6 +436,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
         text.contains("agent args: --model claude-haiku-4-5"),
         "{text}"
     );
+    assert!(text.contains("deny:       WebFetch\n"), "{text}");
 }
 
 #[test]

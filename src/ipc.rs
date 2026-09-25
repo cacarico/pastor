@@ -14,11 +14,19 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// field an older head would silently ignore (serde skips unknown fields), so
 /// the CLI can refuse to send it there. A head that answers no protocol is 0.
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`).
-pub const IPC_PROTOCOL: u32 = 1;
+pub const IPC_PROTOCOL: u32 = 2;
 
 /// The first protocol whose head honours `flock` in a request.
 pub const FLOCK_PROTOCOL: u32 = 1;
 
+/// The first protocol whose head resolves a run's agent with its flock and
+/// passes the tool allow and deny lists on. An older one would start the
+/// agent without the deny list, and say nothing.
+pub const AGENT_PROTOCOL: u32 = 2;
+
+// One request is read per connection and dropped once answered, so the
+// size of the largest variant (`Run`) costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
@@ -342,6 +350,8 @@ mod tests {
             spec: DispatchSpec {
                 agent: "claude".into(),
                 agent_args: vec![],
+                allow: vec![],
+                deny: vec![],
                 repo: None,
                 worktree: false,
                 branch: None,

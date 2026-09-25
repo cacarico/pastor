@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
 use crate::config::flock::{EditError, Flock, FlockDoc, MachineConfig, TaskFlockError};
-use crate::config::{AgentChoice, AgentPick, Defaults, PastorConfig, Paths};
+use crate::config::{AgentChoice, AgentPick, Agents, Defaults, PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
@@ -168,6 +168,8 @@ pub enum QueueError<E = anyhow::Error> {
     UnknownMachine(String),
     /// Names a flock that does not exist, or one its pinned machine is not in.
     Flock(TaskFlockError),
+    /// Its agent cannot be started as resolved (`Agents::launch_args`).
+    Agent(String),
     /// The insert failed; for `queue_retry`, the `RetryError` that says why.
     Store(E),
 }
@@ -201,9 +203,12 @@ pub struct Fleet {
     /// The flock last passed to `apply_flock`. Differs from what `members`
     /// runs while a machine is shutting down.
     wanted: RwLock<Flock>,
-    /// `[defaults]` as last applied (`set_defaults`): what a queued task's
+    /// `[defaults]` as last applied (`set_config`): what a queued task's
     /// agent falls back to after its flock's (`resolve_agent`).
     defaults: RwLock<Defaults>,
+    /// `[agents]` as last applied: whether a queued task's agent can take
+    /// its tool lists (`Agents::launch_args`).
+    agents: RwLock<Agents>,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
@@ -225,6 +230,7 @@ impl Fleet {
             members: RwLock::new(members),
             wanted: RwLock::default(),
             defaults: RwLock::default(),
+            agents: RwLock::default(),
             store,
             spawner: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
@@ -250,6 +256,7 @@ impl Fleet {
             members: RwLock::new(Vec::new()),
             wanted: RwLock::default(),
             defaults: RwLock::default(),
+            agents: RwLock::default(),
             store,
             spawner: Some(Spawner { connect, events }),
             dispatch_lock: tokio::sync::Mutex::new(()),
@@ -296,10 +303,12 @@ impl Fleet {
         self.wanted.read().unwrap().clone()
     }
 
-    /// Take `[defaults]` from `pastor.toml` as now loaded; the scheduler
-    /// calls it at start and on every reload that reads the file.
-    pub fn set_defaults(&self, defaults: Defaults) {
-        *self.defaults.write().unwrap() = defaults;
+    /// Take `[defaults]` and `[agents]` from `pastor.toml` as now loaded;
+    /// the scheduler calls it at start and on every reload that reads the
+    /// file.
+    pub fn set_config(&self, config: &PastorConfig) {
+        *self.defaults.write().unwrap() = config.defaults.clone();
+        *self.agents.write().unwrap() = config.agents.clone();
     }
 
     /// The agent a task queued in `flock` gets, given what its run or job
@@ -311,6 +320,19 @@ impl Fleet {
             .read()
             .unwrap()
             .resolve_agent(ask, wanted.entry(flock))
+    }
+
+    /// `resolve_agent`, applied to `spec`, refused when the agent cannot be
+    /// started as resolved: a tool list it has no flag for. Checked here so
+    /// the task is refused, not queued to fail at dispatch.
+    fn settle_agent(
+        &self,
+        spec: &mut crate::task::DispatchSpec,
+        ask: &AgentChoice,
+        flock: &str,
+    ) -> Result<(), String> {
+        self.resolve_agent(ask, flock).apply_to(spec);
+        self.agents.read().unwrap().launch_args(spec).map(drop)
     }
 
     /// The store the fleet queues tasks in.
@@ -547,7 +569,8 @@ impl Fleet {
             .task_flock(flock, spec.machine.as_deref())
             .map_err(QueueError::Flock)?;
         if let Some(ask) = ask {
-            self.resolve_agent(ask, &flock).apply_to(&mut spec);
+            self.settle_agent(&mut spec, ask, &flock)
+                .map_err(QueueError::Agent)?;
         }
         self.store
             .insert_task(NewTask {
@@ -576,10 +599,15 @@ impl Fleet {
     ) -> anyhow::Result<Task> {
         let _pass = self.dispatch_lock.lock().await;
         let flock = self.job_task_flock(job)?;
-        let pick = self.resolve_agent(&job.agent, &flock);
+        let mut settled = job.spec.clone();
+        self.settle_agent(&mut settled, &job.agent, &flock)
+            .map_err(anyhow::Error::msg)?;
         self.store.insert_job_task(&job.name, &flock, item, |id| {
             let (prompt, mut spec) = render(id)?;
-            pick.apply_to(&mut spec);
+            spec.agent = settled.agent;
+            spec.agent_args = settled.agent_args;
+            spec.allow = settled.allow;
+            spec.deny = settled.deny;
             Ok((prompt, spec))
         })
     }
@@ -634,6 +662,13 @@ impl Fleet {
             {
                 return Err(QueueError::Flock(TaskFlockError::UnknownFlock(f.clone())));
             }
+            // The copy keeps the agent and tool lists as resolved, so only
+            // an `[agents]` edit since can make them unstartable.
+            self.agents
+                .read()
+                .unwrap()
+                .launch_args(&t.spec)
+                .map_err(QueueError::Agent)?;
         }
         self.store.insert_retry(id).map_err(QueueError::Store)
     }
@@ -933,7 +968,7 @@ impl Daemon {
                 if agent.is_some()
                     && let Ok(config) = PastorConfig::load_existing(&self.paths.config_file())
                 {
-                    self.fleet.set_defaults(config.defaults);
+                    self.fleet.set_config(&config);
                 }
                 let task = match self
                     .fleet
@@ -952,6 +987,9 @@ impl Daemon {
                             "unknown_machine",
                             format!("machine {m} is not in the flock"),
                         );
+                    }
+                    Err(QueueError::Agent(err)) => {
+                        return IpcResponse::error("agent_tools_unsupported", err);
                     }
                     Err(QueueError::Store(err)) => {
                         return IpcResponse::error("store_error", err);
@@ -1150,6 +1188,9 @@ impl Daemon {
                     "unknown_machine",
                     format!("t-{id} is pinned to machine {m}, which is not in the flock"),
                 );
+            }
+            Err(QueueError::Agent(err)) => {
+                return IpcResponse::error("agent_tools_unsupported", err);
             }
             // A retry keeps the flock of the task it copies; nothing chooses one.
             Err(QueueError::Flock(err)) => {
@@ -1372,6 +1413,8 @@ mod tests {
         DispatchSpec {
             agent: "claude".into(),
             agent_args: vec![],
+            allow: vec![],
+            deny: vec![],
             repo: None,
             worktree: false,
             branch: None,
@@ -1973,6 +2016,8 @@ mod tests {
         let own = Some(AgentChoice {
             agent: Some("aider".into()),
             agent_args: None,
+            allow: vec![],
+            deny: vec![],
         });
         assert_eq!(
             queued(d.handle(run("work", own)).await),
@@ -2018,6 +2063,60 @@ mod tests {
             (t.spec.agent.as_str(), t.spec.agent_args.len()),
             ("claude", 0)
         );
+    }
+
+    /// A flock's deny list reaches its tasks on top of `[defaults]`, and a
+    /// task whose agent has no flag for its tool lists is refused, run or
+    /// job, rather than queued to start without them.
+    #[tokio::test]
+    async fn tool_lists_reach_the_task_or_refuse_it() {
+        let mut flock = home_and_work();
+        flock.flocks[1].deny = vec!["WebFetch".into()];
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("h", 2, FakeHerdr::new()), ("w", 2, FakeHerdr::new())],
+        )
+        .await;
+        let run = |agent: Option<&str>| IpcRequest::Run {
+            prompt: "x".into(),
+            spec: spec(),
+            flock: Some("work".into()),
+            agent: Some(AgentChoice {
+                agent: agent.map(Into::into),
+                allow: vec!["Edit".into()],
+                ..Default::default()
+            }),
+        };
+        let IpcResponse::Task(t) = d.handle(run(None)).await else {
+            panic!()
+        };
+        assert_eq!(
+            (t.spec.allow.clone(), t.spec.deny.clone()),
+            (vec!["Edit".into()], vec!["WebFetch".into()])
+        );
+        match d.handle(run(Some("codex"))).await {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "agent_tools_unsupported", "{message}");
+                assert!(message.contains("[agents.codex] allow_flag"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let text = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nflock = \"work\"\nagent = \"codex\"\nprompt = \"p\"\n";
+        let job = crate::config::job::Job::parse(
+            text,
+            "j",
+            &test_config().defaults,
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let err = d
+            .fleet()
+            .queue_job_task(&job, &serde_json::json!({"key": "k"}), |_| {
+                Ok(("p".into(), job.spec.clone()))
+            })
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("deny_flag"), "{err:#}");
     }
 
     /// `home_and_work` plus `spare`, a flock with no machine.
@@ -2677,6 +2776,7 @@ mod tests {
             "codex".into(),
             crate::config::AgentDef {
                 trust_keys: Some(vec!["Enter".into()]),
+                ..Default::default()
             },
         );
         let settings = machine_settings(&config);

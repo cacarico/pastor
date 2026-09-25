@@ -9,6 +9,8 @@
 # default = true
 # agent = "claude"
 # agent_args = ["--model", "claude-sonnet-5"]
+# allow = ["Read", "Edit", "Bash(git:*)"]   # tools the agent may use unasked
+# deny = ["Bash(git push:*)"]              # never; wins over allow
 
 [[machine]]
 name = "pi-1"

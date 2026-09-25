@@ -904,6 +904,8 @@ mod tests {
         DispatchSpec {
             agent: "claude".into(),
             agent_args: vec!["--model".into(), "x".into()],
+            allow: vec![],
+            deny: vec![],
             repo: Some("~/w".into()),
             worktree: true,
             branch: Some("b".into()),

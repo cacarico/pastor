@@ -476,6 +476,8 @@ mod tests {
                 spec: DispatchSpec {
                     agent: "claude".into(),
                     agent_args: vec![],
+                    allow: vec![],
+                    deny: vec![],
                     repo: None,
                     worktree: false,
                     branch: None,

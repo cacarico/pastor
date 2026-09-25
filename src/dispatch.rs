@@ -3,6 +3,7 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::time::Instant;
 
+use crate::config::Agents;
 use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
 };
@@ -103,10 +104,12 @@ impl DispatchError {
 ///
 /// `ready_timeout` bounds the wait between `agent.start` and a prompt herdr
 /// accepts; it must stay below the caller's per-request timeout, or a slow
-/// agent surfaces as a confusing "request timed out".
+/// agent surfaces as a confusing "request timed out". `agents` turns the
+/// task's tool lists into the agent's own flags (`Agents::launch_args`).
 pub async fn dispatch(
     conn: &dyn Connector,
     task: &mut Task,
+    agents: &Agents,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     let name = Task::agent_name_for(task.id);
@@ -116,7 +119,7 @@ pub async fn dispatch(
     task.prompt_pending = false;
     task.activity_seen = false;
 
-    let result = dispatch_steps(conn, task, &name, ready_timeout).await;
+    let result = dispatch_steps(conn, task, &name, agents, ready_timeout).await;
     match &result {
         Ok(DispatchOutcome::Running) => {
             task.state = TaskState::Running;
@@ -143,9 +146,14 @@ async fn dispatch_steps(
     conn: &dyn Connector,
     task: &mut Task,
     name: &str,
+    agents: &Agents,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
+    // Before anything is made on the machine: a task whose agent cannot take
+    // its tool lists (an `[agents]` edit since it was queued) leaves nothing
+    // behind.
+    let args = agents.launch_args(&spec).map_err(DispatchError::Task)?;
     let repo = match spec.repo.as_deref() {
         Some(repo) => Some(expand_home(conn, repo, task.machine.as_deref()).await?),
         None => None,
@@ -172,7 +180,7 @@ async fn dispatch_steps(
     // pane; it never reports `agent_not_ready` (its errors are about the name,
     // the kind and the pane). Readiness shows up afterwards, in `agent.list` and
     // in whether `agent.prompt` is accepted.
-    start_agent(conn, name, &spec, &created.root_pane.pane_id).await?;
+    start_agent(conn, name, &spec.agent, &args, &created.root_pane.pane_id).await?;
 
     let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
@@ -269,15 +277,13 @@ async fn find_checkout(
 async fn start_agent(
     conn: &dyn Connector,
     name: &str,
-    spec: &DispatchSpec,
+    agent: &str,
+    args: &[String],
     pane_id: &str,
 ) -> Result<(), DispatchError> {
     let mut attempt = 1;
     loop {
-        match conn
-            .agent_start(name, &spec.agent, pane_id, &spec.agent_args)
-            .await
-        {
+        match conn.agent_start(name, agent, pane_id, args).await {
             Ok(_) => return Ok(()),
             Err(err) if err.code() == Some("agent_pane_busy") => {
                 if attempt >= PANE_BUSY_ATTEMPTS {
@@ -491,6 +497,8 @@ mod tests {
         DispatchSpec {
             agent: "claude".into(),
             agent_args: vec!["--model".into(), "opus".into()],
+            allow: vec![],
+            deny: vec![],
             repo: Some("/srv/app".into()),
             worktree: false,
             branch: None,
@@ -511,7 +519,9 @@ mod tests {
             let fake = FakeHerdr::new();
             fake.set_missing_dir("/srv/app");
             let mut t = task(DispatchSpec { worktree, ..spec() });
-            let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+                .await
+                .unwrap_err();
             assert!(!err.is_transport(), "the machine is fine: {err}");
             assert_eq!(t.state, TaskState::Failed);
             assert_eq!(
@@ -538,7 +548,9 @@ mod tests {
             repo: Some("~/gone".into()),
             ..spec()
         });
-        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("/home/fake/gone does not exist"),
             "{err}"
@@ -668,7 +680,9 @@ mod tests {
     async fn dispatch_sends_prompt_verbatim() {
         let fake = FakeHerdr::new();
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, READY).await.unwrap();
+        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
         assert_eq!(out, DispatchOutcome::Running);
         assert_eq!(t.state, TaskState::Running);
         assert_eq!(t.agent_name.as_deref(), Some("t-7"));
@@ -690,6 +704,52 @@ mod tests {
         assert_eq!(prompt.params["text"], "line one\n\"two\" {{ three }}");
     }
 
+    /// The tool lists reach herdr as the agent's own flags, after its args.
+    #[tokio::test]
+    async fn dispatch_passes_the_tool_lists_as_the_agents_flags() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            allow: vec!["Bash(git:*)".into()],
+            deny: vec!["WebFetch".into()],
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!([
+                "--model",
+                "opus",
+                "--allowedTools",
+                "Bash(git:*)",
+                "--disallowedTools",
+                "WebFetch"
+            ])
+        );
+    }
+
+    /// An agent that cannot take a list it was given fails the task before
+    /// anything is made on the machine.
+    #[tokio::test]
+    async fn dispatch_refuses_a_tool_list_the_agent_has_no_flag_for() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "codex".into(),
+            deny: vec!["WebFetch".into()],
+            ..spec()
+        });
+        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deny_flag"), "{err}");
+        assert!(!err.is_transport());
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+    }
+
     #[tokio::test]
     async fn dispatch_uses_worktree_when_asked() {
         let fake = FakeHerdr::new();
@@ -698,7 +758,9 @@ mod tests {
             branch: Some("pastor/k1".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, READY).await.unwrap();
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
         let wt = fake
             .requests()
             .into_iter()
@@ -729,7 +791,9 @@ mod tests {
                     worktree,
                     ..spec()
                 });
-                dispatch(&fake, &mut t, READY).await.unwrap();
+                dispatch(&fake, &mut t, &Agents::default(), READY)
+                    .await
+                    .unwrap();
                 let method = if worktree {
                     "worktree.create"
                 } else {
@@ -767,7 +831,9 @@ mod tests {
                 repo: Some(repo.into()),
                 ..spec()
             });
-            let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+                .await
+                .unwrap_err();
             assert!(!err.is_transport(), "the machine is fine: {err}");
             assert_eq!(t.state, TaskState::Failed);
             assert!(
@@ -794,7 +860,9 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_millis(300));
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, READY).await.unwrap();
+        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
         assert_eq!(out, DispatchOutcome::Running);
         assert_eq!(t.state, TaskState::Running);
         let methods: Vec<String> = fake.requests().into_iter().map(|r| r.method).collect();
@@ -819,7 +887,9 @@ mod tests {
         let mut t = task(spec());
         t.machine = Some("pi-1".into());
         let started = Instant::now();
-        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "waited {:?} for an agent that was already gone",
@@ -845,9 +915,14 @@ mod tests {
         fake.set_ready_after(Duration::from_secs(30));
         let mut t = task(spec());
         t.machine = Some("pi-1".into());
-        let err = dispatch(&fake, &mut t, Duration::from_millis(200))
-            .await
-            .unwrap_err();
+        let err = dispatch(
+            &fake,
+            &mut t,
+            &Agents::default(),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("not ready after"), "{message}");
         assert!(message.contains("may remain on pi-1"), "{message}");
@@ -878,7 +953,9 @@ mod tests {
         });
         let mut t = task(spec());
         let started = Instant::now();
-        let out = dispatch(&fake, &mut t, READY).await.unwrap();
+        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
         assert_eq!(out, DispatchOutcome::Blocked);
         assert!(started.elapsed() < READY, "waited out the readiness bound");
         assert_eq!(t.state, TaskState::Blocked);
@@ -908,7 +985,9 @@ mod tests {
             }
         });
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, READY).await.unwrap();
+        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
         assert_eq!(out, DispatchOutcome::Blocked);
         assert_eq!(t.state, TaskState::Blocked);
         assert!(t.pane_id.is_some(), "pane is kept for inspection");
@@ -919,7 +998,9 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_start_behaviour(StartBehaviour::Fail("unsupported_agent_kind".into()));
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Some("unsupported_agent_kind"));
         assert!(
             !err.is_transport(),
@@ -947,7 +1028,9 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_pane_busy_for(2);
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, READY).await.unwrap();
+        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
         assert_eq!(out, DispatchOutcome::Running);
         assert_eq!(t.state, TaskState::Running);
         let reqs = fake.requests();
@@ -963,7 +1046,9 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_pane_busy_for(PANE_BUSY_ATTEMPTS + 1);
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Some("agent_pane_busy"));
         assert!(!err.is_transport(), "a busy pane is not a dead machine");
         let message = err.to_string();
@@ -989,7 +1074,9 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_start_behaviour(StartBehaviour::Fail("agent_name_taken".into()));
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Some("agent_name_taken"));
         let starts = fake
             .requests()
@@ -1010,7 +1097,9 @@ mod tests {
         let mut t = task(spec());
         t.machine = Some("pi-1".into());
         let started = Instant::now();
-        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "waited {:?} for an agent that had already exited",
@@ -1038,7 +1127,9 @@ mod tests {
             repo: None,
             ..spec()
         });
-        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,

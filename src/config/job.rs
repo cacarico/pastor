@@ -10,7 +10,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::config::{AgentChoice, Defaults, parse_duration};
+use crate::config::{AgentChoice, Defaults, check_tools, parse_duration};
 use crate::connector::Catalog;
 use crate::schedule::Schedule;
 use crate::task::DispatchSpec;
@@ -47,6 +47,10 @@ pub struct DispatchTable {
     pub agent: Option<String>,
     /// `None` (no key) takes `[defaults] agent_args`; `[]` means none.
     pub agent_args: Option<Vec<String>>,
+    /// Added to the flock's and `[defaults]` allow list.
+    pub allow: Vec<String>,
+    /// Added to the flock's and `[defaults]` deny list.
+    pub deny: Vec<String>,
     pub repo: Option<String>,
     pub worktree: bool,
     pub branch: Option<String>,
@@ -148,9 +152,13 @@ impl Job {
         if max_tasks_per_run == 0 {
             return Err("dispatch.max_tasks_per_run must be at least 1".into());
         }
+        check_tools("dispatch.allow", &d.allow)?;
+        check_tools("dispatch.deny", &d.deny)?;
         let agent = AgentChoice {
             agent: d.agent,
             agent_args: d.agent_args,
+            allow: d.allow,
+            deny: d.deny,
         };
         let pick = defaults.resolve_agent(&agent, None);
         Ok(Job {
@@ -167,6 +175,8 @@ impl Job {
             spec: DispatchSpec {
                 agent: pick.agent,
                 agent_args: pick.agent_args,
+                allow: pick.allow,
+                deny: pick.deny,
                 repo: d.repo,
                 worktree: d.worktree,
                 branch: d.branch,
@@ -410,6 +420,22 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
     }
 
     #[test]
+    fn a_job_can_add_tool_lists_and_bad_patterns_are_invalid() {
+        let d = Defaults::default();
+        let text = SPEC_EXAMPLE.replace(
+            "agent_args = []\n",
+            "agent_args = []\nallow = [\"Edit\"]\ndeny = [\"WebFetch\"]\n",
+        );
+        let job = Job::parse(&text, "support-slack", &d, &Builtins).unwrap();
+        assert_eq!(job.agent.allow, vec!["Edit"]);
+        assert_eq!(job.agent.deny, vec!["WebFetch"]);
+        assert_eq!(job.spec.deny, vec!["WebFetch"]);
+        let bad = SPEC_EXAMPLE.replace("agent_args = []\n", "agent_args = []\nallow = [\"\"]\n");
+        let err = Job::parse(&bad, "support-slack", &d, &Builtins).unwrap_err();
+        assert!(err.contains("dispatch.allow"), "{err}");
+    }
+
+    #[test]
     fn a_connector_the_catalog_lacks_is_invalid() {
         let text = SPEC_EXAMPLE.replace("use = \"clock\"", "use = \"slack\"");
         let err = Job::parse(&text, "support-slack", &defaults(), &Builtins).unwrap_err();
@@ -480,6 +506,8 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         let d = Defaults {
             agent: "codex".into(),
             agent_args: vec![],
+            allow: vec![],
+            deny: vec![],
             max_tasks_per_run: 2,
             timeout: "30m".into(),
         };

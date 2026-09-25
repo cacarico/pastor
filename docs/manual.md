@@ -322,6 +322,77 @@ queued after it. The head reads `pastor.toml` again for every `task run`; a
 hand edit of `flock.toml` reaches it on the next tick, or at once with `pastor
 job reload`.
 
+### Tool allow and deny lists
+
+pastor leaves the agent's own permission mode alone: Claude still asks before
+it runs a tool its settings do not already allow, and a task that waits on
+such a question goes `blocked` until someone answers it with `pastor task
+send`. To answer some of those questions in advance, give pastor lists of tool
+patterns, in the agent's own syntax:
+
+```toml
+# pastor.toml
+[defaults]
+allow = ["Read", "Edit", "Bash(git:*)", "Bash(cargo test:*)"]
+deny = ["WebFetch", "Bash(rm:*)"]
+```
+
+```toml
+# flock.toml
+[[flock]]
+name = "work"
+allow = ["Bash(make:*)"]
+deny = ["Bash(git push:*)"]
+```
+
+```toml
+# a job file
+[dispatch]
+allow = ["Bash(gh pr view:*)"]
+prompt = "..."
+```
+
+`allow` lists tools the agent may use without asking; `deny` lists tools it
+must never use. The lists add up: a task gets `[defaults]`, then its flock's,
+then its job's, without repeats. **Deny wins**: a pattern in any `deny` is
+dropped from `allow`, and is passed to the agent as a deny as well, so a flock
+or a job can widen what `[defaults]` allows but never lift a deny from a
+broader layer. Patterns are compared as written; Claude itself also applies a
+deny over an allow that overlaps it. An empty pattern, or one that starts with
+`-`, fails the file's load: agent flags belong in `agent_args`.
+
+When it starts the agent, pastor turns the lists into the agent's own flags,
+after `agent_args`, one flag per pattern. For `claude` those are
+`--allowedTools` and `--disallowedTools`, so a task in the `work` flock above
+starts as `claude --allowedTools Read --allowedTools Edit ... --disallowedTools
+WebFetch ... --disallowedTools 'Bash(git push:*)'`. Another
+agent names its flags in pastor.toml:
+
+```toml
+[agents.my-agent]
+allow_flag = "--allow-tool"
+deny_flag = "--deny-tool"
+```
+
+A task whose agent has no flag for a list it carries is refused rather than
+started without it (`agent_tools_unsupported` from `pastor task run` and
+`pastor task retry`; a job records the error for that item). `pastor task show`
+prints a task's `allow` and `deny`. Since a head from before these lists would
+start the agent without them, `pastor task run` and `pastor task retry` refuse
+one (`head_too_old`): restart `pastor serve` after an upgrade.
+
+#### Arguments that turn permissions off
+
+`agent_args` is passed through as written, so it can also carry
+`--dangerously-skip-permissions`, `--permission-mode bypassPermissions` or an
+agent's equivalent. pastor allows this, but **it is dangerous**: with it the
+agent asks nothing and no allow list applies. Whatever reads the prompt, the
+repo or a web page can then steer an agent that runs every command it is told
+to, as the head's user on that machine, with that user's files, keys and
+network. See [Trust model](#trust-model) before you set one, prefer a narrow
+`allow` list, and keep such args in a flock of disposable machines rather than
+in `[defaults]`.
+
 `pastor machine move` changes the flock of tasks dispatched after it; tasks
 already on the machine keep running there, and its connection stays up. A
 queued task pinned to a machine that has moved to another flock stays queued
@@ -720,6 +791,40 @@ plugin's hooks fall that far behind, the oldest waiting events are dropped
 and logged. A hook that fails or times out is logged and not retried. Its output goes to `~/.local/state/pastor/runs/@<id>/`, redacted
 like connector logs.
 
+## Trust model
+
+pastor gives an agent what the head's user has on each machine. It reaches a
+machine over ssh as the user in `ssh = "user@host"` (or runs locally as the
+head's own user), and herdr starts the agent in a pane of that user's
+session. The agent can do what that user can do there: read and write their
+files, use their ssh keys, git credentials and API tokens, reach what their
+network reaches, including other machines they can log in to.
+
+The prompt is the agent's input, and it is not always yours. A job's prompt
+is filled from connector items (an issue, a message, a page); a repo holds
+READMEs, comments and test output; the agent may fetch web pages. Any of
+these can carry instructions written to steer the agent: prompt injection.
+What stands between such text and the machine is the agent's own permission
+checks: its settings, the `allow` and `deny` lists pastor passes, and the
+question it asks before anything else, which parks the task as `blocked`
+until a human answers.
+
+So:
+
+- Keep the agent's permission prompts on. An `allow` list should name the
+  tools a task needs, not everything; put what must never happen in `deny`.
+- `--dangerously-skip-permissions` and its kin in `agent_args` remove the
+  checks entirely (see [Arguments that turn permissions
+  off](#arguments-that-turn-permissions-off)). A prompt-injected agent then
+  acts as the head's user on that machine with nothing to stop it. Use them
+  only on machines you could wipe, with no credentials worth stealing, and
+  never for jobs fed by input you do not control.
+- Answer a blocked task only after reading its pane (`pastor task attach`),
+  and treat `pastor task send --trust` the same way: it trusts the repo for
+  every later task on that machine.
+- Give each flock its own machines and accounts when work and personal data
+  must not meet; a flock is a routing rule, not a sandbox.
+
 ## Files
 
 ```
@@ -753,10 +858,14 @@ close_done_after = "15m"     # a done task's pane closes after this; "never" kee
 [defaults]                   # for run flags, job keys and flock keys that are left out
 agent = "claude"
 agent_args = []              # e.g. ["--model", "claude-opus-5-5"]
+allow = []                   # tool patterns the agent may use unasked, e.g. ["Bash(git:*)"]
+deny = []                    # tool patterns it must never use; wins over allow
 max_tasks_per_run = 5
 timeout = "2h"
 [agents.claude]              # one table per agent that needs one
 trust_keys = ["Down", "Enter"]   # accept its folder-trust prompt; [] for none
+allow_flag = "--allowedTools"    # the flag before each allow pattern
+deny_flag = "--disallowedTools"  # the flag before each deny pattern
 ```
 
 ## Shell completions

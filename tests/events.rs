@@ -30,6 +30,8 @@ fn task(id: i64) -> Task {
             spec: DispatchSpec {
                 agent: "claude".into(),
                 agent_args: vec![],
+                allow: vec![],
+                deny: vec![],
                 repo: None,
                 worktree: false,
                 branch: None,
@@ -237,6 +239,8 @@ async fn the_daemon_writes_the_events_log() {
             spec: DispatchSpec {
                 agent: "claude".into(),
                 agent_args: vec![],
+                allow: vec![],
+                deny: vec![],
                 repo: None,
                 worktree: false,
                 branch: None,

@@ -177,6 +177,11 @@ pub struct Defaults {
     /// Extra argv for the agent (`["--model", "claude-opus-5-5"]`), for tasks
     /// whose run flags, job file and flock give none. See `resolve_agent`.
     pub agent_args: Vec<String>,
+    /// Tool patterns every task's agent may use without asking
+    /// (`"Bash(git:*)"`); a flock and a job add to them. See `resolve_agent`.
+    pub allow: Vec<String>,
+    /// Tool patterns every task's agent must never use; wins over `allow`.
+    pub deny: Vec<String>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
 }
@@ -190,6 +195,12 @@ pub struct AgentChoice {
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_args: Option<Vec<String>>,
+    /// Tool patterns added to the flock's and `[defaults]` allow lists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Tool patterns added to the flock's and `[defaults]` deny lists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
 }
 
 /// The agent a task runs, as `Defaults::resolve_agent` settled it.
@@ -197,13 +208,34 @@ pub struct AgentChoice {
 pub struct AgentPick {
     pub agent: String,
     pub agent_args: Vec<String>,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
 }
 
 impl AgentPick {
     pub fn apply_to(&self, spec: &mut crate::task::DispatchSpec) {
         spec.agent = self.agent.clone();
         spec.agent_args = self.agent_args.clone();
+        spec.allow = self.allow.clone();
+        spec.deny = self.deny.clone();
     }
+}
+
+/// Refuse a tool pattern the agent's command line would misread: an empty
+/// one, or one that starts with `-` and reads as a flag. `key` names where
+/// it came from for the error.
+pub fn check_tools(key: &str, patterns: &[String]) -> Result<(), String> {
+    for p in patterns {
+        if p.trim().is_empty() {
+            return Err(format!("{key}: a tool pattern must not be empty"));
+        }
+        if p.starts_with('-') {
+            return Err(format!(
+                "{key}: tool pattern {p:?} starts with '-'; agent flags go in agent_args"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Defaults {
@@ -212,9 +244,30 @@ impl Defaults {
     /// one. Its args come from the first of the three that sets
     /// `agent_args` and was written for that agent: one that names no agent,
     /// or names the same one. So a flock's `--model` for codex never reaches
-    /// a task that asked for claude. The one place the rule lives, so run and
-    /// jobs cannot drift apart.
+    /// a task that asked for claude.
+    ///
+    /// `allow` and `deny` add up instead, `[defaults]` then flock then ask,
+    /// so a narrower layer can never lift a broader one's deny: a pattern
+    /// in any `deny` is dropped from `allow`, and also passed as a deny.
+    /// The one place these rules live, so run and jobs cannot drift apart.
     pub fn resolve_agent(&self, ask: &AgentChoice, flock: Option<&flock::FlockEntry>) -> AgentPick {
+        let lists =
+            |pick: fn(&flock::FlockEntry) -> &Vec<String>, own: &Vec<String>, ask: &Vec<String>| {
+                let mut out: Vec<String> = Vec::new();
+                for p in own
+                    .iter()
+                    .chain(flock.map(pick).into_iter().flatten())
+                    .chain(ask)
+                {
+                    if !out.contains(p) {
+                        out.push(p.clone());
+                    }
+                }
+                out
+            };
+        let deny = lists(|f| &f.deny, &self.deny, &ask.deny);
+        let mut allow = lists(|f| &f.allow, &self.allow, &ask.allow);
+        allow.retain(|p| !deny.contains(p));
         let flock = flock.map(|f| (f.agent.as_deref(), f.agent_args.as_ref()));
         let agent = ask
             .agent
@@ -232,7 +285,12 @@ impl Defaults {
             .find_map(|(for_agent, args)| args.filter(|_| for_agent.is_none_or(|a| a == agent)))
             .cloned()
             .unwrap_or_default();
-        AgentPick { agent, agent_args }
+        AgentPick {
+            agent,
+            agent_args,
+            allow,
+            deny,
+        }
     }
 }
 
@@ -241,6 +299,8 @@ impl Default for Defaults {
         Defaults {
             agent: "claude".into(),
             agent_args: vec![],
+            allow: vec![],
+            deny: vec![],
             max_tasks_per_run: 5,
             timeout: "2h".into(),
         }
@@ -256,6 +316,14 @@ pub struct AgentDef {
     /// an empty list means the agent has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_keys: Option<Vec<String>>,
+    /// The flag that hands the agent one pattern of an `allow` list, put
+    /// before each pattern. Unset keeps the built-in (`--allowedTools` for
+    /// claude); an agent with none refuses tasks that carry an allow list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_flag: Option<String>,
+    /// Like `allow_flag`, for `deny` (`--disallowedTools` for claude).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deny_flag: Option<String>,
 }
 
 /// `[agents.<name>]`, by agent name (`claude`, `codex`).
@@ -266,6 +334,10 @@ pub struct Agents(pub std::collections::BTreeMap<String, AgentDef>);
 /// Claude's folder-trust dialog opens on "No, exit"; Down moves to "Yes,
 /// proceed" and Enter takes it.
 const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
+
+/// Claude Code's own names for the allow and deny lists (`claude --help`).
+/// Both take several patterns and may repeat, so one flag per pattern works.
+const CLAUDE_TOOL_FLAGS: (&str, &str) = ("--allowedTools", "--disallowedTools");
 
 impl Agents {
     /// The keys that accept `agent`'s folder-trust prompt: its own
@@ -278,6 +350,47 @@ impl Agents {
             None => return None,
         };
         (!keys.is_empty()).then_some(keys)
+    }
+
+    /// The flags that carry `agent`'s allow and deny lists: its own, else the
+    /// built-in ones (only `claude` has any).
+    fn tool_flags(&self, agent: &str) -> (Option<String>, Option<String>) {
+        let def = self.0.get(agent);
+        let builtin = (agent == "claude").then_some(CLAUDE_TOOL_FLAGS);
+        (
+            def.and_then(|d| d.allow_flag.clone())
+                .or(builtin.map(|b| b.0.to_string())),
+            def.and_then(|d| d.deny_flag.clone())
+                .or(builtin.map(|b| b.1.to_string())),
+        )
+    }
+
+    /// The argv after the agent's name for `spec`: its `agent_args`, then
+    /// the flag and pattern of each `allow`, then of each `deny`. Refused
+    /// when a list is not empty and the agent has no flag for it: dropping
+    /// a deny list without a word would be worse than not starting.
+    pub fn launch_args(&self, spec: &crate::task::DispatchSpec) -> Result<Vec<String>, String> {
+        let (allow_flag, deny_flag) = self.tool_flags(&spec.agent);
+        let mut args = spec.agent_args.clone();
+        for (list, flag, key) in [
+            (&spec.allow, allow_flag, "allow_flag"),
+            (&spec.deny, deny_flag, "deny_flag"),
+        ] {
+            if list.is_empty() {
+                continue;
+            }
+            let Some(flag) = flag else {
+                return Err(format!(
+                    "agent {} has no {key} to pass its tool list; set [agents.{}] {key} in pastor.toml",
+                    spec.agent, spec.agent
+                ));
+            };
+            for p in list {
+                args.push(flag.clone());
+                args.push(p.clone());
+            }
+        }
+        Ok(args)
     }
 }
 
@@ -371,7 +484,21 @@ impl PastorConfig {
                 anyhow::bail!("{}: {name}: must not be zero", path.display());
             }
         }
+        for (key, list) in [
+            ("defaults.allow", &cfg.defaults.allow),
+            ("defaults.deny", &cfg.defaults.deny),
+        ] {
+            check_tools(key, list).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        }
         for (name, def) in &cfg.agents.0 {
+            for (key, flag) in [
+                ("allow_flag", &def.allow_flag),
+                ("deny_flag", &def.deny_flag),
+            ] {
+                if flag.as_deref().is_some_and(|f| f.trim().is_empty()) {
+                    anyhow::bail!("{}: agents.{name}.{key} must not be empty", path.display());
+                }
+            }
             if def.trust_keys.iter().flatten().any(|k| k.trim().is_empty()) {
                 anyhow::bail!(
                     "{}: agents.{name}.trust_keys: a key name must not be empty",
@@ -574,6 +701,129 @@ mod tests {
         );
     }
 
+    /// Allow and deny lists add up from `[defaults]` through the flock to
+    /// the task, in that order and without repeats; a deny anywhere drops the
+    /// same pattern from allow, so no layer can lift another's deny.
+    #[test]
+    fn tool_lists_add_up_and_deny_wins() {
+        let d = Defaults {
+            allow: vec!["Read".into(), "Bash(git:*)".into()],
+            deny: vec!["Bash(rm:*)".into()],
+            ..Default::default()
+        };
+        let work = flock::FlockEntry {
+            name: "work".into(),
+            allow: vec!["Edit".into(), "Read".into()],
+            deny: vec!["Bash(git:*)".into()],
+            ..Default::default()
+        };
+        let ask = AgentChoice {
+            allow: vec!["Bash(rm:*)".into(), "Write".into()],
+            ..Default::default()
+        };
+        let p = d.resolve_agent(&ask, Some(&work));
+        assert_eq!(p.allow, vec!["Read", "Edit", "Write"]);
+        assert_eq!(p.deny, vec!["Bash(rm:*)", "Bash(git:*)"]);
+        let p = d.resolve_agent(&AgentChoice::default(), None);
+        assert_eq!(p.allow, vec!["Read", "Bash(git:*)"]);
+        assert_eq!(p.deny, vec!["Bash(rm:*)"]);
+    }
+
+    fn spec_with(agent: &str, allow: &[&str], deny: &[&str]) -> crate::task::DispatchSpec {
+        crate::task::DispatchSpec {
+            agent: agent.into(),
+            agent_args: vec!["--model".into(), "m".into()],
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            repo: None,
+            worktree: false,
+            branch: None,
+            machine: None,
+            tags: vec![],
+            timeout_secs: 60,
+            checkout: None,
+            reopen: None,
+        }
+    }
+
+    /// Claude gets its own flags, one per pattern after its args; an agent
+    /// with no flag for a list it was given is refused, not started without
+    /// it; one that sets its own flags gets those.
+    #[test]
+    fn launch_args_turn_tool_lists_into_the_agents_flags() {
+        let agents = Agents::default();
+        let spec = spec_with("claude", &["Bash(git log:*)", "Edit"], &["Bash(rm:*)"]);
+        assert_eq!(
+            agents.launch_args(&spec).unwrap(),
+            vec![
+                "--model",
+                "m",
+                "--allowedTools",
+                "Bash(git log:*)",
+                "--allowedTools",
+                "Edit",
+                "--disallowedTools",
+                "Bash(rm:*)",
+            ]
+        );
+        assert_eq!(
+            agents.launch_args(&spec_with("codex", &[], &[])).unwrap(),
+            vec!["--model", "m"]
+        );
+        let err = agents
+            .launch_args(&spec_with("codex", &[], &["Bash(rm:*)"]))
+            .unwrap_err();
+        assert!(err.contains("[agents.codex] deny_flag"), "{err}");
+
+        let mut own = Agents::default();
+        own.0.insert(
+            "codex".into(),
+            AgentDef {
+                deny_flag: Some("--deny".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            own.launch_args(&spec_with("codex", &[], &["x"])).unwrap(),
+            vec!["--model", "m", "--deny", "x"]
+        );
+        assert!(own.launch_args(&spec_with("codex", &["y"], &[])).is_err());
+    }
+
+    #[test]
+    fn tool_lists_load_from_defaults_and_bad_ones_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nallow = [\"Bash(git:*)\"]\ndeny = [\"WebFetch\"]\n[agents.codex]\nallow_flag = \"--allow\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.allow, vec!["Bash(git:*)"]);
+        assert_eq!(cfg.defaults.deny, vec!["WebFetch"]);
+        assert_eq!(cfg.agents.0["codex"].allow_flag.as_deref(), Some("--allow"));
+
+        for (text, want) in [
+            (
+                "[defaults]\ndeny = [\"\"]\n",
+                "defaults.deny: a tool pattern must not be empty",
+            ),
+            (
+                "[defaults]\nallow = [\"--dangerously-skip-permissions\"]\n",
+                "agent flags go in agent_args",
+            ),
+            (
+                "[agents.codex]\ndeny_flag = \" \"\n",
+                "agents.codex.deny_flag",
+            ),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            assert!(err.contains(want), "{text}: {err}");
+        }
+    }
+
     #[test]
     fn claude_has_built_in_trust_keys_and_agents_can_set_their_own() {
         let cfg = PastorConfig::default();
@@ -667,6 +917,8 @@ mod tests {
         let own = AgentChoice {
             agent: Some("aider".into()),
             agent_args: Some(vec!["-v".into()]),
+            allow: vec![],
+            deny: vec![],
         };
         assert_eq!(pick(&own, Some(&work)), ("aider".into(), "-v".into()));
         // Args follow the agent they were written for: the flock's are for
@@ -674,6 +926,8 @@ mod tests {
         let claude = AgentChoice {
             agent: Some("claude".into()),
             agent_args: None,
+            allow: vec![],
+            deny: vec![],
         };
         assert_eq!(
             pick(&claude, Some(&work)),
@@ -682,6 +936,8 @@ mod tests {
         let codex = AgentChoice {
             agent: Some("codex".into()),
             agent_args: None,
+            allow: vec![],
+            deny: vec![],
         };
         assert_eq!(
             pick(&codex, Some(&work)),

@@ -139,6 +139,16 @@ pub fn task_detail(t: &Task) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     };
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "-".to_string()
+        } else {
+            v.iter()
+                .map(|p| crate::herdr::shell_quote(p))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    };
     let mut repo = opt(&t.spec.repo);
     if t.spec.worktree {
         repo.push_str(" (worktree");
@@ -160,6 +170,8 @@ pub fn task_detail(t: &Task) -> String {
         ("machine", opt(&t.machine)),
         ("agent", t.spec.agent.clone()),
         ("agent args", args),
+        ("allow", list(&t.spec.allow)),
+        ("deny", list(&t.spec.deny)),
         ("repo", repo),
         ("tags", tags),
         ("timeout", format!("{}s", t.spec.timeout_secs)),
@@ -747,6 +759,8 @@ mod tests {
         let spec = crate::task::DispatchSpec {
             agent: "claude".into(),
             agent_args: vec![],
+            allow: vec![],
+            deny: vec![],
             repo: None,
             worktree: false,
             branch: None,
@@ -799,6 +813,8 @@ mod tests {
                 "--append-system-prompt".into(),
                 "be brief".into(),
             ],
+            allow: vec!["Bash(git log:*)".into(), "Edit".into()],
+            deny: vec!["Bash(rm:*)".into()],
             repo: Some("~/work/api".into()),
             worktree: true,
             branch: Some("pastor/t-3".into()),
@@ -814,6 +830,11 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("agent:      claude"), "{out}");
+        assert!(
+            out.contains("allow:      'Bash(git log:*)' Edit\n"),
+            "{out}"
+        );
+        assert!(out.contains("deny:       'Bash(rm:*)'\n"), "{out}");
         assert!(
             out.contains("repo:       ~/work/api (worktree, branch pastor/t-3)"),
             "{out}"
@@ -836,6 +857,8 @@ mod tests {
         let mut t = task_with(crate::task::DispatchSpec {
             agent: "claude".into(),
             agent_args: vec![],
+            allow: vec![],
+            deny: vec![],
             repo: None,
             worktree: false,
             branch: None,

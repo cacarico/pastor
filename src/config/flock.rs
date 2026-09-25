@@ -51,6 +51,12 @@ pub struct FlockEntry {
     /// Like `agent`, for the agent's args; `[]` means none, not `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_args: Option<Vec<String>>,
+    /// Tool patterns this flock's agents may use, on top of `[defaults]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Tool patterns this flock's agents must not use, on top of `[defaults]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
 }
 
 /// Why a task cannot have the flock it asked for (`Flock::task_flock`).
@@ -133,6 +139,8 @@ impl Flock {
             if !names.insert(&f.name) {
                 return Err(format!("flock {} listed twice", f.name));
             }
+            crate::config::check_tools(&format!("flock {}: allow", f.name), &f.allow)?;
+            crate::config::check_tools(&format!("flock {}: deny", f.name), &f.deny)?;
         }
         if !self.flocks.is_empty() {
             let defaults: Vec<&str> = self
@@ -798,6 +806,19 @@ flock = "work"
         assert!(f.entry("play").is_none());
         // The implicit flock of a file with no `[[flock]]` has no entry.
         assert!(Flock::default().entry(DEFAULT_FLOCK).is_none());
+    }
+
+    #[test]
+    fn a_flock_entry_can_carry_tool_lists_and_bad_patterns_fail_the_load() {
+        let f = flocks(
+            "[[flock]]\nname = \"home\"\ndefault = true\nallow = [\"Edit\"]\ndeny = [\"Bash(rm:*)\"]\n",
+        )
+        .unwrap();
+        assert_eq!(f.entry("home").unwrap().allow, vec!["Edit"]);
+        assert_eq!(f.entry("home").unwrap().deny, vec!["Bash(rm:*)"]);
+        let err =
+            flocks("[[flock]]\nname = \"home\"\ndefault = true\ndeny = [\"-x\"]\n").unwrap_err();
+        assert!(err.contains("flock home: deny"), "{err}");
     }
 
     const COMMENTED: &str = "# my fleet\n\n[[machine]]\nname = \"pi-1\"   # the desk one\nlocal = true\n\n# spare\n[[machine]]\nname = \"pi-3\"\nssh = \"user@pi-3\"\n";

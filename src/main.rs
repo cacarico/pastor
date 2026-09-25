@@ -298,7 +298,14 @@ fn main() {
     let result = rt.block_on(async {
         // Commands that never talk to the head do not read `head`.
         let head = match head_use(&command) {
-            Some(flocky) => probe_head(&paths, flocky || flocks_declared(&paths)).await?,
+            Some(flocky) => {
+                probe_head(
+                    &paths,
+                    flocky || flocks_declared(&paths),
+                    needs_agent_protocol(&command),
+                )
+                .await?
+            }
             None => Head::Absent,
         };
         match command {
@@ -363,7 +370,11 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 /// before flocks is refused too: it ignores the `flock` field of a request
 /// (serde skips unknown fields) and reads flock.toml as one flock, so it
 /// would dispatch, list or reload across every flock.
-async fn probe_head(paths: &Paths, flocks: bool) -> anyhow::Result<Head> {
+///
+/// `agents` is for a command that queues a task (`needs_agent_protocol`): a
+/// head before `AGENT_PROTOCOL` would drop the task's tool lists, so it is
+/// refused too.
+async fn probe_head(paths: &Paths, flocks: bool, agents: bool) -> anyhow::Result<Head> {
     let socket = paths.socket_file();
     match pastor::ipc::ping_head(&socket).await {
         HeadPing::NotRunning => Ok(Head::Absent),
@@ -374,6 +385,16 @@ async fn probe_head(paths: &Paths, flocks: bool) -> anyhow::Result<Head> {
                 socket.display()
             ),
         )),
+        HeadPing::Pong { version, protocol }
+            if agents && protocol < pastor::ipc::AGENT_PROTOCOL =>
+        {
+            Err(pastor::cli::CliError::err(
+                "head_too_old",
+                format!(
+                    "the running pastor serve ({version}) predates flock agents and tool allow and deny lists, and would start the agent without them; restart it"
+                ),
+            ))
+        }
         HeadPing::Pong { protocol, .. } if !flocks || protocol >= pastor::ipc::FLOCK_PROTOCOL => {
             Ok(Head::Live)
         }
@@ -411,6 +432,17 @@ fn head_use(command: &Command) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+/// Whether `command` queues a task whose agent the head resolves: it needs a
+/// head at `AGENT_PROTOCOL` or later.
+fn needs_agent_protocol(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Task {
+            cmd: TaskCmd::Run(_) | TaskCmd::Retry { .. }
+        }
+    )
 }
 
 /// Whether flock.toml declares named flocks, so a command with no `--flock`
@@ -477,6 +509,7 @@ fn agent_choice(a: &RunArgs) -> AgentChoice {
     AgentChoice {
         agent: a.agent.clone(),
         agent_args: (!a.agent_args.is_empty()).then(|| a.agent_args.clone()),
+        ..Default::default()
     }
 }
 
@@ -495,6 +528,8 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
     Ok(DispatchSpec {
         agent: pick.agent,
         agent_args: pick.agent_args,
+        allow: pick.allow,
+        deny: pick.deny,
         repo: a.repo.clone(),
         worktree: a.worktree,
         branch: a.branch.clone(),
@@ -1416,6 +1451,54 @@ mod tests {
 
     /// The head resolves the agent with the task's flock, so the request
     /// carries only what the flags said: nothing, when they said nothing.
+    /// A head from before `AGENT_PROTOCOL` would drop a task's deny list
+    /// without a word, so `task run` and `task retry` refuse it; other
+    /// commands still work with it.
+    #[tokio::test]
+    async fn queueing_a_task_refuses_a_head_before_tool_lists() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.into_split();
+                let mut line = String::new();
+                tokio::io::BufReader::new(r)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let pong = IpcResponse::Pong {
+                    version: "0.4.0".into(),
+                    protocol: 1,
+                };
+                let mut out = serde_json::to_string(&pong).unwrap();
+                out.push('\n');
+                w.write_all(out.as_bytes()).await.unwrap();
+            }
+        });
+        let err = probe_head(&paths, false, true).await.unwrap_err();
+        let err = err.downcast::<pastor::cli::CliError>().unwrap();
+        assert_eq!(err.code, "head_too_old");
+        assert!(
+            err.message.contains("tool allow and deny"),
+            "{}",
+            err.message
+        );
+        assert_eq!(probe_head(&paths, true, false).await.unwrap(), Head::Live);
+
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        assert!(needs_agent_protocol(&parse(&[
+            "pastor", "task", "run", "hi"
+        ])));
+        assert!(needs_agent_protocol(&parse(&[
+            "pastor", "task", "retry", "t-1"
+        ])));
+        assert!(!needs_agent_protocol(&parse(&["pastor", "task", "list"])));
+    }
+
     #[test]
     fn run_sends_only_the_agent_its_flags_name() {
         assert_eq!(agent_choice(&run_args(&["hi"])), AgentChoice::default());
@@ -1425,6 +1508,7 @@ mod tests {
             AgentChoice {
                 agent: Some("codex".into()),
                 agent_args: Some(vec!["-v".into()]),
+                ..Default::default()
             }
         );
     }

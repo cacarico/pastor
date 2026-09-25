@@ -624,7 +624,7 @@ impl Scheduler {
         fleet: Arc<Fleet>,
         events: broadcast::Sender<PastorEvent>,
     ) -> Scheduler {
-        fleet.set_defaults(config.defaults.clone());
+        fleet.set_config(config);
         Scheduler {
             paths,
             defaults: config.defaults.clone(),
@@ -888,11 +888,11 @@ impl Scheduler {
             Ok(config) => {
                 if config.defaults != self.config.defaults {
                     self.defaults = config.defaults.clone();
-                    self.fleet.set_defaults(config.defaults.clone());
                     // Jobs were parsed with the old defaults.
                     self.fingerprint = None;
                 }
                 self.tick = config.tick_duration();
+                self.fleet.set_config(&config);
                 self.config = config;
             }
             Err(err) if is_not_found(&err) => tracing::warn!(
@@ -1572,6 +1572,8 @@ mod tests {
             spec: DispatchSpec {
                 agent: "claude".into(),
                 agent_args: vec![],
+                allow: vec![],
+                deny: vec![],
                 repo: Some("/srv/{{ job.name }}".into()),
                 worktree: true,
                 branch: Some("pastor/{{ item.key }}".into()),
