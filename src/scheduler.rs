@@ -825,6 +825,9 @@ impl Scheduler {
             .await;
         if !diff.is_empty() {
             tracing::info!(added = ?diff.added, removed = ?diff.removed, retargeted = ?diff.retargeted, "flock reloaded");
+            if !diff.removed.is_empty() {
+                crate::daemon::warn_removed(&self.store, &flock);
+            }
         }
         Some(diff)
     }

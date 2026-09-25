@@ -1664,3 +1664,81 @@ fn prune_works_without_a_daemon_and_retry_does_not() {
     let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
     assert_eq!(err["code"], "usage_error");
 }
+
+fn wait_for_machine(env: &Env, name: &str, present: bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = env.cmd(&["machine", "list", "--json"]);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        let ms = v["machines"].as_array().cloned().unwrap_or_default();
+        let ok = match ms.iter().find(|m| m["name"] == name) {
+            Some(m) => present && m["channel"] == "connected",
+            None => !present,
+        };
+        if ok {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name}: present={present} never held: {ms:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `machine add` and `machine remove` reach a running head without a
+/// restart, and a task left on a removed machine shows as such (Review
+/// Focus 3).
+#[test]
+fn flock_edits_reach_a_running_head() {
+    let env = start();
+    let socket = env.config.parent().unwrap().join("herdr.sock");
+    let bridge = format!(
+        "{} --connect {}",
+        env!("CARGO_BIN_EXE_fake-herdr"),
+        socket.display()
+    );
+    let out = env.cmd(&[
+        "machine",
+        "add",
+        "second",
+        "--command",
+        &bridge,
+        "--max-agents",
+        "1",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(said.contains("picked it up"), "{said}");
+    wait_for_machine(&env, "second", true);
+
+    let out = env.cmd(&["task", "run", "hello", "--machine", "second", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["machine"], "second", "{task}");
+
+    let out = env.cmd(&["machine", "remove", "second"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("picked it up"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    wait_for_machine(&env, "second", false);
+    // --all: the fake finishes agents on its own, and a task it finished
+    // before the removal is done, which the default live view hides.
+    let list = String::from_utf8_lossy(&env.cmd(&["task", "list", "--all"]).stdout).into_owned();
+    assert!(list.contains("second (removed)"), "{list}");
+}

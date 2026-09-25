@@ -1,6 +1,7 @@
 use chrono::Utc;
 use serde::Serialize;
 
+use crate::config::flock::Flock;
 use crate::ipc::{RequestError, connect_error_means_no_daemon};
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
@@ -210,6 +211,21 @@ pub fn request_failure(err: &RequestError) -> (&'static str, String) {
             "runtime_error",
             format!("pastor serve dropped the request: {e:#}"),
         ),
+    }
+}
+
+/// Tasks still holding a pane on a machine the flock no longer has. Nothing
+/// reconciles them, so their state is the last one seen; the MACHINE column
+/// says so instead of looking live. Rows and tasks are in the same order
+/// (`task_rows`).
+pub fn mark_removed(rows: &mut [Vec<String>], tasks: &[Task], flock: &Flock) {
+    for (row, t) in rows.iter_mut().zip(tasks) {
+        if let Some(m) = &t.machine
+            && t.state.occupies_pane()
+            && flock.get(m).is_none()
+        {
+            row[2] = format!("{m} (removed)");
+        }
     }
 }
 
@@ -597,6 +613,51 @@ mod tests {
             Some("0.9.1")
         );
         assert_eq!(herdr_version_from("").as_deref(), None);
+    }
+
+    #[test]
+    fn mark_removed_names_machines_no_longer_in_the_flock() {
+        use crate::config::flock::{Flock, MachineConfig};
+        use crate::task::TaskState;
+        let spec = crate::task::DispatchSpec {
+            agent: "claude".into(),
+            agent_args: vec![],
+            repo: None,
+            worktree: false,
+            branch: None,
+            machine: None,
+            tags: vec![],
+            timeout_secs: 60,
+        };
+        let running_gone = task_with(spec.clone()); // on pi-3, running
+        let closed_gone = Task {
+            state: TaskState::Closed,
+            ..task_with(spec.clone())
+        };
+        let here = Task {
+            machine: Some("pi-1".into()),
+            ..task_with(spec)
+        };
+        let tasks = vec![running_gone, closed_gone, here];
+        let flock = Flock {
+            machines: vec![MachineConfig {
+                name: "pi-1".into(),
+                local: true,
+                ssh: None,
+                command: None,
+                session: "default".into(),
+                max_agents: 2,
+                tags: vec![],
+            }],
+        };
+        let mut rows = task_rows(&tasks);
+        mark_removed(&mut rows, &tasks, &flock);
+        assert_eq!(rows[0][2], "pi-3 (removed)");
+        assert_eq!(
+            rows[1][2], "pi-3",
+            "a closed task is history, not a live row"
+        );
+        assert_eq!(rows[2][2], "pi-1");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
 use crate::machine::{MachineHandle, MachineSettings, OrphanClosed, PastorEvent, spawn_machine};
 use crate::scheduler::{Scheduler, SchedulerHandle};
-use crate::store::{NewTask, RetryError, Store};
+use crate::store::{NewTask, RetryError, Store, TaskFilter};
 use crate::task::Task;
 use crate::task::TaskState;
 
@@ -36,6 +36,41 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         agent_ready_timeout: config.agent_ready_timeout_duration(),
         poll_every: config.tick_duration(),
         ..Default::default()
+    }
+}
+
+/// Open tasks (holding a pane) on machines `flock` does not have. No actor
+/// reconciles them, so their state is the last one seen. They are never
+/// marked done or failed and not counted toward capacity.
+pub fn tasks_on_removed_machines(store: &Store, flock: &Flock) -> anyhow::Result<Vec<Task>> {
+    Ok(store
+        .list_tasks(&TaskFilter {
+            job: None,
+            machine: None,
+            states: None,
+        })?
+        .into_iter()
+        .filter(|t| {
+            t.state.occupies_pane() && t.machine.as_deref().is_some_and(|m| flock.get(m).is_none())
+        })
+        .collect())
+}
+
+/// One warning per task left on a removed machine: at daemon start (a
+/// machine taken out while pastor was down) and after a reload removed one.
+pub fn warn_removed(store: &Store, flock: &Flock) {
+    match tasks_on_removed_machines(store, flock) {
+        Ok(tasks) => {
+            for t in tasks {
+                tracing::warn!(
+                    task = %t.display_id(),
+                    machine = t.machine.as_deref().unwrap_or("-"),
+                    state = %t.state,
+                    "task on a machine that is not in the flock: left as it was"
+                );
+            }
+        }
+        Err(err) => tracing::error!(%err, "list tasks on removed machines"),
     }
 }
 
@@ -325,6 +360,7 @@ impl Daemon {
         let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone()));
         let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
         fleet.apply_flock(&flock, &machine_settings(&config)).await;
+        warn_removed(&store, &flock);
         // Subscribed in `start`, before any actor runs, so the log sees the
         // first events too. The log holds the fleet weakly (see `spawn_log`),
         // so dropping the daemon still winds the tasks down.
@@ -961,6 +997,38 @@ mod tests {
             TaskState::Running
         );
         assert_eq!(fleet.get("a").unwrap().snapshot().live, 1);
+    }
+
+    /// Review Focus 3: which rows a removed machine leaves behind. Only rows
+    /// that still hold a pane count; a closed one is finished business.
+    #[test]
+    fn tasks_on_removed_machines_lists_open_tasks_only() {
+        let store = Store::open_in_memory().unwrap();
+        let put = |machine: &str, state: TaskState| {
+            let mut t = store
+                .insert_task(NewTask {
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                })
+                .unwrap();
+            t.machine = Some(machine.into());
+            t.state = state;
+            store.update_task(&mut t).unwrap();
+            t.id
+        };
+        let running_gone = put("gone", TaskState::Running);
+        let blocked_gone = put("gone", TaskState::Blocked);
+        put("gone", TaskState::Closed);
+        put("a", TaskState::Running);
+        let mut ids: Vec<i64> = tasks_on_removed_machines(&store, &flock_of(&[("a", 2)]))
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![running_gone, blocked_gone]);
     }
 
     #[tokio::test]

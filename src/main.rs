@@ -700,10 +700,14 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
             println!("no tasks");
         }
     } else {
-        println!(
-            "{}",
-            pastor::cli::table(&pastor::cli::TASK_HEADER, &pastor::cli::task_rows(&tasks))
-        );
+        let mut rows = pastor::cli::task_rows(&tasks);
+        // The flock file is the truth for "removed" whether or not a head
+        // runs (a running head re-reads it every tick). A flock that does not
+        // load marks nothing rather than everything.
+        if let Ok(flock) = Flock::load(&paths.flock_file()) {
+            pastor::cli::mark_removed(&mut rows, &tasks, &flock);
+        }
+        println!("{}", pastor::cli::table(&pastor::cli::TASK_HEADER, &rows));
     }
     // Orphans have no row to list, so they get a line each under the table.
     // Only a running head knows them (its last reconcile); `--json` stays a
@@ -817,20 +821,14 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 ),
                 _ => {}
             }
-            println!(
-                "{}",
-                machine_edit_hint(daemon_running(&paths.socket_file()).await)
-            );
+            println!("{}", reload_running_head(paths).await);
         }
         MachineCmd::Remove { name, herdr } => {
             let mut f = Flock::load(&path)?;
             let target = f.get(&name).and_then(|m| m.ssh.clone());
             anyhow::ensure!(f.remove(&name), "machine {name} not found");
             f.save(&path)?;
-            println!(
-                "removed {name}; {}",
-                machine_edit_hint(daemon_running(&paths.socket_file()).await)
-            );
+            println!("removed {name}; {}", reload_running_head(paths).await);
             if herdr {
                 // herdr removes by profile id; the label is all pastor knows.
                 let list = herdr_cmd(&["machine", "list"]);
@@ -870,14 +868,17 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What to do after editing the flock. The daemon reads `flock.toml` only at
-/// start (hot reload is a later plan), so a running one must be restarted;
-/// with none running, "restart" reads as "already picked up" and misleads.
-fn machine_edit_hint(daemon_up: bool) -> &'static str {
-    if daemon_up {
-        "restart pastor serve to pick it up (the flock does not reload while it runs)"
-    } else {
-        "start pastor serve to use it"
+/// After `machine add|remove` rewrote flock.toml, a running head re-reads it
+/// now (the `pastor job reload` path), so the edit needs no restart.
+async fn reload_running_head(paths: &Paths) -> &'static str {
+    let socket = paths.socket_file();
+    // A busy head (`Unresponsive`) is still a head: ask it too.
+    if probe_daemon(&socket).await == DaemonProbe::NotRunning {
+        return "start pastor serve to use it";
+    }
+    match request(&socket, &IpcRequest::Reload).await {
+        Ok(IpcResponse::Jobs(_)) => "the running pastor serve picked it up",
+        _ => "pastor serve did not take the reload; run `pastor job reload`",
     }
 }
 
@@ -1429,19 +1430,6 @@ mod tests {
                 panic!("{args:?}: {e}");
             }
         }
-    }
-
-    /// A flock edit is only picked up by a daemon start. With no daemon
-    /// running there is nothing to restart, and saying so misleads: the
-    /// user reads "restart" as "it is already known". Say start or restart
-    /// depending on what is actually running.
-    #[test]
-    fn machine_edit_hint_matches_daemon_state() {
-        assert_eq!(
-            machine_edit_hint(true),
-            "restart pastor serve to pick it up (the flock does not reload while it runs)"
-        );
-        assert_eq!(machine_edit_hint(false), "start pastor serve to use it");
     }
 
     /// On failure stderr carries exactly one JSON value, so a script calling an
