@@ -74,11 +74,12 @@ on its PATH (`-` when there is none); it is not a machine and takes no tasks.
 With `pastor serve` running, CHANNEL is the head's live channel state and
 AGENTS counts pastor's tasks against `max_agents`. Without it, the command
 probes each machine itself (a ping and an `agent.list`, one at a time, with no
-time limit); CHANNEL reads one of four values: `probed` (the ping answered),
-`server down` (a local endpoint's own socket has nothing listening), `unreachable`
-(any other transport failure), or `error` (the ping failed some other way, such
-as an old protocol or a failed `agent.list`). AGENTS counts every agent herdr
-reports, and stderr says so. `--json` prints
+time limit); CHANNEL reads one of four values: `probed` (the ping answered —
+an old protocol or a failed `agent.list` still counts as `probed`, with the
+reason in ERROR), `server down` (a local endpoint's own socket has nothing
+listening), `unreachable` (any other transport failure), or `error` (the ping
+itself came back with a non-transport API error). AGENTS counts every agent
+herdr reports, and stderr says so. `--json` prints
 `{"head": {...}, "machines": [...]}`, with `channel` one of the same four
 probe values (or the head's live channel state when `pastor serve` is
 running). `pastor machine status` is the old spelling, kept as a hidden alias.
