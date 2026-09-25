@@ -13,6 +13,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `pastor-<version>-<target>.tar.gz` with `SHA256SUMS`, attests their build
   provenance, and drafts a GitHub release with that version's changelog
   section as notes.
+- `install.sh`: `curl -fsSL https://raw.githubusercontent.com/cacarico/pastor/main/install.sh | sh`
+  picks the tarball for the OS and architecture, checks it against
+  `SHA256SUMS` (and the provenance attestation when a logged-in `gh` is
+  present), and installs the binary to `~/.local/bin` without sudo.
+  `PASTOR_VERSION`, `PASTOR_INSTALL_DIR` and `PASTOR_DOWNLOAD_URL` override
+  the version, the directory and the download source.
 
 ### Changed
 
