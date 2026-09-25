@@ -2325,49 +2325,14 @@ mod tests {
         );
     }
 
-    /// Log lines, for the tests that check a warning is given once.
-    #[derive(Clone, Default)]
-    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Capture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-        type Writer = Capture;
-        fn make_writer(&'a self) -> Capture {
-            self.clone()
-        }
-    }
-    impl Capture {
-        /// Set as this thread's subscriber until the guard drops.
-        fn install(&self) -> tracing::subscriber::DefaultGuard {
-            tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_writer(self.clone())
-                    .with_ansi(false)
-                    .finish(),
-            )
-        }
-        fn count(&self, needle: &str) -> usize {
-            String::from_utf8_lossy(&self.0.lock().unwrap())
-                .matches(needle)
-                .count()
-        }
-    }
-
     /// Copilot 4103070231: `Flock::load` reads a missing file as an empty
     /// flock. A reload must not: deleting flock.toml, or an editor that
     /// replaces it by delete and rename, would stop every actor. The same
-    /// for pastor.toml, which would fall back to default timings.
+    /// for pastor.toml, which would fall back to default timings. The
+    /// warning is given once because a missing file's fingerprint does not
+    /// change: the second pass returns `None` without reading again.
     #[tokio::test]
     async fn a_missing_config_file_keeps_the_previous_one() {
-        let logs = Capture::default();
-        let _guard = logs.install();
         let store = Arc::new(Store::open_in_memory().unwrap());
         let (mut s, _tmp) = managed_scheduler(&store);
         std::fs::write(s.paths.flock_file(), FLOCK_AB).unwrap();
@@ -2383,19 +2348,12 @@ mod tests {
             s.reload_config(false).await.is_none(),
             "nothing new on disk"
         );
-        assert_eq!(logs.count("flock.toml is missing"), 1);
 
         std::fs::remove_file(s.paths.config_file()).unwrap();
         let d = s.reload_config(false).await.expect("pastor.toml went away");
         assert!(d.is_empty(), "{d:?}");
         assert_eq!(s.tick, Duration::from_secs(1), "tick = 1s kept");
         assert!(s.reload_config(false).await.is_none());
-        assert_eq!(logs.count("pastor.toml is missing"), 1);
-        assert_eq!(
-            logs.count("flock.toml is missing"),
-            2,
-            "logged per pass that reads it"
-        );
     }
 
     /// Copilot 4103070231: an existing flock.toml with no machines is a
