@@ -945,6 +945,31 @@ So:
   agent acting on its own, not a determined one: it runs as the same user and
   can unset the variable.
 
+The head's user is the fleet's trust boundary. Anything that runs as that
+user on the head controls every machine in the flock file, because it can:
+
+- talk to `pastor.sock`, which takes any request the CLI can make: queue a
+  task with any prompt, agent arguments, repo and machine, type into a live
+  task with `task send`, run a job, or edit the flock. The socket is 0600, so
+  it keeps other users out, not other processes of the same user;
+- write `flock.toml`, where a `command = [...]` machine is any argv, and the
+  job files and the plugins directory;
+- use the ssh ControlMaster sockets under `~/.local/state/pastor/ssh/`, which
+  reach every ssh machine without authenticating again.
+
+That includes an agent on a `local = true` machine: it runs on the head as
+the head's user, so an agent that a repo or an item's text talks into it can
+dispatch unattended agents across the fleet. Do not give a `local = true`
+machine untrusted work, such as a job fed by issues or chat messages from
+people outside your team. To use the head for that work, run herdr there as
+a separate user and add it as an ssh machine (`ssh = "agents@localhost"`),
+so its agents reach the head only as that user. What the pastor skill asks
+of a dispatched agent, to stay in its own pane and worktree, is advice, not
+a control.
+
+Plugins run as the head's user too, with the same reach; see
+[Plugins](#plugins). Install only plugins you would run by hand.
+
 ## Files
 
 ```
