@@ -378,8 +378,10 @@ A task whose agent has no flag for a list it carries is refused rather than
 started without it (`agent_tools_unsupported` from `pastor task run` and
 `pastor task retry`; a job records the error for that item). `pastor task show`
 prints a task's `allow` and `deny`. Since a head from before these lists would
-start the agent without them, `pastor task run` and `pastor task retry` refuse
-one (`head_too_old`): restart `pastor serve` after an upgrade.
+start the agent without them, every command that can make it queue a task
+(`pastor task run`, `pastor task retry`, `pastor tick` without `--dry-run`,
+`pastor job run`) refuses one (`head_too_old`): restart `pastor serve` after
+an upgrade.
 
 #### Arguments that turn permissions off
 

@@ -58,9 +58,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Agent args follow the agent they were written for: `[defaults] agent_args`
   no longer reach a task that runs another agent than `[defaults] agent`
   (`pastor task run --agent codex` used to get Claude's `--model`).
-- The head protocol is 2. `pastor task run` and `pastor task retry` refuse a
-  head below it (`head_too_old`), which would start the agent without its
-  tool lists: restart `pastor serve` after upgrading.
+- The head protocol is 2. `pastor task run`, `pastor task retry`,
+  `pastor tick` (not `--dry-run`) and `pastor job run` refuse a head below it
+  (`head_too_old`), which would start the agent without its tool lists:
+  restart `pastor serve` after upgrading.
 - The head, not the CLI, settles a `pastor task run` task's agent, since only
   it knows the task's flock. `pastor task run` has the head apply any edit of
   `pastor.toml` or `flock.toml` first, so an edit still takes effect at once.

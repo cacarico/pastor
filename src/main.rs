@@ -371,7 +371,7 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 /// (serde skips unknown fields) and reads flock.toml as one flock, so it
 /// would dispatch, list or reload across every flock.
 ///
-/// `agents` is for a command that queues a task (`needs_agent_protocol`): a
+/// `agents` is for a command that can queue a task (`needs_agent_protocol`): a
 /// head before `AGENT_PROTOCOL` would drop the task's tool lists, so it is
 /// refused too.
 async fn probe_head(paths: &Paths, flocks: bool, agents: bool) -> anyhow::Result<Head> {
@@ -434,15 +434,17 @@ fn head_use(command: &Command) -> Option<bool> {
     }
 }
 
-/// Whether `command` queues a task whose agent the head resolves: it needs a
-/// head at `AGENT_PROTOCOL` or later.
+/// Whether `command` can make the head queue a task, whose agent the head
+/// resolves: it needs a head at `AGENT_PROTOCOL` or later. A tick or a job
+/// run queues through the head's own jobs, so they count too; a dry run
+/// writes nothing, and a reload only re-reads the job files.
 fn needs_agent_protocol(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Task {
-            cmd: TaskCmd::Run(_) | TaskCmd::Retry { .. }
-        }
-    )
+    match command {
+        Command::Task { cmd } => matches!(cmd, TaskCmd::Run(_) | TaskCmd::Retry { .. }),
+        Command::Tick(a) => !a.dry_run,
+        Command::Job { cmd } => matches!(cmd, JobCmd::Run { .. }),
+        _ => false,
+    }
 }
 
 /// Whether flock.toml declares named flocks, so a command with no `--flock`
@@ -1452,8 +1454,8 @@ mod tests {
     /// The head resolves the agent with the task's flock, so the request
     /// carries only what the flags said: nothing, when they said nothing.
     /// A head from before `AGENT_PROTOCOL` would drop a task's deny list
-    /// without a word, so `task run` and `task retry` refuse it; other
-    /// commands still work with it.
+    /// without a word, so every command that makes it queue a task refuses
+    /// it; other commands still work with it.
     #[tokio::test]
     async fn queueing_a_task_refuses_a_head_before_tool_lists() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -1496,7 +1498,19 @@ mod tests {
         assert!(needs_agent_protocol(&parse(&[
             "pastor", "task", "retry", "t-1"
         ])));
+        assert!(needs_agent_protocol(&parse(&["pastor", "tick"])));
+        assert!(needs_agent_protocol(&parse(&[
+            "pastor", "tick", "--job", "j"
+        ])));
+        assert!(needs_agent_protocol(&parse(&["pastor", "job", "run", "j"])));
         assert!(!needs_agent_protocol(&parse(&["pastor", "task", "list"])));
+        assert!(!needs_agent_protocol(&parse(&[
+            "pastor",
+            "tick",
+            "--dry-run"
+        ])));
+        assert!(!needs_agent_protocol(&parse(&["pastor", "job", "list"])));
+        assert!(!needs_agent_protocol(&parse(&["pastor", "job", "reload"])));
     }
 
     #[test]
