@@ -55,6 +55,16 @@ struct SequenceMoved {
     baseline: u64,
 }
 
+/// Auto-close found a done row with no `last_completion_seq`: one written
+/// before pastor recorded a baseline. With nothing to compare against, the
+/// agent's sequence is recorded as the baseline and this pass skips the task;
+/// the next pass closes it if the sequence has not moved since.
+#[derive(Debug, thiserror::Error)]
+#[error("the row had no completion baseline; recorded {seq} from herdr")]
+struct BaselineSeeded {
+    seq: u64,
+}
+
 /// Whether an error from the connected loop means the machine is gone. Only a
 /// transport failure or a request that never answered does; a herdr API error
 /// or a local store error leaves the machine reachable, and reporting it as
@@ -1199,7 +1209,21 @@ impl Actor {
             && let Some(agent) = agents.iter().find(|a| &a.pane_id == pane)
             && let Some(t) = &row
         {
-            let baseline = t.last_completion_seq.unwrap_or(0);
+            // Reading a missing baseline as 0 would make every such row look
+            // moved, forever: reconcile writes no baseline for a row that is
+            // already `Done`. Record what herdr reports now, in the same terms
+            // as the comparison below, and compare from the next pass on.
+            let Some(baseline) = t.last_completion_seq else {
+                let seq = agent.completion_seq.unwrap_or(agent.state_change_seq);
+                write_task(&self.store, t.clone(), |t| {
+                    if t.state != TaskState::Done || t.last_completion_seq.is_some() {
+                        return false;
+                    }
+                    t.last_completion_seq = Some(seq);
+                    true
+                })?;
+                return Err(BaselineSeeded { seq }.into());
+            };
             let moved = match agent.completion_seq {
                 Some(seq) => seq > baseline,
                 None => agent.state_change_seq > baseline,
@@ -1412,6 +1436,9 @@ impl Actor {
                 }
                 Err(err) if err.is::<PaneReused>() => {
                     tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed: its pane holds another agent now");
+                }
+                Err(err) if err.is::<BaselineSeeded>() => {
+                    tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed yet: no completion baseline until now");
                 }
                 Err(err) if err.is::<SequenceMoved>() => {
                     tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed: a new completion has not settled yet");
@@ -3470,6 +3497,43 @@ mod tests {
         assert_eq!(state_of(&store, t.id), TaskState::Done);
         assert_eq!(fake.agents().len(), 1);
         assert!(count(&mut events, "task.closed", t.id).is_empty());
+    }
+
+    /// A done row written before pastor recorded a completion baseline has
+    /// `last_completion_seq` NULL. Its agent is idle with a nonzero sequence,
+    /// as any agent that ever worked is. That must not read as a moved
+    /// sequence: the first pass seeds the baseline from herdr and a later
+    /// pass closes the task.
+    #[tokio::test]
+    async fn auto_close_closes_a_done_row_without_a_baseline() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut t = new_task(&store);
+        let pane = start_agent(&fake, &Task::agent_name_for(t.id)).await;
+        fake.set_status_silently(&pane, AgentStatus::Working);
+        fake.set_status_silently(&pane, AgentStatus::Idle);
+        assert!(fake.agents()[0].state_change_seq > 0);
+        t.state = TaskState::Done;
+        t.machine = Some("m".into());
+        t.pane_id = Some(pane.clone());
+        t.agent_name = Some(Task::agent_name_for(t.id));
+        t.last_completion_seq = None;
+        t.finished_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.update_task(&mut t).unwrap();
+        let (h, mut events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let before = lists(&fake);
+        wait_for("closed within a few reconciles", || {
+            assert!(lists(&fake) < before + 8, "never auto-closed");
+            state_of(&store, t.id) == TaskState::Closed
+        })
+        .await;
+        assert_eq!(calls(&fake, "pane.close").len(), 1);
+        assert!(fake.agents().is_empty());
+        assert_eq!(count(&mut events, "task.closed", t.id).len(), 1);
     }
 
     /// A done task, past its grace period, whose agent is idle in herdr but
