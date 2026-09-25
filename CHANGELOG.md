@@ -18,6 +18,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   daemon down.
 - `pastor setup systemd [--herdr]` installs the pastor or herdr user unit,
   checks that lingering is on, and tightens config/state file permissions.
+- `pastor task show t-N` prints one task in full, and `pastor task run
+  --agent-arg` plus a `[defaults] agent_args` key pass flags such as
+  `--model` to the agent.
+- CI: `make check` and `make test-machine` run on every pull request and on
+  `main`.
 
 ### Changed
 
@@ -31,3 +36,23 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `pastor setup systemd` gained `--enable`, `--start`, `--now` and `--stop`
   to choose the systemd action, plus `--yes` to skip the confirmation
   prompt for scripted and remote use.
+
+### Fixed
+
+- Tasks now reach `done` against herdr 0.9.1. herdr reports no
+  `completion_seq`; pastor now uses `state_change_seq` past the prompt's
+  reply, requires that it saw the agent working or blocked after the prompt,
+  and confirms after the `settle` window. Before, finished agents stayed
+  `running` for ever.
+- A job run whose task insert fails is reported as a failed run, is not
+  counted as a connector failure, and keeps its cursor; runs of one job are
+  serialised and queued in command order; an elapsed backoff makes the job
+  due at once.
+- The store refuses a `meta` table that lost its schema version, creates any
+  job tables missing from a current-version database, and reports a corrupt
+  failure count against its own column instead of wrapping it.
+- The CLI tells a busy head from a missing one: a request that connected but
+  timed out reports `timeout` and says the head may still finish it; only a
+  refused or missing socket says `pastor serve` is not running.
+- The private ssh `ControlPath` directory is created before any ssh command
+  that can start a master, including the daemonless CLI paths.
