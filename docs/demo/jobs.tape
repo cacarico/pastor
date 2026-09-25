@@ -13,6 +13,7 @@ Set TypingSpeed 35ms
 
 Env PASTOR_CONFIG_DIR docs/demo/local
 Env PASTOR_STATE_DIR docs/demo/local/state
+Env PASTOR_DATA_DIR docs/demo/local/data
 
 Type "cat docs/demo/local/jobs/hourly.toml"
 Enter

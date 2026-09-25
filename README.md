@@ -8,9 +8,8 @@ opens a terminal there through [herdr](https://herdr.dev), starts the agent,
 sends the prompt, and tells you when the agent stops. When you come back you
 attach to the agent's terminal and carry on.
 
-<p align="center">
-  <img src="docs/demo/pastor.gif" alt="pastor task run, task list and task read in a terminal" width="800">
-</p>
+A recorded demo goes here once `make demo` has run on a machine with
+[vhs](https://github.com/charmbracelet/vhs); the tapes are in `docs/demo/`.
 
 ## Install
 
