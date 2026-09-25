@@ -35,7 +35,7 @@ impl Item {
     }
 }
 
-/// What a run receives; the same shape plan 3 will put on a plugin's stdin.
+/// What a run receives; a plugin connector gets the same shape on its stdin.
 #[derive(Debug, Clone)]
 pub struct RunInput {
     /// The job's `[connector]` table minus `use`.

@@ -94,20 +94,9 @@ down here because getting them wrong cost a day.
   GitHub release with that section as notes. `CONTRIBUTING.md` has the
   release policy.
 
-## Known gaps, parked for the next plans
+## Known gaps
 
-From the whole-branch review and the live tour of the real fleet and the
-fake, both on 2026-09-24. None of them blocks plan 1 or plan 2; each is a
-design decision for the plan named.
-
-Plan 2 (scheduler and concurrency): every item here was folded into plan 2 on
-this branch — the scheduler is its own task with one dispatch lock, tasks are
-claimed in SQL, `update_task` is optimistic, `request_timeout` and
-`agent_ready_timeout` are config keys, readiness reads herdr's
-`launch_pending`/`interactive_ready`, and the `polling` channel state exists.
-What plan 2 left behind is below.
-
-Plan 3 (events and plugins):
+Still open as of the last review; none of them blocks normal use.
 
 - A 30s unread events socket can overrun herdr's retained history; pastor
   reconnects and reconciles, at the cost of a `machine.lost` blip.
@@ -119,50 +108,32 @@ Plan 3 (events and plugins):
 - `only_own` decides ownership by reading the task's job file for
   `connector.use`; a job file edited or removed after its tasks were made
   changes who owns them.
-
-Plan 4 (cleanup and lifecycle):
-
-- Claude Code's "trust this folder" dialog blocks every agent started in a
-  folder it has not seen, on a fresh machine, until answered once per
-  machine; pastor cannot answer it, so use `pastor task attach` to answer it by
-  hand, or document a one-time `claude` run per repo per machine.
-- The Pis lack git and lingering, and herdr's server does not survive a
-  reboot: start it with `herdr server`; a systemd user unit needs
-  `loginctl enable-linger`.
 - A hand edit of `flock.toml` leaves herdr's saved-machine list stale; only
   `machine add|remove --herdr` touches it. Candidate: `machine sync --herdr`,
-  or reconciling the two lists on head start.
+  or reconciling the two lists on head start. Going further, herdr could own
+  machine identity, with flock entries referencing its saved-machine labels
+  and carrying only pastor's extra fields.
 - `tasks.id` has no `AUTOINCREMENT`, so an id can be reused after a rolled
   back insert of the newest task; ids appear in agent names, branch names
   (`pastor/t-<n>`) and `seen.task_id`. `task prune` never deletes the newest
   row for this reason. The real fix is a table rebuild in a later schema.
 - `pastor open` should detect a nested herdr and say so instead of herdr
   refusing to start.
-- The whole dispatch pass runs under the fleet lock, so slow agent readiness
-  delays `job list`, `tick`, `job reload` and `task run` too. Move readiness waits out
-  of the lock.
+- The whole dispatch pass runs under the dispatch lock, so slow agent
+  readiness delays `job list`, `tick`, `job reload` and `task run` too. Move
+  readiness waits out of the lock.
 - Orphans (agents named `t-N` that no open task owns) are found only by
   reconcile, so they appear up to `reconcile_every` late, and the rule
   assumes one pastor owns the `t-N` names on each herdr. `task close t-N`
   for an orphan with no row finds it through the machines' last reconcile.
-- A retry copies the rendered spec, so a job whose branch template does not
-  use the task id (`pastor/{{ item.key }}`) retries onto the same branch; if
-  the old worktree is still there, `worktree.create` fails. Close the old task
-  with `--remove-worktree` first, or re-render from the job file on retry.
 - `task close --remove-worktree` never sends `force`; a dirty checkout is an
   error until someone commits or cleans it. A `--force` would be a separate
   decision.
 - `tests/transport.rs` `command_transport_talks_to_fake_herdr` failed once
   under a loaded `make check` (the stdio fake-herdr closed before replying)
   and passed on every rerun.
-
-Not yet assigned a plan:
-
 - Cron minutes that do not exist on a spring-forward day are skipped;
   Vixie cron runs them instead.
-- Proposed: herdr owns machine identity, and flock entries reference herdr's
-  saved-machine labels and carry only pastor's extra fields. A small plan of
-  its own, after plan 2.
 
 ## Where things live
 

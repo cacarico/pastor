@@ -230,16 +230,16 @@ impl Store {
                     params![SCHEMA_VERSION.to_string()],
                 )?;
             }
-            // The pastor before plan 2 already wrote version 2 without the
-            // job tables, so a current file still gets them if missing.
+            // A pastor from before the job tables already wrote version 2
+            // without them, so a current file still gets them if missing.
             Some(v) if v == SCHEMA_VERSION => {
                 tx.execute_batch(V2_TABLES)?;
                 tx.execute_batch(V5_TABLES)?;
             }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
-                // first whatever the version: a version-2 file from before
-                // plan 2 may lack them.
+                // first whatever the version: an early version-2 file may
+                // lack them.
                 //
                 // All steps and the version bump share the transaction opened
                 // above, so an interrupted start leaves the old version and
@@ -1169,8 +1169,8 @@ mod tests {
             .unwrap()
     }
 
-    /// The pastor before plan 2 already wrote schema 2 (with prompt_pending)
-    /// but had no seen or job_state tables.
+    /// An early pastor wrote schema 2 (with prompt_pending) but had no seen
+    /// or job_state tables.
     #[test]
     fn a_v2_database_without_the_job_tables_gains_them() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1432,7 +1432,7 @@ mod tests {
         {
             let s = Store::open(&path).unwrap();
             s.insert_task(new_task("run")).unwrap();
-            // A genuine v1 file has neither the plan-2 tables nor the
+            // A genuine v1 file has neither the job tables nor the
             // prompt_pending column; v2 gained both, v3 retry_of.
             s.execute_raw(
                 "DROP TABLE seen; DROP TABLE job_state;

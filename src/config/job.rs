@@ -170,8 +170,8 @@ impl Job {
     }
 }
 
-/// Job names appear in `tasks.job`, in `{{ job.name }}` and, from plan 3, as a
-/// directory under the state dir, so they are kept to a safe alphabet. `run`
+/// Job names appear in `tasks.job`, in `{{ job.name }}` and, for a plugin
+/// connector, as a directory under the state dir, so they are kept to a safe alphabet. `run`
 /// is what one-off tasks carry in `tasks.job`. Public so `job_path` callers
 /// outside a full `Job::parse` (the CLI's `enable`/`disable`) can reject a
 /// name before joining it under the jobs directory: an unvalidated name like
