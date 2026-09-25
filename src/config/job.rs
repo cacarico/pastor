@@ -138,6 +138,22 @@ impl Job {
                 }
             }
         }
+        // An item must not name an existing branch such as `main` and have the
+        // agent commit to it. The job fixes the first component of the branch
+        // (`pastor/...`), so items only choose names inside that namespace.
+        if let Some(branch) = d.branch.as_deref() {
+            let first = branch.split('/').next().unwrap_or_default();
+            let from_item = template::placeholders(first)
+                .map_err(|e| format!("dispatch.branch: {e}"))?
+                .iter()
+                .any(|p| p.starts_with("item.") || p == "item");
+            if from_item {
+                return Err(format!(
+                    "dispatch.branch: {branch:?} puts an item value in its first component; \
+                     start it with a fixed prefix, like \"pastor/{{{{ item.key }}}}\""
+                ));
+            }
+        }
         let timeout = match d.timeout.as_deref() {
             Some(t) => parse_duration(t).map_err(|e| format!("dispatch.timeout: {e}"))?,
             None => {
@@ -493,6 +509,38 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
                 .name,
             "anything-9"
         );
+    }
+
+    /// An item must not be able to pick an existing branch such as `main`
+    /// and have the agent commit to it. The rule: an item value may not
+    /// appear in the first component of `branch`, so the job fixes the
+    /// namespace (`pastor/...`) and items only name branches inside it.
+    #[test]
+    fn a_branch_must_start_with_a_component_the_job_fixes() {
+        for branch in [
+            "{{ item.branch }}",
+            "{{ item.branch }}/x",
+            "fix-{{ item.key }}",
+            "{{ item.a }}{{ job.name }}/x",
+        ] {
+            let text = SPEC_EXAMPLE.replace("pastor/{{ item.key }}", branch);
+            let err = Job::parse(&text, "support-slack", &defaults(), &Builtins).unwrap_err();
+            assert!(
+                err.starts_with("dispatch.branch:") && err.contains("first component"),
+                "{branch}: {err}"
+            );
+        }
+        for branch in [
+            "pastor/{{ item.key }}",
+            "{{ job.name }}/{{ item.key }}",
+            "{{ task.id }}",
+            "pastor/{{ item.a }}/{{ item.b }}",
+            "main",
+        ] {
+            let text = SPEC_EXAMPLE.replace("pastor/{{ item.key }}", branch);
+            Job::parse(&text, "support-slack", &defaults(), &Builtins)
+                .unwrap_or_else(|e| panic!("{branch}: {e}"));
+        }
     }
 
     #[test]

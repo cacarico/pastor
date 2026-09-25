@@ -128,7 +128,10 @@ into the prompt, which is typed into the agent's terminal. An item value put
 into `repo` or `branch` must be one plain path component: not empty (a missing
 field renders empty), not `.` or `..`, no `/` or `\`, no leading `-` and no
 control characters. An item that breaks this is skipped and shown in the job's
-last result; the job's cursor still moves. A job never overlaps itself; `pastor job run <name>` fires
+last result; the job's cursor still moves. An item value may not appear in the first
+component of `branch`: the job fixes a prefix such as `pastor/{{ item.key }}`,
+so an item cannot name an existing branch like `main` and have the agent
+commit to it. A job file that breaks this is `invalid`. A job never overlaps itself; `pastor job run <name>` fires
 one regardless, and it starts once a run already going has finished. `every = "5m"` or `cron = "*/5 9-18 * * 1-5"` (local time)
 says when. The built-in connector is `clock`, one item per run keyed by the
 run time; any other is an installed connector (see Connectors), and a job
