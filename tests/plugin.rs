@@ -683,7 +683,7 @@ fn a_job_on_a_plugin_connector_queues_tasks_through_tick() {
         "k1 twice is one task"
     );
 
-    let (out, _) = cli.ok(&["list", "--job", "support", "--json"]);
+    let (out, _) = cli.ok(&["task", "list", "--job", "support", "--json"]);
     let tasks: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
     let mut prompts: Vec<&str> = tasks
         .iter()
@@ -836,8 +836,8 @@ fn a_daemon_runs_plugin_jobs_and_hooks_hear_their_events() {
     assert_eq!(done["task"]["machine"], "fake");
 
     // A one-off task is nobody's: notify hears of it, echo (only_own) not.
-    cli.ok(&["run", "one-off", "--repo", "/tmp"]);
-    // `run` is not a job, so the hook gets no PASTOR_JOB and its own scratch.
+    cli.ok(&["task", "run", "one-off", "--repo", "/tmp"]);
+    // `task run` is not a job, so the hook gets no PASTOR_JOB and its own scratch.
     let notify_run = cli.dir("s/plugins/@notify/notify.jsonl");
     wait(60, "notify hears the one-off task end", || {
         !records(&notify_run).is_empty()

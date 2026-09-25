@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 
@@ -43,12 +42,6 @@ struct Cli {
 enum Command {
     /// Run the daemon: scheduler, machine channels, dispatch
     Serve,
-    /// Old spelling of `task run`, kept for scripts
-    #[command(hide = true)]
-    Run(RunArgs),
-    /// Old spelling of `task list`, kept for scripts
-    #[command(hide = true)]
-    List(ListArgs),
     /// Manage tasks
     Task {
         #[command(subcommand)]
@@ -61,14 +54,8 @@ enum Command {
     },
     /// Open the full herdr UI on a machine
     Open { machine: String },
-    /// Old spelling of `task attach`, kept for scripts
-    #[command(hide = true)]
-    Attach { task: String },
     /// Run one scheduler pass now and report what it did
     Tick(TickArgs),
-    /// Old spelling of `job reload`, kept for scripts
-    #[command(hide = true)]
-    Reload,
     /// Manage jobs (files in ~/.config/pastor/jobs/)
     Job {
         #[command(subcommand)]
@@ -229,13 +216,6 @@ enum MachineCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Old spelling of `machine list`; a name narrows it to that machine
-    #[command(hide = true)]
-    Status {
-        name: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 fn main() {
@@ -264,26 +244,10 @@ fn main() {
     let result = rt.block_on(async {
         match command {
             Command::Serve => pastor::daemon::serve(paths).await,
-            Command::Run(args) => {
-                moved("run", "task run");
-                run(&paths, args).await
-            }
-            Command::List(args) => {
-                moved("list", "task list");
-                list(&paths, args).await
-            }
             Command::Task { cmd } => task(&paths, cmd).await,
             Command::Machine { cmd } => machine(&paths, cmd).await,
             Command::Open { machine } => open(&paths, &machine).await,
-            Command::Attach { task } => {
-                moved("attach", "task attach");
-                attach(&paths, &task).await
-            }
             Command::Tick(args) => tick(&paths, args).await,
-            Command::Reload => {
-                moved("reload", "job reload");
-                reload(&paths).await
-            }
             Command::Job { cmd } => job(&paths, cmd).await,
             Command::Completions { shell } => {
                 let mut cmd = completion_tree();
@@ -303,46 +267,10 @@ fn main() {
     }
 }
 
-/// The command tree `pastor completions` describes. clap_complete offers
-/// hidden subcommands too, so the old spellings are dropped here and the
-/// scripts name only `task run`, `task list`, `task attach`, `job reload` and
-/// `machine list`. Top-level flags such as `--skill` are kept.
+/// The command tree `pastor completions` describes: the real one, since there
+/// are no hidden subcommands left to strip out.
 fn completion_tree() -> clap::Command {
-    without_hidden(&<Cli as clap::CommandFactory>::command()).version(env!("CARGO_PKG_VERSION"))
-}
-
-/// `c` without its hidden subcommands, at every level. clap cannot remove a
-/// subcommand, so a command that has hidden ones is rebuilt from its name,
-/// about and arguments; the others are cloned whole.
-fn without_hidden(c: &clap::Command) -> clap::Command {
-    if !c.get_subcommands().any(|s| s.is_hide_set()) {
-        return c.clone();
-    }
-    // clap takes a `'static` name without its `string` feature; this runs once
-    // per `pastor completions`, so leaking the few names is harmless.
-    let name: &'static str = Box::leak(c.get_name().to_string().into_boxed_str());
-    clap::Command::new(name)
-        .about(c.get_about().cloned().unwrap_or_default())
-        .args(c.get_arguments().cloned())
-        .subcommands(
-            c.get_subcommands()
-                .filter(|s| !s.is_hide_set())
-                .map(without_hidden),
-        )
-}
-
-/// The hint a hidden old spelling prints before doing exactly what `new` does.
-fn moved(old: &str, new: &str) {
-    if let Some(hint) = moved_hint(old, new, std::io::stderr().is_terminal()) {
-        eprintln!("{hint}");
-    }
-}
-
-/// The hint, or nothing when stderr is not a terminal: a failing command
-/// writes exactly one JSON value to stderr, and a hint in front of it would
-/// break every script that parses it.
-fn moved_hint(old: &str, new: &str, stderr_is_tty: bool) -> Option<String> {
-    stderr_is_tty.then(|| format!("pastor {old} is now pastor {new}"))
+    <Cli as clap::CommandFactory>::command().version(env!("CARGO_PKG_VERSION"))
 }
 
 fn fail(code: &str, message: &str) -> ! {
@@ -550,12 +478,11 @@ fn head_row() -> pastor::cli::HeadRow {
     pastor::cli::HeadRow::new(hostname, herdr_version)
 }
 
-/// `machine list`, and `machine status` narrowed to `only`. The head's view
-/// when it runs; otherwise a probe of each machine in flock.toml. The note that
-/// says so is printed only once everything worked, since a failure must leave
-/// exactly one JSON value on stderr.
-async fn machine_list(paths: &Paths, json: bool, only: Option<String>) -> anyhow::Result<()> {
-    let wanted = |name: &str| only.as_deref().is_none_or(|n| n == name);
+/// `machine list`: the head's view when it runs; otherwise a probe of each
+/// machine in flock.toml. The note that says so is printed only once
+/// everything worked, since a failure must leave exactly one JSON value on
+/// stderr.
+async fn machine_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
     // Only `NotRunning` means nothing is listening; `Unresponsive` covers a
     // head that is up but busy (mid-dispatch, or wedged), and probing
     // machines around it would print the "not running" note for a head that
@@ -567,39 +494,18 @@ async fn machine_list(paths: &Paths, json: bool, only: Option<String>) -> anyhow
             let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
                 unreachable!()
             };
-            if let Some(n) = &only
-                && !ms.iter().any(|m| &m.name == n)
-            {
-                fail(
-                    "unknown_machine",
-                    &format!("machine {n} is not in the flock"),
-                );
-            }
-            let rows: Vec<pastor::cli::MachineRow> = ms
-                .iter()
-                .filter(|m| wanted(&m.name))
-                .map(pastor::cli::MachineRow::from)
-                .collect();
+            let rows: Vec<pastor::cli::MachineRow> =
+                ms.iter().map(pastor::cli::MachineRow::from).collect();
             (rows, None)
         }
         DaemonProbe::NotRunning => {
             let f = Flock::load(&paths.flock_file())?;
-            // A typo would otherwise filter every row out and print a table with
-            // exit 0; name it the way run, attach and open do.
-            if let Some(n) = &only
-                && f.get(n).is_none()
-            {
-                fail(
-                    "unknown_machine",
-                    &format!("machine {n} is not in the flock"),
-                );
-            }
             // Connects without the head, so the state dir the ssh master sockets
             // live under may not exist yet, and must be private.
             paths.ensure()?;
             let store = Store::open(&paths.db_file())?;
             let mut rows = Vec::new();
-            for m in f.machines.iter().filter(|m| wanted(&m.name)) {
+            for m in f.machines.iter() {
                 rows.push(probe_machine(m, paths, &store).await?);
             }
             (
@@ -862,11 +768,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 }
             }
         }
-        MachineCmd::List { json } => machine_list(paths, json, None).await?,
-        MachineCmd::Status { name, json } => {
-            moved("machine status", "machine list");
-            machine_list(paths, json, name).await?
-        }
+        MachineCmd::List { json } => machine_list(paths, json).await?,
     }
     Ok(())
 }
@@ -1440,18 +1342,6 @@ mod tests {
         }
     }
 
-    /// On failure stderr carries exactly one JSON value, so a script calling an
-    /// old spelling must not get the hint in front of it; only a person at a
-    /// terminal sees it.
-    #[test]
-    fn moved_hint_speaks_only_to_a_terminal() {
-        assert_eq!(moved_hint("run", "task run", false), None);
-        assert_eq!(
-            moved_hint("run", "task run", true).as_deref(),
-            Some("pastor run is now pastor task run")
-        );
-    }
-
     /// `--command` used to take every following word, pastor's own options
     /// included. It is one value now, and options after it are pastor's.
     #[test]
@@ -1587,9 +1477,6 @@ mod tests {
     #[test]
     fn task_commands_parse_under_task() {
         for args in [
-            vec!["pastor", "run", "hi"],
-            vec!["pastor", "list", "--json"],
-            vec!["pastor", "attach", "t-1"],
             vec!["pastor", "task", "run", "hi"],
             vec!["pastor", "task", "list", "--json"],
             vec!["pastor", "task", "show", "t-1"],
@@ -1676,11 +1563,10 @@ mod tests {
         let mut rest = words;
         while let Some(word) = rest.first() {
             match cmd.find_subcommand(word) {
-                Some(sub) if !sub.is_hide_set() => {
+                Some(sub) => {
                     cmd = sub;
                     rest = &rest[1..];
                 }
-                Some(_) => panic!("{line:?}: `{word}` is a hidden old spelling"),
                 None if cmd.has_subcommands() && !word.starts_with('-') => {
                     panic!(
                         "{line:?}: `{word}` is not a subcommand of `{}`",

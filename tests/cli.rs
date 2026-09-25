@@ -224,79 +224,10 @@ fn run_list_show_read_end_to_end() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("task_not_found"));
 }
 
-/// The old top-level `run`, `list`, `attach` and `reload` still work, hidden
-/// from `--help` and the completions, with the same stdout, stderr and exit
-/// status as the nested command. The hint that names the new spelling is for
-/// a terminal only (see `moved_hint`), so here, with stderr piped, there is
-/// none, and a failing alias leaves exactly one JSON value on stderr.
-#[test]
-fn old_top_level_commands_are_hidden_aliases() {
-    let env = start();
-    let out = env.cmd(&["run", "hi", "--json"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("is now"));
-    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(task["agent_name"], "t-1");
-    // The fake finishes t-1 on its own; wait for that so both list spellings
-    // read the same settled row instead of racing the change.
-    env.wait_done("t-1");
-
-    for (old, new) in [
-        (
-            vec!["list", "--all", "--json"],
-            vec!["task", "list", "--all", "--json"],
-        ),
-        (vec!["attach", "t-9"], vec!["task", "attach", "t-9"]),
-        (vec!["reload"], vec!["job", "reload"]),
-    ] {
-        let a = env.cmd(&old);
-        let b = env.cmd(&new);
-        assert_eq!(a.status.code(), b.status.code(), "{old:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&a.stdout),
-            String::from_utf8_lossy(&b.stdout),
-            "{old:?}"
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&a.stderr),
-            String::from_utf8_lossy(&b.stderr),
-            "{old:?}"
-        );
-    }
-    let out = env.cmd(&["list", "--all", "--json"]);
-    let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(tasks.len(), 1, "{tasks:?}");
-    assert_eq!(tasks[0]["agent_name"], "t-1");
-
-    // The CLI error contract holds through an alias: the whole of stderr is
-    // one JSON value.
-    for argv in [
-        vec!["attach", "t-9"],
-        vec!["run", "hi", "--machine", "nope"],
-    ] {
-        let out = env.cmd(&argv);
-        assert_eq!(out.status.code(), Some(1), "{argv:?}");
-        let stderr = String::from_utf8(out.stderr).unwrap();
-        let err: serde_json::Value = serde_json::from_str(&stderr)
-            .unwrap_or_else(|e| panic!("{argv:?}: stderr is not one JSON value ({e}): {stderr}"));
-        assert!(err["code"].is_string(), "{argv:?}: {err}");
-    }
-
-    let help = String::from_utf8_lossy(&env.cmd(&["--help"]).stdout).into_owned();
-    for old in ["run", "list", "attach", "reload"] {
-        assert!(
-            !help.lines().any(|l| l.starts_with(&format!("  {old} "))),
-            "{old} should be hidden:\n{help}"
-        );
-    }
-}
-
-/// clap_complete emits hidden subcommands too, so `pastor completions` has to
-/// leave the old spellings out itself; the nested ones stay.
+/// `pastor completions` must offer the real, nested command tree, and never
+/// the old top-level spellings (`run`, `list`, `attach`, `reload`) or
+/// `machine status`: pastor is fresh software, and those names are gone, not
+/// merely hidden. This guards against a regression re-adding them.
 #[test]
 fn completions_offer_only_the_nested_spellings() {
     let gen_ = |shell: &str| {
@@ -331,7 +262,7 @@ fn completions_offer_only_the_nested_spellings() {
     assert!(fish.contains("-f -a \"run\" -d 'Create a one-off task and dispatch it'"));
     assert!(bash.contains("pastor__subcmd__task,run)"));
     assert!(bash.contains("pastor__subcmd__job,reload)"));
-    // `machine status` is hidden one level down; it goes the same way.
+    // `machine status` never appears one level down either.
     assert!(
         !bash.contains("pastor__subcmd__machine,status)"),
         "bash knows machine status"
@@ -474,15 +405,6 @@ fn machine_add_and_remove_edit_the_file() {
     );
     let out = run(&["machine", "add", "pi-3", "fleet@pi-3"]);
     assert!(!out.status.success());
-    // `machine list` without a head probes over ssh, which this test must not
-    // do; `machine_list_without_daemon_probes_each_machine` covers it.
-    let out = run(&["machine", "status", "pi-4"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("\"unknown_machine\""),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     // `--branch` only means something for a worktree; clap rejects it alone
     // before any daemon is asked.
     let out = run(&["task", "run", "hi", "--branch", "b"]);
@@ -1209,18 +1131,6 @@ fn machine_list_shows_the_head_then_the_machines() {
     assert!(ms[0]["pastor_version"].is_null(), "{v}");
     assert_eq!(ms[0]["host"], "fake-herdr");
     assert_eq!(ms[0]["channel"], "connected");
-
-    // The old spelling is the same command; the hint that says so is for a
-    // terminal only, and stderr here is a pipe.
-    let alias = env.cmd(&["machine", "status", "--json"]);
-    assert!(alias.status.success());
-    assert!(
-        alias.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&alias.stderr)
-    );
-    let a: serde_json::Value = serde_json::from_slice(&alias.stdout).unwrap();
-    assert_eq!(a["machines"], v["machines"]);
 }
 
 /// With no head, `machine list` probes each machine itself: a reachable one
@@ -1316,18 +1226,6 @@ fn machine_list_without_daemon_probes_each_machine() {
     assert!(ms[1]["error"].is_string(), "{v}");
     assert_eq!(ms[0]["channel"], "probed");
     assert_eq!(ms[0]["live"], 0);
-
-    // The hidden alias narrows to one machine and still refuses a typo with
-    // one JSON value on stderr and no note in front of it.
-    let out = run(&["machine", "status", "gone", "--json"]);
-    assert!(out.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["machines"].as_array().unwrap().len(), 1, "{v}");
-    let out = run(&["machine", "status", "nope"]);
-    assert_eq!(out.status.code(), Some(1));
-    let err: serde_json::Value = serde_json::from_slice(&out.stderr)
-        .unwrap_or_else(|e| panic!("stderr is not one JSON value ({e})"));
-    assert_eq!(err["code"], "unknown_machine");
 
     std::fs::write(config.join("flock.toml"), "[[machine]\n").unwrap();
     let out = run(&["machine", "list"]);
@@ -1598,7 +1496,7 @@ impl Env {
 #[test]
 fn task_retry_close_and_prune_end_to_end() {
     let env = start();
-    let t1 = env.json(&["run", "first", "--json"]);
+    let t1 = env.json(&["task", "run", "first", "--json"]);
     assert_eq!(t1["state"], "running");
     env.wait_for("t-1 done", &["task", "show", "t-1", "--json"], |t| {
         t.contains("\"done\"")
@@ -1614,7 +1512,9 @@ fn task_retry_close_and_prune_end_to_end() {
     assert_eq!(t2["id"], 2);
     assert_eq!(t2["retry_of"], 1);
     assert_eq!(t2["state"], "running");
-    let list = env.wait_for("the orphan in list", &["list"], |t| t.contains("orphan"));
+    let list = env.wait_for("the orphan in list", &["task", "list"], |t| {
+        t.contains("orphan")
+    });
     assert!(list.contains("t-1") && list.contains("fake"), "{list}");
     assert!(
         list.contains("retry of t-1"),
@@ -1629,20 +1529,20 @@ fn task_retry_close_and_prune_end_to_end() {
     // An orphan has no row, so no state or job: a view narrowed by either
     // leaves it out, and --all keeps it.
     for args in [
-        &["list", "--done"][..],
-        &["list", "--blocked"],
-        &["list", "--job", "run"],
+        &["task", "list", "--done"][..],
+        &["task", "list", "--blocked"],
+        &["task", "list", "--job", "run"],
     ] {
         let out = env.cmd(args);
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(!text.contains("orphan"), "{args:?}: {text}");
     }
-    let all = env.cmd(&["list", "--all"]);
+    let all = env.cmd(&["task", "list", "--all"]);
     assert!(String::from_utf8_lossy(&all.stdout).contains("orphan"));
 
     let closed = env.json(&["task", "close", "t-1", "--json"]);
     assert_eq!(closed["state"], "closed");
-    env.wait_for("no orphan", &["list"], |t| !t.contains("orphan"));
+    env.wait_for("no orphan", &["task", "list"], |t| !t.contains("orphan"));
 
     // Close with and without --remove-worktree.
     env.fails_with(
@@ -1656,11 +1556,19 @@ fn task_retry_close_and_prune_end_to_end() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("closed"));
-    let t3 = env.json(&["run", "third", "--worktree", "--repo", "/tmp/r", "--json"]);
+    let t3 = env.json(&[
+        "task",
+        "run",
+        "third",
+        "--worktree",
+        "--repo",
+        "/tmp/r",
+        "--json",
+    ]);
     assert_eq!(t3["state"], "running");
     let closed = env.json(&["task", "close", "t-3", "--remove-worktree", "--json"]);
     assert_eq!(closed["state"], "closed");
-    let out = env.cmd(&["run", "no repo", "--worktree"]);
+    let out = env.cmd(&["task", "run", "no repo", "--worktree"]);
     assert_eq!(out.status.code(), Some(2), "clap refuses --worktree alone");
 
     // Prune: every closed task finished before "now minus 0s".
