@@ -854,9 +854,11 @@ impl Scheduler {
             return;
         };
         // Only tasks still queued stay in the set: one that was dispatched,
-        // closed or pruned is never warned about again anyway.
-        self.warned_queued
-            .retain(|id| queued.iter().any(|t| t.id == *id));
+        // closed or pruned is never warned about again anyway. Built once
+        // per pass so the retain below is linear, not a scan of `queued`
+        // per warned id.
+        let queued_ids: HashSet<i64> = queued.iter().map(|t| t.id).collect();
+        self.warned_queued.retain(|id| queued_ids.contains(id));
         let limit = chrono::Duration::from_std(QUEUED_WARN_AFTER).expect("1h fits");
         for t in queued {
             if let Some(m) = t
