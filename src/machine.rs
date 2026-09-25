@@ -3250,6 +3250,35 @@ mod tests {
         }
     }
 
+    /// Two retries of one failed task carry the same `reopen`. The first
+    /// reopens the checkout and its agent is at work there under a new name,
+    /// so the second must not reopen it too: any agent listed in the
+    /// checkout's workspace keeps it, and the second gets a new branch and
+    /// worktree.
+    #[tokio::test]
+    async fn a_second_retry_of_one_task_never_reopens_a_checkout_in_use() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let first = h.dispatch(worktree_task(&store).id).await.unwrap();
+        fake.exit_pane(first.pane_id.as_deref().unwrap());
+        wait_for("failed", || state_of(&store, first.id) == TaskState::Failed).await;
+
+        let one = store.insert_retry(first.id).unwrap();
+        let two = store.insert_retry(first.id).unwrap();
+        let one = h.dispatch(one.id).await.unwrap();
+        assert_eq!(one.state, TaskState::Running, "{:?}", one.error);
+        assert_eq!(calls(&fake, "worktree.open").len(), 1);
+
+        let two = h.dispatch(two.id).await.unwrap();
+        assert_eq!(two.state, TaskState::Running, "{:?}", two.error);
+        assert_eq!(calls(&fake, "worktree.open").len(), 1, "reopened once");
+        let created = calls(&fake, "worktree.create");
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[1]["branch"], format!("pastor/t-{}", two.id));
+        assert_ne!(two.workspace_id, one.workspace_id);
+    }
+
     /// A retry whose old checkout was removed meanwhile gets a new one.
     #[tokio::test]
     async fn a_retry_creates_the_worktree_when_the_old_one_is_gone() {

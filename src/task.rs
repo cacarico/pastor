@@ -107,9 +107,9 @@ pub struct DispatchSpec {
     pub checkout: Option<Box<Checkout>>,
     /// The checkout of the failed task this one retries, set only by
     /// `Store::insert_retry` from that task's `checkout`. Dispatch reopens it
-    /// only when it is still on disk at the same path and that task's agent
-    /// is gone (`dispatch::reopenable`); otherwise the retry gets a new
-    /// branch and worktree.
+    /// only when it is still on disk at the same path, that task's agent is
+    /// gone and no other agent is in its workspace (`dispatch::reopenable`);
+    /// otherwise the retry gets a new branch and worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reopen: Option<Box<Reopen>>,
 }

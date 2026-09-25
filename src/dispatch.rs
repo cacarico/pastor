@@ -209,10 +209,12 @@ async fn open_worktree(
 /// of the failed task it retries (`DispatchSpec::reopen`, which
 /// `Store::insert_retry` sets only from the checkout that task's own
 /// dispatch recorded) only while it is on disk at the same path, on the same
-/// branch, and that task's agent is gone: the failed task's work is there,
-/// and nobody else is at work in it. Anything else is `None` and gets a new
-/// branch and worktree, since the checkout may now be another task's or the
-/// old agent may still be editing it.
+/// branch, that task's agent is gone and no agent is listed in the
+/// workspace showing the checkout: the failed task's work is there, and
+/// nobody else is at work in it. Anything else is `None` and gets a new
+/// branch and worktree, since the checkout may now be another task's, the
+/// old agent may still be editing it, or an earlier retry of the same task
+/// may have reopened it.
 async fn reopenable<'a>(
     conn: &dyn Connector,
     spec: &'a DispatchSpec,
@@ -221,20 +223,21 @@ async fn reopenable<'a>(
     let Some(reopen) = spec.reopen.as_ref() else {
         return Ok(None);
     };
-    let on_disk = conn
-        .worktree_list(repo)
-        .await?
+    let worktrees = conn.worktree_list(repo).await?;
+    let Some(checkout) = worktrees
         .iter()
-        .any(|w| w.path == reopen.path && w.branch.as_deref() == Some(reopen.branch.as_str()));
-    if !on_disk {
+        .find(|w| w.path == reopen.path && w.branch.as_deref() == Some(reopen.branch.as_str()))
+    else {
         return Ok(None);
-    }
-    let agent_listed = conn
-        .agent_list()
-        .await?
-        .iter()
-        .any(|a| a.name.as_deref() == Some(reopen.agent.as_str()));
-    Ok((!agent_listed).then_some(reopen))
+    };
+    // Any agent in the checkout's workspace, not only the old task's: a
+    // retry that reopened it earlier has an agent there under its own name.
+    let workspace = checkout.open_workspace_id.as_deref();
+    let in_use = conn.agent_list().await?.iter().any(|a| {
+        a.name.as_deref() == Some(reopen.agent.as_str())
+            || Some(a.workspace_id.as_str()) == workspace
+    });
+    Ok((!in_use).then_some(reopen))
 }
 
 /// The checkout herdr just made or reopened for this task, recorded so that

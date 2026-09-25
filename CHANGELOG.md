@@ -70,7 +70,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `pastor task retry` of a failed worktree task no longer fails with git's
   "fatal: '<path>' already exists": the retry reopens the old task's
   checkout with `worktree.open`, on its branch, when the old task made that
-  checkout, it is still on disk at the same path and the old agent is gone.
+  checkout, it is still on disk at the same path, the old agent is gone and
+  no agent is in its workspace (an earlier retry may be working there).
   Any other retry, a stale task's included, gets its own branch and
   worktree.
 - A task whose agent finished its work and sat idle, waiting for input, no
