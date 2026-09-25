@@ -3,6 +3,19 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- `cargo install` and `make install` install only the `pastor` binary
+  (`--bin pastor`); `fake-herdr` is a test double and no longer lands on
+  the PATH.
+- Release builds are stripped and link-time optimised, so a downloaded
+  binary is about a third smaller.
+- `Cargo.toml` declares the minimum Rust version (1.88) and the repository,
+  and carries cargo-binstall metadata pointing at the GitHub release
+  tarballs.
+
 ## 0.4.0 - 2026-09-25
 
 ### Added

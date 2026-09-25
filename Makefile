@@ -55,8 +55,8 @@ leaks: ## scan the whole git history for secrets, as CI does
 smoke: ## opt-in test against a real herdr: make smoke SESSION=default
 	PASTOR_REAL_HERDR_SESSION=$(or $(SESSION),default) cargo test --test real_herdr -- --ignored --nocapture
 
-install: ## install pastor and fake-herdr into ~/.cargo/bin, with bash and fish completions
-	cargo install --path . --force
+install: ## install pastor into ~/.cargo/bin, with bash and fish completions
+	cargo install --path . --force --bin pastor
 	@$(MAKE) --no-print-directory install-completions
 
 # Writes the completion scripts for the binary `install` just put in place;

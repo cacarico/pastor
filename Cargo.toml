@@ -2,7 +2,11 @@
 name = "pastor"
 version = "0.4.0"
 edition = "2024"
+# Let chains (stable since 1.88) are used throughout; raising this is a
+# minor bump, see CONTRIBUTING.md.
+rust-version = "1.88"
 license = "Apache-2.0"
+repository = "https://github.com/cacarico/pastor"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -23,3 +27,33 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The daemon mostly waits on sockets, so build time is cheap to spend on a
+# smaller binary: a Pi downloads and stores it, and nobody debugs a release
+# build with symbols.
+[profile.release]
+strip = true
+lto = true
+
+# cargo-binstall fetches the tarballs that .github/workflows/release.yml
+# publishes instead of compiling. The crate is not on crates.io (the name is
+# taken there), so it is used as
+#   cargo binstall --git https://github.com/cacarico/pastor pastor
+# Only musl Linux binaries are released; the overrides send glibc hosts to
+# them so one Linux flavour covers every distro.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-x86_64-unknown-linux-musl.tar.gz"
+bin-dir = "{ name }-{ version }-x86_64-unknown-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-aarch64-unknown-linux-musl.tar.gz"
+bin-dir = "{ name }-{ version }-aarch64-unknown-linux-musl/{ bin }"
+
+[package.metadata.binstall.overrides.armv7-unknown-linux-gnueabihf]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-armv7-unknown-linux-musleabihf.tar.gz"
+bin-dir = "{ name }-{ version }-armv7-unknown-linux-musleabihf/{ bin }"

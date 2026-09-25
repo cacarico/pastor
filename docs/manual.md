@@ -357,7 +357,7 @@ ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
 ## Try it
 
 ```bash
-make install                         # pastor and fake-herdr into ~/.cargo/bin
+make install                         # pastor into ~/.cargo/bin
 pastor machine add pi-3 user@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
 pastor machine add here --local
 pastor flock add work                # a second flock; the machines above stay in `default`

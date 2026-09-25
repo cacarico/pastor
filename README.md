@@ -51,7 +51,7 @@ spend time deciding what to do, not typing it. The longer story is in
 ## Install
 
 ```sh
-cargo install --git https://github.com/cacarico/pastor --locked
+cargo install --git https://github.com/cacarico/pastor --locked --bin pastor
 ```
 
 Every machine in the fleet needs [herdr](https://herdr.dev) 0.9 or newer with
