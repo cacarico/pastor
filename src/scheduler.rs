@@ -175,30 +175,36 @@ fn check_rendered(field: &str, template: &str, rendered: &str) -> Result<(), Str
 /// renders empty and is logged: an item that failed to render would stay
 /// unseen and fail again every run.
 pub fn render_task(job: &Job, item: &Value, id: i64) -> Result<(String, DispatchSpec), String> {
-    let ctx = serde_json::json!({
-        "item": item,
-        "job": {"name": job.name},
-        "task": {"id": format!("t-{id}")},
-    });
+    let ctx = |item: Value| {
+        serde_json::json!({
+            "item": item,
+            "job": {"name": job.name},
+            "task": {"id": format!("t-{id}")},
+        })
+    };
+    // The prompt is typed into the agent's pty, where an item's control
+    // characters would be key presses, not text. repo and branch refuse them.
+    let prompt_ctx = ctx(template::strip_controls_deep(item));
+    let ctx = ctx(item.clone());
     let mut missing: Vec<String> = Vec::new();
-    let mut render = |field: &str, text: &str| -> Result<String, String> {
-        let r = template::render(text, &ctx).map_err(|e| format!("{field}: {e}"))?;
+    let mut render = |field: &str, text: &str, ctx: &Value| -> Result<String, String> {
+        let r = template::render(text, ctx).map_err(|e| format!("{field}: {e}"))?;
         missing.extend(r.missing.into_iter().map(|m| format!("{field}: {m}")));
         Ok(r.text)
     };
     check_item_paths(job, item)?;
-    let prompt = render("prompt", &job.prompt)?;
+    let prompt = render("prompt", &job.prompt, &prompt_ctx)?;
     let repo = job
         .spec
         .repo
         .as_deref()
-        .map(|r| render("repo", r))
+        .map(|r| render("repo", r, &ctx))
         .transpose()?;
     let branch = job
         .spec
         .branch
         .as_deref()
-        .map(|b| render("branch", b))
+        .map(|b| render("branch", b, &ctx))
         .transpose()?;
     // Checked again on the real text: the task id is known only now.
     for (field, template, rendered) in [
@@ -1966,6 +1972,28 @@ mod tests {
         let mut item = ok.clone();
         item["title"] = json!("../../etc\n-rf");
         assert!(render_task(&job("j"), &item, 1).is_ok());
+    }
+
+    /// The prompt is typed into the agent's terminal, so an item's control
+    /// characters would arrive as key presses: ESC ends a bracketed paste,
+    /// `\r` submits, Shift+Tab cycles permission modes. Every C0 control
+    /// but newline and tab, DEL and every C1 control are dropped from item
+    /// values; the job's own prompt text is left as written.
+    #[test]
+    fn render_task_strips_control_characters_from_item_values_in_the_prompt() {
+        let mut j = job("j");
+        j.prompt = "{{ item.title }}|{{ item.meta.body }}|{{ item.tags }}\r".into();
+        let item = json!({
+            "key": "k1",
+            "title": "Fix typo\u{1b}[201~\u{1b}[Z\r\u{3}\u{7f}\u{9b}1~ done",
+            "meta": {"body": "line one\n\tline two\u{0}"},
+            "tags": ["a\u{85}b"],
+        });
+        let (prompt, _) = render_task(&j, &item, 1).unwrap();
+        assert_eq!(
+            prompt,
+            "Fix typo[201~[Z1~ done|line one\n\tline two|[\"ab\"]\r"
+        );
     }
 
     /// Each value can pass on its own and still assemble into something

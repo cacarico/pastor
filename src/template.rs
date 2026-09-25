@@ -40,6 +40,29 @@ pub fn render(template: &str, ctx: &Value) -> Result<Rendered, String> {
     Ok(Rendered { text, missing })
 }
 
+/// `s` without the characters a terminal reads as keys or commands: every C0
+/// control except newline and tab, DEL, and every C1 control. For untrusted
+/// text that ends up typed into an agent's pty.
+pub fn strip_controls(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// `v` with `strip_controls` applied to every string in it, keys included.
+pub fn strip_controls_deep(v: &Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(strip_controls(s)),
+        Value::Array(a) => Value::Array(a.iter().map(strip_controls_deep).collect()),
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, v)| (strip_controls(k), strip_controls_deep(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// `(literal before, path, rest after the closing braces)` for the next
 /// placeholder, or `None` when there is no `{{` left.
 fn next_placeholder(rest: &str) -> Result<Option<(&str, &str, &str)>, String> {
@@ -99,6 +122,18 @@ mod tests {
             "[support] login broken #3 true [\"a\",\"b\"] '' t-7\n{ not a placeholder }"
         );
         assert!(r.missing.is_empty());
+    }
+
+    #[test]
+    fn strip_controls_keeps_newline_and_tab_and_drops_c0_del_and_c1() {
+        assert_eq!(
+            strip_controls("a\u{0}\u{1b}[Z\r\n\tb\u{7f}\u{80}\u{9f}\u{a0}é"),
+            "a[Z\n\tb\u{a0}é"
+        );
+        assert_eq!(
+            strip_controls_deep(&json!({"k\u{1b}": ["x\u{3}", 1, null, {"y": "\u{9b}z"}]})),
+            json!({"k": ["x", 1, null, {"y": "z"}]})
+        );
     }
 
     #[test]

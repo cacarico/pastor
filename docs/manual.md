@@ -122,7 +122,9 @@ good version and shows the error in `pastor job list`), asks each due job's
 connector for items, drops keys it has seen before, renders `prompt`, `repo`
 and `branch` with `{{ item.* }}`, `{{ job.name }}` and `{{ task.id }}`, and
 queues one task per new item up to `max_tasks_per_run`. The rest stay unseen
-for the next run. A job never overlaps itself; `pastor job run <name>` fires
+for the next run. Item text comes from outside, so an item's control
+characters, other than newline and tab, are dropped before its values go
+into the prompt, which is typed into the agent's terminal. A job never overlaps itself; `pastor job run <name>` fires
 one regardless, and it starts once a run already going has finished. `every = "5m"` or `cron = "*/5 9-18 * * 1-5"` (local time)
 says when. The built-in connector is `clock`, one item per run keyed by the
 run time; any other is an installed connector (see Connectors), and a job
