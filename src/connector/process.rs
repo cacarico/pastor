@@ -1,7 +1,8 @@
 //! Connectors a plugin provides: its `[connector]` command behind the
 //! `ItemSource` seam. A poll connector runs once per job run; a stream
 //! connector is started once and kept alive, and each job run drains what it
-//! emitted since the last one.
+//! emitted since the last one, plus any earlier batch the scheduler has not
+//! acked.
 //!
 //! Both get the same handshake on stdin, one JSON line
 //! `{"config": .., "cursor": .., "since": ..}`, and answer in JSON lines on
@@ -224,6 +225,11 @@ struct Buffer {
     logs_dropped: usize,
     /// Why the stream is not running right now, if it is not.
     down: Option<String>,
+    /// What the last drain handed out, until the scheduler acks it: the
+    /// process will not emit it again, so it goes out again with the next
+    /// drain until it is persisted.
+    pending: Vec<Item>,
+    pending_cursor: Option<String>,
 }
 
 /// A stream can run for days between two drains of an infrequent job, so
@@ -246,8 +252,19 @@ impl Buffer {
         self.logs.push_back(line);
     }
 
-    /// Everything since the last drain, overflow notes first.
+    /// Everything not yet acked: the unacked batch, then what arrived since,
+    /// overflow notes first. Logs go out once.
     fn drain(&mut self) -> RunOutput {
+        let mut items = std::mem::take(&mut self.pending);
+        items.extend(self.items.drain(..));
+        if items.len() > STREAM_BUFFER_MAX {
+            let over = items.len() - STREAM_BUFFER_MAX;
+            items.drain(..over);
+            self.items_dropped += over;
+        }
+        let cursor = self.cursor.take().or_else(|| self.pending_cursor.take());
+        self.pending = items.clone();
+        self.pending_cursor = cursor.clone();
         let mut logs = Vec::with_capacity(self.logs.len() + 2);
         if self.logs_dropped > 0 {
             logs.push(format!(
@@ -263,10 +280,15 @@ impl Buffer {
         }
         logs.extend(self.logs.drain(..));
         RunOutput {
-            items: self.items.drain(..).collect(),
-            cursor: self.cursor.take(),
+            items,
+            cursor,
             logs,
         }
+    }
+
+    fn ack(&mut self) {
+        self.pending.clear();
+        self.pending_cursor = None;
     }
 }
 
@@ -358,6 +380,7 @@ impl ItemSource for StreamSource {
             self.ensure_started(&input);
             let mut b = lock(&self.buffer);
             if b.items.is_empty()
+                && b.pending.is_empty()
                 && let Some(why) = b.down.clone()
             {
                 b.logs.clear();
@@ -366,6 +389,10 @@ impl ItemSource for StreamSource {
             }
             Ok(b.drain())
         })
+    }
+
+    fn ack(&self) {
+        lock(&self.buffer).ack();
     }
 }
 
@@ -459,6 +486,25 @@ mod tests {
         // The counters start over after a drain.
         b.push_log("info: again".into());
         assert_eq!(b.drain().logs, vec!["info: again"]);
+    }
+
+    #[test]
+    fn a_drained_batch_comes_back_until_it_is_acked() {
+        let mut b = Buffer::default();
+        b.push_item(Item::new("k1", serde_json::Map::new()));
+        b.cursor = Some("c1".into());
+        b.push_log("info: once".into());
+        let first = b.drain();
+        assert_eq!(first.items.len(), 1);
+        b.push_item(Item::new("k2", serde_json::Map::new()));
+        let again = b.drain();
+        let keys: Vec<&str> = again.items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["k1", "k2"], "unacked first, then the new");
+        assert_eq!(again.cursor.as_deref(), Some("c1"));
+        assert!(again.logs.is_empty(), "logs go out once");
+        b.ack();
+        let out = b.drain();
+        assert!(out.items.is_empty() && out.cursor.is_none());
     }
 
     #[test]

@@ -192,6 +192,8 @@ async fn drain_until(
     while keys.len() < want {
         assert!(Instant::now() < deadline, "only got {keys:?}");
         if let Ok(out) = src.run(input(cfg.clone(), Some("cur-0"))).await {
+            // As the scheduler does once it has persisted a batch.
+            src.ack();
             keys.extend(out.items.into_iter().map(|i| i.key));
             cursors.push(out.cursor);
             logs.extend(out.logs);
@@ -475,6 +477,33 @@ fn install_list_and_uninstall_from_a_git_repo() {
     assert!(out.contains("installed echo 0.2.0"), "{out}");
     let err = cli.fails(&["plugin", "install", "acme/missing", "--yes"]);
     assert!(err.contains("git clone"), "{err}");
+}
+
+/// The stream fixture, copied with a 1s timeout so `plugin run` collects for
+/// a second rather than the default minute, and linked.
+fn link_quick_stream(cli: &Cli) {
+    let dir = cli.dir("dev/stream");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(fixture("stream").join("stream.sh"), dir.join("stream.sh")).unwrap();
+    let manifest = std::fs::read_to_string(fixture("stream").join("pastor-plugin.toml")).unwrap();
+    std::fs::write(
+        dir.join("pastor-plugin.toml"),
+        manifest.replace("mode = \"stream\"", "mode = \"stream\"\ntimeout = \"1s\""),
+    )
+    .unwrap();
+    cli.ok(&["plugin", "link", dir.to_str().unwrap()]);
+}
+
+/// A stream is drained twice, at start and after its timeout; nothing is
+/// acked in between, so each item must still print once.
+#[test]
+fn plugin_run_collects_a_stream_and_prints_each_item_once() {
+    let cli = Cli::new();
+    link_quick_stream(&cli);
+    let (out, err) = cli.ok(&["plugin", "run", "stream", "--job", "try"]);
+    assert_eq!(out, "{\"key\":\"start-1\"}\n", "{err}");
+    assert!(err.contains("collecting for 1s"), "{err}");
+    assert!(err.contains("1 items, cursor cur-1"), "{err}");
 }
 
 #[test]

@@ -58,6 +58,12 @@ pub type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<RunOutput, String>> 
 pub trait ItemSource: Send + Sync {
     fn id(&self) -> &str;
     fn run<'a>(&'a self, input: RunInput) -> RunFuture<'a>;
+    /// The last `run`'s items and cursor are persisted. A source that cannot
+    /// produce them again (a stream: its process emitted them once) keeps
+    /// handing them out until this is called, so a dry run or a failed
+    /// insert does not lose them. A source that re-reads from the job's
+    /// cursor ignores it.
+    fn ack(&self) {}
 }
 
 /// The connectors pastor ships inside the binary.

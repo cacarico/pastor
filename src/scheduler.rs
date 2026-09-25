@@ -327,8 +327,10 @@ pub async fn run_job(
         // so they only advance when every new item became a task. A deferred
         // or failed item must be asked for again; the seen-store drops the
         // ones that did land. A rejected item is the item's own fault and a
-        // retry cannot fix it, so it does not hold them.
+        // retry cannot fix it, so it does not hold them. The same rule acks a
+        // stream's batch: until then it hands the items out again.
         if report.deferred == 0 && !insert_failed {
+            source.ack();
             state.last_ok_at = Some(now);
             if output.cursor.is_some() {
                 state.cursor = output.cursor;
@@ -1645,6 +1647,76 @@ mod tests {
         assert_eq!(report.outcome, RunOutcome::Failed);
         assert!(store.job_state("j").unwrap().is_none());
         assert!(rx.try_recv().is_err(), "no job.failed on a dry run");
+    }
+
+    /// The fixture stream connector for job `j`: one item `start-1` and
+    /// cursor `cur-1` shortly after its first run starts it.
+    fn fixture_stream(tmp: &std::path::Path) -> Arc<dyn ItemSource> {
+        let paths = Paths::new(tmp.join("c"), tmp.join("s")).with_data_dir(tmp.join("d"));
+        std::fs::create_dir_all(paths.plugins_dir()).unwrap();
+        std::os::unix::fs::symlink(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin/stream"),
+            paths.plugins_dir().join("stream"),
+        )
+        .unwrap();
+        let catalog = crate::plugin::PluginCatalog::load(&paths).unwrap();
+        catalog.source_for_job("stream", "j").unwrap()
+    }
+
+    /// Run `j` until the stream's item shows up in a report.
+    async fn run_until_items(
+        store: &Store,
+        j: &Job,
+        src: &dyn ItemSource,
+        tx: &broadcast::Sender<PastorEvent>,
+        dry_run: bool,
+    ) -> JobRunReport {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let r = run_job(store, j, src, tx, Utc::now(), dry_run).await;
+            if r.items > 0 {
+                return r;
+            }
+            assert!(std::time::Instant::now() < deadline, "no items: {r:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A stream hands its items over once. A dry run must not use them up:
+    /// the real run after it still gets them and persists their cursor.
+    #[tokio::test]
+    async fn a_dry_run_leaves_a_streams_items_for_the_real_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = fixture_stream(tmp.path());
+        let store = Store::open_in_memory().unwrap();
+        let (tx, _rx) = events();
+        let r = run_until_items(&store, &job("j"), src.as_ref(), &tx, true).await;
+        assert_eq!(r.created, vec!["start-1"]);
+        let r = run_job(&store, &job("j"), src.as_ref(), &tx, Utc::now(), false).await;
+        assert_eq!(r.created, vec!["t-1"], "{r:?}");
+        let st = store.job_state("j").unwrap().unwrap();
+        assert_eq!(st.cursor.as_deref(), Some("cur-1"));
+        let r = run_job(&store, &job("j"), src.as_ref(), &tx, Utc::now(), false).await;
+        assert_eq!(r.items, 0, "a persisted batch is not handed over again");
+    }
+
+    /// Same after a run whose insert failed: the job's cursor held, and the
+    /// stream must hold the items that go with it.
+    #[tokio::test]
+    async fn a_failed_insert_leaves_a_streams_items_for_the_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = fixture_stream(tmp.path());
+        let store = Store::open_in_memory().unwrap();
+        let (tx, _rx) = events();
+        let mut broken = job("j");
+        broken.prompt = "{{ item.title".into();
+        let r = run_until_items(&store, &broken, src.as_ref(), &tx, false).await;
+        assert!(r.created.is_empty(), "{r:?}");
+        assert!(store.job_state("j").unwrap().unwrap().cursor.is_none());
+        let r = run_job(&store, &job("j"), src.as_ref(), &tx, Utc::now(), false).await;
+        assert_eq!(r.created, vec!["t-1"], "{r:?}");
+        let st = store.job_state("j").unwrap().unwrap();
+        assert_eq!(st.cursor.as_deref(), Some("cur-1"));
     }
 
     #[test]

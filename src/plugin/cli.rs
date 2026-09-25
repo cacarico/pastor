@@ -344,17 +344,12 @@ async fn run_once(
                 "stream connector: collecting for {}s",
                 spec.timeout.as_secs()
             );
-            let mut out = source.run(input.clone()).await.unwrap_or_default();
+            // Nothing is acked, so the second drain hands out the first
+            // one's items again along with the rest; only its logs are new.
+            let first = source.run(input.clone()).await.unwrap_or_default();
             tokio::time::sleep(spec.timeout).await;
-            match source.run(input).await {
-                Ok(more) => {
-                    out.items.extend(more.items);
-                    out.cursor = more.cursor.or(out.cursor);
-                    out.logs.extend(more.logs);
-                }
-                Err(e) if out.items.is_empty() => bail!("{e}"),
-                Err(e) => out.logs.push(format!("warn: {e}")),
-            }
+            let mut out = source.run(input).await.map_err(anyhow::Error::msg)?;
+            out.logs.splice(0..0, first.logs);
             out
         }
         super::manifest::Mode::Poll => source.run(input).await.map_err(anyhow::Error::msg)?,
