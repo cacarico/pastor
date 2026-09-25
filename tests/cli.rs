@@ -2642,6 +2642,10 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
         &["plugin", "link", tmp.path().to_str().unwrap()],
         &["plugin", "uninstall", "echo"],
         &["plugin", "unlink", "echo"],
+        // A head started from the pane would dispatch with no request to
+        // refuse.
+        &["serve"],
+        &["setup", "systemd"],
     ] {
         assert_eq!(error_code(&run(args)), "agent_refused", "{args:?}");
     }
