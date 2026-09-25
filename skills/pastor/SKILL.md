@@ -124,7 +124,7 @@ Every machine needs a herdr server running, and the head needs passwordless ssh 
 ```bash
 pastor events                  # every task, job and machine event, oldest first
 pastor events --task t-12 --json
-pastor events --follow         # keeps running; only with a timeout
+timeout 60 pastor events --follow   # --follow never returns on its own; always bound it
 ```
 
 It reads the log file, so it works with the head down.
