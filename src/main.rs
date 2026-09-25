@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 
@@ -271,7 +272,16 @@ fn completion_tree() -> clap::Command {
 
 /// The hint a hidden old spelling prints before doing exactly what `new` does.
 fn moved(old: &str, new: &str) {
-    eprintln!("pastor {old} is now pastor {new}");
+    if let Some(hint) = moved_hint(old, new, std::io::stderr().is_terminal()) {
+        eprintln!("{hint}");
+    }
+}
+
+/// The hint, or nothing when stderr is not a terminal: a failing command
+/// writes exactly one JSON value to stderr, and a hint in front of it would
+/// break every script that parses it.
+fn moved_hint(old: &str, new: &str, stderr_is_tty: bool) -> Option<String> {
+    stderr_is_tty.then(|| format!("pastor {old} is now pastor {new}"))
 }
 
 fn fail(code: &str, message: &str) -> ! {
@@ -1286,6 +1296,18 @@ mod tests {
             "restart pastor serve to pick it up (the flock does not reload while it runs)"
         );
         assert_eq!(machine_edit_hint(false), "start pastor serve to use it");
+    }
+
+    /// On failure stderr carries exactly one JSON value, so a script calling an
+    /// old spelling must not get the hint in front of it; only a person at a
+    /// terminal sees it.
+    #[test]
+    fn moved_hint_speaks_only_to_a_terminal() {
+        assert_eq!(moved_hint("run", "task run", false), None);
+        assert_eq!(
+            moved_hint("run", "task run", true).as_deref(),
+            Some("pastor run is now pastor task run")
+        );
     }
 
     #[test]
