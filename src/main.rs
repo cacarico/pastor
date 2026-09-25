@@ -969,6 +969,14 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
                 println!("{done}");
                 return Ok(());
             }
+            // With no head, the store check and the file edit are not atomic
+            // against a head that starts in between. That head could accept
+            // `task run --flock <name>` after the check and before the save;
+            // the reload then drops the flock and the task stays queued with
+            // no machine to take it (`pastor task close` recovers it). It
+            // needs one user to start a head and submit to this flock while
+            // removing it, so it is left open; closing it would take a file
+            // lock shared by this edit and daemon startup.
             let queued: Vec<String> = open_store(paths)?
                 .list_tasks(&TaskFilter {
                     states: Some(vec![TaskState::Queued]),
