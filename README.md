@@ -12,6 +12,41 @@ attach to the agent's terminal and carry on.
   <img src="docs/demo/tasks.gif" alt="pastor machine list, task run, task list and task read in a terminal" width="800">
 </p>
 
+## Why
+
+Agents got good at one-off work: they loop until the job is done, run tools,
+and hold a whole repo in context. What still needed me at the laptop was the
+routine work around them: picking where it runs, creating the workspace,
+starting the agent, sending the prompt, watching it, and coming back later.
+[herdr](https://herdr.dev) gave agents a proper terminal; pastor is the layer
+above it that decides where work runs and keeps track of it. The goal is to
+spend time deciding what to do, not typing it. The longer story is in
+[the blog post](https://cacari.co/pastor/).
+
+## Features
+
+- **Tasks.** One agent, one prompt, in a repo or a fresh git worktree of it.
+  Tags, a per-machine agent limit or a pinned machine decide where it runs.
+- **Jobs.** Recurring tasks from a TOML file: a schedule, a connector that
+  finds the work, and a prompt template. A cursor keeps an item from being
+  handled twice.
+- **Flocks.** Named groups of machines, such as work and personal ones on
+  different accounts. A task only runs inside its own flock.
+- **Plugins.** Connectors that turn outside sources into work (the built-in
+  `clock`, or [GitHub issues](https://github.com/cacarico/pastor-plugins)),
+  and event hooks that run when a task finishes or blocks.
+- **Task states you can trust.** herdr reports what the agent is doing, and
+  pastor tells a finished agent from one that is waiting, stuck or gone.
+- **Reach any agent from your shell.** `task read` shows its output,
+  `task attach` puts you in its terminal, and `task send` answers it.
+- **A view of the fleet.** `machine list` shows every machine, its flock,
+  its herdr and pastor versions and how busy it is.
+- **An events log** of every state change, with `pastor events --follow`.
+- **Runs as a service.** `pastor setup systemd` installs the head as a user
+  unit, and flock or config edits reload it without a restart.
+- **Scriptable.** `--json` on the list and show commands, and shell
+  completions from `make install`.
+
 ## Install
 
 ```sh
