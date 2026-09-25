@@ -453,7 +453,7 @@ impl FakeHerdr {
             // bug or protocol skew could hand pastor: syntactically fine,
             // shaped nothing like the result any caller decodes.
             let reply = json!({"id": req.id, "result": {"malformed": true}});
-            let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+            let _ = send(&mut writer, &reply).await;
             return;
         }
         if req.method == "events.subscribe" {
@@ -488,16 +488,12 @@ impl FakeHerdr {
             };
             if let Some((i, pane)) = refused {
                 let err = json!({"id": format!("{}:sub:{i}:probe", req.id), "error": {"code": "pane_not_found", "message": format!("pane {pane} not found")}});
-                let _ = writer.write_all(format!("{err}\n").as_bytes()).await;
+                let _ = send(&mut writer, &err).await;
                 return;
             }
             let mut rx = self.events.subscribe();
             let ack = json!({"id": req.id, "result": {"type": "subscription_started"}});
-            if writer
-                .write_all(format!("{ack}\n").as_bytes())
-                .await
-                .is_err()
-            {
+            if send(&mut writer, &ack).await.is_err() {
                 return;
             }
             loop {
@@ -510,18 +506,14 @@ impl FakeHerdr {
                     Ok(ev) => ev,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let err = json!({"id": req.id, "error": {"code": "events_lost", "message": "fell behind"}});
-                        let _ = writer.write_all(format!("{err}\n").as_bytes()).await;
+                        let _ = send(&mut writer, &err).await;
                         return;
                     }
                     Err(_) => return,
                 };
                 if subscription_matches(&subs, &ev) {
                     let line = serde_json::to_string(&ev).unwrap();
-                    if writer
-                        .write_all(format!("{line}\n").as_bytes())
-                        .await
-                        .is_err()
-                    {
+                    if send(&mut writer, &line).await.is_err() {
                         return;
                     }
                 }
@@ -533,7 +525,7 @@ impl FakeHerdr {
                 json!({"id": req.id, "error": {"code": code, "message": message}})
             }
         };
-        let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+        let _ = send(&mut writer, &reply).await;
         // Returning here drops `writer`, closing the connection: one reply is all
         // a herdr connection ever carries.
     }
@@ -807,6 +799,15 @@ fn write_request_log(path: &std::path::Path, requests: &[Request]) {
     }
 }
 
+/// Writes one line of the protocol and flushes it. The stdio fake's writer is
+/// tokio's stdout, which accepts a write before the bytes reach the pipe (a
+/// blocking-pool thread does that later) and drops them if the process exits
+/// first. Without the flush, a busy machine turns a reply into a clean EOF.
+async fn send(writer: &mut BoxWrite, line: &impl std::fmt::Display) -> std::io::Result<()> {
+    writer.write_all(format!("{line}\n").as_bytes()).await?;
+    writer.flush().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,6 +1014,27 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let methods: Vec<&str> = logged.iter().map(|r| r.method.as_str()).collect();
         assert_eq!(methods, ["events.subscribe"]);
+    }
+
+    /// Stands in for `tokio::io::stdout`: a write is accepted at once but only
+    /// reaches the peer on flush, and dropping the writer unflushed loses it.
+    #[tokio::test]
+    async fn a_reply_reaches_a_writer_that_only_delivers_on_flush() {
+        use tokio::io::AsyncBufReadExt;
+        let fake = FakeHerdr::new();
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, mut aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        aw.write_all(b"{\"id\":\"1\",\"method\":\"ping\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        // BufWriter does not flush on drop, which is the stdout behaviour that
+        // matters here: an unflushed reply is simply gone.
+        let writer = tokio::io::BufWriter::new(bw);
+        fake.serve(Box::new(br), Box::new(writer)).await;
+        let mut line = String::new();
+        BufReader::new(ar).read_line(&mut line).await.unwrap();
+        assert!(line.contains("pong"), "reply lost: {line:?}");
     }
 
     /// herdr's API server answers exactly one request per connection and then
