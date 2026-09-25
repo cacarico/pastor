@@ -2173,9 +2173,13 @@ impl Actor {
     /// Answer the folder-trust prompt of every task blocked during startup
     /// (`Blocked` with its prompt still pending) whose (machine, repo) is
     /// saved as trusted: send its agent's trust keys once and emit
-    /// `task.trusted`. `claim_trust_sent` makes it once per task, across
-    /// restarts, whether or not the keys answered the prompt: a task still
-    /// blocked afterwards is left for a human. The pending prompt goes in
+    /// `task.trusted`. `claim_trust_sent`, after herdr accepted the keys,
+    /// makes it once per task, across restarts, whether or not the keys
+    /// answered the prompt: a task still blocked afterwards is left for a
+    /// human. A send that fails claims nothing, so a later reconcile tries
+    /// again; the actor is the only writer of the flag for its tasks, so
+    /// checking before the send and claiming after it cannot race. The
+    /// pending prompt goes in
     /// when the agent reports it is no longer blocked
     /// (`deliver_pending_prompt`).
     async fn auto_trust(&mut self) -> anyhow::Result<()> {
@@ -2189,13 +2193,16 @@ impl Actor {
             let Some(keys) = self.settings.agents.trust_keys(&task.spec.agent) else {
                 continue;
             };
-            if !self.store.is_trusted(&self.name, repo)? || !self.store.claim_trust_sent(task.id)? {
+            if self.store.trust_sent(task.id)? || !self.store.is_trusted(&self.name, repo)? {
                 continue;
             }
             let timeout = self.settings.request_timeout;
             tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
                 .await
                 .map_err(|_| TimedOut("pane.send_keys", timeout))??;
+            if !self.store.claim_trust_sent(task.id)? {
+                continue;
+            }
             tracing::info!(machine = %self.name, task = %task.display_id(), repo, "answered the trust prompt of a trusted repo");
             self.emit_with(
                 "task.trusted",
@@ -3653,6 +3660,40 @@ mod tests {
         let evs = trusted_events(&mut events);
         assert_eq!(evs.len(), 1, "{evs:?}");
         assert_eq!(evs[0].task_id, Some(t.id));
+    }
+
+    /// A trust send that fails (here it times out) is not a send: a later
+    /// reconcile tries again, and the task runs once one gets through.
+    #[tokio::test]
+    async fn a_failed_trust_send_is_tried_again() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let (h, mut events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                request_timeout: Duration::from_secs(1),
+                ..settings()
+            },
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        fake.hang_method("pane.send_keys");
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        wait_for("the task to run", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 2);
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [PaneInput::Keys(vec!["Down".into(), "Enter".into()])]
+        );
+        assert_eq!(trusted_events(&mut events).len(), 1);
     }
 
     #[tokio::test]

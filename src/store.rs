@@ -733,6 +733,19 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Whether task `id` has had its trust keys sent. False for no such row.
+    pub fn trust_sent(&self, id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT trust_sent FROM tasks WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
     /// Mark task `id` as having had its trust keys sent. True only for the
     /// call that set it, so the keys go to a task once, across restarts.
     /// `update_task` never writes the column, so no stale copy resets it.
@@ -1534,7 +1547,9 @@ mod tests {
     fn trust_is_sent_to_a_task_once() {
         let s = Store::open_in_memory().unwrap();
         let t = s.insert_task(new_task("run")).unwrap();
+        assert!(!s.trust_sent(t.id).unwrap());
         assert!(s.claim_trust_sent(t.id).unwrap());
+        assert!(s.trust_sent(t.id).unwrap());
         assert!(!s.claim_trust_sent(t.id).unwrap());
         // A write of the row from a copy read before does not reset it.
         let mut copy = s.get_task(t.id).unwrap().unwrap();
