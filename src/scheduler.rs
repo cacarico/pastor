@@ -853,8 +853,30 @@ impl Scheduler {
         let Ok(queued) = self.store.queued_tasks() else {
             return;
         };
+        // Only tasks still queued stay in the set: one that was dispatched,
+        // closed or pruned is never warned about again anyway.
+        self.warned_queued
+            .retain(|id| queued.iter().any(|t| t.id == *id));
         let limit = chrono::Duration::from_std(QUEUED_WARN_AFTER).expect("1h fits");
         for t in queued {
+            if let Some(m) = t
+                .spec
+                .machine
+                .as_deref()
+                .filter(|m| self.fleet.get(m).is_none())
+            {
+                // No pass can place it until that machine is back in the
+                // flock; waiting an hour to say so helps nobody.
+                if self.warned_queued.insert(t.id) {
+                    tracing::warn!(
+                        task = %t.display_id(),
+                        job = %t.job,
+                        machine = m,
+                        "queued for a machine that is not in the flock; it stays queued until the machine is added back"
+                    );
+                }
+                continue;
+            }
             if now - t.created_at >= limit && self.warned_queued.insert(t.id) {
                 tracing::warn!(
                     task = %t.display_id(),
@@ -1881,5 +1903,53 @@ mod tests {
         s.warn_long_queued(later);
         assert_eq!(s.warned_queued.len(), 1);
         assert!(s.warned_queued.contains(&t.id));
+    }
+
+    #[tokio::test]
+    async fn warned_queued_forgets_tasks_that_left_the_queue() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let t = store
+            .insert_task(crate::store::NewTask {
+                job: "run".into(),
+                item: Value::Null,
+                prompt: "p".into(),
+                spec: job("j").spec,
+            })
+            .unwrap();
+        let later = Utc::now() + chrono::Duration::hours(2);
+        s.warn_long_queued(later);
+        assert!(s.warned_queued.contains(&t.id));
+        // Dispatched: claimed off the queue.
+        store.claim_task(t.id, "m").unwrap().unwrap();
+        s.warn_long_queued(later);
+        assert!(s.warned_queued.is_empty(), "{:?}", s.warned_queued);
+    }
+
+    /// Review Focus 5: no dispatch pass can place a task pinned to a machine
+    /// the flock does not have, so it is warned about on the next pass, once.
+    #[tokio::test]
+    async fn a_task_pinned_to_a_missing_machine_is_warned_at_once() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = scheduler_with(&store);
+        let t = store
+            .insert_task(crate::store::NewTask {
+                job: "run".into(),
+                item: Value::Null,
+                prompt: "p".into(),
+                spec: DispatchSpec {
+                    machine: Some("gone".into()),
+                    ..job("j").spec
+                },
+            })
+            .unwrap();
+        let now = Utc::now();
+        s.warn_long_queued(now);
+        assert!(
+            s.warned_queued.contains(&t.id),
+            "no hour's wait for a machine that is not there"
+        );
+        s.warn_long_queued(now);
+        assert_eq!(s.warned_queued.len(), 1);
     }
 }
