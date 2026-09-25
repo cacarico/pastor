@@ -927,12 +927,12 @@ fn machine_status_creates_the_ssh_dir_private_before_ssh_runs() {
 
 /// systemd counts SIGTERM as a clean exit and would not restart a
 /// `Restart=on-failure` unit after one; `pastor serve` used to only handle
-/// SIGINT (ctrl-c), so a SIGTERM from `systemctl stop` on the wrong signal,
-/// an OOM killer, or a shell job control quirk killed the head silently,
-/// with the socket file left behind and the unit never coming back. Drives
-/// a real `pastor serve` child (no fake-herdr machine is needed: an empty
-/// flock is enough to bind the socket), sends it SIGTERM and checks that it
-/// exits cleanly, removes its socket, and logs which signal it got.
+/// SIGINT (ctrl-c), so a SIGTERM from a plain `kill`, `systemctl stop` of a
+/// wrapper, or a stray signal killed the head silently, with the socket
+/// file left behind and the unit never coming back. Drives a real `pastor
+/// serve` child (`serve` refuses an empty flock, so a fake-herdr-backed
+/// machine is needed too), sends it SIGTERM and checks that it exits
+/// cleanly, removes its socket, and logs which signal it got.
 /// Kills `serve` and `herdr` on drop, mirroring `Env::drop` above, so a
 /// failing assertion anywhere in the test never leaves either process
 /// running.
