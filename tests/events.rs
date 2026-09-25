@@ -8,6 +8,11 @@ use pastor::events::{DEFAULT_MAX_BYTES, EventRecord, LogWriter};
 use pastor::store::{NewTask, Store};
 use pastor::task::{DispatchSpec, Task};
 
+/// How long a test waits for the daemon or the fake herdr to do something.
+/// Generous on purpose: a CI runner under load has taken more than 10s to
+/// bring a daemon up, and a wait that ends early only ever fails a good run.
+const WAIT: Duration = Duration::from_secs(60);
+
 fn pastor(state: &std::path::Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
     c.env("PASTOR_CONFIG_DIR", state.join("c"))
@@ -188,7 +193,7 @@ async fn the_daemon_writes_the_events_log() {
     .unwrap();
     let socket = daemon.socket_path();
     let serve = tokio::spawn(daemon.run_with_listener(listener));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + WAIT;
     loop {
         if let Ok(IpcResponse::Machines(ms)) =
             pastor::ipc::request(&socket, &IpcRequest::FlockList).await
@@ -205,7 +210,7 @@ async fn the_daemon_writes_the_events_log() {
 
     let log = paths.events_file();
     let wait_for = async |kind: &str| -> EventRecord {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + WAIT;
         loop {
             if let Some(r) = pastor::events::read(&log, None)
                 .unwrap()

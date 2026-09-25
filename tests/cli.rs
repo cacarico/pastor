@@ -2,6 +2,11 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// How long a test waits for the daemon or the fake herdr to do something.
+/// Generous on purpose: a CI runner under load has taken more than 10s to
+/// bring a daemon up, and a wait that ends early only ever fails a good run.
+const WAIT: Duration = Duration::from_secs(60);
+
 fn pastor() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pastor"))
 }
@@ -91,7 +96,7 @@ fn start_with_jobs(jobs: &[(&str, &str)]) -> Env {
         herdr,
         herdr_log,
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     loop {
         let out = env.cmd(&["machine", "list", "--json"]);
         if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("\"connected\"") {
@@ -110,7 +115,7 @@ fn start_with_jobs(jobs: &[(&str, &str)]) -> Env {
 impl Env {
     /// The `params` of the `agent.start` the fake herdr got for `agent`.
     fn agent_start_params(&self, agent: &str) -> serde_json::Value {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         loop {
             if let Ok(text) = std::fs::read_to_string(&self.herdr_log)
                 && let Ok(reqs) = serde_json::from_str::<Vec<serde_json::Value>>(&text)
@@ -132,7 +137,7 @@ impl Env {
     /// Polls `task show` until `task` is done, so later snapshots of it are
     /// stable: the fake finishes agents on its own and the daemon reconciles.
     fn wait_done(&self, task: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT;
         loop {
             let out = self.cmd(&["task", "show", task, "--json"]);
             let t: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -765,7 +770,7 @@ fn setup_systemd_without_a_terminal_fails_fast_and_names_yes() {
         .unwrap();
     // Hold stdin open: a read_line would block here until the deadline.
     let stdin = child.stdin.take().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     while child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
             let _ = child.kill();
@@ -794,7 +799,7 @@ fn clock_job_creates_tasks_end_to_end() {
         "tick",
         "every = \"1s\"\n[connector]\nuse = \"clock\"\n[dispatch]\nrepo = \"/tmp\"\nprompt = \"clock {{ item.key }} for {{ job.name }} as {{ task.id }}\"\n",
     )]);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     let tasks: Vec<serde_json::Value> = loop {
         let out = env.cmd(&["task", "list", "--all", "--job", "tick", "--json"]);
         assert!(
@@ -1081,7 +1086,7 @@ fn assert_daemon_shuts_down_cleanly_on(signal: &str) {
             .output()
             .unwrap()
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     loop {
         let out = cmd(&["machine", "list", "--json"]);
         if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("\"connected\"") {
@@ -1100,7 +1105,7 @@ fn assert_daemon_shuts_down_cleanly_on(signal: &str) {
     let killed = Command::new("kill").args([&flag, &pid]).status().unwrap();
     assert!(killed.success(), "kill {flag} {pid} failed to run");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT;
     let exit = loop {
         if let Some(status) = env.serve.try_wait().unwrap() {
             break status;
@@ -1232,7 +1237,7 @@ fn machine_list_without_daemon_probes_each_machine() {
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT;
     while !socket.exists() {
         assert!(Instant::now() < deadline, "fake herdr never listened");
         std::thread::sleep(Duration::from_millis(20));
@@ -1403,7 +1408,7 @@ fn machine_list_without_daemon_shows_a_local_machine_s_pastor_version() {
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT;
     while !socket.exists() {
         assert!(Instant::now() < deadline, "fake herdr never listened");
         std::thread::sleep(Duration::from_millis(20));
@@ -1547,7 +1552,7 @@ impl Env {
     }
 
     fn wait_for(&self, what: &str, args: &[&str], ok: impl Fn(&str) -> bool) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT;
         loop {
             let out = self.cmd(args);
             let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -1707,7 +1712,7 @@ fn prune_works_without_a_daemon_and_retry_does_not() {
 }
 
 fn wait_for_machine(env: &Env, name: &str, present: bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     loop {
         let out = env.cmd(&["machine", "list", "--json"]);
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();

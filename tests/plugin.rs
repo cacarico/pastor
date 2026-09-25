@@ -12,6 +12,11 @@ use pastor::connector::{ItemSource, RunInput};
 use pastor::plugin::{Discovered, Plugin, discover};
 use serde_json::json;
 
+/// How long a test waits for the daemon or the fake herdr to do something.
+/// Generous on purpose: a CI runner under load has taken more than 10s to
+/// bring a daemon up, and a wait that ends early only ever fails a good run.
+const WAIT: Duration = Duration::from_secs(60);
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/plugin")
@@ -185,7 +190,7 @@ async fn drain_until(
     cfg: &serde_json::Value,
     want: usize,
 ) -> (Vec<String>, Vec<Option<String>>, Vec<String>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     let mut keys = Vec::new();
     let mut cursors = Vec::new();
     let mut logs = Vec::new();
@@ -264,7 +269,7 @@ async fn a_crashing_stream_is_restarted_with_backoff() {
     );
     assert_eq!(&keys[..3], &["start-1", "start-2", "start-3"]);
     // Down, nothing buffered: the run fails, naming why.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     let err = loop {
         match src.run(input(cfg.clone(), None)).await {
             Err(e) => break e,
@@ -759,7 +764,7 @@ fn serve() -> Serve {
         cli,
         children: vec![herdr, daemon],
     };
-    wait(10, "the machine connects", || {
+    wait(60, "the machine connects", || {
         let out = s.cli.pastor(&["machine", "list", "--json"]);
         String::from_utf8_lossy(&out.stdout).contains("\"connected\"")
     });
@@ -807,7 +812,7 @@ fn a_daemon_runs_plugin_jobs_and_hooks_hear_their_events() {
 
     let echo = cli.dir("s/plugins/support/hook-records.jsonl");
     let notify = cli.dir("s/plugins/support/notify.jsonl");
-    wait(20, "both tasks are done and every hook heard it", || {
+    wait(60, "both tasks are done and every hook heard it", || {
         records(&echo)
             .iter()
             .filter(|r| r["type"] == "task.done")
@@ -834,7 +839,7 @@ fn a_daemon_runs_plugin_jobs_and_hooks_hear_their_events() {
     cli.ok(&["run", "one-off", "--repo", "/tmp"]);
     // `run` is not a job, so the hook gets no PASTOR_JOB and its own scratch.
     let notify_run = cli.dir("s/plugins/@notify/notify.jsonl");
-    wait(20, "notify hears the one-off task end", || {
+    wait(60, "notify hears the one-off task end", || {
         !records(&notify_run).is_empty()
     });
     std::thread::sleep(Duration::from_millis(300));
