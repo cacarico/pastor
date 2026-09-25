@@ -83,6 +83,10 @@ pub struct CronExpr {
     dow_any: bool,
 }
 
+/// The most days each month can have, indexed by month number. February
+/// counts its leap day, since `0 0 29 2 *` does run, every four years.
+const MONTH_DAYS: [usize; 13] = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
 impl CronExpr {
     pub fn parse(text: &str) -> Result<CronExpr, String> {
         let fields: Vec<&str> = text.split_whitespace().collect();
@@ -102,6 +106,16 @@ impl CronExpr {
             dow[0] = true;
         }
         dow.truncate(7);
+        // With only the day of month restricted, some chosen month must have
+        // one of the chosen days, or the job loads and never runs (`0 0 30 2
+        // *`). With the weekday restricted too, Vixie's OR rule lets the
+        // weekday match, so it always fires eventually.
+        if !dom_any && dow_any && !(1..=12).any(|m| month[m] && (1..=MONTH_DAYS[m]).any(|d| dom[d]))
+        {
+            return Err(format!(
+                "cron {text:?}: none of the chosen months has any of the chosen days, so it never runs"
+            ));
+        }
         Ok(CronExpr {
             source: fields.join(" "),
             minute,
@@ -268,6 +282,27 @@ fn parse_u32_strict(s: &str) -> Result<u32, String> {
 mod tests {
     use super::*;
     use chrono::FixedOffset;
+
+    #[test]
+    fn a_cron_whose_days_never_fall_in_its_months_is_rejected() {
+        for bad in ["0 0 30 2 *", "0 0 31 4,6,9,11 *", "0 0 31 2-4/2 *"] {
+            let err = CronExpr::parse(bad).unwrap_err();
+            assert!(err.contains("never runs"), "{bad}: {err}");
+        }
+        let err = Schedule::from_fields(None, Some("0 0 30 2 *")).unwrap_err();
+        assert!(err.contains("never runs"), "{err}");
+        // 29 February exists every four years; a weekday makes Vixie's OR
+        // rule apply; a wildcard day always fits.
+        for good in [
+            "0 0 29 2 *",
+            "0 0 30 2 1",
+            "0 0 31 * *",
+            "0 0 31 1-12 *",
+            "0 0 * 2 *",
+        ] {
+            CronExpr::parse(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
