@@ -12,6 +12,7 @@ use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
 use crate::machine::{MachineHandle, MachineSettings, OrphanClosed, PastorEvent, spawn_machine};
 use crate::scheduler::{Scheduler, SchedulerHandle};
 use crate::store::{NewTask, RetryError, Store};
+use crate::task::Task;
 use crate::task::TaskState;
 
 /// The machines plus the one lock every dispatch pass takes. Shared by the
@@ -528,34 +529,65 @@ impl Daemon {
                 Err(err) => IpcResponse::error("close_failed", format!("{err:#}")),
             };
         };
-        if remove_worktree && !t.spec.worktree {
-            return IpcResponse::error(
-                "no_worktree",
-                format!("{} has no worktree to remove", t.display_id()),
-            );
-        }
-        // A closed task has no pane left to close, so repeating the close
-        // answers the row without its machine, which may be gone or down.
-        // A worktree removal still routes: the checkout may remain.
-        if t.state == TaskState::Closed && !remove_worktree {
-            return IpcResponse::Task(t);
-        }
-        let Some(machine) = t.machine.clone() else {
+        self.close_row(t, remove_worktree).await
+    }
+
+    /// The rest of `close`, for the row `t` as it was read. A queued task
+    /// can be claimed by a dispatch pass at any moment after that read, so
+    /// its row is closed only while it is still queued (`close_queued`); on
+    /// losing to a claim the row is read again and the close goes to the
+    /// machine that took it, which closes the agent too.
+    async fn close_row(&self, mut t: Task, remove_worktree: bool) -> IpcResponse {
+        let id = t.id;
+        // Runs twice at most: a row leaves `queued` only once, and a claim
+        // sets `machine`, so the second pass routes to it.
+        let machine = loop {
+            if remove_worktree && !t.spec.worktree {
+                return IpcResponse::error(
+                    "no_worktree",
+                    format!("{} has no worktree to remove", t.display_id()),
+                );
+            }
+            // A closed task has no pane left to close, so repeating the close
+            // answers the row without its machine, which may be gone or down.
+            // A worktree removal still routes: the checkout may remain.
+            if t.state == TaskState::Closed && !remove_worktree {
+                return IpcResponse::Task(t);
+            }
+            if let Some(m) = t.machine.clone() {
+                break m;
+            }
             let was = t.state;
-            return match self.store.close_task(id) {
-                Ok(closed) => {
-                    if was != TaskState::Closed {
-                        let _ = self.events.send(PastorEvent {
-                            kind: "task.closed".into(),
-                            task_id: Some(id),
-                            machine: None,
-                            job: Some(closed.job.clone()),
-                        });
-                    }
-                    IpcResponse::Task(closed)
+            let closed = if was == TaskState::Queued {
+                match self.store.close_queued(id) {
+                    Ok(Some(c)) => c,
+                    // Claimed (or closed) since the read: read it again.
+                    Ok(None) => match self.store.get_task(id) {
+                        Ok(Some(fresh)) => {
+                            t = fresh;
+                            continue;
+                        }
+                        Ok(None) => return IpcResponse::error("task_not_found", t.display_id()),
+                        Err(err) => return IpcResponse::error("store_error", err),
+                    },
+                    Err(err) => return IpcResponse::error("store_error", err),
                 }
-                Err(err) => IpcResponse::error("store_error", err),
+            } else {
+                // Not queued and never on a machine: nothing can claim it.
+                match self.store.close_task(id) {
+                    Ok(c) => c,
+                    Err(err) => return IpcResponse::error("store_error", err),
+                }
             };
+            if was != TaskState::Closed {
+                let _ = self.events.send(PastorEvent {
+                    kind: "task.closed".into(),
+                    task_id: Some(id),
+                    machine: None,
+                    job: Some(closed.job.clone()),
+                });
+            }
+            return IpcResponse::Task(closed);
         };
         let Some(handle) = self.fleet.get(&machine) else {
             return IpcResponse::error(
@@ -1068,6 +1100,39 @@ mod tests {
             error_code(d.handle(IpcRequest::TaskRetry { id: failed.id }).await),
             "store_error"
         );
+    }
+
+    /// The close read the task queued, then a dispatch claimed and started
+    /// it before the row was written. Closing the row alone would leave the
+    /// agent running behind a closed task; the close must lose to the claim
+    /// and go through the machine that took it.
+    #[tokio::test]
+    async fn closing_a_queued_task_that_a_dispatch_just_claimed_routes_to_its_machine() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
+        let IpcResponse::Task(t) = d
+            .handle(IpcRequest::Run {
+                prompt: "x".into(),
+                spec: spec(),
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("a"));
+        assert_eq!(fake.agents().len(), 1);
+        // What the close read before the claim landed.
+        let mut seen = t.clone();
+        seen.state = TaskState::Queued;
+        seen.machine = None;
+        seen.pane_id = None;
+        seen.workspace_id = None;
+        let resp = d.close_row(seen, false).await;
+        let IpcResponse::Task(closed) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(closed.state, TaskState::Closed);
+        assert!(fake.agents().is_empty(), "the agent went with the task");
     }
 
     #[tokio::test]

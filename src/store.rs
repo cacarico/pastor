@@ -357,6 +357,26 @@ impl Store {
         Ok(t)
     }
 
+    /// Close task `id` only if it is still `queued`, in one conditional
+    /// UPDATE. A queued task has no machine yet, so nothing but its row to
+    /// close; `None` means it was not queued any more, typically because a
+    /// dispatch claimed it in between (`claim_task`), and the close must then
+    /// go through that machine. The counterpart of `claim_task`.
+    pub fn close_queued(&self, id: i64) -> anyhow::Result<Option<Task>> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE tasks SET state = 'closed', finished_at = COALESCE(finished_at, ?2), updated_at = ?2
+             WHERE id = ?1 AND state = 'queued'",
+            params![id, now],
+        )?;
+        drop(conn);
+        if n == 0 {
+            return Ok(None);
+        }
+        self.get_task(id)
+    }
+
     /// Delete tasks in `states` that finished more than `older_than` ago
     /// (`finished_at`, or `updated_at` for a row that never recorded one).
     /// Their `seen` rows stay, so the items never trigger again. Only
@@ -1417,6 +1437,27 @@ mod tests {
         assert!(closed.finished_at.is_some(), "a running task finishes now");
         assert_eq!(s.get_task(r.id).unwrap().unwrap().state, TaskState::Closed);
         assert!(s.close_task(99).is_err());
+    }
+
+    /// A queued task has no machine to close it through, so its row is
+    /// closed in SQL, and only while it is still queued: a dispatch that
+    /// claimed it in between wins, and the close must go to its machine.
+    #[test]
+    fn close_queued_closes_only_a_task_nobody_claimed() {
+        let s = Store::open_in_memory().unwrap();
+        let q = s.insert_task(new_task("run")).unwrap();
+        let closed = s.close_queued(q.id).unwrap().expect("still queued");
+        assert_eq!(closed.state, TaskState::Closed);
+        assert!(closed.finished_at.is_some());
+        assert!(s.close_queued(q.id).unwrap().is_none(), "closed already");
+
+        let c = s.insert_task(new_task("run")).unwrap();
+        s.claim_task(c.id, "m").unwrap().expect("claimed");
+        assert!(s.close_queued(c.id).unwrap().is_none(), "lost to the claim");
+        let row = s.get_task(c.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Starting);
+        assert_eq!(row.machine.as_deref(), Some("m"));
+        assert!(s.close_queued(99).unwrap().is_none());
     }
 
     #[test]
