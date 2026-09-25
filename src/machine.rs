@@ -932,13 +932,17 @@ impl Actor {
             .map_err(|_| TimedOut("agent.list", timeout))??;
         // The pane the row records, whatever its state: a failed task can
         // hold a pane with no agent in it (a dispatch that failed at
-        // `agent.start`), which no name lookup would find. Not a closed row's:
-        // pastor closed that pane itself, and herdr may have handed its id
-        // out again. Otherwise (closed, no ids, no row) whatever agent still
-        // carries the task's name.
+        // `agent.start`), which no name lookup would find. Not a closed
+        // row's pane for an ordinary close: pastor closed that pane itself,
+        // and herdr may have handed its id out again. A closed row's
+        // *workspace* id is still good for `--remove-worktree`, though: a
+        // plain close only closes the pane, not the checkout, so the id it
+        // recorded can still be removed by even after the row is closed.
+        // Otherwise (closed, no ids, no row) whatever agent still carries
+        // the task's name.
         let recorded = row
             .as_ref()
-            .filter(|t| t.state != TaskState::Closed)
+            .filter(|t| t.state != TaskState::Closed || remove_worktree)
             .and_then(|t| t.pane_id.clone().map(|p| (p, t.workspace_id.clone())));
         let target = recorded.or_else(|| {
             agents
@@ -2445,6 +2449,34 @@ mod tests {
             vec![
                 serde_json::json!({"workspace_id": wt.workspace_id.clone().unwrap(), "force": false})
             ]
+        );
+        assert!(fake.workspaces().is_empty());
+    }
+
+    /// A closed row can still record a workspace whose pane never went
+    /// through pastor's own close: `--remove-worktree` must use that
+    /// recorded id rather than fall back to a name lookup that finds
+    /// nothing and leaves the checkout behind.
+    #[tokio::test]
+    async fn close_remove_worktree_uses_the_recorded_workspace_of_a_closed_row() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        let workspace = t.workspace_id.clone().unwrap();
+        // The pane disappears without going through pastor's close, and the
+        // row is marked closed without reaching herdr: the workspace is
+        // still recorded, but a name lookup would find no agent.
+        fake.exit_pane(&pane);
+        store.close_task(t.id).unwrap();
+        assert_eq!(state_of(&store, t.id), TaskState::Closed);
+
+        let closed = h.close(t.id, true).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(
+            calls(&fake, "worktree.remove"),
+            vec![serde_json::json!({"workspace_id": workspace, "force": false})]
         );
         assert!(fake.workspaces().is_empty());
     }
