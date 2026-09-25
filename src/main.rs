@@ -454,6 +454,8 @@ fn changes_fleet(command: &Command) -> bool {
                 | TaskCmd::Close(_)
                 | TaskCmd::Prune(_)
                 | TaskCmd::Send(_)
+                // herdr's agent terminal types into any task's pane.
+                | TaskCmd::Attach { .. }
         ),
         Command::Machine { cmd } => !matches!(cmd, MachineCmd::List { .. }),
         Command::Flock { cmd } => !matches!(cmd, FlockCmd::List { .. }),

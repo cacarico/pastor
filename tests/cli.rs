@@ -2635,6 +2635,8 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
         // Both apply pastor.toml and flock.toml, head or no head.
         &["job", "reload"],
         &["tick", "--dry-run"],
+        // herdr's agent terminal takes keys for any task's pane.
+        &["task", "attach", "t-1"],
     ] {
         assert_eq!(error_code(&run(args)), "agent_refused", "{args:?}");
     }
