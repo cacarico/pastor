@@ -114,7 +114,7 @@ The head picks up job file edits by itself. A file that stops parsing keeps its 
 pastor machine add pi-3 fleet@pi-3 --max-agents 2 --tag arm --herdr
 pastor machine add here --local
 pastor machine remove pi-3 --herdr
-pastor machine status      # connects to each machine now: ssh, herdr version, agents
+pastor machine list        # connects to each machine now: ssh, herdr version, agents
 ```
 
 Every machine needs a herdr server running, and the head needs passwordless ssh to it. Start herdr with `herdr server`, or better as a user service: `pastor setup systemd --herdr --yes` on that machine. The head itself runs as a service with `pastor setup systemd --yes`. Setup needs `--yes` when stdin is not a terminal. Ask the user before installing services.
