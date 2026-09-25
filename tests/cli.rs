@@ -423,9 +423,9 @@ fn machine_add_and_remove_edit_the_file() {
 /// Copilot 4102376166: a socket that accepts but never answers `Ping` is
 /// `Unresponsive` (a busy head), not the same as no daemon at all, so
 /// `machine add` must not send the "start pastor serve" advice. Copilot
-/// 4106353416: nor may it write the edit, since that head may be one from
-/// before flocks that reloads it later as one flock; it is refused
-/// (`head_too_old`) with flock.toml untouched.
+/// 4106353416, 4106669969: nor may it write the edit next to a head it
+/// cannot check; it is refused (`head_unresponsive`) with flock.toml
+/// untouched.
 #[test]
 fn machine_add_refuses_a_wedged_head_rather_than_taking_it_for_no_head() {
     let tmp = tempfile::tempdir().unwrap();
@@ -446,7 +446,7 @@ fn machine_add_refuses_a_wedged_head_rather_than_taking_it_for_no_head() {
         .env("PASTOR_STATE_DIR", &state)
         .output()
         .unwrap();
-    assert_eq!(error_code(&out), "head_too_old");
+    assert_eq!(error_code(&out), "head_unresponsive");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         !stderr.contains("start pastor serve") && stderr.contains("not answering"),
@@ -1564,12 +1564,14 @@ fn named_flocks_refuse_every_head_path_on_a_head_from_before_flocks() {
     assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
 }
 
-/// Copilot 4106353416: a head that is listening but does not answer ping
-/// may be an old one, busy. With flocks in play it is refused like one,
-/// never taken for no head at all, which would write the edit for it to
-/// reload later as one flock.
+/// Copilot 4106353416, 4106669969: a head that is listening but does not
+/// answer ping is a hard error (`head_unresponsive`) on every path that talks
+/// to or reloads the head, flocks or not. Taking it for no head would let
+/// `tick` start a second scheduler next to it, or an edit or a prune go
+/// offline behind it. The head is pinged once per command: no second probe
+/// can read it differently later in the same command.
 #[test]
-fn an_unresponsive_head_is_refused_when_flocks_are_in_play() {
+fn an_unresponsive_head_is_a_hard_error_on_every_head_path() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
@@ -1588,33 +1590,45 @@ fn an_unresponsive_head_is_refused_when_flocks_are_in_play() {
             .output()
             .unwrap()
     };
-    for args in [
-        &["flock", "add", "work"][..],
-        &["flock", "remove", "default"],
-        &["machine", "move", "pi-1", "default"],
+    let paths: [&[&str]; 14] = [
+        &["tick"],
+        &["job", "list"],
+        &["job", "enable", "j"],
+        &["task", "run", "hi"],
         &["task", "run", "hi", "--flock", "work"],
-    ] {
-        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+        &["task", "list"],
+        &["task", "show", "t-1"],
+        &["task", "prune", "--done", "--older-than", "3d"],
+        &["machine", "list"],
+        &["machine", "add", "pi-2", "--local"],
+        &["machine", "move", "pi-1", "default"],
+        &["flock", "list"],
+        &["flock", "add", "work"],
+        &["flock", "remove", "default"],
+    ];
+    for args in paths {
+        let out = run(args);
+        assert_eq!(error_code(&out), "head_unresponsive", "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not answering") && !stderr.contains("start pastor serve"),
+            "{args:?}: {stderr}"
+        );
         assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), before);
     }
-    std::fs::write(&flock_file, NAMED_FLOCKS).unwrap();
-    assert_eq!(error_code(&run(&["task", "run", "hi"])), "head_too_old");
+    assert!(!state.join("pastor.db").exists(), "nothing ran offline");
     let ops = ops.lock().unwrap();
+    assert_eq!(ops.len(), paths.len(), "one ping per command: {ops:?}");
     assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
 }
 
-/// `probe_daemon` reads a socket that accepts connections but never answers
-/// `Ping` in time as `Unresponsive` — the same state a head busy mid-dispatch
-/// is in. `machine list` must route that through the ordinary IPC request,
-/// the way it does for a healthy head, rather than falling back to probing
-/// machines directly (which would also print pastor's own "not running"
-/// note for a head that is only busy). The fake daemon here answers the
-/// first connection (`probe_daemon`'s ping) with something other than
-/// `Pong`, which reads as `Unresponsive` the instant the reply arrives, no
-/// need to wait out the real 2s ping timeout; it then drops the second
-/// connection (`machine list`'s real `FlockList` request) without a reply,
-/// so `request`'s own "closed the connection" error surfaces instead of
-/// `probe_daemon`'s "not running" advice.
+/// A socket that accepts connections but does not answer `Ping` in time is
+/// `Unresponsive`, the same state a head busy mid-dispatch is in. `machine
+/// list` must not probe the machines around it (which would also print the
+/// "not running" note for a head that is only busy): the command stops with
+/// `head_unresponsive`. The fake daemon answers the ping with something other
+/// than `Pong`, which reads as `Unresponsive` at once, with no wait for the
+/// real 2s ping timeout.
 #[test]
 fn machine_list_treats_an_unresponsive_daemon_as_running_not_absent() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1661,12 +1675,9 @@ fn machine_list_treats_an_unresponsive_daemon_as_running_not_absent() {
             String::from_utf8_lossy(&out.stderr)
         )
     });
-    assert_eq!(err["code"], "runtime_error");
+    assert_eq!(err["code"], "head_unresponsive");
     let message = err["message"].as_str().unwrap();
-    assert!(
-        message.contains("dropped the request"),
-        "expected the IPC exchange error, got: {message}"
-    );
+    assert!(message.contains("not answering"), "{message}");
     assert!(
         !message.contains("not running"),
         "an unresponsive daemon must not be reported as absent: {message}"

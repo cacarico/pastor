@@ -5,8 +5,7 @@ use clap::{ArgGroup, Args};
 use crate::cli::{CliError, TASK_HEADER, request_failure, table, task_rows};
 use crate::config::{Paths, parse_duration};
 use crate::ipc::{
-    DaemonProbe, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon,
-    probe_daemon, request,
+    Head, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, request,
 };
 use crate::machine::SendInput;
 use crate::store::{PruneOutcome, Store};
@@ -186,15 +185,15 @@ impl PruneArgs {
 
 /// `pastor task prune --done|--failed|--closed --older-than D`. Through the
 /// daemon when one runs; straight on the database, since it needs no
-/// machine, only when nothing holds the socket. A head that holds it but
-/// does not answer may be busy mid-request, with actors still writing tasks,
-/// so prune refuses rather than race it.
-pub async fn prune(paths: &Paths, a: PruneArgs) -> anyhow::Result<()> {
+/// machine, only when nothing holds the socket. `head` is what the command's
+/// one probe found: a head that holds the socket but does not answer may be
+/// busy mid-request, with actors still writing tasks, so it stopped the
+/// command before this (`head_unresponsive`) rather than let prune race it.
+pub async fn prune(paths: &Paths, a: PruneArgs, head: Head) -> anyhow::Result<()> {
     let older_than = parse_duration(&a.older_than).map_err(|e| CliError::err("usage_error", e))?;
     let states = a.states();
-    let socket = paths.socket_file();
-    let out = match probe_daemon(&socket).await {
-        DaemonProbe::Running => {
+    let out = match head {
+        Head::Live => {
             let req = IpcRequest::TaskPrune {
                 states,
                 older_than_secs: older_than.as_secs(),
@@ -204,18 +203,9 @@ pub async fn prune(paths: &Paths, a: PruneArgs) -> anyhow::Result<()> {
                 other => return Err(unexpected(other)),
             }
         }
-        DaemonProbe::NotRunning => {
+        Head::Absent => {
             paths.ensure()?;
             Store::open(&paths.db_file())?.prune(&states, older_than)?
-        }
-        DaemonProbe::Unresponsive => {
-            return Err(CliError::err(
-                "daemon_unresponsive",
-                format!(
-                    "pastor serve is not answering on {}; nothing was pruned, run it again once it answers",
-                    socket.display()
-                ),
-            ));
         }
     };
     if a.json {
@@ -312,27 +302,6 @@ mod tests {
             code_and_message(RequestError::Exchange(anyhow::anyhow!("closed early")));
         assert_eq!(code, "runtime_error");
         assert!(message.contains("dropped the request"), "{message}");
-    }
-
-    /// A head that holds the socket but does not answer may still be running
-    /// machine actors and lifecycle requests, so prune must not write the
-    /// database behind its back: only a head that is not there at all lets
-    /// it go offline.
-    #[tokio::test]
-    async fn prune_does_not_write_offline_behind_an_unresponsive_head() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        std::fs::create_dir_all(tmp.path().join("s")).unwrap();
-        // Connects land in the backlog and are never answered.
-        let _listener = std::os::unix::net::UnixListener::bind(paths.socket_file()).unwrap();
-        let a = P::try_parse_from(["p", "--done", "--older-than", "3d"])
-            .unwrap()
-            .a;
-        let err = prune(&paths, a).await.unwrap_err();
-        let e = err.downcast_ref::<CliError>().expect("a CliError");
-        assert_eq!(e.code, "daemon_unresponsive");
-        assert!(e.message.contains("not answering"), "{}", e.message);
-        assert!(!paths.db_file().exists(), "nothing written offline");
     }
 
     #[test]

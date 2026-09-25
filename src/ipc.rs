@@ -248,6 +248,24 @@ pub async fn ping_head(socket: &Path) -> HeadPing {
     }
 }
 
+/// The head as a CLI command found it with its one `ping_head`, carried
+/// through the whole command so no later probe can read it differently. A
+/// head that is listening but does not answer is neither: the command stops
+/// (`head_unresponsive`) rather than work as if none ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Head {
+    /// Nothing listens on the socket; the command works without a head.
+    Absent,
+    /// The head answered the ping.
+    Live,
+}
+
+impl Head {
+    pub fn is_live(self) -> bool {
+        self == Head::Live
+    }
+}
+
 pub async fn probe_daemon(socket: &Path) -> DaemonProbe {
     match ping_head(socket).await {
         HeadPing::NotRunning => DaemonProbe::NotRunning,

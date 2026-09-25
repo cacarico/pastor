@@ -7,9 +7,7 @@ use pastor::config::flock::{EditError, Flock, FlockDoc, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
 use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
-use pastor::ipc::{
-    DaemonProbe, HeadPing, IpcRequest, IpcResponse, daemon_running, probe_daemon, request,
-};
+use pastor::ipc::{Head, HeadPing, IpcRequest, IpcResponse, request};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
 use pastor::task::{DispatchSpec, Task, TaskState, parse_task_id};
@@ -290,17 +288,19 @@ fn main() {
     };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async {
-        if flocks_in_play(&command, &paths) {
-            require_flock_head(&paths).await?;
-        }
+        // Commands that never talk to the head do not read `head`.
+        let head = match head_use(&command) {
+            Some(flocky) => probe_head(&paths, flocky || flocks_declared(&paths)).await?,
+            None => Head::Absent,
+        };
         match command {
             Command::Serve => pastor::daemon::serve(paths).await,
-            Command::Task { cmd } => task(&paths, cmd).await,
-            Command::Machine { cmd } => machine(&paths, cmd).await,
-            Command::Flock { cmd } => flock(&paths, cmd).await,
+            Command::Task { cmd } => task(&paths, cmd, head).await,
+            Command::Machine { cmd } => machine(&paths, cmd, head).await,
+            Command::Flock { cmd } => flock(&paths, cmd, head).await,
             Command::Open { machine } => open(&paths, &machine).await,
-            Command::Tick(args) => tick(&paths, args).await,
-            Command::Job { cmd } => job(&paths, cmd).await,
+            Command::Tick(args) => tick(&paths, args, head).await,
+            Command::Job { cmd } => job(&paths, cmd, head).await,
             Command::Completions { shell } => {
                 let mut cmd = completion_tree();
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
@@ -346,64 +346,67 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
     Ok(resp)
 }
 
-/// The one gate before a command talks to or reloads the head while flocks
-/// are in play (`flocks_in_play`). A head from before flocks ignores the
-/// `flock` field of a request (serde skips unknown fields) and reads
-/// flock.toml as one flock, so it would dispatch, list or reload across
-/// every flock. Only a head that is not running passes unchecked; one that
-/// listens but does not answer ping may be an old head, busy, and is refused
-/// like one rather than taken for no head.
-async fn require_flock_head(paths: &Paths) -> anyhow::Result<()> {
-    let too_old = |why: String| {
-        Err(pastor::cli::CliError::err(
-            "head_too_old",
-            format!("{why}; restart it, or stop it to work without a head"),
-        ))
-    };
-    match pastor::ipc::ping_head(&paths.socket_file()).await {
-        HeadPing::NotRunning => Ok(()),
-        HeadPing::Pong { protocol, .. } if protocol >= pastor::ipc::FLOCK_PROTOCOL => Ok(()),
-        HeadPing::Pong { version, .. } => too_old(format!(
-            "the running pastor serve ({version}) predates flocks and would act on every flock"
+/// The one ping a command sends the head, before it does anything, and what
+/// the command then acts on throughout. A head that is not running is
+/// `Head::Absent` and the command works without it. One that is listening
+/// but does not answer is a hard error, never taken for no head: `tick`
+/// would start a second scheduler next to it, and an edit or a prune would
+/// go offline behind it. With `flocks` in play (`head_use`) a head from
+/// before flocks is refused too: it ignores the `flock` field of a request
+/// (serde skips unknown fields) and reads flock.toml as one flock, so it
+/// would dispatch, list or reload across every flock.
+async fn probe_head(paths: &Paths, flocks: bool) -> anyhow::Result<Head> {
+    let socket = paths.socket_file();
+    match pastor::ipc::ping_head(&socket).await {
+        HeadPing::NotRunning => Ok(Head::Absent),
+        HeadPing::Unresponsive => Err(pastor::cli::CliError::err(
+            "head_unresponsive",
+            format!(
+                "pastor serve is listening on {} but not answering; nothing was done, run it again once it answers",
+                socket.display()
+            ),
         )),
-        HeadPing::Unresponsive => too_old(
-            "pastor serve is listening but not answering, so it cannot be checked to understand flocks"
-                .into(),
-        ),
+        HeadPing::Pong { protocol, .. } if !flocks || protocol >= pastor::ipc::FLOCK_PROTOCOL => {
+            Ok(Head::Live)
+        }
+        HeadPing::Pong { version, .. } => Err(pastor::cli::CliError::err(
+            "head_too_old",
+            format!(
+                "the running pastor serve ({version}) predates flocks and would act on every flock; restart it, or stop it to work without a head"
+            ),
+        )),
     }
 }
 
-/// Whether `command` talks to or reloads the head with flocks in play: it
-/// takes `--flock`, it edits flock.toml, or flock.toml declares named flocks
-/// (then no `--flock` means the default flock, not every machine). A
-/// flock.toml that does not load counts as declaring them.
-fn flocks_in_play(command: &Command, paths: &Paths) -> bool {
+/// Whether `command` talks to or reloads the head, and if so whether it
+/// brings flocks into play on its own: it takes `--flock`, or it edits
+/// flock.toml. `None` for a command that never talks to the head.
+fn head_use(command: &Command) -> Option<bool> {
     use pastor::plugin::cli::PluginCmd;
-    let (talks, flocky) = match command {
-        Command::Task { cmd } => (
-            true,
-            match cmd {
-                TaskCmd::Run(a) => a.flock.is_some(),
-                TaskCmd::List(a) => a.flock.is_some(),
-                _ => false,
-            },
-        ),
-        Command::Machine { cmd } => (
-            true,
-            match cmd {
-                MachineCmd::List { flock, .. } => flock.is_some(),
-                _ => true,
-            },
-        ),
-        Command::Flock { cmd } => (true, !matches!(cmd, FlockCmd::List { .. })),
-        Command::Tick(_) | Command::Job { .. } => (true, false),
-        Command::Plugin { cmd } => (
-            !matches!(cmd, PluginCmd::List { .. } | PluginCmd::Run { .. }),
-            false,
-        ),
-        _ => (false, false),
-    };
-    talks && (flocky || Flock::load(&paths.flock_file()).map_or(true, |f| !f.flocks.is_empty()))
+    match command {
+        Command::Task { cmd } => Some(match cmd {
+            TaskCmd::Run(a) => a.flock.is_some(),
+            TaskCmd::List(a) => a.flock.is_some(),
+            _ => false,
+        }),
+        Command::Machine { cmd } => Some(match cmd {
+            MachineCmd::List { flock, .. } => flock.is_some(),
+            _ => true,
+        }),
+        Command::Flock { cmd } => Some(!matches!(cmd, FlockCmd::List { .. })),
+        Command::Tick(_) | Command::Job { .. } => Some(false),
+        Command::Plugin { cmd } => {
+            (!matches!(cmd, PluginCmd::List { .. } | PluginCmd::Run { .. })).then_some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Whether flock.toml declares named flocks, so a command with no `--flock`
+/// means the default flock rather than every machine. A flock.toml that does
+/// not load counts as declaring them.
+fn flocks_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).map_or(true, |f| !f.flocks.is_empty())
 }
 
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
@@ -598,15 +601,16 @@ fn head_row() -> pastor::cli::HeadRow {
 /// machine in flock.toml. The note that says so is printed only once
 /// everything worked, since a failure must leave exactly one JSON value on
 /// stderr.
-async fn machine_list(paths: &Paths, flock: Option<&str>, json: bool) -> anyhow::Result<()> {
-    // Only `NotRunning` means nothing is listening; `Unresponsive` covers a
-    // head that is up but busy (mid-dispatch, or wedged), and probing
-    // machines around it would print the "not running" note for a head that
-    // is only slow. Route both `Running` and `Unresponsive` through the same
-    // IPC request so `request_failure`'s existing timeout/connect handling
-    // applies.
-    let (rows, note) = match probe_daemon(&paths.socket_file()).await {
-        DaemonProbe::Running | DaemonProbe::Unresponsive => {
+async fn machine_list(
+    paths: &Paths,
+    flock: Option<&str>,
+    json: bool,
+    head: Head,
+) -> anyhow::Result<()> {
+    // A head that is up but busy never gets here (`probe_head`), so the
+    // machines are probed directly only when nothing is listening.
+    let (rows, note) = match head {
+        Head::Live => {
             let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
                 unreachable!()
             };
@@ -614,7 +618,7 @@ async fn machine_list(paths: &Paths, flock: Option<&str>, json: bool) -> anyhow:
                 ms.iter().map(pastor::cli::MachineRow::from).collect();
             (rows, None)
         }
-        DaemonProbe::NotRunning => {
+        Head::Absent => {
             let f = Flock::load(&paths.flock_file())?;
             // Connects without the head, so the state dir the ssh master sockets
             // live under may not exist yet, and must be private.
@@ -704,7 +708,7 @@ fn list_shows_orphans(a: &ListArgs) -> bool {
     !a.blocked && !a.done && a.job.is_none()
 }
 
-async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
+async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
     let states = list_states(&a);
     let hint = list_empty_hint(&a);
     let show_orphans = list_shows_orphans(&a);
@@ -714,8 +718,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         states,
         flock: a.flock.clone(),
     };
-    let daemon_up = daemon_running(&paths.socket_file()).await;
-    let tasks = if daemon_up {
+    let tasks = if head.is_live() {
         let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
             unreachable!()
         };
@@ -751,7 +754,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
     // Orphans have no row to list, so they get a line each under the table.
     // Only a running head knows them (its last reconcile); `--json` stays a
     // plain task array, and `machine list --json` carries them instead.
-    if daemon_up && !a.json && show_orphans {
+    if head.is_live() && !a.json && show_orphans {
         let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
             unreachable!()
         };
@@ -780,13 +783,13 @@ fn task_id(s: &str) -> i64 {
         .unwrap_or_else(|| fail("usage_error", &format!("{s} is not a task id like t-12")))
 }
 
-async fn task(paths: &Paths, cmd: TaskCmd) -> anyhow::Result<()> {
+async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
     match cmd {
         TaskCmd::Run(args) => run(paths, args).await?,
-        TaskCmd::List(args) => list(paths, args).await?,
+        TaskCmd::List(args) => list(paths, args, head).await?,
         TaskCmd::Show { task, json } => {
             let id = task_id(&task);
-            let t = if daemon_running(&paths.socket_file()).await {
+            let t = if head.is_live() {
                 let IpcResponse::Task(t) = ask(paths, IpcRequest::TaskShow { id }).await? else {
                     unreachable!()
                 };
@@ -819,13 +822,13 @@ async fn task(paths: &Paths, cmd: TaskCmd) -> anyhow::Result<()> {
         TaskCmd::Attach { task } => attach(paths, &task).await?,
         TaskCmd::Retry(a) => pastor::task_cli::retry(paths, a).await?,
         TaskCmd::Close(a) => pastor::task_cli::close(paths, a).await?,
-        TaskCmd::Prune(a) => pastor::task_cli::prune(paths, a).await?,
+        TaskCmd::Prune(a) => pastor::task_cli::prune(paths, a, head).await?,
         TaskCmd::Send(a) => pastor::task_cli::send(paths, a).await?,
     }
     Ok(())
 }
 
-async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
+async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<()> {
     let path = paths.flock_file();
     match cmd {
         MachineCmd::Add {
@@ -880,7 +883,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 ),
                 _ => {}
             }
-            println!("{}", reload_running_head(paths).await);
+            println!("{}", reload_running_head(paths, head).await);
         }
         MachineCmd::Remove { name, herdr } => {
             let mut doc = FlockDoc::open(&path)?;
@@ -891,7 +894,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 .and_then(|m| m.ssh.clone());
             doc.remove_machine(&name).map_err(edit_error)?;
             doc.save(&path)?;
-            println!("removed {name}; {}", reload_running_head(paths).await);
+            println!("removed {name}; {}", reload_running_head(paths, head).await);
             if herdr {
                 // herdr removes by profile id; the label is all pastor knows.
                 let list = herdr_cmd(&["machine", "list"]);
@@ -928,10 +931,12 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
             doc.save(&path)?;
             println!(
                 "moved {name} to flock {flock}; tasks already on it stay; {}",
-                reload_running_head(paths).await
+                reload_running_head(paths, head).await
             );
         }
-        MachineCmd::List { flock, json } => machine_list(paths, flock.as_deref(), json).await?,
+        MachineCmd::List { flock, json } => {
+            machine_list(paths, flock.as_deref(), json, head).await?
+        }
     }
     Ok(())
 }
@@ -941,7 +946,7 @@ fn edit_error(e: EditError) -> anyhow::Error {
     pastor::cli::CliError::err(e.code(), e)
 }
 
-async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
+async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
     let path = paths.flock_file();
     let edit = |f: &dyn Fn(&mut FlockDoc) -> Result<(), EditError>| -> anyhow::Result<()> {
         let mut doc = FlockDoc::open(&path)?;
@@ -949,7 +954,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
         doc.save(&path)
     };
     let done = match cmd {
-        FlockCmd::List { json } => return flock_list(paths, json).await,
+        FlockCmd::List { json } => return flock_list(paths, json, head).await,
         FlockCmd::Add { name, default } => {
             edit(&|d| d.add_flock(&name, default))?;
             if default {
@@ -961,7 +966,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
         FlockCmd::Remove { name } => {
             // With a head, the head checks and edits under the lock `task
             // run` takes, so no task can be queued in the flock in between.
-            if daemon_running(&paths.socket_file()).await {
+            if head.is_live() {
                 let IpcResponse::Text(done) = ask(paths, IpcRequest::FlockRemove { name }).await?
                 else {
                     unreachable!()
@@ -994,15 +999,15 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
             format!("{name} is the default flock; machines stay in their flocks")
         }
     };
-    println!("{done}; {}", reload_running_head(paths).await);
+    println!("{done}; {}", reload_running_head(paths, head).await);
     Ok(())
 }
 
 /// `flock list`: the flock file, the queued tasks, and with a head running
 /// the live agents on each flock's machines.
-async fn flock_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
+async fn flock_list(paths: &Paths, json: bool, head: Head) -> anyhow::Result<()> {
     let f = Flock::load(&paths.flock_file())?;
-    let live = if daemon_running(&paths.socket_file()).await {
+    let live = if head.is_live() {
         let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
             unreachable!()
         };
@@ -1011,7 +1016,7 @@ async fn flock_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
         eprintln!("pastor serve is not running; agents are unknown");
         None
     };
-    let queued = queued_tasks(paths).await?;
+    let queued = queued_tasks(paths, head).await?;
     let rows = pastor::cli::flock_list(&f, live.as_deref(), &queued);
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -1025,12 +1030,12 @@ async fn flock_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
 }
 
 /// The queued tasks, from the head when one runs, else from the store.
-async fn queued_tasks(paths: &Paths) -> anyhow::Result<Vec<Task>> {
+async fn queued_tasks(paths: &Paths, head: Head) -> anyhow::Result<Vec<Task>> {
     let filter = TaskFilter {
         states: Some(vec![TaskState::Queued]),
         ..Default::default()
     };
-    if daemon_running(&paths.socket_file()).await {
+    if head.is_live() {
         let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
             unreachable!()
         };
@@ -1041,18 +1046,13 @@ async fn queued_tasks(paths: &Paths) -> anyhow::Result<Vec<Task>> {
 }
 
 /// After `machine add|remove` rewrote flock.toml, a running head re-reads it
-/// now (the `pastor job reload` path), so the edit needs no restart. Matches
-/// on `probe_daemon` rather than a boolean: `Unresponsive` (a busy head mid
-/// request looks exactly like a wedged one from the outside) must not get the
-/// same "start a head" advice as `NotRunning`, since one is already running.
-async fn reload_running_head(paths: &Paths) -> &'static str {
-    let socket = paths.socket_file();
-    match probe_daemon(&socket).await {
-        DaemonProbe::NotRunning => "start pastor serve to use it",
-        DaemonProbe::Unresponsive => {
-            "pastor serve is running but not answering; the next scheduler tick will apply the edit"
-        }
-        DaemonProbe::Running => match request(&socket, &IpcRequest::Reload).await {
+/// now (the `pastor job reload` path), so the edit needs no restart. `head`
+/// is what the command's one probe found (`probe_head`); a head that did not
+/// answer it stopped the command before the edit.
+async fn reload_running_head(paths: &Paths, head: Head) -> &'static str {
+    match head {
+        Head::Absent => "start pastor serve to use it",
+        Head::Live => match request(&paths.socket_file(), &IpcRequest::Reload).await {
             Ok(IpcResponse::Jobs(_)) => "the running pastor serve picked it up",
             _ => "pastor serve did not take the reload; run `pastor job reload`",
         },
@@ -1211,8 +1211,8 @@ fn standalone(paths: &Paths) -> anyhow::Result<Scheduler> {
     Ok(Scheduler::standalone(paths.clone(), &config, store)?.with_plugins())
 }
 
-async fn tick(paths: &Paths, a: TickArgs) -> anyhow::Result<()> {
-    let runs = if daemon_running(&paths.socket_file()).await {
+async fn tick(paths: &Paths, a: TickArgs, head: Head) -> anyhow::Result<()> {
+    let runs = if head.is_live() {
         let IpcResponse::Runs(runs) = ask(
             paths,
             IpcRequest::Tick {
@@ -1243,10 +1243,10 @@ async fn reload(paths: &Paths) -> anyhow::Result<()> {
     print_jobs(&jobs, false)
 }
 
-async fn job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
+async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
     match cmd {
         JobCmd::List { json } => {
-            let jobs = if daemon_running(&paths.socket_file()).await {
+            let jobs = if head.is_live() {
                 let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::JobList).await? else {
                     unreachable!()
                 };
@@ -1261,8 +1261,8 @@ async fn job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
             };
             print_jobs(&jobs, json)?;
         }
-        JobCmd::Enable { name } => toggle(paths, &name, true).await?,
-        JobCmd::Disable { name } => toggle(paths, &name, false).await?,
+        JobCmd::Enable { name } => toggle(paths, &name, true, head).await?,
+        JobCmd::Disable { name } => toggle(paths, &name, false, head).await?,
         JobCmd::Run { name } => {
             let IpcResponse::Text(msg) = ask(paths, IpcRequest::JobRun { name }).await? else {
                 unreachable!()
@@ -1274,7 +1274,7 @@ async fn job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> {
+async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow::Result<()> {
     // Validate before joining: `job_path` just formats and joins, so an
     // unchecked name like "../pastor" would resolve outside the jobs
     // directory instead of failing not-found.
@@ -1287,7 +1287,7 @@ async fn toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> 
     }
     set_enabled(&path, enabled)?;
     let verb = if enabled { "enabled" } else { "disabled" };
-    if daemon_running(&paths.socket_file()).await {
+    if head.is_live() {
         ask(paths, IpcRequest::Reload).await?;
         println!("{verb} {name}");
     } else {

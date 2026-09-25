@@ -16,10 +16,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pinned machine's flock, else the default. `--machine` outside `--flock` is
   refused (`flock_mismatch`), an unknown flock too (`unknown_flock`).
   `pastor task retry` keeps the flock, and is refused (`unknown_flock`) once
-  it is removed. A head from before flocks, or one that does not
-  answer, is refused (`head_too_old`) by every command that talks to or
-  reloads it while flocks are in play: `--flock`, an edit of flock.toml, or
-  named flocks declared there. `Ping` answers the head's IPC protocol for this.
+  it is removed. A head from before flocks is refused (`head_too_old`) by
+  every command that talks to or reloads it while flocks are in play:
+  `--flock`, an edit of flock.toml, or named flocks declared there. `Ping`
+  answers the head's IPC protocol for this.
 - `pastor flock list|add [--default]|remove|default`, `pastor machine move`,
   and `--flock` on `machine add`, `machine list` and `task list`. `task list`,
   `task show` and `job list` show the flock, and task events carry it in the
@@ -42,6 +42,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Every command that talks to or reloads the head pings it once, first, and
+  acts on that answer throughout. A head that holds the socket but does not
+  answer is an error (`head_unresponsive`) on all of them, where `tick`,
+  `job list`, `task list|show`, `flock list|remove` and `job enable|disable`
+  used to take it for no head and work offline next to it, and `machine add`
+  and `plugin install|link|uninstall|unlink` made their change and only
+  warned. `task prune` answered `daemon_unresponsive` for this; it now
+  answers `head_unresponsive` like the rest.
 - `pastor machine list` opens with a line about the head (its pastor and
   herdr versions, its host, the number of machines, and which machine it is
   when it is one) instead of a first table row named `pastor`, and has a

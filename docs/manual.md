@@ -49,7 +49,13 @@ The CLI talks to `pastor serve` over a unix socket (`pastor.sock`) with
 newline-delimited JSON; each response is `{"kind": ..., "data": ...}`.
 `pastor serve` refuses to start if a daemon already holds that socket, or if
 something answers it but not a ping within 2 seconds — it only removes and
-replaces a socket file whose connection is refused. `task list` and `task show`
+replaces a socket file whose connection is refused. Every command that talks
+to or reloads the head pings it once, first, and acts on that answer
+throughout. A head that holds the socket but does not answer the ping within
+2 seconds stops the command (`head_unresponsive`) before it does anything:
+it may be busy mid-request, and working as if no head ran would let `tick`
+start a second scheduler next to it, or an edit or a prune go offline behind
+it. `task list` and `task show`
 read from `pastor serve` when it's running and fall back to the SQLite store
 when it's not (`task list` says so on stderr); `task attach` always reads the store
 directly, since it only needs the task's machine and agent name to hand off
@@ -187,7 +193,7 @@ of that checkout. It names each one it keeps; `task close --remove-worktree`
 on it removes the worktree (or, when herdr has already lost the workspace,
 says to run `git worktree remove`) and clears the recorded workspace, and the
 next prune takes the row. Prune works without `pastor serve`, but not behind one that holds
-the socket and does not answer (`daemon_unresponsive`): that head may still be
+the socket and does not answer (`head_unresponsive`): that head may still be
 writing tasks. Retry and close need it.
 `task run --worktree` needs `--repo`.
 
@@ -272,8 +278,8 @@ talks to or reloads the head asks its protocol first and refuses an old one
 when the command takes `--flock`, edits `flock.toml` (`flock add|default|remove`,
 `machine add|remove|move`), or `flock.toml` declares named flocks, since then
 no `--flock` means the default flock rather than every machine. A head that
-is listening but does not answer is refused the same way, since it may be an
-old one; only a head that is not running at all is passed by.
+is listening but does not answer is refused whether flocks are in play or not
+(`head_unresponsive`); only a head that is not running at all is passed by.
 
 `pastor machine move` changes the flock of tasks dispatched after it; tasks
 already on the machine keep running there, and its connection stays up. A
