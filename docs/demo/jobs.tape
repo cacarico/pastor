@@ -1,5 +1,6 @@
 # A scheduled job: written, listed, fired, and the task it made.
-# Recorded by `make demo` against a demo head (see flock.example.toml).
+# Recorded by `make demo`, which starts the demo head and sets PASTOR_* for
+# this shell (see flock.example.toml).
 
 Output docs/demo/jobs.gif
 
@@ -11,10 +12,6 @@ Set Padding 16
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 35ms
 
-Env PASTOR_CONFIG_DIR docs/demo/local
-Env PASTOR_STATE_DIR docs/demo/local/state
-Env PASTOR_DATA_DIR docs/demo/local/data
-
 Type "cat docs/demo/local/jobs/hourly.toml"
 Enter
 Sleep 3s
@@ -25,7 +22,7 @@ Sleep 2.5s
 
 Type "pastor job run hourly"
 Enter
-Sleep 3s
+Sleep 8s
 
 Type "pastor task list --job hourly"
 Enter

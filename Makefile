@@ -66,15 +66,19 @@ install: ## install pastor and fake-herdr into ~/.cargo/bin
 # which is not committed: copy flock.example.toml there and point it at
 # machines you can ssh to. Config, state and data dirs are all under it, so
 # nothing from your real setup is read, run or shown, and state is reset
-# before each recording so task ids start at t-1.
-demo: ## record the README gifs with vhs against a demo head
+# before each recording so task ids start at t-1. The tapes run the pastor
+# just built, not an installed one, and start once the head answers.
+demo: build ## record the README gifs with vhs against a demo head
 	mkdir -p docs/demo/local/jobs
 	cp -n docs/demo/flock.example.toml docs/demo/local/flock.toml
 	cp -n docs/demo/jobs.example/hourly.toml docs/demo/local/jobs/hourly.toml
 	rm -rf docs/demo/local/state docs/demo/local/data
-	PASTOR_CONFIG_DIR=$(CURDIR)/docs/demo/local PASTOR_STATE_DIR=$(CURDIR)/docs/demo/local/state PASTOR_DATA_DIR=$(CURDIR)/docs/demo/local/data \
-	  cargo run -q --bin pastor -- serve & \
-	  sleep 2; for t in docs/demo/*.tape; do vhs $$t || exit 1; done; kill $$!
+	@set -e; \
+	export PASTOR_CONFIG_DIR=$(CURDIR)/docs/demo/local PASTOR_STATE_DIR=$(CURDIR)/docs/demo/local/state \
+	  PASTOR_DATA_DIR=$(CURDIR)/docs/demo/local/data PATH=$(CURDIR)/target/debug:$$PATH; \
+	pastor serve & pid=$$!; trap 'kill $$pid' EXIT; \
+	for i in $$(seq 1 100); do pastor task read t-1 2>&1 | grep -q 'not running' || break; sleep 0.3; done; \
+	for t in docs/demo/*.tape; do vhs $$t; done
 
 completions: ## regenerate contrib/completions/pastor.{bash,fish} from the CLI
 	cargo build -q
