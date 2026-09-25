@@ -2073,6 +2073,7 @@ mod tests {
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
                 spec: spec(),
+                flock: "default".into(),
             })
             .unwrap()
     }
@@ -2840,6 +2841,7 @@ mod tests {
                     worktree: true,
                     ..spec()
                 },
+                flock: "default".into(),
             })
             .unwrap()
     }
@@ -3234,6 +3236,7 @@ mod tests {
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
                 spec: spec(),
+                flock: "default".into(),
             })
             .unwrap();
         let t = run_to_done(&h, &fake, &store, task).await;
@@ -4406,6 +4409,7 @@ mod tests {
                     timeout_secs: 1,
                     ..spec()
                 },
+                flock: "default".into(),
             })
             .unwrap();
         let t = h.dispatch(t.id).await.unwrap();

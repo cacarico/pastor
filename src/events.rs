@@ -475,9 +475,20 @@ mod tests {
                     tags: vec![],
                     timeout_secs: 60,
                 },
+                flock: "work".into(),
             })
             .unwrap();
         (store, t)
+    }
+
+    /// A hook routes work and personal notifications apart on the flock the
+    /// record's task row carries.
+    #[test]
+    fn a_task_event_carries_the_flock() {
+        let (store, t) = store_with_task("run");
+        let rec = EventRecord::build(&ev("task.done", Some(t.id), None, None), &store, None);
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["task"]["flock"], "work");
     }
 
     fn ev(

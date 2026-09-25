@@ -146,6 +146,11 @@ pub struct Task {
     /// with a new id, because the old agent `t-<id>` may still be alive.
     #[serde(default)]
     pub retry_of: Option<i64>,
+    /// The flock whose machines may take this task. `None` only on a row
+    /// from before flocks until `Store::adopt_default_flock` fills it in;
+    /// it reads as the default flock.
+    #[serde(default)]
+    pub flock: Option<String>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -313,6 +318,7 @@ mod tests {
             started_at: Some(now),
             finished_at: None,
             updated_at: now,
+            flock: None,
         }
     }
 

@@ -57,6 +57,7 @@ pub fn tasks_on_removed_machines(store: &Store, flock: &Flock) -> anyhow::Result
             job: None,
             machine: None,
             states: Some(PANE_OWNING_STATES.to_vec()),
+            flock: None,
         })?
         .into_iter()
         .filter(|t| t.machine.as_deref().is_some_and(|m| flock.get(m).is_none()))
@@ -531,6 +532,9 @@ impl Daemon {
     ) -> anyhow::Result<Daemon> {
         paths.ensure()?;
         let store = Arc::new(Store::open(&paths.db_file())?);
+        // Before any actor or the scheduler reads a row, so none of them
+        // sees a task from before flocks without one.
+        store.adopt_default_flock(flock.default_flock())?;
         let (events, log_rx) = broadcast::channel(1024);
         // Plugin event hooks read the broadcast on their own, subscribed here
         // for the same reason as the log: before any actor can emit.
@@ -715,6 +719,7 @@ impl Daemon {
                     item: serde_json::Value::Null,
                     prompt,
                     spec,
+                    flock: self.fleet.flock().default_flock().to_string(),
                 };
                 let task = match self.fleet.queue_task(new).await {
                     Ok(t) => t,
@@ -1202,6 +1207,7 @@ mod tests {
                 item: serde_json::Value::Null,
                 prompt: "p".into(),
                 spec: spec(),
+                flock: "default".into(),
             })
             .unwrap();
         fleet.dispatch_queued().await;
@@ -1318,6 +1324,7 @@ mod tests {
                     item: serde_json::Value::Null,
                     prompt: "p".into(),
                     spec: spec(),
+                    flock: "default".into(),
                 })
                 .unwrap();
             t.machine = Some(machine.into());
@@ -1352,6 +1359,7 @@ mod tests {
                     item: serde_json::Value::Null,
                     prompt: "p".into(),
                     spec: spec(),
+                    flock: "default".into(),
                 })
                 .unwrap();
             t.machine = Some(machine.into());
@@ -1750,6 +1758,41 @@ mod tests {
         );
     }
 
+    /// Rows from before flocks join the default flock of the flock file the
+    /// head starts with, whatever it is named.
+    #[tokio::test]
+    async fn the_head_puts_flockless_rows_in_the_default_flock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        {
+            let store = Store::open(&paths.db_file()).unwrap();
+            store
+                .insert_task(NewTask {
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                    flock: "x".into(),
+                })
+                .unwrap();
+            store.execute_raw("UPDATE tasks SET flock = NULL");
+        }
+        let flock = Flock {
+            flocks: vec![crate::config::flock::FlockEntry {
+                name: "personal".into(),
+                default: true,
+            }],
+            machines: vec![machine("a", 1)],
+        };
+        let on_disk = ConfigFingerprint::sample(&paths);
+        let d = Daemon::start(paths, test_config(), flock, on_disk, Some(factory(&[])))
+            .await
+            .unwrap();
+        let t = d.store().get_task(1).unwrap().unwrap();
+        assert_eq!(t.flock.as_deref(), Some("personal"));
+    }
+
     /// Two passes at once (a tick and a `pastor task run`) against one machine with
     /// one free slot: the lock makes the second wait and see the first's task.
     #[tokio::test]
@@ -1764,6 +1807,7 @@ mod tests {
                     item: serde_json::Value::Null,
                     prompt: p.into(),
                     spec: spec(),
+                    flock: "default".into(),
                 })
                 .unwrap();
         }
@@ -1895,6 +1939,7 @@ mod tests {
                 item: serde_json::Value::Null,
                 prompt: "p".into(),
                 spec: spec(),
+                flock: "default".into(),
             })
             .unwrap();
         if state != TaskState::Queued {

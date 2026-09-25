@@ -481,6 +481,7 @@ mod tests {
             started_at: Some(now),
             finished_at: None,
             updated_at: now,
+            flock: None,
         }
     }
 

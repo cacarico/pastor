@@ -230,6 +230,7 @@ fn first_line(s: &str) -> String {
 pub async fn run_job(
     store: &Store,
     job: &Job,
+    flock: &Flock,
     source: &dyn ItemSource,
     events: &broadcast::Sender<PastorEvent>,
     now: DateTime<Utc>,
@@ -337,7 +338,9 @@ pub async fn run_job(
             report.created.push(item.key.clone());
             continue;
         }
-        match store.insert_job_task(&job.name, &value, |id| render_task(job, &value, id)) {
+        match store.insert_job_task(&job.name, flock.default_flock(), &value, |id| {
+            render_task(job, &value, id)
+        }) {
             Ok(t) => {
                 tracing::info!(job = %job.name, task = %t.display_id(), key = %item.key, "task queued");
                 let _ = events.send(PastorEvent {
@@ -1065,7 +1068,16 @@ impl Scheduler {
             if let Some(t) = turn.as_mut() {
                 t.wait().await;
             }
-            let report = run_job(&store, &job, source.as_ref(), &events, now, dry_run).await;
+            let report = run_job(
+                &store,
+                &job,
+                &fleet.flock(),
+                source.as_ref(),
+                &events,
+                now,
+                dry_run,
+            )
+            .await;
             drop(turn); // the next run of this job may start
             if dispatch && !dry_run && !report.created.is_empty() {
                 // Do not wait for the next tick to place what this run queued.
@@ -1520,7 +1532,7 @@ mod tests {
         *src.cursor.lock().unwrap() = Some("c1".into());
         let (tx, mut rx) = events();
         let now = Utc::now();
-        let report = run_job(&store, &job("j"), &src, &tx, now, false).await;
+        let report = run_job(&store, &job("j"), &Flock::default(), &src, &tx, now, false).await;
         assert_eq!(report.outcome, RunOutcome::Ran);
         for id in [1, 2] {
             let ev = rx.try_recv().expect("task.queued emitted");
@@ -1566,7 +1578,16 @@ mod tests {
 
         // Second run: since = last ok run, cursor = the persisted one.
         let later = now + chrono::Duration::seconds(60);
-        run_job(&store, &job("j"), &src, &tx, later, false).await;
+        run_job(
+            &store,
+            &job("j"),
+            &Flock::default(),
+            &src,
+            &tx,
+            later,
+            false,
+        )
+        .await;
         let input = src.inputs.lock().unwrap()[1].clone();
         assert_eq!(input.since, state.last_ok_at.unwrap());
         assert_eq!(input.cursor.as_deref(), Some("c1"));
@@ -1577,9 +1598,27 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let (tx, _rx) = events();
         let src = Scripted::with_keys(&["k1"]);
-        run_job(&store, &job("j"), &src, &tx, Utc::now(), false).await;
+        run_job(
+            &store,
+            &job("j"),
+            &Flock::default(),
+            &src,
+            &tx,
+            Utc::now(),
+            false,
+        )
+        .await;
         *src.items.lock().unwrap() = vec![item("k1"), item("k1"), item("k2"), item("k2")];
-        let report = run_job(&store, &job("j"), &src, &tx, Utc::now(), false).await;
+        let report = run_job(
+            &store,
+            &job("j"),
+            &Flock::default(),
+            &src,
+            &tx,
+            Utc::now(),
+            false,
+        )
+        .await;
         assert_eq!(report.items, 4);
         assert_eq!(
             report.created,
@@ -1592,6 +1631,7 @@ mod tests {
         let report = run_job(
             &store,
             &job("other"),
+            &Flock::default(),
             &Scripted::with_keys(&["k1"]),
             &tx,
             Utc::now(),
@@ -1608,14 +1648,14 @@ mod tests {
         let mut j = job("j");
         j.max_tasks_per_run = 2;
         let src = Scripted::with_keys(&["k1", "k2", "k3", "k4"]);
-        let report = run_job(&store, &j, &src, &tx, Utc::now(), false).await;
+        let report = run_job(&store, &j, &Flock::default(), &src, &tx, Utc::now(), false).await;
         assert_eq!(report.created, vec!["t-1", "t-2"]);
         assert_eq!(report.deferred, 2);
         assert!(
             !store.is_seen("j", "k3").unwrap(),
             "deferred items stay unseen"
         );
-        let report = run_job(&store, &j, &src, &tx, Utc::now(), false).await;
+        let report = run_job(&store, &j, &Flock::default(), &src, &tx, Utc::now(), false).await;
         assert_eq!(report.created, vec!["t-3", "t-4"]);
         assert_eq!(report.skipped_seen, 2);
         assert_eq!(report.deferred, 0);
@@ -1641,7 +1681,7 @@ mod tests {
         *src.cursor.lock().unwrap() = Some("new".into());
 
         let t1 = Utc::now();
-        let report = run_job(&store, &j, &src, &tx, t1, false).await;
+        let report = run_job(&store, &j, &Flock::default(), &src, &tx, t1, false).await;
         assert_eq!(report.deferred, 2);
         let s = store.job_state("j").unwrap().unwrap();
         assert_eq!(
@@ -1655,7 +1695,7 @@ mod tests {
         // The next run is asked from the old cursor and picks the rest up;
         // with nothing deferred, the new cursor is kept.
         let t2 = t1 + chrono::Duration::seconds(60);
-        let report = run_job(&store, &j, &src, &tx, t2, false).await;
+        let report = run_job(&store, &j, &Flock::default(), &src, &tx, t2, false).await;
         let input = src.inputs.lock().unwrap()[1].clone();
         assert_eq!(input.cursor.as_deref(), Some("old"));
         assert_eq!(input.since, t0);
@@ -1675,7 +1715,7 @@ mod tests {
         let src = Scripted::with_keys(&["k1"]);
         *src.cursor.lock().unwrap() = Some("new".into());
         let t1 = Utc::now();
-        let report = run_job(&store, &j, &src, &tx, t1, false).await;
+        let report = run_job(&store, &j, &Flock::default(), &src, &tx, t1, false).await;
         assert!(report.error.is_some(), "{report:?}");
         let s = store.job_state("j").unwrap().unwrap();
         assert!(s.cursor.is_none(), "{s:?}");
@@ -1691,7 +1731,7 @@ mod tests {
         j.prompt = "{{ unclosed".into();
         let src = Scripted::with_keys(&["k1"]);
         let t1 = Utc::now();
-        let report = run_job(&store, &j, &src, &tx, t1, false).await;
+        let report = run_job(&store, &j, &Flock::default(), &src, &tx, t1, false).await;
         assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
         let s = store.job_state("j").unwrap().unwrap();
         assert!(s.last_error.as_deref().unwrap().contains("k1"), "{s:?}");
@@ -1726,7 +1766,7 @@ mod tests {
         let mut j = job("j");
         j.prompt = "[{{ item.title }}] {{ item.author }}!".into();
         let src = Scripted::with_keys(&["k1"]);
-        let report = run_job(&store, &j, &src, &tx, Utc::now(), false).await;
+        let report = run_job(&store, &j, &Flock::default(), &src, &tx, Utc::now(), false).await;
         assert_eq!(report.created, vec!["t-1"]);
         let t = store.get_task(1).unwrap().unwrap();
         assert_eq!(t.prompt, "[title of k1] !");
@@ -1740,12 +1780,12 @@ mod tests {
         let src = Scripted::with_keys(&["k1"]);
         *src.cursor.lock().unwrap() = Some("c1".into());
         let t0 = Utc::now();
-        run_job(&store, &job("j"), &src, &tx, t0, false).await;
+        run_job(&store, &job("j"), &Flock::default(), &src, &tx, t0, false).await;
         assert_eq!(rx.try_recv().unwrap().kind, "task.queued");
 
         *src.fail.lock().unwrap() = Some("boom: 503 from upstream".into());
         let t1 = t0 + chrono::Duration::seconds(60);
-        let report = run_job(&store, &job("j"), &src, &tx, t1, false).await;
+        let report = run_job(&store, &job("j"), &Flock::default(), &src, &tx, t1, false).await;
         assert_eq!(report.outcome, RunOutcome::Failed);
         assert!(report.error.as_deref().unwrap().contains("boom"));
         let s = store.job_state("j").unwrap().unwrap();
@@ -1762,7 +1802,7 @@ mod tests {
         assert!(ev.machine.is_none() && ev.task_id.is_none());
 
         let t2 = t1 + chrono::Duration::seconds(120);
-        run_job(&store, &job("j"), &src, &tx, t2, false).await;
+        run_job(&store, &job("j"), &Flock::default(), &src, &tx, t2, false).await;
         let s = store.job_state("j").unwrap().unwrap();
         assert_eq!(s.failures, 2);
         assert_eq!(s.backoff_until, Some(t2 + chrono::Duration::seconds(120)));
@@ -1771,6 +1811,7 @@ mod tests {
         run_job(
             &store,
             &job("j"),
+            &Flock::default(),
             &src,
             &tx,
             t2 + chrono::Duration::seconds(300),
@@ -1806,7 +1847,7 @@ mod tests {
         // fails inside the store's insert transaction.
         j.prompt = "{{ item.title".into();
         let now = Utc::now();
-        let report = run_job(&store, &j, &src, &tx, now, false).await;
+        let report = run_job(&store, &j, &Flock::default(), &src, &tx, now, false).await;
         assert!(report.created.is_empty());
         assert!(
             report.error.as_deref().unwrap().contains("k1"),
@@ -1823,7 +1864,7 @@ mod tests {
         assert!(!store.is_seen("j", "k1").unwrap());
 
         // The next run inserts it; now the cursor moves.
-        let report = run_job(&store, &job("j"), &src, &tx, now, false).await;
+        let report = run_job(&store, &job("j"), &Flock::default(), &src, &tx, now, false).await;
         assert_eq!(report.created.len(), 1);
         let st = store.job_state("j").unwrap().unwrap();
         assert_eq!(st.cursor.as_deref(), Some("c-new"));
@@ -1931,7 +1972,16 @@ mod tests {
             fail: Mutex::new(None),
             inputs: Mutex::new(Vec::new()),
         };
-        let report = run_job(&store, &job("j"), &src, &tx, Utc::now(), false).await;
+        let report = run_job(
+            &store,
+            &job("j"),
+            &Flock::default(),
+            &src,
+            &tx,
+            Utc::now(),
+            false,
+        )
+        .await;
         assert_eq!(report.created.len(), 1);
         let err = report.error.as_deref().unwrap();
         assert!(err.contains("../evil") && err.contains("rejected"), "{err}");
@@ -1945,7 +1995,16 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let (tx, mut rx) = events();
         let src = Scripted::with_keys(&["k1", "k2"]);
-        let report = run_job(&store, &job("j"), &src, &tx, Utc::now(), true).await;
+        let report = run_job(
+            &store,
+            &job("j"),
+            &Flock::default(),
+            &src,
+            &tx,
+            Utc::now(),
+            true,
+        )
+        .await;
         assert_eq!(report.outcome, RunOutcome::DryRun);
         assert_eq!(
             report.created,
@@ -1957,7 +2016,16 @@ mod tests {
         assert!(store.job_state("j").unwrap().is_none());
         // A failing dry run does not back the job off either.
         *src.fail.lock().unwrap() = Some("boom".into());
-        let report = run_job(&store, &job("j"), &src, &tx, Utc::now(), true).await;
+        let report = run_job(
+            &store,
+            &job("j"),
+            &Flock::default(),
+            &src,
+            &tx,
+            Utc::now(),
+            true,
+        )
+        .await;
         assert_eq!(report.outcome, RunOutcome::Failed);
         assert!(store.job_state("j").unwrap().is_none());
         assert!(rx.try_recv().is_err(), "no job.failed on a dry run");
@@ -1987,7 +2055,7 @@ mod tests {
     ) -> JobRunReport {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let r = run_job(store, j, src, tx, Utc::now(), dry_run).await;
+            let r = run_job(store, j, &Flock::default(), src, tx, Utc::now(), dry_run).await;
             if r.items > 0 {
                 return r;
             }
@@ -2006,11 +2074,29 @@ mod tests {
         let (tx, _rx) = events();
         let r = run_until_items(&store, &job("j"), src.as_ref(), &tx, true).await;
         assert_eq!(r.created, vec!["start-1"]);
-        let r = run_job(&store, &job("j"), src.as_ref(), &tx, Utc::now(), false).await;
+        let r = run_job(
+            &store,
+            &job("j"),
+            &Flock::default(),
+            src.as_ref(),
+            &tx,
+            Utc::now(),
+            false,
+        )
+        .await;
         assert_eq!(r.created, vec!["t-1"], "{r:?}");
         let st = store.job_state("j").unwrap().unwrap();
         assert_eq!(st.cursor.as_deref(), Some("cur-1"));
-        let r = run_job(&store, &job("j"), src.as_ref(), &tx, Utc::now(), false).await;
+        let r = run_job(
+            &store,
+            &job("j"),
+            &Flock::default(),
+            src.as_ref(),
+            &tx,
+            Utc::now(),
+            false,
+        )
+        .await;
         assert_eq!(r.items, 0, "a persisted batch is not handed over again");
     }
 
@@ -2027,7 +2113,16 @@ mod tests {
         let r = run_until_items(&store, &broken, src.as_ref(), &tx, false).await;
         assert!(r.created.is_empty(), "{r:?}");
         assert!(store.job_state("j").unwrap().unwrap().cursor.is_none());
-        let r = run_job(&store, &job("j"), src.as_ref(), &tx, Utc::now(), false).await;
+        let r = run_job(
+            &store,
+            &job("j"),
+            &Flock::default(),
+            src.as_ref(),
+            &tx,
+            Utc::now(),
+            false,
+        )
+        .await;
         assert_eq!(r.created, vec!["t-1"], "{r:?}");
         let st = store.job_state("j").unwrap().unwrap();
         assert_eq!(st.cursor.as_deref(), Some("cur-1"));
@@ -2379,6 +2474,7 @@ mod tests {
                 item: Value::Null,
                 prompt: "p".into(),
                 spec: job("j").spec,
+                flock: "default".into(),
             })
             .unwrap();
         store.claim_task(t.id, "a").unwrap().unwrap();
@@ -3120,6 +3216,7 @@ mod tests {
                 item: Value::Null,
                 prompt: "p".into(),
                 spec: job("j").spec,
+                flock: "default".into(),
             })
             .unwrap();
         let now = Utc::now();
@@ -3145,6 +3242,7 @@ mod tests {
                 item: Value::Null,
                 prompt: "p".into(),
                 spec: job("j").spec,
+                flock: "default".into(),
             })
             .unwrap();
         let later = Utc::now() + chrono::Duration::hours(2);
@@ -3171,6 +3269,7 @@ mod tests {
                     machine: Some("gone".into()),
                     ..job("j").spec
                 },
+                flock: "default".into(),
             })
             .unwrap();
         let now = Utc::now();

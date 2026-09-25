@@ -37,6 +37,7 @@ fn task(id: i64) -> Task {
                 tags: vec![],
                 timeout_secs: 60,
             },
+            flock: "default".into(),
         })
         .unwrap();
     t.id = id;

@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -77,11 +77,16 @@ pub struct NewTask {
     pub item: Value,
     pub prompt: String,
     pub spec: DispatchSpec,
+    /// The flock the task targets, already resolved (see
+    /// `Flock::task_flock`): only its machines take the task.
+    pub flock: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TaskFilter {
     pub job: Option<String>,
+    #[serde(default)]
+    pub flock: Option<String>,
     pub machine: Option<String>,
     pub states: Option<Vec<TaskState>>,
 }
@@ -189,6 +194,7 @@ impl Store {
                         last_completion_seq INTEGER,
                         prompt_pending INTEGER NOT NULL DEFAULT 0,
                         retry_of INTEGER,
+                        flock TEXT,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -228,6 +234,12 @@ impl Store {
                 if v < 3 {
                     add_column(&tx, "retry_of", "retry_of INTEGER")?;
                 }
+                // Rows from before flocks get none here: the store does not
+                // know which flock is the default. `adopt_default_flock`
+                // fills them in once the caller has read flock.toml.
+                if v < 4 {
+                    add_column(&tx, "flock", "flock TEXT")?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -247,8 +259,8 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?5)",
-            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, now],
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)",
+            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, now],
         )?;
         let id = conn.last_insert_rowid();
         drop(conn);
@@ -335,8 +347,8 @@ impl Store {
         self.get_task(id)
     }
 
-    /// Queue a fresh task that copies job, item, prompt and spec from task
-    /// `of`, with `retry_of = of`. A new row and id rather than a reset of the
+    /// Queue a fresh task that copies job, item, prompt, spec and flock from
+    /// task `of`, with `retry_of = of`. A new row and id rather than a reset of the
     /// old one: the agent is named after the id, and the old agent `t-<of>`
     /// may still be alive on its machine (a stale task always is). Refused
     /// unless `of` is failed or stale. The `seen` row keeps pointing at `of`.
@@ -346,8 +358,8 @@ impl Store {
         // Check and copy in one statement, so a task closed, pruned or
         // finished by another writer in between is not retried.
         let n = conn.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, state, retry_of, created_at, updated_at)
-             SELECT job, item, prompt, spec, 'queued', id, ?2, ?2 FROM tasks
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, retry_of, created_at, updated_at)
+             SELECT job, item, prompt, spec, flock, 'queued', id, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now],
         )?;
@@ -480,6 +492,10 @@ impl Store {
             args.push(Box::new(job.clone()));
             sql.push_str(&format!(" AND job = ?{}", args.len()));
         }
+        if let Some(flock) = &f.flock {
+            args.push(Box::new(flock.clone()));
+            sql.push_str(&format!(" AND flock = ?{}", args.len()));
+        }
         if let Some(m) = &f.machine {
             args.push(Box::new(m.clone()));
             sql.push_str(&format!(" AND machine = ?{}", args.len()));
@@ -524,6 +540,19 @@ impl Store {
         })?;
         v.reverse();
         Ok(v)
+    }
+
+    /// Put every task that has no flock, a row from before flocks, in
+    /// `default`: the default flock of flock.toml as the caller read it.
+    /// Called wherever the store is opened with the flock file at hand, so
+    /// such a row is only ever seen flockless between a migration and the
+    /// first read of flock.toml. Returns how many rows it changed.
+    pub fn adopt_default_flock(&self, default: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE tasks SET flock = ?1 WHERE flock IS NULL",
+            params![default],
+        )?)
     }
 
     pub fn find_by_pane(&self, machine: &str, pane_id: &str) -> anyhow::Result<Option<Task>> {
@@ -588,6 +617,7 @@ impl Store {
     pub fn insert_job_task(
         &self,
         job: &str,
+        flock: &str,
         item: &Value,
         render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
@@ -600,8 +630,8 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, state, created_at, updated_at) VALUES (?1, ?2, '', '{}', 'queued', ?3, ?3)",
-            params![job, serde_json::to_string(item)?, now],
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, 'queued', ?4, ?4)",
+            params![job, serde_json::to_string(item)?, flock, now],
         )?;
         let id = tx.last_insert_rowid();
         let (prompt, spec) =
@@ -697,6 +727,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // Held in the machine actor's memory, never stored.
         activity_seen: false,
         retry_of: row.get("retry_of")?,
+        flock: row.get("flock")?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -758,6 +789,7 @@ mod tests {
             item: serde_json::json!({"key": "k1", "title": "t"}),
             prompt: "do it\nnow \"quoted\" {{ x }}".into(),
             spec: spec(),
+            flock: "default".into(),
         }
     }
 
@@ -1211,7 +1243,7 @@ mod tests {
         let item = serde_json::json!({"key": "k1", "title": "t"});
         assert!(!s.is_seen("j", "k1").unwrap());
         let t = s
-            .insert_job_task("j", &item, |id| {
+            .insert_job_task("j", "default", &item, |id| {
                 Ok((
                     format!("prompt for t-{id}"),
                     DispatchSpec {
@@ -1235,7 +1267,7 @@ mod tests {
         // The same key again: refused, nothing written.
         let before = s.list_tasks(&TaskFilter::default()).unwrap().len();
         assert!(
-            s.insert_job_task("j", &item, |_| Ok(("x".into(), spec())))
+            s.insert_job_task("j", "default", &item, |_| Ok(("x".into(), spec())))
                 .is_err()
         );
         assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), before);
@@ -1243,7 +1275,7 @@ mod tests {
         // A render failure rolls the whole thing back: no task, key still unseen.
         let item2 = serde_json::json!({"key": "k2"});
         let err = s
-            .insert_job_task("j", &item2, |_| Err("nope".into()))
+            .insert_job_task("j", "default", &item2, |_| Err("nope".into()))
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
         assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), before);
@@ -1251,10 +1283,12 @@ mod tests {
 
         // No string key: refused up front.
         assert!(
-            s.insert_job_task("j", &serde_json::json!({"title": "no key"}), |_| Ok((
-                "x".into(),
-                spec()
-            )))
+            s.insert_job_task(
+                "j",
+                "default",
+                &serde_json::json!({"title": "no key"}),
+                |_| Ok(("x".into(), spec()))
+            )
             .is_err()
         );
     }
@@ -1272,6 +1306,7 @@ mod tests {
                 "DROP TABLE seen; DROP TABLE job_state;
                  ALTER TABLE tasks DROP COLUMN prompt_pending;
                  ALTER TABLE tasks DROP COLUMN retry_of;
+                 ALTER TABLE tasks DROP COLUMN flock;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version'",
             );
         }
@@ -1290,6 +1325,91 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION.to_string());
     }
 
+    /// A task row stores its flock; `task list --flock` narrows to it.
+    #[test]
+    fn a_task_keeps_its_flock_and_lists_filter_on_it() {
+        let s = Store::open_in_memory().unwrap();
+        let home = s.insert_task(new_task("run")).unwrap();
+        let work = s
+            .insert_task(NewTask {
+                flock: "work".into(),
+                ..new_task("run")
+            })
+            .unwrap();
+        assert_eq!(home.flock.as_deref(), Some("default"));
+        assert_eq!(work.flock.as_deref(), Some("work"));
+        let ids = |flock: &str| -> Vec<i64> {
+            s.list_tasks(&TaskFilter {
+                flock: Some(flock.into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect()
+        };
+        assert_eq!(ids("work"), [work.id]);
+        assert_eq!(ids("default"), [home.id]);
+        assert!(ids("nope").is_empty());
+        let job = s
+            .insert_job_task("j", "work", &serde_json::json!({"key": "k"}), |_| {
+                Ok(("p".into(), spec()))
+            })
+            .unwrap();
+        assert_eq!(job.flock.as_deref(), Some("work"));
+    }
+
+    /// A v3 database predates flocks: opening it adds the column empty, and
+    /// `adopt_default_flock` puts those rows in the default flock, once.
+    #[test]
+    fn a_v3_database_gains_flock_and_its_rows_join_the_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN flock;
+                 UPDATE meta SET value = '3' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "4");
+        assert_eq!(s.get_task(1).unwrap().unwrap().flock, None);
+        let fresh = s
+            .insert_task(NewTask {
+                flock: "work".into(),
+                ..new_task("run")
+            })
+            .unwrap();
+        assert_eq!(s.adopt_default_flock("personal").unwrap(), 2);
+        assert_eq!(
+            s.get_task(1).unwrap().unwrap().flock.as_deref(),
+            Some("personal")
+        );
+        assert_eq!(
+            s.get_task(fresh.id).unwrap().unwrap().flock.as_deref(),
+            Some("work"),
+            "a row that has a flock keeps it"
+        );
+        assert_eq!(s.adopt_default_flock("other").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_retry_stays_in_its_flock() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task(NewTask {
+                flock: "work".into(),
+                ..new_task("run")
+            })
+            .unwrap();
+        set_state(&s, t.id, TaskState::Failed);
+        let r = s.insert_retry(t.id).unwrap();
+        assert_eq!(r.flock.as_deref(), Some("work"));
+    }
+
     /// A v2 database predates `retry_of`; opening it adds the column empty.
     #[test]
     fn a_v2_database_gains_retry_of() {
@@ -1300,12 +1420,16 @@ mod tests {
             s.insert_task(new_task("run")).unwrap();
             s.execute_raw(
                 "ALTER TABLE tasks DROP COLUMN retry_of;
+                 ALTER TABLE tasks DROP COLUMN flock;
                  UPDATE meta SET value = '2' WHERE key = 'schema_version'",
             );
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(s.get_task(1).unwrap().unwrap().retry_of, None);
-        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "3");
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
     }
 
     /// A v2 -> v3 migration that added `retry_of` but died before recording
@@ -1321,7 +1445,10 @@ mod tests {
             s.execute_raw("UPDATE meta SET value = '2' WHERE key = 'schema_version'");
         }
         let s = Store::open(&path).expect("column present, version 2");
-        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "3");
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
         assert_eq!(s.get_task(1).unwrap().unwrap().retry_of, None);
     }
 
@@ -1334,13 +1461,14 @@ mod tests {
         {
             let s = Store::open(&path).unwrap();
             // A v1 file whose version bump fails (a trigger aborts it)
-            // after both ALTERs have run: nothing of the migration may stay.
+            // after every ALTER has run: nothing of the migration may stay.
             s.execute_raw(
                 "ALTER TABLE tasks DROP COLUMN prompt_pending;
                  ALTER TABLE tasks DROP COLUMN retry_of;
+                 ALTER TABLE tasks DROP COLUMN flock;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
-                 CREATE TRIGGER no_retry_of BEFORE UPDATE ON meta
-                   WHEN NEW.value = '3' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                 CREATE TRIGGER no_bump BEFORE UPDATE ON meta
+                   WHEN NEW.value = '4' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -1363,7 +1491,7 @@ mod tests {
         assert!(
             !cols
                 .iter()
-                .any(|c| c == "prompt_pending" || c == "retry_of"),
+                .any(|c| c == "prompt_pending" || c == "retry_of" || c == "flock"),
             "rolled back: {cols:?}"
         );
     }
@@ -1416,7 +1544,7 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         let item = serde_json::json!({"key": "k1", "title": "t"});
         let old = s
-            .insert_job_task("j", &item, |_| Ok(("p".into(), spec())))
+            .insert_job_task("j", "default", &item, |_| Ok(("p".into(), spec())))
             .unwrap();
         for state in [
             TaskState::Queued,
@@ -1571,7 +1699,7 @@ mod tests {
         let mk = |key: &str, state: TaskState, finished: Option<DateTime<Utc>>| {
             let item = serde_json::json!({ "key": key });
             let t = s
-                .insert_job_task("j", &item, |_| Ok(("p".into(), spec())))
+                .insert_job_task("j", "default", &item, |_| Ok(("p".into(), spec())))
                 .unwrap();
             let mut t = set_state(&s, t.id, state);
             t.finished_at = finished;

@@ -378,6 +378,7 @@ mod tests {
                 .store
                 .insert_job_task(
                     job,
+                    "default",
                     &serde_json::json!({"key": format!("k-{kind}")}),
                     |_| Ok(("p".into(), spec())),
                 )
@@ -642,7 +643,7 @@ mod tests {
         );
         let store = Arc::new(Store::open_in_memory().unwrap());
         let rec = store
-            .insert_job_task("run", &serde_json::json!({"key": "k"}), |_| {
+            .insert_job_task("run", "default", &serde_json::json!({"key": "k"}), |_| {
                 Ok(("p".into(), spec()))
             })
             .unwrap();

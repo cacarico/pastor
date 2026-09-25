@@ -450,6 +450,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             updated_at: now,
+            flock: None,
         }
     }
 

@@ -582,6 +582,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         job: a.job,
         machine: a.machine.clone(),
         states,
+        flock: None,
     };
     let daemon_up = daemon_running(&paths.socket_file()).await;
     let tasks = if daemon_up {
@@ -591,8 +592,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         ts
     } else {
         eprintln!("pastor serve is not running; showing the last known state");
-        paths.ensure()?;
-        Store::open(&paths.db_file())?.list_tasks(&filter)?
+        open_store(paths)?.list_tasks(&filter)?
     };
     if tasks.is_empty()
         && let Some(hint) = hint
@@ -632,6 +632,19 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The store, for a CLI path that reads it without the head. Rows from
+/// before flocks join the default flock first, as the head does at start, so
+/// `--flock` finds them. A flock.toml that does not load leaves them for the
+/// head; the read itself does not depend on it.
+fn open_store(paths: &Paths) -> anyhow::Result<Store> {
+    paths.ensure()?;
+    let store = Store::open(&paths.db_file())?;
+    if let Ok(flock) = Flock::load(&paths.flock_file()) {
+        store.adopt_default_flock(flock.default_flock())?;
+    }
+    Ok(store)
+}
+
 fn task_id(s: &str) -> i64 {
     parse_task_id(s)
         .unwrap_or_else(|| fail("usage_error", &format!("{s} is not a task id like t-12")))
@@ -649,8 +662,7 @@ async fn task(paths: &Paths, cmd: TaskCmd) -> anyhow::Result<()> {
                 };
                 t
             } else {
-                paths.ensure()?;
-                Store::open(&paths.db_file())?
+                open_store(paths)?
                     .get_task(id)?
                     .unwrap_or_else(|| fail("task_not_found", &task))
             };
@@ -855,8 +867,7 @@ fn attach_remote_command(session: &str, agent: &str) -> String {
 
 async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     let id = task_id(task);
-    paths.ensure()?;
-    let t = Store::open(&paths.db_file())?
+    let t = open_store(paths)?
         .get_task(id)?
         .unwrap_or_else(|| fail("task_not_found", task));
     let (Some(machine), Some(agent)) = (t.machine.clone(), t.agent_name.clone()) else {
@@ -942,8 +953,7 @@ fn print_jobs(jobs: &[JobStatus], json: bool) -> anyhow::Result<()> {
 /// `pastor serve` is down. Tasks it queues wait for the daemon.
 fn standalone(paths: &Paths) -> anyhow::Result<Scheduler> {
     let config = PastorConfig::load(&paths.config_file())?;
-    paths.ensure()?;
-    let store = Arc::new(Store::open(&paths.db_file())?);
+    let store = Arc::new(open_store(paths)?);
     Ok(Scheduler::standalone(paths.clone(), &config, store).with_plugins())
 }
 
