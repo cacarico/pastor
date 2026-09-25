@@ -214,7 +214,10 @@ fn remote_home(target: &str, out: &std::process::Output) -> Result<Option<String
         });
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    let home = raw.trim_end();
+    // Only the newline pastor's own `printf` may trail with is trimmed here;
+    // `trim_end()` would also eat a tab or form feed, letting a control
+    // character through disguised as trailing whitespace.
+    let home = raw.trim_end_matches(['\r', '\n']);
     // `?raw` logs stdout escaped, so a control character cannot garble the
     // journal line.
     if !out.status.success() || !home.starts_with('/') || home.chars().any(char::is_control) {
@@ -707,6 +710,10 @@ mod tests {
             remote_home("t", &out(0, "/home/pi\r\n")).unwrap(),
             Some("/home/pi".into())
         );
+        // A trailing tab or form feed is a control character, not part of
+        // the newline pastor trims, so it must still reject the home.
+        assert_eq!(remote_home("t", &out(0, "/home/pi\t\n")).unwrap(), None);
+        assert_eq!(remote_home("t", &out(0, "/home/pi\x0c\n")).unwrap(), None);
         assert_eq!(
             remote_home("t", &out(0, "/home/p\u{1b}[0mi")).unwrap(),
             None
