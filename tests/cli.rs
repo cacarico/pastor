@@ -2177,6 +2177,18 @@ fn task_send_trust_answers_the_prompt_and_trust_list_and_remove_show_it() {
     let out = env.cmd(&["trust", "list"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("/tmp/app"));
 
+    // The next task of that repo on that machine is answered by the head.
+    let out = env.cmd(&["task", "run", "again", "--repo", "/tmp/app", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_state(&env, "t-2", "running");
+    assert_eq!(herdr_calls(&env, "pane.send_keys").len(), 2);
+    let log = std::fs::read_to_string(env.state.join("events.jsonl")).unwrap();
+    assert!(log.contains("task.trusted"), "{log}");
+
     let out = env.cmd(&["trust", "remove", "fake", "/tmp/app"]);
     assert!(
         out.status.success(),

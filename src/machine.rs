@@ -1119,7 +1119,13 @@ impl Actor {
     async fn handle_command(&mut self, cmd: MachineCommand) -> CommandOutcome {
         match cmd {
             MachineCommand::Dispatch { task_id, reply } => {
-                let (result, dead) = self.run_dispatch(task_id).await;
+                let (result, mut dead) = self.run_dispatch(task_id).await;
+                if matches!(&result, Ok(t) if t.state == TaskState::Blocked)
+                    && let Err(err) = self.auto_trust().await
+                {
+                    tracing::warn!(machine = %self.name, "auto trust after dispatch: {err:#}");
+                    dead |= is_outage(&err);
+                }
                 let changed = result.is_ok();
                 self.refresh_live();
                 let _ = reply.send(result);
@@ -1769,6 +1775,15 @@ impl Actor {
                 self.apply(task, &observed);
             }
         }
+        if matches!(
+            observed,
+            Observed::Status {
+                status: AgentStatus::Blocked,
+                ..
+            }
+        ) {
+            self.auto_trust().await?;
+        }
         Ok(())
     }
 
@@ -2137,7 +2152,44 @@ impl Actor {
         }
         self.find_orphans(&agents)?;
         self.refresh_live();
+        self.auto_trust().await?;
         Ok(adopted)
+    }
+
+    /// Answer the folder-trust prompt of every task blocked during startup
+    /// (`Blocked` with its prompt still pending) whose (machine, repo) is
+    /// saved as trusted: send its agent's trust keys once and emit
+    /// `task.trusted`. `claim_trust_sent` makes it once per task, across
+    /// restarts, whether or not the keys answered the prompt: a task still
+    /// blocked afterwards is left for a human. The pending prompt goes in
+    /// when the agent reports it is no longer blocked
+    /// (`deliver_pending_prompt`).
+    async fn auto_trust(&mut self) -> anyhow::Result<()> {
+        for task in self.store.tasks_on_machine(&self.name)? {
+            if task.state != TaskState::Blocked || !task.prompt_pending {
+                continue;
+            }
+            let (Some(pane), Some(repo)) = (&task.pane_id, &task.spec.repo) else {
+                continue;
+            };
+            let Some(keys) = self.settings.agents.trust_keys(&task.spec.agent) else {
+                continue;
+            };
+            if !self.store.is_trusted(&self.name, repo)? || !self.store.claim_trust_sent(task.id)? {
+                continue;
+            }
+            let timeout = self.settings.request_timeout;
+            tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
+                .await
+                .map_err(|_| TimedOut("pane.send_keys", timeout))??;
+            tracing::info!(machine = %self.name, task = %task.display_id(), repo, "answered the trust prompt of a trusted repo");
+            self.emit_with(
+                "task.trusted",
+                Some(task.id),
+                Some(serde_json::json!({"keys": keys})),
+            );
+        }
+        Ok(())
     }
 
     /// Agents named `t-<id>` that no pane-owning task on this machine owns.
@@ -3511,6 +3563,78 @@ mod tests {
         h.send(bare.id, trust()).await.unwrap();
         assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
         assert!(store.trusted_repos().unwrap().is_empty());
+    }
+
+    fn trusted_events(events: &mut broadcast::Receiver<PastorEvent>) -> Vec<PastorEvent> {
+        let mut out = vec![];
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind == "task.trusted" {
+                out.push(ev);
+            }
+        }
+        out
+    }
+
+    /// A worktree task of a trusted repo blocks on the trust prompt of its
+    /// new folder; the actor answers it once and the task runs.
+    #[tokio::test]
+    async fn a_task_of_a_trusted_repo_is_answered_once_and_runs() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        wait_for("the task to run", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        // Some reconciles later, still once.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [PaneInput::Keys(vec!["Down".into(), "Enter".into()])]
+        );
+        let evs = trusted_events(&mut events);
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert_eq!(evs[0].task_id, Some(t.id));
+    }
+
+    #[tokio::test]
+    async fn a_task_of_an_untrusted_repo_stays_blocked() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        // Trusted on another machine only.
+        store.trust_repo("other", "/r").unwrap();
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert!(calls(&fake, "pane.send_keys").is_empty());
+        assert!(trusted_events(&mut events).is_empty());
+    }
+
+    /// Keys that do not answer the prompt leave the task blocked for a
+    /// human; the actor does not try again.
+    #[tokio::test]
+    async fn a_task_still_blocked_after_the_trust_keys_is_left_to_a_human() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
+        assert_eq!(trusted_events(&mut events).len(), 1);
+        // A new actor, as after a restart, does not send them again either.
+        assert_eq!(h.shutdown().await, ShutdownOutcome::Finished);
+        let (h2, _events) = connected(&fake, &store).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
+        drop(h2);
     }
 
     #[tokio::test]
