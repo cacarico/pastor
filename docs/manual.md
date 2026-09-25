@@ -1,7 +1,7 @@
 # pastor manual
 
 How pastor works today, in full. The [README](../README.md) is the short
-version. Planning documents live on the `docs` branch.
+version.
 
 ## How it works
 

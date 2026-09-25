@@ -1,6 +1,6 @@
 //! `pastor setup systemd [--herdr]`: install the shipped user unit, apply the
 //! requested systemd action, and check what a unit needs to outlive a login (lingering) and
-//! what the spec requires of pastor's own files (config and state dirs 0700,
+//! what pastor requires of its own files (config and state dirs 0700,
 //! socket and plugin `.env` files 0600).
 //!
 //! Every `systemctl` and `loginctl` call goes through [`Runner`], so the tests
@@ -459,7 +459,7 @@ fn which(name: &str, path_var: &str) -> Option<PathBuf> {
         })
 }
 
-/// Bring pastor's files to the modes the spec lists: config and state dirs
+/// Bring pastor's files to their required modes: config and state dirs
 /// 0700 (created if missing), the daemon socket and every plugin `.env` 0600.
 /// Returns one line per change. Symlinks are left alone: `create_private_dir`
 /// and `chmod` both follow them, so a symlinked root (or plugin directory)

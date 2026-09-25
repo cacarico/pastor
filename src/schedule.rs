@@ -1,5 +1,5 @@
 //! When a job is due. `every` is a plain interval; `cron` is 5-field cron in the
-//! head's local time, matched by a small walker rather than a crate: the spec's
+//! head's local time, matched by a small walker rather than a crate: the
 //! subset (numbers, `*`, ranges, lists, steps) fits in a page and stays
 //! readable next to its tests.
 

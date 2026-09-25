@@ -1,35 +1,13 @@
 # Working on pastor
 
-Read this first, then `docs/manual.md` (how it works today; `README.md` is the short version) and the design spec
-on the `docs` branch, `docs/superpowers/specs/2026-09-23-pastor-design.md`
-(what it must become). The spec is the source of truth for design; the code
-is the source of truth for behaviour. When they disagree, fix one and say
-which.
-
-## Status
-
-Plans 1 (core) and 2 (jobs and schedules) are implemented: plan 1 on
-`feat/core` (PR #1), plan 2 on `feat/jobs`. Plan 2 added job files, the
-schedule (`every`/`cron`), the built-in `clock` connector behind the
-`ItemSource` seam, the seen-store and per-job state (schema v2), templates,
-the scheduler as its own task with one dispatch lock, SQL task claims and
-optimistic `update_task`, the `polling` channel state, readiness from herdr's
-launch flags, and `task run|list`, `job list|enable|disable|run|reload`, `tick`.
-
-Plans 3 and 4 are not written yet:
-
-- Plan 3: plugins and the connector protocol (process connectors behind
-  `connector::ItemSource`), event hooks, the events log, `pastor events`.
-- Plan 4: systemd unit, `task retry|close|prune`, cleanup of orphaned
-  workspaces and agents, hot reload of `flock.toml` and `pastor.toml`.
-
-`docs/superpowers/plans/` on the `docs` branch holds the executed plans; they
-are history, not reference. Do not copy code from them.
+Read this first, then `docs/manual.md` (how it works today; `README.md` is
+the short version). The code is the source of truth for behaviour, and the
+manual describes it; when they disagree, fix one and say which.
 
 ## herdr facts that shaped the code
 
-Verified against herdr 0.9.1 (protocol 22) and its source. The spec records
-them too; they are repeated here because getting them wrong cost a day.
+Verified against herdr 0.9.1 (protocol 22) and its source. They are written
+down here because getting them wrong cost a day.
 
 - herdr's API server answers one request per socket connection and closes.
   Only `events.subscribe` stays open. pastor opens a connection per request
@@ -104,7 +82,7 @@ them too; they are repeated here because getting them wrong cost a day.
   the why. No `Co-Authored-By` or other trailers.
 - `skills/pastor/SKILL.md` is built into the binary. Change it with the CLI:
   a unit test fails when it names a command or flag that does not exist.
-- Vocabulary is fixed by the spec: machine, flock, head, job, task, plugin,
+- Vocabulary is fixed: machine, flock, head, job, task, plugin,
   connector, agent. Agents are never renamed; hosts are not "sheep".
 - Runtime CLI errors are JSON on stderr with a stable code and exit 1; clap
   usage errors stay plain text with exit 2.

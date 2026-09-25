@@ -166,7 +166,7 @@ pub struct MachineSettings {
     /// reconnect) instead of the readiness failure it is.
     pub agent_ready_timeout: Duration,
     /// While `Polling`, how often `agent.list` reconciles. The daemon passes its
-    /// `tick`, the spec's "each tick for a polling machine".
+    /// `tick`, so a polling machine is reconciled once per tick.
     pub poll_every: Duration,
     /// How long a `done` task keeps its pane before reconcile closes it
     /// (`close_done_after` in `pastor.toml`). `None` turns auto-close off.
@@ -5534,7 +5534,7 @@ mod tests {
     }
 
     /// Requests work (ping, agent.list) but the event subscription will not open:
-    /// the spec's `polling` state. The machine stays dispatchable, tasks are
+    /// the `polling` state. The machine stays dispatchable, tasks are
     /// tracked by reconcile every `poll_every`, no `machine.lost` is announced,
     /// and the first successful subscribe returns it to `connected`.
     ///

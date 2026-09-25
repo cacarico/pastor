@@ -7,8 +7,7 @@ well-scoped changes with clear tests are easiest to review.
 
 - Work on a branch and open a pull request. Do not push to `main`.
 - Read `AGENTS.md`, `README.md` and `docs/manual.md` before changing
-  behavior. The design spec and implementation plans live on the `docs`
-  branch, under `docs/superpowers/`.
+  behavior.
 - Keep vocabulary consistent: machine, flock, head, job, task, plugin,
   connector, and agent.
 - Do not add runtime dependencies unless the pull request explains why the

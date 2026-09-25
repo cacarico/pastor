@@ -1,6 +1,6 @@
 //! `{{ item.title }}` substitution for prompts, branches and repos. No logic,
-//! no filters, no escapes: the spec asks for substitution only, and a template
-//! engine would invite exactly the conditionals it rules out. A missing path
+//! no filters, no escapes: substitution only, because a template engine
+//! would invite exactly the conditionals job files should not hold. A missing path
 //! renders empty and is reported, so one odd item cannot fail a job forever.
 
 use serde_json::Value;

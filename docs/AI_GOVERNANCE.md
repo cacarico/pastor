@@ -15,7 +15,7 @@ the work. AI output is never authority by itself.
 - Never feed secrets, private prompts, logs, hostnames, credentials, customer
   data, or private repositories to an AI tool unless that use is approved.
 
-If generated code or text conflicts with the spec, README, behavior, security
+If generated code or text conflicts with the manual, README, behavior, security
 practice, or license obligations, fix it before submitting.
 
 ## Operator rules

@@ -102,7 +102,7 @@ pub const MIN_SECRET_LEN: usize = 4;
 
 /// Replaces secret values with `[redacted:NAME]`. Built from the names a
 /// manifest declares under `[secrets]` and the values the `.env` gives them,
-/// so what gets hidden is chosen by name, as the spec says.
+/// so what gets hidden is chosen by name.
 #[derive(Debug, Clone, Default)]
 pub struct Redactor {
     /// Longest first, so a secret that contains another is replaced whole.
