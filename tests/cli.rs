@@ -2242,6 +2242,33 @@ fn a_first_default_flock_takes_the_machines_along() {
     assert_eq!(list[0]["machines"], serde_json::json!(["pi-1", "pi-2"]));
 }
 
+/// A task queued in the implicit flock keeps its machines there when the
+/// first flock is added as the default, and the output names the task.
+#[test]
+fn a_queued_task_keeps_the_machines_in_the_implicit_flock() {
+    let env = start();
+    // `fake` takes two agents; the third task waits in `default`.
+    let mut last = serde_json::Value::Null;
+    for _ in 0..3 {
+        last = serde_json::from_str(&ok(env.cmd(&["task", "run", "hi", "--json"]))).unwrap();
+    }
+    assert_eq!(last["state"], "queued", "{last}");
+    let id = last["id"].as_i64().unwrap();
+    let out = ok(env.cmd(&["flock", "add", "personal", "--default"]));
+    assert!(
+        out.starts_with(&format!(
+            "added flock personal, now the default; machine fake stays in flock default, which has queued tasks: t-{id};"
+        )),
+        "{out}"
+    );
+    let list: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["flock", "list", "--json"]))).unwrap();
+    assert_eq!(list[0]["name"], "default", "{list}");
+    assert_eq!(list[0]["machines"], serde_json::json!(["fake"]));
+    assert_eq!(list[1]["name"], "personal");
+    assert_eq!(list[1]["default"], true);
+}
+
 /// `task run --flock` against a running head: the task waits for a machine
 /// of its flock, the flock cannot be removed under it, `--machine` outside
 /// it is refused, `task list --flock`

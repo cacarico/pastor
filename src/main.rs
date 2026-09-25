@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use pastor::cli::{CliError, request_failure};
-use pastor::config::flock::{EditError, Flock, FlockDoc, MachineConfig};
+use pastor::config::flock::{DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{AgentChoice, PastorConfig, Paths, parse_duration};
 use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
@@ -1048,8 +1048,22 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
     let done = match cmd {
         FlockCmd::List { json } => return flock_list(paths, json, head).await,
         FlockCmd::Add { name, default } => {
+            // A first default flock would take the implicit flock's
+            // machines, stranding the tasks queued there. As with `flock
+            // remove` without a head, a task queued between this read and
+            // the save is not seen; `pastor task close` recovers it.
+            let queued: Vec<String> = if default && Flock::load(&path)?.flocks.is_empty() {
+                queued_tasks(paths, head)
+                    .await?
+                    .iter()
+                    .filter(|t| t.flock.as_deref() == Some(DEFAULT_FLOCK))
+                    .map(|t| t.display_id())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let mut doc = FlockDoc::open(&path)?;
-            let added = doc.add_flock(&name, default).map_err(edit_error)?;
+            let added = doc.add_flock(&name, default, &queued).map_err(edit_error)?;
             doc.save(&path)?;
             let mut done = if default {
                 format!("added flock {name}, now the default")
@@ -1066,6 +1080,9 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                     done += &format!("; {noun} {machines} moved to it");
                 } else {
                     done += &format!("; {noun} {machines} {verb} in flock {}", added.flock);
+                }
+                if !added.held_by.is_empty() {
+                    done += &format!(", which has queued tasks: {}", added.held_by.join(", "));
                 }
             }
             done

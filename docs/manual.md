@@ -274,8 +274,11 @@ change up at once, as it does for `machine add|remove`. The first `flock add`
 on a file with no `[[flock]]` entry writes the implicit flock down as
 `default` first, and the machines stay in it; with `--default` the new flock
 takes the implicit one's place instead, and the machines that name no flock
-move to it. `flock add` says which flock those machines are in afterwards. `flock default` writes the old default flock onto every
-machine that named none, so changing where new work goes moves no machine.
+move to it (`default` is still written down if a machine names it). While
+tasks are queued in the implicit flock the machines stay there, so those
+tasks keep somewhere to run, and the output names the tasks. `flock add` says
+which flock those machines are in afterwards. `flock default` writes the old
+default flock onto every machine that named none, so changing where new work goes moves no machine.
 AGENTS in `flock list` needs a running head and is `-` without one.
 
 A task's flock is fixed when it is created: `--flock` on `pastor task run`, or

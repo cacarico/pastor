@@ -326,6 +326,10 @@ pub struct FlockAdded {
     pub machines: Vec<String>,
     /// They followed the new flock, rather than staying where they were.
     pub moved: bool,
+    /// The queued tasks in the implicit flock that kept them from following
+    /// a new default: those tasks would be left waiting in a flock with no
+    /// machines.
+    pub held_by: Vec<String>,
 }
 
 /// flock.toml opened for an edit that keeps everything it does not touch:
@@ -552,8 +556,16 @@ impl FlockDoc {
     /// first, so its machines keep their flock; unless the new flock is to
     /// be the default, which then takes the implicit one's place and its
     /// machines. The implicit flock is still declared when a machine names
-    /// it, and that machine stays in it.
-    pub fn add_flock(&mut self, name: &str, default: bool) -> Result<FlockAdded, EditError> {
+    /// it, and that machine stays in it. `queued` holds the ids of the queued
+    /// tasks in the implicit flock; while there are any the machines stay,
+    /// since dispatch only looks in declared flocks and those tasks would
+    /// wait forever.
+    pub fn add_flock(
+        &mut self,
+        name: &str,
+        default: bool,
+        queued: &[String],
+    ) -> Result<FlockAdded, EditError> {
         let f = self.current()?;
         if f.has_flock(name) {
             return Err(EditError::FlockExists(name.into()));
@@ -567,7 +579,7 @@ impl FlockDoc {
             .filter(|m| m.flock.is_none())
             .map(|m| m.name.clone())
             .collect();
-        if default && f.flocks.is_empty() {
+        if default && f.flocks.is_empty() && queued.is_empty() {
             if f.machines.iter().any(|m| m.flock.is_some()) {
                 let mut t = toml_edit::Table::new();
                 t.insert("name", toml_edit::value(DEFAULT_FLOCK));
@@ -581,6 +593,7 @@ impl FlockDoc {
                 flock: name.into(),
                 machines,
                 moved: true,
+                held_by: Vec::new(),
             });
         }
         self.declare_implicit(&f);
@@ -590,10 +603,16 @@ impl FlockDoc {
         if default {
             self.set_default(name)?;
         }
+        let held_by = if default && f.flocks.is_empty() && !machines.is_empty() {
+            queued.to_vec()
+        } else {
+            Vec::new()
+        };
         Ok(FlockAdded {
             flock: f.default_flock().into(),
             machines,
             moved: false,
+            held_by,
         })
     }
 
@@ -889,7 +908,7 @@ flock = "work"
     #[test]
     fn adding_a_flock_declares_the_implicit_default_first() {
         let mut d = FlockDoc::parse(COMMENTED).unwrap();
-        d.add_flock("work", false).unwrap();
+        d.add_flock("work", false, &[]).unwrap();
         let text = d.to_string();
         assert!(
             text.starts_with("# my fleet\n\n[[flock]]\nname = \"default\"\ndefault = true\n\n[[flock]]\nname = \"work\"\n\n[[machine]]\nname = \"pi-1\"   # the desk one\n"),
@@ -898,7 +917,7 @@ flock = "work"
         let f = d.flock().unwrap();
         assert_eq!(f.flock_names(), ["default", "work"]);
         assert_eq!(f.machine_flock("pi-1"), Some("default"));
-        d.add_flock("play", false).unwrap();
+        d.add_flock("play", false, &[]).unwrap();
         assert_eq!(
             d.flock().unwrap().flock_names(),
             ["default", "work", "play"]
@@ -909,7 +928,7 @@ flock = "work"
             "{d}"
         );
         assert_eq!(
-            d.add_flock("work", false).unwrap_err(),
+            d.add_flock("work", false, &[]).unwrap_err(),
             EditError::FlockExists("work".into())
         );
     }
@@ -920,11 +939,12 @@ flock = "work"
     fn a_first_flock_reports_the_machines_stay_in_default() {
         let mut d = FlockDoc::parse(COMMENTED).unwrap();
         assert_eq!(
-            d.add_flock("work", false).unwrap(),
+            d.add_flock("work", false, &[]).unwrap(),
             FlockAdded {
                 flock: "default".into(),
                 machines: vec!["pi-1".into(), "pi-3".into()],
                 moved: false,
+                held_by: Vec::new(),
             }
         );
         assert_eq!(d.flock().unwrap().machine_flock("pi-1"), Some("default"));
@@ -937,11 +957,12 @@ flock = "work"
     fn a_first_default_flock_takes_the_machines_along() {
         let mut d = FlockDoc::parse(COMMENTED).unwrap();
         assert_eq!(
-            d.add_flock("personal", true).unwrap(),
+            d.add_flock("personal", true, &[]).unwrap(),
             FlockAdded {
                 flock: "personal".into(),
                 machines: vec!["pi-1".into(), "pi-3".into()],
                 moved: true,
+                held_by: Vec::new(),
             }
         );
         let f = d.flock().unwrap();
@@ -962,7 +983,7 @@ flock = "work"
             "{COMMENTED}\n[[machine]]\nname = \"pi-5\"\nlocal = true\nflock = \"default\"\n"
         );
         let mut d = FlockDoc::parse(&named).unwrap();
-        let added = d.add_flock("personal", true).unwrap();
+        let added = d.add_flock("personal", true, &[]).unwrap();
         assert_eq!(added.machines, ["pi-1", "pi-3"]);
         assert!(added.moved);
         let f = d.flock().unwrap();
@@ -974,10 +995,27 @@ flock = "work"
         // With no machines there is nothing to move.
         let mut d = FlockDoc::parse("").unwrap();
         assert_eq!(
-            d.add_flock("personal", true).unwrap().machines,
+            d.add_flock("personal", true, &[]).unwrap().machines,
             Vec::<String>::new()
         );
         assert_eq!(d.flock().unwrap().flock_names(), ["personal"]);
+
+        // Queued tasks in the implicit flock keep the machines there, so the
+        // tasks still have somewhere to run.
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        assert_eq!(
+            d.add_flock("personal", true, &["t-4".into()]).unwrap(),
+            FlockAdded {
+                flock: "default".into(),
+                machines: vec!["pi-1".into(), "pi-3".into()],
+                moved: false,
+                held_by: vec!["t-4".into()],
+            }
+        );
+        let f = d.flock().unwrap();
+        assert_eq!(f.flock_names(), ["default", "personal"]);
+        assert_eq!(f.default_flock(), "personal");
+        assert_eq!(f.machine_flock("pi-1"), Some("default"));
     }
 
     #[test]
@@ -987,7 +1025,7 @@ flock = "work"
             d.move_machine("pi-3", "work").unwrap_err(),
             EditError::UnknownFlock("work".into())
         );
-        d.add_flock("work", false).unwrap();
+        d.add_flock("work", false, &[]).unwrap();
         d.move_machine("pi-3", "work").unwrap();
         assert_eq!(d.flock().unwrap().machine_flock("pi-3"), Some("work"));
         assert!(d.to_string().contains("# spare\n"), "{d}");
@@ -1011,13 +1049,14 @@ flock = "work"
     #[test]
     fn a_new_default_keeps_the_machines_in_their_flocks() {
         let mut d = FlockDoc::parse(COMMENTED).unwrap();
-        d.add_flock("play", false).unwrap();
+        d.add_flock("play", false, &[]).unwrap();
         assert_eq!(
-            d.add_flock("work", true).unwrap(),
+            d.add_flock("work", true, &[]).unwrap(),
             FlockAdded {
                 flock: "default".into(),
                 machines: vec!["pi-1".into(), "pi-3".into()],
                 moved: false,
+                held_by: Vec::new(),
             }
         );
         let f = d.flock().unwrap();
@@ -1036,7 +1075,7 @@ flock = "work"
     #[test]
     fn a_flock_is_removed_only_when_empty_idle_and_not_the_default() {
         let mut d = FlockDoc::parse(COMMENTED).unwrap();
-        d.add_flock("work", false).unwrap();
+        d.add_flock("work", false, &[]).unwrap();
         d.move_machine("pi-3", "work").unwrap();
         assert_eq!(
             d.remove_flock("work", &[]).unwrap_err(),
