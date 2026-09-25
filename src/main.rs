@@ -704,6 +704,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 session,
                 max_agents,
                 tags,
+                flock: None,
             };
             f.add(m).map_err(|e| anyhow::anyhow!(e))?;
             f.save(&path)?;

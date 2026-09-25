@@ -26,10 +26,31 @@ pub struct MachineConfig {
     pub max_agents: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The flock this machine belongs to; `None` is the default flock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flock: Option<String>,
 }
 
+/// The flock a file with no `[[flock]]` entry has: every machine is in it.
+pub const DEFAULT_FLOCK: &str = "default";
+
+/// One `[[flock]]` entry. A flock is only a name for now; which machines are
+/// in it is each machine's `flock` field, so a machine is in exactly one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlockEntry {
+    pub name: String,
+    /// Where tasks and jobs that name no flock go. Exactly one entry has it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+}
+
+/// `flock.toml`: the declared flocks and the machines, each in one of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flock {
+    /// Empty means one implicit flock, `DEFAULT_FLOCK`, holding every machine.
+    #[serde(default, rename = "flock", skip_serializing_if = "Vec::is_empty")]
+    pub flocks: Vec<FlockEntry>,
     #[serde(default, rename = "machine")]
     pub machines: Vec<MachineConfig>,
 }
@@ -83,6 +104,32 @@ impl Flock {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        let mut names = std::collections::HashSet::new();
+        for f in &self.flocks {
+            if f.name.is_empty() {
+                return Err("flock with empty name".into());
+            }
+            if !names.insert(&f.name) {
+                return Err(format!("flock {} listed twice", f.name));
+            }
+        }
+        if !self.flocks.is_empty() {
+            let defaults: Vec<&str> = self
+                .flocks
+                .iter()
+                .filter(|f| f.default)
+                .map(|f| f.name.as_str())
+                .collect();
+            match defaults[..] {
+                [_] => {}
+                [] => return Err("no flock has default = true; exactly one must".into()),
+                [a, b, ..] => {
+                    return Err(format!(
+                        "flocks {a} and {b} are both default; exactly one may be"
+                    ));
+                }
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         for m in &self.machines {
             if m.name.is_empty() {
@@ -104,8 +151,45 @@ impl Flock {
             if m.max_agents == 0 {
                 return Err(format!("machine {}: max_agents must be at least 1", m.name));
             }
+            if let Some(f) = &m.flock
+                && !self.has_flock(f)
+            {
+                return Err(format!("machine {}: flock {f} is not declared", m.name));
+            }
         }
         Ok(())
+    }
+
+    /// The flock tasks and jobs that name none go to.
+    pub fn default_flock(&self) -> &str {
+        self.flocks
+            .iter()
+            .find(|f| f.default)
+            .map_or(DEFAULT_FLOCK, |f| f.name.as_str())
+    }
+
+    /// Every flock in file order; the implicit one when none is declared.
+    pub fn flock_names(&self) -> Vec<&str> {
+        if self.flocks.is_empty() {
+            vec![DEFAULT_FLOCK]
+        } else {
+            self.flocks.iter().map(|f| f.name.as_str()).collect()
+        }
+    }
+
+    pub fn has_flock(&self, name: &str) -> bool {
+        self.flock_names().contains(&name)
+    }
+
+    /// The flock `m` belongs to.
+    pub fn flock_of<'a>(&'a self, m: &'a MachineConfig) -> &'a str {
+        m.flock.as_deref().unwrap_or_else(|| self.default_flock())
+    }
+
+    /// The flock of the machine named `name`, `None` when there is no such
+    /// machine.
+    pub fn machine_flock(&self, name: &str) -> Option<&str> {
+        self.get(name).map(|m| self.flock_of(m))
     }
 
     pub fn get(&self, name: &str) -> Option<&MachineConfig> {
@@ -144,12 +228,115 @@ mod tests {
             session: "default".into(),
             max_agents: 2,
             tags: vec![],
+            flock: None,
         }
+    }
+
+    fn flocks(text: &str) -> Result<Flock, String> {
+        let f: Flock = toml::from_str(text).map_err(|e| e.to_string())?;
+        f.validate()?;
+        Ok(f)
+    }
+
+    #[test]
+    fn parses_the_flocks_of_the_spec_example() {
+        let f = flocks(
+            r#"
+[[flock]]
+name = "personal"
+default = true
+
+[[flock]]
+name = "work"
+
+[[machine]]
+name = "pi-1"
+local = true
+
+[[machine]]
+name = "pi-3"
+ssh = "user@pi-3"
+flock = "work"
+"#,
+        )
+        .unwrap();
+        assert_eq!(f.default_flock(), "personal");
+        assert_eq!(f.flock_names(), ["personal", "work"]);
+        assert_eq!(f.machine_flock("pi-1"), Some("personal"));
+        assert_eq!(f.machine_flock("pi-3"), Some("work"));
+        assert_eq!(f.machine_flock("pi-9"), None);
+        assert!(f.has_flock("work"));
+        assert!(!f.has_flock("default"));
+    }
+
+    /// Flock files from before flocks keep working: one flock, `default`.
+    #[test]
+    fn no_flock_entry_is_one_flock_named_default() {
+        let f = flocks("[[machine]]\nname = \"a\"\nlocal = true\n").unwrap();
+        assert_eq!(f.default_flock(), DEFAULT_FLOCK);
+        assert_eq!(f.flock_names(), [DEFAULT_FLOCK]);
+        assert_eq!(f.machine_flock("a"), Some(DEFAULT_FLOCK));
+        // Naming the implicit flock is allowed; any other name is not.
+        flocks("[[machine]]\nname = \"a\"\nlocal = true\nflock = \"default\"\n").unwrap();
+        let err =
+            flocks("[[machine]]\nname = \"a\"\nlocal = true\nflock = \"work\"\n").unwrap_err();
+        assert_eq!(err, "machine a: flock work is not declared");
+        assert_eq!(Flock::default().default_flock(), DEFAULT_FLOCK);
+    }
+
+    #[test]
+    fn flock_errors_are_config_errors() {
+        let two =
+            "[[flock]]\nname = \"a\"\ndefault = true\n[[flock]]\nname = \"b\"\ndefault = true\n";
+        assert_eq!(
+            flocks(two).unwrap_err(),
+            "flocks a and b are both default; exactly one may be"
+        );
+        let none = "[[flock]]\nname = \"a\"\n[[flock]]\nname = \"b\"\n";
+        assert_eq!(
+            flocks(none).unwrap_err(),
+            "no flock has default = true; exactly one must"
+        );
+        let dup = "[[flock]]\nname = \"a\"\ndefault = true\n[[flock]]\nname = \"a\"\n";
+        assert_eq!(flocks(dup).unwrap_err(), "flock a listed twice");
+        let empty = "[[flock]]\nname = \"\"\ndefault = true\n";
+        assert_eq!(flocks(empty).unwrap_err(), "flock with empty name");
+        let unknown = "[[flock]]\nname = \"a\"\ndefault = true\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"b\"\n";
+        assert_eq!(
+            flocks(unknown).unwrap_err(),
+            "machine m: flock b is not declared"
+        );
+        // A typo in a key is a load error too, not a machine in the default flock.
+        assert!(flocks("[[flock]]\nname = \"a\"\ndefualt = true\n").is_err());
+    }
+
+    #[test]
+    fn a_bad_flock_fails_the_load_with_the_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flock.toml");
+        std::fs::write(&path, "[[flock]]\nname = \"a\"\n").unwrap();
+        let err = format!("{:#}", Flock::load(&path).unwrap_err());
+        assert!(err.contains("flock.toml"), "{err}");
+        assert!(err.contains("no flock has default = true"), "{err}");
+        assert!(Flock::load_existing(&path).is_err());
+    }
+
+    #[test]
+    fn flocks_survive_a_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flock.toml");
+        let f = flocks(
+            "[[flock]]\nname = \"home\"\ndefault = true\n[[flock]]\nname = \"work\"\n\n[[machine]]\nname = \"a\"\nlocal = true\nflock = \"work\"\n",
+        )
+        .unwrap();
+        f.save(&path).unwrap();
+        assert_eq!(Flock::load(&path).unwrap(), f);
     }
 
     #[test]
     fn an_empty_command_is_refused() {
         let f = Flock {
+            flocks: vec![],
             machines: vec![MachineConfig {
                 ssh: None,
                 command: Some(vec![]),

@@ -1045,6 +1045,7 @@ mod tests {
             session: "default".into(),
             max_agents: max,
             tags: vec![],
+            flock: None,
         }
     }
 
@@ -1105,6 +1106,7 @@ mod tests {
 
     fn flock_of(machines: &[(&str, u32)]) -> Flock {
         Flock {
+            flocks: vec![],
             machines: machines.iter().map(|(n, max)| machine(n, *max)).collect(),
         }
     }
@@ -1389,6 +1391,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let flock = Flock {
+            flocks: vec![],
             machines: fakes.iter().map(|(n, max, _)| machine(n, *max)).collect(),
         };
         // On disk too, as `serve` would have found them: a `pastor job reload`
@@ -1697,6 +1700,7 @@ mod tests {
 
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let flock = Flock {
+            flocks: vec![],
             machines: vec![machine("a", 2)],
         };
         let fake = FakeHerdr::new();
@@ -1732,6 +1736,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let flock = Flock {
+            flocks: vec![],
             machines: vec![machine("a", 1)],
         };
         let on_disk = ConfigFingerprint::sample(&paths);

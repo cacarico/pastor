@@ -171,6 +171,7 @@ async fn the_daemon_writes_the_events_log() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
     let flock = Flock {
+        flocks: vec![],
         machines: vec![MachineConfig {
             name: "m".into(),
             local: false,
@@ -179,6 +180,7 @@ async fn the_daemon_writes_the_events_log() {
             session: "default".into(),
             max_agents: 1,
             tags: vec![],
+            flock: None,
         }],
     };
     let fake: Arc<dyn Connector> = Arc::new(FakeHerdr::new());

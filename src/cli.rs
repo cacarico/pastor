@@ -640,6 +640,7 @@ mod tests {
         };
         let tasks = vec![running_gone, closed_gone, here];
         let flock = Flock {
+            flocks: vec![],
             machines: vec![MachineConfig {
                 name: "pi-1".into(),
                 local: true,
@@ -648,6 +649,7 @@ mod tests {
                 session: "default".into(),
                 max_agents: 2,
                 tags: vec![],
+                flock: None,
             }],
         };
         let mut rows = task_rows(&tasks);
