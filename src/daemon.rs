@@ -304,8 +304,7 @@ impl Fleet {
     }
 
     /// Take `[defaults]` and `[agents]` from `pastor.toml` as now loaded;
-    /// the scheduler calls it at start and on every reload that reads the
-    /// file.
+    /// the scheduler calls it at start, and a reload through `apply_config`.
     pub fn set_config(&self, config: &PastorConfig) {
         *self.defaults.write().unwrap() = config.defaults.clone();
         *self.agents.write().unwrap() = config.agents.clone();
@@ -387,6 +386,12 @@ impl Fleet {
         *self.wanted.write().unwrap() = flock;
     }
 
+    /// Hold the dispatch lock, as a dispatch pass does.
+    #[cfg(test)]
+    pub async fn hold_dispatch_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.dispatch_lock.lock().await
+    }
+
     /// Is any machine waiting for its old actor to end?
     pub fn any_shutting_down(&self) -> bool {
         self.members.read().unwrap().iter().any(|m| m.shutting_down)
@@ -411,6 +416,32 @@ impl Fleet {
             return FlockDiff::default();
         };
         let _pass = self.dispatch_lock.lock().await;
+        self.apply_flock_locked(spawner, flock, settings).await
+    }
+
+    /// A reload: `set_config` and `apply_flock` as one step under the
+    /// dispatch lock, so no task is queued with the new `[defaults]` and
+    /// `[agents]` and then dispatched to an actor that still runs the old
+    /// ones, or the other way round. A fixed fleet takes the config only.
+    pub async fn apply_config(&self, config: &PastorConfig, flock: &Flock) -> FlockDiff {
+        let _pass = self.dispatch_lock.lock().await;
+        self.set_config(config);
+        match &self.spawner {
+            Some(spawner) => {
+                self.apply_flock_locked(spawner, flock, &machine_settings(config))
+                    .await
+            }
+            None => FlockDiff::default(),
+        }
+    }
+
+    /// `apply_flock`'s body; the caller holds the dispatch lock.
+    async fn apply_flock_locked(
+        &self,
+        spawner: &Spawner,
+        flock: &Flock,
+        settings: &MachineSettings,
+    ) -> FlockDiff {
         *self.wanted.write().unwrap() = flock.clone();
         let mut diff = FlockDiff::default();
         // A copy: readers keep seeing the old set until the new one is ready,

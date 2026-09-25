@@ -863,9 +863,10 @@ impl Scheduler {
 
     /// Re-read `pastor.toml` and `flock.toml` if either changed on disk (or
     /// always, with `force`) and apply them. Machines are added, removed or
-    /// replaced in the fleet (`Fleet::apply_flock`). `tick` sets the period
-    /// from the next tick on. A change to `[defaults]` makes the job files
-    /// re-parse. A file that does not load is logged and its previous version
+    /// replaced in the fleet, and `[defaults]` and `[agents]` handed to it,
+    /// in one step under the dispatch lock (`Fleet::apply_config`). `tick`
+    /// sets the period from the next tick on. A change to `[defaults]` makes
+    /// the job files re-parse. A file that does not load is logged and its previous version
     /// stays in use, the same rule as a job file. A machine whose old actor
     /// did not stop (`FlockDiff::shutting_down`) is retried on every pass,
     /// with the flock last applied, until the swap is done. Returns `None`
@@ -904,7 +905,7 @@ impl Scheduler {
                     self.fingerprint = None;
                 }
                 self.tick = config.tick_duration();
-                self.fleet.set_config(&config);
+                // Handed to the fleet with the flock below, under one lock.
                 self.config = config;
             }
             Err(err) if is_not_found(&err) => tracing::warn!(
@@ -929,10 +930,7 @@ impl Scheduler {
                 self.fleet.flock()
             }
         };
-        let diff = self
-            .fleet
-            .apply_flock(&flock, &machine_settings(&self.config))
-            .await;
+        let diff = self.fleet.apply_config(&self.config, &flock).await;
         self.report(&diff, &flock);
         Some(diff)
     }
@@ -2303,6 +2301,43 @@ mod tests {
             Scheduler::new(paths, &config, store.clone(), fleet, events),
             tmp,
         )
+    }
+
+    /// Copilot 4109078080: a reload that waits behind a dispatch pass must
+    /// not publish the new `[defaults]` and `[agents]` before it holds the
+    /// dispatch lock. Otherwise a task queued in the gap resolves the new
+    /// agent settings and goes to an actor spawned with the old ones.
+    #[tokio::test]
+    async fn a_reload_applies_the_config_and_the_flock_under_one_lock() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = managed_scheduler(&store);
+        std::fs::write(s.paths.flock_file(), FLOCK_A).unwrap();
+        s.reload_config(false).await.unwrap();
+        let ask = crate::config::AgentChoice::default();
+        let old = s.fleet.resolve_agent(&ask, "default").agent;
+        std::fs::write(
+            s.paths.config_file(),
+            "tick = \"1s\"\n[defaults]\nagent = \"codex\"\n",
+        )
+        .unwrap();
+        let fleet = s.fleet.clone();
+        let held = fleet.hold_dispatch_lock().await;
+        let reload = s.reload_config(false);
+        tokio::pin!(reload);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut reload)
+                .await
+                .is_err(),
+            "the reload waits for the dispatch lock"
+        );
+        assert_eq!(
+            fleet.resolve_agent(&ask, "default").agent,
+            old,
+            "the new [defaults] must not be visible before the lock is taken"
+        );
+        drop(held);
+        reload.await.unwrap();
+        assert_eq!(fleet.resolve_agent(&ask, "default").agent, "codex");
     }
 
     #[tokio::test]
