@@ -76,6 +76,24 @@ impl Endpoint {
             Endpoint::Command { argv } => format!("command {}", argv.join(" ")),
         }
     }
+
+    /// Where the machine lives, short enough for a table column: the ssh
+    /// target as written, `local`, or the file name of a command machine's
+    /// program (its full path and arguments are in `describe`).
+    pub fn host(&self) -> String {
+        match self {
+            Endpoint::Local { .. } => "local".into(),
+            Endpoint::Ssh { target, .. } => target.clone(),
+            Endpoint::Command { argv } => argv
+                .first()
+                .map(|a| {
+                    Path::new(a)
+                        .file_name()
+                        .map_or_else(|| a.clone(), |f| f.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "-".into()),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -248,6 +266,10 @@ pub type DirFuture<'a> =
 pub trait Connector: Send + Sync {
     fn connect(&self) -> ConnectFuture<'_>;
     fn describe(&self) -> String;
+    /// The short form of `describe` that `machine list` shows as HOST.
+    fn host(&self) -> String {
+        self.describe()
+    }
     /// The home directory on the machine, for expanding `~` in a repo path:
     /// herdr takes a `cwd` literally and silently falls back to another
     /// directory when it does not exist. `None` when it cannot be known.
@@ -268,6 +290,9 @@ impl Connector for Endpoint {
     }
     fn describe(&self) -> String {
         Endpoint::describe(self)
+    }
+    fn host(&self) -> String {
+        Endpoint::host(self)
     }
     fn home_dir(&self) -> HomeFuture<'_> {
         Box::pin(home_dir(self))
@@ -462,6 +487,37 @@ mod tests {
             max_agents: 2,
             tags: vec![],
         }
+    }
+
+    /// `machine list` shows where each machine lives in a few characters: the
+    /// ssh target as written, `local`, or the program a command machine runs.
+    #[test]
+    fn host_is_the_ssh_target_local_or_the_command_program() {
+        let paths = Paths::new("/c", "/s");
+        assert_eq!(
+            Endpoint::from_machine(&ssh_machine("pi-3"), &paths).host(),
+            "fleet@host"
+        );
+        let local = MachineConfig {
+            local: true,
+            ssh: None,
+            ..ssh_machine("here")
+        };
+        assert_eq!(Endpoint::from_machine(&local, &paths).host(), "local");
+        let command = MachineConfig {
+            ssh: None,
+            command: Some(vec![
+                "/opt/bin/fake-herdr".into(),
+                "--connect".into(),
+                "/tmp/h.sock".into(),
+            ]),
+            ..ssh_machine("fake")
+        };
+        assert_eq!(
+            Endpoint::from_machine(&command, &paths).host(),
+            "fake-herdr"
+        );
+        assert_eq!(Endpoint::Command { argv: vec![] }.host(), "-");
     }
 
     /// The machine name in the ControlPath is only there to be recognisable;

@@ -112,7 +112,8 @@ Plan 3 (events and plugins):
 - A 30s unread events socket can overrun herdr's retained history; pastor
   reconnects and reconciles, at the cost of a `machine.lost` blip.
 - Adopted panes get no `agent_status` subscription until the next reconnect.
-- `pastor machine status` does unbounded connect/ping/list on the CLI path.
+- `pastor machine list` without a head does unbounded connect/ping/list on the
+  CLI path, one machine at a time.
 - A stream connector starts on its job's first run, not at daemon start,
   and `pastor job reload` (which every `plugin install|link|uninstall|unlink`
   sends) rebuilds the catalog, restarting every stream connector.

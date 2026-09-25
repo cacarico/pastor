@@ -505,6 +505,9 @@ impl super::transport::Connector for FakeHerdr {
     fn describe(&self) -> String {
         "fake herdr".into()
     }
+    fn host(&self) -> String {
+        "fake".into()
+    }
     fn home_dir(&self) -> super::transport::HomeFuture<'_> {
         let home = self.state.lock().unwrap().home.clone();
         Box::pin(async move { Ok(home) })

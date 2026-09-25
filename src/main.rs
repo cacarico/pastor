@@ -10,7 +10,6 @@ use pastor::herdr::{ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{
     IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, daemon_running, request,
 };
-use pastor::machine::{ChannelState, MachineStatus};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
 use pastor::task::{DispatchSpec, Task, TaskState, parse_task_id};
@@ -216,10 +215,13 @@ enum MachineCmd {
         #[arg(long)]
         herdr: bool,
     },
+    /// The head, then each machine: host, channel, herdr, agents
     List {
         #[arg(long)]
         json: bool,
     },
+    /// Old spelling of `machine list`; a name narrows it to that machine
+    #[command(hide = true)]
     Status {
         name: Option<String>,
         #[arg(long)]
@@ -290,16 +292,31 @@ fn main() {
 }
 
 /// The command tree `pastor completions` describes. clap_complete offers
-/// hidden subcommands too, so the old top-level spellings are dropped here and
-/// the scripts name only `task run`, `task list`, `task attach`, `job reload`.
-/// Top-level flags such as `--skill` are kept.
+/// hidden subcommands too, so the old spellings are dropped here and the
+/// scripts name only `task run`, `task list`, `task attach`, `job reload` and
+/// `machine list`. Top-level flags such as `--skill` are kept.
 fn completion_tree() -> clap::Command {
-    let full = <Cli as clap::CommandFactory>::command();
-    clap::Command::new("pastor")
-        .version(env!("CARGO_PKG_VERSION"))
-        .about(full.get_about().cloned().unwrap_or_default())
-        .args(full.get_arguments().cloned())
-        .subcommands(full.get_subcommands().filter(|c| !c.is_hide_set()).cloned())
+    without_hidden(&<Cli as clap::CommandFactory>::command()).version(env!("CARGO_PKG_VERSION"))
+}
+
+/// `c` without its hidden subcommands, at every level. clap cannot remove a
+/// subcommand, so a command that has hidden ones is rebuilt from its name,
+/// about and arguments; the others are cloned whole.
+fn without_hidden(c: &clap::Command) -> clap::Command {
+    if !c.get_subcommands().any(|s| s.is_hide_set()) {
+        return c.clone();
+    }
+    // clap takes a `'static` name without its `string` feature; this runs once
+    // per `pastor completions`, so leaking the few names is harmless.
+    let name: &'static str = Box::leak(c.get_name().to_string().into_boxed_str());
+    clap::Command::new(name)
+        .about(c.get_about().cloned().unwrap_or_default())
+        .args(c.get_arguments().cloned())
+        .subcommands(
+            c.get_subcommands()
+                .filter(|s| !s.is_hide_set())
+                .map(without_hidden),
+        )
 }
 
 /// The hint a hidden old spelling prints before doing exactly what `new` does.
@@ -422,18 +439,16 @@ fn print_task(t: &Task, json: bool) {
     }
 }
 
-/// Turn a `machine status` probe into a table/JSON row's fields. Pure so the
-/// classification (including the agent.list-failed case) is unit-testable
-/// without a live herdr.
+/// Turn a direct probe (what `machine list` does with no head running) into a
+/// row's channel, herdr version, protocol, agent count and error. Pure so the
+/// classification is unit-testable without a live herdr.
 ///
 /// `agent_count` is `None` when `ping` itself failed (agent.list was never
 /// called), `Some(Err(_))` when ping succeeded but agent.list failed, and
-/// `Some(Ok(n))` for the normal case.
-///
-/// Connect/ping failure classification (server down / unreachable / error) is
-/// unchanged; only the ping-succeeded, agent.list-failed case is new: it must
-/// not report the row as reachable with zero agents.
-type MachineStatusRow = (
+/// `Some(Ok(n))` for the normal case. A machine that answered the ping is
+/// `probed`; anything wrong past that (old protocol, agent.list failing) goes
+/// in the error, and a failed agent.list never reads as zero agents.
+type ProbeFields = (
     &'static str,
     Option<String>,
     Option<u32>,
@@ -441,69 +456,142 @@ type MachineStatusRow = (
     Option<String>,
 );
 
-fn machine_status_row(
+fn probe_fields(
     ping: Result<pastor::herdr::Pong, pastor::herdr::CallError>,
     agent_count: Option<Result<usize, pastor::herdr::CallError>>,
-) -> MachineStatusRow {
+) -> ProbeFields {
     match ping {
         Ok(p) => {
-            let compatible = p.protocol >= pastor::MIN_HERDR_PROTOCOL;
-            match agent_count {
-                Some(Ok(n)) => (
-                    if compatible {
-                        "reachable"
-                    } else {
-                        "incompatible"
-                    },
-                    Some(p.version),
-                    Some(p.protocol),
-                    Some(n),
-                    if compatible {
-                        None
-                    } else {
-                        Some(format!(
-                            "protocol {} < {}",
-                            p.protocol,
-                            pastor::MIN_HERDR_PROTOCOL
-                        ))
-                    },
-                ),
-                Some(Err(e)) => (
-                    "error",
-                    Some(p.version),
-                    Some(p.protocol),
-                    None,
-                    Some(format!("agent.list: {e}")),
-                ),
-                // The caller always attempts agent.list once ping succeeds; treat a
-                // missing count the same as an agent.list failure rather than
-                // pretending the machine is reachable with zero agents.
-                None => (
-                    "error",
-                    Some(p.version),
-                    Some(p.protocol),
-                    None,
-                    Some("agent.list: not attempted".into()),
-                ),
-            }
+            let old_protocol = (p.protocol < pastor::MIN_HERDR_PROTOCOL)
+                .then(|| format!("protocol {} < {}", p.protocol, pastor::MIN_HERDR_PROTOCOL));
+            let (agents, error) = match agent_count {
+                Some(Ok(n)) => (Some(n), old_protocol),
+                Some(Err(e)) => (None, Some(format!("agent.list: {e}"))),
+                // The caller always attempts agent.list once ping succeeds.
+                None => (None, Some("agent.list: not attempted".into())),
+            };
+            ("probed", Some(p.version), Some(p.protocol), agents, error)
         }
-        Err(e) => {
-            let message = e.to_string();
-            (
-                if message.contains("herdr.sock") {
-                    "server down"
-                } else if e.is_transport() {
-                    "unreachable"
-                } else {
-                    "error"
-                },
-                None,
-                None,
-                None,
-                Some(message),
-            )
-        }
+        Err(e) => ("unreachable", None, None, None, Some(e.to_string())),
     }
+}
+
+/// One machine's row from a probe made here, without the head. Two ordinary
+/// calls, each on its own connection, exactly as the head makes them: herdr
+/// answers one request per connection.
+async fn probe_machine(m: &MachineConfig, paths: &Paths) -> pastor::cli::MachineRow {
+    let ep = Endpoint::from_machine(m, paths);
+    let ping = ep.ping().await;
+    let agent_count = match &ping {
+        Ok(_) => Some(ep.agent_list().await.map(|a| a.len())),
+        Err(_) => None,
+    };
+    let (channel, herdr_version, protocol, live, error) = probe_fields(ping, agent_count);
+    pastor::cli::MachineRow {
+        name: m.name.clone(),
+        host: ep.host(),
+        endpoint: ep.describe(),
+        channel: channel.into(),
+        herdr_version,
+        protocol,
+        error,
+        live,
+        max_agents: m.max_agents,
+        tags: m.tags.clone(),
+    }
+}
+
+/// The head's row: this machine's hostname and the herdr it has, if any. Read
+/// from the kernel and files rather than a new dependency for `gethostname`.
+fn head_row() -> pastor::cli::HeadRow {
+    let hostname = ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .find_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "-".into());
+    let herdr_version = std::process::Command::new("herdr")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| pastor::cli::herdr_version_from(&String::from_utf8_lossy(&o.stdout)));
+    pastor::cli::HeadRow::new(hostname, herdr_version)
+}
+
+/// `machine list`, and `machine status` narrowed to `only`. The head's view
+/// when it runs; otherwise a probe of each machine in flock.toml. The note that
+/// says so is printed only once everything worked, since a failure must leave
+/// exactly one JSON value on stderr.
+async fn machine_list(paths: &Paths, json: bool, only: Option<String>) -> anyhow::Result<()> {
+    let wanted = |name: &str| only.as_deref().is_none_or(|n| n == name);
+    let (rows, note) = if daemon_running(&paths.socket_file()).await {
+        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
+            unreachable!()
+        };
+        if let Some(n) = &only
+            && !ms.iter().any(|m| &m.name == n)
+        {
+            fail(
+                "unknown_machine",
+                &format!("machine {n} is not in the flock"),
+            );
+        }
+        let rows: Vec<pastor::cli::MachineRow> = ms
+            .iter()
+            .filter(|m| wanted(&m.name))
+            .map(pastor::cli::MachineRow::from)
+            .collect();
+        (rows, None)
+    } else {
+        let f = Flock::load(&paths.flock_file())?;
+        // A typo would otherwise filter every row out and print a table with
+        // exit 0; name it the way run, attach and open do.
+        if let Some(n) = &only
+            && f.get(n).is_none()
+        {
+            fail(
+                "unknown_machine",
+                &format!("machine {n} is not in the flock"),
+            );
+        }
+        // Connects without the head, so the state dir the ssh master sockets
+        // live under may not exist yet, and must be private.
+        paths.ensure()?;
+        let mut rows = Vec::new();
+        for m in f.machines.iter().filter(|m| wanted(&m.name)) {
+            rows.push(probe_machine(m, paths).await);
+        }
+        (
+            rows,
+            Some("pastor serve is not running; probed the machines directly"),
+        )
+    };
+    let head = head_row();
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&pastor::cli::machine_list_json(&head, &rows))?
+        );
+    } else {
+        println!(
+            "{}",
+            pastor::cli::table(
+                &pastor::cli::MACHINE_HEADER,
+                &pastor::cli::machine_rows(&head, &rows)
+            )
+        );
+    }
+    Ok(())
 }
 
 /// The states a task can be in while it still needs pastor or a human:
@@ -715,103 +803,10 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 }
             }
         }
-        MachineCmd::List { json } => {
-            let statuses: Vec<MachineStatus> = if daemon_running(&paths.socket_file()).await {
-                let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
-                    unreachable!()
-                };
-                ms
-            } else {
-                eprintln!(
-                    "no head is running (start one with `pastor serve`); showing the flock file only, nothing is connected"
-                );
-                Flock::load(&path)?
-                    .machines
-                    .iter()
-                    .map(|m| MachineStatus {
-                        name: m.name.clone(),
-                        endpoint: Endpoint::from_machine(m, paths).describe(),
-                        channel: ChannelState::Connecting,
-                        herdr_version: None,
-                        protocol: None,
-                        error: Some("no head running; start pastor serve".into()),
-                        live: 0,
-                        max_agents: m.max_agents,
-                        tags: m.tags.clone(),
-                    })
-                    .collect()
-            };
-            if json {
-                println!("{}", serde_json::to_string_pretty(&statuses)?);
-            } else {
-                println!(
-                    "{}",
-                    pastor::cli::table(
-                        &pastor::cli::MACHINE_HEADER,
-                        &pastor::cli::machine_rows(&statuses)
-                    )
-                );
-            }
-        }
+        MachineCmd::List { json } => machine_list(paths, json, None).await?,
         MachineCmd::Status { name, json } => {
-            let f = Flock::load(&path)?;
-            // A typo would otherwise filter every row out and print an empty
-            // table with exit 0; name it the way run, attach and open do.
-            if let Some(n) = &name
-                && f.get(n).is_none()
-            {
-                fail(
-                    "unknown_machine",
-                    &format!("machine {n} is not in the flock"),
-                );
-            }
-            // Connects without the daemon, so the state dir the ssh master
-            // sockets live under may not exist yet, and must be private.
-            paths.ensure()?;
-            let mut rows = Vec::new();
-            for m in f
-                .machines
-                .iter()
-                .filter(|m| name.as_ref().is_none_or(|n| &m.name == n))
-            {
-                let ep = Endpoint::from_machine(m, paths);
-                // Two ordinary calls, each on its own connection, exactly as the
-                // daemon makes them: herdr answers one request per connection.
-                let ping = ep.ping().await;
-                let agent_count = match &ping {
-                    Ok(_) => Some(ep.agent_list().await.map(|a| a.len())),
-                    Err(_) => None,
-                };
-                let (status, version, protocol, agents, error) =
-                    machine_status_row(ping, agent_count);
-                rows.push(serde_json::json!({"name": m.name, "endpoint": ep.describe(), "status": status, "herdr_version": version, "protocol": protocol, "agents": agents, "error": error}));
-            }
-            if json {
-                println!("{}", serde_json::to_string_pretty(&rows)?);
-            } else {
-                let table_rows: Vec<Vec<String>> = rows
-                    .iter()
-                    .map(|r| {
-                        vec![
-                            r["name"].as_str().unwrap_or("").into(),
-                            r["status"].as_str().unwrap_or("").into(),
-                            r["herdr_version"].as_str().unwrap_or("-").into(),
-                            r["agents"]
-                                .as_u64()
-                                .map(|n| n.to_string())
-                                .unwrap_or_else(|| "-".into()),
-                            r["error"].as_str().unwrap_or("").into(),
-                        ]
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    pastor::cli::table(
-                        &["NAME", "STATUS", "HERDR", "AGENTS", "ERROR"],
-                        &table_rows
-                    )
-                );
-            }
+            moved("machine status", "machine list");
+            machine_list(paths, json, name).await?
         }
     }
     Ok(())
@@ -1253,9 +1248,9 @@ mod tests {
 
     #[test]
     fn agent_list_failure_is_surfaced_not_hidden_as_zero_agents() {
-        let (status, version, protocol, agents, error) =
-            machine_status_row(Ok(pong()), Some(Err(agent_list_error())));
-        assert_eq!(status, "error");
+        let (channel, version, protocol, agents, error) =
+            probe_fields(Ok(pong()), Some(Err(agent_list_error())));
+        assert_eq!(channel, "probed", "herdr answered the ping");
         assert_eq!(version, Some("0.9.1".into()));
         assert_eq!(protocol, Some(pastor::MIN_HERDR_PROTOCOL));
         assert_eq!(agents, None, "agent count must show as absent, not zero");
@@ -1264,18 +1259,29 @@ mod tests {
     }
 
     #[test]
-    fn agent_list_success_still_reports_reachable() {
-        let (status, _, _, agents, error) = machine_status_row(Ok(pong()), Some(Ok(3)));
-        assert_eq!(status, "reachable");
+    fn agent_list_success_reads_as_probed() {
+        let (channel, _, _, agents, error) = probe_fields(Ok(pong()), Some(Ok(3)));
+        assert_eq!(channel, "probed");
         assert_eq!(agents, Some(3));
         assert_eq!(error, None);
     }
 
     #[test]
-    fn ping_failure_classification_is_unchanged() {
+    fn an_old_herdr_is_probed_with_the_protocol_as_its_error() {
+        let old = pastor::herdr::Pong {
+            version: "0.8.0".into(),
+            protocol: pastor::MIN_HERDR_PROTOCOL - 1,
+        };
+        let (channel, _, _, _, error) = probe_fields(Ok(old), Some(Ok(0)));
+        assert_eq!(channel, "probed");
+        assert!(error.unwrap().starts_with("protocol "));
+    }
+
+    #[test]
+    fn a_failed_ping_is_unreachable_with_the_reason() {
         let err = pastor::herdr::CallError::from(pastor::herdr::HerdrError::Closed);
-        let (status, version, protocol, agents, error) = machine_status_row(Err(err), None);
-        assert_eq!(status, "unreachable");
+        let (channel, version, protocol, agents, error) = probe_fields(Err(err), None);
+        assert_eq!(channel, "unreachable");
         assert_eq!(version, None);
         assert_eq!(protocol, None);
         assert_eq!(agents, None);

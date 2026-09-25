@@ -21,6 +21,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Event hooks: a plugin's `[[events]]` commands get each matching event on
   stdin, one plugin at a time in event order, from a bounded queue.
 
+- `pastor machine list` adds a HOST column (ssh target, `local`, or a command
+  machine's program) and a first row for the head itself, with its hostname
+  and local herdr version. `--json` is now `{"head": {...}, "machines": [...]}`
+  instead of a bare array.
+- Without `pastor serve`, `pastor machine list` probes each machine directly
+  instead of printing the flock file with no live data. `pastor machine status`
+  is folded into it and stays as a hidden alias.
+
 ### Changed
 
 - `pastor tick` under `pastor serve` spawns its runs, so a slow connector no

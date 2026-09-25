@@ -69,6 +69,10 @@ impl std::fmt::Display for ChannelState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineStatus {
     pub name: String,
+    /// `Connector::host`. Defaulted so a CLI can still read a head that
+    /// predates the field.
+    #[serde(default)]
+    pub host: String,
     pub endpoint: String,
     pub channel: ChannelState,
     pub herdr_version: Option<String>,
@@ -187,6 +191,7 @@ pub fn spawn_machine(
     let (tx, rx) = mpsc::channel(32);
     let status = Arc::new(RwLock::new(MachineStatus {
         name: name.clone(),
+        host: connector.host(),
         endpoint: connector.describe(),
         channel: ChannelState::Connecting,
         herdr_version: None,

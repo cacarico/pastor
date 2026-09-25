@@ -60,6 +60,25 @@ when it's not (`task list` says so on stderr); `task attach` always reads the st
 directly, since it only needs the task's machine and agent name to hand off
 to `ssh`/`herdr`.
 
+`pastor machine list` shows the head first, then each machine in the flock:
+
+```
+NAME    HOST        CHANNEL    HERDR  AGENTS  TAGS  ERROR
+pastor  darkbeat    head       0.9.1  -       -
+pi-3    fleet@pi-3  connected  0.9.1  1/2     fast
+```
+
+HOST is the ssh target, `local`, or the program a `command` machine runs.
+The head row carries this machine's hostname and the version of the `herdr`
+on its PATH (`-` when there is none); it is not a machine and takes no tasks.
+With `pastor serve` running, CHANNEL is the head's live channel state and
+AGENTS counts pastor's tasks against `max_agents`. Without it, the command
+probes each machine itself (a ping and an `agent.list`, one at a time, with no
+time limit), CHANNEL reads `probed` or `unreachable`, AGENTS counts every
+agent herdr reports, and stderr says so. `--json` prints
+`{"head": {...}, "machines": [...]}`. `pastor machine status` is the old
+spelling, kept as a hidden alias.
+
 Jobs are one TOML file each in `~/.config/pastor/jobs/`. On every `tick` the
 daemon re-reads files that changed (a file that stops parsing keeps its last
 good version and shows the error in `pastor job list`), asks each due job's
@@ -126,9 +145,10 @@ A record, which is also what plugin event hooks will get on stdin:
   that moment, on `task.*` events; `null` otherwise or if the row is gone.
 - `job`: the job name. For a task event it is the task's `job` (`run` for a
   one-off `pastor task run` task); for `job.failed`, the job that failed.
-- `machine`: on `machine.*` events, the machine's status as `pastor machine
-  list --json` shows it (`name`, `endpoint`, `channel`, `herdr_version`,
-  `protocol`, `error`, `live`, `max_agents`, `tags`); `null` on other events.
+- `machine`: on `machine.*` events, the machine's status as an entry of
+  `machines` in `pastor machine list --json` shows it (`name`, `host`,
+  `endpoint`, `channel`, `herdr_version`, `protocol`, `error`, `live`,
+  `max_agents`, `tags`); `null` on other events.
   A task's machine is `task.machine`.
 
 Fields may be added; none will be renamed or removed. Unreadable lines (a
@@ -147,7 +167,7 @@ ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
 make install                         # pastor and fake-herdr into ~/.cargo/bin
 pastor machine add pi-3 fleet@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
 pastor machine add here --local
-pastor machine status                  # ssh, herdr version, protocol
+pastor machine list                  # the head, then each machine: host, channel, herdr, agents
 pastor setup systemd                 # confirm, then install and enable --now; or `pastor serve &`
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
 pastor task run "Review the open PR" --agent-arg=--model --agent-arg=claude-opus-5-5

@@ -314,6 +314,16 @@ fn completions_offer_only_the_nested_spellings() {
     assert!(fish.contains("-f -a \"run\" -d 'Create a one-off task and dispatch it'"));
     assert!(bash.contains("pastor__subcmd__task,run)"));
     assert!(bash.contains("pastor__subcmd__job,reload)"));
+    // `machine status` is hidden one level down; it goes the same way.
+    assert!(
+        !bash.contains("pastor__subcmd__machine,status)"),
+        "bash knows machine status"
+    );
+    assert!(
+        !fish.contains("-f -a \"status\""),
+        "fish offers machine status"
+    );
+    assert!(bash.contains("pastor__subcmd__machine,list)"));
 }
 
 /// `pastor --skill` is how an agent on any machine gets the guide, so it must
@@ -447,20 +457,8 @@ fn machine_add_and_remove_edit_the_file() {
     );
     let out = run(&["machine", "add", "pi-3", "fleet@pi-3"]);
     assert!(!out.status.success());
-    let out = run(&["machine", "list"]);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("pi-3"));
-    // Without a head the table cannot know anything live; both the note and the
-    // ERROR column say so in pastor's own words rather than "daemon down".
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no head is running"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("no head running"),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
+    // `machine list` without a head probes over ssh, which this test must not
+    // do; `machine_list_without_daemon_probes_each_machine` covers it.
     let out = run(&["machine", "status", "pi-4"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
@@ -908,12 +906,12 @@ fn tick_without_daemon_queues_tasks_for_later() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("ok: 1 items, 1 tasks"));
 }
 
-/// `machine status` connects without the daemon, so nothing else has made the
+/// `machine list` without a head connects directly, so nothing else has made the
 /// state dir yet. The ssh ControlMaster socket directory must exist, private,
 /// before ssh starts. A fake `ssh` first on PATH records that it did and fails
 /// the way an unreachable host does, so no real ssh runs.
 #[test]
-fn machine_status_creates_the_ssh_dir_private_before_ssh_runs() {
+fn machine_list_without_daemon_creates_the_ssh_dir_private_before_ssh_runs() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
@@ -949,7 +947,7 @@ fn machine_status_creates_the_ssh_dir_private_before_ssh_runs() {
     );
     let _ = std::fs::remove_dir_all(&state);
 
-    let out = run(&["machine", "status", "--json"]);
+    let out = run(&["machine", "list", "--json"]);
     assert!(
         out.status.success(),
         "{}",
@@ -1093,4 +1091,180 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
 #[test]
 fn sighup_shuts_the_daemon_down_cleanly() {
     assert_daemon_shuts_down_cleanly_on("HUP");
+}
+
+/// With a head running, `machine list` starts with the head's own row and
+/// gives each machine its host; `--json` keeps the head out of `machines`.
+#[test]
+fn machine_list_shows_the_head_then_the_machines() {
+    let env = start();
+    let out = env.cmd(&["machine", "list"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<Vec<&str>> = stdout
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        lines[0],
+        [
+            "NAME", "HOST", "CHANNEL", "HERDR", "AGENTS", "TAGS", "ERROR"
+        ],
+        "{stdout}"
+    );
+    assert_eq!(lines[1][0], "pastor", "{stdout}");
+    assert_eq!(lines[1][2], "head", "{stdout}");
+    assert_eq!(&lines[1][4..], ["-", "-"], "{stdout}");
+    assert_eq!(
+        lines[2][..3],
+        ["fake", "fake-herdr", "connected"],
+        "{stdout}"
+    );
+    assert_eq!(lines[2][4], "0/2", "{stdout}");
+    assert_eq!(lines.len(), 3, "{stdout}");
+
+    let out = env.cmd(&["machine", "list", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["head"]["name"], "pastor");
+    assert_eq!(v["head"]["channel"], "head");
+    let ms = v["machines"].as_array().unwrap();
+    assert_eq!(ms.len(), 1, "{v}");
+    assert_eq!(ms[0]["name"], "fake");
+    assert_eq!(ms[0]["host"], "fake-herdr");
+    assert_eq!(ms[0]["channel"], "connected");
+
+    // The old spelling is the same command; the hint that says so is for a
+    // terminal only, and stderr here is a pipe.
+    let alias = env.cmd(&["machine", "status", "--json"]);
+    assert!(alias.status.success());
+    assert!(
+        alias.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let a: serde_json::Value = serde_json::from_slice(&alias.stdout).unwrap();
+    assert_eq!(a["machines"], v["machines"]);
+}
+
+/// With no head, `machine list` probes each machine itself: a reachable one
+/// reads `probed` with herdr's agent count, one that cannot be reached reads
+/// `unreachable` with the reason. The note goes to stderr only on success, so
+/// a failure still leaves exactly one JSON value there.
+#[test]
+fn machine_list_without_daemon_probes_each_machine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    let socket = tmp.path().join("herdr.sock");
+    // Killed on drop, so a failed assertion does not leave it running.
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _herdr = Server(
+        Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+            .arg("--listen")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "fake herdr never listened");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(
+        config.join("flock.toml"),
+        format!(
+            "[[machine]]\nname = \"fake\"\ncommand = [\"{}\", \"--connect\", \"{}\"]\nmax_agents = 2\ntags = [\"arm\"]\n\n\
+             [[machine]]\nname = \"gone\"\ncommand = [\"{}\"]\nmax_agents = 1\n",
+            env!("CARGO_BIN_EXE_fake-herdr"),
+            socket.display(),
+            tmp.path().join("no-such-bridge").display()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["machine", "list"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "pastor serve is not running; probed the machines directly"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<Vec<&str>> = stdout
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(lines[0][..3], ["NAME", "HOST", "CHANNEL"], "{stdout}");
+    assert_eq!(lines[1][0], "pastor", "{stdout}");
+    assert_eq!(lines[1][2], "head", "{stdout}");
+    assert_eq!(lines[2][..3], ["fake", "fake-herdr", "probed"], "{stdout}");
+    assert_eq!(&lines[2][4..], ["0/2", "arm"], "{stdout}");
+    assert_eq!(
+        lines[3][..3],
+        ["gone", "no-such-bridge", "unreachable"],
+        "{stdout}"
+    );
+    assert_eq!(lines[3][3..5], ["-", "-/1"], "{stdout}");
+    assert!(lines[3].len() > 6, "ERROR should say why: {stdout}");
+
+    // The same JSON shape as with a head.
+    let out = run(&["machine", "list", "--json"]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["head"]["name"], "pastor");
+    let ms = v["machines"].as_array().unwrap();
+    assert_eq!(ms.len(), 2, "{v}");
+    assert_eq!(ms[1]["name"], "gone");
+    assert_eq!(ms[1]["channel"], "unreachable");
+    assert!(ms[1]["error"].is_string(), "{v}");
+    assert_eq!(ms[0]["channel"], "probed");
+    assert_eq!(ms[0]["live"], 0);
+
+    // The hidden alias narrows to one machine and still refuses a typo with
+    // one JSON value on stderr and no note in front of it.
+    let out = run(&["machine", "status", "gone", "--json"]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["machines"].as_array().unwrap().len(), 1, "{v}");
+    let out = run(&["machine", "status", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr)
+        .unwrap_or_else(|e| panic!("stderr is not one JSON value ({e})"));
+    assert_eq!(err["code"], "unknown_machine");
+
+    std::fs::write(config.join("flock.toml"), "[[machine]\n").unwrap();
+    let out = run(&["machine", "list"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr)
+        .unwrap_or_else(|e| panic!("stderr is not one JSON value ({e})"));
+    assert!(err["code"].is_string(), "{err}");
 }

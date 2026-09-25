@@ -1,4 +1,5 @@
 use chrono::Utc;
+use serde::Serialize;
 
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
@@ -157,22 +158,123 @@ pub fn task_detail(t: &Task) -> String {
 
 pub const TASK_HEADER: [&str; 7] = ["ID", "STATE", "MACHINE", "AGENT", "JOB", "AGE", "NOTE"];
 
-pub fn machine_rows(ms: &[MachineStatus]) -> Vec<Vec<String>> {
-    ms.iter()
-        .map(|m| {
+/// The first row of `machine list`: the head itself. It runs no tasks, so it
+/// is not a machine and has no agents, tags or error of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeadRow {
+    pub name: String,
+    pub host: String,
+    pub channel: String,
+    pub herdr_version: Option<String>,
+}
+
+impl HeadRow {
+    pub fn new(host: String, herdr_version: Option<String>) -> HeadRow {
+        HeadRow {
+            name: "pastor".into(),
+            host,
+            channel: "head".into(),
+            herdr_version,
+        }
+    }
+}
+
+/// The version in `herdr --version` output (`herdr 0.9.1`).
+pub fn herdr_version_from(output: &str) -> Option<String> {
+    output
+        .lines()
+        .next()?
+        .split_whitespace()
+        .last()
+        .map(str::to_string)
+}
+
+/// One machine in `machine list`, from the head's live view or from a direct
+/// probe when no head runs. The fields and names are `MachineStatus`'s, so the
+/// JSON matches what the events log carries; `channel` is a plain string
+/// because a probe reports `probed` or `unreachable`, which no live channel
+/// is, and `live` is absent when a probe could not count the agents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineRow {
+    pub name: String,
+    pub host: String,
+    pub endpoint: String,
+    pub channel: String,
+    pub herdr_version: Option<String>,
+    pub protocol: Option<u32>,
+    pub error: Option<String>,
+    pub live: Option<usize>,
+    pub max_agents: u32,
+    pub tags: Vec<String>,
+}
+
+impl From<&MachineStatus> for MachineRow {
+    fn from(m: &MachineStatus) -> MachineRow {
+        MachineRow {
+            name: m.name.clone(),
+            host: m.host.clone(),
+            endpoint: m.endpoint.clone(),
+            channel: m.channel.to_string(),
+            herdr_version: m.herdr_version.clone(),
+            protocol: m.protocol,
+            error: m.error.clone(),
+            live: Some(m.live),
+            max_agents: m.max_agents,
+            tags: m.tags.clone(),
+        }
+    }
+}
+
+pub const MACHINE_HEADER: [&str; 7] = [
+    "NAME", "HOST", "CHANNEL", "HERDR", "AGENTS", "TAGS", "ERROR",
+];
+
+/// The head's row, then one per machine.
+pub fn machine_rows(head: &HeadRow, ms: &[MachineRow]) -> Vec<Vec<String>> {
+    let dash = || "-".to_string();
+    let head_row = vec![
+        head.name.clone(),
+        head.host.clone(),
+        head.channel.clone(),
+        head.herdr_version.clone().unwrap_or_else(dash),
+        dash(),
+        dash(),
+        String::new(),
+    ];
+    std::iter::once(head_row)
+        .chain(ms.iter().map(|m| {
             vec![
                 m.name.clone(),
-                m.channel.to_string(),
-                m.herdr_version.clone().unwrap_or_else(|| "-".into()),
-                format!("{}/{}", m.live, m.max_agents),
-                m.tags.join(","),
+                m.host.clone(),
+                m.channel.clone(),
+                m.herdr_version.clone().unwrap_or_else(dash),
+                format!(
+                    "{}/{}",
+                    m.live.map_or_else(dash, |n| n.to_string()),
+                    m.max_agents
+                ),
+                if m.tags.is_empty() {
+                    dash()
+                } else {
+                    m.tags.join(",")
+                },
                 m.error.clone().unwrap_or_default(),
             ]
-        })
+        }))
         .collect()
 }
 
-pub const MACHINE_HEADER: [&str; 6] = ["NAME", "CHANNEL", "HERDR", "AGENTS", "TAGS", "ERROR"];
+/// `machine list --json`: the head under its own key so `machines` holds
+/// machines only. A struct rather than `json!` so fields keep their order.
+#[derive(Debug, Serialize)]
+pub struct MachineList<'a> {
+    pub head: &'a HeadRow,
+    pub machines: &'a [MachineRow],
+}
+
+pub fn machine_list_json<'a>(head: &'a HeadRow, ms: &'a [MachineRow]) -> MachineList<'a> {
+    MachineList { head, machines: ms }
+}
 
 /// "in 4m" for the future, "12s ago" for the past, "now" within a second.
 pub fn in_(at: chrono::DateTime<Utc>) -> String {
@@ -268,6 +370,116 @@ mod tests {
             finished_at: None,
             updated_at: now,
         }
+    }
+
+    fn status(name: &str, host: &str) -> MachineStatus {
+        MachineStatus {
+            name: name.into(),
+            host: host.into(),
+            endpoint: format!("ssh {host} (session default)"),
+            channel: crate::machine::ChannelState::Connected,
+            herdr_version: Some("0.9.1".into()),
+            protocol: Some(22),
+            error: None,
+            live: 1,
+            max_agents: 3,
+            tags: vec!["fast".into(), "arm".into()],
+        }
+    }
+
+    fn head() -> HeadRow {
+        HeadRow::new("darkbeat".into(), Some("0.9.1".into()))
+    }
+
+    #[test]
+    fn machine_table_puts_the_head_first_then_each_machine_with_its_host() {
+        let rows: Vec<MachineRow> = [
+            status("pi-3", "fleet@pi-3"),
+            status("here", "local"),
+            status("fake", "fake-herdr"),
+        ]
+        .iter()
+        .map(MachineRow::from)
+        .collect();
+        let out = table(&MACHINE_HEADER, &machine_rows(&head(), &rows));
+        let lines: Vec<&str> = out.lines().collect();
+        let cells = |i: usize| lines[i].split_whitespace().collect::<Vec<_>>();
+        assert_eq!(
+            cells(0),
+            [
+                "NAME", "HOST", "CHANNEL", "HERDR", "AGENTS", "TAGS", "ERROR"
+            ]
+        );
+        assert_eq!(cells(1), ["pastor", "darkbeat", "head", "0.9.1", "-", "-"]);
+        assert_eq!(
+            cells(2),
+            [
+                "pi-3",
+                "fleet@pi-3",
+                "connected",
+                "0.9.1",
+                "1/3",
+                "fast,arm"
+            ]
+        );
+        assert_eq!(cells(3)[1], "local");
+        assert_eq!(cells(4)[1], "fake-herdr");
+    }
+
+    #[test]
+    fn a_probed_machine_without_a_count_shows_a_dash_and_its_error() {
+        let row = MachineRow {
+            channel: "unreachable".into(),
+            herdr_version: None,
+            live: None,
+            error: Some("no route to host".into()),
+            tags: vec![],
+            ..MachineRow::from(&status("pi-3", "fleet@pi-3"))
+        };
+        let head = HeadRow::new("darkbeat".into(), None);
+        let rows = machine_rows(&head, &[row]);
+        assert_eq!(rows[0][3], "-", "no herdr on the head reads as a dash");
+        assert_eq!(
+            rows[1],
+            [
+                "pi-3",
+                "fleet@pi-3",
+                "unreachable",
+                "-",
+                "-/3",
+                "-",
+                "no route to host"
+            ]
+        );
+    }
+
+    /// The head is not a machine: scripts that walk `machines` must not trip
+    /// over it, so it sits under its own key.
+    #[test]
+    fn machine_list_json_keeps_the_head_out_of_the_machines() {
+        let rows = vec![MachineRow::from(&status("pi-3", "fleet@pi-3"))];
+        let head = head();
+        let v = serde_json::to_value(machine_list_json(&head, &rows)).unwrap();
+        assert_eq!(v["head"]["name"], "pastor");
+        assert_eq!(v["head"]["host"], "darkbeat");
+        assert_eq!(v["head"]["channel"], "head");
+        assert_eq!(v["head"]["herdr_version"], "0.9.1");
+        let ms = v["machines"].as_array().unwrap();
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0]["name"], "pi-3");
+        assert_eq!(ms[0]["host"], "fleet@pi-3");
+        assert_eq!(ms[0]["channel"], "connected");
+        assert_eq!(ms[0]["live"], 1);
+        assert_eq!(ms[0]["max_agents"], 3);
+    }
+
+    #[test]
+    fn herdr_version_is_the_last_word_of_the_first_line() {
+        assert_eq!(
+            herdr_version_from("herdr 0.9.1\n").as_deref(),
+            Some("0.9.1")
+        );
+        assert_eq!(herdr_version_from("").as_deref(), None);
     }
 
     #[test]

@@ -503,6 +503,7 @@ mod tests {
             tx,
             status: Arc::new(RwLock::new(MachineStatus {
                 name: name.into(),
+                host: name.into(),
                 endpoint: format!("ssh {name}"),
                 channel,
                 herdr_version: Some("0.9.1".into()),
