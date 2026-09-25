@@ -584,7 +584,6 @@ impl Scheduler {
         fleet: Arc<Fleet>,
         events: broadcast::Sender<PastorEvent>,
     ) -> Scheduler {
-        let config_fingerprint = Some(file_fingerprint(&[paths.config_file(), paths.flock_file()]));
         Scheduler {
             paths,
             defaults: config.defaults.clone(),
@@ -603,7 +602,14 @@ impl Scheduler {
             first_seen: HashMap::new(),
             warned_queued: HashSet::new(),
             config: config.clone(),
-            config_fingerprint,
+            // No baseline: the caller (`Daemon::start`) already loaded and
+            // applied `config` and `fleet` from disk, but an edit can land in
+            // the window between that load and this constructor sampling a
+            // fingerprint. Starting empty makes the scheduler's own first
+            // pass always verify and apply whatever is on disk right now,
+            // instead of trusting a fingerprint that might already reflect
+            // an edit the caller never saw.
+            config_fingerprint: None,
         }
     }
 
@@ -2103,6 +2109,50 @@ mod tests {
         let d = s.reload_config(false).await.expect("flock.toml grew");
         assert_eq!(d.added, vec!["b".to_string()]);
         assert!(d.removed.is_empty() && d.retargeted.is_empty(), "{d:?}");
+    }
+
+    /// Copilot 4102376228: an edit that lands between `Daemon::start`'s own
+    /// load-and-apply and `Scheduler::new` sampling the fingerprint must not
+    /// be invisible to every later pass. `Scheduler::new` must start with no
+    /// fingerprint, so its own first `reload_config` call always verifies and
+    /// applies whatever is on disk right now.
+    #[tokio::test]
+    async fn a_startup_window_edit_is_not_skipped_by_the_first_pass() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(tmp.path().join("c")).unwrap();
+        std::fs::write(paths.config_file(), "tick = \"1s\"\n").unwrap();
+        std::fs::write(paths.flock_file(), FLOCK_A).unwrap();
+        let config = PastorConfig {
+            tick: "1s".into(),
+            ..Default::default()
+        };
+        let (events, _) = broadcast::channel(16);
+        let connect: crate::daemon::ConnectorFactory =
+            Arc::new(|_m: &crate::config::flock::MachineConfig| {
+                Arc::new(crate::herdr::fake::FakeHerdr::new()) as Arc<dyn crate::herdr::Connector>
+            });
+        let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
+        // `Daemon::start`'s own load and apply, exactly as it runs today,
+        // from what was on disk before the edit below.
+        let loaded = Flock::load(&paths.flock_file()).unwrap();
+        fleet.apply_flock(&loaded, &machine_settings(&config)).await;
+        assert!(fleet.get("a").is_some() && fleet.get("b").is_none());
+
+        // The startup-window race: flock.toml grows a second machine before
+        // `Scheduler::new` runs.
+        std::fs::write(paths.flock_file(), FLOCK_AB).unwrap();
+        let mut s = Scheduler::new(paths, &config, store.clone(), fleet.clone(), events);
+
+        // The scheduler's own first pass must still see and apply that edit,
+        // not read it as "nothing changed since the caller already applied it".
+        let d = s
+            .reload_config(false)
+            .await
+            .expect("an edit made before the scheduler was built must not be invisible");
+        assert_eq!(d.added, vec!["b".to_string()]);
+        assert!(fleet.get("b").is_some());
     }
 
     /// Review Focus 1: a flock.toml that stops loading while the daemon runs
