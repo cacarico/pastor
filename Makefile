@@ -63,13 +63,15 @@ install: ## install pastor and fake-herdr into ~/.cargo/bin, with bash and fish 
 # PASTOR_BIN overrides the binary run (for testing against a debug build
 # without touching the installed one).
 install-completions:
-	@bin="$${PASTOR_BIN:-$${CARGO_HOME:-$$HOME/.cargo}/bin/pastor}"; \
+	@set -e; bin="$${PASTOR_BIN:-$${CARGO_HOME:-$$HOME/.cargo}/bin/pastor}"; \
 	fish_dir="$${XDG_CONFIG_HOME:-$$HOME/.config}/fish/completions"; \
 	bash_dir="$${XDG_DATA_HOME:-$$HOME/.local/share}/bash-completion/completions"; \
 	mkdir -p "$$fish_dir" "$$bash_dir"; \
-	"$$bin" completions fish > "$$fish_dir/pastor.fish"; \
+	"$$bin" completions fish > "$$fish_dir/pastor.fish.tmp"; \
+	mv "$$fish_dir/pastor.fish.tmp" "$$fish_dir/pastor.fish"; \
 	echo "wrote $$fish_dir/pastor.fish"; \
-	"$$bin" completions bash > "$$bash_dir/pastor"; \
+	"$$bin" completions bash > "$$bash_dir/pastor.tmp"; \
+	mv "$$bash_dir/pastor.tmp" "$$bash_dir/pastor"; \
 	echo "wrote $$bash_dir/pastor"
 
 # Records docs/demo/*.gif with vhs (https://github.com/charmbracelet/vhs; needs
