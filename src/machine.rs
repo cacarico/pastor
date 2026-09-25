@@ -829,8 +829,8 @@ impl Actor {
         Ok(())
     }
 
-    /// Send the prompt herdr refused at dispatch (see `Task::prompt_pending`)
-    /// once the agent has left `blocked`. Returns whether it dealt with
+    /// Send the prompt the agent has not seen yet (see `Task::prompt_pending`)
+    /// once it has left `blocked` or its launch. Returns whether it dealt with
     /// `status`; `false` leaves the observation to the usual state machine.
     ///
     /// Without this, a human who clears the agent's startup question sees the
@@ -871,9 +871,7 @@ impl Actor {
             Err(err) if err.is_transport() => return Err(err.into()),
             Err(err) => {
                 task.state = TaskState::Failed;
-                task.error = Some(format!(
-                    "could not send the prompt after the block cleared: {err}"
-                ));
+                task.error = Some(format!("could not send the pending prompt: {err}"));
                 task.finished_at = Some(Utc::now());
             }
         }
@@ -1009,6 +1007,13 @@ impl Actor {
                         // count from now: only work seen after adoption completes it.
                         // An agent that had already finished is left to go stale.
                         t.last_completion_seq = Some(agent.state_change_seq);
+                        // Still launching, it cannot have taken the prompt: its launch
+                        // ending moves the sequence past the baseline above, which
+                        // must not read as this task done. The pending delivery sends
+                        // the prompt once it is ready and resets the baseline.
+                        if agent.launch_pending {
+                            t.prompt_pending = true;
+                        }
                         let idle_like = matches!(
                             agent.agent_status,
                             crate::herdr::AgentStatus::Idle | crate::herdr::AgentStatus::Done
@@ -1922,6 +1927,77 @@ mod tests {
             TaskState::Running,
             "done waits for the settle window"
         );
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// A crash can leave a `Starting` row whose agent is still launching:
+    /// `agent.list` shows it `launch_pending`, so dispatch never sent it the
+    /// prompt. Adoption must keep that delivery pending. When the launch ends
+    /// the agent goes idle at a newer `state_change_seq` than the one adopted;
+    /// that is its startup, not this task's work, so the task is not done:
+    /// the prompt is sent then, and only idle past the prompt reply's sequence
+    /// completes it.
+    #[tokio::test]
+    async fn reconcile_keeps_the_prompt_pending_for_a_launching_agent() {
+        let fake = FakeHerdr::new();
+        let ready_after = Duration::from_millis(600);
+        fake.set_ready_after(ready_after);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut t = new_task(&store);
+        let name = Task::agent_name_for(t.id);
+        let created = fake.workspace_create(None, &name).await.unwrap();
+        let pane = created.root_pane.pane_id.clone();
+        fake.agent_start(&name, "claude", &pane, &[]).await.unwrap();
+        let launched = Instant::now();
+        // As herdr has it: nothing detected while launching, so the end of the
+        // launch (unknown -> idle) is a state change with a new sequence.
+        fake.set_status_silently(&pane, AgentStatus::Unknown);
+        t.state = TaskState::Starting;
+        t.machine = Some("m".into());
+        store.update_task(&mut t).unwrap();
+        let (_h, mut events) = spawn(&fake, &store);
+        let prompts = || {
+            fake.requests()
+                .iter()
+                .filter(|r| r.method == "agent.prompt")
+                .count()
+        };
+
+        wait_for("adopted", || {
+            store.get_task(t.id).unwrap().unwrap().pane_id.is_some()
+        })
+        .await;
+        assert!(
+            launched.elapsed() < ready_after,
+            "adopted while the agent was still launching"
+        );
+        assert!(
+            store.get_task(t.id).unwrap().unwrap().prompt_pending,
+            "a launch-pending agent has not seen the prompt"
+        );
+
+        tokio::time::sleep(ready_after.saturating_sub(launched.elapsed())).await;
+        assert_eq!(prompts(), 0, "nothing is sent before the agent is ready");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("running with the prompt sent", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Running && !t.prompt_pending
+        })
+        .await;
+        assert_eq!(prompts(), 1, "the prompt is sent once, after the launch");
+        let got = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            got.last_completion_seq,
+            Some(fake.agents()[0].state_change_seq),
+            "the baseline is the prompt reply's sequence"
+        );
+
+        // Well past settle and a reconcile: the agent is working, not done.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert!(!saw(&mut events, "task.done", t.id));
+
+        fake.set_status(&pane, AgentStatus::Idle);
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
     }
 

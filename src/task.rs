@@ -112,8 +112,9 @@ pub struct Task {
     /// which has no `completion_seq`; the column is kept to keep the schema.
     /// `None` on rows written before this was recorded, read as 0.
     pub last_completion_seq: Option<u64>,
-    /// herdr refused the prompt at dispatch with `agent_blocked`, so the agent
-    /// has never seen it. The machine sends it once the agent leaves `blocked`.
+    /// The agent has never seen the prompt: herdr refused it at dispatch with
+    /// `agent_blocked`, or reconcile adopted the agent while it was still
+    /// launching. The machine sends it once the agent is past both.
     #[serde(default)]
     pub prompt_pending: bool,
     pub created_at: DateTime<Utc>,
