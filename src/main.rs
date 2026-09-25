@@ -652,9 +652,17 @@ fn list_empty_hint(a: &ListArgs) -> Option<&'static str> {
         .then_some("no live tasks; pastor task list --all shows finished ones")
 }
 
+/// Whether `pastor task list` prints orphan lines. An orphan has no row, so
+/// no state and no job: a view narrowed to a state (`--blocked`, `--done`)
+/// or a job cannot select one. `--machine` still applies, to the orphans too.
+fn list_shows_orphans(a: &ListArgs) -> bool {
+    !a.blocked && !a.done && a.job.is_none()
+}
+
 async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
     let states = list_states(&a);
     let hint = list_empty_hint(&a);
+    let show_orphans = list_shows_orphans(&a);
     let filter = TaskFilter {
         job: a.job,
         machine: a.machine.clone(),
@@ -691,7 +699,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
     // Orphans have no row to list, so they get a line each under the table.
     // Only a running head knows them (its last reconcile); `--json` stays a
     // plain task array, and `machine list --json` carries them instead.
-    if daemon_up && !a.json {
+    if daemon_up && !a.json && show_orphans {
         let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
             unreachable!()
         };
@@ -1216,6 +1224,26 @@ mod tests {
             assert!(!message.contains("not running"), "{kind:?}: {message}");
             assert!(!message.contains("start it"), "{kind:?}: {message}");
             assert!(message.contains("could not connect"), "{kind:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn orphans_show_only_when_state_and_job_are_not_filtered() {
+        for argv in [
+            &[][..],
+            &["--all"],
+            &["--machine", "a"],
+            &["--all", "--machine", "a"],
+        ] {
+            assert!(list_shows_orphans(&list_args(argv)), "{argv:?}");
+        }
+        for argv in [
+            &["--blocked"][..],
+            &["--done"],
+            &["--job", "j"],
+            &["--all", "--job", "j"],
+        ] {
+            assert!(!list_shows_orphans(&list_args(argv)), "{argv:?}");
         }
     }
 

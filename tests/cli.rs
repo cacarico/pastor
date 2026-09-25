@@ -1566,6 +1566,19 @@ fn task_retry_close_and_prune_end_to_end() {
         serde_json::json!(["t-1"]),
         "{status}"
     );
+    // An orphan has no row, so no state or job: a view narrowed by either
+    // leaves it out, and --all keeps it.
+    for args in [
+        &["list", "--done"][..],
+        &["list", "--blocked"],
+        &["list", "--job", "run"],
+    ] {
+        let out = env.cmd(args);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(!text.contains("orphan"), "{args:?}: {text}");
+    }
+    let all = env.cmd(&["list", "--all"]);
+    assert!(String::from_utf8_lossy(&all.stdout).contains("orphan"));
 
     let closed = env.json(&["task", "close", "t-1", "--json"]);
     assert_eq!(closed["state"], "closed");

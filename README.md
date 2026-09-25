@@ -155,7 +155,8 @@ An agent named like a task (`t-N`) that no open task owns is an orphan: a
 dispatch that failed after the agent started, a daemon killed mid-dispatch, a
 failed task whose agent never exited, a pruned row. Orphans still hold a pane,
 so they count toward `max_agents`. `pastor task list` prints a line for each under
-its table, `machine list` names them in an ORPHANS column,
+its table, unless `--blocked`, `--done` or `--job` narrows it (an orphan has no
+state or job; `--machine` still applies), `machine list` names them in an ORPHANS column,
 and `pastor task close t-N` closes one, with or without a row. pastor finds
 them when it reconciles (every `reconcile_every`). It assumes it is the only
 pastor naming agents `t-N` on each herdr.
