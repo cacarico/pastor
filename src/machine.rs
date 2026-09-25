@@ -1829,21 +1829,30 @@ impl Actor {
         // outcome. A row closed or failed meanwhile is left as it is.
         let still_pending = |t: &Task| t.prompt_pending && t.state.occupies_pane();
         let written = match result {
-            Ok(agent) => write_task(&self.store, task, |t| {
-                if !still_pending(t) {
-                    return false;
+            Ok(agent) => {
+                let written = write_task(&self.store, task, |t| {
+                    if !still_pending(t) {
+                        return false;
+                    }
+                    t.prompt_pending = false;
+                    t.state = TaskState::Running;
+                    t.error = None;
+                    t.finished_at = None;
+                    // State changes before the agent had our prompt (its launch,
+                    // its startup question) are not this task's work: count from here.
+                    t.last_completion_seq = Some(agent.state_change_seq);
+                    // Set on the fresh row too: a re-read row never carries it.
+                    t.activity_seen = agent.agent_status.is_activity();
+                    true
+                })?;
+                // `status` was what the prompt went in on, typically idle; the
+                // reply is newer. Without it, an exit before the next event (or
+                // any time while polling) would read as between turns.
+                if written.is_some() {
+                    self.note_status(id, agent.agent_status);
                 }
-                t.prompt_pending = false;
-                t.state = TaskState::Running;
-                t.error = None;
-                t.finished_at = None;
-                // State changes before the agent had our prompt (its launch,
-                // its startup question) are not this task's work: count from here.
-                t.last_completion_seq = Some(agent.state_change_seq);
-                // Set on the fresh row too: a re-read row never carries it.
-                t.activity_seen = agent.agent_status.is_activity();
-                true
-            })?,
+                written
+            }
             // Blocked again, or between states: the next status event or
             // reconcile tries again.
             Err(err) if matches!(err.code(), Some("agent_blocked" | "agent_not_ready")) => {
@@ -4476,6 +4485,68 @@ mod tests {
             store.get_task(t.id).unwrap().unwrap().error.as_deref(),
             Some("agent process exited")
         );
+    }
+
+    /// The pending prompt goes in on an `idle` sighting, and herdr answers
+    /// that the agent is working on it. Without an event stream nothing else
+    /// tells the actor, so the reply itself must: an exit after it is an exit
+    /// while working, a failure, not the end of work that was done.
+    #[tokio::test]
+    async fn an_exit_after_the_pending_prompt_went_in_is_not_an_idle_completion() {
+        let fake = FakeHerdr::new();
+        fake.set_ready_after(Duration::from_millis(150));
+        let watcher = fake.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(a) = watcher.agents().first() {
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, _rx) = broadcast::channel(64);
+        let mut settings = settings();
+        settings.poll_every = Duration::from_millis(50);
+        let h = spawn_machine(
+            "m".into(),
+            2,
+            vec![],
+            Arc::new(FlakyEvents {
+                subscribes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail_until: usize::MAX,
+                wedge_forever: false,
+                slow_ack: None,
+                fake: fake.clone(),
+            }),
+            store.clone(),
+            settings,
+            events,
+        );
+        wait_for("polling", || h.snapshot().channel == ChannelState::Polling).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(t.prompt_pending);
+        let pane = t.pane_id.clone().unwrap();
+
+        fake.set_status_silently(&pane, AgentStatus::Idle);
+        wait_for("running with the prompt sent", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Running && !t.prompt_pending
+        })
+        .await;
+        assert_eq!(fake.agents()[0].agent_status, AgentStatus::Working);
+
+        fake.exit_pane(&pane);
+        wait_for("failed", || {
+            matches!(
+                state_of(&store, t.id),
+                TaskState::Failed | TaskState::Done | TaskState::Closed
+            )
+        })
+        .await;
+        assert_eq!(state_of(&store, t.id), TaskState::Failed);
     }
 
     /// The dogfooding bug: the agent worked, finished and sat idle waiting
