@@ -29,7 +29,8 @@ complete -c pastor -n "__fish_pastor_needs_command" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_needs_command" -s V -l version -d 'Print version'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "serve" -d 'Run the daemon: scheduler, machine channels, dispatch'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "task" -d 'Manage tasks'
-complete -c pastor -n "__fish_pastor_needs_command" -f -a "machine" -d 'Manage the machines in the flock'
+complete -c pastor -n "__fish_pastor_needs_command" -f -a "machine" -d 'Manage the machines and which flock each is in'
+complete -c pastor -n "__fish_pastor_needs_command" -f -a "flock" -d 'Manage the flocks: named groups of machines that tasks and jobs target'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "open" -d 'Open the full herdr UI on a machine'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "tick" -d 'Run one scheduler pass now and report what it did'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "job" -d 'Manage jobs (files in ~/.config/pastor/jobs/)'
@@ -39,17 +40,19 @@ complete -c pastor -n "__fish_pastor_needs_command" -f -a "setup" -d 'Install pa
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "plugin" -d 'Install, link, list and try out plugins'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand serve" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "run" -d 'Create a one-off task and dispatch it'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "show" -d 'Show one task row'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "read" -d 'Read recent output from a task\'s pane'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "run" -d 'Create a one-off task and dispatch it'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "show" -d 'Show one task row'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "read" -d 'Read recent output from a task\'s pane'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l repo -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l flock -d 'Only this flock\'s machines take the task (default: the flock of --machine, else the default flock)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l machine -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l agent -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l agent-arg -d 'One argument for the agent; repeat it, in order, for more. Replaces `[defaults] agent_args`. The next word is always the value, dashes and all' -r
@@ -60,6 +63,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l json
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l job -d 'Only tasks from this job (omit for one-off `run` tasks)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l flock -d 'Only tasks of this flock' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l machine -d 'Only tasks on this machine' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l blocked -d 'Only blocked tasks, needing a human'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l done -d 'Only done tasks'
@@ -82,6 +86,10 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l closed -d 'Prune closed tasks'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -l json
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from prune" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l key -d 'A named key to press after the text (Enter, Down, esc, ctrl+c); repeat for more, in order' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l no-enter -d 'Type the text without pressing Enter after it'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "run" -d 'Create a one-off task and dispatch it'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "show" -d 'Show one task row'
@@ -90,27 +98,50 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove list help" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove list help" -f -a "add"
-complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove list help" -f -a "remove"
-complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove list help" -f -a "list" -d 'The head, then each machine: host, channel, herdr, agents'
-complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove list help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list help" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list help" -f -a "add"
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list help" -f -a "remove"
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list help" -f -a "move" -d 'Put a machine in another flock; tasks already on it stay there'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list help" -f -a "list" -d 'A line about the head, then each machine: host, flock, channel, herdr, agents'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l command -d 'Developer option: the bridge command as one string, split on whitespace (`--command "fake-herdr --connect /tmp/h.sock"`). Words containing spaces go in flock.toml by hand' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l session -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l max-agents -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l tag -r
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l flock -d 'The flock it joins (default: the default flock)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l local
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l herdr -d 'Also save it in herdr\'s sidebar (runs `herdr machine add`)'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from remove" -l herdr -d 'Also remove herdr\'s saved machine with this label'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from remove" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from move" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from list" -l flock -d 'Only the machines of this flock' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from list" -l json
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "add"
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "remove"
-complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "list" -d 'The head, then each machine: host, channel, herdr, agents'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "move" -d 'Put a machine in another flock; tasks already on it stay there'
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "list" -d 'A line about the head, then each machine: host, flock, channel, herdr, agents'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add remove default help" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add remove default help" -f -a "list" -d 'Every flock: default or not, its machines, live agents, queued tasks'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add remove default help" -f -a "add" -d 'Declare a flock; with --default, new tasks and jobs go to it'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add remove default help" -f -a "remove" -d 'Remove a flock; refused while it has machines or queued tasks, or is the default'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add remove default help" -f -a "default" -d 'Make another flock the default; machines stay in their flocks'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add remove default help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from list" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from add" -l default
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from add" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from remove" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from default" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from help" -f -a "list" -d 'Every flock: default or not, its machines, live agents, queued tasks'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from help" -f -a "add" -d 'Declare a flock; with --default, new tasks and jobs go to it'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from help" -f -a "remove" -d 'Remove a flock; refused while it has machines or queued tasks, or is the default'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from help" -f -a "default" -d 'Make another flock the default; machines stay in their flocks'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand open" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand tick" -l job -d 'Only this job, and run it whether or not it is due' -r
 complete -c pastor -n "__fish_pastor_using_subcommand tick" -l dry-run -d 'Run connectors and show what would be created; write nothing'
@@ -178,17 +209,18 @@ complete -c pastor -n "__fish_pastor_using_subcommand plugin; and __fish_seen_su
 complete -c pastor -n "__fish_pastor_using_subcommand plugin; and __fish_seen_subcommand_from help" -f -a "list" -d 'List plugins: version, connector, hooks, missing secrets'
 complete -c pastor -n "__fish_pastor_using_subcommand plugin; and __fish_seen_subcommand_from help" -f -a "run" -d 'Run a plugin\'s connector once for a job and print its items; creates no tasks and saves no cursor'
 complete -c pastor -n "__fish_pastor_using_subcommand plugin; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "serve" -d 'Run the daemon: scheduler, machine channels, dispatch'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "task" -d 'Manage tasks'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "machine" -d 'Manage the machines in the flock'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "open" -d 'Open the full herdr UI on a machine'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "tick" -d 'Run one scheduler pass now and report what it did'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "job" -d 'Manage jobs (files in ~/.config/pastor/jobs/)'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "completions" -d 'Print a shell completion script (fish, bash, zsh, ...) to stdout'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "events" -d 'Show the events log (task, job and machine events)'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "setup" -d 'Install pastor or herdr as a systemd user service'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "plugin" -d 'Install, link, list and try out plugins'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine open tick job completions events setup plugin help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "serve" -d 'Run the daemon: scheduler, machine channels, dispatch'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "task" -d 'Manage tasks'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "machine" -d 'Manage the machines and which flock each is in'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "flock" -d 'Manage the flocks: named groups of machines that tasks and jobs target'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "open" -d 'Open the full herdr UI on a machine'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "tick" -d 'Run one scheduler pass now and report what it did'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "job" -d 'Manage jobs (files in ~/.config/pastor/jobs/)'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "completions" -d 'Print a shell completion script (fish, bash, zsh, ...) to stdout'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "events" -d 'Show the events log (task, job and machine events)'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "setup" -d 'Install pastor or herdr as a systemd user service'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "plugin" -d 'Install, link, list and try out plugins'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock open tick job completions events setup plugin help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "run" -d 'Create a one-off task and dispatch it'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "show" -d 'Show one task row'
@@ -197,9 +229,15 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "add"
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "remove"
-complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "list" -d 'The head, then each machine: host, channel, herdr, agents'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "move" -d 'Put a machine in another flock; tasks already on it stay there'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "list" -d 'A line about the head, then each machine: host, flock, channel, herdr, agents'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "list" -d 'Every flock: default or not, its machines, live agents, queued tasks'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "add" -d 'Declare a flock; with --default, new tasks and jobs go to it'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "remove" -d 'Remove a flock; refused while it has machines or queued tasks, or is the default'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "default" -d 'Make another flock the default; machines stay in their flocks'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "enable" -d 'Enable a job file'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "disable" -d 'Disable a job file'

@@ -46,6 +46,7 @@ fn task(id: i64) -> Task {
 
 fn record(kind: &str, t: Option<&Task>, job: Option<&str>) -> EventRecord {
     EventRecord {
+        detail: None,
         at: Utc::now(),
         kind: kind.into(),
         task: t.cloned(),

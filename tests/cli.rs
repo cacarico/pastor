@@ -2042,3 +2042,76 @@ fn a_task_waits_for_its_flock_end_to_end() {
         "unknown_flock"
     );
 }
+
+/// The params of every request for `method` the fake herdr has received.
+fn herdr_calls(env: &Env, method: &str) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(&env.herdr_log).unwrap_or_default();
+    serde_json::from_str::<Vec<serde_json::Value>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r["method"] == method)
+        .map(|r| r["params"].clone())
+        .collect()
+}
+
+#[test]
+fn task_send_types_into_a_live_task_and_refuses_a_finished_one() {
+    let env = start();
+    let out = env.cmd(&["task", "run", "hi", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let pane = task["pane_id"].clone();
+
+    let out = env.cmd(&["task", "send", "t-1", "go on"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = env.cmd(&["task", "send", "t-1", "--key", "esc", "--key", "Down"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = env.cmd(&["task", "send", "t-1", "draft", "--no-enter"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        herdr_calls(&env, "pane.send_text"),
+        vec![
+            serde_json::json!({"pane_id": pane, "text": "go on"}),
+            serde_json::json!({"pane_id": pane, "text": "draft"}),
+        ]
+    );
+    assert_eq!(
+        herdr_calls(&env, "pane.send_keys"),
+        vec![
+            serde_json::json!({"pane_id": pane, "keys": ["Enter"]}),
+            serde_json::json!({"pane_id": pane, "keys": ["esc", "Down"]}),
+        ]
+    );
+    // The events log has the input, never the text.
+    let log = std::fs::read_to_string(env.state.join("events.jsonl")).unwrap();
+    assert!(log.contains("task.input"), "{log}");
+    assert!(!log.contains("go on") && !log.contains("draft"), "{log}");
+
+    // Usage: nothing to send, or --no-enter without text.
+    let out = env.cmd(&["task", "send", "t-1"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = env.cmd(&["task", "send", "t-1", "--key", "Enter", "--no-enter"]);
+    assert_eq!(out.status.code(), Some(2));
+
+    env.wait_done("t-1");
+    let out = env.cmd(&["task", "send", "t-1", "more"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["code"], "task_not_live", "{err}");
+}

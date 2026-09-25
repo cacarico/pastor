@@ -307,6 +307,7 @@ pub async fn run_job(
                     tracing::error!(job = %job.name, %e, "save job state");
                 }
                 let _ = events.send(PastorEvent {
+                    detail: None,
                     kind: "job.failed".into(),
                     task_id: None,
                     machine: None,
@@ -366,6 +367,7 @@ pub async fn run_job(
             Ok(t) => {
                 tracing::info!(job = %job.name, task = %t.display_id(), key = %item.key, "task queued");
                 let _ = events.send(PastorEvent {
+                    detail: None,
                     kind: "task.queued".into(),
                     task_id: Some(t.id),
                     machine: None,

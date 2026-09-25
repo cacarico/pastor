@@ -197,6 +197,10 @@ pub struct PastorEvent {
     pub machine: Option<String>,
     #[serde(default)]
     pub job: Option<String>,
+    /// What the event carries beyond its ids: for `task.input`, the key
+    /// names sent and the length of any text, never the text itself.
+    #[serde(default)]
+    pub detail: Option<serde_json::Value>,
 }
 
 pub enum MachineCommand {
@@ -218,6 +222,62 @@ pub enum MachineCommand {
         remove_worktree: bool,
         reply: oneshot::Sender<anyhow::Result<Task>>,
     },
+    /// `pastor task send`: type into the pane of a live task (starting with
+    /// a pane, running or blocked). Replies with the row as it was sent to.
+    Send {
+        task_id: i64,
+        input: SendInput,
+        reply: oneshot::Sender<anyhow::Result<Task>>,
+    },
+}
+
+/// What `pastor task send` types into a task's pane: `text` first, then
+/// Enter if `enter`, then each of `keys` in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendInput {
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Press Enter after `text`. Ignored without text.
+    #[serde(default)]
+    pub enter: bool,
+    /// Named keys (`Enter`, `Down`, `esc`, `ctrl+c`), pressed after the text.
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+impl SendInput {
+    /// The keys pressed, in order: Enter after text if asked, then `keys`.
+    pub fn key_sequence(&self) -> Vec<String> {
+        let enter = (self.text.is_some() && self.enter).then(|| "Enter".to_string());
+        enter.into_iter().chain(self.keys.iter().cloned()).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_none() && self.keys.is_empty()
+    }
+
+    /// What `task.input` records: the key names and the length of the text,
+    /// never the text, which may hold a secret.
+    pub fn detail(&self) -> serde_json::Value {
+        let mut d = serde_json::Map::new();
+        if let Some(text) = &self.text {
+            d.insert("text_len".into(), text.chars().count().into());
+        }
+        let keys = self.key_sequence();
+        if !keys.is_empty() {
+            d.insert("keys".into(), keys.into());
+        }
+        d.into()
+    }
+}
+
+/// `Send` refused before it typed anything, for a reason the CLI reports
+/// under its own code (`task_not_live`, ...).
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct SendRefused {
+    pub code: &'static str,
+    pub message: String,
 }
 
 /// `Close` found no task row, only an orphaned agent by that name, and closed
@@ -358,6 +418,16 @@ impl MachineHandle {
         self.request(cmd, rx).await
     }
 
+    pub async fn send(&self, task_id: i64, input: SendInput) -> anyhow::Result<Task> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = MachineCommand::Send {
+            task_id,
+            input,
+            reply,
+        };
+        self.request(cmd, rx).await
+    }
+
     /// Send `cmd` and wait for its reply, or fail with `ActorStopped` once
     /// `shutdown` has begun. An aborted actor stuck in a poll neither reads
     /// the queue nor drops it, so without this a request sent just before
@@ -478,6 +548,26 @@ struct Actor {
     /// Orphaned agents from the last reconcile, as (agent name, pane id).
     /// See `MachineStatus::orphans`.
     orphans: Vec<(String, String)>,
+}
+
+/// The pane of `task` if it is live on `machine`: starting with a pane
+/// already, running or blocked. Anything else has no agent to type into.
+fn live_pane(task: &Task, machine: &str) -> Result<String, SendRefused> {
+    let live = matches!(
+        task.state,
+        TaskState::Starting | TaskState::Running | TaskState::Blocked
+    );
+    match (&task.pane_id, task.machine.as_deref()) {
+        (Some(pane), Some(m)) if live && m == machine => Ok(pane.clone()),
+        _ => Err(SendRefused {
+            code: "task_not_live",
+            message: format!(
+                "{} is {}; only a starting, running or blocked task with a pane takes input",
+                task.display_id(),
+                task.state
+            ),
+        }),
+    }
 }
 
 /// Agents named `t-<id>` that none of `owned` (the pane-owning tasks on the
@@ -810,6 +900,7 @@ impl Actor {
                     Some(MachineCommand::Dispatch { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Read { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Close { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::Send { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                 },
             }
         }
@@ -844,6 +935,11 @@ impl Actor {
     /// own. A row that cannot be read leaves `job` empty rather than dropping
     /// the event.
     fn emit(&self, kind: &str, task_id: Option<i64>) {
+        self.emit_with(kind, task_id, None);
+    }
+
+    /// `emit` with a `PastorEvent::detail`.
+    fn emit_with(&self, kind: &str, task_id: Option<i64>, detail: Option<serde_json::Value>) {
         let job = task_id.and_then(|id| match self.store.get_task(id) {
             Ok(t) => t.map(|t| t.job),
             Err(err) => {
@@ -853,6 +949,7 @@ impl Actor {
         });
         tracing::info!(machine = %self.name, kind, ?task_id, ?job, "event");
         let _ = self.events.send(PastorEvent {
+            detail,
             kind: kind.into(),
             task_id,
             machine: Some(self.name.clone()),
@@ -1039,6 +1136,19 @@ impl Actor {
                     CommandOutcome::Nothing
                 }
             }
+            MachineCommand::Send {
+                task_id,
+                input,
+                reply,
+            } => {
+                let (result, dead) = self.run_send(task_id, input).await;
+                let _ = reply.send(result);
+                if dead {
+                    CommandOutcome::Reconnect
+                } else {
+                    CommandOutcome::Nothing
+                }
+            }
             MachineCommand::Read {
                 task_id,
                 lines,
@@ -1087,6 +1197,56 @@ impl Actor {
                 }
             }
         }
+    }
+
+    /// `MachineCommand::Send`: the text, then the keys, into the task's pane,
+    /// and a `task.input` event that records what was sent but not the text.
+    /// Reports whether a request failed below the API, like `run_dispatch`.
+    async fn run_send(&mut self, task_id: i64, input: SendInput) -> (anyhow::Result<Task>, bool) {
+        let task = match self.store.get_task(task_id) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                let err = SendRefused {
+                    code: "task_not_found",
+                    message: format!("t-{task_id} not found"),
+                };
+                return (Err(err.into()), false);
+            }
+            Err(err) => return (Err(err), false),
+        };
+        let pane = match live_pane(&task, &self.name) {
+            Ok(p) => p,
+            Err(err) => return (Err(err.into()), false),
+        };
+        if input.is_empty() {
+            let err = SendRefused {
+                code: "nothing_to_send",
+                message: "give text, --key or --trust".into(),
+            };
+            return (Err(err.into()), false);
+        }
+        let keys = input.key_sequence();
+        let timeout = self.settings.request_timeout;
+        let sent = tokio::time::timeout(timeout, async {
+            if let Some(text) = &input.text {
+                self.connector.pane_send_text(&pane, text).await?;
+            }
+            if !keys.is_empty() {
+                self.connector.pane_send_keys(&pane, &keys).await?;
+            }
+            Ok::<_, CallError>(())
+        })
+        .await;
+        match sent {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let dead = err.is_transport();
+                return (Err(err.into()), dead);
+            }
+            Err(_) => return (Err(TimedOut("pane input", timeout).into()), true),
+        }
+        self.emit_with("task.input", Some(task.id), Some(input.detail()));
+        (Ok(task), false)
     }
 
     /// `MachineCommand::Close`. herdr first, the row second: a herdr refusal
@@ -2014,6 +2174,7 @@ fn observed_from(agent: &AgentInfo) -> Observed {
 mod tests {
     use super::*;
     use crate::herdr::fake::FakeHerdr;
+    use crate::herdr::fake::PaneInput;
     use crate::herdr::{AgentStatus, ConnectError, ConnectFuture, Connection};
     use crate::store::NewTask;
     use crate::task::DispatchSpec;
@@ -3166,6 +3327,103 @@ mod tests {
 
     /// Settings for the auto-close tests: done tasks are closed 150ms after
     /// they finish, checked by a reconcile every 100ms.
+    fn input_events(events: &mut broadcast::Receiver<PastorEvent>) -> Vec<PastorEvent> {
+        let mut out = vec![];
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind == "task.input" {
+                out.push(ev);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn send_types_text_then_enter_then_keys_into_the_task_pane() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        h.send(
+            t.id,
+            SendInput {
+                text: Some("my secret".into()),
+                enter: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        h.send(
+            t.id,
+            SendInput {
+                keys: vec!["esc".into(), "Down".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        h.send(
+            t.id,
+            SendInput {
+                text: Some("half".into()),
+                enter: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fake.pane_input(&pane),
+            [
+                PaneInput::Text("my secret".into()),
+                PaneInput::Keys(vec!["Enter".into()]),
+                PaneInput::Keys(vec!["esc".into(), "Down".into()]),
+                PaneInput::Text("half".into()),
+            ]
+        );
+        let evs = input_events(&mut events);
+        assert_eq!(evs.len(), 3, "{evs:?}");
+        assert!(evs.iter().all(|e| e.task_id == Some(t.id)));
+        // The text itself may be a secret: only its length is recorded.
+        assert_eq!(
+            evs[0].detail,
+            Some(serde_json::json!({"text_len": 9, "keys": ["Enter"]}))
+        );
+        assert_eq!(
+            evs[1].detail,
+            Some(serde_json::json!({"keys": ["esc", "Down"]}))
+        );
+        assert_eq!(evs[2].detail, Some(serde_json::json!({"text_len": 4})));
+        assert!(!format!("{evs:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn send_refuses_a_task_that_is_not_live() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        h.close(t.id, false).await.unwrap();
+        let err = h
+            .send(
+                t.id,
+                SendInput {
+                    keys: vec!["Enter".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<SendRefused>().map(|r| r.code),
+            Some("task_not_live"),
+            "{err:#}"
+        );
+        assert!(calls(&fake, "pane.send_keys").is_empty());
+        assert!(input_events(&mut events).is_empty());
+    }
+
     fn auto_close_settings() -> MachineSettings {
         MachineSettings {
             reconcile_every: Duration::from_millis(100),

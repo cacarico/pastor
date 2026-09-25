@@ -69,6 +69,12 @@ pub enum IpcRequest {
         id: i64,
         remove_worktree: bool,
     },
+    /// Type into a live task's pane, through its machine's actor. Answers
+    /// `Text`.
+    TaskSend {
+        id: i64,
+        input: crate::machine::SendInput,
+    },
     /// Delete rows in `states` that finished more than `older_than_secs`
     /// ago. Answers `Pruned`.
     TaskPrune {

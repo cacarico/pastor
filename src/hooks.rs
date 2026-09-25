@@ -384,6 +384,7 @@ mod tests {
                 )
                 .unwrap();
             EventRecord {
+                detail: None,
                 at: chrono::Utc::now(),
                 kind: kind.into(),
                 job: Some(t.job.clone()),
@@ -433,6 +434,7 @@ mod tests {
 
     fn machine_record(kind: &str) -> EventRecord {
         EventRecord {
+            detail: None,
             at: chrono::Utc::now(),
             kind: kind.into(),
             task: None,
@@ -650,6 +652,7 @@ mod tests {
         let (tx, rx) = broadcast::channel(8);
         let h = spawn(e.paths.clone(), store, None, rx);
         tx.send(PastorEvent {
+            detail: None,
             kind: "task.done".into(),
             task_id: Some(rec.id),
             machine: None,

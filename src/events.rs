@@ -41,6 +41,10 @@ pub struct EventRecord {
     pub job: Option<String>,
     /// Set on `machine.*` events: the machine's status at that moment.
     pub machine: Option<MachineStatus>,
+    /// The event's own detail (`PastorEvent::detail`); absent when it has
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
 }
 
 /// Where `build` finds a machine's current status. The daemon's machine set
@@ -97,6 +101,7 @@ impl EventRecord {
             None
         };
         EventRecord {
+            detail: ev.detail.clone(),
             at: Utc::now(),
             kind: ev.kind.clone(),
             task,
@@ -134,6 +139,9 @@ impl EventRecord {
         }
         if let Some(e) = self.task.as_ref().and_then(|t| t.error.as_ref()) {
             cols.push(e.clone());
+        }
+        if let Some(d) = &self.detail {
+            cols.push(d.to_string());
         }
         cols.iter()
             .map(|c| crate::cli::one_line(c))
@@ -498,6 +506,7 @@ mod tests {
         job: Option<&str>,
     ) -> PastorEvent {
         PastorEvent {
+            detail: None,
             kind: kind.into(),
             task_id,
             machine: machine.map(Into::into),
@@ -600,6 +609,7 @@ mod tests {
 
     fn record(kind: &str, task: Option<&Task>) -> EventRecord {
         EventRecord {
+            detail: None,
             at: Utc::now(),
             kind: kind.into(),
             task: task.cloned(),

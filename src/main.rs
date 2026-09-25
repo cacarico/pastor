@@ -193,6 +193,8 @@ enum TaskCmd {
     Close(pastor::task_cli::CloseArgs),
     /// Delete old finished tasks; their items stay seen
     Prune(pastor::task_cli::PruneArgs),
+    /// Type text or press keys in a live task's agent, to answer what it is waiting on
+    Send(pastor::task_cli::SendArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -770,6 +772,7 @@ async fn task(paths: &Paths, cmd: TaskCmd) -> anyhow::Result<()> {
         TaskCmd::Retry(a) => pastor::task_cli::retry(paths, a).await?,
         TaskCmd::Close(a) => pastor::task_cli::close(paths, a).await?,
         TaskCmd::Prune(a) => pastor::task_cli::prune(paths, a).await?,
+        TaskCmd::Send(a) => pastor::task_cli::send(paths, a).await?,
     }
     Ok(())
 }

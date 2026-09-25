@@ -11,8 +11,8 @@ use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
 use crate::machine::{
-    ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, ShutdownOutcome,
-    spawn_machine,
+    ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, SendInput,
+    SendRefused, ShutdownOutcome, spawn_machine,
 };
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{NewTask, RetryError, Store, TaskFilter};
@@ -40,6 +40,22 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         poll_every: config.tick_duration(),
         close_done_after: config.close_done_after_duration(),
         ..Default::default()
+    }
+}
+
+/// "text and 1 key", "2 keys": what `task send` reports it sent.
+fn describe_input(input: &SendInput) -> String {
+    let n = input.key_sequence().len();
+    let keys = match n {
+        0 => None,
+        1 => Some("1 key".to_string()),
+        n => Some(format!("{n} keys")),
+    };
+    match (input.text.is_some(), keys) {
+        (true, Some(k)) => format!("text and {k}"),
+        (true, None) => "text".into(),
+        (false, Some(k)) => k,
+        (false, None) => "nothing".into(),
     }
 }
 
@@ -834,6 +850,7 @@ impl Daemon {
                     }
                 };
                 let _ = self.events.send(PastorEvent {
+                    detail: None,
                     kind: "task.queued".into(),
                     task_id: Some(task.id),
                     machine: None,
@@ -928,6 +945,7 @@ impl Daemon {
                 id,
                 remove_worktree,
             } => self.close(id, remove_worktree).await,
+            IpcRequest::TaskSend { id, input } => self.send(id, input).await,
             IpcRequest::TaskPrune {
                 states,
                 older_than_secs,
@@ -946,6 +964,49 @@ impl Daemon {
                     Err(err) => IpcResponse::error("store_error", err),
                 }
             }
+        }
+    }
+
+    /// `TaskSend`: through the actor of the task's machine, which checks the
+    /// row again and types into the pane. A task on no machine, or one whose
+    /// machine has left the flock, has no agent to type into.
+    async fn send(&self, id: i64, input: SendInput) -> IpcResponse {
+        if input.is_empty() {
+            return IpcResponse::error("nothing_to_send", "give text, --key or --trust");
+        }
+        let task = match self.store.get_task(id) {
+            Ok(Some(t)) => t,
+            Ok(None) => return IpcResponse::error("task_not_found", format!("t-{id}")),
+            Err(err) => return IpcResponse::error("store_error", err),
+        };
+        let handle = task
+            .machine
+            .as_deref()
+            .filter(|_| task.state.occupies_pane())
+            .and_then(|m| self.fleet.get(m).filter(|_| self.fleet.in_flock(m)));
+        let Some(handle) = handle else {
+            return IpcResponse::error(
+                "task_not_live",
+                format!(
+                    "{} is {} with no live agent to send to",
+                    task.display_id(),
+                    task.state
+                ),
+            );
+        };
+        if self.fleet.shutting_down(&handle.name) {
+            return IpcResponse::error(
+                "machine_shutting_down",
+                format!("machine {} is shutting down; try again later", handle.name),
+            );
+        }
+        let what = describe_input(&input);
+        match handle.send(id, input).await {
+            Ok(t) => IpcResponse::Text(format!("sent {what} to {}", t.display_id())),
+            Err(err) => match err.downcast_ref::<SendRefused>() {
+                Some(r) => IpcResponse::error(r.code, r),
+                None => stopped_or(err, "send_failed"),
+            },
         }
     }
 
@@ -979,6 +1040,7 @@ impl Daemon {
             }
         };
         let _ = self.events.send(PastorEvent {
+            detail: None,
             kind: "task.queued".into(),
             task_id: Some(task.id),
             machine: None,
@@ -1074,6 +1136,7 @@ impl Daemon {
             };
             if was != TaskState::Closed {
                 let _ = self.events.send(PastorEvent {
+                    detail: None,
                     kind: "task.closed".into(),
                     task_id: Some(id),
                     machine: None,
@@ -1106,6 +1169,7 @@ impl Daemon {
                 Err(err) => return IpcResponse::error("store_error", err),
             };
             let _ = self.events.send(PastorEvent {
+                detail: None,
                 kind: "task.closed".into(),
                 task_id: Some(id),
                 machine: Some(machine),
@@ -2341,6 +2405,62 @@ mod tests {
             d.store.update_task(&mut t).unwrap();
         }
         t
+    }
+
+    #[tokio::test]
+    async fn task_send_reaches_a_live_task_and_refuses_the_rest() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
+        let IpcResponse::Task(t) = d
+            .handle(IpcRequest::Run {
+                prompt: "hi".into(),
+                spec: spec(),
+                flock: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        let keys = crate::machine::SendInput {
+            keys: vec!["Enter".into()],
+            ..Default::default()
+        };
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: keys.clone(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [crate::herdr::fake::PaneInput::Keys(vec!["Enter".into()])]
+        );
+        let queued = insert(&d, TaskState::Queued);
+        let done = insert(&d, TaskState::Done);
+        for id in [queued.id, done.id] {
+            let resp = d
+                .handle(IpcRequest::TaskSend {
+                    id,
+                    input: keys.clone(),
+                })
+                .await;
+            assert_eq!(error_code(resp), "task_not_live");
+        }
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: 99,
+                input: keys.clone(),
+            })
+            .await;
+        assert_eq!(error_code(resp), "task_not_found");
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput::default(),
+            })
+            .await;
+        assert_eq!(error_code(resp), "nothing_to_send");
     }
 
     #[tokio::test]

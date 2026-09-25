@@ -1,4 +1,4 @@
-//! `pastor task retry|close|prune`: argument types and handlers. `main.rs` only
+//! `pastor task retry|close|prune|send`: argument types and handlers. `main.rs` only
 //! holds one `TaskCmd` variant per command and calls these.
 use clap::{ArgGroup, Args};
 
@@ -8,6 +8,7 @@ use crate::ipc::{
     DaemonProbe, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon,
     probe_daemon, request,
 };
+use crate::machine::SendInput;
 use crate::store::{PruneOutcome, Store};
 use crate::task::{Task, TaskState, parse_task_id};
 
@@ -26,6 +27,24 @@ pub struct CloseArgs {
     /// Remove the task's worktree too (refused if it has uncommitted changes)
     #[arg(long)]
     pub remove_worktree: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("send_input").required(true).multiple(true)))]
+pub struct SendArgs {
+    /// A live task (starting, running or blocked), like t-12
+    pub task: String,
+    /// Text to type into the agent, followed by Enter
+    #[arg(group = "send_input")]
+    pub text: Option<String>,
+    /// A named key to press after the text (Enter, Down, esc, ctrl+c); repeat for more, in order
+    #[arg(long = "key", value_name = "KEY", group = "send_input")]
+    pub keys: Vec<String>,
+    /// Type the text without pressing Enter after it
+    #[arg(long, requires = "text")]
+    pub no_enter: bool,
     #[arg(long)]
     pub json: bool,
 }
@@ -115,6 +134,27 @@ pub async fn close(paths: &Paths, a: CloseArgs) -> anyhow::Result<()> {
     match ask(paths, req).await? {
         IpcResponse::Task(t) => print_task(&t, a.json),
         // An orphaned agent with no row: there is no task to print.
+        IpcResponse::Text(msg) if a.json => {
+            println!("{}", serde_json::json!({"message": msg}));
+            Ok(())
+        }
+        IpcResponse::Text(msg) => {
+            println!("{msg}");
+            Ok(())
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+/// `pastor task send t-N [TEXT] [--key K]... [--no-enter]`.
+pub async fn send(paths: &Paths, a: SendArgs) -> anyhow::Result<()> {
+    let id = task_id(&a.task)?;
+    let input = SendInput {
+        enter: a.text.is_some() && !a.no_enter,
+        text: a.text,
+        keys: a.keys,
+    };
+    match ask(paths, IpcRequest::TaskSend { id, input }).await? {
         IpcResponse::Text(msg) if a.json => {
             println!("{}", serde_json::json!({"message": msg}));
             Ok(())
