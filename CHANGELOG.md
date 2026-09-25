@@ -107,6 +107,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `Cargo.toml` declares the minimum Rust version (1.88) and the repository,
   and carries cargo-binstall metadata pointing at the GitHub release
   tarballs.
+||||||| parent of ec9412e (docs(changelog): record the security fixes under Unreleased)
+
+### Security
+
+- Item values rendered into a job's prompt lose every control character but
+  newline and tab (C0, DEL and C1), so an issue title or chat message cannot
+  type key presses into the agent's terminal. The job's own prompt text and
+  `pastor task send` are unchanged.
+- Lines read from herdr are capped at 16 MiB and the output of the ssh probes
+  (home, repo directory, pastor version) at 64 KiB per stream. Past the cap
+  the connection is dropped with a protocol error, or the probe is killed,
+  so one machine cannot exhaust the head's memory.
+- An item value put into `repo` or `branch` may no longer be empty (which a
+  missing field renders to) or `.`, so it cannot point the task at the
+  template's parent directory.
+- A job whose `branch` puts an item value in its first component, such as
+  `{{ item.branch }}`, is invalid: the job must fix a prefix like
+  `pastor/{{ item.key }}`, so an item cannot pick an existing branch such as
+  `main`.
+- An ssh target that is empty, starts with `-`, or holds whitespace or a
+  control character makes `flock.toml` fail to load, and every ssh command
+  pastor runs passes `--` before the target.
+- `pastor serve` logs a failed `accept` on its socket and keeps serving
+  instead of exiting. An IPC request line is capped at 1 MiB
+  (`request_too_large`) and must arrive within 10 seconds.
+- `SECURITY.md` and the manual's new Trust model section state that the
+  head's user is the fleet's trust boundary, that `local = true` machines
+  should not run untrusted work, and what plugins inherit.
 
 ## 0.4.0 - 2026-09-25
 
