@@ -136,6 +136,12 @@ pub struct Created {
     pub root_pane: PaneRef,
 }
 
+/// `pane.split`'s reply: `{"type": "pane_info", "pane": {...}}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneInfoResult {
+    pub pane: PaneRef,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResult {
     pub agent: AgentInfo,

@@ -318,9 +318,9 @@ flock above, `pastor task run --flock work --agent codex` runs codex without
 
 `pastor task show` prints the agent and args a task resolved to; the task keeps
 them, so a later edit of `flock.toml` or `pastor.toml` changes only tasks
-queued after it. The head reads `pastor.toml` again for every `task run`; a
-hand edit of `flock.toml` reaches it on the next tick, or at once with `pastor
-job reload`.
+queued after it. `pastor task run` makes the head apply an edit of
+`pastor.toml` or `flock.toml` first; for a job, an edit reaches the head on
+its next tick, or at once with `pastor job reload`.
 
 ### Tool allow and deny lists
 
@@ -392,6 +392,50 @@ to, as the head's user on that machine, with that user's files, keys and
 network. See [Trust model](#trust-model) before you set one, prefer a narrow
 `allow` list, and keep such args in a flock of disposable machines rather than
 in `[defaults]`.
+
+### Agent definitions
+
+`[agents.<name>]` in pastor.toml defines an agent by name. Tasks, jobs and
+flocks name it like any other agent; `kind` says which herdr agent it starts,
+and `env` sets environment variables for its pane. The usual case is a second
+Claude account on the same machines:
+
+```toml
+# pastor.toml
+[agents.claude-personal]
+kind = "claude"
+env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
+```
+
+```toml
+# flock.toml: every task of the personal flock runs it
+[[flock]]
+name = "personal"
+agent = "claude-personal"
+```
+
+`pastor task run --agent claude-personal` or `agent = "claude-personal"` in
+a job does the same for one task. herdr starts a `claude` (the `kind`; without
+one, the name itself), and `task show` and `task list` keep the name
+`claude-personal`. Built-in settings follow the kind, not the name: the
+definition gets Claude's trust keys and its `--allowedTools` and
+`--disallowedTools` flags unless it sets `trust_keys`, `allow_flag` or
+`deny_flag` of its own. It does not inherit what `[agents.claude]` sets.
+
+`env` values are passed as written, except that a value of `~` or one that
+starts with `~/` is expanded against the home of the machine the task runs
+on, as `--repo` is; a `command` machine cannot report a home, so give those
+absolute paths. Keys must be variable names (letters, digits and `_`, not
+starting with a digit). pastor sets the env when it creates the task's pane:
+`workspace.create` takes it directly. herdr's `worktree.create` and
+`worktree.open` take none, so for a `--worktree` task pastor splits a pane off
+the worktree's, with the env and the checkout as its directory, closes the
+pane without it, and starts the agent in the new one. A task without env keeps
+herdr's own pane either way.
+
+The head checks a task's agent against pastor.toml when it queues it, and
+`pastor task run` makes the head apply an edit of pastor.toml or flock.toml
+first, so a definition you have just added is the one its machine starts.
 
 `pastor machine move` changes the flock of tasks dispatched after it; tasks
 already on the machine keep running there, and its connection stays up. A
@@ -863,6 +907,8 @@ deny = []                    # tool patterns it must never use; wins over allow
 max_tasks_per_run = 5
 timeout = "2h"
 [agents.claude]              # one table per agent that needs one
+kind = "claude"                  # the herdr agent it starts; default: the table's name
+env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
 trust_keys = ["Down", "Enter"]   # accept its folder-trust prompt; [] for none
 allow_flag = "--allowedTools"    # the flag before each allow pattern
 deny_flag = "--disallowedTools"  # the flag before each deny pattern

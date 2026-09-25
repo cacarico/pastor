@@ -26,6 +26,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `[agents.<name>] allow_flag` and `deny_flag` name them for another agent,
   and a task whose agent has none for a list it carries is refused
   (`agent_tools_unsupported`). `pastor task show` prints both lists.
+- Agent definitions can set `kind` and `env`: `[agents.claude-personal]`
+  with `kind = "claude"` and `env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }`
+  starts a claude whose pane has that env, `~` expanded against the task
+  machine's home. Built-in trust keys and tool flags follow the kind, and a
+  task, job or flock names the definition like any agent. A worktree task
+  gets the env through a pane split off the worktree's, since herdr's
+  worktree calls take none.
 - A Trust model section in the manual, and a warning there on agent args
   that turn permission checks off, such as `--dangerously-skip-permissions`.
 
@@ -55,7 +62,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   head below it (`head_too_old`), which would start the agent without its
   tool lists: restart `pastor serve` after upgrading.
 - The head, not the CLI, settles a `pastor task run` task's agent, since only
-  it knows the task's flock. It still reads `pastor.toml` afresh for each run.
+  it knows the task's flock. `pastor task run` has the head apply any edit of
+  `pastor.toml` or `flock.toml` first, so an edit still takes effect at once.
 
 - `cargo install` and `make install` install only the `pastor` binary
   (`--bin pastor`); `fake-herdr` is a test double and no longer lands on

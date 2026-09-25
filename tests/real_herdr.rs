@@ -59,7 +59,7 @@ async fn talks_to_a_real_herdr_session() {
 
     let label = format!("pastor-real-herdr-test-{}", std::process::id());
     let created = endpoint
-        .workspace_create(None, &label)
+        .workspace_create(None, &label, &Default::default())
         .await
         .expect("create a workspace on the real herdr");
     assert!(!created.workspace.workspace_id.is_empty());

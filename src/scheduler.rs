@@ -520,6 +520,9 @@ pub enum SchedulerCommand {
     JobList {
         reply: oneshot::Sender<Vec<JobStatus>>,
     },
+    /// Apply `pastor.toml` and `flock.toml` if they changed on disk
+    /// (`reload_config`), before a `task run` queues against them.
+    SyncConfig { reply: oneshot::Sender<()> },
 }
 
 #[derive(Clone)]
@@ -562,6 +565,10 @@ impl SchedulerHandle {
     }
     pub async fn job_list(&self) -> anyhow::Result<Vec<JobStatus>> {
         self.send(|reply| SchedulerCommand::JobList { reply }).await
+    }
+    pub async fn sync_config(&self) -> anyhow::Result<()> {
+        self.send(|reply| SchedulerCommand::SyncConfig { reply })
+            .await
     }
 }
 
@@ -762,6 +769,11 @@ impl Scheduler {
                             self.force_reload();
                             self.reap().await;
                             let _ = reply.send(self.statuses(Utc::now()));
+                            retime(&mut tick, self.tick);
+                        }
+                        SchedulerCommand::SyncConfig { reply } => {
+                            self.reload_config(false).await;
+                            let _ = reply.send(());
                             retime(&mut tick, self.tick);
                         }
                         SchedulerCommand::JobList { reply } => {

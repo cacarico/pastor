@@ -962,13 +962,16 @@ impl Daemon {
                         "a worktree task needs a repo to branch from",
                     );
                 }
-                // `[defaults]` as pastor.toml reads now, not as of the last
-                // tick: `task run` has always taken an edit at once. A file
-                // that does not load leaves the last good one in use.
+                // pastor.toml and flock.toml as they read now, not as of the
+                // last tick: `task run` has always taken a `[defaults]` edit
+                // at once. Through the scheduler, so the `[agents]` the task
+                // is checked against here are the ones its machine's actor
+                // dispatches with. A file that does not load leaves the last
+                // good one in use.
                 if agent.is_some()
-                    && let Ok(config) = PastorConfig::load_existing(&self.paths.config_file())
+                    && let Err(err) = self.scheduler.sync_config().await
                 {
-                    self.fleet.set_config(&config);
+                    tracing::warn!(%err, "config not re-read before task run");
                 }
                 let task = match self
                     .fleet
@@ -2119,6 +2122,44 @@ mod tests {
         assert!(format!("{err:#}").contains("deny_flag"), "{err:#}");
     }
 
+    /// A flock's default agent can name an `[agents]` definition: its tasks
+    /// keep that name, and Claude's tool flags follow its kind, so a deny
+    /// list does not refuse it.
+    #[tokio::test]
+    async fn a_flock_can_run_an_agent_definition() {
+        let mut flock = home_and_work();
+        flock.flocks[1].agent = Some("claude-personal".into());
+        flock.flocks[1].deny = vec!["WebFetch".into()];
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("h", 2, FakeHerdr::new()), ("w", 2, FakeHerdr::new())],
+        )
+        .await;
+        let mut config = test_config();
+        config.agents.0.insert(
+            "claude-personal".into(),
+            crate::config::AgentDef {
+                kind: Some("claude".into()),
+                ..Default::default()
+            },
+        );
+        // `task run` reads pastor.toml afresh, as the CLI's edit would land.
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        let resp = d
+            .handle(IpcRequest::Run {
+                prompt: "x".into(),
+                spec: spec(),
+                flock: Some("work".into()),
+                agent: Some(AgentChoice::default()),
+            })
+            .await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.spec.agent, "claude-personal");
+        assert_eq!(t.spec.deny, vec!["WebFetch"]);
+    }
+
     /// `home_and_work` plus `spare`, a flock with no machine.
     async fn spare_daemon() -> (Daemon, tempfile::TempDir) {
         let mut flock = home_and_work();
@@ -3237,7 +3278,10 @@ mod tests {
     #[tokio::test]
     async fn close_finds_an_orphan_with_no_row() {
         let fake = FakeHerdr::new();
-        let ws = fake.workspace_create(None, "t-42").await.unwrap();
+        let ws = fake
+            .workspace_create(None, "t-42", &Default::default())
+            .await
+            .unwrap();
         fake.agent_start("t-42", "claude", &ws.root_pane.pane_id, &[])
             .await
             .unwrap();

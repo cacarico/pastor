@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,8 +10,8 @@ use tokio::io::{
 
 use super::transport::{ConnectError, Connector};
 use super::{
-    AgentInfo, AgentList, AgentResult, Created, Event, HerdrError, Incoming, PaneRead, Pong,
-    Request, Response, WorktreeInfo, WorktreeList, WorktreeRemoved,
+    AgentInfo, AgentList, AgentResult, Created, Event, HerdrError, Incoming, PaneInfoResult,
+    PaneRead, PaneRef, Pong, Request, Response, WorktreeInfo, WorktreeList, WorktreeRemoved,
 };
 
 pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
@@ -373,12 +374,39 @@ pub trait ConnectorExt: Connector {
             .agents)
     }
 
-    async fn workspace_create(&self, cwd: Option<&str>, label: &str) -> Result<Created, CallError> {
-        self.call_as(
-            "workspace.create",
-            serde_json::json!({"cwd": cwd, "label": label, "focus": false}),
-        )
-        .await
+    /// `env` sets variables for the root pane's shell, and so for an agent
+    /// started in it; left out of the request when empty.
+    async fn workspace_create(
+        &self,
+        cwd: Option<&str>,
+        label: &str,
+        env: &BTreeMap<String, String>,
+    ) -> Result<Created, CallError> {
+        let mut params = serde_json::json!({"cwd": cwd, "label": label, "focus": false});
+        if !env.is_empty() {
+            params["env"] = serde_json::json!(env);
+        }
+        self.call_as("workspace.create", params).await
+    }
+
+    /// `pane.split` (herdr 0.9.1): a new pane beside `target`, in its
+    /// workspace, with `cwd` and `env` for its shell. The only way to give a
+    /// worktree's agent an env: `worktree.create` and `worktree.open` take
+    /// none.
+    async fn pane_split(
+        &self,
+        target: &str,
+        cwd: Option<&str>,
+        env: &BTreeMap<String, String>,
+    ) -> Result<PaneRef, CallError> {
+        Ok(self
+            .call_as::<PaneInfoResult>(
+                "pane.split",
+                serde_json::json!({"target_pane_id": target, "direction": "right",
+                    "cwd": cwd, "env": env, "focus": false}),
+            )
+            .await?
+            .pane)
     }
 
     async fn worktree_create(

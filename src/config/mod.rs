@@ -307,10 +307,21 @@ impl Default for Defaults {
     }
 }
 
-/// One agent's definition under `[agents.<name>]` in `pastor.toml`.
+/// One agent's definition under `[agents.<name>]` in `pastor.toml`. The
+/// name is what tasks, jobs and flocks call it; `kind` is what herdr starts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentDef {
+    /// The herdr agent kind to start (`claude`, `codex`); unset, the name
+    /// itself. Built-in trust keys and tool flags follow it, so
+    /// `[agents.claude-personal] kind = "claude"` gets Claude's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Environment for the task's pane, set when pastor creates it. A value
+    /// that starts with `~/` (or is `~`) is expanded against the home of the
+    /// machine the task runs on.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
     /// The keys that accept the agent's folder-trust prompt, for `pastor
     /// task send --trust` and saved trust. Unset keeps the built-in keys;
     /// an empty list means the agent has none.
@@ -331,6 +342,15 @@ pub struct AgentDef {
 #[serde(transparent)]
 pub struct Agents(pub std::collections::BTreeMap<String, AgentDef>);
 
+/// How dispatch starts a task's agent (`Agents::launch`): the herdr kind,
+/// its argv, and the env its pane is created with (`~` not yet expanded).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Launch {
+    pub kind: String,
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
 /// Claude's folder-trust dialog opens on "No, exit"; Down moves to "Yes,
 /// proceed" and Enter takes it.
 const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
@@ -340,29 +360,51 @@ const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
 const CLAUDE_TOOL_FLAGS: (&str, &str) = ("--allowedTools", "--disallowedTools");
 
 impl Agents {
+    /// The herdr kind `agent` starts: its definition's `kind`, else its name.
+    pub fn kind<'a>(&'a self, agent: &'a str) -> &'a str {
+        self.0
+            .get(agent)
+            .and_then(|d| d.kind.as_deref())
+            .unwrap_or(agent)
+    }
+
     /// The keys that accept `agent`'s folder-trust prompt: its own
-    /// `trust_keys`, else the built-in ones (only `claude` has any). `None`
-    /// when it has none.
+    /// `trust_keys`, else the built-in ones of its kind (only `claude` has
+    /// any). `None` when it has none.
     pub fn trust_keys(&self, agent: &str) -> Option<Vec<String>> {
         let keys = match self.0.get(agent).and_then(|d| d.trust_keys.clone()) {
             Some(keys) => keys,
-            None if agent == "claude" => CLAUDE_TRUST_KEYS.map(str::to_string).to_vec(),
+            None if self.kind(agent) == "claude" => CLAUDE_TRUST_KEYS.map(str::to_string).to_vec(),
             None => return None,
         };
         (!keys.is_empty()).then_some(keys)
     }
 
     /// The flags that carry `agent`'s allow and deny lists: its own, else the
-    /// built-in ones (only `claude` has any).
+    /// built-in ones of its kind (only `claude` has any).
     fn tool_flags(&self, agent: &str) -> (Option<String>, Option<String>) {
         let def = self.0.get(agent);
-        let builtin = (agent == "claude").then_some(CLAUDE_TOOL_FLAGS);
+        let builtin = (self.kind(agent) == "claude").then_some(CLAUDE_TOOL_FLAGS);
         (
             def.and_then(|d| d.allow_flag.clone())
                 .or(builtin.map(|b| b.0.to_string())),
             def.and_then(|d| d.deny_flag.clone())
                 .or(builtin.map(|b| b.1.to_string())),
         )
+    }
+
+    /// How to start `spec`'s agent: its kind, `launch_args` and the env of
+    /// its definition. Refused as `launch_args` is.
+    pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, String> {
+        Ok(Launch {
+            kind: self.kind(&spec.agent).to_string(),
+            args: self.launch_args(spec)?,
+            env: self
+                .0
+                .get(&spec.agent)
+                .map(|d| d.env.clone())
+                .unwrap_or_default(),
+        })
     }
 
     /// The argv after the agent's name for `spec`: its `agent_args`, then
@@ -491,6 +533,22 @@ impl PastorConfig {
             check_tools(key, list).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         }
         for (name, def) in &cfg.agents.0 {
+            if def.kind.as_deref().is_some_and(|k| k.trim().is_empty()) {
+                anyhow::bail!("{}: agents.{name}.kind must not be empty", path.display());
+            }
+            for key in def.env.keys() {
+                let ok = key
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !ok {
+                    anyhow::bail!(
+                        "{}: agents.{name}.env: {key:?} is not a variable name (letters, digits and _, not starting with a digit)",
+                        path.display()
+                    );
+                }
+            }
             for (key, flag) in [
                 ("allow_flag", &def.allow_flag),
                 ("deny_flag", &def.deny_flag),
@@ -816,6 +874,52 @@ mod tests {
             (
                 "[agents.codex]\ndeny_flag = \" \"\n",
                 "agents.codex.deny_flag",
+            ),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            assert!(err.contains(want), "{text}: {err}");
+        }
+    }
+
+    /// An agent definition names a herdr kind and an env; Claude's built-in
+    /// trust keys and tool flags follow the kind, not the name.
+    #[test]
+    fn agent_definitions_carry_a_kind_and_an_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.claude-personal]\nkind = \"claude\"\nenv = { CLAUDE_CONFIG_DIR = \"~/.claude-personal\" }\n",
+        )
+        .unwrap();
+        let agents = PastorConfig::load(&path).unwrap().agents;
+        assert_eq!(agents.kind("claude-personal"), "claude");
+        assert_eq!(agents.kind("codex"), "codex", "no definition: the name");
+        assert_eq!(
+            agents.trust_keys("claude-personal"),
+            Some(vec!["Down".into(), "Enter".into()])
+        );
+        let launch = agents
+            .launch(&spec_with("claude-personal", &["Edit"], &[]))
+            .unwrap();
+        assert_eq!(launch.kind, "claude");
+        assert_eq!(launch.args, vec!["--model", "m", "--allowedTools", "Edit"]);
+        assert_eq!(launch.env["CLAUDE_CONFIG_DIR"], "~/.claude-personal");
+        assert!(
+            agents
+                .launch(&spec_with("codex", &[], &[]))
+                .unwrap()
+                .env
+                .is_empty()
+        );
+
+        for (text, want) in [
+            ("[agents.x]\nkind = \"\"\n", "agents.x.kind"),
+            ("[agents.x]\nenv = { \"1A\" = \"v\" }\n", "agents.x.env"),
+            (
+                "[agents.x]\nenv = { \"A-B\" = \"v\" }\n",
+                "not a variable name",
             ),
         ] {
             std::fs::write(&path, text).unwrap();

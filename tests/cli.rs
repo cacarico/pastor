@@ -439,6 +439,42 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     assert!(text.contains("deny:       WebFetch\n"), "{text}");
 }
 
+/// `[agents.claude-personal] kind = "claude"` with an env: herdr starts a
+/// claude in a workspace created with that env, and the task keeps the name.
+#[test]
+fn an_agent_definition_reaches_herdr_as_its_kind_and_env() {
+    let env = start();
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [agents.claude-personal]\nkind = \"claude\"\n\
+         env = { CLAUDE_CONFIG_DIR = \"/srv/claude-personal\" }\n",
+    )
+    .unwrap();
+    let out = env.cmd(&["task", "run", "hi", "--agent", "claude-personal", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let start = env.agent_start_params("t-1");
+    assert_eq!(start["kind"], "claude", "{start}");
+    let reqs: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&env.herdr_log).unwrap()).unwrap();
+    let ws = reqs
+        .iter()
+        .find(|r| r["method"] == "workspace.create")
+        .unwrap();
+    assert_eq!(
+        ws["params"]["env"],
+        serde_json::json!({"CLAUDE_CONFIG_DIR": "/srv/claude-personal"}),
+        "{ws}"
+    );
+    let out = env.cmd(&["task", "show", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("agent:      claude-personal\n"), "{text}");
+}
+
 #[test]
 fn machine_add_and_remove_edit_the_file() {
     let tmp = tempfile::tempdir().unwrap();

@@ -29,9 +29,14 @@ pub enum PaneInput {
 #[derive(Default)]
 struct State {
     next_ws: u32,
-    /// Open workspaces: id -> created by `worktree.create`. One pane each,
-    /// `<id>:p1`, as herdr gives a new workspace.
+    /// Open workspaces: id -> created by `worktree.create`. Each opens with
+    /// one pane, `<id>:p1`, as herdr gives a new workspace.
     workspaces: HashMap<String, bool>,
+    /// Open workspace -> its open panes, in order. `pane.split` adds one;
+    /// `pane.close` of the last closes the workspace, as in herdr.
+    panes: HashMap<String, Vec<String>>,
+    /// The `env` each pane was created with (`workspace.create`, `pane.split`).
+    pane_env: HashMap<String, Value>,
     /// Worktree workspaces whose checkout has changes, so `worktree.remove`
     /// needs `force`.
     dirty: HashSet<String>,
@@ -374,9 +379,27 @@ impl FakeHerdr {
     /// Does the fake have this pane: a workspace's root pane, or one with an
     /// agent on it.
     fn has_pane(s: &State, pane_id: &str) -> bool {
+        s.agents.contains_key(pane_id) || Self::pane_open(s, pane_id)
+    }
+
+    fn pane_open(s: &State, pane_id: &str) -> bool {
         let ws = pane_id.split(':').next().unwrap_or("");
-        s.agents.contains_key(pane_id)
-            || (pane_id.ends_with(":p1") && s.workspaces.contains_key(ws))
+        s.panes
+            .get(ws)
+            .is_some_and(|p| p.iter().any(|x| x == pane_id))
+    }
+
+    /// Open workspace `ws` with its root pane.
+    fn open_workspace(s: &mut State, ws: &str, is_worktree: bool) {
+        s.workspaces.insert(ws.to_string(), is_worktree);
+        s.panes.insert(ws.to_string(), vec![format!("{ws}:p1")]);
+    }
+
+    /// The env the pane was created with, `Null` for none: what a test
+    /// checks to see that an agent definition's env reached its pane.
+    pub fn pane_env(&self, pane_id: &str) -> Value {
+        let s = self.state.lock().unwrap();
+        s.pane_env.get(pane_id).cloned().unwrap_or(Value::Null)
     }
 
     pub fn close_pane(&self, pane_id: &str) {
@@ -385,6 +408,7 @@ impl FakeHerdr {
             let mut s = self.state.lock().unwrap();
             s.agents.remove(pane_id);
             s.workspaces.remove(&ws);
+            s.panes.remove(&ws);
             // The checkout stays on disk.
             s.workspace_checkout.remove(&ws);
         }
@@ -595,7 +619,10 @@ impl FakeHerdr {
                 let ws = format!("w{}", s.next_ws);
                 let pane = format!("{ws}:p1");
                 let is_worktree = req.method == "worktree.create";
-                s.workspaces.insert(ws.clone(), is_worktree);
+                Self::open_workspace(&mut s, &ws, is_worktree);
+                if let Some(env) = p.get("env").filter(|e| !e.is_null()) {
+                    s.pane_env.insert(pane.clone(), env.clone());
+                }
                 if is_worktree {
                     s.workspace_checkout.insert(ws.clone(), checkout);
                 }
@@ -661,7 +688,7 @@ impl FakeHerdr {
                     None => {
                         s.next_ws += 1;
                         let ws = format!("w{}", s.next_ws);
-                        s.workspaces.insert(ws.clone(), true);
+                        Self::open_workspace(&mut s, &ws, true);
                         s.workspace_checkout.insert(ws.clone(), checkout.clone());
                         ws
                     }
@@ -676,20 +703,10 @@ impl FakeHerdr {
             }
             "agent.start" => {
                 let pane_id = p["pane_id"].as_str().unwrap_or("").to_string();
-                // The fake creates exactly one pane per workspace ("w<N>:p1"), so a
-                // pane is known only if it has that shape and N is a workspace that
-                // was actually created. `strip_prefix` avoids byte-slicing the
-                // workspace part directly (`ws[1..]`), which panics on non-ASCII
-                // input and would poison `state`'s mutex while it's held.
-                let mut parts = pane_id.split(':');
-                let ws_part = parts.next().unwrap_or("");
-                let pane_part = parts.next();
-                let ws_num = ws_part
-                    .strip_prefix('w')
-                    .and_then(|n| n.parse::<u32>().ok());
-                let known = matches!((ws_num, pane_part), (Some(n), Some("p1")) if n >= 1 && n <= s.next_ws)
-                    && s.workspaces.contains_key(ws_part);
-                if !known {
+                // A pane is known only if a workspace was created with it or
+                // split it off, and it is still open. A lookup, never a
+                // slice, so non-ASCII input cannot panic with `state` held.
+                if !Self::pane_open(&s, &pane_id) {
                     return Err(("pane_not_found".into(), pane_id));
                 }
                 if s.pane_busy_for > 0 {
@@ -699,7 +716,7 @@ impl FakeHerdr {
                         format!("agent target pane {pane_id} is not an available shell"),
                     ));
                 }
-                let ws = ws_part.to_string();
+                let ws = pane_id.split(':').next().unwrap_or("").to_string();
                 match s.start.clone().unwrap_or(StartBehaviour::Ready) {
                     StartBehaviour::Fail(code) => return Err((code, "start failed".into())),
                     StartBehaviour::Ready => {}
@@ -851,17 +868,47 @@ impl FakeHerdr {
                 Ok(json!({"type": "ok"}))
             }
             "agent.read" => Ok(json!({"type": "pane_read", "read": {"text": "fake output\n"}})),
+            // herdr 0.9.1: `pane.split {target_pane_id, direction, cwd, env}`
+            // answers `pane_info` with the new pane, in the target's workspace.
+            "pane.split" => {
+                let target = p["target_pane_id"].as_str().unwrap_or("").to_string();
+                if !Self::pane_open(&s, &target) {
+                    return Err(("pane_not_found".into(), format!("pane {target} not found")));
+                }
+                let ws = target.split(':').next().unwrap_or("").to_string();
+                let open = s.panes.get_mut(&ws).expect("pane_open checked it");
+                let pane = (2..)
+                    .map(|n| format!("{ws}:p{n}"))
+                    .find(|id| !open.contains(id))
+                    .unwrap();
+                open.push(pane.clone());
+                if let Some(env) = p.get("env").filter(|e| !e.is_null()) {
+                    s.pane_env.insert(pane.clone(), env.clone());
+                }
+                Ok(
+                    json!({"type": "pane_info", "pane": {"pane_id": pane, "workspace_id": ws,
+                    "cwd": p.get("cwd").cloned().unwrap_or(Value::Null), "agent_status": "unknown"}}),
+                )
+            }
             // herdr 0.9.1: `pane.close {pane_id}` answers `{"type": "ok"}`, and
             // closing a workspace's last pane closes the workspace.
             "pane.close" => {
                 let pane_id = p["pane_id"].as_str().unwrap_or("").to_string();
                 let ws = pane_id.split(':').next().unwrap_or("").to_string();
-                if !pane_id.ends_with(":p1") || s.workspaces.remove(&ws).is_none() {
+                if !Self::pane_open(&s, &pane_id) {
                     return Err(("pane_not_found".into(), format!("pane {pane_id} not found")));
                 }
                 s.agents.remove(&pane_id);
-                s.dirty.remove(&ws);
-                s.workspace_checkout.remove(&ws);
+                let left = s.panes.get_mut(&ws).map(|panes| {
+                    panes.retain(|x| *x != pane_id);
+                    panes.len()
+                });
+                if left == Some(0) {
+                    s.panes.remove(&ws);
+                    s.workspaces.remove(&ws);
+                    s.dirty.remove(&ws);
+                    s.workspace_checkout.remove(&ws);
+                }
                 drop(s);
                 self.pane_closed_event(&pane_id, &ws);
                 Ok(json!({"type": "ok"}))
@@ -899,10 +946,14 @@ impl FakeHerdr {
                 if let Some(checkout) = s.workspace_checkout.remove(&ws) {
                     s.checkouts.remove(&checkout);
                 }
-                let pane_id = format!("{ws}:p1");
-                s.agents.remove(&pane_id);
+                let panes = s.panes.remove(&ws).unwrap_or_default();
+                for pane_id in &panes {
+                    s.agents.remove(pane_id);
+                }
                 drop(s);
-                self.pane_closed_event(&pane_id, &ws);
+                for pane_id in &panes {
+                    self.pane_closed_event(pane_id, &ws);
+                }
                 Ok(
                     json!({"type": "worktree_removed", "workspace_id": ws, "forced": force, "path": format!("/fake/{ws}")}),
                 )
@@ -988,7 +1039,10 @@ mod tests {
         // real herdr; the fake's state lives in the `FakeHerdr`, not the connection.
         let fake = FakeHerdr::new();
         assert_eq!(fake.ping().await.unwrap().protocol, 22);
-        let created = fake.workspace_create(Some("/tmp"), "t-1").await.unwrap();
+        let created = fake
+            .workspace_create(Some("/tmp"), "t-1", &Default::default())
+            .await
+            .unwrap();
         assert_eq!(created.root_pane.pane_id, "w1:p1");
         let a = fake
             .agent_start("t-1", "claude", "w1:p1", &[])
@@ -1018,7 +1072,10 @@ mod tests {
     #[tokio::test]
     async fn pane_close_and_worktree_remove() {
         let fake = FakeHerdr::new();
-        let plain = fake.workspace_create(None, "t-1").await.unwrap();
+        let plain = fake
+            .workspace_create(None, "t-1", &Default::default())
+            .await
+            .unwrap();
         let wt = fake.worktree_create("/r", "b", "t-2").await.unwrap();
         let dirty = fake.worktree_create("/r", "c", "t-3").await.unwrap();
         fake.agent_start("t-1", "claude", &plain.root_pane.pane_id, &[])
@@ -1043,7 +1100,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("workspace_not_found"), "closed already");
-        let other = fake.workspace_create(None, "t-4").await.unwrap();
+        let other = fake
+            .workspace_create(None, "t-4", &Default::default())
+            .await
+            .unwrap();
         let err = fake
             .worktree_remove(&other.workspace.workspace_id, false)
             .await
@@ -1081,7 +1141,10 @@ mod tests {
     #[tokio::test]
     async fn start_behaviours() {
         let fake = FakeHerdr::new();
-        let created = fake.workspace_create(None, "x").await.unwrap();
+        let created = fake
+            .workspace_create(None, "x", &Default::default())
+            .await
+            .unwrap();
         fake.set_start_behaviour(StartBehaviour::Fail("unsupported_agent_kind".into()));
         let err = fake
             .agent_start("t-3", "nope", &created.root_pane.pane_id, &[])
@@ -1098,7 +1161,10 @@ mod tests {
     #[tokio::test]
     async fn prompt_on_blocked_agent_is_rejected() {
         let fake = FakeHerdr::new();
-        let created = fake.workspace_create(None, "x").await.unwrap();
+        let created = fake
+            .workspace_create(None, "x", &Default::default())
+            .await
+            .unwrap();
         fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
@@ -1110,8 +1176,14 @@ mod tests {
     #[tokio::test]
     async fn subscription_filters_by_pane_and_delivers_lifecycle() {
         let fake = FakeHerdr::new();
-        let a = fake.workspace_create(None, "a").await.unwrap();
-        let b = fake.workspace_create(None, "b").await.unwrap();
+        let a = fake
+            .workspace_create(None, "a", &Default::default())
+            .await
+            .unwrap();
+        let b = fake
+            .workspace_create(None, "b", &Default::default())
+            .await
+            .unwrap();
         fake.agent_start("t-1", "claude", &a.root_pane.pane_id, &[])
             .await
             .unwrap();
@@ -1152,7 +1224,10 @@ mod tests {
         };
         assert_eq!(err.code(), Some("pane_not_found"), "{err:?}");
 
-        let ws = fake.workspace_create(None, "x").await.unwrap();
+        let ws = fake
+            .workspace_create(None, "x", &Default::default())
+            .await
+            .unwrap();
         let pane = ws.root_pane.pane_id;
         fake.close_pane_before_subscribe(&pane);
         fake.subscribe(vec![super::super::subscription_lifecycle("pane.closed")])
@@ -1250,7 +1325,10 @@ mod tests {
     async fn an_agent_is_unready_for_ready_after() {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_millis(200));
-        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        let created = fake
+            .workspace_create(None, "t-1", &Default::default())
+            .await
+            .unwrap();
         fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
@@ -1275,7 +1353,10 @@ mod tests {
     async fn an_agent_can_exit_on_start() {
         let fake = FakeHerdr::new();
         fake.exit_agents_on_start(true);
-        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        let created = fake
+            .workspace_create(None, "t-1", &Default::default())
+            .await
+            .unwrap();
         fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
@@ -1317,7 +1398,10 @@ mod tests {
     async fn an_exited_agent_can_stay_listed_without_flags() {
         let fake = FakeHerdr::new();
         fake.exit_agents_listed(true);
-        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        let created = fake
+            .workspace_create(None, "t-1", &Default::default())
+            .await
+            .unwrap();
         fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
@@ -1334,7 +1418,10 @@ mod tests {
     async fn launch_flags_follow_the_ready_window() {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_millis(200));
-        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        let created = fake
+            .workspace_create(None, "t-1", &Default::default())
+            .await
+            .unwrap();
         fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
@@ -1348,7 +1435,9 @@ mod tests {
     #[tokio::test]
     async fn agent_start_rejects_malformed_and_unknown_panes() {
         let fake = FakeHerdr::new();
-        fake.workspace_create(None, "x").await.unwrap();
+        fake.workspace_create(None, "x", &Default::default())
+            .await
+            .unwrap();
         for pane in ["é:p1", "w1:p99", "w1"] {
             let err = fake
                 .agent_start("t", "claude", pane, &[])
@@ -1364,7 +1453,10 @@ mod tests {
     #[tokio::test]
     async fn pane_input_is_recorded_per_pane_in_order() {
         let fake = FakeHerdr::new();
-        let created = fake.workspace_create(None, "x").await.unwrap();
+        let created = fake
+            .workspace_create(None, "x", &Default::default())
+            .await
+            .unwrap();
         let pane = created.root_pane.pane_id;
         fake.pane_send_text(&pane, "yes please").await.unwrap();
         fake.pane_send_keys(&pane, &["Down".into(), "Enter".into()])
@@ -1403,7 +1495,10 @@ mod tests {
         let fake = FakeHerdr::new();
         let err = fake.pane_send_text("w9:p1", "hi").await.unwrap_err();
         assert_eq!(err.code(), Some("pane_not_found"));
-        let created = fake.workspace_create(None, "x").await.unwrap();
+        let created = fake
+            .workspace_create(None, "x", &Default::default())
+            .await
+            .unwrap();
         let err = fake
             .pane_send_keys(&created.root_pane.pane_id, &[])
             .await
@@ -1418,7 +1513,10 @@ mod tests {
     async fn a_trust_prompt_holds_the_agent_blocked_until_its_keys_arrive() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
-        let created = fake.workspace_create(None, "x").await.unwrap();
+        let created = fake
+            .workspace_create(None, "x", &Default::default())
+            .await
+            .unwrap();
         let pane = created.root_pane.pane_id;
         fake.agent_start("t-1", "claude", &pane, &[]).await.unwrap();
         assert_eq!(

@@ -2941,7 +2941,10 @@ mod tests {
         .await;
         let mut t = new_task(&store);
         let name = Task::agent_name_for(t.id);
-        let created = fake.workspace_create(None, &name).await.unwrap();
+        let created = fake
+            .workspace_create(None, &name, &Default::default())
+            .await
+            .unwrap();
         let pane = created.root_pane.pane_id.clone();
         fake.agent_start(&name, "claude", &pane, &[]).await.unwrap();
         fake.set_status(&pane, AgentStatus::Working);
@@ -3014,7 +3017,10 @@ mod tests {
 
     /// Start an agent named `name` in a fresh workspace; returns its pane.
     async fn start_agent(fake: &FakeHerdr, name: &str) -> String {
-        let created = fake.workspace_create(None, name).await.unwrap();
+        let created = fake
+            .workspace_create(None, name, &Default::default())
+            .await
+            .unwrap();
         fake.agent_start(name, "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
@@ -4952,7 +4958,10 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut t = new_task(&store);
         let name = Task::agent_name_for(t.id);
-        let created = fake.workspace_create(None, &name).await.unwrap();
+        let created = fake
+            .workspace_create(None, &name, &Default::default())
+            .await
+            .unwrap();
         let pane = created.root_pane.pane_id.clone();
         fake.agent_start(&name, "claude", &pane, &[]).await.unwrap();
         fake.set_status(&pane, AgentStatus::Blocked);
@@ -4985,7 +4994,10 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut t = new_task(&store);
         let name = Task::agent_name_for(t.id);
-        let created = fake.workspace_create(None, &name).await.unwrap();
+        let created = fake
+            .workspace_create(None, &name, &Default::default())
+            .await
+            .unwrap();
         let pane = created.root_pane.pane_id.clone();
         fake.agent_start(&name, "claude", &pane, &[]).await.unwrap();
         fake.set_status(&pane, AgentStatus::Working);
@@ -5046,7 +5058,10 @@ mod tests {
     async fn reconcile_adopts_live_agent_state() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let created = fake.workspace_create(None, "t-1").await.unwrap();
+        let created = fake
+            .workspace_create(None, "t-1", &Default::default())
+            .await
+            .unwrap();
         fake.agent_start("t-1", "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
@@ -5078,7 +5093,10 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut t = new_task(&store);
         let name = Task::agent_name_for(t.id);
-        let created = fake.workspace_create(None, &name).await.unwrap();
+        let created = fake
+            .workspace_create(None, &name, &Default::default())
+            .await
+            .unwrap();
         fake.agent_start(&name, "claude", &created.root_pane.pane_id, &[])
             .await
             .unwrap();
@@ -5143,7 +5161,10 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut t = new_task(&store);
         let name = Task::agent_name_for(t.id);
-        let created = fake.workspace_create(None, &name).await.unwrap();
+        let created = fake
+            .workspace_create(None, &name, &Default::default())
+            .await
+            .unwrap();
         let pane = created.root_pane.pane_id.clone();
         fake.agent_start(&name, "claude", &pane, &[]).await.unwrap();
         let launched = Instant::now();

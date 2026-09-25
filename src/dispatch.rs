@@ -153,11 +153,18 @@ async fn dispatch_steps(
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
-    let args = agents.launch_args(&spec).map_err(DispatchError::Task)?;
+    let launch = agents.launch(&spec).map_err(DispatchError::Task)?;
     let repo = match spec.repo.as_deref() {
-        Some(repo) => Some(expand_home(conn, repo, task.machine.as_deref()).await?),
+        Some(repo) => Some(expand_home(conn, "repo", repo, task.machine.as_deref()).await?),
         None => None,
     };
+    let mut env = launch.env.clone();
+    for (key, value) in env.iter_mut() {
+        if value == "~" || value.starts_with("~/") {
+            *value =
+                expand_home(conn, &format!("env {key}"), value, task.machine.as_deref()).await?;
+        }
+    }
     if let Some(dir) = repo.as_deref() {
         check_repo_exists(conn, dir, task.machine.as_deref()).await?;
     }
@@ -168,19 +175,33 @@ async fn dispatch_steps(
         let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
         (created, Some(branch))
     } else {
-        (conn.workspace_create(repo.as_deref(), name).await?, None)
+        (
+            conn.workspace_create(repo.as_deref(), name, &env).await?,
+            None,
+        )
     };
     task.workspace_id = Some(created.workspace.workspace_id.clone());
     task.pane_id = Some(created.root_pane.pane_id.clone());
     if let (Some(repo), Some(branch)) = (repo.as_deref(), branch) {
         task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
     }
+    let mut pane_id = created.root_pane.pane_id.clone();
+    if spec.worktree && !env.is_empty() {
+        // `worktree.create` and `worktree.open` take no env, so the agent
+        // gets a pane split off the worktree's with it, and the pane without
+        // it goes: a task keeps one pane, whose close ends the workspace.
+        let cwd = task.spec.checkout.as_ref().map(|c| c.path.clone());
+        let pane = conn.pane_split(&pane_id, cwd.as_deref(), &env).await?;
+        task.pane_id = Some(pane.pane_id.clone());
+        conn.pane_close(&pane_id).await?;
+        pane_id = pane.pane_id;
+    }
 
     // herdr's `agent.start` returns as soon as it has launched the agent in the
     // pane; it never reports `agent_not_ready` (its errors are about the name,
     // the kind and the pane). Readiness shows up afterwards, in `agent.list` and
     // in whether `agent.prompt` is accepted.
-    start_agent(conn, name, &spec.agent, &args, &created.root_pane.pane_id).await?;
+    start_agent(conn, name, &launch.kind, &launch.args, &pane_id).await?;
 
     let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
@@ -322,6 +343,7 @@ async fn start_agent(
 /// pastor resolves it there before asking herdr.
 async fn expand_home(
     conn: &dyn Connector,
+    what: &str,
     repo: &str,
     machine: Option<&str>,
 ) -> Result<String, DispatchError> {
@@ -330,7 +352,7 @@ async fn expand_home(
         Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
         Some(_) => {
             return Err(DispatchError::Task(format!(
-                "repo {repo}: only ~ and ~/ are expanded, not ~user; use an absolute path"
+                "{what} {repo}: only ~ and ~/ are expanded, not ~user; use an absolute path"
             )));
         }
     };
@@ -341,7 +363,7 @@ async fn expand_home(
         Some(home) if rest.is_empty() => Ok(home),
         Some(home) => Ok(format!("{}{rest}", home.trim_end_matches('/'))),
         None => Err(DispatchError::Task(format!(
-            "repo {repo}: pastor cannot tell the home directory on {machine}; \
+            "{what} {repo}: pastor cannot tell the home directory on {machine}; \
              use an absolute path"
         ))),
     }
@@ -748,6 +770,102 @@ mod tests {
         assert!(!err.is_transport());
         assert_eq!(t.state, TaskState::Failed);
         assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+    }
+
+    /// `[agents.claude-personal] kind = "claude"` with an env: herdr starts
+    /// a claude, with Claude's tool flags, in a pane that has the env, `~`
+    /// expanded against the machine's home.
+    fn personal() -> Agents {
+        let mut agents = Agents::default();
+        agents.0.insert(
+            "claude-personal".into(),
+            crate::config::AgentDef {
+                kind: Some("claude".into()),
+                env: [
+                    (
+                        "CLAUDE_CONFIG_DIR".to_string(),
+                        "~/.claude-personal".to_string(),
+                    ),
+                    ("PLAIN".to_string(), "a~b".to_string()),
+                ]
+                .into(),
+                ..Default::default()
+            },
+        );
+        agents
+    }
+
+    #[tokio::test]
+    async fn an_agent_definition_starts_its_kind_with_its_env() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "claude-personal".into(),
+            deny: vec!["WebFetch".into()],
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &personal(), READY).await.unwrap();
+        let reqs = fake.requests();
+        let ws = reqs
+            .iter()
+            .find(|r| r.method == "workspace.create")
+            .unwrap();
+        let want = serde_json::json!({
+            "CLAUDE_CONFIG_DIR": "/home/fake/.claude-personal",
+            "PLAIN": "a~b",
+        });
+        assert_eq!(ws.params["env"], want);
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "claude");
+        assert_eq!(start.params["name"], "t-7");
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!(["--model", "opus", "--disallowedTools", "WebFetch"])
+        );
+        assert_eq!(fake.pane_env(t.pane_id.as_deref().unwrap()), want);
+        assert!(!reqs.iter().any(|r| r.method == "pane.split"));
+    }
+
+    /// A worktree gets no env from herdr, so the agent runs in a pane split
+    /// off it with the env, and the pane without it is closed.
+    #[tokio::test]
+    async fn a_worktree_agent_gets_its_env_through_a_split_pane() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "claude-personal".into(),
+            worktree: true,
+            branch: Some("pastor/k1".into()),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &personal(), READY).await.unwrap();
+        let reqs = fake.requests();
+        let methods: Vec<&str> = reqs.iter().map(|r| r.method.as_str()).collect();
+        let at = |m: &str| methods.iter().position(|x| *x == m).unwrap();
+        assert!(at("worktree.create") < at("pane.split"), "{methods:?}");
+        assert!(at("pane.split") < at("pane.close"), "{methods:?}");
+        assert!(at("pane.close") < at("agent.start"), "{methods:?}");
+        let split = &reqs[at("pane.split")];
+        assert_eq!(split.params["target_pane_id"], "w1:p1");
+        assert_eq!(split.params["cwd"], "/fake/worktrees/pastor-k1");
+        assert_eq!(reqs[at("pane.close")].params["pane_id"], "w1:p1");
+        let pane = t.pane_id.clone().unwrap();
+        assert_ne!(pane, "w1:p1");
+        assert_eq!(reqs[at("agent.start")].params["pane_id"], pane.as_str());
+        assert_eq!(
+            fake.pane_env(&pane)["CLAUDE_CONFIG_DIR"],
+            "/home/fake/.claude-personal"
+        );
+        assert_eq!(t.workspace_id.as_deref(), Some("w1"));
+
+        // Without an env, a worktree task keeps herdr's own pane.
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            worktree: true,
+            branch: Some("pastor/k2".into()),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &personal(), READY).await.unwrap();
+        assert!(!fake.requests().iter().any(|r| r.method == "pane.split"));
+        assert_eq!(t.pane_id.as_deref(), Some("w1:p1"));
     }
 
     #[tokio::test]
