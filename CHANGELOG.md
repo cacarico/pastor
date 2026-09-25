@@ -5,6 +5,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- A release workflow (`.github/workflows/release.yml`). Pushing a `vX.Y.Z`
+  tag builds static musl binaries for x86_64, aarch64, armv7 and riscv64
+  Linux and native macOS arm64 and x86_64 binaries, packs each as
+  `pastor-<version>-<target>.tar.gz` with `SHA256SUMS`, attests their build
+  provenance, and drafts a GitHub release with that version's changelog
+  section as notes.
+
 ### Changed
 
 - `cargo install` and `make install` install only the `pastor` binary

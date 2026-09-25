@@ -1,0 +1,43 @@
+# Puts a pinned zig and cargo-zigbuild on the PATH for cross-compiling to
+# the musl and BSD targets. libsqlite3-sys (rusqlite's bundled SQLite) needs
+# a C compiler that knows the target, and zig is one download that covers
+# every one of them. The zig tarball is pinned by version and checksum, as
+# gitleaks.yml pins gitleaks, and cargo-zigbuild by version through cargo.
+# The cargo-zigbuild install is skipped when the pinned version is already
+# there, which is what Swatinem/rust-cache restores in ci.yml; release.yml
+# uses no cache on purpose and builds it every time.
+name: zig
+description: Install pinned zig and cargo-zigbuild on a Linux runner
+
+runs:
+  using: composite
+  steps:
+    - name: Install zig
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      env:
+        ZIG_VERSION: 0.16.0
+        # From https://ziglang.org/download/index.json, entry 0.16.0.
+        SHA256_X86_64: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+        SHA256_AARCH64: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+      run: |
+        case "$(uname -m)" in
+          x86_64) sum="$SHA256_X86_64" ;;
+          aarch64) sum="$SHA256_AARCH64" ;;
+          *) echo "no pinned zig for $(uname -m)" >&2; exit 1 ;;
+        esac
+        name="zig-$(uname -m)-linux-${ZIG_VERSION}"
+        curl -sSfL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/${name}.tar.xz"
+        echo "${sum}  zig.tar.xz" | sha256sum -c -
+        tar -xJf zig.tar.xz
+        echo "${RUNNER_TEMP}/${name}" >> "$GITHUB_PATH"
+    - name: Install cargo-zigbuild
+      shell: bash
+      env:
+        ZIGBUILD_VERSION: 0.23.4
+      run: |
+        if ! cargo-zigbuild --version 2>/dev/null | grep -qx "cargo-zigbuild ${ZIGBUILD_VERSION}"; then
+          cargo install --locked "cargo-zigbuild@${ZIGBUILD_VERSION}"
+        fi
+        cargo-zigbuild --version
+        zig version

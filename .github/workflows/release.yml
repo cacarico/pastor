@@ -1,0 +1,189 @@
+# Builds the binaries for a version tag and drafts the GitHub release. Only
+# the pastor binary ships; fake-herdr is a test double. Linux binaries are
+# static musl builds made with zig, so one tarball per architecture runs on
+# every distro and every Raspberry Pi OS release: a glibc build from a
+# current distro refuses to start on an older one. macOS is built natively on
+# the arm64 runner, the x86_64 binary through Xcode's cross support. Nothing
+# here uses a build cache: release builds are rare, and a poisoned cache is
+# the usual way a release job gets compromised. Every action is pinned to a
+# commit, and the release is created as a draft that the owner reads and
+# publishes by hand, so a bad build never becomes the "latest" that
+# install.sh and cargo-binstall pick up. The tarballs and SHA256SUMS get a
+# GitHub build provenance attestation, so a download can be tied back to
+# this workflow, this commit and this tag with `gh attestation verify`.
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The tag must name the version Cargo.toml carries, and CHANGELOG.md must
+  # have that version's section because the release notes come from it; a
+  # prerelease (v1.2.3-rc.1) may still be under "Unreleased". `make check`
+  # runs again here because a tag can point at a commit that never went
+  # through a pull request. The tag's signature is not checked: that needs
+  # an allowed-signers file in the repository, which is a decision of its
+  # own; `--verify-tag` below only checks that the tag exists on GitHub.
+  verify:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      section: ${{ steps.version.outputs.section }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$tag" != "$crate" ]; then
+            echo "tag v$tag does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+          section="${tag%%-*}"
+          if grep -q "^## $section " CHANGELOG.md; then
+            :
+          elif [ "$tag" != "$section" ] && grep -q '^## Unreleased' CHANGELOG.md; then
+            section=Unreleased
+          else
+            echo "CHANGELOG.md has no section for $section" >&2
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+          echo "section=$section" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1, 2026-09-12
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: make check
+
+  # One tarball per target, named pastor-<version>-<target>.tar.gz, which is
+  # what install.sh and the binstall metadata in Cargo.toml expect. The
+  # smoke step runs the binary where the runner can execute it: it catches
+  # a build that links but cannot start, which a cross-compile alone would
+  # not.
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+            smoke: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            zig: true
+            smoke: true
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-24.04
+            zig: true
+            smoke: false
+          - target: riscv64gc-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+            smoke: false
+          - target: aarch64-apple-darwin
+            os: macos-15
+            zig: false
+            smoke: true
+          - target: x86_64-apple-darwin
+            os: macos-15
+            zig: false
+            smoke: false
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.verify.outputs.version }}
+      ZIG: ${{ matrix.zig }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1, 2026-09-12
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - if: matrix.zig
+        uses: ./.github/actions/zig
+      - name: Build
+        run: |
+          if [ "$ZIG" = true ]; then
+            cargo zigbuild --release --locked --target "$TARGET" --bin pastor
+          else
+            cargo build --release --locked --target "$TARGET" --bin pastor
+          fi
+      - name: Smoke
+        if: matrix.smoke
+        run: |
+          bin="target/$TARGET/release/pastor"
+          "$bin" --version
+          PASTOR_CONFIG_DIR="$(mktemp -d)" PASTOR_STATE_DIR="$(mktemp -d)" "$bin" machine list
+      - name: Package
+        run: |
+          dir="pastor-$VERSION-$TARGET"
+          mkdir -p "$dir/completions"
+          cp "target/$TARGET/release/pastor" LICENSE README.md CHANGELOG.md "$dir/"
+          cp contrib/completions/pastor.bash contrib/completions/pastor.fish "$dir/completions/"
+          case "$TARGET" in
+            *-linux-*) cp -r contrib/systemd "$dir/systemd" ;;
+          esac
+          tar -czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: pastor-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release and upload its assets
+      id-token: write # Sigstore's OIDC identity for the attestation
+      attestations: write # store the attestation on the repository
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      SECTION: ${{ needs.verify.outputs.section }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum pastor-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/pastor-*.tar.gz
+            dist/SHA256SUMS
+      # The section's body without its heading; the heading is the release
+      # title. `verify` already checked the section exists.
+      - name: Release notes from the changelog
+        run: |
+          awk -v s="$SECTION" '/^## /{ if (p) exit; p = ($2 == s); next } p' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "CHANGELOG.md section $SECTION is empty" >&2
+            exit 1
+          fi
+          cat notes.md
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(--draft --verify-tag --title "pastor $VERSION" --notes-file notes.md)
+          case "$GITHUB_REF_NAME" in
+            *-*) args+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "${args[@]}" dist/* install.sh
