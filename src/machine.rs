@@ -40,6 +40,21 @@ struct PaneReused {
     expected: String,
 }
 
+/// Auto-close's fresh check found the agent of a done task idle, matching the
+/// row, but its `completion_seq` (or `state_change_seq`, absent that) has
+/// moved past the row's `last_completion_seq`: a whole work cycle finished
+/// since, unseen by reconcile. Not a failure; the row needs reconcile's
+/// settle window to catch up before it can be closed.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the agent's sequence moved past the row's baseline {baseline} (state_change_seq {state_change_seq}, completion_seq {completion_seq:?})"
+)]
+struct SequenceMoved {
+    state_change_seq: u64,
+    completion_seq: Option<u64>,
+    baseline: u64,
+}
+
 /// Whether an error from the connected loop means the machine is gone. Only a
 /// transport failure or a request that never answered does; a herdr API error
 /// or a local store error leaves the machine reachable, and reporting it as
@@ -1172,6 +1187,32 @@ impl Actor {
         {
             return Err(NotIdle(agent.agent_status).into());
         }
+        // Idle here too, but a whole work cycle may have finished since the
+        // row went `Done`, unseen by any reconcile in between (it never
+        // showed `working`, only idle before and idle after): a moved
+        // `completion_seq` (or `state_change_seq`, when herdr reports no
+        // `completion_seq`) past the row's baseline means exactly that.
+        // Closing now would destroy that unsettled completion; leave the row
+        // for reconcile's settle window to catch up on instead.
+        if by == CloseBy::AutoClose
+            && let Some((pane, _)) = &target
+            && let Some(agent) = agents.iter().find(|a| &a.pane_id == pane)
+            && let Some(t) = &row
+        {
+            let baseline = t.last_completion_seq.unwrap_or(0);
+            let moved = match agent.completion_seq {
+                Some(seq) => seq > baseline,
+                None => agent.state_change_seq > baseline,
+            };
+            if moved {
+                return Err(SequenceMoved {
+                    state_change_seq: agent.state_change_seq,
+                    completion_seq: agent.completion_seq,
+                    baseline,
+                }
+                .into());
+            }
+        }
         let Some((pane, workspace)) = target else {
             return match row {
                 Some(t) if remove_worktree => {
@@ -1371,6 +1412,9 @@ impl Actor {
                 }
                 Err(err) if err.is::<PaneReused>() => {
                     tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed: its pane holds another agent now");
+                }
+                Err(err) if err.is::<SequenceMoved>() => {
+                    tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed: a new completion has not settled yet");
                 }
                 Err(err) => {
                     tracing::warn!(machine = %self.name, task = %t.display_id(), err = format!("{err:#}"), "auto-close failed; trying again at the next reconcile");
@@ -3388,6 +3432,46 @@ mod tests {
         assert!(count(&mut events, "task.closed", t.id).is_empty());
     }
 
+    /// A done task whose agent ran a whole extra work cycle -- working, then
+    /// idle again -- that no reconcile ever caught mid-flight: auto-close's
+    /// fresh check finds it idle, matching the row, but its `state_change_seq`
+    /// has moved past the row's baseline. Closing now would destroy that
+    /// unsettled completion; it must skip and leave the row for reconcile's
+    /// settle window instead.
+    #[tokio::test]
+    async fn auto_close_skips_an_agent_whose_sequence_moved() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut t = new_task(&store);
+        let pane = start_agent(&fake, &Task::agent_name_for(t.id)).await;
+        fake.set_status_silently(&pane, AgentStatus::Idle);
+        let baseline = fake.agents()[0].state_change_seq;
+        t.state = TaskState::Done;
+        t.machine = Some("m".into());
+        t.pane_id = Some(pane.clone());
+        t.agent_name = Some(Task::agent_name_for(t.id));
+        t.last_completion_seq = Some(baseline);
+        t.finished_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.update_task(&mut t).unwrap();
+        // The unobserved cycle: back to idle, but the sequence moved twice
+        // (idle -> working -> idle), with no event and no reconcile in between.
+        fake.set_status_silently(&pane, AgentStatus::Working);
+        fake.set_status_silently(&pane, AgentStatus::Idle);
+        assert!(fake.agents()[0].state_change_seq > baseline);
+        let (h, mut events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let before = lists(&fake);
+        wait_for("a few reconciles", || lists(&fake) >= before + 4).await;
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
+        assert_eq!(fake.agents().len(), 1);
+        assert!(count(&mut events, "task.closed", t.id).is_empty());
+    }
+
     /// A done task, past its grace period, whose agent is idle in herdr but
     /// turns `Working` between a reconcile's `agent.list` and the fresh one
     /// auto-close makes before closing. Returns the running machine, its
@@ -3496,7 +3580,9 @@ mod tests {
         t.machine = Some("m".into());
         t.pane_id = Some(pane);
         t.agent_name = Some(Task::agent_name_for(t.id));
-        t.last_completion_seq = Some(0);
+        // The launch itself is a state change (see `FakeHerdr::agent_start`),
+        // so the row's baseline is the sequence already settled at, not 0.
+        t.last_completion_seq = Some(fake.agents()[0].state_change_seq);
         t.finished_at = Some(Utc::now() - chrono::Duration::hours(1));
         store.update_task(&mut t).unwrap();
         let (events, _rx) = broadcast::channel(64);
