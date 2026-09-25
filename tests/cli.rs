@@ -925,23 +925,24 @@ fn machine_status_creates_the_ssh_dir_private_before_ssh_runs() {
     }
 }
 
-/// systemd counts SIGTERM as a clean exit and would not restart a
-/// `Restart=on-failure` unit after one; `pastor serve` used to only handle
-/// SIGINT (ctrl-c), so a SIGTERM from a plain `kill`, `systemctl stop` of a
-/// wrapper, or a stray signal killed the head silently, with the socket
-/// file left behind and the unit never coming back. Drives a real `pastor
-/// serve` child (`serve` refuses an empty flock, so a fake-herdr-backed
-/// machine is needed too), sends it SIGTERM and checks that it exits
-/// cleanly, removes its socket, and logs which signal it got.
+/// systemd counts SIGTERM and SIGHUP as a clean exit and would not restart a
+/// `Restart=on-failure` unit after either; `pastor serve` used to only
+/// handle SIGINT (ctrl-c), so a SIGTERM or SIGHUP from a plain `kill`,
+/// `systemctl stop` of a wrapper, or a stray signal killed the head
+/// silently, with the socket file left behind and the unit never coming
+/// back. Drives a real `pastor serve` child (`serve` refuses an empty
+/// flock, so a fake-herdr-backed machine is needed too), sends it the given
+/// signal and checks that it exits cleanly, removes its socket, and logs
+/// which signal it got.
 /// Kills `serve` and `herdr` on drop, mirroring `Env::drop` above, so a
 /// failing assertion anywhere in the test never leaves either process
 /// running.
-struct SigtermEnv {
+struct ServeEnv {
     serve: std::process::Child,
     herdr: std::process::Child,
 }
 
-impl Drop for SigtermEnv {
+impl Drop for ServeEnv {
     fn drop(&mut self) {
         for child in [&mut self.serve, &mut self.herdr] {
             let _ = child.kill();
@@ -950,8 +951,11 @@ impl Drop for SigtermEnv {
     }
 }
 
-#[test]
-fn sigterm_shuts_the_daemon_down_cleanly() {
+/// Shared body for the SIGTERM and SIGHUP regression tests: `signal` is the
+/// `kill` flag (`TERM`, `HUP`), which also names the log line to expect
+/// (`SIGTERM`, `SIGHUP`) since `ExtraSignals::recv` labels each branch that
+/// way.
+fn assert_daemon_shuts_down_cleanly_on(signal: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
@@ -987,7 +991,7 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
         .stderr(std::fs::File::create(&stderr_path).unwrap())
         .spawn()
         .unwrap();
-    let mut env = SigtermEnv { serve, herdr };
+    let mut env = ServeEnv { serve, herdr };
 
     let cmd = |args: &[&str]| -> std::process::Output {
         pastor()
@@ -1012,8 +1016,9 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
     }
 
     let pid = env.serve.id().to_string();
-    let killed = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
-    assert!(killed.success(), "kill -TERM {pid} failed to run");
+    let flag = format!("-{signal}");
+    let killed = Command::new("kill").args([&flag, &pid]).status().unwrap();
+    assert!(killed.success(), "kill {flag} {pid} failed to run");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let exit = loop {
@@ -1022,7 +1027,7 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
         }
         assert!(
             Instant::now() < deadline,
-            "pastor serve did not exit within 5s of SIGTERM"
+            "pastor serve did not exit within 5s of SIG{signal}"
         );
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -1031,12 +1036,20 @@ fn sigterm_shuts_the_daemon_down_cleanly() {
     let socket_file = state.join("pastor.sock");
     assert!(
         !socket_file.exists(),
-        "pastor.sock was left behind after SIGTERM"
+        "pastor.sock was left behind after SIG{signal}"
     );
 
     let log = std::fs::read_to_string(&stderr_path).unwrap();
-    assert!(
-        log.contains("SIGTERM"),
-        "log did not mention SIGTERM: {log}"
-    );
+    let label = format!("SIG{signal}");
+    assert!(log.contains(&label), "log did not mention {label}: {log}");
+}
+
+#[test]
+fn sigterm_shuts_the_daemon_down_cleanly() {
+    assert_daemon_shuts_down_cleanly_on("TERM");
+}
+
+#[test]
+fn sighup_shuts_the_daemon_down_cleanly() {
+    assert_daemon_shuts_down_cleanly_on("HUP");
 }
