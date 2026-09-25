@@ -867,6 +867,7 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 enum RequestReadError {
     TooLarge,
     TimedOut,
+    NotUtf8,
     Io,
 }
 
@@ -888,8 +889,9 @@ async fn read_request<R: tokio::io::AsyncRead + Unpin>(
     if content > max {
         return Err(RequestReadError::TooLarge);
     }
-    // Not UTF-8 is not JSON either; let the parser say so.
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    // Strict, never lossy: U+FFFD in place of bad bytes could turn a
+    // malformed line into a valid request with different parameters.
+    String::from_utf8(buf).map_err(|_| RequestReadError::NotUtf8)
 }
 
 /// SIGTERM and SIGHUP, alongside ctrl_c's SIGINT, so `run_with_listener` can
@@ -1112,6 +1114,9 @@ impl Daemon {
                                 "request_too_large",
                                 format!("a request is at most {MAX_IPC_REQUEST} bytes"),
                             ),
+                            Err(RequestReadError::NotUtf8) => {
+                                IpcResponse::error("invalid_request", "a request must be UTF-8")
+                            }
                             Err(_) => return,
                         };
                         let mut out = serde_json::to_string(&resp).unwrap_or_else(|e| format!("{{\"kind\":\"error\",\"code\":\"internal\",\"message\":\"{e}\"}}"));
@@ -2972,6 +2977,11 @@ mod tests {
         assert!(matches!(
             read(b"0123456789abcdefg\n", 16).await,
             Err(RequestReadError::TooLarge)
+        ));
+        // Malformed UTF-8 is refused, never patched into U+FFFD and parsed.
+        assert!(matches!(
+            read(b"{\"a\":\"\xff\"}\n", 16).await,
+            Err(RequestReadError::NotUtf8)
         ));
         let (_client, server) = tokio::io::duplex(64);
         let started = Instant::now();
