@@ -2030,4 +2030,15 @@ fn a_task_waits_for_its_flock_end_to_end() {
         assert!(Instant::now() < deadline, "never dispatched: {t}");
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    // The head removes an empty flock itself, and refuses a run in it at once.
+    ok(env.cmd(&["flock", "add", "spare"]));
+    assert!(
+        ok(env.cmd(&["flock", "remove", "spare"])).contains("picked it up"),
+        "the head did the removal"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["task", "run", "x", "--flock", "spare"])),
+        "unknown_flock"
+    );
 }

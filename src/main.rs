@@ -908,10 +908,24 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
             }
         }
         FlockCmd::Remove { name } => {
-            let queued: Vec<String> = queued_tasks(paths)
-                .await?
+            // With a head, the head checks and edits under the lock `task
+            // run` takes, so no task can be queued in the flock in between.
+            if daemon_running(&paths.socket_file()).await {
+                require_flock_head(paths).await?;
+                let IpcResponse::Text(done) = ask(paths, IpcRequest::FlockRemove { name }).await?
+                else {
+                    unreachable!()
+                };
+                println!("{done}");
+                return Ok(());
+            }
+            let queued: Vec<String> = open_store(paths)?
+                .list_tasks(&TaskFilter {
+                    states: Some(vec![TaskState::Queued]),
+                    flock: Some(name.clone()),
+                    ..Default::default()
+                })?
                 .iter()
-                .filter(|t| t.flock.as_deref() == Some(name.as_str()))
                 .map(|t| t.display_id())
                 .collect();
             edit(&|d| d.remove_flock(&name, &queued))?;

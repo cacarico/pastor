@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
-use crate::config::flock::{Flock, MachineConfig, TaskFlockError};
+use crate::config::flock::{EditError, Flock, FlockDoc, MachineConfig, TaskFlockError};
 use crate::config::{PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
@@ -482,6 +482,35 @@ impl Fleet {
             .map_err(QueueError::Store)
     }
 
+    /// `flock remove` with a head running: refuse while queued tasks name
+    /// the flock (`FlockDoc::remove_flock`), else take it out of `file` and
+    /// of the wanted flock. All under the dispatch lock that `queue_run`
+    /// takes, so a `task run --flock` either queued first, and is seen here,
+    /// or comes after and finds the flock gone; checking in the CLI and then
+    /// editing let one queue in between and wait forever. The wanted flock
+    /// changes here, not on the reload that follows, since `queue_run` reads
+    /// it. The flock has no machines (or the edit is refused), so no actor
+    /// needs to change. An `EditError` comes back inside the error.
+    pub async fn remove_flock(&self, file: &std::path::Path, name: &str) -> anyhow::Result<()> {
+        let _pass = self.dispatch_lock.lock().await;
+        let queued: Vec<String> = self
+            .store
+            .queued_tasks()?
+            .iter()
+            .filter(|t| t.flock.as_deref() == Some(name))
+            .map(|t| t.display_id())
+            .collect();
+        let mut doc = FlockDoc::open(file)?;
+        doc.remove_flock(name, &queued)?;
+        doc.save(file)?;
+        self.wanted
+            .write()
+            .unwrap()
+            .flocks
+            .retain(|f| f.name != name);
+        Ok(())
+    }
+
     /// `queue_task` for a retry of task `id` (`Store::insert_retry`). The
     /// copy keeps the original's pin, so the pin gets the same check under
     /// the same lock. A row that is missing or not retryable is left for
@@ -855,6 +884,28 @@ impl Daemon {
                 }
             }
             IpcRequest::FlockList => IpcResponse::Machines(self.fleet.statuses()),
+            IpcRequest::FlockRemove { name } => {
+                if let Err(err) = self
+                    .fleet
+                    .remove_flock(&self.paths.flock_file(), &name)
+                    .await
+                {
+                    return match err.downcast_ref::<EditError>() {
+                        Some(e) => IpcResponse::error(e.code(), e),
+                        None => IpcResponse::error("runtime_error", format!("{err:#}")),
+                    };
+                }
+                // The file changed on disk; the reload brings the scheduler's
+                // view of it up to date. The flock is already out of dispatch.
+                match self.scheduler.reload().await {
+                    Ok(_) => IpcResponse::Text(format!(
+                        "removed flock {name}; the running pastor serve picked it up"
+                    )),
+                    Err(err) => IpcResponse::Text(format!(
+                        "removed flock {name}; the reload after it failed ({err}); run `pastor job reload`"
+                    )),
+                }
+            }
             IpcRequest::Tick { job, dry_run } => match self.scheduler.tick(job, dry_run).await {
                 Ok(runs) => IpcResponse::Runs(runs),
                 Err(err) => IpcResponse::error("scheduler_error", err),
@@ -1682,6 +1733,120 @@ mod tests {
                 ..spec()
             },
             flock: flock.map(Into::into),
+        }
+    }
+
+    /// `home_and_work` plus `spare`, a flock with no machine.
+    async fn spare_daemon() -> (Daemon, tempfile::TempDir) {
+        let mut flock = home_and_work();
+        flock.flocks.push(crate::config::flock::FlockEntry {
+            name: "spare".into(),
+            default: false,
+        });
+        daemon_with_flock(
+            flock,
+            &[("h", 2, FakeHerdr::new()), ("w", 2, FakeHerdr::new())],
+        )
+        .await
+    }
+
+    /// The head removes a flock: refused while a queued task names it, and
+    /// once it is gone a `task run` in it is refused at once, before any
+    /// reload, and the file no longer has it.
+    #[tokio::test]
+    async fn flock_remove_goes_through_the_head() {
+        let (d, tmp) = spare_daemon().await;
+        let IpcResponse::Task(t) = d.handle(run_in(Some("spare"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let resp = d
+            .handle(IpcRequest::FlockRemove {
+                name: "spare".into(),
+            })
+            .await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "flock_has_tasks");
+        assert!(message.contains(&t.display_id()), "{message}");
+        d.handle(IpcRequest::TaskClose {
+            id: t.id,
+            remove_worktree: false,
+        })
+        .await;
+        let resp = d
+            .handle(IpcRequest::FlockRemove {
+                name: "spare".into(),
+            })
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        let resp = d.handle(run_in(Some("spare"), None)).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "unknown_flock"),
+            "{resp:?}"
+        );
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        assert!(!Flock::load(&paths.flock_file()).unwrap().has_flock("spare"));
+        let resp = d
+            .handle(IpcRequest::FlockRemove {
+                name: "home".into(),
+            })
+            .await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "flock_is_default"),
+            "{resp:?}"
+        );
+    }
+
+    /// A `flock remove` and a `task run` in that flock that race each other
+    /// are ordered by the dispatch lock (tokio's mutex is fair, so the one
+    /// that waited first goes first): whichever loses sees what the winner
+    /// did. Before, the CLI checked for queued tasks and then edited the
+    /// file, and a run landing in between waited forever in a removed flock.
+    #[tokio::test]
+    async fn flock_remove_and_run_are_ordered_by_the_dispatch_lock() {
+        for remove_first in [true, false] {
+            let (d, tmp) = spare_daemon().await;
+            let fleet = d.fleet();
+            let file = Paths::new(tmp.path().join("c"), tmp.path().join("s")).flock_file();
+            let held = fleet.dispatch_lock.lock().await;
+            let remove = {
+                let fleet = fleet.clone();
+                async move { fleet.remove_flock(&file, "spare").await }
+            };
+            let run = {
+                let fleet = fleet.clone();
+                async move { fleet.queue_run("x".into(), spec(), Some("spare")).await }
+            };
+            // Each waits on the held lock before the next is started.
+            let (remove, run) = if remove_first {
+                let remove = tokio::spawn(remove);
+                tokio::task::yield_now().await;
+                (remove, tokio::spawn(run))
+            } else {
+                let run = tokio::spawn(run);
+                tokio::task::yield_now().await;
+                (tokio::spawn(remove), run)
+            };
+            tokio::task::yield_now().await;
+            drop(held);
+            let (remove, run) = (remove.await.unwrap(), run.await.unwrap());
+            if remove_first {
+                remove.unwrap();
+                assert!(
+                    matches!(run, Err(QueueError::Flock(TaskFlockError::UnknownFlock(_)))),
+                    "{run:?}"
+                );
+            } else {
+                assert_eq!(run.unwrap().flock.as_deref(), Some("spare"));
+                let err = remove.unwrap_err();
+                assert_eq!(
+                    err.downcast_ref::<EditError>().map(EditError::code),
+                    Some("flock_has_tasks"),
+                    "{err:#}"
+                );
+            }
         }
     }
 

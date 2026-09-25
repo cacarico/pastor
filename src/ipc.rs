@@ -40,6 +40,11 @@ pub enum IpcRequest {
         lines: u32,
     },
     FlockList,
+    /// `flock remove`, done by the head so the queued-task check and the
+    /// edit of flock.toml are one step against `Run`. Answers `Text`.
+    FlockRemove {
+        name: String,
+    },
     /// One scheduler pass now; `job` forces that job regardless of schedule.
     Tick {
         job: Option<String>,
