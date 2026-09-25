@@ -22,6 +22,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `--flock` on `machine add`, `machine list` and `task list`. `task list`,
   `task show` and `job list` show the flock, and task events carry it in the
   task row.
+- `pastor task send <task> [TEXT] [--key K]... [--no-enter]` types into a
+  live task's agent through the head, to answer what it is waiting on without
+  attaching. Only starting, running and blocked tasks take input
+  (`task_not_live`). Each send emits `task.input`, which records the key
+  names and the text length, never the text.
+- Saved repo trust. `pastor task send <task> --trust` presses the agent's
+  folder-trust keys and saves the task's machine and repo; the head then
+  answers the trust prompt of that repo's later tasks on that machine on its
+  own, once per task, and emits `task.trusted`. `[agents.<name>] trust_keys`
+  in `pastor.toml` sets the keys (Claude's, `Down` then `Enter`, are built
+  in). `pastor trust list [--json]` and `pastor trust remove <machine>
+  <repo>` show and revoke it.
+- Events carry an optional `detail` object for what they add beyond their
+  ids; records without one are unchanged.
 
 ### Changed
 
@@ -33,7 +47,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `machine add|remove` and the new flock commands edit `flock.toml` in place,
   keeping comments and layout; they used to rewrite the whole file.
 - The database is schema 4: each task stores its flock. Rows from before
-  flocks join the default flock.
+  flocks join the default flock. Schema 5 adds the `trusted_repos` table
+  and a `trust_sent` flag on each task.
 
 ## 0.3.0 - 2026-09-25
 

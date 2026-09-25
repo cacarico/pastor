@@ -35,6 +35,8 @@ pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api'
 pastor task list                         # queued, starting, running, blocked
 pastor task read t-1                     # the agent's recent output
 pastor task attach t-1                   # sit in its terminal; ctrl+b q detaches
+pastor task send t-1 --trust             # accept its folder-trust prompt, and trust that repo
+pastor task send t-1 "yes, go on"        # or type an answer to what it is waiting on
 ```
 
 A job is one TOML file in `~/.config/pastor/jobs/`. This one starts an agent

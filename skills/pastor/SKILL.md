@@ -73,7 +73,7 @@ States:
 - `queued`: accepted, no machine has a free slot or the tag yet.
 - `starting`: pastor is creating the workspace and starting the agent.
 - `running`: the agent is working.
-- `blocked`: the agent is waiting on a permission prompt or question. Nobody answers it unless a human attaches.
+- `blocked`: the agent is waiting on a permission prompt or question. Nobody answers it unless someone sends input (`pastor task send`) or attaches.
 - `done`: the agent went idle after pastor saw it work, and stayed idle for `settle` (10s by default). It means the agent stopped, not that the work is good; read the output.
 - `stale`: the timeout passed without `done`. The agent is left running.
 - `failed`: dispatch failed or the agent exited before it was done. `task show` has the error.
@@ -91,6 +91,18 @@ pastor task prune --done --older-than 3d   # deletes finished rows; --failed and
 ```
 
 `retry` re-dispatches the task's job, item, prompt and dispatch settings as a new task; the old agent may still be running under its own id. `close` also closes an orphaned agent, a `t-N` pane with no open task. `prune` never deletes a row whose worktree may still be on disk; it names the ones it keeps, and `task close t-N --remove-worktree` clears them so the next prune takes them. A pruned task's item stays seen, so a job never queues it again.
+
+## Answering a blocked task
+
+```bash
+pastor task read t-12                       # see what it is asking first
+pastor task send t-12 "yes, go on"          # types the text, then Enter; --no-enter leaves Enter out
+pastor task send t-12 --key esc             # named keys, in order; repeat --key
+pastor task send t-12 --trust               # accept the folder-trust prompt, and trust that repo on that machine
+pastor trust list                           # saved (machine, repo) pairs; pastor trust remove <machine> <repo>
+```
+
+Only starting, running and blocked tasks take input (`task_not_live` otherwise). Read the pane before you answer; never send what a human should decide. Once a repo is trusted on a machine, the head answers the trust prompt of its later tasks there by itself, once per task (`task.trusted`), worktrees included. `--trust` needs `trust_keys` for the agent (Claude has them built in); `no_trust_keys` otherwise.
 
 ## Jobs
 
@@ -166,7 +178,7 @@ You are a pastor task when `HERDR_ENV=1` is set, your herdr agent and workspace 
 - `failed` with `agent_pane_busy`: herdr refused to start the agent because the pane was not at an idle shell prompt.
 - `failed` with "agent t-N not found": the agent's pane vanished before it was done (closed by hand, herdr restarted, or the agent crashed).
 - `failed` soon after start: the agent is usually not installed, or not on the PATH herdr sees on that machine.
-- `blocked` right after start: often Claude's "trust this folder" dialog on a repo that machine has not seen. A human has to answer it once with `pastor task attach`.
+- `blocked` right after start: often Claude's "trust this folder" dialog on a repo that machine has not seen. Check with `pastor task read`, then `pastor task send t-N --trust` answers it and saves the repo as trusted, so its next tasks on that machine go through on their own.
 - A machine `polling`: herdr answers requests but its event stream will not open. It still takes tasks; pastor checks them every tick and keeps trying to subscribe.
 - A machine `reconnecting`: herdr is unreachable. Its tasks are reconciled when it comes back.
 - A `timeout` error from the CLI: the head may still carry the request out. Check `pastor task list` before sending it again, or you may queue a duplicate.

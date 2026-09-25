@@ -136,11 +136,32 @@ A task that reaches `done` is closed by pastor after `close_done_after`
 worktree pastor created is removed if it is clean and kept with a note if it
 is not, and the task shows as `closed`. Failed and stale tasks are left for
 `pastor task retry`; blocked tasks need their prompt answered
-(`pastor task attach`) or `pastor task close`. None of them is closed on its
+(`pastor task send` or `pastor task attach`) or `pastor task close`. None of them is closed on its
 own. The grace period keeps the pane there for `pastor task attach`; the
 check runs with each reconcile, while the machine is connected. An agent
 that herdr shows working or blocked again
 at that moment is left alone, and its task goes back to running or blocked.
+
+`pastor task send t-3 "yes, go on"` types into the pane of a live task
+(starting, running or blocked) and presses Enter; `--no-enter` leaves Enter
+out, and each `--key K` presses one named key after the text, in order
+(`--key esc`, `--key Down --key Enter`; herdr's key names). It goes through
+the head to the task's machine; anything else answers `task_not_live`. Each
+send is a `task.input` event recording the key names and the length of the
+text, never the text, which may be a secret.
+
+An agent started in a folder it has not seen stops at its folder-trust
+prompt, and a worktree is always a new folder. `pastor task send t-3
+--trust` presses the agent's trust keys (`trust_keys` under `[agents.<name>]`
+in `pastor.toml`; Claude's are built in as `Down`, `Enter`) and saves the
+task's machine and repo, the `--repo` as given, so every worktree of that
+repo counts. An agent without trust keys answers `no_trust_keys`, and a task
+without `--repo` gets the keys but nothing is saved. From then on, when a task
+of a saved repo is blocked during startup on that machine, the head presses
+the trust keys itself, once per task, and emits `task.trusted`; a task still
+blocked after that is left for a human. `pastor trust list [--json]` shows
+the saved pairs and `pastor trust remove <machine> <repo>` forgets one; both
+work with `pastor serve` down.
 
 Everything else pastor closes only when asked; three commands do it, all
 with `--json`. `pastor task retry t-4` queues a new task
@@ -275,7 +296,8 @@ A record, which is also what plugin event hooks will get on stdin:
 
 - `at`: when the daemon received the event, RFC 3339 UTC.
 - `type`: `task.queued|running|blocked|done|stale|failed|closed`,
-  `job.failed`, `machine.connected`, `machine.lost`.
+  `task.input` (`pastor task send`), `task.trusted` (the head answered a
+  trust prompt), `job.failed`, `machine.connected`, `machine.lost`.
 - `task`: the full task row (the same object as `pastor task show --json`) at
   that moment, on `task.*` events; `null` otherwise or if the row is gone.
   `task.flock` is the task's flock, so a hook can route work and personal
@@ -287,6 +309,10 @@ A record, which is also what plugin event hooks will get on stdin:
   `endpoint`, `channel`, `herdr_version`, `pastor_version`, `protocol`,
   `error`, `live`, `max_agents`, `tags`, `flock`); `null` on other events.
   A task's machine is `task.machine`.
+- `detail`: only on events that carry more, and absent otherwise. On
+  `task.input`, `keys` (the key names pressed, Enter included), `text_len`
+  (the length of any text) and `trust` (sent by `--trust`); on
+  `task.trusted`, `keys`.
 
 Fields may be added; none will be renamed or removed. Unreadable lines (a
 torn write, a hand edit) are skipped.
@@ -471,10 +497,10 @@ like connector logs.
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, defaults (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, defaults, agents (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks (schema 4, with retry_of and flock), seen keys, job state
+~/.local/state/pastor/pastor.db   tasks (schema 5, with retry_of, flock and trust_sent), seen keys, job state, trusted repos
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
@@ -503,6 +529,8 @@ agent = "claude"
 agent_args = []              # e.g. ["--model", "claude-opus-5-5"]
 max_tasks_per_run = 5
 timeout = "2h"
+[agents.claude]              # one table per agent that needs one
+trust_keys = ["Down", "Enter"]   # accept its folder-trust prompt; [] for none
 ```
 
 ## Shell completions
