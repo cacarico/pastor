@@ -1,8 +1,9 @@
+use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
-use pastor::cli::request_failure;
+use pastor::cli::{CliError, request_failure};
 use pastor::config::flock::{EditError, Flock, FlockDoc, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
@@ -118,7 +119,13 @@ enum JobCmd {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    prompt: String,
+    /// What the agent is asked to do (or --prompt-file)
+    #[arg(required_unless_present = "prompt_file")]
+    prompt: Option<String>,
+    /// Read the prompt from this file on this machine ('-' for stdin); it
+    /// spares long prompts the shell's quoting
+    #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+    prompt_file: Option<String>,
     #[arg(long)]
     repo: Option<String>,
     /// Only this flock's machines take the task (default: the flock of
@@ -412,13 +419,44 @@ fn flocks_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).map_or(true, |f| !f.flocks.is_empty())
 }
 
+/// The prompt of `pastor task run`: the positional one as given, or the
+/// contents of `--prompt-file` (`-` is stdin) without the newlines an editor
+/// or `echo` leaves at the end.
+fn run_prompt(a: &RunArgs) -> anyhow::Result<String> {
+    let Some(path) = a.prompt_file.as_deref() else {
+        return Ok(a.prompt.clone().expect("clap requires a prompt or a file"));
+    };
+    let unreadable = |e: &dyn std::fmt::Display| {
+        CliError::err(
+            "prompt_file_unreadable",
+            format!("cannot read the prompt from {path}: {e}"),
+        )
+    };
+    let mut text = String::new();
+    if path == "-" {
+        std::io::stdin().read_to_string(&mut text)
+    } else {
+        std::fs::File::open(path).and_then(|mut f| f.read_to_string(&mut text))
+    }
+    .map_err(|e| unreadable(&e))?;
+    let text = text.trim_end_matches(['\n', '\r']);
+    if text.trim().is_empty() {
+        return Err(CliError::err(
+            "prompt_file_empty",
+            format!("the prompt file {path} is empty"),
+        ));
+    }
+    Ok(text.to_string())
+}
+
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
+    let prompt = run_prompt(&a)?;
     let config = PastorConfig::load(&paths.config_file())?;
     let spec = run_spec(&a, &config)?;
     let IpcResponse::Task(t) = ask(
         paths,
         IpcRequest::Run {
-            prompt: a.prompt,
+            prompt,
             spec,
             flock: a.flock,
         },
@@ -1340,7 +1378,7 @@ mod tests {
         ] {
             let a = run_args(argv);
             assert_eq!(a.agent_args, vec!["--model", "claude-opus-5-5"], "{argv:?}");
-            assert_eq!(a.prompt, "hi", "{argv:?}");
+            assert_eq!(a.prompt.as_deref(), Some("hi"), "{argv:?}");
         }
         assert!(run_args(&["hi"]).agent_args.is_empty());
         // One value per flag: the next word is the prompt, not a second arg.

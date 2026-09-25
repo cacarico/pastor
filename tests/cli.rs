@@ -176,6 +176,27 @@ impl Env {
             .output()
             .unwrap()
     }
+
+    /// Like `cmd`, with `input` on the command's stdin.
+    fn cmd_stdin(&self, args: &[&str], input: &str) -> std::process::Output {
+        use std::io::Write;
+        let mut child = pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
 }
 
 #[test]
@@ -2324,4 +2345,79 @@ fn task_send_trust_answers_the_prompt_and_trust_list_and_remove_show_it() {
     let out = env.cmd(&["trust", "list", "--json"]);
     let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(list, serde_json::json!([]));
+}
+
+#[test]
+fn run_reads_the_prompt_from_a_file_or_stdin() {
+    let env = start();
+    // Quotes, a backtick, a dollar sign and a blank line: what one shell
+    // argument cannot carry. The trailing newline is the editor's, not the
+    // prompt's.
+    let prompt = "say \"hi\" and 'bye'\n\n`date` costs $5";
+    let file = env._tmp.path().join("prompt.md");
+    std::fs::write(&file, format!("{prompt}\n")).unwrap();
+    let out = env.cmd(&[
+        "task",
+        "run",
+        "--prompt-file",
+        file.to_str().unwrap(),
+        "--json",
+    ]);
+    let t: serde_json::Value = serde_json::from_str(&ok(out)).unwrap();
+    assert_eq!(t["prompt"], prompt, "{t}");
+
+    let out = env.cmd_stdin(
+        &["task", "run", "--prompt-file", "-", "--json"],
+        "from stdin\r\n\n",
+    );
+    let t: serde_json::Value = serde_json::from_str(&ok(out)).unwrap();
+    assert_eq!(t["prompt"], "from stdin", "{t}");
+}
+
+#[test]
+fn run_prompt_file_errors_carry_stable_codes() {
+    let env = start();
+    let dir = env._tmp.path();
+    let empty = dir.join("empty.md");
+    std::fs::write(&empty, "").unwrap();
+    let blank = dir.join("blank.md");
+    std::fs::write(&blank, "\n \n").unwrap();
+    let binary = dir.join("binary.md");
+    std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+    for (path, code) in [
+        (empty.to_str().unwrap(), "prompt_file_empty"),
+        (blank.to_str().unwrap(), "prompt_file_empty"),
+        (binary.to_str().unwrap(), "prompt_file_unreadable"),
+        (
+            dir.join("missing.md").to_str().unwrap(),
+            "prompt_file_unreadable",
+        ),
+        // A directory opens fine and fails on read.
+        (dir.to_str().unwrap(), "prompt_file_unreadable"),
+    ] {
+        let out = env.cmd(&["task", "run", "--prompt-file", path]);
+        assert_eq!(error_code(&out), code, "{path}");
+    }
+    let out = env.cmd_stdin(&["task", "run", "--prompt-file", "-"], "\n");
+    assert_eq!(error_code(&out), "prompt_file_empty");
+
+    // Nothing was dispatched.
+    let listed = ok(env.cmd(&["task", "list", "--all", "--json"]));
+    assert_eq!(listed.trim(), "[]", "{listed}");
+}
+
+#[test]
+fn run_takes_exactly_one_of_prompt_and_prompt_file() {
+    let env = start();
+    let file = env._tmp.path().join("p.md");
+    std::fs::write(&file, "hi\n").unwrap();
+    // clap usage errors: plain text, exit 2.
+    for args in [
+        &["task", "run", "hi", "--prompt-file", file.to_str().unwrap()][..],
+        &["task", "run"][..],
+    ] {
+        let out = env.cmd(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(serde_json::from_slice::<serde_json::Value>(&out.stderr).is_err());
+    }
 }

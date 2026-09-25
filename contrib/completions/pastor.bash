@@ -2204,12 +2204,16 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__run)
-            opts="-h --repo --flock --machine --agent --agent-arg --worktree --branch --tag --timeout --json --help"
+            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --worktree --branch --tag --timeout --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --prompt-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --repo)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0

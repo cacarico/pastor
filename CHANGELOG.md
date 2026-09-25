@@ -7,6 +7,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `pastor task run --prompt-file <path>` reads the prompt from a file on the
+  machine running the CLI (`-` for stdin), so a long prompt with quotes needs
+  no shell quoting. It conflicts with the positional prompt; exactly one is
+  required. Trailing newlines are trimmed. An unreadable file fails with
+  `prompt_file_unreadable`, an empty one with `prompt_file_empty`.
 - A release workflow (`.github/workflows/release.yml`). Pushing a `vX.Y.Z`
   tag builds static musl binaries for x86_64, aarch64, armv7 and riscv64
   Linux and native macOS arm64 and x86_64 binaries, packs each as

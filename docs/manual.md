@@ -368,6 +368,7 @@ pastor setup systemd                 # confirm, then install and enable --now; o
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
 pastor task run "Review the open PR" --agent-arg=--model --agent-arg=claude-opus-5-5
 pastor task run "Triage the inbox" --flock work   # only work machines take it
+pastor task run --prompt-file ./prompt.md --repo '~/work/api'   # a long prompt, no shell quoting
 mkdir -p ~/.config/pastor/jobs
 cat > ~/.config/pastor/jobs/hourly.toml <<'EOF'
 every = "1h"
@@ -400,7 +401,8 @@ expands it to the head's home first. A `command` machine cannot report a home,
 and neither can one whose shell has no absolute `$HOME`; give those absolute
 paths.
 
-`pastor task run` takes `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
+`pastor task run` takes the prompt as its argument or, instead, `--prompt-file
+PATH`, and `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
 `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
 `--timeout` and `--json`. `--agent-arg` hands one argument to the agent,
 through herdr's `agent.start`; repeat it for more, in order. It always takes the
@@ -413,6 +415,16 @@ job file's `agent_args` does the same for its tasks. When neither says
 anything, `[defaults] agent_args` in pastor.toml applies; a job file that sets
 `agent_args = []` opts out of it. `pastor task show t-1` prints the args a task
 was started with.
+
+`--prompt-file` reads the prompt from a file on the machine that runs the CLI,
+not on the agent's machine; `-` reads standard input. It spares a long prompt
+the shell's quoting, so `pastor task run --prompt-file - <<'EOF'` takes quotes,
+backticks and dollar signs as they are. Give exactly one of the argument and
+the flag; both, or neither, is a usage error (exit 2). Newlines at the end of
+the file are dropped, as a prompt typed on the command line has none; the rest
+is sent unchanged. A file that cannot be read (missing, a directory, not UTF-8)
+fails with `prompt_file_unreadable`, and one with nothing but whitespace with
+`prompt_file_empty`; in both cases nothing is dispatched.
 
 Without a real herdr, a fake one speaks the same protocol. It comes in the same
 two pieces the real thing does, because state has to outlive a single request:

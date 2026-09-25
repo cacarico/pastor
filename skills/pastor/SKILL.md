@@ -55,6 +55,7 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 - `--worktree` makes a git worktree of `--repo` for the task, on `--branch` or `pastor/t-N`. It needs `--repo` and the repo cloned on that machine.
 - `--agent-arg` passes one argument to the agent and always takes the next word, dashes included. Repeat it, in order.
 - `--timeout` bounds the task; past it the task goes `stale`.
+- `--prompt-file PATH` takes the prompt from a file on the machine running the CLI (`-` is stdin) in place of the argument; give exactly one of the two. Use it for a long prompt: quotes, backticks and `$` need no escaping, and trailing newlines are dropped. An unreadable file fails with `prompt_file_unreadable`, an empty one with `prompt_file_empty`.
 
 pastor sends the prompt as is, and the agent knows nothing else. Write it so the agent can finish alone: say where it is (its own worktree and branch), what to change, what to commit and where to push, what report to write, and to print `DONE` as its last line.
 

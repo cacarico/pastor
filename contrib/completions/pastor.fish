@@ -52,6 +52,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show read attach retry close prune send help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l prompt-file -d 'Read the prompt from this file on this machine (\'-\' for stdin); it spares long prompts the shell\'s quoting' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l repo -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l flock -d 'Only this flock\'s machines take the task (default: the flock of --machine, else the default flock)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l machine -r
