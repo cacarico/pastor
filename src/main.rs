@@ -869,16 +869,21 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
 }
 
 /// After `machine add|remove` rewrote flock.toml, a running head re-reads it
-/// now (the `pastor job reload` path), so the edit needs no restart.
+/// now (the `pastor job reload` path), so the edit needs no restart. Matches
+/// on `probe_daemon` rather than a boolean: `Unresponsive` (a busy head mid
+/// request looks exactly like a wedged one from the outside) must not get the
+/// same "start a head" advice as `NotRunning`, since one is already running.
 async fn reload_running_head(paths: &Paths) -> &'static str {
     let socket = paths.socket_file();
-    // A busy head (`Unresponsive`) is still a head: ask it too.
-    if probe_daemon(&socket).await == DaemonProbe::NotRunning {
-        return "start pastor serve to use it";
-    }
-    match request(&socket, &IpcRequest::Reload).await {
-        Ok(IpcResponse::Jobs(_)) => "the running pastor serve picked it up",
-        _ => "pastor serve did not take the reload; run `pastor job reload`",
+    match probe_daemon(&socket).await {
+        DaemonProbe::NotRunning => "start pastor serve to use it",
+        DaemonProbe::Unresponsive => {
+            "pastor serve is running but not answering; the next scheduler tick will apply the edit"
+        }
+        DaemonProbe::Running => match request(&socket, &IpcRequest::Reload).await {
+            Ok(IpcResponse::Jobs(_)) => "the running pastor serve picked it up",
+            _ => "pastor serve did not take the reload; run `pastor job reload`",
+        },
     }
 }
 

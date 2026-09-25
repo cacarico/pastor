@@ -474,6 +474,47 @@ fn machine_add_and_remove_edit_the_file() {
     assert!(!run(&["machine", "remove", "pi-3"]).status.success());
 }
 
+/// Copilot 4102376166: a socket that accepts but never answers `Ping` is
+/// `Unresponsive` (a busy head), not the same as no daemon at all. `machine
+/// add` must not send the "start pastor serve" advice in that case, since a
+/// live head is sitting right there; it tells the user the next scheduler
+/// tick will pick up the edit instead.
+#[test]
+fn machine_add_tells_a_wedged_head_apart_from_no_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&state).unwrap();
+    let socket = state.join("pastor.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // Accept the connection and never reply, so the probe times out into
+    // `Unresponsive` rather than reading as an absent daemon.
+    std::thread::spawn(move || {
+        let _ = listener.accept();
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let out = pastor()
+        .args(["machine", "add", "pi-9", "fleet@pi-9"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !stdout.contains("start pastor serve"),
+        "a busy head must not get the start advice: {stdout}"
+    );
+    assert!(
+        stdout.contains("not answering") && stdout.contains("next scheduler tick"),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn list_without_daemon_reads_the_database() {
     let tmp = tempfile::tempdir().unwrap();
