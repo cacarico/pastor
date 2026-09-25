@@ -321,13 +321,16 @@ pub fn orphan_agents(agents: &[AgentInfo], owned: &[Task]) -> Vec<(String, Strin
 }
 
 /// The task id in an agent name pastor gives (`t-<id>`), and nothing looser:
-/// `parse_task_id` also takes a bare number, which a human could name an agent.
+/// `parse_task_id` also takes a bare number, which a human could name an agent,
+/// and `t-01`, which `task close` would look up as `t-1`. Only a name that
+/// `Task::agent_name_for` gives back unchanged counts.
 fn task_id_of_agent(name: &str) -> Option<i64> {
     let digits = name.strip_prefix("t-")?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    digits.parse().ok()
+    let id: i64 = digits.parse().ok()?;
+    (id > 0 && Task::agent_name_for(id) == name).then_some(id)
 }
 
 /// What the inner loop should do after a command: nothing, reopen the event
@@ -2153,6 +2156,28 @@ mod tests {
         for name in ["12", "t-", "t-1a", "t-+1", "x-1", "t-1 "] {
             assert_eq!(task_id_of_agent(name), None, "{name:?}");
         }
+    }
+
+    /// `task close t-01` parses id 1 and looks for `t-1`, so an agent named
+    /// `t-01` reported as an orphan could never be closed. Only the names
+    /// `Task::agent_name_for` makes count.
+    #[test]
+    fn only_canonical_task_names_are_orphans() {
+        for name in ["t-01", "t-007", "t-0", "t-00"] {
+            assert_eq!(task_id_of_agent(name), None, "{name:?}");
+        }
+        let agent = |name: &str, pane: &str| -> AgentInfo {
+            serde_json::from_value(serde_json::json!({
+                "pane_id": pane, "workspace_id": "w", "tab_id": "tab",
+                "name": name, "agent_status": "idle",
+            }))
+            .unwrap()
+        };
+        let agents = [agent("t-01", "p1"), agent("t-0", "p2"), agent("t-3", "p3")];
+        assert_eq!(
+            orphan_agents(&agents, &[]),
+            vec![("t-3".to_string(), "p3".to_string())]
+        );
     }
 
     /// An agent named like a task that no open task owns is an orphan: its
