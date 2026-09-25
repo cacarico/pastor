@@ -83,6 +83,8 @@ them too; they are repeated here because getting them wrong cost a day.
 - Work on a branch, open a pull request, never push `main`.
 - Commit messages: conventional prefix, plain subject, a body that explains
   the why. No `Co-Authored-By` or other trailers.
+- `skills/pastor/SKILL.md` is built into the binary. Change it with the CLI:
+  a unit test fails when it names a command or flag that does not exist.
 - Vocabulary is fixed by the spec: machine, flock, head, job, task, plugin,
   connector, agent. Agents are never renamed; hosts are not "sheep".
 - Runtime CLI errors are JSON on stderr with a stable code and exit 1; clap
@@ -168,6 +170,7 @@ Not yet assigned a plan:
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
 ~/.config/systemd/user/*.service  from `pastor setup systemd [--herdr]`
+skills/pastor/SKILL.md            agent skill, in the repo; `pastor --skill` prints it
 ```
 
 `PASTOR_CONFIG_DIR` and `PASTOR_STATE_DIR` override these; tests always set

@@ -271,6 +271,29 @@ pastor completions fish > ~/.config/fish/completions/pastor.fish
 pastor completions bash > ~/.local/share/bash-completion/completions/pastor
 ```
 
+## Skill for agents
+
+`skills/pastor/SKILL.md` is a guide for coding agents: what pastor is, how to
+run and watch tasks, what each state means, and what an agent that pastor
+dispatched is expected to do. The same file is built into the binary, so
+`pastor --skill` prints the copy that matches the installed version, and
+`pastor --help` ends with a pointer to it.
+
+It follows the Agent Skills layout, so a symlink makes it available to an
+agent, either for your user or for one project:
+
+```bash
+mkdir -p ~/.claude/skills
+ln -s ~/ghq/github.com/cacarico/pastor/skills/pastor ~/.claude/skills/pastor   # for you
+mkdir -p .claude/skills
+ln -s ~/ghq/github.com/cacarico/pastor/skills/pastor .claude/skills/pastor     # for one project
+```
+
+An agent that pastor dispatched runs on a flock machine, where this checkout
+may not exist; if pastor is installed there, it can run `pastor --skill`.
+A unit test checks that every command and flag the skill names exists, so a
+CLI change that breaks it fails `make check`.
+
 ## Development
 
 The Makefile is the list of things you can run here; `make help` prints it.

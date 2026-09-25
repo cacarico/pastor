@@ -5,6 +5,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- An agent skill, `skills/pastor/SKILL.md`, for agents that drive pastor or
+  were dispatched by it. `pastor --skill` prints the copy built into the
+  binary, and `pastor --help` points agents at it.
+
 ### Fixed
 
 - `pastor serve` now also shuts down cleanly on SIGTERM and SIGHUP, not just
