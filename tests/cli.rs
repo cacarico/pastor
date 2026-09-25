@@ -129,6 +129,21 @@ impl Env {
         }
     }
 
+    /// Polls `task show` until `task` is done, so later snapshots of it are
+    /// stable: the fake finishes agents on its own and the daemon reconciles.
+    fn wait_done(&self, task: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let out = self.cmd(&["task", "show", task, "--json"]);
+            let t: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            if t["state"] == "done" {
+                return;
+            }
+            assert!(Instant::now() < deadline, "task never became done: {t}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn cmd(&self, args: &[&str]) -> std::process::Output {
         pastor()
             .args(args)
@@ -163,16 +178,7 @@ fn run_list_show_read_end_to_end() {
     let out = env.cmd(&["task", "read", "t-1"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("fake output"));
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let out = env.cmd(&["task", "show", "t-1", "--json"]);
-        let t: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        if t["state"] == "done" {
-            break;
-        }
-        assert!(Instant::now() < deadline, "task never became done: {t}");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    env.wait_done("t-1");
     // A done task is finished: the default list hides it and says where it
     // went, `--all` shows it, and `--json` follows the same selection.
     let out = env.cmd(&["task", "list"]);
@@ -202,10 +208,12 @@ fn run_list_show_read_end_to_end() {
 }
 
 /// The old top-level `run`, `list`, `attach` and `reload` still work, hidden
-/// from `--help` and the completions, with a one-line hint on stderr and the
-/// same stdout and exit status as the nested command.
+/// from `--help` and the completions, with the same stdout, stderr and exit
+/// status as the nested command. The hint that names the new spelling is for
+/// a terminal only (see `moved_hint`), so here, with stderr piped, there is
+/// none, and a failing alias leaves exactly one JSON value on stderr.
 #[test]
-fn old_top_level_commands_are_hidden_aliases_with_a_hint() {
+fn old_top_level_commands_are_hidden_aliases() {
     let env = start();
     let out = env.cmd(&["run", "hi", "--json"]);
     assert!(
@@ -213,35 +221,23 @@ fn old_top_level_commands_are_hidden_aliases_with_a_hint() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("pastor run is now pastor task run"),
-        "{stderr}"
-    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("is now"));
     let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(task["agent_name"], "t-1");
+    // The fake finishes t-1 on its own; wait for that so both list spellings
+    // read the same settled row instead of racing the change.
+    env.wait_done("t-1");
 
-    for (old, new, hint) in [
+    for (old, new) in [
         (
             vec!["list", "--all", "--json"],
             vec!["task", "list", "--all", "--json"],
-            "pastor list is now pastor task list",
         ),
-        (
-            vec!["attach", "t-9"],
-            vec!["task", "attach", "t-9"],
-            "pastor attach is now pastor task attach",
-        ),
-        (
-            vec!["reload"],
-            vec!["job", "reload"],
-            "pastor reload is now pastor job reload",
-        ),
+        (vec!["attach", "t-9"], vec!["task", "attach", "t-9"]),
+        (vec!["reload"], vec!["job", "reload"]),
     ] {
         let a = env.cmd(&old);
         let b = env.cmd(&new);
-        let stderr = String::from_utf8_lossy(&a.stderr);
-        assert!(stderr.contains(hint), "{old:?}: {stderr}");
         assert_eq!(a.status.code(), b.status.code(), "{old:?}");
         assert_eq!(
             String::from_utf8_lossy(&a.stdout),
@@ -249,10 +245,28 @@ fn old_top_level_commands_are_hidden_aliases_with_a_hint() {
             "{old:?}"
         );
         assert_eq!(
-            stderr.replace(&format!("{hint}\n"), ""),
+            String::from_utf8_lossy(&a.stderr),
             String::from_utf8_lossy(&b.stderr),
             "{old:?}"
         );
+    }
+    let out = env.cmd(&["list", "--all", "--json"]);
+    let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(tasks.len(), 1, "{tasks:?}");
+    assert_eq!(tasks[0]["agent_name"], "t-1");
+
+    // The CLI error contract holds through an alias: the whole of stderr is
+    // one JSON value.
+    for argv in [
+        vec!["attach", "t-9"],
+        vec!["run", "hi", "--machine", "nope"],
+    ] {
+        let out = env.cmd(&argv);
+        assert_eq!(out.status.code(), Some(1), "{argv:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        let err: serde_json::Value = serde_json::from_str(&stderr)
+            .unwrap_or_else(|e| panic!("{argv:?}: stderr is not one JSON value ({e}): {stderr}"));
+        assert!(err["code"].is_string(), "{argv:?}: {err}");
     }
 
     let help = String::from_utf8_lossy(&env.cmd(&["--help"]).stdout).into_owned();
