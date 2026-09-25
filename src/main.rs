@@ -15,15 +15,30 @@ use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
 use pastor::task::{DispatchSpec, Task, TaskState, parse_task_id};
 
+/// The agent skill, built into the binary so an agent on any machine with
+/// pastor installed can read the guide that matches this exact CLI.
+const SKILL: &str = include_str!("../skills/pastor/SKILL.md");
+
+/// Agents read `--help` first; this sends them to the skill once.
+const AGENT_FOOTER: &str = "\
+Are you an AI agent? `pastor --skill` prints a guide to driving pastor.
+Skip it if a pastor skill is already in your context.";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "pastor",
     version,
-    about = "run coding agents on machines you own"
+    about = "run coding agents on machines you own",
+    arg_required_else_help = true,
+    args_conflicts_with_subcommands = true,
+    after_help = AGENT_FOOTER
 )]
 struct Cli {
+    /// Print the agent skill (SKILL.md) for this version and exit
+    #[arg(long, exclusive = true)]
+    skill: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -216,13 +231,22 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    if cli.skill {
+        print!("{SKILL}");
+        return;
+    }
+    // `arg_required_else_help` means clap has already printed help for a bare
+    // `pastor`; the only other way here without a command is `--skill`.
+    let Some(command) = cli.command else {
+        unreachable!("clap requires a command or --skill")
+    };
     let paths = match Paths::from_env() {
         Ok(p) => p,
         Err(err) => fail("config_error", &err.to_string()),
     };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async {
-        match cli.command {
+        match command {
             Command::Serve => pastor::daemon::serve(paths).await,
             Command::Run(args) => {
                 moved("run", "task run");
@@ -262,11 +286,13 @@ fn main() {
 /// The command tree `pastor completions` describes. clap_complete offers
 /// hidden subcommands too, so the old top-level spellings are dropped here and
 /// the scripts name only `task run`, `task list`, `task attach`, `job reload`.
+/// Top-level flags such as `--skill` are kept.
 fn completion_tree() -> clap::Command {
     let full = <Cli as clap::CommandFactory>::command();
     clap::Command::new("pastor")
         .version(env!("CARGO_PKG_VERSION"))
         .about(full.get_about().cloned().unwrap_or_default())
+        .args(full.get_arguments().cloned())
         .subcommands(full.get_subcommands().filter(|c| !c.is_hide_set()).cloned())
 }
 
@@ -1042,7 +1068,7 @@ mod tests {
     fn run_args(argv: &[&str]) -> RunArgs {
         let mut full = vec!["pastor", "task", "run"];
         full.extend_from_slice(argv);
-        match Cli::try_parse_from(full).unwrap().command {
+        match Cli::try_parse_from(full).unwrap().command.unwrap() {
             Command::Task {
                 cmd: TaskCmd::Run(a),
             } => a,
@@ -1100,7 +1126,7 @@ mod tests {
     fn list_args(argv: &[&str]) -> ListArgs {
         let mut full = vec!["pastor", "task", "list"];
         full.extend_from_slice(argv);
-        match Cli::try_parse_from(full).unwrap().command {
+        match Cli::try_parse_from(full).unwrap().command.unwrap() {
             Command::Task {
                 cmd: TaskCmd::List(a),
             } => a,
@@ -1439,5 +1465,93 @@ mod tests {
             attach_remote_command("", "t-1"),
             "herdr --session '' agent attach t-1"
         );
+    }
+
+    /// Every `pastor ...` command the skill shows, in inline code or a code
+    /// block, must be a real command with real long flags, so the skill
+    /// cannot drift from the CLI. Words that are not commands end the walk
+    /// (`t-12`, a quoted prompt); flags are checked on the command reached.
+    #[test]
+    fn skill_mentions_only_real_commands_and_flags() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let mut checked = 0;
+        for code in code_spans(SKILL) {
+            for line in code.lines() {
+                let line = line.split(" # ").next().unwrap_or(line);
+                let words: Vec<&str> = line.split_whitespace().collect();
+                for (at, _) in words.iter().enumerate().filter(|(_, w)| **w == "pastor") {
+                    check_command(&root, &words[at + 1..], line);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 20, "only {checked} commands found in the skill");
+    }
+
+    /// Inline code spans and fenced blocks of a Markdown text, in order.
+    fn code_spans(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut fence: Option<String> = None;
+        for line in text.lines() {
+            if line.starts_with("```") {
+                match fence.take() {
+                    Some(block) => out.push(block),
+                    None => fence = Some(String::new()),
+                }
+                continue;
+            }
+            if let Some(block) = fence.as_mut() {
+                // A trailing backslash continues the command on the next line.
+                block.push_str(line.trim_end_matches('\\'));
+                if !line.ends_with('\\') {
+                    block.push('\n');
+                }
+                continue;
+            }
+            out.extend(line.split('`').skip(1).step_by(2).map(str::to_string));
+        }
+        out
+    }
+
+    fn check_command(root: &clap::Command, words: &[&str], line: &str) {
+        let mut cmd = root;
+        let mut rest = words;
+        while let Some(word) = rest.first() {
+            match cmd.find_subcommand(word) {
+                Some(sub) if !sub.is_hide_set() => {
+                    cmd = sub;
+                    rest = &rest[1..];
+                }
+                Some(_) => panic!("{line:?}: `{word}` is a hidden old spelling"),
+                None if cmd.has_subcommands() && !word.starts_with('-') => {
+                    panic!(
+                        "{line:?}: `{word}` is not a subcommand of `{}`",
+                        cmd.get_name()
+                    )
+                }
+                None => break,
+            }
+        }
+        let mut words = rest.iter();
+        while let Some(word) = words.next() {
+            let Some(flag) = word.strip_prefix("--") else {
+                continue;
+            };
+            let (name, inline) = match flag.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (flag, false),
+            };
+            if name == "help" {
+                continue;
+            }
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_long() == Some(name))
+                .unwrap_or_else(|| panic!("{line:?}: `{}` has no --{name}", cmd.get_name()));
+            if !inline && arg.get_action().takes_values() {
+                words.next();
+            }
+        }
     }
 }

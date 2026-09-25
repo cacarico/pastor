@@ -1,6 +1,6 @@
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_pastor_global_optspecs
-    string join \n h/help V/version
+    string join \n skill h/help V/version
 end
 
 function __fish_pastor_needs_command
@@ -24,6 +24,7 @@ function __fish_pastor_using_subcommand
     contains -- $cmd[1] $argv
 end
 
+complete -c pastor -n "__fish_pastor_needs_command" -l skill -d 'Print the agent skill (SKILL.md) for this version and exit'
 complete -c pastor -n "__fish_pastor_needs_command" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_needs_command" -s V -l version -d 'Print version'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "serve" -d 'Run the daemon: scheduler, machine channels, dispatch'

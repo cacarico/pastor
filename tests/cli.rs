@@ -291,8 +291,12 @@ fn completions_offer_only_the_nested_spellings() {
     let bash = gen_("bash");
     let top = bash
         .lines()
-        .find(|l| l.trim_start().starts_with("opts=\"-h -V --help --version"))
+        .find(|l| {
+            l.trim_start()
+                .starts_with("opts=\"-h -V --skill --help --version")
+        })
         .unwrap_or_else(|| panic!("no top-level opts line:\n{bash}"));
+    assert!(fish.contains("-l skill"), "fish does not offer --skill");
     for old in ["run", "list", "attach", "reload"] {
         assert!(
             !fish.contains(&format!("__fish_pastor_needs_command\" -f -a \"{old}\"")),
@@ -310,6 +314,43 @@ fn completions_offer_only_the_nested_spellings() {
     assert!(fish.contains("-f -a \"run\" -d 'Create a one-off task and dispatch it'"));
     assert!(bash.contains("pastor__subcmd__task,run)"));
     assert!(bash.contains("pastor__subcmd__job,reload)"));
+}
+
+/// `pastor --skill` is how an agent on any machine gets the guide, so it must
+/// print the embedded file and nothing else: no log line, no trailing text.
+#[test]
+fn skill_flag_prints_the_embedded_skill_and_nothing_else() {
+    let out = pastor().arg("--skill").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.starts_with("---\nname: pastor\n"), "{stdout}");
+    assert_eq!(stdout, include_str!("../skills/pastor/SKILL.md"));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // With a command it would be ambiguous which one ran; clap refuses it.
+    let out = pastor().args(["--skill", "task", "list"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{:?}", out.status);
+}
+
+/// An agent reads `--help` first; the footer is what sends it to the skill.
+#[test]
+fn help_footer_points_agents_at_the_skill() {
+    let out = pastor().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8(out.stdout).unwrap();
+    let footer = help.trim_end().lines().rev().take(2).collect::<Vec<_>>();
+    assert!(
+        footer.iter().any(|l| l.contains("pastor --skill")),
+        "{help}"
+    );
+    assert!(
+        footer.iter().any(|l| l.contains("already in your context")),
+        "{help}"
+    );
 }
 
 /// `--agent-arg` reaches herdr's `agent.start` as `args`, in order, and shows

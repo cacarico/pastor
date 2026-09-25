@@ -242,7 +242,7 @@ _pastor() {
 
     case "${cmd}" in
         pastor)
-            opts="-h -V --help --version serve task machine open tick job completions events setup help"
+            opts="-h -V --skill --help --version serve task machine open tick job completions events setup help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
