@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -111,6 +111,15 @@ pub struct FakeHerdr {
     /// `disconnect_all()` called right after `connect()` returns is never lost to a
     /// task that hasn't subscribed yet.
     kill: broadcast::Sender<()>,
+    /// See `wedge_connects`.
+    wedge: Arc<(Mutex<Wedge>, Condvar)>,
+}
+
+#[derive(Default)]
+struct Wedge {
+    on: bool,
+    /// Threads blocked in `Connector::connect` right now.
+    waiting: usize,
 }
 
 impl Default for FakeHerdr {
@@ -132,6 +141,7 @@ impl FakeHerdr {
             })),
             events,
             kill,
+            wedge: Arc::default(),
         }
     }
 
@@ -204,6 +214,28 @@ impl FakeHerdr {
             .collect();
         v.sort();
         v
+    }
+    /// While on, `Connector::connect` blocks the calling thread instead of
+    /// yielding. `hang_method` wedges an await, which an abort still ends;
+    /// this wedges a poll, which nothing can interrupt, so a test can have an
+    /// aborted actor that has not ended. Needs a multi-thread runtime.
+    pub fn wedge_connects(&self, on: bool) {
+        let (lock, cvar) = &*self.wedge;
+        lock.lock().unwrap().on = on;
+        cvar.notify_all();
+    }
+    /// How many threads are blocked in `connect` by `wedge_connects`.
+    pub fn wedged(&self) -> usize {
+        self.wedge.0.lock().unwrap().waiting
+    }
+    fn wait_unwedged(&self) {
+        let (lock, cvar) = &*self.wedge;
+        let mut w = lock.lock().unwrap();
+        w.waiting += 1;
+        while w.on {
+            w = cvar.wait(w).unwrap();
+        }
+        w.waiting -= 1;
     }
     pub fn agents(&self) -> Vec<AgentInfo> {
         self.state
@@ -667,7 +699,10 @@ impl FakeHerdr {
 
 impl super::transport::Connector for FakeHerdr {
     fn connect(&self) -> super::transport::ConnectFuture<'_> {
-        Box::pin(async move { Ok(FakeHerdr::connect(self)) })
+        Box::pin(async move {
+            self.wait_unwedged();
+            Ok(FakeHerdr::connect(self))
+        })
     }
     fn describe(&self) -> String {
         "fake herdr".into()

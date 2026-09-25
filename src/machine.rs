@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -200,8 +200,21 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 /// stop: until it has ended it can still write a row.
 pub struct ActorTask {
     abort: tokio::task::AbortHandle,
-    /// Taken by the first `shutdown` to wait on it.
-    join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// `None` once a `shutdown` has seen the task end. A tokio mutex, held
+    /// across the wait, so a second caller waits too instead of guessing.
+    join: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// What `MachineHandle::shutdown` saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ShutdownOutcome {
+    /// The actor task has ended: it will not write another row.
+    Finished,
+    /// Aborted, but still inside a poll after `SHUTDOWN_WAIT`. It may still
+    /// write rows until it ends, so nothing may take its place yet. Calling
+    /// `shutdown` again waits again.
+    StillRunning,
 }
 
 impl MachineHandle {
@@ -212,26 +225,36 @@ impl MachineHandle {
     ///
     /// Nothing on the machine is touched: agents keep running, rows keep their
     /// state, and a replacement actor reconciles them. A request in flight
-    /// answers "dropped the request". Waits at most `SHUTDOWN_WAIT`, then
-    /// warns and returns.
-    pub async fn shutdown(&self) {
-        let Some(task) = &self.task else { return };
-        task.abort.abort();
-        // Taken out first: a std guard must not be held across the await.
-        let join = task.join.lock().unwrap().take();
-        let Some(join) = join else {
-            // Another clone is already waiting on it.
-            return;
+    /// answers "dropped the request". Waits at most `SHUTDOWN_WAIT`; if the
+    /// task has not ended by then it warns and returns `StillRunning`, and
+    /// keeps the task so a later call can wait for it again.
+    pub async fn shutdown(&self) -> ShutdownOutcome {
+        let Some(task) = &self.task else {
+            return ShutdownOutcome::Finished;
         };
-        match tokio::time::timeout(SHUTDOWN_WAIT, join).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) if err.is_cancelled() => {}
-            Ok(Err(err)) => tracing::warn!(machine = %self.name, %err, "actor ended with an error"),
-            Err(_) => tracing::warn!(
-                machine = %self.name,
-                wait = ?SHUTDOWN_WAIT,
-                "actor did not stop in time"
-            ),
+        task.abort.abort();
+        let mut join = task.join.lock().await;
+        let Some(handle) = join.as_mut() else {
+            return ShutdownOutcome::Finished;
+        };
+        match tokio::time::timeout(SHUTDOWN_WAIT, handle).await {
+            Ok(res) => {
+                if let Err(err) = res
+                    && !err.is_cancelled()
+                {
+                    tracing::warn!(machine = %self.name, %err, "actor ended with an error");
+                }
+                *join = None;
+                ShutdownOutcome::Finished
+            }
+            Err(_) => {
+                tracing::warn!(
+                    machine = %self.name,
+                    wait = ?SHUTDOWN_WAIT,
+                    "actor did not stop in time; still waiting for it"
+                );
+                ShutdownOutcome::StillRunning
+            }
         }
     }
 
@@ -331,7 +354,7 @@ pub fn spawn_machine(
         status,
         task: Some(Arc::new(ActorTask {
             abort: task.abort_handle(),
-            join: Mutex::new(Some(task)),
+            join: tokio::sync::Mutex::new(Some(task)),
         })),
     }
 }
@@ -1804,7 +1827,7 @@ mod tests {
         h.dispatch(t.id).await.unwrap();
         assert_eq!(state_of(&store, t.id), TaskState::Running);
 
-        h.shutdown().await;
+        assert_eq!(h.shutdown().await, ShutdownOutcome::Finished);
         // No waiting here: once `shutdown` returns the actor task has ended,
         // so it can neither write a row nor ask herdr anything.
         assert!(h.actor_finished(), "shutdown waits for the task to end");
@@ -1824,6 +1847,30 @@ mod tests {
         assert!(err.to_string().contains("is gone"), "{err}");
         assert_eq!(state_of(&store, queued.id), TaskState::Queued);
         assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// An abort lands at the actor's next await, so an actor stuck inside a
+    /// poll outlives it. `shutdown` says so instead of returning as if it had
+    /// ended, and keeps the task so a later call can wait for it again: a
+    /// reload must not spawn a replacement next to a live actor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_reports_an_actor_that_does_not_stop() {
+        let fake = FakeHerdr::new();
+        fake.wedge_connects(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("actor wedged in connect", || fake.wedged() == 1).await;
+
+        assert_eq!(h.shutdown().await, ShutdownOutcome::StillRunning);
+        assert!(!h.actor_finished());
+        // A clone shares the task: it too sees an actor that has not ended.
+        assert_eq!(h.clone().shutdown().await, ShutdownOutcome::StillRunning);
+
+        fake.wedge_connects(false);
+        assert_eq!(h.shutdown().await, ShutdownOutcome::Finished);
+        assert!(h.actor_finished());
+        assert!(h.tx.is_closed());
+        assert_eq!(h.shutdown().await, ShutdownOutcome::Finished, "idempotent");
     }
 
     #[test]

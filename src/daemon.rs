@@ -9,7 +9,9 @@ use crate::config::{PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
-use crate::machine::{MachineHandle, MachineSettings, OrphanClosed, PastorEvent, spawn_machine};
+use crate::machine::{
+    MachineHandle, MachineSettings, OrphanClosed, PastorEvent, ShutdownOutcome, spawn_machine,
+};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{NewTask, RetryError, Store, TaskFilter};
 use crate::task::Task;
@@ -84,11 +86,18 @@ pub struct FlockDiff {
     /// different timings: the actor was replaced. Its tasks stay; the new
     /// actor reconciles them.
     pub retargeted: Vec<String>,
+    /// To be removed or replaced, but the old actor has not ended yet
+    /// (`ShutdownOutcome::StillRunning`). The machine stays in the fleet,
+    /// out of dispatch, and the next pass tries again.
+    pub shutting_down: Vec<String>,
 }
 
 impl FlockDiff {
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.retargeted.is_empty()
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.retargeted.is_empty()
+            && self.shutting_down.is_empty()
     }
 }
 
@@ -98,6 +107,9 @@ struct Member {
     /// What the actor was spawned from; `None` for handles given to
     /// `Fleet::new`, which `apply_flock` never manages.
     spawned_from: Option<(MachineConfig, MachineSettings)>,
+    /// The actor was stopped but has not ended. Nothing is dispatched to it
+    /// and no replacement is spawned until a later `apply_flock` sees it end.
+    shutting_down: bool,
 }
 
 struct Spawner {
@@ -115,6 +127,9 @@ struct Spawner {
 /// `get` hand out clones, never a reference into the set.
 pub struct Fleet {
     members: RwLock<Vec<Member>>,
+    /// The flock last passed to `apply_flock`. Differs from what `members`
+    /// runs while a machine is shutting down.
+    wanted: RwLock<Flock>,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
@@ -129,10 +144,12 @@ impl Fleet {
             .map(|handle| Member {
                 handle,
                 spawned_from: None,
+                shutting_down: false,
             })
             .collect();
         Fleet {
             members: RwLock::new(members),
+            wanted: RwLock::default(),
             store,
             spawner: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
@@ -148,6 +165,7 @@ impl Fleet {
     ) -> Fleet {
         Fleet {
             members: RwLock::new(Vec::new()),
+            wanted: RwLock::default(),
             store,
             spawner: Some(Spawner { connect, events }),
             dispatch_lock: tokio::sync::Mutex::new(()),
@@ -174,17 +192,36 @@ impl Fleet {
     }
 
     /// The flock as last applied: what a reload falls back to when
-    /// `flock.toml` does not load.
+    /// `flock.toml` does not load, and what it applies again to finish a
+    /// swap a machine that was shutting down held up. Empty for a fixed
+    /// fleet.
     pub fn flock(&self) -> Flock {
-        Flock {
-            machines: self
-                .members
-                .read()
-                .unwrap()
-                .iter()
-                .filter_map(|m| m.spawned_from.as_ref().map(|(c, _)| c.clone()))
-                .collect(),
+        self.wanted.read().unwrap().clone()
+    }
+
+    /// Is `name` held in the fleet only until its old actor ends?
+    pub fn shutting_down(&self, name: &str) -> bool {
+        self.members
+            .read()
+            .unwrap()
+            .iter()
+            .any(|m| m.handle.name == name && m.shutting_down)
+    }
+
+    /// Is `name` in the flock? For a managed fleet that is the flock last
+    /// applied, so a removed machine held only until its old actor ends is
+    /// not. A fixed fleet has no applied flock; its machines are the flock.
+    pub fn in_flock(&self, name: &str) -> bool {
+        if self.spawner.is_some() {
+            self.wanted.read().unwrap().get(name).is_some()
+        } else {
+            self.get(name).is_some()
         }
+    }
+
+    /// Is any machine waiting for its old actor to end?
+    pub fn any_shutting_down(&self) -> bool {
+        self.members.read().unwrap().iter().any(|m| m.shutting_down)
     }
 
     /// Make the running set match `flock` and `settings`: spawn actors for
@@ -194,54 +231,88 @@ impl Fleet {
     ///
     /// Takes the dispatch lock, so no pass is holding a handle that is being
     /// stopped. Stopping an actor touches nothing on its machine; tasks left
-    /// there keep their last state. Every stopped actor has ended before a
-    /// replacement is spawned or the new set is published, so a removed
+    /// there keep their last state. A replacement is spawned, or a removed
+    /// machine dropped, only once its old actor has ended, so a removed
     /// machine writes no row afterwards and a retargeted one never has two
-    /// actors on the same tasks.
+    /// actors on the same tasks. An old actor that does not end in time keeps
+    /// its place, marked as shutting down and out of dispatch, and is listed
+    /// in `FlockDiff::shutting_down`; calling this again (the scheduler does,
+    /// on its next reload pass) waits for it again and finishes the swap.
     pub async fn apply_flock(&self, flock: &Flock, settings: &MachineSettings) -> FlockDiff {
         let Some(spawner) = &self.spawner else {
             return FlockDiff::default();
         };
         let _pass = self.dispatch_lock.lock().await;
+        *self.wanted.write().unwrap() = flock.clone();
         let mut diff = FlockDiff::default();
         // A copy: readers keep seeing the old set until the new one is ready,
         // and the lock is not held across the waits below. The dispatch lock
         // keeps any other `apply_flock` out meanwhile.
         let mut old: Vec<Member> = self.members.read().unwrap().clone();
-        // `None`: spawn once the stopped actors have ended.
-        let mut plan: Vec<Option<Member>> = Vec::new();
-        let mut stop: Vec<MachineHandle> = Vec::new();
+        enum Step {
+            Keep(Member),
+            Add,
+            /// Replace this member once its actor has ended.
+            Replace(Member),
+        }
+        let mut plan: Vec<Step> = Vec::new();
         for m in &flock.machines {
             let want = (m.clone(), settings.clone());
-            match old.iter().position(|o| o.handle.name == m.name) {
-                Some(i) if old[i].spawned_from.as_ref() == Some(&want) => {
-                    plan.push(Some(old.remove(i)));
+            plan.push(match old.iter().position(|o| o.handle.name == m.name) {
+                Some(i) if !old[i].shutting_down && old[i].spawned_from.as_ref() == Some(&want) => {
+                    Step::Keep(old.remove(i))
                 }
-                Some(i) => {
-                    stop.push(old.remove(i).handle);
-                    diff.retargeted.push(m.name.clone());
-                    plan.push(None);
-                }
-                None => {
+                Some(i) => Step::Replace(old.remove(i)),
+                None => Step::Add,
+            });
+        }
+        let gone = old;
+        let mut members: Vec<Member> = Vec::new();
+        for (step, m) in plan.into_iter().zip(&flock.machines) {
+            members.push(match step {
+                Step::Keep(kept) => kept,
+                Step::Add => {
                     diff.added.push(m.name.clone());
-                    plan.push(None);
+                    self.spawn(spawner, m, settings)
+                }
+                Step::Replace(o) => match o.handle.shutdown().await {
+                    ShutdownOutcome::Finished => {
+                        diff.retargeted.push(m.name.clone());
+                        self.spawn(spawner, m, settings)
+                    }
+                    ShutdownOutcome::StillRunning => {
+                        diff.shutting_down.push(m.name.clone());
+                        Self::hold(o)
+                    }
+                },
+            });
+        }
+        for o in gone {
+            match o.handle.shutdown().await {
+                ShutdownOutcome::Finished => diff.removed.push(o.handle.name.clone()),
+                ShutdownOutcome::StillRunning => {
+                    diff.shutting_down.push(o.handle.name.clone());
+                    members.push(Self::hold(o));
                 }
             }
         }
-        for gone in old {
-            diff.removed.push(gone.handle.name.clone());
-            stop.push(gone.handle);
+        for name in &diff.shutting_down {
+            tracing::warn!(
+                machine = %name,
+                "old actor has not stopped: machine kept out of dispatch and not \
+                 replaced or removed yet; the next reload pass tries again"
+            );
         }
-        for h in &stop {
-            h.shutdown().await;
-        }
-        let members: Vec<Member> = plan
-            .into_iter()
-            .zip(&flock.machines)
-            .map(|(kept, m)| kept.unwrap_or_else(|| self.spawn(spawner, m, settings)))
-            .collect();
         *self.members.write().unwrap() = members;
         diff
+    }
+
+    /// Keep `m` in the fleet, out of dispatch, until its actor ends.
+    fn hold(mut m: Member) -> Member {
+        m.shutting_down = true;
+        m.handle.status.write().unwrap().error =
+            Some("shutting down: the old actor has not stopped yet".into());
+        m
     }
 
     fn spawn(&self, spawner: &Spawner, m: &MachineConfig, settings: &MachineSettings) -> Member {
@@ -257,20 +328,25 @@ impl Fleet {
         Member {
             handle,
             spawned_from: Some((m.clone(), settings.clone())),
+            shutting_down: false,
         }
     }
 
     pub fn views(&self) -> Vec<MachineView> {
-        self.machines()
+        self.members
+            .read()
+            .unwrap()
             .iter()
             .map(|m| {
-                let s = m.snapshot();
+                let s = m.handle.snapshot();
                 MachineView {
-                    name: m.name.clone(),
-                    max_agents: m.max_agents,
-                    tags: m.tags.clone(),
+                    name: m.handle.name.clone(),
+                    max_agents: m.handle.max_agents,
+                    tags: m.handle.tags.clone(),
                     live: s.live,
-                    healthy: s.channel.accepts_dispatch(),
+                    // An aborted actor answers nothing, and a dispatch to
+                    // it would wait for as long as it stays wedged.
+                    healthy: !m.shutting_down && s.channel.accepts_dispatch(),
                 }
             })
             .collect()
@@ -603,6 +679,14 @@ impl Daemon {
                         format!("t-{id} is not on any machine"),
                     );
                 };
+                // Its aborted actor answers nothing; the read would wait for
+                // as long as it stays wedged.
+                if self.fleet.shutting_down(&handle.name) {
+                    return IpcResponse::error(
+                        "machine_shutting_down",
+                        format!("machine {} is shutting down; try again later", handle.name),
+                    );
+                }
                 match handle.read(id, lines).await {
                     Ok(text) => IpcResponse::Text(text),
                     Err(err) => IpcResponse::error("read_failed", err),
@@ -699,12 +783,11 @@ impl Daemon {
         };
         let Some(t) = row else {
             let name = crate::task::Task::agent_name_for(id);
-            let Some(handle) = self
-                .fleet
-                .machines()
-                .into_iter()
-                .find(|m| m.snapshot().orphans.contains(&name))
-            else {
+            // A machine shutting down has an aborted actor that answers
+            // nothing, so its last reconcile does not count.
+            let Some(handle) = self.fleet.machines().into_iter().find(|m| {
+                !self.fleet.shutting_down(&m.name) && m.snapshot().orphans.contains(&name)
+            }) else {
                 return IpcResponse::error(
                     "task_not_found",
                     format!("{name}: no task row, and no machine reports an agent by that name"),
@@ -778,7 +861,13 @@ impl Daemon {
             }
             return IpcResponse::Task(closed);
         };
-        let Some(handle) = self.fleet.get(&machine) else {
+        // A removed machine held only until its old actor ends counts as
+        // gone: that actor answers nothing and no replacement will come.
+        let handle = self
+            .fleet
+            .get(&machine)
+            .filter(|_| self.fleet.in_flock(&machine));
+        let Some(handle) = handle else {
             // Its machine left the flock, so no actor owns the row and no
             // herdr can be asked: a plain close is only the row, but the
             // checkout lives on that machine and cannot be removed from here.
@@ -803,6 +892,15 @@ impl Daemon {
             });
             return IpcResponse::Task(closed);
         };
+        // Still in the flock but waiting for its old actor to end before the
+        // replacement starts. That actor answers nothing, and the row belongs
+        // to the replacement, so the close waits for it.
+        if self.fleet.shutting_down(&machine) {
+            return IpcResponse::error(
+                "machine_shutting_down",
+                format!("machine {machine} is shutting down; try again later"),
+            );
+        }
         match handle.close(id, remove_worktree).await {
             Ok(t) => IpcResponse::Task(t),
             Err(err) => IpcResponse::error("close_failed", format!("{err:#}")),
@@ -1026,6 +1124,82 @@ mod tests {
             TaskState::Running
         );
         assert_eq!(fleet.get("a").unwrap().snapshot().live, 1);
+    }
+
+    /// Copilot 4103070196: an old actor that does not end within the
+    /// shutdown wait must not get a replacement next to it, or two actors
+    /// race on the same tasks. The machine stays, marked as shutting down and
+    /// out of dispatch, and the next pass finishes the swap once it has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_waits_for_an_actor_that_does_not_stop() {
+        let fake = FakeHerdr::new();
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, _) = broadcast::channel(64);
+        let connect: ConnectorFactory = {
+            let (fake, spawns) = (fake.clone(), spawns.clone());
+            Arc::new(move |_m: &MachineConfig| {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Arc::new(fake.clone()) as Arc<dyn Connector>
+            })
+        };
+        let fleet = Fleet::managed(store.clone(), events, connect);
+        let spawned = || spawns.load(std::sync::atomic::Ordering::SeqCst);
+
+        fake.wedge_connects(true);
+        fleet.apply_flock(&flock_of(&[("a", 2)]), &fast()).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.wedged() == 0 {
+            assert!(Instant::now() < deadline, "actor never reached connect");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let old = fleet.get("a").unwrap();
+
+        let d = fleet.apply_flock(&flock_of(&[("a", 3)]), &fast()).await;
+        assert_eq!(d.shutting_down, vec!["a".to_string()], "{d:?}");
+        assert!(d.retargeted.is_empty(), "not replaced yet: {d:?}");
+        assert_eq!(spawned(), 1, "no second actor next to the live one");
+        assert!(old.tx.same_channel(&fleet.get("a").unwrap().tx));
+        assert!(fleet.shutting_down("a"));
+        assert!(
+            !fleet.views().iter().any(|v| v.name == "a" && v.healthy),
+            "nothing is dispatched to it"
+        );
+        assert_eq!(fleet.flock(), flock_of(&[("a", 3)]), "what was asked for");
+
+        fake.wedge_connects(false);
+        let d = fleet.apply_flock(&flock_of(&[("a", 3)]), &fast()).await;
+        assert_eq!(d.retargeted, vec!["a".to_string()], "{d:?}");
+        assert!(d.shutting_down.is_empty(), "{d:?}");
+        assert!(old.actor_finished());
+        assert_eq!(spawned(), 2);
+        assert!(!fleet.shutting_down("a"));
+        assert_eq!(fleet.get("a").unwrap().max_agents, 3);
+        healthy(&fleet, "a").await;
+    }
+
+    /// The same for a removed machine: it stays listed until its actor ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removed_machine_stays_until_its_actor_stops() {
+        let fake = FakeHerdr::new();
+        let (fleet, _store) = managed(&[("a", fake.clone())]);
+        fake.wedge_connects(true);
+        fleet.apply_flock(&flock_of(&[("a", 2)]), &fast()).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.wedged() == 0 {
+            assert!(Instant::now() < deadline, "actor never reached connect");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let d = fleet.apply_flock(&Flock::default(), &fast()).await;
+        assert_eq!(d.shutting_down, vec!["a".to_string()], "{d:?}");
+        assert!(d.removed.is_empty(), "{d:?}");
+        assert!(fleet.get("a").is_some() && fleet.shutting_down("a"));
+
+        fake.wedge_connects(false);
+        let d = fleet.apply_flock(&Flock::default(), &fast()).await;
+        assert_eq!(d.removed, vec!["a".to_string()], "{d:?}");
+        assert!(fleet.machines().is_empty());
     }
 
     /// Review Focus 3: which rows a removed machine leaves behind. Only rows
@@ -1733,6 +1907,119 @@ mod tests {
         );
         assert!(message.contains("worktree"), "{message}");
         let stored = d.store.get_task(wt.id).unwrap().unwrap();
+        assert_eq!(stored.state, TaskState::Running, "the row stays open");
+    }
+
+    /// Wedges `FakeHerdr::connect` until dropped, even when an assert fails:
+    /// a wedged connect blocks a runtime thread, and the runtime would never
+    /// shut down.
+    struct Unwedge(FakeHerdr);
+    impl Drop for Unwedge {
+        fn drop(&mut self) {
+            self.0.wedge_connects(false);
+        }
+    }
+
+    /// A daemon running `a`, and `b` whose actor is stuck in connect and was
+    /// then taken out of the flock (`keep_b` false) or retargeted (true), so
+    /// `b` is shutting down. Needs a multi-thread runtime.
+    async fn daemon_with_b_shutting_down(keep_b: bool) -> (Daemon, tempfile::TempDir, Unwedge) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let flock = flock_of(&[("a", 2)]);
+        flock.save(&paths.flock_file()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            toml::to_string(&test_config()).unwrap(),
+        )
+        .unwrap();
+        let b = FakeHerdr::new();
+        b.wedge_connects(true);
+        let unwedge = Unwedge(b.clone());
+        let on_disk = ConfigFingerprint::sample(&paths);
+        let d = Daemon::start(
+            paths,
+            test_config(),
+            flock.clone(),
+            on_disk,
+            Some(factory(&[("a", FakeHerdr::new()), ("b", b.clone())])),
+        )
+        .await
+        .unwrap();
+        let settings = machine_settings(&test_config());
+        d.fleet()
+            .apply_flock(&flock_of(&[("a", 2), ("b", 2)]), &settings)
+            .await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while b.wedged() == 0 {
+            assert!(Instant::now() < deadline, "actor never reached connect");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let next = if keep_b {
+            flock_of(&[("a", 2), ("b", 3)])
+        } else {
+            flock
+        };
+        let diff = d.fleet().apply_flock(&next, &settings).await;
+        assert_eq!(diff.shutting_down, vec!["b".to_string()], "{diff:?}");
+        assert!(d.fleet().get("b").is_some(), "still held while it stops");
+        (d, tmp, unwedge)
+    }
+
+    /// A task on a removed machine held only while its old actor ends is
+    /// closed like one on any removed machine: that actor would never answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_a_task_on_a_removed_machine_shutting_down_closes_the_row() {
+        let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(false).await;
+        let mut t = insert(&d, TaskState::Running);
+        t.machine = Some("b".into());
+        d.store.update_task(&mut t).unwrap();
+        let resp = d
+            .handle(IpcRequest::TaskClose {
+                id: t.id,
+                remove_worktree: false,
+            })
+            .await;
+        let IpcResponse::Task(closed) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(closed.state, TaskState::Closed);
+
+        let mut wt = insert(&d, TaskState::Running);
+        wt.spec.worktree = true;
+        wt.machine = Some("b".into());
+        d.store.update_task(&mut wt).unwrap();
+        assert_eq!(
+            error_code(
+                d.handle(IpcRequest::TaskClose {
+                    id: wt.id,
+                    remove_worktree: true
+                })
+                .await
+            ),
+            "unknown_machine"
+        );
+    }
+
+    /// A retargeted machine keeps its tasks for the replacement, so a close
+    /// is refused until the old actor has ended, not left to hang on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_a_task_on_a_machine_being_replaced_waits() {
+        let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(true).await;
+        let mut t = insert(&d, TaskState::Running);
+        t.machine = Some("b".into());
+        d.store.update_task(&mut t).unwrap();
+        assert_eq!(
+            error_code(
+                d.handle(IpcRequest::TaskClose {
+                    id: t.id,
+                    remove_worktree: false
+                })
+                .await
+            ),
+            "machine_shutting_down"
+        );
+        let stored = d.store.get_task(t.id).unwrap().unwrap();
         assert_eq!(stored.state, TaskState::Running, "the row stays open");
     }
 

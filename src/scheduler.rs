@@ -803,13 +803,26 @@ impl Scheduler {
     /// replaced in the fleet (`Fleet::apply_flock`). `tick` sets the period
     /// from the next tick on. A change to `[defaults]` makes the job files
     /// re-parse. A file that does not load is logged and its previous version
-    /// stays in use, the same rule as a job file. Returns `None` when nothing
-    /// changed on disk, else what the fleet did (often nothing).
+    /// stays in use, the same rule as a job file. A machine whose old actor
+    /// did not stop (`FlockDiff::shutting_down`) is retried on every pass,
+    /// with the flock last applied, until the swap is done. Returns `None`
+    /// when nothing changed on disk and no swap was pending, else what the
+    /// fleet did (often nothing).
     pub async fn reload_config(&mut self, force: bool) -> Option<FlockDiff> {
         let files = [self.paths.config_file(), self.paths.flock_file()];
         let fp = ConfigFingerprint(file_fingerprint(&files));
         if !force && self.config_fingerprint.as_ref() == Some(&fp) {
-            return None;
+            if !self.fleet.any_shutting_down() {
+                return None;
+            }
+            // Nothing new on disk: finish the swap the last pass asked for.
+            let flock = self.fleet.flock();
+            let diff = self
+                .fleet
+                .apply_flock(&flock, &machine_settings(&self.config))
+                .await;
+            self.report(&diff, &flock);
+            return Some(diff);
         }
         self.config_fingerprint = Some(fp);
         match PastorConfig::load(&files[0]) {
@@ -837,13 +850,24 @@ impl Scheduler {
             .fleet
             .apply_flock(&flock, &machine_settings(&self.config))
             .await;
-        if !diff.is_empty() {
-            tracing::info!(added = ?diff.added, removed = ?diff.removed, retargeted = ?diff.retargeted, "flock reloaded");
-            if !diff.removed.is_empty() {
-                crate::daemon::warn_removed(&self.store, &flock);
-            }
-        }
+        self.report(&diff, &flock);
         Some(diff)
+    }
+
+    fn report(&self, diff: &FlockDiff, flock: &Flock) {
+        if diff.is_empty() {
+            return;
+        }
+        tracing::info!(
+            added = ?diff.added,
+            removed = ?diff.removed,
+            retargeted = ?diff.retargeted,
+            shutting_down = ?diff.shutting_down,
+            "flock reloaded"
+        );
+        if !diff.removed.is_empty() {
+            crate::daemon::warn_removed(&self.store, flock);
+        }
     }
 
     fn states(&self) -> HashMap<String, JobState> {
@@ -2227,6 +2251,52 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// Copilot 4103070196: a swap held up by an old actor that did not stop
+    /// is finished by a later pass even when nothing changed on disk since.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_up_swap_is_retried_without_an_edit() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (s, _tmp) = managed_scheduler(&store);
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let connect: crate::daemon::ConnectorFactory = {
+            let fake = fake.clone();
+            Arc::new(move |_m: &crate::config::flock::MachineConfig| {
+                Arc::new(fake.clone()) as Arc<dyn crate::herdr::Connector>
+            })
+        };
+        let (events, _) = broadcast::channel(16);
+        let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
+        let mut s = Scheduler::new(s.paths.clone(), &s.config, store.clone(), fleet, events);
+
+        fake.wedge_connects(true);
+        std::fs::write(s.paths.flock_file(), FLOCK_A).unwrap();
+        s.reload_config(false).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fake.wedged() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actor never reached connect"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        std::fs::write(s.paths.flock_file(), "").unwrap();
+        let d = s.reload_config(false).await.unwrap();
+        assert_eq!(d.shutting_down, vec!["a".to_string()], "{d:?}");
+        assert!(s.fleet.get("a").is_some());
+
+        fake.wedge_connects(false);
+        let d = s
+            .reload_config(false)
+            .await
+            .expect("an unfinished swap is retried with nothing changed on disk");
+        assert_eq!(d.removed, vec!["a".to_string()], "{d:?}");
+        assert!(s.fleet.machines().is_empty());
+        assert!(
+            s.reload_config(false).await.is_none(),
+            "and then left alone"
+        );
     }
 
     /// Review Focus 2: an editor re-save of either file restarts nothing.
