@@ -58,9 +58,6 @@ smoke: ## opt-in test against a real herdr: make smoke SESSION=default
 install: ## install pastor and fake-herdr into ~/.cargo/bin
 	cargo install --path . --force
 
-# The scripts are generated from the clap definitions, so they cannot drift
-# from the real command tree; `pastor completions <shell>` prints the same
-# thing at runtime for shells not listed here.
 # Records docs/demo/*.gif with vhs (https://github.com/charmbracelet/vhs; needs
 # vhs, ttyd, ffmpeg and fish). A demo head runs against docs/demo/local/,
 # which is not committed: copy flock.example.toml there and point it at
@@ -80,6 +77,9 @@ demo: build ## record the README gifs with vhs against a demo head
 	for i in $$(seq 1 100); do pastor task read t-1 2>&1 | grep -q 'not running' || break; sleep 0.3; done; \
 	for t in docs/demo/*.tape; do vhs $$t; done
 
+# The scripts are generated from the clap definitions, so they cannot drift
+# from the real command tree; `pastor completions <shell>` prints the same
+# thing at runtime for shells not listed here.
 completions: ## regenerate contrib/completions/pastor.{bash,fish} from the CLI
 	cargo build -q
 	mkdir -p contrib/completions
