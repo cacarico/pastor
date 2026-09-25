@@ -825,8 +825,14 @@ impl Scheduler {
             return Some(diff);
         }
         self.config_fingerprint = Some(fp);
-        match PastorConfig::load(&files[0]) {
-            Ok(config) => {
+        // Both loaders read a missing file as the defaults, which is what
+        // `serve` wants at startup. Here it is a failure: a deleted file, or
+        // an editor that replaces it by delete and rename, must not empty the
+        // fleet or reset the timings. A file that exists but is empty still
+        // applies. Logged once per pass that reads the files, which is once
+        // per change on disk.
+        match files[0].exists().then(|| PastorConfig::load(&files[0])) {
+            Some(Ok(config)) => {
                 if config.defaults != self.config.defaults {
                     self.defaults = config.defaults.clone();
                     // Jobs were parsed with the old defaults.
@@ -835,14 +841,25 @@ impl Scheduler {
                 self.tick = config.tick_duration();
                 self.config = config;
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 tracing::error!(%err, "pastor.toml does not load; the previous version stays in use")
             }
+            None => tracing::warn!(
+                path = %files[0].display(),
+                "pastor.toml is missing; the previous version stays in use"
+            ),
         }
-        let flock = match Flock::load(&files[1]) {
-            Ok(f) => f,
-            Err(err) => {
+        let flock = match files[1].exists().then(|| Flock::load(&files[1])) {
+            Some(Ok(f)) => f,
+            Some(Err(err)) => {
                 tracing::error!(%err, "flock.toml does not load; the previous flock stays in use");
+                self.fleet.flock()
+            }
+            None => {
+                tracing::warn!(
+                    path = %files[1].display(),
+                    "flock.toml is missing; the previous flock stays in use"
+                );
                 self.fleet.flock()
             }
         };
@@ -2297,6 +2314,93 @@ mod tests {
             s.reload_config(false).await.is_none(),
             "and then left alone"
         );
+    }
+
+    /// Log lines, for the tests that check a warning is given once.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Capture {
+            self.clone()
+        }
+    }
+    impl Capture {
+        /// Set as this thread's subscriber until the guard drops.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(self.clone())
+                    .with_ansi(false)
+                    .finish(),
+            )
+        }
+        fn count(&self, needle: &str) -> usize {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .matches(needle)
+                .count()
+        }
+    }
+
+    /// Copilot 4103070231: `Flock::load` reads a missing file as an empty
+    /// flock. A reload must not: deleting flock.toml, or an editor that
+    /// replaces it by delete and rename, would stop every actor. The same
+    /// for pastor.toml, which would fall back to default timings.
+    #[tokio::test]
+    async fn a_missing_config_file_keeps_the_previous_one() {
+        let logs = Capture::default();
+        let _guard = logs.install();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = managed_scheduler(&store);
+        std::fs::write(s.paths.flock_file(), FLOCK_AB).unwrap();
+        s.reload_config(false).await.unwrap();
+        let a = s.fleet.get("a").unwrap();
+
+        std::fs::remove_file(s.paths.flock_file()).unwrap();
+        let d = s.reload_config(false).await.expect("flock.toml went away");
+        assert!(d.is_empty(), "{d:?}");
+        assert!(s.fleet.get("a").is_some() && s.fleet.get("b").is_some());
+        assert!(a.tx.same_channel(&s.fleet.get("a").unwrap().tx));
+        assert!(
+            s.reload_config(false).await.is_none(),
+            "nothing new on disk"
+        );
+        assert_eq!(logs.count("flock.toml is missing"), 1);
+
+        std::fs::remove_file(s.paths.config_file()).unwrap();
+        let d = s.reload_config(false).await.expect("pastor.toml went away");
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(s.tick, Duration::from_secs(1), "tick = 1s kept");
+        assert!(s.reload_config(false).await.is_none());
+        assert_eq!(logs.count("pastor.toml is missing"), 1);
+        assert_eq!(
+            logs.count("flock.toml is missing"),
+            2,
+            "logged per pass that reads it"
+        );
+    }
+
+    /// Copilot 4103070231: an existing flock.toml with no machines is a
+    /// real edit, not a failure: it empties the fleet.
+    #[tokio::test]
+    async fn an_empty_flock_toml_empties_the_fleet() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = managed_scheduler(&store);
+        std::fs::write(s.paths.flock_file(), FLOCK_AB).unwrap();
+        s.reload_config(false).await.unwrap();
+        std::fs::write(s.paths.flock_file(), "# no machines\n").unwrap();
+        let d = s.reload_config(false).await.unwrap();
+        assert_eq!(d.removed, vec!["a".to_string(), "b".to_string()], "{d:?}");
+        assert!(s.fleet.machines().is_empty());
     }
 
     /// Review Focus 2: an editor re-save of either file restarts nothing.
