@@ -511,6 +511,7 @@ pub fn spawn_machine(
         status: status.clone(),
         rx,
         pending_done: HashMap::new(),
+        trust_answered: HashMap::new(),
         idle_agents: HashSet::new(),
         was_connected: false,
         failures: 0,
@@ -546,6 +547,13 @@ struct Actor {
     /// agent is still idle at that same sequence; with no sequence, the first
     /// check records one and starts the window over.
     pending_done: HashMap<i64, (Option<u64>, Instant)>,
+    /// task id -> when its trust keys went in. Claude redraws for a moment
+    /// after its trust dialog, already reported idle and ready, and loses a
+    /// prompt typed then although herdr accepts it; the pending prompt waits
+    /// `settle` from here (`deliver_pending_prompt`, `deliver_held_prompts`).
+    /// Kept in memory only: an actor started later comes well after the
+    /// redraw.
+    trust_answered: HashMap<i64, Instant>,
     /// Tasks whose agent this actor last saw `idle` or `done` (`unknown`
     /// changes nothing). Decides what an exit means: an agent that ends
     /// between turns finished its task; see `Observed::PaneExited`.
@@ -805,6 +813,10 @@ impl Actor {
                         Err(err) => { tracing::warn!(machine = %self.name, %err, "event stream ended"); break; }
                     },
                     _ = settle_tick.tick() => {
+                        if let Err(err) = self.deliver_held_prompts().await {
+                            if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "held prompt delivery failed"); break; }
+                            tracing::warn!(machine = %self.name, %err, "held prompt delivery failed; staying connected");
+                        }
                         if let Err(err) = self.confirm_pending_done().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "settle check failed"); break; }
                             tracing::warn!(machine = %self.name, %err, "settle check failed; staying connected");
@@ -1321,6 +1333,7 @@ impl Actor {
         }
         self.emit_with("task.input", Some(task.id), Some(detail));
         if input.trust {
+            self.trust_answered.insert(task.id, Instant::now());
             // The prompt is answered: saved trust must not answer it again.
             if let Err(err) = self.store.claim_trust_sent(task.id) {
                 return (Err(err), false);
@@ -1849,6 +1862,14 @@ impl Actor {
         if matches!(status, AgentStatus::Blocked | AgentStatus::Unknown) {
             return Ok(false);
         }
+        if let Some(at) = self.trust_answered.get(&task.id) {
+            if at.elapsed() < self.settings.settle {
+                // Still redrawing after its trust dialog: the settle tick
+                // sends it (`deliver_held_prompts`).
+                return Ok(true);
+            }
+            self.trust_answered.remove(&task.id);
+        }
         let name = task
             .agent_name
             .clone()
@@ -1916,6 +1937,43 @@ impl Actor {
         }
         self.refresh_live();
         Ok(true)
+    }
+
+    /// Send the pending prompts held after a trust answer once `settle` has
+    /// passed. No status event may come in between: the agent sits idle at
+    /// an empty input until it gets its prompt.
+    async fn deliver_held_prompts(&mut self) -> anyhow::Result<()> {
+        let due: Vec<i64> = self
+            .trust_answered
+            .iter()
+            .filter(|(_, at)| at.elapsed() >= self.settings.settle)
+            .map(|(id, _)| *id)
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        let timeout = self.settings.request_timeout;
+        let agents = tokio::time::timeout(timeout, self.connector.agent_list())
+            .await
+            .map_err(|_| TimedOut("agent.list", timeout))??;
+        for id in due {
+            self.trust_answered.remove(&id);
+            let Ok(Some(task)) = self.store.get_task(id) else {
+                continue;
+            };
+            if !task.prompt_pending || !task.state.occupies_pane() {
+                continue;
+            }
+            let Some(agent) = agents
+                .iter()
+                .find(|a| Some(&a.pane_id) == task.pane_id.as_ref())
+            else {
+                continue;
+            };
+            self.deliver_pending_prompt(task, agent.agent_status)
+                .await?;
+        }
+        Ok(())
     }
 
     /// After the settle window, confirm with agent.list that the agent is still idle, at
@@ -2264,6 +2322,7 @@ impl Actor {
             tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
                 .await
                 .map_err(|_| TimedOut("pane.send_keys", timeout))??;
+            self.trust_answered.insert(task.id, Instant::now());
             if !self.store.claim_trust_sent(task.id)? {
                 continue;
             }
@@ -3816,6 +3875,69 @@ mod tests {
             evs[0].detail,
             Some(serde_json::json!({"keys": ["Down", "Enter"], "trust": true}))
         );
+    }
+
+    /// Claude redraws for a moment after its trust dialog, and loses a prompt
+    /// typed then although herdr accepts it. Settings where that moment is
+    /// shorter than the settle window, and the fake set to lose such prompts.
+    fn redrawing_after_trust() -> (FakeHerdr, MachineSettings) {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        fake.set_trust_redraw(Duration::from_millis(250));
+        let settings = MachineSettings {
+            settle: Duration::from_millis(400),
+            ..settings()
+        };
+        (fake, settings)
+    }
+
+    /// The agent has the prompt: it went to work on it.
+    fn agent_working(fake: &FakeHerdr) -> bool {
+        fake.agents()
+            .first()
+            .is_some_and(|a| a.agent_status == AgentStatus::Working)
+    }
+
+    /// `--trust` on an agent that redraws after its dialog: the prompt waits
+    /// out the settle window, so it reaches the agent, and goes in once.
+    #[tokio::test]
+    async fn send_trust_delivers_the_prompt_once_after_the_agent_redraws() {
+        let (fake, settings) = redrawing_after_trust();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h
+            .dispatch(repo_task(&store, "claude", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        h.send(t.id, trust()).await.unwrap();
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        // Some reconciles later, still once.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// The same for the actor's own answer to a trusted repo's dialog.
+    #[tokio::test]
+    async fn auto_trust_delivers_the_prompt_once_after_the_agent_redraws() {
+        let (fake, settings) = redrawing_after_trust();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
     /// `--trust` answers only the startup prompt: a task that is starting,

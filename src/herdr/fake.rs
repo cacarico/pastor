@@ -102,6 +102,13 @@ struct State {
     /// A started agent sits `blocked` on its folder-trust question until
     /// `pane.send_keys` sends exactly these keys (see `set_trust_prompt`).
     trust_prompt: Option<Vec<String>>,
+    /// How long after its trust question is answered an agent still redraws:
+    /// `agent.prompt` is accepted in that window but the text is lost, as
+    /// Claude loses input typed while it replaces the dialog with its prompt
+    /// box. herdr already reports it idle and ready by then. Zero by default.
+    trust_redraw: Duration,
+    /// pane id -> when its trust question was answered.
+    trust_answered: HashMap<String, Instant>,
 }
 
 /// herdr 0.9.1 derives `agent_status` from a detected state (idle, working,
@@ -330,6 +337,12 @@ impl FakeHerdr {
     /// turns it off.
     pub fn set_trust_prompt(&self, keys: Option<Vec<String>>) {
         self.state.lock().unwrap().trust_prompt = keys;
+    }
+
+    /// Prompts sent within `d` of the trust answer are accepted and lost (see
+    /// `State::trust_redraw`).
+    pub fn set_trust_redraw(&self, d: Duration) {
+        self.state.lock().unwrap().trust_redraw = d;
     }
 
     /// `agent.prompt` is accepted from now on, but the agent never starts
@@ -787,7 +800,11 @@ impl FakeHerdr {
                         format!("agent {target} is not an active named agent"),
                     ));
                 }
-                if s.ignore_prompts {
+                let redrawing = s
+                    .trust_answered
+                    .get(&found.pane_id)
+                    .is_some_and(|at| at.elapsed() < s.trust_redraw);
+                if s.ignore_prompts || redrawing {
                     return Ok(json!({"type": "agent_prompted", "agent": found}));
                 }
                 let info = change_status(&mut s, &found.pane_id, AgentStatus::Working)
@@ -857,6 +874,7 @@ impl FakeHerdr {
                         .is_some_and(|a| a.agent_status == AgentStatus::Blocked);
                 s.pane_input.entry(pane_id.clone()).or_default().push(input);
                 if answered {
+                    s.trust_answered.insert(pane_id.clone(), Instant::now());
                     change_status(&mut s, &pane_id, AgentStatus::Idle);
                     let ws = pane_id.split(':').next().unwrap_or("w1").to_string();
                     drop(s);
@@ -1534,5 +1552,32 @@ mod tests {
         let a = &fake.agent_list().await.unwrap()[0];
         assert_eq!(a.agent_status, AgentStatus::Idle);
         assert!(a.interactive_ready);
+    }
+
+    /// A prompt sent while the agent redraws after its trust answer is
+    /// accepted and lost; one sent after it lands.
+    #[tokio::test]
+    async fn a_prompt_right_after_the_trust_answer_is_lost() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Enter".into()]));
+        fake.set_trust_redraw(Duration::from_millis(100));
+        let created = fake
+            .workspace_create(None, "x", &Default::default())
+            .await
+            .unwrap();
+        let pane = created.root_pane.pane_id;
+        fake.agent_start("t-1", "claude", &pane, &[]).await.unwrap();
+        fake.pane_send_keys(&pane, &["Enter".into()]).await.unwrap();
+        fake.agent_prompt("t-1", "go").await.unwrap();
+        assert_eq!(
+            fake.agent_list().await.unwrap()[0].agent_status,
+            AgentStatus::Idle
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        fake.agent_prompt("t-1", "go").await.unwrap();
+        assert_eq!(
+            fake.agent_list().await.unwrap()[0].agent_status,
+            AgentStatus::Working
+        );
     }
 }

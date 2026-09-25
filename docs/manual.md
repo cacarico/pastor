@@ -181,7 +181,10 @@ without trust keys answers `no_trust_keys`, and a task
 without `--repo` gets the keys but nothing is saved. From then on, when a task
 of a saved repo is blocked during startup on that machine, the head presses
 the trust keys itself, once per task, and emits `task.trusted`; a task still
-blocked after that is left for a human. `pastor trust list [--json]` shows
+blocked after that is left for a human. Either way the task's prompt goes in
+once, `settle` after the trust keys: Claude redraws for a moment after the
+dialog and loses what is typed then, though herdr takes it.
+`pastor trust list [--json]` shows
 the saved pairs and `pastor trust remove <machine> <repo>` forgets one; both
 work with `pastor serve` down.
 
