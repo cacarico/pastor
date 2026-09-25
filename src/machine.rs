@@ -129,7 +129,7 @@ pub struct MachineStatus {
     pub channel: ChannelState,
     pub herdr_version: Option<String>,
     /// `Connector::pastor_version`, asked at each connect and again every
-    /// `MachineSettings::version_every` while connected. Defaulted so a
+    /// `MachineSettings::version_every` while connected or polling. Defaulted so a
     /// CLI can still read a head that predates the field.
     #[serde(default)]
     pub pastor_version: Option<String>,
@@ -172,9 +172,10 @@ pub struct MachineSettings {
     /// How long a `done` task keeps its pane before reconcile closes it
     /// (`close_done_after` in `pastor.toml`). `None` turns auto-close off.
     pub close_done_after: Option<Duration>,
-    /// While connected, how often the reconcile tick asks the machine for its
+    /// While connected or polling, how often the machine is asked for its
     /// pastor version again, so an upgrade shows without a reconnect. Checked
-    /// on the reconcile tick, so the real interval rounds up to it.
+    /// after each reconcile (`reconcile_every` connected, `poll_every`
+    /// polling), so the real interval rounds up to that tick.
     pub version_every: Duration,
     /// `[agents]` in `pastor.toml`: the keys that answer each agent's
     /// folder-trust prompt.
@@ -515,6 +516,7 @@ pub fn spawn_machine(
         failures: 0,
         lost_announced: false,
         orphans: vec![],
+        version_asked_at: Instant::now(),
     };
     let task = tokio::spawn(actor.run());
     MachineHandle {
@@ -560,6 +562,9 @@ struct Actor {
     /// Orphaned agents from the last reconcile, as (agent name, pane id).
     /// See `MachineStatus::orphans`.
     orphans: Vec<(String, String)>,
+    /// When the machine was last asked for its pastor version; see
+    /// `refresh_pastor_version`.
+    version_asked_at: Instant,
 }
 
 /// The pane of `task` if it is live on `machine`: starting with a pane
@@ -698,7 +703,7 @@ impl Actor {
                     }
                 };
             let pastor_version = self.ask_pastor_version().await.flatten();
-            let mut version_asked_at = Instant::now();
+            self.version_asked_at = Instant::now();
             {
                 let mut s = self.status.write().unwrap();
                 s.herdr_version = Some(pong.version.clone());
@@ -832,14 +837,8 @@ impl Actor {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "auto-close failed"); break; }
                             tracing::warn!(machine = %self.name, %err, "auto-close failed; staying connected");
                         }
-                        if reconciled && version_asked_at.elapsed() >= self.settings.version_every {
-                            version_asked_at = Instant::now();
-                            // A probe that got no answer keeps the version
-                            // last read, rather than blanking it until the
-                            // next probe.
-                            if let Some(v) = self.ask_pastor_version().await {
-                                self.status.write().unwrap().pastor_version = v;
-                            }
+                        if reconciled {
+                            self.refresh_pastor_version().await;
                         }
                     }
                 }
@@ -875,6 +874,21 @@ impl Actor {
             self.refresh_live();
         }
         exit
+    }
+
+    /// Ask for the pastor version again once `version_every` has passed since
+    /// the last ask. Called after a reconcile that worked, connected or
+    /// polling, so an upgrade shows without a reconnect. A probe that got no
+    /// answer keeps the version last read rather than blanking it until the
+    /// next probe.
+    async fn refresh_pastor_version(&mut self) {
+        if self.version_asked_at.elapsed() < self.settings.version_every {
+            return;
+        }
+        self.version_asked_at = Instant::now();
+        if let Some(v) = self.ask_pastor_version().await {
+            self.status.write().unwrap().pastor_version = v;
+        }
     }
 
     async fn connect_failed(&mut self, message: String, backoff: &mut Duration) {
@@ -1086,10 +1100,12 @@ impl Actor {
                         // An attempt already in flight was built before the
                         // adoption and would miss the pane; start it over. With
                         // none in flight the next attempt reads the store fresh.
-                        Ok(true) if subscribing.is_some() => {
-                            subscribing = self.subscribe_future().ok();
+                        Ok(adopted) => {
+                            if adopted && subscribing.is_some() {
+                                subscribing = self.subscribe_future().ok();
+                            }
+                            self.refresh_pastor_version().await;
                         }
-                        Ok(_) => {}
                         Err(err) => {
                             tracing::warn!(machine = %self.name, %err, "poll reconcile failed");
                             if is_outage(&err) {
@@ -5411,6 +5427,44 @@ mod tests {
         assert_eq!(pings, 1, "picked up without a reconnect");
     }
 
+    /// The same refresh while polling: a machine whose events will not open
+    /// still answers requests and can stay that way for as long as it likes.
+    #[tokio::test]
+    async fn a_polling_machine_picks_up_a_new_pastor_version() {
+        let fake = FakeHerdr::new();
+        fake.set_pastor_version(Some("0.2.0"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, _rx) = broadcast::channel(64);
+        let mut settings = settings();
+        settings.poll_every = Duration::from_millis(50);
+        let h = spawn_machine(
+            "m".into(),
+            2,
+            vec![],
+            Arc::new(FlakyEvents {
+                subscribes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                // The first subscribe fails fast, so the machine polls at
+                // once; every retry wedges, so it keeps polling.
+                fail_until: 1,
+                wedge_forever: true,
+                slow_ack: None,
+                fake: fake.clone(),
+            }),
+            store,
+            settings,
+            events,
+        );
+        wait_for("polling", || h.snapshot().channel == ChannelState::Polling).await;
+        assert_eq!(h.snapshot().pastor_version.as_deref(), Some("0.2.0"));
+
+        fake.set_pastor_version(Some("0.3.0"));
+        wait_for("the new version", || {
+            h.snapshot().pastor_version.as_deref() == Some("0.3.0")
+        })
+        .await;
+        assert_eq!(h.snapshot().channel, ChannelState::Polling);
+    }
+
     #[tokio::test]
     async fn incompatible_protocol_is_reported_and_not_dispatched_to() {
         let fake = FakeHerdr::new();
@@ -5565,6 +5619,9 @@ mod tests {
         }
         fn describe(&self) -> String {
             "flaky events".into()
+        }
+        fn pastor_version(&self) -> crate::herdr::transport::VersionFuture<'_> {
+            self.fake.pastor_version()
         }
     }
 
