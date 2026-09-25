@@ -28,8 +28,8 @@ spend time deciding what to do, not typing it. The longer story is in
 - **Tasks.** One agent, one prompt, in a repo or a fresh git worktree of it.
   Tags, a per-machine agent limit or a pinned machine decide where it runs.
 - **Jobs.** Recurring tasks from a TOML file: a schedule, a connector that
-  finds the work, and a prompt template. A cursor keeps an item from being
-  handled twice.
+  finds the work, and a prompt template. Each item has a stable key, and a
+  key pastor has seen is never turned into a task again.
 - **Flocks.** Named groups of machines, such as work and personal ones on
   different accounts. A task only runs inside its own flock.
 - **Plugins.** Connectors that turn outside sources into work (the built-in
@@ -41,7 +41,8 @@ spend time deciding what to do, not typing it. The longer story is in
   `task attach` puts you in its terminal, and `task send` answers it.
 - **A view of the fleet.** `machine list` shows every machine, its flock,
   its herdr and pastor versions and how busy it is.
-- **An events log** of every state change, with `pastor events --follow`.
+- **An events log** of pastor's task, job and machine events, with
+  `pastor events --follow`.
 - **Runs as a service.** `pastor setup systemd` installs the head as a user
   unit, and flock or config edits reload it without a restart.
 - **Scriptable.** `--json` on the list and show commands, and shell
