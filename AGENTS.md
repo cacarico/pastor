@@ -130,9 +130,6 @@ Plan 4 (cleanup and lifecycle):
   `Run`.
 - `machine add --command` is greedy (`num_args = 1..`): options placed after
   it are taken as part of the command. Put options before it, or add `--`.
-- A repo that does not exist on the machine is not an error: herdr opened
-  t-5's workspace at `$HOME` instead of the requested path. Check herdr's
-  `workspace.create` behaviour and fail the task if the cwd is wrong.
 - Claude Code's "trust this folder" dialog blocks every agent started in a
   folder it has not seen, on a fresh machine, until answered once per
   machine; pastor cannot answer it, so use `pastor task attach` to answer it by

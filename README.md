@@ -42,6 +42,14 @@ kept in memory, so after a daemon restart an agent found idle stays `running`
 until its task goes `stale`. Task state lives in SQLite under
 `~/.local/state/pastor/`.
 
+Before creating a workspace, pastor checks that the repo directory is
+actually there: `test -d` over the same ssh master for an `ssh` machine,
+directly on the filesystem for a `local` one, and skipped for a `command`
+bridge, which says nothing about where it lands. herdr otherwise opens the
+workspace in the shell's home with no error when the requested `cwd` is
+missing, so a missing repo fails the task instead of silently working in
+the wrong place.
+
 The CLI talks to `pastor serve` over a unix socket (`pastor.sock`) with
 newline-delimited JSON; each response is `{"kind": ..., "data": ...}`.
 `pastor serve` refuses to start if a daemon already holds that socket, or if
