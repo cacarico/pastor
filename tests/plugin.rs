@@ -193,7 +193,7 @@ async fn drain_until(
         assert!(Instant::now() < deadline, "only got {keys:?}");
         if let Ok(out) = src.run(input(cfg.clone(), Some("cur-0"))).await {
             // As the scheduler does once it has persisted a batch.
-            src.ack();
+            src.ack(out.batch);
             keys.extend(out.items.into_iter().map(|i| i.key));
             cursors.push(out.cursor);
             logs.extend(out.logs);

@@ -23,6 +23,7 @@ impl ItemSource for Clock {
                 items: vec![Item::new(at, fields)],
                 cursor: None,
                 logs: Vec::new(),
+                batch: 0,
             })
         })
     }

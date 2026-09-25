@@ -52,6 +52,9 @@ pub struct RunOutput {
     /// Persisted only when the run succeeds; `None` keeps the previous cursor.
     pub cursor: Option<String>,
     pub logs: Vec<String>,
+    /// Which batch this is, handed back to `ItemSource::ack` once it is
+    /// persisted. 0 from a source that does not hold batches.
+    pub batch: u64,
 }
 
 pub type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<RunOutput, String>> + Send + 'a>>;
@@ -59,12 +62,15 @@ pub type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<RunOutput, String>> 
 pub trait ItemSource: Send + Sync {
     fn id(&self) -> &str;
     fn run<'a>(&'a self, input: RunInput) -> RunFuture<'a>;
-    /// The last `run`'s items and cursor are persisted. A source that cannot
-    /// produce them again (a stream: its process emitted them once) keeps
-    /// handing them out until this is called, so a dry run or a failed
-    /// insert does not lose them. A source that re-reads from the job's
-    /// cursor ignores it.
-    fn ack(&self) {}
+    /// The items and cursor of the run that returned `batch` are persisted.
+    /// A source that cannot produce them again (a stream: its process
+    /// emitted them once) keeps handing them out until this is called, so a
+    /// dry run or a failed insert does not lose them. Runs of one job can
+    /// overlap (a forced tick and `job run`), so the ack names its batch and
+    /// clears only what that batch held, never items a later run took and
+    /// has not persisted. A source that re-reads from the job's cursor
+    /// ignores it.
+    fn ack(&self, _batch: u64) {}
     /// A process that outlives a run and emits between runs (a stream). Only
     /// `pastor serve` can host one: a process that exits after one pass
     /// would stop it before anything it emitted is drained.

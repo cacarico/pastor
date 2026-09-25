@@ -1,8 +1,8 @@
 //! Connectors a plugin provides: its `[connector]` command behind the
 //! `ItemSource` seam. A poll connector runs once per job run; a stream
 //! connector is started once and kept alive, and each job run drains what it
-//! emitted since the last one, plus any earlier batch the scheduler has not
-//! acked.
+//! emitted since the last one, plus whatever earlier batch the scheduler has
+//! not acked yet.
 //!
 //! Both get the same handshake on stdin, one JSON line
 //! `{"config": .., "cursor": .., "since": ..}`, and answer in JSON lines on
@@ -225,11 +225,14 @@ struct Buffer {
     logs_dropped: usize,
     /// Why the stream is not running right now, if it is not.
     down: Option<String>,
-    /// What the last drain handed out, until the scheduler acks it: the
-    /// process will not emit it again, so it goes out again with the next
-    /// drain until it is persisted.
-    pending: Vec<Item>,
-    pending_cursor: Option<String>,
+    /// What drains handed out and nobody has acked yet, each with the first
+    /// batch it went out in: the process will not emit it again, so it goes
+    /// out again with every drain until it is persisted. Every drain carries
+    /// all of it, so batch `n` held exactly the entries numbered `<= n`.
+    pending: Vec<(u64, Item)>,
+    pending_cursor: Option<(u64, String)>,
+    /// The number of the last drain.
+    batch: u64,
 }
 
 /// A stream can run for days between two drains of an infrequent job, so
@@ -255,16 +258,21 @@ impl Buffer {
     /// Everything not yet acked: the unacked batch, then what arrived since,
     /// overflow notes first. Logs go out once.
     fn drain(&mut self) -> RunOutput {
-        let mut items = std::mem::take(&mut self.pending);
-        items.extend(self.items.drain(..));
-        if items.len() > STREAM_BUFFER_MAX {
-            let over = items.len() - STREAM_BUFFER_MAX;
-            items.drain(..over);
+        self.batch += 1;
+        let batch = self.batch;
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.extend(self.items.drain(..).map(|i| (batch, i)));
+        if pending.len() > STREAM_BUFFER_MAX {
+            let over = pending.len() - STREAM_BUFFER_MAX;
+            pending.drain(..over);
             self.items_dropped += over;
         }
-        let cursor = self.cursor.take().or_else(|| self.pending_cursor.take());
-        self.pending = items.clone();
-        self.pending_cursor = cursor.clone();
+        if let Some(c) = self.cursor.take() {
+            self.pending_cursor = Some((batch, c));
+        }
+        let items = pending.iter().map(|(_, i)| i.clone()).collect();
+        self.pending = pending;
+        let cursor = self.pending_cursor.as_ref().map(|(_, c)| c.clone());
         let mut logs = Vec::with_capacity(self.logs.len() + 2);
         if self.logs_dropped > 0 {
             logs.push(format!(
@@ -283,12 +291,21 @@ impl Buffer {
             items,
             cursor,
             logs,
+            batch,
         }
     }
 
-    fn ack(&mut self) {
-        self.pending.clear();
-        self.pending_cursor = None;
+    /// Batch `batch` is persisted: forget what it held, and keep what a
+    /// later drain added, since that run may still fail or be a dry run.
+    fn ack(&mut self, batch: u64) {
+        self.pending.retain(|(first, _)| *first > batch);
+        if self
+            .pending_cursor
+            .as_ref()
+            .is_some_and(|(first, _)| *first <= batch)
+        {
+            self.pending_cursor = None;
+        }
     }
 }
 
@@ -391,8 +408,8 @@ impl ItemSource for StreamSource {
         })
     }
 
-    fn ack(&self) {
-        lock(&self.buffer).ack();
+    fn ack(&self, batch: u64) {
+        lock(&self.buffer).ack(batch);
     }
 
     fn long_lived(&self) -> bool {
@@ -506,9 +523,45 @@ mod tests {
         assert_eq!(keys, vec!["k1", "k2"], "unacked first, then the new");
         assert_eq!(again.cursor.as_deref(), Some("c1"));
         assert!(again.logs.is_empty(), "logs go out once");
-        b.ack();
+        b.ack(again.batch);
         let out = b.drain();
         assert!(out.items.is_empty() && out.cursor.is_none());
+    }
+
+    #[test]
+    fn an_ack_clears_only_the_batch_it_names() {
+        let mut b = Buffer::default();
+        b.push_item(Item::new("a", serde_json::Map::new()));
+        b.cursor = Some("c-a".into());
+        let run_a = b.drain();
+        b.push_item(Item::new("b", serde_json::Map::new()));
+        b.cursor = Some("c-b".into());
+        let run_b = b.drain();
+        let keys: Vec<&str> = run_b.items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["a", "b"]);
+        assert_ne!(run_a.batch, run_b.batch);
+        // Run A persisted its batch; run B has not (a dry run, say).
+        b.ack(run_a.batch);
+        let next = b.drain();
+        let keys: Vec<&str> = next.items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["b"], "B's newer item stays pending");
+        assert_eq!(next.cursor.as_deref(), Some("c-b"));
+        b.ack(next.batch);
+        let out = b.drain();
+        assert!(out.items.is_empty() && out.cursor.is_none());
+    }
+
+    #[test]
+    fn acking_the_later_batch_clears_the_earlier_too() {
+        let mut b = Buffer::default();
+        b.push_item(Item::new("a", serde_json::Map::new()));
+        let run_a = b.drain();
+        b.push_item(Item::new("b", serde_json::Map::new()));
+        let run_b = b.drain();
+        b.ack(run_b.batch);
+        b.ack(run_a.batch);
+        let out = b.drain();
+        assert!(out.items.is_empty(), "{:?}", out.items);
     }
 
     #[test]

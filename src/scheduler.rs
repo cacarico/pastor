@@ -330,7 +330,7 @@ pub async fn run_job(
         // retry cannot fix it, so it does not hold them. The same rule acks a
         // stream's batch: until then it hands the items out again.
         if report.deferred == 0 && !insert_failed {
-            source.ack();
+            source.ack(output.batch);
             state.last_ok_at = Some(now);
             if output.cursor.is_some() {
                 state.cursor = output.cursor;
@@ -1240,6 +1240,7 @@ mod tests {
                     items: self.items.lock().unwrap().clone(),
                     cursor: self.cursor.lock().unwrap().clone(),
                     logs: vec!["scripted ran".into()],
+                    batch: 0,
                 })
             })
         }
