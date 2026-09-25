@@ -129,8 +129,6 @@ Plan 3 (events and plugins):
 
 Plan 4 (cleanup and lifecycle):
 
-- `machine add --command` is greedy (`num_args = 1..`): options placed after
-  it are taken as part of the command. Put options before it, or add `--`.
 - Claude Code's "trust this folder" dialog blocks every agent started in a
   folder it has not seen, on a fresh machine, until answered once per
   machine; pastor cannot answer it, so use `pastor task attach` to answer it by

@@ -104,7 +104,7 @@ pastor job reload          # re-read the files now instead of at the next tick
 pastor tick --dry-run --job hourly   # what a run would create, creating nothing
 ```
 
-The head picks up job file edits by itself. A file that stops parsing keeps its last good version and shows the error in `pastor job list`. It re-reads `flock.toml` and `pastor.toml` the same way, so `pastor machine add`, `pastor machine remove` and config edits need no restart; `pastor tick` reloads them too.
+The head picks up job file edits by itself. A file that stops parsing keeps its last good version and shows the error in `pastor job list`. It also re-reads `flock.toml` and `pastor.toml`, so `pastor machine add`, `pastor machine remove` and config edits need no restart (`pastor tick` reloads them too); one of those that stops parsing also keeps its last good version, but reports it in the daemon log only (`journalctl --user -u pastor`), not in `pastor job list`.
 
 ## The fleet
 
