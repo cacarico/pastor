@@ -1493,6 +1493,7 @@ mod tests {
             poll_every: Duration::from_millis(200),
             close_done_after: None,
             agents: Default::default(),
+            ..Default::default()
         }
     }
 

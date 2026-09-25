@@ -128,7 +128,8 @@ pub struct MachineStatus {
     pub endpoint: String,
     pub channel: ChannelState,
     pub herdr_version: Option<String>,
-    /// `Connector::pastor_version`, asked once per connect. Defaulted so a
+    /// `Connector::pastor_version`, asked at each connect and again every
+    /// `MachineSettings::version_every` while connected. Defaulted so a
     /// CLI can still read a head that predates the field.
     #[serde(default)]
     pub pastor_version: Option<String>,
@@ -171,6 +172,10 @@ pub struct MachineSettings {
     /// How long a `done` task keeps its pane before reconcile closes it
     /// (`close_done_after` in `pastor.toml`). `None` turns auto-close off.
     pub close_done_after: Option<Duration>,
+    /// While connected, how often the reconcile tick asks the machine for its
+    /// pastor version again, so an upgrade shows without a reconnect. Checked
+    /// on the reconcile tick, so the real interval rounds up to it.
+    pub version_every: Duration,
     /// `[agents]` in `pastor.toml`: the keys that answer each agent's
     /// folder-trust prompt.
     pub agents: crate::config::Agents,
@@ -187,6 +192,7 @@ impl Default for MachineSettings {
             agent_ready_timeout: Duration::from_secs(30),
             poll_every: Duration::from_secs(10),
             close_done_after: Some(Duration::from_secs(15 * 60)),
+            version_every: Duration::from_secs(10 * 60),
             agents: crate::config::Agents::default(),
         }
     }
@@ -639,18 +645,19 @@ enum PollExit {
 }
 
 impl Actor {
-    /// The machine's pastor version, for `machine list` only. The ping just
-    /// proved the machine reachable, so a failure here, even an ssh one, is
-    /// logged and read as unknown rather than failing the connect: the next
-    /// request finds out soon enough if the machine really went away.
-    async fn ask_pastor_version(&self) -> Option<String> {
+    /// The machine's pastor version, for `machine list` only; `None` when
+    /// the question got no answer. The ping or reconcile before it just proved
+    /// the machine reachable, so a failure here, even an ssh one, is logged
+    /// rather than failing the connection: the next request finds out soon
+    /// enough if the machine really went away.
+    async fn ask_pastor_version(&self) -> Option<Option<String>> {
         match tokio::time::timeout(
             self.settings.request_timeout,
             self.connector.pastor_version(),
         )
         .await
         {
-            Ok(Ok(v)) => v,
+            Ok(Ok(v)) => Some(v),
             Ok(Err(err)) => {
                 tracing::warn!(machine = %self.name, %err, "could not ask for the pastor version");
                 None
@@ -690,7 +697,8 @@ impl Actor {
                         continue;
                     }
                 };
-            let pastor_version = self.ask_pastor_version().await;
+            let pastor_version = self.ask_pastor_version().await.flatten();
+            let mut version_asked_at = Instant::now();
             {
                 let mut s = self.status.write().unwrap();
                 s.herdr_version = Some(pong.version.clone());
@@ -823,6 +831,15 @@ impl Actor {
                         if reconciled && let Err(err) = self.auto_close_done().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "auto-close failed"); break; }
                             tracing::warn!(machine = %self.name, %err, "auto-close failed; staying connected");
+                        }
+                        if reconciled && version_asked_at.elapsed() >= self.settings.version_every {
+                            version_asked_at = Instant::now();
+                            // A probe that got no answer keeps the version
+                            // last read, rather than blanking it until the
+                            // next probe.
+                            if let Some(v) = self.ask_pastor_version().await {
+                                self.status.write().unwrap().pastor_version = v;
+                            }
                         }
                     }
                 }
@@ -2326,6 +2343,7 @@ mod tests {
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
             close_done_after: None,
+            version_every: Duration::from_millis(200),
             agents: Default::default(),
         }
     }
@@ -5363,6 +5381,34 @@ mod tests {
             h.snapshot().pastor_version.is_none() && h.snapshot().channel == ChannelState::Connected
         })
         .await;
+    }
+
+    /// An upgrade on a machine that stays connected shows without a restart
+    /// or a reconnect: the reconcile tick asks again once `version_every`
+    /// has passed.
+    #[tokio::test]
+    async fn a_connected_machine_picks_up_a_new_pastor_version() {
+        let fake = FakeHerdr::new();
+        fake.set_pastor_version(Some("0.2.0"));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        assert_eq!(h.snapshot().pastor_version.as_deref(), Some("0.2.0"));
+
+        fake.set_pastor_version(Some("0.3.0"));
+        wait_for("the new version", || {
+            h.snapshot().pastor_version.as_deref() == Some("0.3.0")
+        })
+        .await;
+        let pings = fake
+            .requests()
+            .iter()
+            .filter(|r| r.method == "ping")
+            .count();
+        assert_eq!(pings, 1, "picked up without a reconnect");
     }
 
     #[tokio::test]

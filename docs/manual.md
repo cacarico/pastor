@@ -93,8 +93,11 @@ over the ssh master, pastor runs `pastor --version` in a shell that has
 `~/.cargo/bin` and `~/.local/bin` on its PATH, since ssh's non-login shell
 often lacks them. A `local` machine is the head's own pastor; a `command`
 machine, one with no pastor, or one that gives an odd answer shows `-`. The
-head asks once each time it connects to a machine, so an upgrade shows after
-the next reconnect.
+head asks each time it connects to a machine, and again on the first
+reconcile tick (`reconcile_every`) after ten minutes connected, so an upgrade
+shows within about ten minutes without restarting the head. A probe that gets
+no answer keeps the version last read. `machine list` itself never probes
+while the head is running.
 With `pastor serve` running, CHANNEL is the head's live channel state and
 AGENTS counts pastor's tasks and orphans (see below) against `max_agents`. Without it, the command
 probes each machine itself (a ping and an `agent.list`, one at a time, with no
