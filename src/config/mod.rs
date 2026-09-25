@@ -203,6 +203,19 @@ pub struct AgentChoice {
     pub deny: Vec<String>,
 }
 
+/// Where a task's agent, or its args, came from (`Defaults::resolve_agent_on`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// The run flags or the job file.
+    Ask,
+    /// The `[[machine]]` entry of the machine the task runs on.
+    Machine,
+    /// The task's `[[flock]]` entry.
+    Flock,
+    /// `[defaults]`, whose `agent` is the built-in `claude` when unset.
+    Defaults,
+}
+
 /// The agent a task runs, as `Defaults::resolve_agent` settled it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPick {
@@ -210,6 +223,10 @@ pub struct AgentPick {
     pub agent_args: Vec<String>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    pub agent_from: Layer,
+    /// `None` when no layer's args were written for the agent: it runs
+    /// with none.
+    pub args_from: Option<Layer>,
 }
 
 impl AgentPick {
@@ -251,6 +268,18 @@ impl Defaults {
     /// in any `deny` is dropped from `allow`, and also passed as a deny.
     /// The one place these rules live, so run and jobs cannot drift apart.
     pub fn resolve_agent(&self, ask: &AgentChoice, flock: Option<&flock::FlockEntry>) -> AgentPick {
+        self.resolve_agent_on(ask, None, flock)
+    }
+
+    /// `resolve_agent` for a task on `machine`: its `agent` and
+    /// `agent_args` come between the ask and the flock's, so machines of
+    /// one flock can run different agents. Tool lists stay per flock.
+    pub fn resolve_agent_on(
+        &self,
+        ask: &AgentChoice,
+        machine: Option<&flock::MachineConfig>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> AgentPick {
         let lists =
             |pick: fn(&flock::FlockEntry) -> &Vec<String>, own: &Vec<String>, ask: &Vec<String>| {
                 let mut out: Vec<String> = Vec::new();
@@ -268,28 +297,42 @@ impl Defaults {
         let deny = lists(|f| &f.deny, &self.deny, &ask.deny);
         let mut allow = lists(|f| &f.allow, &self.allow, &ask.allow);
         allow.retain(|p| !deny.contains(p));
-        let flock = flock.map(|f| (f.agent.as_deref(), f.agent_args.as_ref()));
-        let agent = ask
-            .agent
-            .as_deref()
-            .or(flock.and_then(|(a, _)| a))
-            .unwrap_or(&self.agent)
-            .to_string();
         let layers = [
-            (ask.agent.as_deref(), ask.agent_args.as_ref()),
-            flock.unwrap_or((None, None)),
-            (Some(self.agent.as_str()), Some(&self.agent_args)),
+            (Layer::Ask, ask.agent.as_deref(), ask.agent_args.as_ref()),
+            (
+                Layer::Machine,
+                machine.and_then(|m| m.agent.as_deref()),
+                machine.and_then(|m| m.agent_args.as_ref()),
+            ),
+            (
+                Layer::Flock,
+                flock.and_then(|f| f.agent.as_deref()),
+                flock.and_then(|f| f.agent_args.as_ref()),
+            ),
+            (
+                Layer::Defaults,
+                Some(self.agent.as_str()),
+                Some(&self.agent_args),
+            ),
         ];
-        let agent_args = layers
-            .into_iter()
-            .find_map(|(for_agent, args)| args.filter(|_| for_agent.is_none_or(|a| a == agent)))
-            .cloned()
+        let (agent_from, agent) = layers
+            .iter()
+            .find_map(|&(layer, agent, _)| Some((layer, agent?.to_string())))
+            .expect("[defaults] always names an agent");
+        let (args_from, agent_args) = layers
+            .iter()
+            .find_map(|&(layer, for_agent, args)| {
+                args.filter(|_| for_agent.is_none_or(|a| a == agent))
+                    .map(|a| (Some(layer), a.clone()))
+            })
             .unwrap_or_default();
         AgentPick {
             agent,
             agent_args,
             allow,
             deny,
+            agent_from,
+            args_from,
         }
     }
 }
@@ -801,6 +844,7 @@ mod tests {
             timeout_secs: 60,
             checkout: None,
             reopen: None,
+            agent_source: None,
         }
     }
 
@@ -1071,6 +1115,74 @@ mod tests {
         assert_eq!(
             Defaults::default().resolve_agent(&none, None).agent,
             "claude"
+        );
+    }
+
+    /// A machine's agent comes before its flock's and `[defaults]`, and the
+    /// ask before all three; each pick says which layer it came from.
+    #[test]
+    fn a_machines_agent_comes_before_its_flocks_and_the_defaults() {
+        let d = Defaults {
+            agent_args: vec!["--model".into(), "claude-sonnet-5".into()],
+            ..Default::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "personal".into(),
+            agent: Some("codex".into()),
+            ..Default::default()
+        };
+        let machine = |extra: &str| -> flock::MachineConfig {
+            toml::from_str(&format!("name = \"m\"\nlocal = true\n{extra}")).unwrap()
+        };
+        let own = machine("agent = \"claude-personal\"\nagent_args = [\"-v\"]");
+        let plain = machine("");
+        let none = AgentChoice::default();
+        let pick = |ask: &AgentChoice, m: Option<&flock::MachineConfig>, f| {
+            let p = d.resolve_agent_on(ask, m, f);
+            (p.agent, p.agent_args.join(" "), p.agent_from, p.args_from)
+        };
+        assert_eq!(
+            pick(&none, Some(&own), Some(&flock)),
+            (
+                "claude-personal".into(),
+                "-v".into(),
+                Layer::Machine,
+                Some(Layer::Machine)
+            )
+        );
+        assert_eq!(
+            pick(&none, Some(&plain), Some(&flock)),
+            ("codex".into(), String::new(), Layer::Flock, None)
+        );
+        assert_eq!(
+            pick(&none, Some(&plain), None),
+            (
+                "claude".into(),
+                "--model claude-sonnet-5".into(),
+                Layer::Defaults,
+                Some(Layer::Defaults)
+            )
+        );
+        let asked = AgentChoice {
+            agent: Some("aider".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            pick(&asked, Some(&own), Some(&flock)),
+            ("aider".into(), String::new(), Layer::Ask, None)
+        );
+        let args = AgentChoice {
+            agent_args: Some(vec!["--fast".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            pick(&args, Some(&own), Some(&flock)),
+            (
+                "claude-personal".into(),
+                "--fast".into(),
+                Layer::Machine,
+                Some(Layer::Ask)
+            )
         );
     }
 

@@ -13,6 +13,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   required. Trailing newlines are trimmed. An unreadable file fails with
   `prompt_file_unreadable`, an empty one with `prompt_file_empty`.
 
+- A machine can name its own agent: `agent` and `agent_args` under a
+  `[[machine]]` entry in `flock.toml`, before its flock's and `[defaults]`, so
+  machines of one flock can run different agents. The head settles a task's
+  agent again when it places it on a machine, and `pastor task show` prints
+  where the agent and its args came from.
+
 - A flock can name the agent its tasks run: `agent` and `agent_args` under a
   `[[flock]]` entry in `flock.toml`. A task or job that names none takes its
   flock's, then `[defaults]`, then the built-in `claude`; `--agent` and

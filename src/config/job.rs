@@ -185,6 +185,7 @@ impl Job {
                 timeout_secs: timeout.as_secs(),
                 checkout: None,
                 reopen: None,
+                agent_source: None,
             },
         })
     }

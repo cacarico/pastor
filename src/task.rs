@@ -120,6 +120,25 @@ pub struct DispatchSpec {
     /// otherwise the retry gets a new branch and worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reopen: Option<Box<Reopen>>,
+    /// What the task asked for about its agent, and where its `agent` and
+    /// `agent_args` came from. Kept so dispatch can settle the agent again
+    /// on the machine it picks (`Fleet::dispatch_queued`), since a machine
+    /// can set its own. `None` on a task from a client or head that
+    /// predates it: that task keeps the agent it was queued with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_source: Option<Box<AgentSource>>,
+}
+
+/// See `DispatchSpec::agent_source`. The labels read like `machine own`,
+/// `flock personal`, `defaults`, `task run` or `job <name>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSource {
+    pub ask: crate::config::AgentChoice,
+    pub agent: String,
+    /// `None` when the agent runs with no args because no layer set any
+    /// for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_args: Option<String>,
 }
 
 /// A worktree herdr made for a task: its branch and where it is on disk.
@@ -348,6 +367,7 @@ mod tests {
                 timeout_secs: 10,
                 checkout: None,
                 reopen: None,
+                agent_source: None,
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),

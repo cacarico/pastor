@@ -1592,6 +1592,7 @@ mod tests {
                 timeout_secs: 60,
                 checkout: None,
                 reopen: None,
+                agent_source: None,
             },
             agent: Default::default(),
             flock: None,
@@ -2314,7 +2315,7 @@ mod tests {
         std::fs::write(s.paths.flock_file(), FLOCK_A).unwrap();
         s.reload_config(false).await.unwrap();
         let ask = crate::config::AgentChoice::default();
-        let old = s.fleet.resolve_agent(&ask, "default").agent;
+        let old = s.fleet.resolve_agent(&ask, "default", None).agent;
         std::fs::write(
             s.paths.config_file(),
             "tick = \"1s\"\n[defaults]\nagent = \"codex\"\n",
@@ -2331,13 +2332,13 @@ mod tests {
             "the reload waits for the dispatch lock"
         );
         assert_eq!(
-            fleet.resolve_agent(&ask, "default").agent,
+            fleet.resolve_agent(&ask, "default", None).agent,
             old,
             "the new [defaults] must not be visible before the lock is taken"
         );
         drop(held);
         reload.await.unwrap();
-        assert_eq!(fleet.resolve_agent(&ask, "default").agent, "codex");
+        assert_eq!(fleet.resolve_agent(&ask, "default", None).agent, "codex");
     }
 
     #[tokio::test]
@@ -2657,7 +2658,9 @@ mod tests {
         assert_eq!(s.tick, Duration::from_secs(30));
         assert_eq!(s.defaults.agent, "codex");
         assert_eq!(
-            s.fleet.resolve_agent(&Default::default(), "default").agent,
+            s.fleet
+                .resolve_agent(&Default::default(), "default", None)
+                .agent,
             "codex",
             "`pastor task run` through the head sees the new defaults too"
         );

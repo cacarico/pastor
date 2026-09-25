@@ -2406,6 +2406,7 @@ mod tests {
             timeout_secs: 3600,
             checkout: None,
             reopen: None,
+            agent_source: None,
         }
     }
 

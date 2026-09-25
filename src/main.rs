@@ -540,6 +540,7 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
         timeout_secs: timeout.as_secs(),
         checkout: None,
         reopen: None,
+        agent_source: None,
     })
 }
 
@@ -944,6 +945,8 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 max_agents,
                 tags,
                 flock,
+                agent: None,
+                agent_args: None,
             };
             doc.add_machine(&m).map_err(edit_error)?;
             doc.save(&path)?;

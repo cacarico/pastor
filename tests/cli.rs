@@ -431,7 +431,10 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     );
     let out = env.cmd(&["task", "show", "t-3"]);
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("agent:      claude\n"), "{text}");
+    assert!(
+        text.contains("agent:      claude (from defaults)\n"),
+        "{text}"
+    );
     assert!(
         text.contains("agent args: --model claude-haiku-4-5"),
         "{text}"
@@ -472,7 +475,10 @@ fn an_agent_definition_reaches_herdr_as_its_kind_and_env() {
     );
     let out = env.cmd(&["task", "show", "t-1"]);
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("agent:      claude-personal\n"), "{text}");
+    assert!(
+        text.contains("agent:      claude-personal (from task run)\n"),
+        "{text}"
+    );
 }
 
 #[test]

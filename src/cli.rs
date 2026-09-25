@@ -122,22 +122,28 @@ pub fn one_line(s: &str) -> String {
 
 /// `pastor task show`: every field a human asks about one task, one per line,
 /// then the prompt. The agent args are shell-quoted, so the line reads as the
-/// command herdr runs.
+/// command herdr runs; each is followed by where it came from, when the task
+/// knows (`DispatchSpec::agent_source`).
 pub fn task_detail(t: &Task) -> String {
     let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
     let when = |v: Option<chrono::DateTime<Utc>>| {
         v.map(|at| format!("{} ({} ago)", at.format("%Y-%m-%d %H:%M:%S UTC"), age(at)))
             .unwrap_or_else(|| "-".into())
     };
+    let source = t.spec.agent_source.as_deref();
+    let from = |label: Option<&String>| label.map(|l| format!(" (from {l})")).unwrap_or_default();
+    let agent = format!("{}{}", t.spec.agent, from(source.map(|s| &s.agent)));
     let args = if t.spec.agent_args.is_empty() {
         "-".to_string()
     } else {
-        t.spec
+        let args = t
+            .spec
             .agent_args
             .iter()
             .map(|a| crate::herdr::shell_quote(a))
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" ");
+        format!("{args}{}", from(source.and_then(|s| s.agent_args.as_ref())))
     };
     let list = |v: &[String]| {
         if v.is_empty() {
@@ -168,7 +174,7 @@ pub fn task_detail(t: &Task) -> String {
         ("job", t.job.clone()),
         ("flock", opt(&t.flock)),
         ("machine", opt(&t.machine)),
-        ("agent", t.spec.agent.clone()),
+        ("agent", agent),
         ("agent args", args),
         ("allow", list(&t.spec.allow)),
         ("deny", list(&t.spec.deny)),
@@ -769,6 +775,7 @@ mod tests {
             timeout_secs: 60,
             checkout: None,
             reopen: None,
+            agent_source: None,
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -791,6 +798,8 @@ mod tests {
                 max_agents: 2,
                 tags: vec![],
                 flock: None,
+                agent: None,
+                agent_args: None,
             }],
         };
         let mut rows = task_rows(&tasks);
@@ -823,6 +832,7 @@ mod tests {
             timeout_secs: 7200,
             checkout: None,
             reopen: None,
+            agent_source: None,
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -850,6 +860,45 @@ mod tests {
         assert!(bare.contains("agent args: -"), "{bare}");
     }
 
+    /// `task show` says where the agent and its args came from, when the
+    /// task knows; a task with no args from any layer says so too.
+    #[test]
+    fn task_detail_prints_where_the_agent_came_from() {
+        let spec = crate::task::DispatchSpec {
+            agent: "claude-personal".into(),
+            agent_args: vec!["--model".into(), "claude-opus-5-5".into()],
+            agent_source: Some(Box::new(crate::task::AgentSource {
+                ask: Default::default(),
+                agent: "machine own".into(),
+                agent_args: Some("flock personal".into()),
+            })),
+            ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
+        };
+        let out = task_detail(&task_with(spec.clone()));
+        assert!(
+            out.contains("agent:      claude-personal (from machine own)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("agent args: --model claude-opus-5-5 (from flock personal)\n"),
+            "{out}"
+        );
+        let bare = task_detail(&task_with(crate::task::DispatchSpec {
+            agent_args: vec![],
+            agent_source: Some(Box::new(crate::task::AgentSource {
+                ask: Default::default(),
+                agent: "defaults".into(),
+                agent_args: None,
+            })),
+            ..spec
+        }));
+        assert!(
+            bare.contains("agent:      claude-personal (from defaults)\n"),
+            "{bare}"
+        );
+        assert!(bare.contains("agent args: -\n"), "{bare}");
+    }
+
     /// An error can be raw multi-line stderr; it must stay one field on one
     /// line, escaped the way the events log's human lines escape it.
     #[test]
@@ -867,6 +916,7 @@ mod tests {
             timeout_secs: 60,
             checkout: None,
             reopen: None,
+            agent_source: None,
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);

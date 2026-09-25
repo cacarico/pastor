@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
 use crate::config::flock::{EditError, Flock, FlockDoc, MachineConfig, TaskFlockError};
-use crate::config::{AgentChoice, AgentPick, Agents, Defaults, PastorConfig, Paths};
+use crate::config::{AgentChoice, AgentPick, Agents, Defaults, Layer, PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
@@ -16,7 +16,7 @@ use crate::machine::{
 };
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{NewTask, RetryError, Store, TaskFilter};
-use crate::task::{PANE_OWNING_STATES, Task, TaskState};
+use crate::task::{AgentSource, PANE_OWNING_STATES, Task, TaskState};
 
 /// Builds a machine's transport from its flock entry. `serve` uses
 /// `endpoint_factory`; tests hand out fakes by machine name.
@@ -125,13 +125,16 @@ fn flock_of(flock: &Flock, name: &str) -> String {
         .to_string()
 }
 
-/// The part of a machine's entry its actor is built from. The flock is not:
-/// it only decides which tasks the machine is offered, which dispatch reads
-/// from the flock last applied, so moving a machine keeps its connection and
-/// the tasks already on it.
+/// The part of a machine's entry its actor is built from. The flock and the
+/// agent are not: they only decide which tasks the machine is offered and
+/// what they run, which dispatch reads from the flock last applied, so
+/// moving a machine or changing its agent keeps its connection and the
+/// tasks already on it.
 fn actor_config(m: &MachineConfig) -> MachineConfig {
     MachineConfig {
         flock: None,
+        agent: None,
+        agent_args: None,
         ..m.clone()
     }
 }
@@ -310,28 +313,81 @@ impl Fleet {
         *self.agents.write().unwrap() = config.agents.clone();
     }
 
-    /// The agent a task queued in `flock` gets, given what its run or job
-    /// asked for (`Defaults::resolve_agent`), from the flock and defaults as
-    /// they stand now.
-    pub fn resolve_agent(&self, ask: &AgentChoice, flock: &str) -> AgentPick {
+    /// The agent a task in `flock` gets on `machine` (none before one is
+    /// picked), given what its run or job asked for
+    /// (`Defaults::resolve_agent_on`), from the flock and defaults as they
+    /// stand now.
+    pub fn resolve_agent(
+        &self,
+        ask: &AgentChoice,
+        flock: &str,
+        machine: Option<&str>,
+    ) -> AgentPick {
         let wanted = self.wanted.read().unwrap();
-        self.defaults
-            .read()
-            .unwrap()
-            .resolve_agent(ask, wanted.entry(flock))
+        self.defaults.read().unwrap().resolve_agent_on(
+            ask,
+            machine.and_then(|m| wanted.get(m)),
+            wanted.entry(flock),
+        )
     }
 
-    /// `resolve_agent`, applied to `spec`, refused when the agent cannot be
-    /// started as resolved: a tool list it has no flag for. Checked here so
-    /// the task is refused, not queued to fail at dispatch.
+    /// `resolve_agent` written into `spec`, with the ask and where the agent
+    /// and its args came from (`DispatchSpec::agent_source`). `asked_by`
+    /// names the ask: `task run` or `job <name>`.
+    fn settle(
+        &self,
+        spec: &mut crate::task::DispatchSpec,
+        ask: &AgentChoice,
+        flock: &str,
+        machine: Option<&str>,
+        asked_by: &str,
+    ) {
+        let pick = self.resolve_agent(ask, flock, machine);
+        pick.apply_to(spec);
+        let label = |layer| match layer {
+            Layer::Ask => asked_by.to_string(),
+            Layer::Machine => format!("machine {}", machine.unwrap_or("-")),
+            Layer::Flock => format!("flock {flock}"),
+            Layer::Defaults => "defaults".to_string(),
+        };
+        spec.agent_source = Some(Box::new(AgentSource {
+            ask: ask.clone(),
+            agent: label(pick.agent_from),
+            agent_args: pick.args_from.map(label),
+        }));
+    }
+
+    /// `settle` for a task being queued: on the machine it is pinned to,
+    /// else with no machine yet, as dispatch settles it again on the one it
+    /// picks. Refused when the agent cannot be started as resolved (a tool
+    /// list it has no flag for) on any machine it may land on. Checked here
+    /// so the task is refused, not queued to fail at dispatch.
     fn settle_agent(
         &self,
         spec: &mut crate::task::DispatchSpec,
         ask: &AgentChoice,
         flock: &str,
+        asked_by: &str,
     ) -> Result<(), String> {
-        self.resolve_agent(ask, flock).apply_to(spec);
-        self.agents.read().unwrap().launch_args(spec).map(drop)
+        let pinned = spec.machine.clone();
+        self.settle(spec, ask, flock, pinned.as_deref(), asked_by);
+        let mut landings = vec![spec.clone()];
+        if pinned.is_none() {
+            let wanted = self.flock();
+            for m in wanted
+                .machines
+                .iter()
+                .filter(|m| wanted.flock_of(m) == flock)
+            {
+                let mut s = spec.clone();
+                self.settle(&mut s, ask, flock, Some(&m.name), asked_by);
+                landings.push(s);
+            }
+        }
+        let agents = self.agents.read().unwrap();
+        landings
+            .iter()
+            .try_for_each(|s| agents.launch_args(s).map(drop))
     }
 
     /// The store the fleet queues tasks in.
@@ -600,7 +656,7 @@ impl Fleet {
             .task_flock(flock, spec.machine.as_deref())
             .map_err(QueueError::Flock)?;
         if let Some(ask) = ask {
-            self.settle_agent(&mut spec, ask, &flock)
+            self.settle_agent(&mut spec, ask, &flock, "task run")
                 .map_err(QueueError::Agent)?;
         }
         self.store
@@ -631,14 +687,20 @@ impl Fleet {
         let _pass = self.dispatch_lock.lock().await;
         let flock = self.job_task_flock(job)?;
         let mut settled = job.spec.clone();
-        self.settle_agent(&mut settled, &job.agent, &flock)
-            .map_err(anyhow::Error::msg)?;
+        self.settle_agent(
+            &mut settled,
+            &job.agent,
+            &flock,
+            &format!("job {}", job.name),
+        )
+        .map_err(anyhow::Error::msg)?;
         self.store.insert_job_task(&job.name, &flock, item, |id| {
             let (prompt, mut spec) = render(id)?;
             spec.agent = settled.agent;
             spec.agent_args = settled.agent_args;
             spec.allow = settled.allow;
             spec.deny = settled.deny;
+            spec.agent_source = settled.agent_source;
             Ok((prompt, spec))
         })
     }
@@ -728,6 +790,23 @@ impl Fleet {
             let Some(handle) = self.get(&name) else {
                 continue;
             };
+            // The agent can depend on the machine, now known. A task from
+            // before `agent_source` keeps the agent it was queued with.
+            if let Some(source) = &task.spec.agent_source {
+                let mut on = task.clone();
+                let asked_by = if task.job == "run" {
+                    "task run".to_string()
+                } else {
+                    format!("job {}", task.job)
+                };
+                self.settle(&mut on.spec, &source.ask, target, Some(&name), &asked_by);
+                if on.spec != task.spec
+                    && let Err(err) = self.store.update_task(&mut on)
+                {
+                    tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
+                    continue;
+                }
+            }
             match handle.dispatch(task.id).await {
                 Ok(t) => {
                     tracing::info!(task = %t.display_id(), machine = %name, state = %t.state, "dispatched")
@@ -1440,6 +1519,8 @@ mod tests {
             max_agents: max,
             tags: vec![],
             flock: None,
+            agent: None,
+            agent_args: None,
         }
     }
 
@@ -1457,6 +1538,7 @@ mod tests {
             timeout_secs: 60,
             checkout: None,
             reopen: None,
+            agent_source: None,
         }
     }
 
@@ -2192,6 +2274,127 @@ mod tests {
         assert_eq!(t.spec.deny, vec!["WebFetch"]);
     }
 
+    /// `personal` holds `own`, which runs `claude-personal`, and `plain`,
+    /// which runs `[defaults]`' `claude`. The flock's `--model` names no
+    /// agent, so both take it.
+    fn personal_flock() -> Flock {
+        use crate::config::flock::FlockEntry;
+        Flock {
+            flocks: vec![FlockEntry {
+                name: "personal".into(),
+                default: true,
+                agent_args: Some(vec!["--model".into(), "claude-opus-5-5".into()]),
+                ..Default::default()
+            }],
+            machines: vec![
+                MachineConfig {
+                    agent: Some("claude-personal".into()),
+                    ..machine("own", 1)
+                },
+                machine("plain", 1),
+            ],
+        }
+    }
+
+    /// Two machines of one flock, each with its own agent: every task runs
+    /// the agent of the machine it lands on, and herdr is asked for it.
+    #[tokio::test]
+    async fn each_task_runs_the_agent_of_the_machine_it_lands_on() {
+        let (own, plain) = (FakeHerdr::new(), FakeHerdr::new());
+        let (d, _tmp) = daemon_with_flock(
+            personal_flock(),
+            &[("own", 1, own.clone()), ("plain", 1, plain.clone())],
+        )
+        .await;
+        let run = || IpcRequest::Run {
+            prompt: "x".into(),
+            spec: spec(),
+            flock: None,
+            agent: Some(AgentChoice::default()),
+        };
+        let mut seen = vec![];
+        for _ in 0..2 {
+            let IpcResponse::Task(t) = d.handle(run()).await else {
+                panic!()
+            };
+            let from = t.spec.agent_source.clone().unwrap();
+            seen.push((
+                t.machine.clone().unwrap(),
+                t.spec.agent.clone(),
+                t.spec.agent_args.join(" "),
+                from.agent,
+                from.agent_args,
+            ));
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "own".into(),
+                    "claude-personal".into(),
+                    "--model claude-opus-5-5".into(),
+                    "machine own".into(),
+                    Some("flock personal".into())
+                ),
+                (
+                    "plain".into(),
+                    "claude".into(),
+                    "--model claude-opus-5-5".into(),
+                    "defaults".into(),
+                    Some("flock personal".into())
+                ),
+            ]
+        );
+        let kind = |fake: &FakeHerdr| {
+            let reqs = fake.requests();
+            let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+            start.params["kind"].as_str().unwrap().to_string()
+        };
+        assert_eq!(kind(&own), "claude-personal");
+        assert_eq!(kind(&plain), "claude");
+    }
+
+    /// A task pinned to a machine shows that machine's agent from the moment
+    /// it is queued, and `--agent` wins over the machine's.
+    #[tokio::test]
+    async fn a_pinned_task_takes_its_machines_agent_unless_it_names_one() {
+        let (d, _tmp) = daemon_with_flock(
+            personal_flock(),
+            &[("own", 1, FakeHerdr::new()), ("plain", 1, FakeHerdr::new())],
+        )
+        .await;
+        let pinned = DispatchSpec {
+            machine: Some("own".into()),
+            ..spec()
+        };
+        let t = d
+            .fleet()
+            .queue_run(
+                "x".into(),
+                pinned.clone(),
+                None,
+                Some(&AgentChoice::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Queued);
+        assert_eq!(t.spec.agent, "claude-personal");
+        assert_eq!(t.spec.agent_source.unwrap().agent, "machine own");
+
+        let asked = AgentChoice {
+            agent: Some("aider".into()),
+            ..Default::default()
+        };
+        let t = d
+            .fleet()
+            .queue_run("x".into(), pinned, None, Some(&asked))
+            .await
+            .unwrap();
+        assert_eq!(t.spec.agent, "aider");
+        assert_eq!(t.spec.agent_source.unwrap().agent, "task run");
+    }
+
     /// `home_and_work` plus `spare`, a flock with no machine.
     async fn spare_daemon() -> (Daemon, tempfile::TempDir) {
         let mut flock = home_and_work();
@@ -2434,6 +2637,34 @@ mod tests {
             panic!("{resp:?}")
         };
         assert_eq!(t.state, TaskState::Queued, "home has no machine left");
+    }
+
+    /// A machine's agent is read by dispatch from the flock last applied,
+    /// like its flock: changing it keeps the actor, and the next task on
+    /// the machine runs the new agent.
+    #[tokio::test]
+    async fn changing_a_machines_agent_keeps_its_actor() {
+        let (d, _tmp) = flocked_daemon().await;
+        let mut changed = home_and_work();
+        changed.machines[0].agent = Some("claude-personal".into());
+        let diff = d
+            .fleet()
+            .apply_flock(&changed, &machine_settings(&test_config()))
+            .await;
+        assert!(diff.is_empty(), "{diff:?}");
+        let resp = d
+            .handle(IpcRequest::Run {
+                prompt: "x".into(),
+                spec: spec(),
+                flock: Some("home".into()),
+                agent: Some(AgentChoice::default()),
+            })
+            .await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.machine.as_deref(), Some("h"));
+        assert_eq!(t.spec.agent, "claude-personal");
     }
 
     /// Copilot 4103544623: a machine a reload removed but whose old actor

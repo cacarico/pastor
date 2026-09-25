@@ -29,6 +29,13 @@ pub struct MachineConfig {
     /// The flock this machine belongs to; `None` is the default flock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flock: Option<String>,
+    /// The agent for tasks on this machine that name none, before its
+    /// flock's and `[defaults]` (see `Defaults::resolve_agent_on`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Like `agent`, for the agent's args; `[]` means none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_args: Option<Vec<String>>,
 }
 
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
@@ -701,6 +708,8 @@ mod tests {
             max_agents: 2,
             tags: vec![],
             flock: None,
+            agent: None,
+            agent_args: None,
         }
     }
 

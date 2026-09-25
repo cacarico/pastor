@@ -40,6 +40,7 @@ fn task(id: i64) -> Task {
                 timeout_secs: 60,
                 checkout: None,
                 reopen: None,
+                agent_source: None,
             },
             flock: "default".into(),
         })
@@ -187,6 +188,8 @@ async fn the_daemon_writes_the_events_log() {
             max_agents: 1,
             tags: vec![],
             flock: None,
+            agent: None,
+            agent_args: None,
         }],
     };
     let fake: Arc<dyn Connector> = Arc::new(FakeHerdr::new());
@@ -249,6 +252,7 @@ async fn the_daemon_writes_the_events_log() {
                 timeout_secs: 60,
                 checkout: None,
                 reopen: None,
+                agent_source: None,
             },
             flock: None,
             agent: None,

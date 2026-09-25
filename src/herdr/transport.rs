@@ -574,6 +574,8 @@ mod tests {
             max_agents: 2,
             tags: vec![],
             flock: None,
+            agent: None,
+            agent_args: None,
         }
     }
 
@@ -696,6 +698,8 @@ mod tests {
             max_agents: 2,
             tags: vec![],
             flock: None,
+            agent: None,
+            agent_args: None,
         };
         let paths = Paths::new("/tmp/c", "/tmp/s");
         let ep = Endpoint::from_machine(&m, &paths);
@@ -987,6 +991,8 @@ mod tests {
             max_agents: 2,
             tags: vec![],
             flock: None,
+            agent: None,
+            agent_args: None,
         };
         let paths = Paths::new("/tmp/c", &deep);
         let Endpoint::Ssh {

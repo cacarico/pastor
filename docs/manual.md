@@ -307,17 +307,19 @@ no `--flock` means the default flock rather than every machine. A head that
 is listening but does not answer is refused whether flocks are in play or not
 (`head_unresponsive`); only a head that is not running at all is passed by.
 
-### A flock's agent
+### A flock's or a machine's agent
 
 `agent` and `agent_args` under a `[[flock]]` entry are the agent its tasks and
-jobs run when they name none. Each task settles its agent when it is queued,
+jobs run when they name none. The same keys under a `[[machine]]` entry set it
+for one machine, for flocks whose machines differ. Each task settles its agent
 from the first of these that says:
 
 1. `--agent` and `--agent-arg` on `pastor task run`, or `agent` and
    `agent_args` under a job's `[dispatch]`;
-2. the task's flock, in `flock.toml`;
-3. `[defaults]` in `pastor.toml`;
-4. the built-in: `claude` with no args.
+2. the machine the task runs on, in `flock.toml`;
+3. the task's flock, in `flock.toml`;
+4. `[defaults]` in `pastor.toml`;
+5. the built-in: `claude` with no args.
 
 The agent and its args are looked up on their own, with one rule: args follow
 the agent they were written for. A layer's `agent_args` only apply when that
@@ -327,11 +329,42 @@ flock above, `pastor task run --flock work --agent codex` runs codex without
 `[defaults] agent`) do not reach a flock that runs another agent. An
 `agent_args = []` is a choice, not a gap: it stops the lookup with no args.
 
-`pastor task show` prints the agent and args a task resolved to; the task keeps
-them, so a later edit of `flock.toml` or `pastor.toml` changes only tasks
-queued after it. `pastor task run` makes the head apply an edit of
-`pastor.toml` or `flock.toml` first; for a job, an edit reaches the head on
-its next tick, or at once with `pastor job reload`.
+Two machines of one flock can run different agents. Say both are personal
+machines, but on the first the plain `claude` is logged in to a work account,
+so it must run the personal one from an [agent definition](#agent-definitions),
+while the second's plain `claude` already is the personal account:
+
+```toml
+# flock.toml
+[[flock]]
+name = "personal"
+default = true
+
+[[machine]]
+name = "laptop"
+ssh = "user@laptop"
+flock = "personal"
+agent = "claude-personal"   # `claude` here is the work account
+
+[[machine]]
+name = "desktop"
+ssh = "user@desktop"
+flock = "personal"          # no agent: the flock's, then [defaults]: claude
+```
+
+A task that is not pinned to a machine does not know its machine until it is
+dispatched, so the head settles its agent again when it places it, from the
+files as they stand then; a task pinned with `--machine` (or a job's
+`machine`) has its machine's agent from the start. `pastor task show` prints
+the agent and args a task resolved to and where each came from, such as
+`claude-personal (from machine laptop)` or `--model claude-sonnet-5 (from
+flock work)`; before dispatch it shows what the task would run without a
+machine of its own. Once dispatched, a task keeps what it ran, so a later
+edit of `flock.toml` or `pastor.toml` changes only tasks not yet placed, and a
+retry settles again on the machine it lands on. `pastor task run` makes the
+head apply an edit of `pastor.toml` or `flock.toml` first; for a job, an edit
+reaches the head on its next tick, or at once with `pastor job reload`.
+Changing a machine's agent, like moving it, keeps its connection.
 
 ### Tool allow and deny lists
 
@@ -446,7 +479,8 @@ the worktree's, with the env and the checkout as its directory, closes the
 pane without it, and starts the agent in the new one. A task without env keeps
 herdr's own pane either way.
 
-The head checks a task's agent against pastor.toml when it queues it, and
+The head checks a task's agent against pastor.toml when it queues it (for a
+task that is not pinned, the agent each machine of its flock would run), and
 `pastor task run` makes the head apply an edit of pastor.toml or flock.toml
 first, so a definition you have just added is the one its machine starts.
 
@@ -567,9 +601,10 @@ next word as its value, even one that starts with a dash, so
 `=` form just reads more clearly. There is no single-string form: pastor would
 have to split it on spaces, and that breaks any argument that contains one. A
 job file's `agent_args` does the same for its tasks. When neither says
-anything, the flock's `agent_args` apply, then `[defaults] agent_args` in
-pastor.toml (see [A flock's agent](#a-flocks-agent)); a job file that sets
-`agent_args = []` opts out of both. `pastor task show t-1` prints the agent and
+anything, the machine's `agent_args` apply, then the flock's, then
+`[defaults] agent_args` in pastor.toml (see [A flock's or a machine's
+agent](#a-flocks-or-a-machines-agent)); a job file that sets `agent_args = []`
+opts out of all three. `pastor task show t-1` prints the agent and
 args a task was started with.
 
 `--prompt-file` reads the prompt from a file on the machine that runs the CLI,
