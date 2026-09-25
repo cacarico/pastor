@@ -33,8 +33,12 @@ pastor must have seen the agent `working` or `blocked` since the prompt went in,
 from an event or from `agent.list`; `unknown` does not count. herdr also counts
 each agent state change, and the count must have moved past its value when the
 prompt went in and not moved again during the window. What pastor has seen is
-kept in memory, so after a daemon restart an agent found idle stays `running`
-until its task goes `stale`. An agent whose process exits while it sits idle
+stored with the task, so a daemon restart or a flock or settings reload does
+not forget work it saw before. An agent that went idle without pastor ever
+seeing it `working` or `blocked` (its whole working spell fell between two
+reconciles while the event was lost) stays `running` until its task goes
+`stale`: herdr's counter moves on `idle -> unknown -> idle` as well, so
+without the activity pastor cannot tell finished work from a flicker. An agent whose process exits while it sits idle
 between turns (someone typed `/exit` after the work) leaves its task `done`;
 one that exits while starting, blocked or working fails it with "agent process
 exited". Task state lives in SQLite under
@@ -523,7 +527,7 @@ like connector logs.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, defaults, agents (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks (schema 5, with retry_of, flock and trust_sent), seen keys, job state, trusted repos
+~/.local/state/pastor/pastor.db   tasks (schema 6, with retry_of, flock, trust_sent and activity_seen), seen keys, job state, trusted repos
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host

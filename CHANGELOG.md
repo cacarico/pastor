@@ -59,7 +59,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   keeping comments and layout; they used to rewrite the whole file.
 - The database is schema 5. Schema 4 stores each task's flock; rows from
   before flocks join the default flock. Schema 5 adds the `trusted_repos`
-  table and a `trust_sent` flag on each task.
+  table and a `trust_sent` flag on each task. Schema 6 stores whether the
+  task's agent has been seen at work since its prompt (`activity_seen`).
 
 ### Fixed
 
@@ -69,6 +70,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `pastor task retry` of a failed worktree task no longer fails with git's
   "fatal: '<path>' already exists": the retry keeps the old task's branch
   and reopens its checkout with `worktree.open` when it is still on disk.
+- A task whose agent finished its work and sat idle, waiting for input, no
+  longer stays `running` until the session ends when the daemon restarted,
+  or the flock or settings were reloaded, while the agent worked: whether
+  pastor saw the agent at work is stored with the task instead of held in
+  the machine actor's memory, so the new actor settles the idle agent as
+  `done`.
 
 ## 0.3.0 - 2026-09-25
 

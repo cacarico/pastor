@@ -504,7 +504,6 @@ pub fn spawn_machine(
         status: status.clone(),
         rx,
         pending_done: HashMap::new(),
-        activity_seen: HashSet::new(),
         idle_agents: HashSet::new(),
         was_connected: false,
         failures: 0,
@@ -539,12 +538,6 @@ struct Actor {
     /// agent is still idle at that same sequence; with no sequence, the first
     /// check records one and starts the window over.
     pending_done: HashMap<i64, (Option<u64>, Instant)>,
-    /// Tasks whose agent this actor has seen `working` or `blocked` since the
-    /// prompt went in or the task last finished (`Task::activity_seen`). Kept
-    /// here, not in the store: `apply` copies it onto the task before each
-    /// transition. A restarted daemon starts empty; reconcile refills it for
-    /// agents it finds at work.
-    activity_seen: HashSet<i64>,
     /// Tasks whose agent this actor last saw `idle` or `done` (`unknown`
     /// changes nothing). Decides what an exit means: an agent that ends
     /// between turns finished its task; see `Observed::PaneExited`.
@@ -1622,7 +1615,6 @@ impl Actor {
             t.error = note;
         }
         self.store.update_task(&mut t)?;
-        self.activity_seen.remove(&t.id);
         self.emit("task.closed", Some(t.id));
         self.refresh_live();
         Ok(t)
@@ -1730,7 +1722,6 @@ impl Actor {
             }
         };
         let dead = matches!(&outcome, Err(err) if err.is_transport());
-        self.set_activity(&task);
         if let Err(err) = self.store.update_task(&mut task) {
             return (Err(err), dead);
         }
@@ -1875,10 +1866,9 @@ impl Actor {
             }
         };
         self.pending_done.remove(&id);
-        // A row left alone keeps whatever the actor knew of it: nothing it saw
-        // while the prompt was pending counted as activity (see `apply`).
+        // A row left alone keeps what it had: nothing seen while the prompt
+        // was pending counted as activity (see `apply`).
         if let Some(t) = written {
-            self.set_activity(&t);
             self.emit(&format!("task.{}", t.state), Some(t.id));
         }
         self.refresh_live();
@@ -1947,33 +1937,34 @@ impl Actor {
         }
     }
 
-    /// Record whether `task` (just prompted, so its flag is fresh) has shown
-    /// activity; see `Task::activity_seen`.
-    fn set_activity(&mut self, task: &Task) {
-        if task.activity_seen {
-            self.activity_seen.insert(task.id);
-        } else {
-            self.activity_seen.remove(&task.id);
-        }
-    }
-
     fn apply(&mut self, mut task: Task, observed: &Observed) {
         // Any `working` or `blocked` after the prompt is activity, whether an
         // event or `agent.list` showed it; `unknown` never is. Before the
         // prompt reached the agent (`prompt_pending`) nothing counts.
-        if let Observed::Status { status, .. } = observed
-            && status.is_activity()
+        // It is stored with the task (see `Task::activity_seen`), so the first
+        // sighting is written even when the state does not change.
+        let first_activity = matches!(observed, Observed::Status { status, .. } if status.is_activity())
             && !task.prompt_pending
-        {
-            self.activity_seen.insert(task.id);
+            && !task.activity_seen;
+        if first_activity {
+            task.activity_seen = true;
         }
-        task.activity_seen = self.activity_seen.contains(&task.id);
         let Some(to) = next_state(&task, observed) else {
+            if first_activity {
+                let written = write_task(&self.store, task, |t| {
+                    let wanted = !t.prompt_pending && t.state.is_open();
+                    t.activity_seen |= wanted;
+                    wanted
+                });
+                if let Err(err) = written {
+                    tracing::error!(%err, "record agent activity");
+                }
+            }
             return;
         };
         if to == TaskState::Done || !to.is_open() {
             // The next completion needs activity of its own.
-            self.activity_seen.remove(&task.id);
+            task.activity_seen = false;
         }
         if !to.is_open() {
             self.idle_agents.remove(&task.id);
@@ -2272,9 +2263,8 @@ impl Actor {
 /// written, or `None` when nothing was. A second conflict, or any other
 /// store error, is returned.
 ///
-/// The fresh copy comes from the store, so its unstored fields
-/// (`Task::activity_seen`) are at their defaults: `change` must set any it
-/// relies on rather than expect them carried over.
+/// The fresh copy is the row as it is now: `change` must set every field it
+/// relies on rather than expect the old copy's values carried over.
 fn write_task(
     store: &Store,
     mut task: Task,
@@ -2575,11 +2565,10 @@ mod tests {
         assert_eq!(state_of(&store, t.id), TaskState::Closed);
     }
 
-    /// `activity_seen` is not stored, so a re-read row always comes back
-    /// without it. The retried write carries what the change set, which is
-    /// what the caller copies into the actor's in-memory set.
+    /// The retried write carries what the change set on the fresh row,
+    /// `activity_seen` included, and stores it.
     #[test]
-    fn write_task_keeps_the_unstored_activity_flag_on_the_retry() {
+    fn write_task_stores_the_activity_flag_on_the_retry() {
         let store = Store::open_in_memory().unwrap();
         let mut t = new_task(&store);
         t.prompt_pending = true;
@@ -2597,7 +2586,9 @@ mod tests {
         .unwrap()
         .expect("the fresh row still wanted the change");
         assert!(written.activity_seen);
-        assert!(!store.get_task(t.id).unwrap().unwrap().prompt_pending);
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert!(!row.prompt_pending);
+        assert!(row.activity_seen);
     }
 
     /// A second conflict is not retried again: it is returned to the caller.
@@ -4485,6 +4476,49 @@ mod tests {
             store.get_task(t.id).unwrap().unwrap().error.as_deref(),
             Some("agent process exited")
         );
+    }
+
+    /// The dogfooding bug: the agent worked, finished and sat idle waiting
+    /// for input, and the task stayed `running` until the session ended.
+    /// pastor had seen the work, but only in the memory of an actor that was
+    /// replaced (a daemon restart, a flock or settings reload) before the
+    /// agent went idle. What it saw is kept with the task now, so the new
+    /// actor settles the idle agent as done.
+    #[tokio::test]
+    async fn work_seen_before_a_restart_still_completes_the_task() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Blocked);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        assert_eq!(h.shutdown().await, ShutdownOutcome::Finished);
+
+        // The agent finishes while no actor watches it.
+        fake.set_status_silently(&pane, AgentStatus::Idle);
+        let (_h2, _events) = connected(&fake, &store).await;
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// Only work seen after the prompt counts across a restart, as it does
+    /// within one actor: an agent never seen at work stays `running`.
+    #[tokio::test]
+    async fn an_agent_never_seen_at_work_stays_running_after_a_restart() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        assert_eq!(h.shutdown().await, ShutdownOutcome::Finished);
+        fake.set_status_silently(&pane, AgentStatus::Unknown);
+        fake.set_status_silently(&pane, AgentStatus::Idle);
+        let (_h2, _events) = connected(&fake, &store).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
     /// herdr's `done` status (idle, not yet looked at) finishes a task the same

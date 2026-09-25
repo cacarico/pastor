@@ -135,11 +135,10 @@ pub struct Task {
     /// alone does not prove work: herdr stamps one on every change of the
     /// detected state, `unknown` included, so `idle -> unknown -> idle` moves
     /// it too. herdr's `agent.prompt --wait` gates on the same activity
-    /// (`prompt_activity_statuses` in `src/api/wait.rs`). Not stored: the
-    /// machine actor keeps it in memory and sets it here before each
-    /// transition, so a daemon restart forgets it; an agent found working or
-    /// blocked afterwards counts again, one found idle stays running until it
-    /// goes stale.
+    /// (`prompt_activity_statuses` in `src/api/wait.rs`). Stored with the
+    /// task, so an actor that replaces the one that saw the work (a daemon
+    /// restart, a flock or settings reload) still completes it once the agent
+    /// settles idle. Left out of the JSON the CLI prints.
     #[serde(skip)]
     pub activity_seen: bool,
     /// The task this one retries (`pastor task retry`). A retry is a new row

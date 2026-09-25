@@ -75,6 +75,9 @@ issues into tasks, and event hooks that run when a task finishes or blocks.
 - **A task** is one agent in one herdr pane, in a repo or a fresh worktree of
   it. Its states are `queued`, `starting`, `running`, `blocked`, `done`, `stale`, `failed`
   and `closed`; `done` means the agent stopped, not that the work is good.
+  A running task is done once its agent, seen at work since the prompt, has
+  sat idle for `settle` (herdr's `idle` or `done`), or exits while idle; an
+  interactive agent waiting for more input counts as finished.
 - **herdr** owns the terminals and detects what the agent is doing. pastor
   never reads the agent's screen itself.
 

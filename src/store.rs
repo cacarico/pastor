@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -214,6 +214,7 @@ impl Store {
                         retry_of INTEGER,
                         flock TEXT,
                         trust_sent INTEGER NOT NULL DEFAULT 0,
+                        activity_seen INTEGER NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -269,6 +270,15 @@ impl Store {
                     tx.execute_batch(V5_TABLES)?;
                     add_column(&tx, "trust_sent", "trust_sent INTEGER NOT NULL DEFAULT 0")?;
                 }
+                // Whether pastor has seen the task's agent at work since the
+                // prompt (`Task::activity_seen`), so a restart keeps it.
+                if v < 6 {
+                    add_column(
+                        &tx,
+                        "activity_seen",
+                        "activity_seen INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -320,7 +330,7 @@ impl Store {
         let n = conn.execute(
             "UPDATE tasks SET machine = ?2, workspace_id = ?3, pane_id = ?4, agent_name = ?5, state = ?6, error = ?7,
                 last_completion_seq = ?8, started_at = ?9, finished_at = ?10, updated_at = ?11, prompt = ?12, spec = ?13,
-                prompt_pending = ?14
+                prompt_pending = ?14, activity_seen = ?16
              WHERE id = ?1 AND updated_at = ?15",
             params![
                 t.id,
@@ -338,6 +348,7 @@ impl Store {
                 serde_json::to_string(&t.spec)?,
                 t.prompt_pending,
                 t.updated_at.to_rfc3339(),
+                t.activity_seen,
             ],
         )?;
         if n == 1 {
@@ -838,8 +849,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
             .transpose()
             .map_err(conversion_failure)?,
         prompt_pending: row.get("prompt_pending")?,
-        // Held in the machine actor's memory, never stored.
-        activity_seen: false,
+        activity_seen: row.get("activity_seen")?,
         retry_of: row.get("retry_of")?,
         flock: row.get("flock")?,
         created_at: parse_dt(&created_at)?,
@@ -1619,6 +1629,32 @@ mod tests {
         assert!(s.claim_trust_sent(1).unwrap());
     }
 
+    /// A v5 database keeps no `activity_seen`; opening it adds the column,
+    /// unset, and a row then stores it.
+    #[test]
+    fn a_v5_database_gains_activity_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN activity_seen;
+                 UPDATE meta SET value = '5' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let mut t = s.get_task(1).unwrap().unwrap();
+        assert!(!t.activity_seen);
+        t.activity_seen = true;
+        s.update_task(&mut t).unwrap();
+        assert!(s.get_task(1).unwrap().unwrap().activity_seen);
+    }
+
     /// A v2 database predates `retry_of`; opening it adds the column empty.
     #[test]
     fn a_v2_database_gains_retry_of() {
@@ -1676,10 +1712,11 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN retry_of;
                  ALTER TABLE tasks DROP COLUMN flock;
                  ALTER TABLE tasks DROP COLUMN trust_sent;
+                 ALTER TABLE tasks DROP COLUMN activity_seen;
                  DROP TABLE trusted_repos;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '5' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '6' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -1703,7 +1740,8 @@ mod tests {
             !cols.iter().any(|c| c == "prompt_pending"
                 || c == "retry_of"
                 || c == "flock"
-                || c == "trust_sent"),
+                || c == "trust_sent"
+                || c == "activity_seen"),
             "rolled back: {cols:?}"
         );
         drop(conn);
