@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check fmt lint test test-machine leaks smoke install completions demo clean
+.PHONY: help build release check fmt lint test test-machine leaks smoke install install-completions completions demo clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -55,8 +55,22 @@ leaks: ## scan the whole git history for secrets, as CI does
 smoke: ## opt-in test against a real herdr: make smoke SESSION=default
 	PASTOR_REAL_HERDR_SESSION=$(or $(SESSION),default) cargo test --test real_herdr -- --ignored --nocapture
 
-install: ## install pastor and fake-herdr into ~/.cargo/bin
+install: ## install pastor and fake-herdr into ~/.cargo/bin, with bash and fish completions
 	cargo install --path . --force
+	@$(MAKE) --no-print-directory install-completions
+
+# Writes the completion scripts for the binary `install` just put in place;
+# PASTOR_BIN overrides the binary run (for testing against a debug build
+# without touching the installed one).
+install-completions:
+	@bin="$${PASTOR_BIN:-$${CARGO_HOME:-$$HOME/.cargo}/bin/pastor}"; \
+	fish_dir="$${XDG_CONFIG_HOME:-$$HOME/.config}/fish/completions"; \
+	bash_dir="$${XDG_DATA_HOME:-$$HOME/.local/share}/bash-completion/completions"; \
+	mkdir -p "$$fish_dir" "$$bash_dir"; \
+	"$$bin" completions fish > "$$fish_dir/pastor.fish"; \
+	echo "wrote $$fish_dir/pastor.fish"; \
+	"$$bin" completions bash > "$$bash_dir/pastor"; \
+	echo "wrote $$bash_dir/pastor"
 
 # Records docs/demo/*.gif with vhs (https://github.com/charmbracelet/vhs; needs
 # vhs, ttyd, ffmpeg and fish). A demo head runs against docs/demo/local/,

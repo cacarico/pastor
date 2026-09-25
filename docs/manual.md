@@ -426,6 +426,10 @@ timeout = "2h"
 command definitions, so it always matches the installed binary. Ready-made
 copies for bash and fish live in `contrib/completions/`.
 
+`make install` writes both files after installing the binary, honouring
+`$XDG_CONFIG_HOME` and `$XDG_DATA_HOME`. If you installed with plain `cargo
+install`, or want completions for another shell such as zsh, run:
+
 ```bash
 pastor completions fish > ~/.config/fish/completions/pastor.fish
 pastor completions bash > ~/.local/share/bash-completion/completions/pastor
