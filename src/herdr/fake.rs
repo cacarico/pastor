@@ -42,6 +42,8 @@ struct State {
     home: Option<String>,
     /// Paths `Connector::dir_exists` reports missing; every other path exists.
     missing_dirs: HashSet<String>,
+    /// What `Connector::pastor_version` reports.
+    pastor_version: Option<String>,
     /// The started agent vanishes immediately, as it does when the agent binary
     /// is missing and the process exits the moment it is launched.
     exit_on_start: bool,
@@ -111,6 +113,7 @@ impl FakeHerdr {
             state: Arc::new(Mutex::new(State {
                 protocol: 22,
                 home: Some("/home/fake".into()),
+                pastor_version: Some("fake".into()),
                 ..Default::default()
             })),
             events,
@@ -123,6 +126,9 @@ impl FakeHerdr {
     }
     pub fn set_home(&self, home: Option<&str>) {
         self.state.lock().unwrap().home = home.map(str::to_string);
+    }
+    pub fn set_pastor_version(&self, version: Option<&str>) {
+        self.state.lock().unwrap().pastor_version = version.map(str::to_string);
     }
     pub fn set_missing_dir(&self, path: &str) {
         self.state
@@ -515,6 +521,10 @@ impl super::transport::Connector for FakeHerdr {
     fn dir_exists(&self, path: &str) -> super::transport::DirFuture<'_> {
         let exists = !self.state.lock().unwrap().missing_dirs.contains(path);
         Box::pin(async move { Ok(Some(exists)) })
+    }
+    fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
+        let version = self.state.lock().unwrap().pastor_version.clone();
+        Box::pin(async move { Ok(version) })
     }
 }
 

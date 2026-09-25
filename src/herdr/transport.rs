@@ -258,6 +258,9 @@ pub type HomeFuture<'a> =
 pub type DirFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<bool>, ConnectError>> + Send + 'a>>;
 
+pub type VersionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<String>, ConnectError>> + Send + 'a>>;
+
 /// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
 ///
 /// A connection carries one request (see `Connection`), so this is called once
@@ -282,6 +285,13 @@ pub trait Connector: Send + Sync {
     fn dir_exists(&self, _path: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// The version of pastor installed on the machine, for `machine list`: a
+    /// fleet runs whatever each machine last installed, and a skill or CLI
+    /// that an agent there calls is that version's. `None` when there is no
+    /// pastor there or it cannot be known.
+    fn pastor_version(&self) -> VersionFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 impl Connector for Endpoint {
@@ -300,6 +310,9 @@ impl Connector for Endpoint {
     fn dir_exists(&self, path: &str) -> DirFuture<'_> {
         let path = path.to_string();
         Box::pin(async move { dir_exists(self, &path).await })
+    }
+    fn pastor_version(&self) -> VersionFuture<'_> {
+        Box::pin(pastor_version(self))
     }
 }
 
@@ -362,6 +375,80 @@ async fn dir_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectEr
         // An arbitrary bridge command says nothing about where it lands.
         Endpoint::Command { .. } => Ok(None),
     }
+}
+
+async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
+    match ep {
+        // The head and this herdr share a machine, so the pastor there is
+        // this one.
+        Endpoint::Local { .. } => Ok(Some(env!("CARGO_PKG_VERSION").to_string())),
+        Endpoint::Ssh {
+            target,
+            control_path,
+            ..
+        } => {
+            // The actor asks right after a ping, so the master is up; a probe
+            // may still be the first ssh, and start it.
+            ensure_control_dir(control_path.as_deref())?;
+            let argv = ssh_argv_running(
+                target,
+                control_path.as_deref(),
+                REMOTE_PASTOR_VERSION_COMMAND.to_string(),
+            );
+            let out = tokio::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| ConnectError {
+                    message: format!("spawn ssh: {e}"),
+                })?;
+            remote_pastor_version(target, &out)
+        }
+        // An arbitrary bridge command says nothing about what else is there.
+        Endpoint::Command { .. } => Ok(None),
+    }
+}
+
+/// Asks the remote machine for `pastor --version`. ssh runs its command in a
+/// non-login shell, whose PATH usually lacks `~/.cargo/bin` (where `make
+/// install` puts pastor) and `~/.local/bin`, so the command adds them. It
+/// answers `none` when there is no pastor, so a missing binary is an answer
+/// and not a failure.
+const REMOTE_PASTOR_VERSION_COMMAND: &str = r#"sh -c 'PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"; command -v pastor >/dev/null 2>&1 && pastor --version || printf none'"#;
+
+/// Reads the answer to `REMOTE_PASTOR_VERSION_COMMAND`: `pastor 0.2.0` is
+/// `0.2.0`, `none` is no pastor. As with `remote_home`, only ssh failing to
+/// reach the machine is an error. rc-file noise comes before the answer, so
+/// the answer is the last line; anything else is logged and read as unknown.
+fn remote_pastor_version(
+    target: &str,
+    out: &std::process::Output,
+) -> Result<Option<String>, ConnectError> {
+    if matches!(out.status.code(), Some(255) | None) {
+        return Err(ConnectError {
+            message: format!(
+                "ssh {target}: {} ({})",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                out.status
+            ),
+        });
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let last = raw.trim_end().lines().last().unwrap_or("");
+    let words: Vec<&str> = last.split_whitespace().collect();
+    if out.status.success() {
+        match words.as_slice() {
+            [.., "none"] => return Ok(None),
+            [.., "pastor", v] if v.chars().all(|c| c.is_ascii_graphic()) => {
+                return Ok(Some(v.to_string()));
+            }
+            _ => {}
+        }
+    }
+    tracing::warn!(%target, status = %out.status, stdout = ?raw, "no pastor version from the remote shell");
+    Ok(None)
 }
 
 /// `test -d` in the remote shell, answered on stdout with one word. `test -d`
@@ -705,6 +792,92 @@ mod tests {
             argv: vec!["true".into()],
         };
         assert_eq!(command.dir_exists("/").await.unwrap(), None);
+    }
+
+    /// A local machine shares the head's pastor; a bridge command cannot know.
+    /// The ssh command runs through `sh -c` so the PATH it adds is POSIX
+    /// whatever the login shell is (fish, for one).
+    #[tokio::test]
+    async fn pastor_version_per_endpoint() {
+        let argv = ssh_argv_running(
+            "fleet@pi-3",
+            Some(Path::new("/tmp/s/ssh/pi-3-%C")),
+            REMOTE_PASTOR_VERSION_COMMAND.to_string(),
+        );
+        assert!(
+            argv.last()
+                .unwrap()
+                .starts_with("sh -c 'PATH=\"$HOME/.cargo/bin:")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ControlPath=/tmp/s/ssh/pi-3-%C")
+        );
+        let local = Endpoint::Local {
+            session: "default".into(),
+        };
+        assert_eq!(
+            local.pastor_version().await.unwrap().as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.pastor_version().await.unwrap(), None);
+    }
+
+    /// The command's own shell script, run here, answers the way the parser
+    /// expects: `none` with no pastor on the PATH it builds.
+    #[test]
+    fn the_remote_command_answers_none_without_pastor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", REMOTE_PASTOR_VERSION_COMMAND])
+            .env("HOME", tmp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert_eq!(remote_pastor_version("t", &out).unwrap(), None);
+    }
+
+    /// Only ssh failing to reach the machine is an error; an odd answer from a
+    /// reachable one is an unknown version.
+    #[test]
+    fn remote_pastor_version_reads_the_last_line() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"boom".to_vec(),
+        };
+        let v = |code: i32, stdout: &str| remote_pastor_version("t", &out(code, stdout)).unwrap();
+        assert_eq!(v(0, "pastor 0.2.0\n").as_deref(), Some("0.2.0"));
+        assert_eq!(v(0, "none"), None);
+        assert_eq!(v(0, ""), None);
+        assert_eq!(v(1, ""), None);
+        assert_eq!(
+            v(1, "pastor 0.2.0\n"),
+            None,
+            "a failed command is no answer"
+        );
+        assert_eq!(
+            v(
+                0,
+                "Welcome to Raspberry Pi\nLast login: today\npastor 0.2.0\n"
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(v(0, "welcome\nnone"), None);
+        assert_eq!(v(0, "pastor 0.2.0\nmotd after"), None);
+        assert_eq!(v(0, "pastor 0.2\u{1b}[0m"), None);
+        assert!(remote_pastor_version("t", &out(255, "")).is_err());
+        let killed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: vec![],
+            stderr: vec![],
+        };
+        assert!(remote_pastor_version("t", &killed).is_err());
     }
 
     #[test]
