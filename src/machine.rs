@@ -103,7 +103,7 @@ pub struct MachineStatus {
     pub orphans: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MachineSettings {
     pub settle: Duration,
     pub reconcile_every: Duration,
@@ -186,9 +186,22 @@ pub struct MachineHandle {
     pub tags: Vec<String>,
     pub tx: mpsc::Sender<MachineCommand>,
     pub status: Arc<RwLock<MachineStatus>>,
+    /// Stops the actor task (`shutdown`). `None` only for handles built by
+    /// hand in tests, which have no actor.
+    pub abort: Option<tokio::task::AbortHandle>,
 }
 
 impl MachineHandle {
+    /// Stop the actor now, at whatever it is awaiting. A flock reload calls
+    /// this for a machine it removes or replaces. Nothing on the machine is
+    /// touched: agents keep running, rows keep their state, and a replacement
+    /// actor reconciles them. A request in flight answers "dropped the request".
+    pub fn shutdown(&self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+
     pub fn snapshot(&self) -> MachineStatus {
         self.status.read().unwrap().clone()
     }
@@ -271,13 +284,14 @@ pub fn spawn_machine(
         lost_announced: false,
         orphans: vec![],
     };
-    tokio::spawn(actor.run());
+    let task = tokio::spawn(actor.run());
     MachineHandle {
         name,
         max_agents,
         tags,
         tx,
         status,
+        abort: Some(task.abort_handle()),
     }
 }
 
@@ -1731,6 +1745,47 @@ mod tests {
 
     fn state_of(store: &Store, id: i64) -> TaskState {
         store.get_task(id).unwrap().unwrap().state
+    }
+
+    /// A flock reload stops a removed or replaced machine's actor. Afterwards
+    /// the actor asks herdr nothing, the handle refuses new work, and the task
+    /// it was tracking is left exactly as it was: agents are herdr's.
+    #[tokio::test]
+    async fn shutdown_stops_the_actor_and_leaves_tasks_alone() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        h.dispatch(t.id).await.unwrap();
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+
+        h.shutdown();
+        wait_for("actor gone", || h.tx.is_closed()).await;
+        let sent = fake.requests().len();
+        // `settings()` reconciles every 200ms: a live actor would have called
+        // agent.list at least twice in this window.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            fake.requests().len(),
+            sent,
+            "a stopped actor asks herdr nothing"
+        );
+
+        let queued = new_task(&store);
+        let err = h.dispatch(queued.id).await.unwrap_err();
+        assert!(err.to_string().contains("is gone"), "{err}");
+        assert_eq!(state_of(&store, queued.id), TaskState::Queued);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    #[test]
+    fn settings_compare_by_value() {
+        assert_eq!(MachineSettings::default(), MachineSettings::default());
+        assert_ne!(settings(), MachineSettings::default());
     }
 
     /// Someone else wrote the row (task close, retry) between our read and
