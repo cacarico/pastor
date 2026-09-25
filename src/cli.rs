@@ -182,9 +182,12 @@ pub fn task_detail(t: &Task) -> String {
 
 pub const TASK_HEADER: [&str; 7] = ["ID", "STATE", "MACHINE", "AGENT", "JOB", "AGE", "NOTE"];
 
-/// One line per orphaned agent, for under the `pastor list` table.
-pub fn orphan_lines(ms: &[MachineStatus]) -> Vec<String> {
+/// One line per orphaned agent, for under the `pastor list` table. With
+/// `machine`, only that machine's, as `task list --machine` shows only its
+/// tasks.
+pub fn orphan_lines(ms: &[MachineStatus], machine: Option<&str>) -> Vec<String> {
     ms.iter()
+        .filter(|m| machine.is_none_or(|name| m.name == name))
         .flat_map(|m| {
             m.orphans.iter().map(move |o| {
                 format!(
@@ -718,10 +721,22 @@ mod tests {
             orphans: vec![],
             ..m.clone()
         };
-        let lines = orphan_lines(&[m.clone(), none.clone()]);
+        let lines = orphan_lines(&[m.clone(), none.clone()], None);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("orphan t-4 on pi:"), "{}", lines[0]);
         assert!(lines[1].contains("pastor task close t-9"));
+        // `task list --machine pi-2` shows pi-2's tasks, so only its orphans.
+        let other = MachineStatus {
+            name: "pi-2".into(),
+            orphans: vec!["t-5".into()],
+            ..m.clone()
+        };
+        let both = [m.clone(), other];
+        assert_eq!(orphan_lines(&both, None).len(), 3);
+        let lines = orphan_lines(&both, Some("pi-2"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("orphan t-5 on pi-2:"), "{}", lines[0]);
+        assert!(orphan_lines(&both, Some("nope")).is_empty());
         let rows = machine_rows(&head(), &[MachineRow::from(&m), MachineRow::from(&none)]);
         assert_eq!(rows[1][5], "3/4");
         assert_eq!(rows[1][6], "t-4,t-9");

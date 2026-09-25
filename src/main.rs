@@ -690,7 +690,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
     let hint = list_empty_hint(&a);
     let filter = TaskFilter {
         job: a.job,
-        machine: a.machine,
+        machine: a.machine.clone(),
         states,
     };
     let daemon_up = daemon_running(&paths.socket_file()).await;
@@ -728,7 +728,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
             unreachable!()
         };
-        for line in pastor::cli::orphan_lines(&ms) {
+        for line in pastor::cli::orphan_lines(&ms, a.machine.as_deref()) {
             println!("{line}");
         }
     }
