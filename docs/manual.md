@@ -872,6 +872,26 @@ job as failed, saying it needs `pastor serve`, and leaves it alone. Item fields 
 `repo` or `branch` may not be empty or `.`, or contain `/`, `\`, `..`, a
 leading `-` or control characters; such an item is skipped and reported.
 
+### What a plugin inherits
+
+A plugin is code you run as the head's user, not a sandboxed extension. Each
+command inherits:
+
+- the whole environment of the `pastor serve` or `pastor` process that runs
+  it, not just its `.env`: `SSH_AUTH_SOCK`, API tokens and cloud credentials
+  exported there reach every plugin. Only the secrets a manifest declares are
+  redacted from logs, so a plugin that prints its environment writes the rest
+  to its run log in clear text;
+- the head user's files, including every other plugin's `.env`, so keeping
+  secrets in separate `.env` files organises them but does not isolate them;
+- `PASTOR_STATE_DIR`, and with it `pastor.sock` and the ssh ControlMaster
+  sockets, which is control of the fleet (see [Trust model](#trust-model)).
+
+A hook without `only_own = true` also receives every task's item and prompt
+on stdin, whichever plugin the job uses. Start `pastor serve` from an
+environment that holds only what its plugins and ssh need, and install only
+plugins you would run by hand.
+
 ### Event hooks
 
 A connector's `[[events]]` hooks run on the head for every event whose type is
@@ -967,8 +987,8 @@ so its agents reach the head only as that user. What the pastor skill asks
 of a dispatched agent, to stay in its own pane and worktree, is advice, not
 a control.
 
-Plugins run as the head's user too, with the same reach; see
-[Plugins](#plugins). Install only plugins you would run by hand.
+Plugins run as the head's user too, with the same reach and the head's
+environment; [Plugins](#plugins) lists what they inherit.
 
 ## Files
 

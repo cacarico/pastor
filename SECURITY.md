@@ -21,6 +21,19 @@ fed by issues or chat messages from outside your team; run herdr for that
 work as a separate user and add it as an ssh machine instead. Plugins also
 run as that user, so installing one grants it control of the fleet.
 
+## What plugins inherit
+
+A plugin command (connector or hook) runs on the head as the head's user and
+inherits the full environment of the pastor process that starts it, plus its
+own `.env` and the `PASTOR_*` variables. It is not limited to its `.env`:
+`SSH_AUTH_SOCK`, API tokens and cloud credentials in that environment reach
+every plugin, and only the secrets its manifest declares are redacted from
+its run logs. It can read the head user's files, including other plugins'
+`.env` files, and `PASTOR_STATE_DIR` points it at `pastor.sock` and the ssh
+ControlMaster sockets. Hooks that do not set `only_own = true` receive every
+task's item and prompt. Start `pastor serve` from a minimal environment, and
+review a plugin as you would any program you run with your own account.
+
 Reports that need the head user's own access (writing its config, or running
 code as it) are in scope only where pastor makes that access easier to get
 than the model above says.
