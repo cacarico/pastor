@@ -614,8 +614,8 @@ mod tests {
     #[test]
     fn long_machine_names_are_shortened_to_keep_multiplexing() {
         let paths = Paths::new(
-            "/home/cacarico/.config/pastor",
-            "/home/cacarico/.local/state/pastor",
+            "/home/exampleuser/.config/pastor",
+            "/home/exampleuser/.local/state/pastor",
         );
         let Endpoint::Ssh { control_path, .. } =
             Endpoint::from_machine(&ssh_machine("pastor-sauron"), &paths)
@@ -626,7 +626,7 @@ mod tests {
         assert!(control_path_fits(&path), "{}", path.display());
         let text = path.to_string_lossy();
         assert!(
-            text.starts_with("/home/cacarico/.local/state/pastor/ssh/pastor"),
+            text.starts_with("/home/exampleuser/.local/state/pastor/ssh/pastor"),
             "{text}"
         );
         assert!(text.ends_with("-%C"), "{text}");
