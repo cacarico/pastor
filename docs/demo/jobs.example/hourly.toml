@@ -1,0 +1,8 @@
+every = "1h"
+
+[connector]
+use = "clock"
+
+[dispatch]
+repo = "~/work/api"
+prompt = "It is {{ item.key }}. Run the test suite and fix what broke."

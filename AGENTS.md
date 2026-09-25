@@ -1,6 +1,6 @@
 # Working on pastor
 
-Read this first, then `README.md` (how it works today) and the design spec
+Read this first, then `docs/manual.md` (how it works today; `README.md` is the short version) and the design spec
 on the `docs` branch, `docs/superpowers/specs/2026-09-23-pastor-design.md`
 (what it must become). The spec is the source of truth for design; the code
 is the source of truth for behaviour. When they disagree, fix one and say

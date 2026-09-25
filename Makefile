@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check fmt lint test test-machine leaks smoke install completions clean
+.PHONY: help build release check fmt lint test test-machine leaks smoke install completions demo clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -61,6 +61,17 @@ install: ## install pastor and fake-herdr into ~/.cargo/bin
 # The scripts are generated from the clap definitions, so they cannot drift
 # from the real command tree; `pastor completions <shell>` prints the same
 # thing at runtime for shells not listed here.
+# Records docs/demo/*.gif with vhs (https://github.com/charmbracelet/vhs; needs
+# vhs, ttyd and ffmpeg). A demo head runs against docs/demo/local/, which is
+# not committed: copy flock.example.toml there and point it at machines you
+# can ssh to. Nothing from your real config is shown.
+demo: ## record the README gifs with vhs against a demo head
+	mkdir -p docs/demo/local/jobs
+	cp -n docs/demo/flock.example.toml docs/demo/local/flock.toml
+	cp -n docs/demo/jobs.example/hourly.toml docs/demo/local/jobs/hourly.toml
+	PASTOR_CONFIG_DIR=$(CURDIR)/docs/demo/local PASTOR_STATE_DIR=$(CURDIR)/docs/demo/local/state cargo run -q --bin pastor -- serve & \
+	  sleep 2; for t in docs/demo/*.tape; do vhs $$t || exit 1; done; kill $$!
+
 completions: ## regenerate contrib/completions/pastor.{bash,fish} from the CLI
 	cargo build -q
 	mkdir -p contrib/completions
