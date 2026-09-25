@@ -25,6 +25,22 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prompts and a ledger live on a plan branch so any machine can resume;
   tasks run one after another.
 
+- `describe` for one thing in full, kubectl style, each with `--json`:
+  `pastor job describe <name>` (schedule, connector and its config, dispatch,
+  last runs and errors, next run, recent tasks and job events),
+  `pastor machine describe <name>` (host, flock, channel, versions, agents,
+  tags, its tasks, recent errors), `pastor flock describe <name>` (default or
+  not, its agent and args, machines, queued and running tasks), and
+  `pastor task describe <id>`, an alias of `task show`.
+- `edit` for the files behind them: `pastor job edit <name>`,
+  `pastor flock edit` and `pastor config edit` open a copy in `$VISUAL`, else
+  `$EDITOR`, else `vi`, check it the way the head loads it, and only then
+  replace the file atomically and reload a running head. An invalid edit
+  offers to reopen with the error on top; declining keeps the file as it was
+  and names where the edit is kept (`invalid_edit`). A symlinked job file is
+  edited at its target. `editor_failed` and `edit_conflict` cover an editor
+  that fails and a file changed during the edit.
+
 - `pastor task run --prompt-file <path>` reads the prompt from a file on the
   machine running the CLI (`-` for stdin), so a long prompt with quotes needs
   no shell quoting. It conflicts with the positional prompt; exactly one is

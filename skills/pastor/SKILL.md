@@ -21,7 +21,7 @@ pastor events --help
 pastor setup --help
 ```
 
-Most read commands take `--json` (`pastor task list`, `pastor task show`, `pastor machine list`, `pastor job list`, `pastor events`). Use it, and read task ids, machines and states from the output instead of predicting them.
+Most read commands take `--json` (`pastor task list`, `pastor task show`, `pastor machine list`, `pastor job list`, `pastor events`, and every `describe`). Use it, and read task ids, machines and states from the output instead of predicting them.
 
 Runtime errors are one JSON object on stderr, `{"code": ..., "message": ...}`, with exit 1. A malformed command line is clap usage text with exit 2.
 
@@ -126,6 +126,7 @@ prompt = "It is {{ item.key }}. Run the suite and fix what broke. Task {{ task.i
 
 ```bash
 pastor job list            # schedule, enabled, last and next run, errors
+pastor job describe hourly --json   # one job: connector, dispatch, last runs and errors, recent tasks
 pastor job run hourly      # fire now, ignoring the schedule
 pastor job enable hourly
 pastor job disable hourly
@@ -150,7 +151,13 @@ pastor flock list          # each flock: default, machines, live agents, queued 
 pastor flock add work [--default]
 pastor flock default work  # new tasks and jobs go there; machines stay put
 pastor flock remove work   # refused while it has machines or queued tasks, or is the default
+pastor machine describe pi-3 --json   # one machine: channel, versions, its tasks, recent errors
+pastor flock describe work --json     # one flock: default, agent, machines, live tasks
 ```
+
+`pastor task describe t-12` is `pastor task show t-12`.
+
+`pastor job edit hourly`, `pastor flock edit` and `pastor config edit` open the file in `$VISUAL` or `$EDITOR` and save it only once it is valid, reloading a running head. They are for a human at a terminal: an agent without one would wait on the editor, so edit the file directly and run `pastor job reload`, or use the commands above.
 
 These commands edit `flock.toml` in place, keeping its comments.
 

@@ -96,12 +96,7 @@ impl Flock {
         }
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let flock: Flock =
-            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-        flock
-            .validate()
-            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        Ok(flock)
+        Flock::parse(path, &text)
     }
 
     /// Like `load`, but a missing file is an error rather than the defaults:
@@ -117,8 +112,14 @@ impl Flock {
                 anyhow::Error::new(e).context(format!("read {}", path.display()))
             }
         })?;
+        Flock::parse(path, &text)
+    }
+
+    /// `text` as the file at `path` would load: parsed and validated, with
+    /// errors that name `path`. `pastor flock edit` checks an edit with it.
+    pub fn parse(path: &Path, text: &str) -> anyhow::Result<Flock> {
         let flock: Flock =
-            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+            toml::from_str(text).with_context(|| format!("parse {}", path.display()))?;
         flock
             .validate()
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;

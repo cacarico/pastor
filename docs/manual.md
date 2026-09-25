@@ -287,6 +287,9 @@ pastor flock default <name>             new tasks and jobs go to <name>
 pastor machine add ... [--flock F]      default: the default flock
 pastor machine move <name> <flock>
 pastor machine list [--flock F]
+pastor machine describe <name>          one machine in full (--json)
+pastor flock describe <name>            one flock in full (--json)
+pastor flock edit                       flock.toml in $VISUAL or $EDITOR
 ```
 
 These commands edit `flock.toml` in place: comments, order and layout that
@@ -989,6 +992,47 @@ a control.
 
 Plugins run as the head's user too, with the same reach and the head's
 environment; [Plugins](#plugins) lists what they inherit.
+
+## Describe and edit
+
+In the terminal pastor reads like kubectl: `list` shows many things, `describe`
+one in full, `edit` its file.
+
+```
+pastor job describe <name>       schedule, connector and its config, dispatch, last runs and errors, next run, recent tasks and job events
+pastor machine describe <name>   host, flock, session, channel, herdr, protocol and pastor versions, agents, orphans, tags, its tasks, recent errors
+pastor flock describe <name>     default or not, its agent, agent args, allow and deny, machines, live agents, queued and running tasks
+pastor task describe <id>        the same as `pastor task show`
+pastor job edit <name>           ~/.config/pastor/jobs/<name>.toml
+pastor flock edit                ~/.config/pastor/flock.toml
+pastor config edit               ~/.config/pastor/pastor.toml
+```
+
+Every `describe` takes `--json`. A description reads from the head when one
+runs and from the files and the store when not; a machine is then probed
+directly, as `machine list` does. The job's `connector` and `dispatch` are the
+tables as written in its file. Recent events come from `events.jsonl`: a
+job's `job.*` events, and for a machine its `machine.*` events that carried
+an error and its `task.failed` ones, ten at most.
+
+`edit` opens a copy of the file in `$VISUAL`, else `$EDITOR`, else `vi`, run
+through `sh` so the variable can carry arguments (`code --wait`). A file that
+does not exist yet (`flock.toml`, `pastor.toml`) starts empty; a job must
+exist. When the editor exits the copy is checked the way the head loads the
+file: a job against `pastor.toml`'s `[defaults]` and the connectors installed
+here, `flock.toml` and `pastor.toml` by their own rules. A valid edit replaces
+the file atomically (a temp file beside it, then a rename, keeping its mode)
+and a running head reloads it at once. A symlink is edited at its target and
+stays a symlink.
+
+An invalid edit prints the error and asks `reopen the editor to fix it?
+[Y/n]`. Yes reopens the copy with the error on top as `# pastor:` comments,
+which are taken off again. No, a closed stdin, or saving the reopened copy
+unchanged gives up: the file is left as it was, and the error
+(`invalid_edit`) names where the edit is kept. A copy saved as it was means
+no changes and writes nothing; an editor that exits non-zero writes nothing
+(`editor_failed`); a file that changed on disk while the editor was open is
+not overwritten (`edit_conflict`).
 
 ## Files
 

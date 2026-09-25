@@ -552,7 +552,9 @@ impl PastorConfig {
         Self::parse(path, &text)
     }
 
-    fn parse(path: &Path, text: &str) -> anyhow::Result<PastorConfig> {
+    /// `text` as the file at `path` would load, with errors that name
+    /// `path`. `pastor config edit` checks an edit with it.
+    pub fn parse(path: &Path, text: &str) -> anyhow::Result<PastorConfig> {
         let cfg: PastorConfig =
             toml::from_str(text).with_context(|| format!("parse {}", path.display()))?;
         // tick, settle and reconcile_every all drive `tokio::time::interval`,

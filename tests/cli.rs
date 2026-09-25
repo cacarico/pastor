@@ -2749,3 +2749,397 @@ fn first_dispatch_command(plan: &str) -> Vec<String> {
     }
     words
 }
+
+/// A config and state dir with no head, and a way to run pastor in them
+/// with a given editor. `VISUAL` is cleared so the test's `EDITOR` is the
+/// one that runs, whatever the developer's shell has.
+struct Offline {
+    tmp: tempfile::TempDir,
+    config: std::path::PathBuf,
+    state: std::path::PathBuf,
+}
+
+const NIGHTLY: &str = "# nightly sweep\nevery = \"1h\"\n\n[connector]\nuse = \"clock\"\n\n[dispatch]\nrepo = \"/tmp/r\"\nprompt = \"sweep {{ task.id }}\"\n";
+
+fn offline() -> Offline {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(config.join("jobs")).unwrap();
+    std::fs::write(config.join("jobs/nightly.toml"), NIGHTLY).unwrap();
+    Offline { tmp, config, state }
+}
+
+impl Offline {
+    fn edit(&self, editor: &str, args: &[&str], stdin: &str) -> std::process::Output {
+        use std::io::Write;
+        let mut child = pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .env_remove("VISUAL")
+            .env("EDITOR", editor)
+            // Kept copies land in the test's dir, not the real temp dir.
+            .env("TMPDIR", self.tmp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn cmd(&self, args: &[&str]) -> std::process::Output {
+        self.edit("false", args, "")
+    }
+
+    /// An editor script that writes `edits[n]` over the file on its n-th
+    /// run (the last one for every later run), and logs what it was given.
+    fn editor(&self, edits: &[&str]) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.tmp.path().join("editor");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, e) in edits.iter().enumerate() {
+            std::fs::write(dir.join(format!("edit{i}")), e).unwrap();
+        }
+        let script = dir.join("ed.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nd={dir}\nn=$(cat $d/count 2>/dev/null || echo 0)\necho $((n+1)) > $d/count\ncp \"$1\" $d/seen$n\nf=$d/edit$n\n[ -f $f ] || f=$d/edit{last}\ncp $f \"$1\"\n",
+                dir = dir.display(),
+                last = edits.len() - 1
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script.display().to_string()
+    }
+
+    fn runs(&self) -> usize {
+        std::fs::read_to_string(self.tmp.path().join("editor/count"))
+            .map_or(0, |s| s.trim().parse().unwrap())
+    }
+
+    fn seen(&self, n: usize) -> String {
+        std::fs::read_to_string(self.tmp.path().join(format!("editor/seen{n}"))).unwrap()
+    }
+}
+
+#[test]
+fn edit_saves_a_valid_edit_of_each_file() {
+    let o = offline();
+    let job = o.config.join("jobs/nightly.toml");
+    let edited = NIGHTLY.replace("1h", "2h");
+    let out = o.edit(&o.editor(&[&edited]), &["job", "edit", "nightly"], "");
+    let text = ok(out);
+    assert!(text.contains("saved"), "{text}");
+    assert_eq!(o.seen(0), NIGHTLY, "the editor starts from the file");
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), edited);
+    // The temp copy is gone once the edit is saved.
+    let tmp_left: Vec<_> = std::fs::read_dir(o.config.join("jobs"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(tmp_left, [std::ffi::OsString::from("nightly.toml")]);
+
+    // flock.toml and pastor.toml need not exist yet.
+    let flock = "[[flock]]\nname = \"work\"\ndefault = true\n\n[[machine]]\nname = \"pi-1\"\nlocal = true\n";
+    let o2 = offline();
+    ok(o2.edit(&o2.editor(&[flock]), &["flock", "edit"], ""));
+    assert_eq!(o2.seen(0), "");
+    assert_eq!(
+        std::fs::read_to_string(o2.config.join("flock.toml")).unwrap(),
+        flock
+    );
+    let config = "tick = \"5s\"\n";
+    let o3 = offline();
+    ok(o3.edit(&o3.editor(&[config]), &["config", "edit"], ""));
+    assert_eq!(
+        std::fs::read_to_string(o3.config.join("pastor.toml")).unwrap(),
+        config
+    );
+
+    // $VISUAL wins over $EDITOR; the editor is a shell word list, as git
+    // reads it.
+    let o4 = offline();
+    let visual = o4.editor(&["tick = \"7s\"\n"]);
+    let out = pastor()
+        .args(["config", "edit"])
+        .env("PASTOR_CONFIG_DIR", &o4.config)
+        .env("PASTOR_STATE_DIR", &o4.state)
+        .env("VISUAL", format!("sh {visual}"))
+        .env("EDITOR", "false")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    ok(out);
+    assert_eq!(
+        std::fs::read_to_string(o4.config.join("pastor.toml")).unwrap(),
+        "tick = \"7s\"\n"
+    );
+}
+
+#[test]
+fn edit_of_a_symlinked_job_writes_its_target() {
+    let o = offline();
+    let real = o.tmp.path().join("dotfiles/nightly.toml");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    let link = o.config.join("jobs/nightly.toml");
+    std::fs::rename(&link, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let edited = NIGHTLY.replace("1h", "3h");
+    ok(o.edit(&o.editor(&[&edited]), &["job", "edit", "nightly"], ""));
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), edited);
+}
+
+#[test]
+fn edit_that_is_invalid_reopens_until_fixed() {
+    let o = offline();
+    let job = o.config.join("jobs/nightly.toml");
+    let broken = NIGHTLY.replace("1h", "soon");
+    let fixed = NIGHTLY.replace("1h", "4h");
+    let out = o.edit(
+        &o.editor(&[&broken, &fixed]),
+        &["job", "edit", "nightly"],
+        "y\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    ok(out);
+    assert_eq!(o.runs(), 2);
+    assert!(stderr.contains("soon"), "the error is shown: {stderr}");
+    // The reopened copy is the broken edit, with the error on top as comments.
+    let second = o.seen(1);
+    assert!(second.starts_with("# pastor:"), "{second}");
+    assert!(second.ends_with(&broken), "{second}");
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), fixed);
+
+    // pastor.toml is checked as the head loads it: a zero tick is refused.
+    let o2 = offline();
+    let out = o2.edit(
+        &o2.editor(&["tick = \"0s\"\n", "tick = \"2s\"\n"]),
+        &["config", "edit"],
+        "\n",
+    );
+    ok(out);
+    assert_eq!(
+        std::fs::read_to_string(o2.config.join("pastor.toml")).unwrap(),
+        "tick = \"2s\"\n"
+    );
+}
+
+#[test]
+fn edit_that_is_invalid_and_not_reopened_leaves_the_file_alone() {
+    let o = offline();
+    let job = o.config.join("jobs/nightly.toml");
+    let broken = NIGHTLY.replace("clock", "no-such-connector");
+    let out = o.edit(&o.editor(&[&broken]), &["job", "edit", "nightly"], "n\n");
+    let (code, message) = last_error(&out);
+    assert_eq!(code, "invalid_edit");
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), NIGHTLY);
+    // The message names the kept copy, which holds the edit.
+    let kept = message
+        .split_whitespace()
+        .find(|w| w.contains("pastor-edit"))
+        .unwrap_or_else(|| panic!("{message}"))
+        .trim_end_matches([',', ';', '.']);
+    assert_eq!(std::fs::read_to_string(kept).unwrap(), broken);
+    std::fs::remove_file(kept).unwrap();
+
+    // No answer at all (stdin closed) is a no too, never a loop.
+    let o2 = offline();
+    let out = o2.edit(
+        &o2.editor(&["[[machine]]\nname = \"a\"\n"]),
+        &["flock", "edit"],
+        "",
+    );
+    let (code, message) = last_error(&out);
+    assert_eq!(code, "invalid_edit");
+    assert_eq!(o2.runs(), 1);
+    assert!(!o2.config.join("flock.toml").exists());
+    if let Some(kept) = message
+        .split_whitespace()
+        .find(|w| w.contains("pastor-edit"))
+    {
+        let _ = std::fs::remove_file(kept);
+    }
+}
+
+/// The code and message of a failed edit. The error is the last line of
+/// stderr: before it, the edit's problem and the reopen prompt.
+fn last_error(out: &std::process::Output) -> (String, String) {
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr.trim_end().lines().last().unwrap_or_default();
+    let line = &line[line.find('{').unwrap_or_else(|| panic!("{stderr}"))..];
+    let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|_| panic!("{stderr}"));
+    (
+        v["code"].as_str().unwrap().to_string(),
+        v["message"].as_str().unwrap().to_string(),
+    )
+}
+
+#[test]
+fn edit_aborted_or_unchanged_writes_nothing() {
+    let o = offline();
+    let job = o.config.join("jobs/nightly.toml");
+    let out = o.edit("false", &["job", "edit", "nightly"], "");
+    assert_eq!(error_code(&out), "editor_failed");
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), NIGHTLY);
+    let text = ok(o.edit("true", &["job", "edit", "nightly"], ""));
+    assert!(text.contains("no changes"), "{text}");
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), NIGHTLY);
+    let out = o.edit("true", &["job", "edit", "ghost"], "");
+    assert_eq!(error_code(&out), "job_not_found");
+    let out = o.edit("true", &["job", "edit", "../pastor"], "");
+    assert_eq!(error_code(&out), "job_not_found");
+    // A file changed behind the editor is not overwritten.
+    let script = format!(
+        "#!/bin/sh\necho '# changed elsewhere' >> {}\necho '# mine' >> \"$1\"\n",
+        job.display()
+    );
+    let ed = o.tmp.path().join("race.sh");
+    std::fs::write(&ed, script).unwrap();
+    let out = o.edit(
+        &format!("sh {}", ed.display()),
+        &["job", "edit", "nightly"],
+        "",
+    );
+    assert_eq!(error_code(&out), "edit_conflict");
+    let now = std::fs::read_to_string(&job).unwrap();
+    assert!(
+        now.ends_with("# changed elsewhere\n") && !now.contains("# mine"),
+        "{now}"
+    );
+}
+
+#[test]
+fn edit_reloads_a_running_head() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let edited = format!("enabled = false\n{NIGHTLY}");
+    let ed = env.config.join("ed.sh");
+    std::fs::write(&ed, format!("#!/bin/sh\ncat > \"$1\" <<'X'\n{edited}X\n")).unwrap();
+    let out = pastor()
+        .args(["job", "edit", "nightly"])
+        .env("PASTOR_CONFIG_DIR", &env.config)
+        .env("PASTOR_STATE_DIR", &env.state)
+        .env_remove("VISUAL")
+        .env("EDITOR", format!("sh {}", ed.display()))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = ok(out);
+    assert!(text.contains("picked it up"), "{text}");
+    let jobs: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(env.cmd(&["job", "list", "--json"]))).unwrap();
+    assert_eq!(jobs[0]["enabled"], false);
+}
+
+#[test]
+fn describe_a_job_flock_and_task_without_a_head() {
+    let o = offline();
+    std::fs::write(
+        o.config.join("flock.toml"),
+        "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"work\"\nagent = \"codex\"\nagent_args = [\"--full-auto\"]\ndeny = [\"Bash(rm:*)\"]\n\n[[machine]]\nname = \"pi-1\"\nlocal = true\nflock = \"work\"\ntags = [\"arm\"]\n",
+    )
+    .unwrap();
+    ok(o.cmd(&["tick", "--job", "nightly"]));
+
+    let j: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["job", "describe", "nightly", "--json"]))).unwrap();
+    assert_eq!(j["name"], "nightly");
+    assert_eq!(j["schedule"], "every 1h");
+    assert_eq!(j["enabled"], true);
+    assert_eq!(j["connector"]["use"], "clock");
+    assert_eq!(j["dispatch"]["repo"], "/tmp/r");
+    assert_eq!(j["flock"], "home");
+    assert!(j["last_run_at"].is_string(), "{j}");
+    assert!(j["next_due"].is_string(), "{j}");
+    assert_eq!(j["tasks"][0]["id"], 1);
+    assert!(j["file"].as_str().unwrap().ends_with("jobs/nightly.toml"));
+    let text = ok(o.cmd(&["job", "describe", "nightly"]));
+    for want in ["every 1h", "clock", "/tmp/r", "next run:", "t-1", "sweep"] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    assert_eq!(
+        error_code(&o.cmd(&["job", "describe", "ghost"])),
+        "job_not_found"
+    );
+
+    let f: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["flock", "describe", "work", "--json"]))).unwrap();
+    assert_eq!(f["name"], "work");
+    assert_eq!(f["default"], false);
+    assert_eq!(f["agent"], "codex");
+    assert_eq!(f["agent_args"], serde_json::json!(["--full-auto"]));
+    assert_eq!(f["deny"], serde_json::json!(["Bash(rm:*)"]));
+    assert_eq!(f["machines"], serde_json::json!(["pi-1"]));
+    assert_eq!(f["tasks"], serde_json::json!([]));
+    let h: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["flock", "describe", "home", "--json"]))).unwrap();
+    assert_eq!(h["default"], true);
+    assert_eq!(h["tasks"][0]["state"], "queued");
+    let text = ok(o.cmd(&["flock", "describe", "work"]));
+    for want in ["default:", "no", "codex", "--full-auto", "pi-1"] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    assert_eq!(
+        error_code(&o.cmd(&["flock", "describe", "nope"])),
+        "unknown_flock"
+    );
+
+    // `task describe` is `task show`, spelled the kubectl way.
+    assert_eq!(
+        ok(o.cmd(&["task", "describe", "t-1", "--json"])),
+        ok(o.cmd(&["task", "show", "t-1", "--json"]))
+    );
+    assert_eq!(
+        ok(o.cmd(&["task", "describe", "t-1"])),
+        ok(o.cmd(&["task", "show", "t-1"]))
+    );
+
+    // Without a head a machine is probed directly; a local one with no
+    // herdr server reads as down.
+    let m: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["machine", "describe", "pi-1", "--json"]))).unwrap();
+    assert_eq!(m["name"], "pi-1");
+    assert_eq!(m["flock"], "work");
+    assert_eq!(m["tags"], serde_json::json!(["arm"]));
+    assert_eq!(
+        error_code(&o.cmd(&["machine", "describe", "nope"])),
+        "unknown_machine"
+    );
+}
+
+#[test]
+fn describe_a_machine_and_its_flock_with_a_head() {
+    let env = start();
+    let t: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["task", "run", "hi", "--json"]))).unwrap();
+    let id = format!("t-{}", t["id"]);
+    env.wait_done(&id);
+    let m: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["machine", "describe", "fake", "--json"]))).unwrap();
+    assert_eq!(m["name"], "fake");
+    assert_eq!(m["channel"], "connected");
+    assert_eq!(m["flock"], "default");
+    assert_eq!(m["max_agents"], 2);
+    assert!(m["herdr_version"].is_string(), "{m}");
+    assert_eq!(m["tasks"][0]["id"], t["id"]);
+    let text = ok(env.cmd(&["machine", "describe", "fake"]));
+    for want in ["channel:", "connected", "herdr:", &id] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    let f: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["flock", "describe", "default", "--json"]))).unwrap();
+    assert_eq!(f["default"], true);
+    assert_eq!(f["machines"], serde_json::json!(["fake"]));
+    assert!(f["agents"].is_u64(), "a head knows the live agents: {f}");
+}

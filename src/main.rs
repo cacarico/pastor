@@ -67,6 +67,11 @@ enum Command {
         #[command(subcommand)]
         cmd: JobCmd,
     },
+    /// pastor.toml: the head's settings and the task defaults
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
     /// Print a shell completion script (fish, bash, zsh, ...) to stdout
     Completions { shell: clap_complete::Shell },
     /// Show the events log (task, job and machine events)
@@ -115,6 +120,20 @@ enum JobCmd {
     Run { name: String },
     /// Re-read the job files now instead of at the next tick
     Reload,
+    /// Open a job file in $VISUAL or $EDITOR; save it only once it is valid
+    Edit { name: String },
+    /// One job in full: schedule, connector, dispatch, last runs, recent tasks
+    Describe {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCmd {
+    /// Open pastor.toml in $VISUAL or $EDITOR; save it only once it is valid
+    Edit,
 }
 
 #[derive(Args, Debug)]
@@ -187,6 +206,7 @@ enum TaskCmd {
     /// List live tasks across the flock; --all adds finished ones
     List(ListArgs),
     /// Show one task row
+    #[command(visible_alias = "describe")]
     Show {
         task: String,
         #[arg(long)]
@@ -251,6 +271,12 @@ enum MachineCmd {
         #[arg(long)]
         json: bool,
     },
+    /// One machine in full: host, flock, channel, versions, agents, recent errors
+    Describe {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -270,6 +296,14 @@ enum FlockCmd {
     Remove { name: String },
     /// Make another flock the default; machines stay in their flocks
     Default { name: String },
+    /// Open flock.toml in $VISUAL or $EDITOR; save it only once it is valid
+    Edit,
+    /// One flock in full: default or not, its agent, machines, live tasks
+    Describe {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -323,6 +357,9 @@ fn main() {
             Command::Open { machine } => open(&paths, &machine).await,
             Command::Tick(args) => tick(&paths, args, head).await,
             Command::Job { cmd } => job(&paths, cmd, head).await,
+            Command::Config {
+                cmd: ConfigCmd::Edit,
+            } => config_edit(&paths, head).await,
             Command::Completions { shell } => {
                 let mut cmd = completion_tree();
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
@@ -430,10 +467,14 @@ fn head_use(command: &Command) -> Option<bool> {
         },
         Command::Machine { cmd } => Some(match cmd {
             MachineCmd::List { flock, .. } => flock.is_some(),
+            MachineCmd::Describe { .. } => false,
             _ => true,
         }),
-        Command::Flock { cmd } => Some(!matches!(cmd, FlockCmd::List { .. })),
-        Command::Tick(_) | Command::Job { .. } => Some(false),
+        Command::Flock { cmd } => Some(!matches!(
+            cmd,
+            FlockCmd::List { .. } | FlockCmd::Describe { .. }
+        )),
+        Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
         Command::Connector { cmd } => {
             (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Run { .. })).then_some(false)
         }
@@ -1082,6 +1123,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
         MachineCmd::List { flock, json } => {
             machine_list(paths, flock.as_deref(), json, head).await?
         }
+        MachineCmd::Describe { name, json } => machine_describe(paths, &name, json, head).await?,
     }
     Ok(())
 }
@@ -1100,6 +1142,17 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
     };
     let done = match cmd {
         FlockCmd::List { json } => return flock_list(paths, json, head).await,
+        FlockCmd::Describe { name, json } => {
+            return flock_describe(paths, &name, json, head).await;
+        }
+        FlockCmd::Edit => {
+            let check = |text: &str| {
+                Flock::parse(&path, text)
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:#}"))
+            };
+            return edit_file(paths, &path, &check, head).await;
+        }
         FlockCmd::Add { name, default } => {
             // A first default flock would take the implicit flock's
             // machines, stranding the tasks queued there. As with `flock
@@ -1212,14 +1265,7 @@ async fn queued_tasks(paths: &Paths, head: Head) -> anyhow::Result<Vec<Task>> {
         states: Some(vec![TaskState::Queued]),
         ..Default::default()
     };
-    if head.is_live() {
-        let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
-            unreachable!()
-        };
-        Ok(ts)
-    } else {
-        Ok(open_store(paths)?.list_tasks(&filter)?)
-    }
+    tasks_matching(paths, head, filter).await
 }
 
 /// After `machine add|remove` rewrote flock.toml, a running head re-reads it
@@ -1446,14 +1492,15 @@ async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
             println!("{msg}");
         }
         JobCmd::Reload => reload(paths).await?,
+        JobCmd::Edit { name } => job_edit(paths, &name, head).await?,
+        JobCmd::Describe { name, json } => job_describe(paths, &name, json, head).await?,
     }
     Ok(())
 }
 
-async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow::Result<()> {
-    // Validate before joining: `job_path` just formats and joins, so an
-    // unchecked name like "../pastor" would resolve outside the jobs
-    // directory instead of failing not-found.
+/// The job file `name` names, which must exist. The name is checked before
+/// it is joined under the jobs dir: `"../pastor"` would resolve outside it.
+fn existing_job_file(paths: &Paths, name: &str) -> std::path::PathBuf {
     if let Err(e) = check_name(name) {
         fail("job_not_found", &e);
     }
@@ -1461,6 +1508,272 @@ async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow:
     if !path.exists() {
         fail("job_not_found", &format!("no job file {}", path.display()));
     }
+    path
+}
+
+/// Edit `path` in the user's editor, checked with `check`; a saved edit
+/// reloads a running head.
+async fn edit_file(
+    paths: &Paths,
+    path: &std::path::Path,
+    check: &dyn Fn(&str) -> Result<(), String>,
+    head: Head,
+) -> anyhow::Result<()> {
+    let editor = pastor::edit::editor();
+    match pastor::edit::edit(path, &editor, check, &mut |_| ask_reopen())? {
+        pastor::edit::Outcome::Unchanged => println!("no changes to {}", path.display()),
+        pastor::edit::Outcome::Saved => println!(
+            "saved {}; {}",
+            path.display(),
+            reload_running_head(paths, head).await
+        ),
+    }
+    Ok(())
+}
+
+/// Whether to reopen an invalid edit: yes unless the answer on stdin says
+/// no. No answer at all (stdin closed) is a no, so a script never loops.
+fn ask_reopen() -> bool {
+    eprint!("reopen the editor to fix it? [Y/n] ");
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    // A terminal echoes the answer and its newline; anything else does not.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!();
+    }
+    match read {
+        Ok(0) | Err(_) => false,
+        Ok(_) => {
+            let a = line.trim().to_ascii_lowercase();
+            a.is_empty() || a == "y" || a == "yes"
+        }
+    }
+}
+
+/// A job file is checked as the head loads it: against pastor.toml's
+/// `[defaults]` and the connectors installed here.
+async fn job_edit(paths: &Paths, name: &str, head: Head) -> anyhow::Result<()> {
+    let path = existing_job_file(paths, name);
+    let defaults = PastorConfig::load(&paths.config_file())?.defaults;
+    let catalog: Box<dyn pastor::connector::Catalog> =
+        match pastor::connector::ConnectorCatalog::load(paths) {
+            Ok(c) => Box::new(c),
+            Err(_) => Box::new(pastor::connector::Builtins),
+        };
+    let check = |text: &str| {
+        pastor::config::job::Job::parse(text, name, &defaults, catalog.as_ref()).map(|_| ())
+    };
+    edit_file(paths, &path, &check, head).await
+}
+
+async fn config_edit(paths: &Paths, head: Head) -> anyhow::Result<()> {
+    let path = paths.config_file();
+    let check = |text: &str| {
+        PastorConfig::parse(&path, text)
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+    };
+    edit_file(paths, &path, &check, head).await
+}
+
+/// Tasks matching `filter`, from the head when one runs, else the store.
+async fn tasks_matching(
+    paths: &Paths,
+    head: Head,
+    filter: TaskFilter,
+) -> anyhow::Result<Vec<Task>> {
+    if head.is_live() {
+        let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
+            unreachable!()
+        };
+        Ok(ts)
+    } else {
+        Ok(open_store(paths)?.list_tasks(&filter)?)
+    }
+}
+
+/// The events log, or nothing when it cannot be read: a description is
+/// still worth printing without it.
+fn events_log(paths: &Paths) -> Vec<pastor::events::EventRecord> {
+    pastor::events::read(&paths.events_file(), None).unwrap_or_default()
+}
+
+fn print_description<T: serde::Serialize>(
+    d: &T,
+    json: bool,
+    text: fn(&T) -> String,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(d)?);
+    } else {
+        println!("{}", text(d));
+    }
+    Ok(())
+}
+
+async fn job_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
+    let path = existing_job_file(paths, name);
+    let statuses = if head.is_live() {
+        let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::JobList).await? else {
+            unreachable!()
+        };
+        jobs
+    } else {
+        let mut s = standalone(paths)?;
+        s.reload();
+        s.statuses(chrono::Utc::now())
+    };
+    let Some(status) = statuses.into_iter().find(|j| j.name == name) else {
+        fail("job_not_found", &format!("the head has no job {name}"));
+    };
+    // The tables as written, so a file that does not parse still shows what
+    // it says as far as TOML goes.
+    let raw: Option<toml::Table> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok());
+    let table = |key: &str| {
+        raw.as_ref()
+            .and_then(|r| r.get(key))
+            .and_then(|v| serde_json::to_value(v).ok())
+    };
+    let state = open_store(paths)?.job_state(name)?.unwrap_or_default();
+    let tasks = tasks_matching(
+        paths,
+        head,
+        TaskFilter {
+            job: Some(name.to_string()),
+            ..Default::default()
+        },
+    )
+    .await?
+    .into_iter()
+    .take(pastor::describe::RECENT)
+    .collect();
+    let events = pastor::describe::recent_events(events_log(paths), |e| {
+        e.kind.starts_with("job.") && e.job.as_deref() == Some(name)
+    });
+    let d = pastor::describe::JobDescription {
+        name: name.to_string(),
+        file: path.display().to_string(),
+        schedule: status.schedule,
+        enabled: status.enabled,
+        error: status.error,
+        running: status.running,
+        flock: status.flock,
+        connector: table("connector"),
+        dispatch: table("dispatch"),
+        next_due: status.next_due,
+        last_run_at: status.last_run_at.or(state.last_run_at),
+        last_ok_at: state.last_ok_at,
+        last_result: status.last_result.or(state.last_result),
+        last_error: state.last_error,
+        failures: state.failures,
+        backoff_until: state.backoff_until,
+        tasks,
+        events,
+    };
+    print_description(&d, json, pastor::describe::job_text)
+}
+
+async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
+    let f = Flock::load(&paths.flock_file())?;
+    let Some(m) = f.get(name) else {
+        fail(
+            "unknown_machine",
+            &format!("no machine {name} in the flock"),
+        );
+    };
+    let live = if head.is_live() {
+        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
+            unreachable!()
+        };
+        ms.iter()
+            .find(|s| s.name == name)
+            .map(pastor::cli::MachineRow::from)
+    } else {
+        None
+    };
+    let row = match live {
+        Some(row) => row,
+        // No head, or one that has not picked the machine up yet.
+        None => {
+            paths.ensure()?;
+            let store = Store::open(&paths.db_file())?;
+            probe_machine(m, f.flock_of(m), paths, &store).await?
+        }
+    };
+    let tasks = tasks_matching(
+        paths,
+        head,
+        TaskFilter {
+            machine: Some(name.to_string()),
+            states: Some(pastor::task::PANE_OWNING_STATES.to_vec()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let recent_errors = pastor::describe::recent_events(events_log(paths), |e| {
+        let machine_error = e.kind.starts_with("machine.")
+            && e.machine
+                .as_ref()
+                .is_some_and(|s| s.name == name && s.error.is_some());
+        let failed_here = e.kind == "task.failed"
+            && e.task.as_ref().and_then(|t| t.machine.as_deref()) == Some(name);
+        machine_error || failed_here
+    });
+    let d = pastor::describe::MachineDescription {
+        row,
+        session: m.session.clone(),
+        tasks,
+        recent_errors,
+    };
+    print_description(&d, json, pastor::describe::machine_text)
+}
+
+async fn flock_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
+    let f = Flock::load(&paths.flock_file())?;
+    if !f.has_flock(name) {
+        fail("unknown_flock", &format!("no flock {name}"));
+    }
+    let live = if head.is_live() {
+        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
+            unreachable!()
+        };
+        Some(ms)
+    } else {
+        None
+    };
+    let row = pastor::cli::flock_list(&f, live.as_deref(), &[])
+        .into_iter()
+        .find(|r| r.name == name)
+        .expect("has_flock");
+    let tasks = tasks_matching(
+        paths,
+        head,
+        TaskFilter {
+            flock: Some(name.to_string()),
+            states: Some(LIVE_STATES.to_vec()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let entry = f.entry(name).cloned().unwrap_or_default();
+    let d = pastor::describe::FlockDescription {
+        name: row.name,
+        default: row.default,
+        agent: entry.agent,
+        agent_args: entry.agent_args,
+        allow: entry.allow,
+        deny: entry.deny,
+        machines: row.machines,
+        agents: row.agents,
+        tasks,
+    };
+    print_description(&d, json, pastor::describe::flock_text)
+}
+
+async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow::Result<()> {
+    let path = existing_job_file(paths, name);
     set_enabled(&path, enabled)?;
     let verb = if enabled { "enabled" } else { "disabled" };
     if head.is_live() {
