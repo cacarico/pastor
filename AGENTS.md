@@ -84,6 +84,11 @@ them too; they are repeated here because getting them wrong cost a day.
   full suite. Run it before every commit. `make help` lists the rest.
 - CI (`.github/workflows/ci.yml`) runs `make check` and `make test-machine`
   on every pull request and on pushes to `main`.
+- The repository is public. `.github/workflows/gitleaks.yml` scans the whole
+  history on every push and pull request, and `make leaks` runs the same scan
+  here. Nothing from the fleet goes into a commit: no addresses, hostnames,
+  user names, tokens or home paths; examples use placeholders such as
+  `user@pi-1`.
 - Nothing in the suite talks to a real herdr. `make smoke SESSION=s` runs the
   opt-in test against one on the same host; do it on a fleet machine before
   trusting a change to the transport or dispatch.

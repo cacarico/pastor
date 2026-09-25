@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check fmt lint test test-machine smoke install completions clean
+.PHONY: help build release check fmt lint test test-machine leaks smoke install completions clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -28,6 +28,11 @@ test: ## whole suite, including the end-to-end CLI tests against the fake herdr
 
 test-machine: ## the machine actor tests five times, to catch timing flakes
 	@for i in 1 2 3 4 5; do cargo test --lib machine:: -q || exit 1; done
+
+# The repository is public; CI runs the same scan on every push. Needs the
+# gitleaks binary (a system package, not a cargo one).
+leaks: ## scan the whole git history for secrets
+	gitleaks git --redact --no-banner --log-opts="--all" .
 
 # Needs herdr 0.9+ running with the named session on this host. Nothing else
 # in the suite touches a real herdr, so this is the smoke test to run on a
