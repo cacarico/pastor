@@ -274,7 +274,7 @@ characters; such an item is skipped and reported.
 `plugin install|link|uninstall|unlink` tell a running daemon to reload, so a
 new plugin is usable without a restart (this also restarts stream
 connectors). A daemon that is running but does not answer gets a warning to
-run `pastor reload` yourself.
+run `pastor job reload` yourself.
 
 ### Event hooks
 
@@ -284,7 +284,7 @@ in `on` (`task.queued`, `task.done`, `task.blocked`, `task.failed`,
 event record, the same JSON `pastor events --json` prints, on stdin, and the
 same environment as the connector (`PASTOR_JOB` is the task's job). With
 `only_own = true` it only hears about tasks and jobs whose connector is this
-plugin; one-off `pastor run` tasks belong to no plugin.
+plugin; one-off `pastor task run` tasks belong to no plugin.
 
 ```toml
 [[events]]

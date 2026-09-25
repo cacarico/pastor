@@ -492,7 +492,7 @@ pub struct Scheduler {
     /// Which connectors exist: job files validate against it and runs
     /// resolve through it. `Builtins` until `with_plugins`.
     catalog: Arc<dyn Catalog>,
-    /// Re-read the plugins dir on a forced reload (`pastor reload`, which
+    /// Re-read the plugins dir on a forced reload (`pastor job reload`, which
     /// `plugin install|link|uninstall|unlink` send).
     plugins: bool,
     /// Replaces the catalog's lookup when set.

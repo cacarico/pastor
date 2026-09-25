@@ -184,7 +184,7 @@ async fn reload_note(socket: &std::path::Path) -> Option<String> {
         DaemonProbe::NotRunning => return None,
         DaemonProbe::Unresponsive => {
             return Some(
-                "pastor serve is not responding, so it did not reload; run `pastor reload` once it answers"
+                "pastor serve is not responding, so it did not reload; run `pastor job reload` once it answers"
                     .into(),
             );
         }
@@ -193,10 +193,10 @@ async fn reload_note(socket: &std::path::Path) -> Option<String> {
     Some(
         match crate::ipc::request(socket, &IpcRequest::Reload).await {
             Ok(IpcResponse::Error { message, .. }) => {
-                format!("pastor serve did not reload ({message}); run `pastor reload`")
+                format!("pastor serve did not reload ({message}); run `pastor job reload`")
             }
             Ok(_) => "pastor serve reloaded its plugins and jobs".into(),
-            Err(e) => format!("pastor serve did not reload ({e:#}); run `pastor reload`"),
+            Err(e) => format!("pastor serve did not reload ({e:#}); run `pastor job reload`"),
         },
     )
 }
@@ -392,7 +392,7 @@ mod tests {
         });
         let note = reload_note(&socket).await.expect("a warning");
         assert!(
-            note.contains("not responding") && note.contains("pastor reload"),
+            note.contains("not responding") && note.contains("pastor job reload"),
             "{note}"
         );
     }

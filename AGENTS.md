@@ -114,11 +114,8 @@ Plan 3 (events and plugins):
 - Adopted panes get no `agent_status` subscription until the next reconnect.
 - `pastor machine status` does unbounded connect/ping/list on the CLI path.
 - A stream connector starts on its job's first run, not at daemon start,
-  and `pastor reload` (which every `plugin install|link|uninstall|unlink`
+  and `pastor job reload` (which every `plugin install|link|uninstall|unlink`
   sends) rebuilds the catalog, restarting every stream connector.
-- Items deferred by `max_tasks_per_run` stay unseen, but the cursor still
-  advances past them, so a connector that resumes strictly from its cursor
-  never emits them again. Failed inserts hold the cursor; deferrals do not.
 - `only_own` decides ownership by reading the task's job file for
   `connector.use`; a job file edited or removed after its tasks were made
   changes who owns them.
