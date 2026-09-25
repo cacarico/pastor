@@ -8,7 +8,8 @@ use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
 use pastor::herdr::{ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{
-    IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, daemon_running, request,
+    DaemonProbe, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon,
+    daemon_running, probe_daemon, request,
 };
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
@@ -547,47 +548,56 @@ fn head_row() -> pastor::cli::HeadRow {
 /// exactly one JSON value on stderr.
 async fn machine_list(paths: &Paths, json: bool, only: Option<String>) -> anyhow::Result<()> {
     let wanted = |name: &str| only.as_deref().is_none_or(|n| n == name);
-    let (rows, note) = if daemon_running(&paths.socket_file()).await {
-        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
-            unreachable!()
-        };
-        if let Some(n) = &only
-            && !ms.iter().any(|m| &m.name == n)
-        {
-            fail(
-                "unknown_machine",
-                &format!("machine {n} is not in the flock"),
-            );
+    // Only `NotRunning` means nothing is listening; `Unresponsive` covers a
+    // head that is up but busy (mid-dispatch, or wedged), and probing
+    // machines around it would print the "not running" note for a head that
+    // is only slow. Route both `Running` and `Unresponsive` through the same
+    // IPC request so `request_failure`'s existing timeout/connect handling
+    // applies.
+    let (rows, note) = match probe_daemon(&paths.socket_file()).await {
+        DaemonProbe::Running | DaemonProbe::Unresponsive => {
+            let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
+                unreachable!()
+            };
+            if let Some(n) = &only
+                && !ms.iter().any(|m| &m.name == n)
+            {
+                fail(
+                    "unknown_machine",
+                    &format!("machine {n} is not in the flock"),
+                );
+            }
+            let rows: Vec<pastor::cli::MachineRow> = ms
+                .iter()
+                .filter(|m| wanted(&m.name))
+                .map(pastor::cli::MachineRow::from)
+                .collect();
+            (rows, None)
         }
-        let rows: Vec<pastor::cli::MachineRow> = ms
-            .iter()
-            .filter(|m| wanted(&m.name))
-            .map(pastor::cli::MachineRow::from)
-            .collect();
-        (rows, None)
-    } else {
-        let f = Flock::load(&paths.flock_file())?;
-        // A typo would otherwise filter every row out and print a table with
-        // exit 0; name it the way run, attach and open do.
-        if let Some(n) = &only
-            && f.get(n).is_none()
-        {
-            fail(
-                "unknown_machine",
-                &format!("machine {n} is not in the flock"),
-            );
+        DaemonProbe::NotRunning => {
+            let f = Flock::load(&paths.flock_file())?;
+            // A typo would otherwise filter every row out and print a table with
+            // exit 0; name it the way run, attach and open do.
+            if let Some(n) = &only
+                && f.get(n).is_none()
+            {
+                fail(
+                    "unknown_machine",
+                    &format!("machine {n} is not in the flock"),
+                );
+            }
+            // Connects without the head, so the state dir the ssh master sockets
+            // live under may not exist yet, and must be private.
+            paths.ensure()?;
+            let mut rows = Vec::new();
+            for m in f.machines.iter().filter(|m| wanted(&m.name)) {
+                rows.push(probe_machine(m, paths).await);
+            }
+            (
+                rows,
+                Some("pastor serve is not running; probed the machines directly"),
+            )
         }
-        // Connects without the head, so the state dir the ssh master sockets
-        // live under may not exist yet, and must be private.
-        paths.ensure()?;
-        let mut rows = Vec::new();
-        for m in f.machines.iter().filter(|m| wanted(&m.name)) {
-            rows.push(probe_machine(m, paths).await);
-        }
-        (
-            rows,
-            Some("pastor serve is not running; probed the machines directly"),
-        )
     };
     let head = head_row();
     if let Some(note) = note {

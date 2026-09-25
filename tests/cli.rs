@@ -1324,3 +1324,73 @@ fn machine_list_without_daemon_reads_a_local_machine_with_no_server_as_down() {
     let error = ms[0]["error"].as_str().expect("error string");
     assert!(error.contains("herdr.sock"), "{error}");
 }
+
+/// `probe_daemon` reads a socket that accepts connections but never answers
+/// `Ping` in time as `Unresponsive` — the same state a head busy mid-dispatch
+/// is in. `machine list` must route that through the ordinary IPC request,
+/// the way it does for a healthy head, rather than falling back to probing
+/// machines directly (which would also print pastor's own "not running"
+/// note for a head that is only busy). The fake daemon here answers the
+/// first connection (`probe_daemon`'s ping) with something other than
+/// `Pong`, which reads as `Unresponsive` the instant the reply arrives, no
+/// need to wait out the real 2s ping timeout; it then drops the second
+/// connection (`machine list`'s real `FlockList` request) without a reply,
+/// so `request`'s own "closed the connection" error surfaces instead of
+/// `probe_daemon`'s "not running" advice.
+#[test]
+fn machine_list_treats_an_unresponsive_daemon_as_running_not_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"pi-3\"\nssh = \"fleet@pi-3\"\nmax_agents = 1\n",
+    )
+    .unwrap();
+
+    let socket = state.join("pastor.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        if let Ok((mut stream, _)) = listener.accept() {
+            let reply =
+                serde_json::to_string(&pastor::ipc::IpcResponse::error("boom", "nope")).unwrap();
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.write_all(b"\n");
+        }
+        if let Ok((stream, _)) = listener.accept() {
+            drop(stream);
+        }
+    });
+
+    let out = pastor()
+        .args(["machine", "list"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unresponsive daemon must not be probed around: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap_or_else(|e| {
+        panic!(
+            "stderr is not one JSON value ({e}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_eq!(err["code"], "runtime_error");
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("dropped the request"),
+        "expected the IPC exchange error, got: {message}"
+    );
+    assert!(
+        !message.contains("not running"),
+        "an unresponsive daemon must not be reported as absent: {message}"
+    );
+}
