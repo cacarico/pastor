@@ -18,6 +18,14 @@ pub enum StartBehaviour {
     Fail(String),
 }
 
+/// What a pane was sent through `pane.send_text` or `pane.send_keys`, in
+/// the order it arrived. See `FakeHerdr::pane_input`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneInput {
+    Text(String),
+    Keys(Vec<String>),
+}
+
 #[derive(Default)]
 struct State {
     next_ws: u32,
@@ -79,6 +87,11 @@ struct State {
     status_between_lists: Option<(String, AgentStatus)>,
     /// When the last `agent.list` arrived.
     last_list: Option<Instant>,
+    /// Everything typed into each pane, by pane id.
+    pane_input: HashMap<String, Vec<PaneInput>>,
+    /// A started agent sits `blocked` on its folder-trust question until
+    /// `pane.send_keys` sends exactly these keys (see `set_trust_prompt`).
+    trust_prompt: Option<Vec<String>>,
 }
 
 /// herdr 0.9.1 derives `agent_status` from a detected state (idle, working,
@@ -287,6 +300,26 @@ impl FakeHerdr {
         let kill = self.kill.subscribe();
         tokio::spawn(async move { fake.serve_with_kill(Box::new(br), Box::new(bw), kill).await });
         Connection::new(Box::new(ar), Box::new(aw))
+    }
+
+    /// Everything `pane.send_text` and `pane.send_keys` delivered to this
+    /// pane, in order.
+    pub fn pane_input(&self, pane_id: &str) -> Vec<PaneInput> {
+        self.state
+            .lock()
+            .unwrap()
+            .pane_input
+            .get(pane_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Agents started from now on stop at a folder-trust question: `blocked`
+    /// until `pane.send_keys` sends exactly `keys` to their pane, then idle
+    /// and ready, as Claude is once its trust dialog is answered. `None`
+    /// turns it off.
+    pub fn set_trust_prompt(&self, keys: Option<Vec<String>>) {
+        self.state.lock().unwrap().trust_prompt = keys;
     }
 
     /// `agent.prompt` is accepted from now on, but the agent never starts
@@ -619,7 +652,12 @@ impl FakeHerdr {
                     return Ok(json!({"type": "agent_started", "agent": info, "argv": []}));
                 }
                 s.started.insert(pane_id.clone(), Instant::now());
-                s.agents.insert(pane_id, info.clone());
+                s.agents.insert(pane_id.clone(), info.clone());
+                if s.trust_prompt.is_some() {
+                    // Its first screen is the trust question, which herdr
+                    // reports as `blocked`.
+                    change_status(&mut s, &pane_id, AgentStatus::Blocked);
+                }
                 Ok(json!({"type": "agent_started", "agent": info, "argv": []}))
             }
             "agent.prompt" => {
@@ -684,6 +722,48 @@ impl FakeHerdr {
                     })
                     .collect();
                 Ok(json!({"type": "agent_list", "agents": agents}))
+            }
+            // herdr 0.9.1: `pane.send_text {pane_id, text}` and
+            // `pane.send_keys {pane_id, keys}` answer `{"type": "ok"}`.
+            "pane.send_text" | "pane.send_keys" => {
+                let pane_id = p["pane_id"].as_str().unwrap_or("").to_string();
+                if !Self::has_pane(&s, &pane_id) {
+                    return Err(("pane_not_found".into(), format!("pane {pane_id} not found")));
+                }
+                let input = if req.method == "pane.send_text" {
+                    PaneInput::Text(p["text"].as_str().unwrap_or("").to_string())
+                } else {
+                    let keys: Vec<String> = p["keys"]
+                        .as_array()
+                        .map(|ks| {
+                            ks.iter()
+                                .filter_map(|k| k.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if keys.is_empty() || keys.iter().any(String::is_empty) {
+                        return Err((
+                            "invalid_keys".into(),
+                            "no keys, or an empty key name".into(),
+                        ));
+                    }
+                    PaneInput::Keys(keys)
+                };
+                let answered = matches!(&input, PaneInput::Keys(k) if s.trust_prompt.as_ref() == Some(k))
+                    && s.agents
+                        .get(&pane_id)
+                        .is_some_and(|a| a.agent_status == AgentStatus::Blocked);
+                s.pane_input.entry(pane_id.clone()).or_default().push(input);
+                if answered {
+                    change_status(&mut s, &pane_id, AgentStatus::Idle);
+                    let ws = pane_id.split(':').next().unwrap_or("w1").to_string();
+                    drop(s);
+                    let _ = self.events.send(Event {
+                        event: "pane.agent_status_changed".into(),
+                        data: json!({"pane_id": pane_id, "workspace_id": ws, "agent_status": "idle"}),
+                    });
+                }
+                Ok(json!({"type": "ok"}))
             }
             "agent.read" => Ok(json!({"type": "pane_read", "read": {"text": "fake output\n"}})),
             // herdr 0.9.1: `pane.close {pane_id}` answers `{"type": "ok"}`, and
@@ -1190,5 +1270,82 @@ mod tests {
         // A non-ASCII workspace part must not panic while `state`'s mutex is held
         // (that would poison it); confirm it's still usable afterwards.
         assert!(fake.agents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pane_input_is_recorded_per_pane_in_order() {
+        let fake = FakeHerdr::new();
+        let created = fake.workspace_create(None, "x").await.unwrap();
+        let pane = created.root_pane.pane_id;
+        fake.pane_send_text(&pane, "yes please").await.unwrap();
+        fake.pane_send_keys(&pane, &["Down".into(), "Enter".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.pane_input(&pane),
+            [
+                PaneInput::Text("yes please".into()),
+                PaneInput::Keys(vec!["Down".into(), "Enter".into()]),
+            ]
+        );
+        let sent: Vec<_> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.method.starts_with("pane.send_"))
+            .map(|r| (r.method, r.params))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (
+                    "pane.send_text".to_string(),
+                    json!({"pane_id": pane, "text": "yes please"})
+                ),
+                (
+                    "pane.send_keys".to_string(),
+                    json!({"pane_id": pane, "keys": ["Down", "Enter"]})
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_input_to_an_unknown_pane_or_with_no_keys_is_refused() {
+        let fake = FakeHerdr::new();
+        let err = fake.pane_send_text("w9:p1", "hi").await.unwrap_err();
+        assert_eq!(err.code(), Some("pane_not_found"));
+        let created = fake.workspace_create(None, "x").await.unwrap();
+        let err = fake
+            .pane_send_keys(&created.root_pane.pane_id, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("invalid_keys"));
+        assert!(fake.pane_input(&created.root_pane.pane_id).is_empty());
+    }
+
+    /// The folder-trust case: a started agent sits `blocked` on its startup
+    /// question until it gets the keys that answer it.
+    #[tokio::test]
+    async fn a_trust_prompt_holds_the_agent_blocked_until_its_keys_arrive() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let created = fake.workspace_create(None, "x").await.unwrap();
+        let pane = created.root_pane.pane_id;
+        fake.agent_start("t-1", "claude", &pane, &[]).await.unwrap();
+        assert_eq!(
+            fake.agent_list().await.unwrap()[0].agent_status,
+            AgentStatus::Blocked
+        );
+        fake.pane_send_keys(&pane, &["Enter".into()]).await.unwrap();
+        assert_eq!(
+            fake.agent_list().await.unwrap()[0].agent_status,
+            AgentStatus::Blocked
+        );
+        fake.pane_send_keys(&pane, &["Down".into(), "Enter".into()])
+            .await
+            .unwrap();
+        let a = &fake.agent_list().await.unwrap()[0];
+        assert_eq!(a.agent_status, AgentStatus::Idle);
+        assert!(a.interactive_ready);
     }
 }

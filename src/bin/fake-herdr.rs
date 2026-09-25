@@ -28,8 +28,13 @@
 //!                                so a test can see what pastor sent.
 //!   FAKE_HERDR_DIRTY_WORKTREES=1 every worktree has uncommitted changes, so
 //!                                `worktree.remove` needs `force`.
+//!   FAKE_HERDR_TRUST_PROMPT=<keys> a started agent sits `blocked` on a
+//!                                folder-trust question until `pane.send_keys`
+//!                                sends exactly these comma-separated keys
+//!                                (`Down,Enter`), then goes idle.
 //!
-//! `pane.close` and `worktree.remove` answer as herdr 0.9.1 does; see
+//! `pane.close`, `pane.send_text`, `pane.send_keys` and `worktree.remove`
+//! answer as herdr 0.9.1 does; see
 //! `FakeHerdr::handle`.
 use std::path::PathBuf;
 
@@ -72,6 +77,9 @@ async fn listen(path: PathBuf) {
     }
     if std::env::var("FAKE_HERDR_DIRTY_WORKTREES").as_deref() == Ok("1") {
         fake.dirty_worktrees(true);
+    }
+    if let Ok(keys) = std::env::var("FAKE_HERDR_TRUST_PROMPT") {
+        fake.set_trust_prompt(Some(keys.split(',').map(str::to_string).collect()));
     }
     // A leftover socket from a previous run would make bind fail with EADDRINUSE.
     let _ = std::fs::remove_file(&path);

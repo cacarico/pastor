@@ -431,6 +431,30 @@ pub trait ConnectorExt: Connector {
             .text)
     }
 
+    /// `pane.send_text` (herdr 0.9.1): types `text` into the pane as it is,
+    /// with no Enter after it. Answers `pane_not_found` for a pane it does
+    /// not have.
+    async fn pane_send_text(&self, pane_id: &str, text: &str) -> Result<(), CallError> {
+        self.call(
+            "pane.send_text",
+            serde_json::json!({"pane_id": pane_id, "text": text}),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// `pane.send_keys` (herdr 0.9.1): presses named keys (`Enter`, `Down`,
+    /// `esc`, `ctrl+c`) in order. herdr checks every name before it writes
+    /// any byte, so a bad name sends nothing.
+    async fn pane_send_keys(&self, pane_id: &str, keys: &[String]) -> Result<(), CallError> {
+        self.call(
+            "pane.send_keys",
+            serde_json::json!({"pane_id": pane_id, "keys": keys}),
+        )
+        .await
+        .map(drop)
+    }
+
     /// `pane.close` (herdr 0.9.1): closes the pane and, with it, the agent in
     /// it. herdr closes a workspace whose last pane closes. `pane_not_found`
     /// if it is already gone.
