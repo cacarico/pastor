@@ -59,8 +59,8 @@ to `ssh`/`herdr`.
 
 ```
 NAME    HOST        CHANNEL    HERDR  PASTOR  AGENTS  ORPHANS  TAGS  ERROR
-pastor  nuc         head       0.9.1  0.2.0   -       -        -
-pi-3    fleet@pi-3  connected  0.9.1  0.2.0   1/2     -        fast
+pastor  desk        head       0.9.1  0.2.0   -       -        -
+pi-3    user@pi-3   connected  0.9.1  0.2.0   1/2     -        fast
 ```
 
 HOST is the ssh target, `local`, or the program a `command` machine runs.
@@ -221,7 +221,7 @@ ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
 
 ```bash
 make install                         # pastor and fake-herdr into ~/.cargo/bin
-pastor machine add pi-3 fleet@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
+pastor machine add pi-3 user@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
 pastor machine add here --local
 pastor machine list                  # the head, then each machine: host, channel, herdr, pastor, agents
 pastor setup systemd                 # confirm, then install and enable --now; or `pastor serve &`
