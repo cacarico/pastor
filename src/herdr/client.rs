@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 
 use super::transport::{ConnectError, Connector};
@@ -24,6 +24,55 @@ const DIAGNOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How much of a child's stderr is kept for that error message. Only the tail
 /// is worth keeping: the last thing ssh or herdr said before dying.
 const STDERR_LIMIT: usize = 8 * 1024;
+
+/// The longest line read from herdr, newline excluded. `agent.read` is the
+/// largest legitimate reply and stays well under this; a machine that sends
+/// more is broken or hostile, and the connection is dropped rather than
+/// letting one machine fill the head's memory.
+pub const MAX_LINE: usize = 16 * 1024 * 1024;
+
+/// The next `\n`-terminated line from `reader`, without `\n` or `\r\n`, or
+/// `None` at EOF. The final line may lack its newline, as with `Lines`. A
+/// line longer than `max` bytes is a protocol error.
+///
+/// Cancellation safe: bytes are moved from `reader` into `buf` with no await
+/// in between, so a dropped call loses nothing and the next resumes.
+pub(crate) async fn read_capped_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> Result<Option<String>, HerdrError> {
+    loop {
+        let chunk = reader.fill_buf().await?;
+        let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None if chunk.is_empty() && buf.is_empty() => return Ok(None),
+            None if chunk.is_empty() => (0, true),
+            None => (chunk.len(), false),
+        };
+        let content = buf.len() + take - usize::from(done && take > 0);
+        if content > max {
+            buf.clear();
+            return Err(HerdrError::Protocol(format!(
+                "herdr sent a line longer than {max} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if done {
+            let mut line = std::mem::take(buf);
+            if line.last() == Some(&b'\n') {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            }
+            return String::from_utf8(line).map(Some).map_err(|e| {
+                HerdrError::Protocol(format!("herdr sent a line that is not UTF-8: {e}"))
+            });
+        }
+    }
+}
 
 /// A bridge process whose stdio this connection is speaking over. Kept so that a
 /// connection that dies can name the command, its exit status and its stderr
@@ -73,7 +122,9 @@ fn drain_stderr(
 /// open. `call` and `subscribe` therefore both consume the connection, so the
 /// type itself rules out a second request.
 pub struct Connection {
-    reader: Lines<BufReader<BoxRead>>,
+    reader: BufReader<BoxRead>,
+    /// A line read in part, kept here so a dropped read loses nothing.
+    partial: Vec<u8>,
     writer: BoxWrite,
     bridge: Option<Bridge>,
 }
@@ -81,7 +132,8 @@ pub struct Connection {
 impl Connection {
     pub fn new(reader: BoxRead, writer: BoxWrite) -> Connection {
         Connection {
-            reader: BufReader::new(reader).lines(),
+            reader: BufReader::new(reader),
+            partial: Vec::new(),
             writer,
             bridge: None,
         }
@@ -210,11 +262,12 @@ impl Connection {
         Ok(id)
     }
 
-    /// Cancellation safe: `Lines::next_line` keeps its partial-line buffer inside
-    /// the `Lines` reader itself, so dropping this future mid-read (e.g. losing a
-    /// `tokio::select!` branch) does not discard any bytes already read.
+    /// Cancellation safe: the partial line lives in `self.partial`, so dropping
+    /// this future mid-read (e.g. losing a `tokio::select!` branch) does not
+    /// discard any bytes already read. A line over `MAX_LINE` is an error, and
+    /// the caller drops the connection with it.
     async fn read_line(&mut self) -> Result<Option<String>, HerdrError> {
-        Ok(self.reader.next_line().await?)
+        read_capped_line(&mut self.reader, &mut self.partial, MAX_LINE).await
     }
 
     /// Turn a transport-level failure on a bridge connection into an error that
@@ -606,6 +659,72 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), Some("agent_blocked"));
         server.await.unwrap();
+    }
+
+    /// A herdr on a fleet machine is not trusted to be well behaved: a
+    /// reply line with no end must not grow the head's memory without bound.
+    #[tokio::test]
+    async fn a_line_over_the_cap_is_a_protocol_error() {
+        let (client, mut sr, mut sw) = pipe();
+        let server = tokio::spawn(async move {
+            let mut line = String::new();
+            sr.read_line(&mut line).await.unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            // Stop once the client hangs up; it must do so past the cap.
+            let mut sent = 0;
+            while sw.write_all(&chunk).await.is_ok() {
+                sent += chunk.len();
+                assert!(sent <= MAX_LINE + 2 * chunk.len(), "client kept reading");
+            }
+        });
+        let err = client
+            .call("agent.list", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HerdrError::Protocol(m) if m.contains("longer than")),
+            "{err:?}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_splits_lines_and_keeps_partial_reads() {
+        let data: &[u8] = b"one\r\ntwo\nlast";
+        let mut r = BufReader::with_capacity(2, data);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut r, &mut buf, 8)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            read_capped_line(&mut r, &mut buf, 8)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("two")
+        );
+        assert_eq!(
+            read_capped_line(&mut r, &mut buf, 8)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("last")
+        );
+        assert_eq!(read_capped_line(&mut r, &mut buf, 8).await.unwrap(), None);
+
+        let mut r = BufReader::with_capacity(2, &b"123456789\n"[..]);
+        let err = read_capped_line(&mut r, &mut Vec::new(), 8)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HerdrError::Protocol(_)), "{err:?}");
+        // Exactly at the cap is fine.
+        let mut r = BufReader::with_capacity(2, &b"12345678\n"[..]);
+        let line = read_capped_line(&mut r, &mut Vec::new(), 8).await.unwrap();
+        assert_eq!(line.as_deref(), Some("12345678"));
     }
 
     #[tokio::test]

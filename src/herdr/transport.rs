@@ -217,6 +217,62 @@ fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -
     argv
 }
 
+/// The most a probe may write to stdout, and to stderr. Its answer is a
+/// path, a version or `yes`/`no`, plus whatever the rc files print.
+const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// Run a probe to completion and collect its output, like `Command::output`
+/// but refusing more than `PROBE_OUTPUT_LIMIT` bytes on either stream: the
+/// machine answering is not trusted to stop, and one misbehaving machine must
+/// not exhaust the head's memory. Over the limit the probe is killed.
+async fn probe_output(argv: &[String]) -> Result<std::process::Output, ConnectError> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| ConnectError {
+            message: format!("spawn {}: {e}", argv[0]),
+        })?;
+    let read = |pipe: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>| async move {
+        let mut buf = Vec::new();
+        if let Some(pipe) = pipe {
+            // The pipe is dropped once the cap is hit, so a probe still
+            // writing gets EPIPE and exits instead of blocking the other read.
+            pipe.take(PROBE_OUTPUT_LIMIT as u64 + 1)
+                .read_to_end(&mut buf)
+                .await?;
+        }
+        Ok::<_, std::io::Error>(buf)
+    };
+    let stdout = child.stdout.take().map(|p| Box::new(p) as _);
+    let stderr = child.stderr.take().map(|p| Box::new(p) as _);
+    let (stdout, stderr) =
+        tokio::try_join!(read(stdout), read(stderr)).map_err(|e| ConnectError {
+            message: format!("{}: read: {e}", argv[0]),
+        })?;
+    if stdout.len() > PROBE_OUTPUT_LIMIT || stderr.len() > PROBE_OUTPUT_LIMIT {
+        // Dropping `child` kills it (`kill_on_drop`).
+        return Err(ConnectError {
+            message: format!(
+                "{}: probe wrote more than {PROBE_OUTPUT_LIMIT} bytes",
+                argv[0]
+            ),
+        });
+    }
+    let status = child.wait().await.map_err(|e| ConnectError {
+        message: format!("{}: wait: {e}", argv[0]),
+    })?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Reads the answer to `REMOTE_HOME_COMMAND`. Only ssh failing to reach the
 /// machine is an error, and so a transport failure; a machine that answered
 /// without a usable home is fine, its home is just unknown.
@@ -332,15 +388,7 @@ async fn home_dir(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
                 control_path.as_deref(),
                 REMOTE_HOME_COMMAND.to_string(),
             );
-            let out = tokio::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output()
-                .await
-                .map_err(|e| ConnectError {
-                    message: format!("spawn ssh: {e}"),
-                })?;
+            let out = probe_output(&argv).await?;
             remote_home(target, &out)
         }
         // An arbitrary bridge command says nothing about where it lands.
@@ -361,15 +409,7 @@ async fn dir_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectEr
             // to this machine and start the master.
             ensure_control_dir(control_path.as_deref())?;
             let argv = ssh_argv_running(target, control_path.as_deref(), remote_dir_command(path));
-            let out = tokio::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output()
-                .await
-                .map_err(|e| ConnectError {
-                    message: format!("spawn ssh: {e}"),
-                })?;
+            let out = probe_output(&argv).await?;
             remote_dir_answer(target, &out)
         }
         // An arbitrary bridge command says nothing about where it lands.
@@ -395,15 +435,7 @@ async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
                 control_path.as_deref(),
                 REMOTE_PASTOR_VERSION_COMMAND.to_string(),
             );
-            let out = tokio::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output()
-                .await
-                .map_err(|e| ConnectError {
-                    message: format!("spawn ssh: {e}"),
-                })?;
+            let out = probe_output(&argv).await?;
             remote_pastor_version(target, &out)
         }
         // An arbitrary bridge command says nothing about what else is there.
@@ -918,6 +950,29 @@ mod tests {
     /// Only ssh itself failing (255, or killed) means the machine was not
     /// reached. An unset or relative `$HOME`, or a remote command that fails,
     /// comes from a reachable machine and must not mark it lost.
+    /// A probe answers a word or a path. A fleet machine that answers with
+    /// an endless stream is cut off at the cap, not buffered on the head.
+    #[tokio::test]
+    async fn probe_output_is_capped() {
+        let argv = |script: &str| vec!["sh".to_string(), "-c".into(), script.into()];
+        let out = probe_output(&argv("printf /home/x; printf err >&2; exit 3"))
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, b"/home/x");
+        assert_eq!(out.stderr, b"err");
+        assert_eq!(out.status.code(), Some(3));
+
+        let err = probe_output(&argv("yes")).await.unwrap_err();
+        assert!(err.message.contains("more than"), "{}", err.message);
+        let err = probe_output(&argv("yes >&2")).await.unwrap_err();
+        assert!(err.message.contains("more than"), "{}", err.message);
+        // Exactly at the cap is fine.
+        let out = probe_output(&argv(&format!("head -c {PROBE_OUTPUT_LIMIT} /dev/zero")))
+            .await
+            .unwrap();
+        assert_eq!(out.stdout.len(), PROBE_OUTPUT_LIMIT);
+    }
+
     #[test]
     fn remote_home_separates_unreachable_from_unknown() {
         use std::os::unix::process::ExitStatusExt;
