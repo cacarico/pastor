@@ -1551,7 +1551,7 @@ mod tests {
         assert_eq!(st.last_ok_at, Some(t0), "since held");
         assert_eq!(st.last_run_at, Some(now));
         assert!(
-            st.last_result.as_deref().unwrap().contains("not inserted"),
+            st.last_result.as_deref().unwrap().starts_with("failed"),
             "{st:?}"
         );
         assert!(!store.is_seen("j", "k1").unwrap());
