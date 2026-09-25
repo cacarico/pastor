@@ -442,10 +442,12 @@ fn head_use(command: &Command) -> Option<bool> {
 
 /// Whether `command` changes the fleet: the CLI's side of
 /// `IpcRequest::changes_fleet`, for the edits it makes without the head
-/// (machines, flocks, jobs, an offline tick). A tick, dry or not, and a job
-/// reload apply pastor.toml and flock.toml, so they count. An agent pastor
-/// started (`ipc::TASK_ENV`) is refused these up front, head or no head.
+/// (machines, flocks, jobs, plugins, an offline tick). A tick, dry or not,
+/// and a job reload apply pastor.toml and flock.toml, so they count. An agent
+/// pastor started (`ipc::TASK_ENV`) is refused these up front, head or no
+/// head.
 fn changes_fleet(command: &Command) -> bool {
+    use pastor::plugin::cli::PluginCmd;
     match command {
         Command::Task { cmd } => matches!(
             cmd,
@@ -461,6 +463,9 @@ fn changes_fleet(command: &Command) -> bool {
         Command::Flock { cmd } => !matches!(cmd, FlockCmd::List { .. }),
         Command::Tick(_) => true,
         Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. }),
+        // Install, link, uninstall and unlink edit the catalog and reload the
+        // head's jobs, restarting its stream connectors.
+        Command::Plugin { cmd } => !matches!(cmd, PluginCmd::List { .. } | PluginCmd::Run { .. }),
         _ => false,
     }
 }

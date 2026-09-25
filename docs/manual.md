@@ -924,8 +924,9 @@ So:
   in the pane of every agent it starts, and refuses a command from such a pane
   that changes the fleet: `task run`, `send`, `attach` (herdr's agent terminal
   types into any task's pane), `retry`, `close` and `prune`, `tick`
-  (`--dry-run` too), `job run` and `job reload`, and edits of machines, flocks
-  and jobs (`agent_refused`). A dry tick and a reload count because both apply
+  (`--dry-run` too), `job run` and `job reload`, `plugin install`, `link`,
+  `uninstall` and `unlink`, and edits of machines, flocks and jobs
+  (`agent_refused`). A dry tick and a reload count because both apply
   `pastor.toml` and `flock.toml` first. Reads still work.
   `agents_change_fleet = true` in `pastor.toml` turns this off. It stops an
   agent acting on its own, not a determined one: it runs as the same user and
