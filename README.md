@@ -19,9 +19,10 @@ cargo install --git https://github.com/cacarico/pastor --locked
 ```
 
 Every machine in the fleet needs [herdr](https://herdr.dev) 0.9 or newer with
-its server running, and ssh from the head without a passphrase prompt. The
-agents themselves (`claude`, `opencode`, ...) are installed on each machine
-the usual way.
+its server running. A machine on another host is reached over ssh, which must
+work from the head without a passphrase prompt; the head itself joins as a
+local machine with no ssh at all. The agents themselves (`claude`, `opencode`,
+...) are installed on each machine the usual way.
 
 ## Quick start
 
@@ -60,9 +61,10 @@ issues into tasks, and event hooks that run when a task finishes or blocks.
 
 - **The head** runs `pastor serve`. It owns the queue, the schedule and the
   task history, in SQLite under `~/.local/state/pastor/`.
-- **The flock** is the machines in `~/.config/pastor/flock.toml`, reached over
-  one multiplexed ssh connection each. A machine takes up to `max_agents`
-  tasks at once; tags steer a task to the right one.
+- **The flock** is the machines in `~/.config/pastor/flock.toml`: the head
+  itself as a local machine, and other hosts reached over one multiplexed ssh
+  connection each. A machine takes up to `max_agents` tasks at once; tags
+  steer a task to the right one.
 - **A task** is one agent in one herdr pane, in a repo or a fresh worktree of
   it. Its states are `queued`, `starting`, `running`, `blocked`, `done`, `stale`, `failed`
   and `closed`; `done` means the agent stopped, not that the work is good.
