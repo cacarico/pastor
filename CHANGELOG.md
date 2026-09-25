@@ -10,6 +10,24 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - An agent skill, `skills/pastor/SKILL.md`, for agents that drive pastor or
   were dispatched by it. `pastor --skill` prints the copy built into the
   binary, and `pastor --help` points agents at it.
+- Plugins: a directory with a `pastor-plugin.toml` that provides a connector,
+  event hooks, or both. `pastor plugin install|link|uninstall|unlink|list|run`
+  manages them; secrets live in `~/.config/pastor/plugins/<id>/.env` and are
+  redacted from the capped run logs under `~/.local/state/pastor/runs/`.
+- Process connectors, poll and stream: a job names a plugin's connector with
+  `[connector] use = "<id>"`, and `pastor serve` and `pastor tick` run it.
+  A stream keeps a batch until a run has persisted it; a standalone
+  `pastor tick` refuses stream jobs, which need `pastor serve`.
+- Event hooks: a plugin's `[[events]]` commands get each matching event on
+  stdin, one plugin at a time in event order, from a bounded queue.
+
+### Changed
+
+- `pastor tick` under `pastor serve` spawns its runs, so a slow connector no
+  longer holds the scheduler.
+- Item fields put into a job's `repo` or `branch` may not hold path
+  separators, `..`, a leading `-` or control characters; such an item is
+  skipped and reported.
 
 ### Fixed
 
