@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,8 @@ struct State {
     ready_after: Duration,
     /// What `Connector::home_dir` reports; `None` like a `command` machine.
     home: Option<String>,
+    /// Paths `Connector::dir_exists` reports missing; every other path exists.
+    missing_dirs: HashSet<String>,
     /// The started agent vanishes immediately, as it does when the agent binary
     /// is missing and the process exits the moment it is launched.
     exit_on_start: bool,
@@ -121,6 +123,13 @@ impl FakeHerdr {
     }
     pub fn set_home(&self, home: Option<&str>) {
         self.state.lock().unwrap().home = home.map(str::to_string);
+    }
+    pub fn set_missing_dir(&self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .missing_dirs
+            .insert(path.to_string());
     }
     pub fn set_protocol(&self, p: u32) {
         self.state.lock().unwrap().protocol = p;
@@ -499,6 +508,10 @@ impl super::transport::Connector for FakeHerdr {
     fn home_dir(&self) -> super::transport::HomeFuture<'_> {
         let home = self.state.lock().unwrap().home.clone();
         Box::pin(async move { Ok(home) })
+    }
+    fn dir_exists(&self, path: &str) -> super::transport::DirFuture<'_> {
+        let exists = !self.state.lock().unwrap().missing_dirs.contains(path);
+        Box::pin(async move { Ok(Some(exists)) })
     }
 }
 

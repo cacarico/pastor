@@ -134,6 +134,9 @@ async fn dispatch_steps(
         Some(repo) => Some(expand_home(conn, repo, task.machine.as_deref()).await?),
         None => None,
     };
+    if let Some(dir) = repo.as_deref() {
+        check_repo_exists(conn, dir, task.machine.as_deref()).await?;
+    }
     let created = if spec.worktree {
         let repo = repo
             .as_deref()
@@ -202,6 +205,25 @@ async fn expand_home(
             "repo {repo}: pastor cannot tell the home directory on {machine}; \
              use an absolute path"
         ))),
+    }
+}
+
+/// herdr opens a workspace whose `cwd` does not exist in the shell's home
+/// instead, with no error, and the agent then works on the wrong tree (t-5,
+/// 2026-09-24). Refuse before creating anything. A machine that cannot answer
+/// (`None`: a `command` bridge, a shell that printed nothing) goes ahead, as
+/// before.
+async fn check_repo_exists(
+    conn: &dyn Connector,
+    repo: &str,
+    machine: Option<&str>,
+) -> Result<(), DispatchError> {
+    match conn.dir_exists(repo).await.map_err(CallError::from)? {
+        Some(false) => Err(DispatchError::Task(format!(
+            "repo {repo} does not exist on {}",
+            machine.unwrap_or("this machine")
+        ))),
+        Some(true) | None => Ok(()),
     }
 }
 
@@ -312,6 +334,49 @@ mod tests {
             tags: vec![],
             timeout_secs: 60,
         }
+    }
+
+    /// herdr opens a workspace whose cwd is missing in the shell's home
+    /// instead, silently (t-5 on 2026-09-24). A repo the machine says is not
+    /// a directory fails the task before anything is created.
+    #[tokio::test]
+    async fn a_repo_missing_on_the_machine_fails_before_herdr_is_asked() {
+        for worktree in [false, true] {
+            let fake = FakeHerdr::new();
+            fake.set_missing_dir("/srv/app");
+            let mut t = task(DispatchSpec { worktree, ..spec() });
+            let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+            assert!(!err.is_transport(), "the machine is fine: {err}");
+            assert_eq!(t.state, TaskState::Failed);
+            assert_eq!(
+                t.error.as_deref(),
+                Some("repo /srv/app does not exist on pi-1")
+            );
+            assert!(
+                !fake
+                    .requests()
+                    .iter()
+                    .any(|r| r.method.ends_with(".create")),
+                "nothing was created"
+            );
+        }
+    }
+
+    /// The check runs on the expanded path, so `~/x` is looked up as
+    /// `/home/fake/x`.
+    #[tokio::test]
+    async fn the_repo_check_sees_the_expanded_path() {
+        let fake = FakeHerdr::new();
+        fake.set_missing_dir("/home/fake/gone");
+        let mut t = task(DispatchSpec {
+            repo: Some("~/gone".into()),
+            ..spec()
+        });
+        let err = dispatch(&fake, &mut t, READY).await.unwrap_err();
+        assert!(
+            err.to_string().contains("/home/fake/gone does not exist"),
+            "{err}"
+        );
     }
 
     fn task(spec: DispatchSpec) -> Task {

@@ -231,6 +231,9 @@ pub type ConnectFuture<'a> =
 pub type HomeFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<String>, ConnectError>> + Send + 'a>>;
 
+pub type DirFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<bool>, ConnectError>> + Send + 'a>>;
+
 /// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
 ///
 /// A connection carries one request (see `Connection`), so this is called once
@@ -245,6 +248,12 @@ pub trait Connector: Send + Sync {
     fn home_dir(&self) -> HomeFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// Whether `path` is a directory on the machine. herdr opens a workspace
+    /// whose `cwd` does not exist somewhere else (the shell's home) without an
+    /// error, so dispatch asks first. `None` when it cannot be known.
+    fn dir_exists(&self, _path: &str) -> DirFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 impl Connector for Endpoint {
@@ -256,6 +265,10 @@ impl Connector for Endpoint {
     }
     fn home_dir(&self) -> HomeFuture<'_> {
         Box::pin(home_dir(self))
+    }
+    fn dir_exists(&self, path: &str) -> DirFuture<'_> {
+        let path = path.to_string();
+        Box::pin(async move { dir_exists(self, &path).await })
     }
 }
 
@@ -288,6 +301,72 @@ async fn home_dir(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
         }
         // An arbitrary bridge command says nothing about where it lands.
         Endpoint::Command { .. } => Ok(None),
+    }
+}
+
+async fn dir_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectError> {
+    match ep {
+        // The head and this herdr share a machine, and so a filesystem.
+        Endpoint::Local { .. } => Ok(Some(std::path::Path::new(path).is_dir())),
+        Endpoint::Ssh {
+            target,
+            control_path,
+            ..
+        } => {
+            // A repo without `~` skips `home_dir`, so this may be the first ssh
+            // to this machine and start the master.
+            ensure_control_dir(control_path.as_deref())?;
+            let argv = ssh_argv_running(target, control_path.as_deref(), remote_dir_command(path));
+            let out = tokio::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| ConnectError {
+                    message: format!("spawn ssh: {e}"),
+                })?;
+            remote_dir_answer(target, &out)
+        }
+        // An arbitrary bridge command says nothing about where it lands.
+        Endpoint::Command { .. } => Ok(None),
+    }
+}
+
+/// `test -d` in the remote shell, answered on stdout with one word. `test -d`
+/// follows symlinks, as `cd` does.
+fn remote_dir_command(path: &str) -> String {
+    format!(
+        "if test -d {}; then printf yes; else printf no; fi",
+        shell_quote(path)
+    )
+}
+
+/// Reads the answer to `remote_dir_command`. As with `remote_home`, only ssh
+/// failing to reach the machine is an error. Output from rc files comes
+/// before the answer, so the answer is the end of stdout.
+fn remote_dir_answer(
+    target: &str,
+    out: &std::process::Output,
+) -> Result<Option<bool>, ConnectError> {
+    if matches!(out.status.code(), Some(255) | None) {
+        return Err(ConnectError {
+            message: format!(
+                "ssh {target}: {} ({})",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                out.status
+            ),
+        });
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim_end();
+    if out.status.success() && text.ends_with("yes") {
+        Ok(Some(true))
+    } else if out.status.success() && text.ends_with("no") {
+        Ok(Some(false))
+    } else {
+        tracing::warn!(%target, status = %out.status, stdout = ?text, "no answer to the repo check from the remote shell");
+        Ok(None)
     }
 }
 
@@ -532,6 +611,67 @@ mod tests {
             argv: vec!["true".into()],
         };
         assert_eq!(command.home_dir().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn dir_exists_per_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo");
+        std::fs::create_dir(&dir).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let local = Endpoint::Local {
+            session: "s".into(),
+        };
+        assert_eq!(
+            local.dir_exists(dir.to_str().unwrap()).await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            local.dir_exists(link.to_str().unwrap()).await.unwrap(),
+            Some(true),
+            "a symlink to a directory is a directory to the shell too"
+        );
+        assert_eq!(
+            local
+                .dir_exists(tmp.path().join("nope").to_str().unwrap())
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.dir_exists("/").await.unwrap(), None);
+    }
+
+    #[test]
+    fn remote_dir_command_quotes_the_path() {
+        assert_eq!(
+            remote_dir_command("/srv/my app/it's"),
+            "if test -d '/srv/my app/it'\\''s'; then printf yes; else printf no; fi"
+        );
+    }
+
+    /// Only ssh failing to reach the machine is an error. rc-file noise comes
+    /// before the answer, so the answer is read from the end of stdout.
+    #[test]
+    fn remote_dir_answer_reads_the_last_word() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"boom".to_vec(),
+        };
+        assert_eq!(remote_dir_answer("t", &out(0, "yes")).unwrap(), Some(true));
+        assert_eq!(remote_dir_answer("t", &out(0, "no")).unwrap(), Some(false));
+        assert_eq!(
+            remote_dir_answer("t", &out(0, "welcome to pi\nyes")).unwrap(),
+            Some(true)
+        );
+        assert_eq!(remote_dir_answer("t", &out(0, "")).unwrap(), None);
+        assert_eq!(remote_dir_answer("t", &out(1, "")).unwrap(), None);
+        assert!(remote_dir_answer("t", &out(255, "")).is_err());
     }
 
     /// Only ssh itself failing (255, or killed) means the machine was not
