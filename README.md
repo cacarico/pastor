@@ -30,7 +30,7 @@ pastor machine add pi-1 user@pi-1        # a machine you can ssh to
 pastor machine add here --local          # this machine can take tasks too
 pastor setup systemd                     # run the head as a user service
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api'
-pastor task list                         # queued, running, blocked
+pastor task list                         # queued, starting, running, blocked
 pastor task read t-1                     # the agent's recent output
 pastor task attach t-1                   # sit in its terminal; ctrl+b q detaches
 ```
