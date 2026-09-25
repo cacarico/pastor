@@ -254,7 +254,8 @@ that file in its environment plus `PASTOR_PLUGIN_ID`, `PASTOR_JOB`,
 job's scratch directory). What a run writes to stderr lands in
 `~/.local/state/pastor/runs/<job>/<ts>.log`, with the values of the secrets
 the manifest declares replaced by `[redacted:NAME]`; each log is cut at
-256 KiB and the newest 20 per job are kept.
+256 KiB and the newest 20 per job are kept. A stdout or stderr line longer
+than 256 KiB is cut there and the rest of it dropped.
 
 A job uses a plugin's connector by its id (`[connector] use = "slack"`);
 `pastor serve` and `pastor tick` check the job's connector table against the

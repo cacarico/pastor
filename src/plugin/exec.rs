@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::env::Redactor;
 use crate::config::create_private_dir;
@@ -21,6 +21,11 @@ pub const LOG_MAX_BYTES: u64 = 256 * 1024;
 pub const LOG_KEEP: usize = 20;
 /// Lines of stderr kept for the error message of a failed run.
 const STDERR_TAIL: usize = 5;
+/// The longest stdout or stderr line pastor holds in memory; the rest of a
+/// longer line is read and dropped. The same as the run log cap, since no
+/// longer line could be logged whole anyway, and a plugin that writes
+/// without newlines must not grow the daemon without bound.
+pub const LINE_MAX_BYTES: usize = 256 * 1024;
 
 /// `<runs>/<job>/<ts>.log`: what one run wrote to stderr, what pastor had to
 /// say about its stdout, and how it ended. Every line goes through the
@@ -195,6 +200,39 @@ impl Finished {
     }
 }
 
+/// Read one line into `buf`, without its newline, keeping at most `max`
+/// bytes and consuming the rest. `None` at EOF; otherwise whether the line
+/// was cut. A last line with no newline still counts, as with `split`.
+async fn read_line_capped<R: AsyncBufRead + Unpin>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let mut cut = false;
+    let mut any = false;
+    loop {
+        let chunk = r.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(any.then_some(cut));
+        }
+        any = true;
+        let (line, used, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (&chunk[..i], i + 1, true),
+            None => (chunk, chunk.len(), false),
+        };
+        let room = max.saturating_sub(buf.len());
+        if line.len() > room {
+            cut = true;
+        }
+        buf.extend_from_slice(&line[..line.len().min(room)]);
+        r.consume(used);
+        if done {
+            return Ok(Some(cut));
+        }
+    }
+}
+
 /// Kills the command's whole process group if the run is abandoned (timeout,
 /// or the future dropped): a shell script's children would otherwise keep
 /// stdout open and outlive it. Disarmed once the command has exited on its
@@ -269,9 +307,13 @@ pub async fn run(inv: Invocation, log: SharedLog, mut on_line: impl FnMut(&str))
     let err_log = log.clone();
     let mut stderr_task = tokio::spawn(async move {
         let mut tail: Vec<String> = Vec::new();
-        let mut lines = BufReader::new(stderr).split(b'\n');
-        while let Ok(Some(raw)) = lines.next_segment().await {
-            let line = String::from_utf8_lossy(&raw).into_owned();
+        let mut reader = BufReader::new(stderr);
+        let mut raw = Vec::new();
+        while let Ok(Some(cut)) = read_line_capped(&mut reader, &mut raw, LINE_MAX_BYTES).await {
+            let mut line = String::from_utf8_lossy(&raw).into_owned();
+            if cut {
+                line.push_str(&format!(" [pastor: line cut at {LINE_MAX_BYTES} bytes]"));
+            }
             let mut log = lock(&err_log);
             log.line(&line);
             if tail.len() == STDERR_TAIL {
@@ -284,8 +326,18 @@ pub async fn run(inv: Invocation, log: SharedLog, mut on_line: impl FnMut(&str))
     let stdout = child.stdout.take().expect("piped");
 
     let body = async {
-        let mut lines = BufReader::new(stdout).split(b'\n');
-        while let Ok(Some(raw)) = lines.next_segment().await {
+        let mut reader = BufReader::new(stdout);
+        let mut raw = Vec::new();
+        let mut n = 0usize;
+        while let Ok(Some(cut)) = read_line_capped(&mut reader, &mut raw, LINE_MAX_BYTES).await {
+            n += 1;
+            if cut {
+                // The cut line still goes to `on_line`, where it fails to
+                // parse and is skipped with a note of its own.
+                lock(&log).line(&format!(
+                    "[pastor: stdout line {n} cut at {LINE_MAX_BYTES} bytes]"
+                ));
+            }
             on_line(&String::from_utf8_lossy(&raw));
         }
         child.wait().await
@@ -406,6 +458,55 @@ mod tests {
         let done = run(inv, log.clone(), |_| {}).await;
         assert!(matches!(&done.exit, Exit::SpawnFailed(e) if e.contains("no-such-program")));
         assert!(!done.exit.success());
+    }
+
+    #[tokio::test]
+    async fn a_line_without_a_newline_is_held_to_the_cap() {
+        let mut input = vec![b'x'; 4 * 1024 * 1024];
+        input.extend_from_slice(b"\nnext\nlast");
+        let mut reader = BufReader::new(&input[..]);
+        let mut buf = Vec::new();
+        let cut = read_line_capped(&mut reader, &mut buf, LINE_MAX_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(cut, Some(true));
+        assert_eq!(buf.len(), LINE_MAX_BYTES);
+        assert!(buf.capacity() <= 2 * LINE_MAX_BYTES, "{}", buf.capacity());
+        let mut rest = Vec::new();
+        while let Some(cut) = read_line_capped(&mut reader, &mut buf, LINE_MAX_BYTES)
+            .await
+            .unwrap()
+        {
+            assert!(!cut);
+            rest.push(String::from_utf8(buf.clone()).unwrap());
+        }
+        assert_eq!(rest, vec!["next", "last"]);
+    }
+
+    #[tokio::test]
+    async fn megabytes_without_a_newline_do_not_lose_the_rest_of_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = log_in(tmp.path());
+        let mut lines = Vec::new();
+        let done = run(
+            sh(
+                "head -c 4194304 /dev/zero | tr '\\0' x >&2; echo >&2; echo after >&2; \
+                 head -c 4194304 /dev/zero | tr '\\0' y; echo; echo '{\"ok\":1}'",
+                Some(Duration::from_secs(20)),
+            ),
+            log.clone(),
+            |l| lines.push(l.to_string()),
+        )
+        .await;
+        assert_eq!(done.exit, Exit::Code(0));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), LINE_MAX_BYTES, "the long line is cut");
+        assert_eq!(lines[1], "{\"ok\":1}");
+        assert_eq!(done.stderr_tail.last().map(String::as_str), Some("after"));
+        let body = text(&log);
+        // The cut stderr line alone reaches the log's cap.
+        assert!(body.contains("[pastor: log truncated at"), "{}", body.len());
+        assert!(body.len() as u64 <= LOG_MAX_BYTES + 1024, "{}", body.len());
     }
 
     #[test]
