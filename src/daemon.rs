@@ -771,6 +771,7 @@ impl Daemon {
         match req {
             IpcRequest::Ping => IpcResponse::Pong {
                 version: env!("CARGO_PKG_VERSION").into(),
+                protocol: crate::ipc::IPC_PROTOCOL,
             },
             IpcRequest::Run {
                 prompt,

@@ -1402,6 +1402,58 @@ fn machine_list_without_daemon_shows_a_local_machine_s_pastor_version() {
     );
 }
 
+/// A head from before flocks ignores the `flock` field of a `run` request
+/// (serde skips unknown fields) and would queue the task in any flock. The
+/// CLI asks the head's IPC protocol first and refuses `--flock` on an old
+/// one, before anything is queued; `task list --flock` likewise, since an
+/// old head would list every flock's tasks.
+#[test]
+fn flock_flags_refuse_a_head_from_before_flocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let socket = state.join("pastor.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = ops.clone();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            seen.lock()
+                .unwrap()
+                .push(req["op"].as_str().unwrap_or_default().to_string());
+            // What a 0.3.0 head answers: a pong with no protocol.
+            let _ = stream.write_all(b"{\"kind\":\"pong\",\"data\":{\"version\":\"0.3.0\"}}\n");
+        }
+    });
+
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        error_code(&run(&["task", "run", "hi", "--flock", "work"])),
+        "head_too_old"
+    );
+    assert_eq!(
+        error_code(&run(&["task", "list", "--flock", "work"])),
+        "head_too_old"
+    );
+    let ops = ops.lock().unwrap();
+    assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
+}
+
 /// `probe_daemon` reads a socket that accepts connections but never answers
 /// `Ping` in time as `Unresponsive` — the same state a head busy mid-dispatch
 /// is in. `machine list` must route that through the ordinary IPC request,

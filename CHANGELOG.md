@@ -15,7 +15,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `--flock` on `pastor task run`, `flock` under a job's `[dispatch]`, else the
   pinned machine's flock, else the default. `--machine` outside `--flock` is
   refused (`flock_mismatch`), an unknown flock too (`unknown_flock`).
-  `pastor task retry` keeps the flock.
+  `pastor task retry` keeps the flock. A head from before flocks is refused
+  (`head_too_old`) rather than trusted to honour `--flock`; `Ping` answers
+  the head's IPC protocol for this.
 - `pastor flock list|add [--default]|remove|default`, `pastor machine move`,
   and `--flock` on `machine add`, `machine list` and `task list`. `task list`,
   `task show` and `job list` show the flock, and task events carry it in the

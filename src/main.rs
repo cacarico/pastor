@@ -333,9 +333,29 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
     Ok(resp)
 }
 
+/// Before a request carrying `--flock` goes to the head: a head from before
+/// flocks would ignore the field and act on every flock, so it is refused.
+async fn require_flock_head(paths: &Paths) -> anyhow::Result<()> {
+    let IpcResponse::Pong { version, protocol } = ask(paths, IpcRequest::Ping).await? else {
+        fail("runtime_error", "the head did not answer ping with pong");
+    };
+    if protocol < pastor::ipc::FLOCK_PROTOCOL {
+        fail(
+            "head_too_old",
+            &format!(
+                "the running pastor serve ({version}) predates flocks and would ignore --flock; restart it"
+            ),
+        );
+    }
+    Ok(())
+}
+
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     let config = PastorConfig::load(&paths.config_file())?;
     let spec = run_spec(&a, &config)?;
+    if a.flock.is_some() {
+        require_flock_head(paths).await?;
+    }
     let IpcResponse::Task(t) = ask(
         paths,
         IpcRequest::Run {
@@ -642,6 +662,9 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         flock: a.flock,
     };
     let daemon_up = daemon_running(&paths.socket_file()).await;
+    if daemon_up && filter.flock.is_some() {
+        require_flock_head(paths).await?;
+    }
     let tasks = if daemon_up {
         let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
             unreachable!()

@@ -9,6 +9,15 @@ use crate::scheduler::{JobRunReport, JobStatus};
 use crate::store::TaskFilter;
 use crate::task::{DispatchSpec, Task, TaskState};
 
+/// The head's IPC protocol, answered in `Pong`. Bumped when a request gains a
+/// field an older head would silently ignore (serde skips unknown fields), so
+/// the CLI can refuse to send it there. A head that answers no protocol is 0.
+/// 1: flocks (`Run::flock`, `TaskFilter::flock`).
+pub const IPC_PROTOCOL: u32 = 1;
+
+/// The first protocol whose head honours `flock` in a request.
+pub const FLOCK_PROTOCOL: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
@@ -74,12 +83,20 @@ pub enum IpcRequest {
 // difference between variants that clippy flags here doesn't matter in practice.
 #[allow(clippy::large_enum_variant)]
 pub enum IpcResponse {
-    Pong { version: String },
+    Pong {
+        version: String,
+        /// `IPC_PROTOCOL` of the head; missing from a head older than it.
+        #[serde(default)]
+        protocol: u32,
+    },
     Task(Task),
     Tasks(Vec<Task>),
     Text(String),
     Machines(Vec<MachineStatus>),
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
     Runs(Vec<JobRunReport>),
     Jobs(Vec<JobStatus>),
     Pruned(crate::store::PruneOutcome),
@@ -309,6 +326,7 @@ mod tests {
         let responses = vec![
             IpcResponse::Pong {
                 version: "1".into(),
+                protocol: IPC_PROTOCOL,
             },
             IpcResponse::Task(minimal_task()),
             IpcResponse::Tasks(vec![minimal_task()]),
