@@ -129,7 +129,8 @@ Plan 3 (events and plugins):
 
 Plan 4 (cleanup and lifecycle):
 
-- A machine removed from the flock leaves its open tasks `running` forever.
+- A machine removed from the flock leaves its open tasks `running` until
+  someone runs `task close`, which closes such a row without herdr.
 - `flock.toml` and `pastor.toml` do not reload; a machine added with `pastor
   machine add` needs a daemon restart. Job files do reload.
 - `machine add --command` is greedy (`num_args = 1..`): options placed after

@@ -499,8 +499,8 @@ impl Daemon {
     }
 
     /// `TaskClose`: through the actor of the task's machine, which closes the
-    /// pane (or worktree) before the row. A task that never reached a machine
-    /// only has its row closed, and a closed one is answered as it is. With
+    /// pane (or worktree) before the row. A task that never reached a machine,
+    /// or whose machine has left the flock, only has its row closed, and a closed one is answered as it is. With
     /// no row, the machines are asked for an orphaned agent `t-<id>` (as
     /// their last reconcile found them).
     async fn close(&self, id: i64, remove_worktree: bool) -> IpcResponse {
@@ -590,13 +590,29 @@ impl Daemon {
             return IpcResponse::Task(closed);
         };
         let Some(handle) = self.fleet.get(&machine) else {
-            return IpcResponse::error(
-                "unknown_machine",
-                format!(
-                    "{} is on machine {machine}, which is not in the flock",
-                    t.display_id()
-                ),
-            );
+            // Its machine left the flock, so no actor owns the row and no
+            // herdr can be asked: a plain close is only the row, but the
+            // checkout lives on that machine and cannot be removed from here.
+            if remove_worktree {
+                return IpcResponse::error(
+                    "unknown_machine",
+                    format!(
+                        "{} is on machine {machine}, which is not in the flock, so its worktree cannot be reached; close it without --remove-worktree",
+                        t.display_id()
+                    ),
+                );
+            }
+            let closed = match self.store.close_task(id) {
+                Ok(c) => c,
+                Err(err) => return IpcResponse::error("store_error", err),
+            };
+            let _ = self.events.send(PastorEvent {
+                kind: "task.closed".into(),
+                task_id: Some(id),
+                machine: Some(machine),
+                job: Some(closed.job.clone()),
+            });
+            return IpcResponse::Task(closed);
         };
         match handle.close(id, remove_worktree).await {
             Ok(t) => IpcResponse::Task(t),
@@ -1183,20 +1199,6 @@ mod tests {
         };
         assert_eq!(c.state, TaskState::Closed);
 
-        // On a machine the flock no longer has.
-        let mut gone = insert(&d, TaskState::Running);
-        gone.machine = Some("zzz".into());
-        d.store.update_task(&mut gone).unwrap();
-        assert_eq!(
-            error_code(
-                d.handle(IpcRequest::TaskClose {
-                    id: gone.id,
-                    remove_worktree: false
-                })
-                .await
-            ),
-            "unknown_machine"
-        );
         assert_eq!(
             error_code(
                 d.handle(IpcRequest::TaskClose {
@@ -1245,6 +1247,57 @@ mod tests {
             ),
             "unknown_machine"
         );
+    }
+
+    #[tokio::test]
+    async fn closing_a_task_on_a_removed_machine_closes_the_row_locally() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let mut gone = insert(&d, TaskState::Running);
+        gone.machine = Some("zzz".into());
+        d.store.update_task(&mut gone).unwrap();
+        let finished = d.store.get_task(gone.id).unwrap().unwrap().finished_at;
+        let mut events = d.subscribe();
+        let resp = d
+            .handle(IpcRequest::TaskClose {
+                id: gone.id,
+                remove_worktree: false,
+            })
+            .await;
+        let IpcResponse::Task(closed) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(closed.finished_at, finished, "finished_at is kept");
+        let stored = d.store.get_task(gone.id).unwrap().unwrap();
+        assert_eq!(stored.state, TaskState::Closed);
+        let ev = events.try_recv().expect("task.closed emitted");
+        assert_eq!(ev.kind, "task.closed");
+        assert_eq!(ev.task_id, Some(gone.id));
+        assert_eq!(ev.job.as_deref(), Some("run"));
+        assert!(events.try_recv().is_err(), "one task.closed only");
+
+        // Its checkout is on a machine pastor cannot reach any more.
+        let mut wt = insert(&d, TaskState::Running);
+        wt.spec.worktree = true;
+        wt.machine = Some("zzz".into());
+        d.store.update_task(&mut wt).unwrap();
+        let resp = d
+            .handle(IpcRequest::TaskClose {
+                id: wt.id,
+                remove_worktree: true,
+            })
+            .await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "unknown_machine");
+        assert!(
+            message.contains("zzz") && message.contains("not in the flock"),
+            "{message}"
+        );
+        assert!(message.contains("worktree"), "{message}");
+        let stored = d.store.get_task(wt.id).unwrap().unwrap();
+        assert_eq!(stored.state, TaskState::Running, "the row stays open");
     }
 
     #[tokio::test]
