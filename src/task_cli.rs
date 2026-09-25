@@ -2,9 +2,11 @@
 //! holds one `TaskCmd` variant per command and calls these.
 use clap::{ArgGroup, Args};
 
-use crate::cli::{CliError, TASK_HEADER, table, task_rows};
+use crate::cli::{CliError, TASK_HEADER, request_failure, table, task_rows};
 use crate::config::{Paths, parse_duration};
-use crate::ipc::{IpcRequest, IpcResponse, daemon_running, request};
+use crate::ipc::{
+    IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, daemon_running, request,
+};
 use crate::store::Store;
 use crate::task::{Task, TaskState, parse_task_id};
 
@@ -51,15 +53,26 @@ fn task_id(s: &str) -> anyhow::Result<i64> {
         .ok_or_else(|| CliError::err("usage_error", format!("{s} is not a task id like t-12")))
 }
 
+/// A request that got no reply, classified as `request_failure` does for
+/// the rest of the CLI. These commands answer `daemon_not_running` where
+/// that says `runtime_error`, and only for a refused or missing socket: a
+/// timed-out retry may still land, and a connect denied for permissions may
+/// hide a live head.
+fn request_error(err: &RequestError) -> anyhow::Error {
+    let (code, message) = request_failure(err);
+    let code = match err {
+        RequestError::Connect(e) if connect_error_means_no_daemon(e) => "daemon_not_running",
+        _ => code,
+    };
+    CliError::err(code, message)
+}
+
 /// One request to the daemon. Retry and close need it: one dispatches, the
 /// other talks to herdr on the task's machine.
 async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    let resp = request(&paths.socket_file(), &req).await.map_err(|e| {
-        CliError::err(
-            "daemon_not_running",
-            format!("pastor serve is not running ({e}); start it with `pastor serve`"),
-        )
-    })?;
+    let resp = request(&paths.socket_file(), &req)
+        .await
+        .map_err(|e| request_error(&e))?;
     match resp {
         IpcResponse::Error { code, message } => Err(CliError::err(&code, message)),
         other => Ok(other),
@@ -177,6 +190,41 @@ mod tests {
         assert!(P::try_parse_from(["p", "--older-than", "3d"]).is_err());
         let p = P::try_parse_from(["p", "--done", "--closed", "--older-than", "3d"]).unwrap();
         assert_eq!(p.a.states(), vec![TaskState::Done, TaskState::Closed]);
+    }
+
+    /// A retry that timed out may still land, so telling the user pastor
+    /// serve is not running would send them to run it again and queue a
+    /// second task. Only a refused or missing socket means nothing is there.
+    #[test]
+    fn request_failures_keep_their_own_codes() {
+        let code_and_message = |err: RequestError| {
+            let err = request_error(&err);
+            let e = err.downcast_ref::<CliError>().unwrap();
+            (e.code.clone(), e.message.clone())
+        };
+        let (code, message) =
+            code_and_message(RequestError::Timeout(std::time::Duration::from_secs(120)));
+        assert_eq!(code, "timeout");
+        assert!(message.contains("may still complete"), "{message}");
+        assert!(!message.contains("not running"), "{message}");
+
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NotFound,
+        ] {
+            let (code, message) = code_and_message(RequestError::Connect(kind.into()));
+            assert_eq!(code, "daemon_not_running", "{kind:?}");
+            assert!(message.contains("start it with"), "{message}");
+        }
+        let (code, message) = code_and_message(RequestError::Connect(
+            std::io::ErrorKind::PermissionDenied.into(),
+        ));
+        assert_eq!(code, "runtime_error");
+        assert!(!message.contains("not running"), "{message}");
+        let (code, message) =
+            code_and_message(RequestError::Exchange(anyhow::anyhow!("closed early")));
+        assert_eq!(code, "runtime_error");
+        assert!(message.contains("dropped the request"), "{message}");
     }
 
     #[test]

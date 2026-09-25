@@ -1,6 +1,7 @@
 use chrono::Utc;
 use serde::Serialize;
 
+use crate::ipc::{RequestError, connect_error_means_no_daemon};
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::task::Task;
@@ -178,6 +179,38 @@ pub fn task_detail(t: &Task) -> String {
             .map(|l| format!("  {l}").trim_end().to_string()),
     );
     out.join("\n")
+}
+
+/// The stable code and message for a request that got no reply. Only a connect
+/// that was refused or found no socket means nothing is listening; one denied
+/// for permissions may hide a live head, as `probe_daemon` also assumes. A head
+/// that took the connection and then sat on it is running but busy. Telling
+/// the user to start a head in either case would send them the wrong way.
+/// The head handles each request in a detached task, so a timed-out `run`,
+/// `task retry`, `tick` or `job run` may still land; sending it again blindly
+/// can queue a duplicate.
+pub fn request_failure(err: &RequestError) -> (&'static str, String) {
+    match err {
+        RequestError::Connect(e) if connect_error_means_no_daemon(e) => (
+            "runtime_error",
+            format!("pastor serve is not running ({e}); start it with `pastor serve`"),
+        ),
+        RequestError::Connect(e) => (
+            "runtime_error",
+            format!("could not connect to pastor serve: {e}"),
+        ),
+        RequestError::Timeout(bound) => (
+            "timeout",
+            format!(
+                "pastor serve did not answer within {}s; the request may still complete, so check `pastor task list` (or `pastor job list` for a tick or job run) before sending it again",
+                bound.as_secs()
+            ),
+        ),
+        RequestError::Exchange(e) => (
+            "runtime_error",
+            format!("pastor serve dropped the request: {e:#}"),
+        ),
+    }
 }
 
 pub const TASK_HEADER: [&str; 7] = ["ID", "STATE", "MACHINE", "AGENT", "JOB", "AGE", "NOTE"];

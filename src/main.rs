@@ -3,14 +3,12 @@ use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
+use pastor::cli::request_failure;
 use pastor::config::flock::{Flock, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
 use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
-use pastor::ipc::{
-    DaemonProbe, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon,
-    daemon_running, probe_daemon, request,
-};
+use pastor::ipc::{DaemonProbe, IpcRequest, IpcResponse, daemon_running, probe_daemon, request};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
 use pastor::task::{DispatchSpec, Task, TaskState, parse_task_id};
@@ -362,37 +360,6 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
         fail(code, message);
     }
     Ok(resp)
-}
-
-/// The stable code and message for a request that got no reply. Only a connect
-/// that was refused or found no socket means nothing is listening; one denied
-/// for permissions may hide a live head, as `probe_daemon` also assumes. A head
-/// that took the connection and then sat on it is running but busy. Telling
-/// the user to start a head in either case would send them the wrong way. The head handles each request in a detached task,
-/// so a timed-out `run`, `tick` or `job run` may still land; sending it again
-/// blindly can queue a duplicate.
-fn request_failure(err: &RequestError) -> (&'static str, String) {
-    match err {
-        RequestError::Connect(e) if connect_error_means_no_daemon(e) => (
-            "runtime_error",
-            format!("pastor serve is not running ({e}); start it with `pastor serve`"),
-        ),
-        RequestError::Connect(e) => (
-            "runtime_error",
-            format!("could not connect to pastor serve: {e}"),
-        ),
-        RequestError::Timeout(bound) => (
-            "timeout",
-            format!(
-                "pastor serve did not answer within {}s; the request may still complete, so check `pastor task list` (or `pastor job list` for a tick or job run) before sending it again",
-                bound.as_secs()
-            ),
-        ),
-        RequestError::Exchange(e) => (
-            "runtime_error",
-            format!("pastor serve dropped the request: {e:#}"),
-        ),
-    }
 }
 
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
@@ -1139,6 +1106,7 @@ async fn toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pastor::ipc::RequestError;
 
     fn run_args(argv: &[&str]) -> RunArgs {
         let mut full = vec!["pastor", "task", "run"];
