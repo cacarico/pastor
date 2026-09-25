@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use pastor::cli::request_failure;
-use pastor::config::flock::{Flock, MachineConfig};
+use pastor::config::flock::{EditError, Flock, FlockDoc, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
 use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
@@ -47,10 +47,15 @@ enum Command {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
-    /// Manage the machines in the flock
+    /// Manage the machines and which flock each is in
     Machine {
         #[command(subcommand)]
         cmd: MachineCmd,
+    },
+    /// Manage the flocks: named groups of machines that tasks and jobs target
+    Flock {
+        #[command(subcommand)]
+        cmd: FlockCmd,
     },
     /// Open the full herdr UI on a machine
     Open { machine: String },
@@ -111,6 +116,10 @@ struct RunArgs {
     prompt: String,
     #[arg(long)]
     repo: Option<String>,
+    /// Only this flock's machines take the task (default: the flock of
+    /// --machine, else the default flock)
+    #[arg(long)]
+    flock: Option<String>,
     #[arg(long)]
     machine: Option<String>,
     #[arg(long)]
@@ -138,6 +147,9 @@ struct ListArgs {
     /// Only tasks from this job (omit for one-off `run` tasks)
     #[arg(long)]
     job: Option<String>,
+    /// Only tasks of this flock
+    #[arg(long)]
+    flock: Option<String>,
     /// Only tasks on this machine
     #[arg(long)]
     machine: Option<String>,
@@ -201,6 +213,9 @@ enum MachineCmd {
         max_agents: u32,
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// The flock it joins (default: the default flock)
+        #[arg(long)]
+        flock: Option<String>,
         /// Also save it in herdr's sidebar (runs `herdr machine add`)
         #[arg(long, conflicts_with_all = ["local", "command"])]
         herdr: bool,
@@ -211,11 +226,32 @@ enum MachineCmd {
         #[arg(long)]
         herdr: bool,
     },
+    /// Put a machine in another flock; tasks already on it stay there
+    Move { name: String, flock: String },
     /// The head, then each machine: host, channel, herdr, agents
     List {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum FlockCmd {
+    /// Every flock: default or not, its machines, live agents, queued tasks
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Declare a flock; with --default, new tasks and jobs go to it
+    Add {
+        name: String,
+        #[arg(long)]
+        default: bool,
+    },
+    /// Remove a flock; refused while it has machines or is the default
+    Remove { name: String },
+    /// Make another flock the default; machines stay in their flocks
+    Default { name: String },
 }
 
 fn main() {
@@ -246,6 +282,7 @@ fn main() {
             Command::Serve => pastor::daemon::serve(paths).await,
             Command::Task { cmd } => task(&paths, cmd).await,
             Command::Machine { cmd } => machine(&paths, cmd).await,
+            Command::Flock { cmd } => flock(&paths, cmd).await,
             Command::Open { machine } => open(&paths, &machine).await,
             Command::Tick(args) => tick(&paths, args).await,
             Command::Job { cmd } => job(&paths, cmd).await,
@@ -301,7 +338,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
         IpcRequest::Run {
             prompt: a.prompt,
             spec,
-            flock: None,
+            flock: a.flock,
         },
     )
     .await?
@@ -583,7 +620,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         job: a.job,
         machine: a.machine.clone(),
         states,
-        flock: None,
+        flock: a.flock,
     };
     let daemon_up = daemon_running(&paths.socket_file()).await;
     let tasks = if daemon_up {
@@ -706,9 +743,10 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
             session,
             max_agents,
             tags,
+            flock,
             herdr,
         } => {
-            let mut f = Flock::load(&path)?;
+            let mut doc = FlockDoc::open(&path)?;
             let m = MachineConfig {
                 name: name.clone(),
                 local,
@@ -717,11 +755,16 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 session,
                 max_agents,
                 tags,
-                flock: None,
+                flock,
             };
-            f.add(m).map_err(|e| anyhow::anyhow!(e))?;
-            f.save(&path)?;
-            println!("added {name} to {}", path.display());
+            doc.add_machine(&m).map_err(edit_error)?;
+            doc.save(&path)?;
+            let f = doc.flock().map_err(anyhow::Error::msg)?;
+            println!(
+                "added {name} to flock {} in {}",
+                f.machine_flock(&name).unwrap_or_default(),
+                path.display()
+            );
             let target = f.get(&name).and_then(|m| m.ssh.clone());
             match (herdr, target) {
                 // The flock file is already written: a herdr failure below is
@@ -747,10 +790,14 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
             println!("{}", reload_running_head(paths).await);
         }
         MachineCmd::Remove { name, herdr } => {
-            let mut f = Flock::load(&path)?;
-            let target = f.get(&name).and_then(|m| m.ssh.clone());
-            anyhow::ensure!(f.remove(&name), "machine {name} not found");
-            f.save(&path)?;
+            let mut doc = FlockDoc::open(&path)?;
+            let target = doc
+                .flock()
+                .map_err(anyhow::Error::msg)?
+                .get(&name)
+                .and_then(|m| m.ssh.clone());
+            doc.remove_machine(&name).map_err(edit_error)?;
+            doc.save(&path)?;
             println!("removed {name}; {}", reload_running_head(paths).await);
             if herdr {
                 // herdr removes by profile id; the label is all pastor knows.
@@ -782,7 +829,83 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 }
             }
         }
+        MachineCmd::Move { name, flock } => {
+            let mut doc = FlockDoc::open(&path)?;
+            doc.move_machine(&name, &flock).map_err(edit_error)?;
+            doc.save(&path)?;
+            println!(
+                "moved {name} to flock {flock}; tasks already on it stay; {}",
+                reload_running_head(paths).await
+            );
+        }
         MachineCmd::List { json } => machine_list(paths, json).await?,
+    }
+    Ok(())
+}
+
+/// A refused flock.toml edit, with its stable code.
+fn edit_error(e: EditError) -> anyhow::Error {
+    pastor::cli::CliError::err(e.code(), e)
+}
+
+async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
+    let path = paths.flock_file();
+    let edit = |f: &dyn Fn(&mut FlockDoc) -> Result<(), EditError>| -> anyhow::Result<()> {
+        let mut doc = FlockDoc::open(&path)?;
+        f(&mut doc).map_err(edit_error)?;
+        doc.save(&path)
+    };
+    let done = match cmd {
+        FlockCmd::List { json } => return flock_list(paths, json).await,
+        FlockCmd::Add { name, default } => {
+            edit(&|d| d.add_flock(&name, default))?;
+            if default {
+                format!("added flock {name}, now the default")
+            } else {
+                format!("added flock {name}")
+            }
+        }
+        FlockCmd::Remove { name } => {
+            edit(&|d| d.remove_flock(&name))?;
+            format!("removed flock {name}")
+        }
+        FlockCmd::Default { name } => {
+            edit(&|d| d.set_default(&name))?;
+            format!("{name} is the default flock; machines stay in their flocks")
+        }
+    };
+    println!("{done}; {}", reload_running_head(paths).await);
+    Ok(())
+}
+
+/// `flock list`: the flock file, the queued tasks, and with a head running
+/// the live agents on each flock's machines.
+async fn flock_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
+    let f = Flock::load(&paths.flock_file())?;
+    let filter = TaskFilter {
+        states: Some(vec![TaskState::Queued]),
+        ..Default::default()
+    };
+    let (live, queued) = if daemon_running(&paths.socket_file()).await {
+        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
+            unreachable!()
+        };
+        let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
+            unreachable!()
+        };
+        (Some(ms), ts)
+    } else {
+        eprintln!("pastor serve is not running; agents are unknown");
+        (None, open_store(paths)?.list_tasks(&filter)?)
+    };
+    let rows = pastor::cli::flock_list(&f, live.as_deref(), &queued);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        println!(
+            "{}",
+            pastor::cli::table(&pastor::cli::FLOCK_HEADER, &pastor::cli::flock_rows(&rows))
+        );
     }
     Ok(())
 }

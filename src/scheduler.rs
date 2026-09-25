@@ -255,13 +255,25 @@ pub async fn run_job(
             return report;
         }
     };
-    // A pin to a machine settles the flock; else the default. Worked out
-    // once per run, before the connector, from the flock file as the run found it.
-    let task_flock = match flock.task_flock(None, job.spec.machine.as_deref()) {
+    // The job's flock, else its pinned machine's, else the default. Worked
+    // out once per run, before the connector, from the flock file as the run
+    // found it. A flock that does not fit is the job file's fault, not the
+    // connector's: no backoff, the next scheduled run tries again.
+    let task_flock = match flock.task_flock(job.flock.as_deref(), job.spec.machine.as_deref()) {
         Ok(f) => f,
         Err(err) => {
+            let err = err.to_string();
+            tracing::warn!(job = %job.name, %err, "job run refused");
             report.outcome = RunOutcome::Failed;
-            report.error = Some(err.to_string());
+            report.error = Some(err.clone());
+            if !dry_run {
+                state.last_run_at = Some(now);
+                state.last_result = Some(format!("failed: {err}"));
+                state.last_error = Some(err);
+                if let Err(e) = store.save_job_state(&state) {
+                    tracing::error!(job = %job.name, %e, "save job state");
+                }
+            }
             return report;
         }
     };
@@ -441,6 +453,11 @@ pub struct JobStatus {
     pub last_result: Option<String>,
     pub next_due: Option<DateTime<Utc>>,
     pub running: bool,
+    /// The flock its tasks go to as flock.toml stands now; the one it names
+    /// when that does not fit (its next run fails and says why). `None`
+    /// when the file never parsed.
+    #[serde(default)]
+    pub flock: Option<String>,
 }
 
 /// A job as the scheduler holds it: the last good parse, plus the current
@@ -979,6 +996,7 @@ impl Scheduler {
 
     pub fn statuses(&self, now: DateTime<Utc>) -> Vec<JobStatus> {
         let states = self.states();
+        let flock = self.fleet.flock();
         let mut out: Vec<JobStatus> = self
             .entries
             .iter()
@@ -1002,6 +1020,11 @@ impl Scheduler {
                     last_result: state.and_then(|s| s.last_result.clone()),
                     next_due,
                     running: self.is_running(name),
+                    flock: e.job.as_ref().map(|j| {
+                        flock
+                            .task_flock(j.flock.as_deref(), j.spec.machine.as_deref())
+                            .unwrap_or_else(|_| j.flock.clone().unwrap_or_default())
+                    }),
                 }
             })
             .collect();
@@ -1555,6 +1578,7 @@ mod tests {
                 tags: vec![],
                 timeout_secs: 60,
             },
+            flock: None,
         }
     }
 
@@ -3277,6 +3301,58 @@ mod tests {
             .map(|id| store.get_task(*id).unwrap().unwrap().flock)
             .collect();
         assert_eq!(flocks, [Some("home".into()), Some("work".into())]);
+    }
+
+    /// `flock` under `[dispatch]` is where a job's tasks go. One that does
+    /// not exist, or that its pinned machine is not in, fails the run before
+    /// the connector is asked for anything.
+    #[tokio::test]
+    async fn a_job_names_its_flock_and_a_bad_one_fails_the_run() {
+        let store = Store::open_in_memory().unwrap();
+        let (tx, _rx) = events();
+        let flock = home_and_work();
+        let work = Job {
+            flock: Some("work".into()),
+            ..job("a")
+        };
+        let src = Scripted::with_keys(&["k1"]);
+        run_job(&store, &work, &flock, &src, &tx, Utc::now(), false).await;
+        assert_eq!(
+            store.get_task(1).unwrap().unwrap().flock.as_deref(),
+            Some("work")
+        );
+        for (bad, why) in [
+            (
+                Job {
+                    flock: Some("play".into()),
+                    ..job("b")
+                },
+                "flock play does not exist",
+            ),
+            (
+                Job {
+                    flock: Some("home".into()),
+                    spec: DispatchSpec {
+                        machine: Some("w".into()),
+                        ..job("c").spec
+                    },
+                    ..job("c")
+                },
+                "machine w is in flock work, not home",
+            ),
+        ] {
+            let src = Scripted::with_keys(&["k1"]);
+            let report = run_job(&store, &bad, &flock, &src, &tx, Utc::now(), false).await;
+            assert_eq!(report.outcome, RunOutcome::Failed, "{why}");
+            assert_eq!(report.error.as_deref(), Some(why));
+            assert!(
+                src.inputs.lock().unwrap().is_empty(),
+                "the connector is not run: {why}"
+            );
+            let state = store.job_state(&bad.name).unwrap().unwrap();
+            assert_eq!(state.last_error.as_deref(), Some(why));
+            assert!(state.last_run_at.is_some(), "waits for its next run");
+        }
     }
 
     /// `pastor tick` without a head queues into the flocks flock.toml

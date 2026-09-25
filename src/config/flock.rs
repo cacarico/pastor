@@ -257,6 +257,342 @@ impl Flock {
     }
 }
 
+/// Why an edit of flock.toml was refused. Each has a stable CLI code.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EditError {
+    #[error("machine {0} already exists")]
+    MachineExists(String),
+    #[error("machine {0} not found")]
+    UnknownMachine(String),
+    #[error("flock {0} already exists")]
+    FlockExists(String),
+    #[error("flock {0} does not exist")]
+    UnknownFlock(String),
+    #[error("flock {flock} still has machines: {}; move them first", machines.join(", "))]
+    FlockHasMachines {
+        flock: String,
+        machines: Vec<String>,
+    },
+    #[error("flock {0} is the default; make another flock the default first")]
+    RemovingDefault(String),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+impl EditError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            EditError::MachineExists(_) => "machine_exists",
+            EditError::UnknownMachine(_) => "unknown_machine",
+            EditError::FlockExists(_) => "flock_exists",
+            EditError::UnknownFlock(_) => "unknown_flock",
+            EditError::FlockHasMachines { .. } => "flock_not_empty",
+            EditError::RemovingDefault(_) => "flock_is_default",
+            EditError::Invalid(_) => "config_error",
+        }
+    }
+}
+
+/// flock.toml opened for an edit that keeps everything it does not touch:
+/// comments, key order, blank lines. `machine add|remove|move` and the
+/// `flock` commands go through it; `Flock::save` would rewrite the file from
+/// scratch. Each edit checks what it needs against the file as it stands,
+/// and `save` checks the result loads before it replaces the file.
+pub struct FlockDoc {
+    doc: toml_edit::DocumentMut,
+}
+
+impl FlockDoc {
+    /// A missing file is an empty one, as for `Flock::load`. A file that
+    /// does not load is refused: an edit must not paper over it.
+    pub fn open(path: &Path) -> anyhow::Result<FlockDoc> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        let doc: toml_edit::DocumentMut = text
+            .parse()
+            .with_context(|| format!("parse {}", path.display()))?;
+        let d = FlockDoc { doc };
+        d.flock()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        Ok(d)
+    }
+
+    pub fn parse(text: &str) -> anyhow::Result<FlockDoc> {
+        let d = FlockDoc { doc: text.parse()? };
+        d.flock().map_err(anyhow::Error::msg)?;
+        Ok(d)
+    }
+
+    /// The file as it now reads, validated.
+    pub fn flock(&self) -> Result<Flock, String> {
+        let f: Flock = toml::from_str(&self.doc.to_string()).map_err(|e| e.to_string())?;
+        f.validate()?;
+        Ok(f)
+    }
+
+    /// Write the edited file in place of `path` (a temp file, then a rename,
+    /// so a reader never sees half of it). Refused if it would not load.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        self.flock().map_err(anyhow::Error::msg)?;
+        if let Some(parent) = path.parent() {
+            crate::config::create_private_dir(parent)?;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, self.to_string())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+        Ok(())
+    }
+
+    fn current(&self) -> Result<Flock, EditError> {
+        self.flock().map_err(EditError::Invalid)
+    }
+
+    /// Every table in the document with its position, for placing new ones.
+    fn positions(&self) -> Vec<(bool, isize)> {
+        let mut out = Vec::new();
+        for (key, item) in self.doc.as_table().iter() {
+            let is_flock = key == "flock";
+            match item {
+                toml_edit::Item::ArrayOfTables(a) => {
+                    out.extend(a.iter().filter_map(|t| Some((is_flock, t.position()?))))
+                }
+                toml_edit::Item::Table(t) => out.extend(t.position().map(|p| (is_flock, p))),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn array(&mut self, key: &str) -> &mut toml_edit::ArrayOfTables {
+        let item = self
+            .doc
+            .as_table_mut()
+            .entry(key)
+            .or_insert_with(|| toml_edit::Item::ArrayOfTables(Default::default()));
+        item.as_array_of_tables_mut()
+            .expect("checked by flock(): the key holds an array of tables")
+    }
+
+    /// A new `[[<key>]]` table: flocks after the last flock (or before
+    /// everything when there is none, so they head the file), machines at
+    /// the end. Separated from what comes before by a blank line.
+    fn push(&mut self, key: &str, mut table: toml_edit::Table) {
+        let pos = self.positions();
+        let at = if key == "flock" {
+            pos.iter()
+                .filter(|(f, _)| *f)
+                .map(|(_, p)| *p)
+                .max()
+                .unwrap_or_else(|| pos.iter().map(|(_, p)| *p).min().unwrap_or(0) - 1)
+        } else {
+            pos.iter().map(|(_, p)| *p).max().unwrap_or(0) + 1
+        };
+        table.set_position(Some(at));
+        let first = pos.iter().all(|(_, p)| *p > at);
+        let blank = self.doc.to_string().trim().is_empty();
+        let prefix = match self.first_table_mut() {
+            // The new table heads the file, so the file's header comment
+            // (the old first table's prefix, up to its last blank line)
+            // moves up with it; what follows the blank line stays with the
+            // table it was written above.
+            Some(old) if first => {
+                let p = old.decor().prefix().and_then(|p| p.as_str()).unwrap_or("");
+                let (header, rest) = match p.rfind("\n\n") {
+                    Some(i) => (format!("{}\n", &p[..=i]), p[i + 2..].to_string()),
+                    None => (String::new(), p.to_string()),
+                };
+                old.decor_mut().set_prefix(format!("\n{rest}"));
+                header
+            }
+            Some(_) => "\n".to_string(),
+            None if blank => String::new(),
+            None => "\n".to_string(),
+        };
+        table.decor_mut().set_prefix(prefix);
+        self.array(key).push(table);
+    }
+
+    /// The table that comes first in the file.
+    fn first_table_mut(&mut self) -> Option<&mut toml_edit::Table> {
+        let mut tables: Vec<&mut toml_edit::Table> = Vec::new();
+        for (_, item) in self.doc.as_table_mut().iter_mut() {
+            match item {
+                toml_edit::Item::ArrayOfTables(a) => tables.extend(a.iter_mut()),
+                toml_edit::Item::Table(t) => tables.push(t),
+                _ => {}
+            }
+        }
+        tables
+            .into_iter()
+            .filter(|t| t.position().is_some())
+            .min_by_key(|t| t.position())
+    }
+
+    fn tables_mut<'a>(
+        &'a mut self,
+        key: &str,
+    ) -> impl Iterator<Item = &'a mut toml_edit::Table> + 'a {
+        self.doc
+            .get_mut(key)
+            .and_then(|i| i.as_array_of_tables_mut())
+            .into_iter()
+            .flat_map(|a| a.iter_mut())
+    }
+
+    fn machine_mut(&mut self, name: &str) -> Option<&mut toml_edit::Table> {
+        self.tables_mut("machine")
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+    }
+
+    fn remove_named(&mut self, key: &str, name: &str) {
+        if let Some(a) = self
+            .doc
+            .get_mut(key)
+            .and_then(|i| i.as_array_of_tables_mut())
+        {
+            a.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
+        }
+    }
+
+    /// With no `[[flock]]` entry the file has one implicit flock; naming a
+    /// second one needs the first on paper, as the default.
+    fn declare_implicit(&mut self, f: &Flock) {
+        if f.flocks.is_empty() {
+            let mut t = toml_edit::Table::new();
+            t.insert("name", toml_edit::value(DEFAULT_FLOCK));
+            t.insert("default", toml_edit::value(true));
+            self.push("flock", t);
+        }
+    }
+
+    pub fn add_machine(&mut self, m: &MachineConfig) -> Result<(), EditError> {
+        let f = self.current()?;
+        if f.get(&m.name).is_some() {
+            return Err(EditError::MachineExists(m.name.clone()));
+        }
+        if let Some(name) = &m.flock
+            && !f.has_flock(name)
+        {
+            return Err(EditError::UnknownFlock(name.clone()));
+        }
+        let mut probe = f.clone();
+        probe.machines.push(m.clone());
+        probe.validate().map_err(EditError::Invalid)?;
+        let text = toml::to_string(m).map_err(|e| EditError::Invalid(e.to_string()))?;
+        let table: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|e: toml_edit::TomlError| EditError::Invalid(e.to_string()))?;
+        self.push("machine", table.as_table().clone());
+        Ok(())
+    }
+
+    pub fn remove_machine(&mut self, name: &str) -> Result<(), EditError> {
+        if self.current()?.get(name).is_none() {
+            return Err(EditError::UnknownMachine(name.into()));
+        }
+        self.remove_named("machine", name);
+        Ok(())
+    }
+
+    /// `machine move`: put `name` in `flock`, by name, so it stays there
+    /// whichever flock is the default later.
+    pub fn move_machine(&mut self, name: &str, flock: &str) -> Result<(), EditError> {
+        let f = self.current()?;
+        if f.get(name).is_none() {
+            return Err(EditError::UnknownMachine(name.into()));
+        }
+        if !f.has_flock(flock) {
+            return Err(EditError::UnknownFlock(flock.into()));
+        }
+        let t = self.machine_mut(name).expect("checked above");
+        t.insert("flock", toml_edit::value(flock));
+        Ok(())
+    }
+
+    /// `flock add`. A file with only the implicit flock gets it declared
+    /// first, so its machines keep their flock.
+    pub fn add_flock(&mut self, name: &str, default: bool) -> Result<(), EditError> {
+        let f = self.current()?;
+        if f.has_flock(name) {
+            return Err(EditError::FlockExists(name.into()));
+        }
+        if name.is_empty() {
+            return Err(EditError::Invalid("flock with empty name".into()));
+        }
+        self.declare_implicit(&f);
+        let mut t = toml_edit::Table::new();
+        t.insert("name", toml_edit::value(name));
+        self.push("flock", t);
+        if default {
+            self.set_default(name)?;
+        }
+        Ok(())
+    }
+
+    /// `flock remove`: refused while machines are in it or it is the default.
+    pub fn remove_flock(&mut self, name: &str) -> Result<(), EditError> {
+        let f = self.current()?;
+        if !f.flocks.iter().any(|e| e.name == name) {
+            return Err(EditError::UnknownFlock(name.into()));
+        }
+        if f.default_flock() == name {
+            return Err(EditError::RemovingDefault(name.into()));
+        }
+        let machines: Vec<String> = f
+            .machines
+            .iter()
+            .filter(|m| f.flock_of(m) == name)
+            .map(|m| m.name.clone())
+            .collect();
+        if !machines.is_empty() {
+            return Err(EditError::FlockHasMachines {
+                flock: name.into(),
+                machines,
+            });
+        }
+        self.remove_named("flock", name);
+        Ok(())
+    }
+
+    /// `flock default`: tasks and jobs that name no flock go to `name` from
+    /// now on. A machine with no `flock` of its own is in the default flock,
+    /// so each one is first written into the flock it is in now: changing
+    /// where new work goes must not move machines.
+    pub fn set_default(&mut self, name: &str) -> Result<(), EditError> {
+        let f = self.current()?;
+        if !f.has_flock(name) {
+            return Err(EditError::UnknownFlock(name.into()));
+        }
+        let old = f.default_flock().to_string();
+        if old == name {
+            return Ok(());
+        }
+        self.declare_implicit(&f);
+        for m in f.machines.iter().filter(|m| m.flock.is_none()) {
+            let t = self.machine_mut(&m.name).expect("listed by current()");
+            t.insert("flock", toml_edit::value(old.as_str()));
+        }
+        for t in self.tables_mut("flock") {
+            if t.get("name").and_then(|v| v.as_str()) == Some(name) {
+                t.insert("default", toml_edit::value(true));
+            } else {
+                t.remove("default");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for FlockDoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.doc.fmt(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +748,144 @@ flock = "work"
         // A pin to a machine the file does not have settles nothing; the
         // caller refuses the machine on its own terms.
         assert_eq!(f.task_flock(None, Some("gone")).unwrap(), "home");
+    }
+
+    const COMMENTED: &str = "# my fleet\n\n[[machine]]\nname = \"pi-1\"   # the desk one\nlocal = true\n\n# spare\n[[machine]]\nname = \"pi-3\"\nssh = \"user@pi-3\"\n";
+
+    #[test]
+    fn edits_keep_comments_and_layout() {
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        d.add_machine(&pi("pi-4")).unwrap();
+        let text = d.to_string();
+        assert!(text.starts_with(COMMENTED), "{text}");
+        assert!(
+            text.contains("\n\n[[machine]]\nname = \"pi-4\"\n"),
+            "{text}"
+        );
+        d.remove_machine("pi-4").unwrap();
+        assert_eq!(d.to_string(), COMMENTED);
+        assert_eq!(
+            d.remove_machine("pi-9").unwrap_err(),
+            EditError::UnknownMachine("pi-9".into())
+        );
+        assert_eq!(
+            d.add_machine(&pi("pi-3")).unwrap_err(),
+            EditError::MachineExists("pi-3".into())
+        );
+    }
+
+    /// The first named flock puts the implicit one on paper, as the default,
+    /// at the head of the file; the machines stay where they were.
+    #[test]
+    fn adding_a_flock_declares_the_implicit_default_first() {
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        d.add_flock("work", false).unwrap();
+        let text = d.to_string();
+        assert!(
+            text.starts_with("# my fleet\n\n[[flock]]\nname = \"default\"\ndefault = true\n\n[[flock]]\nname = \"work\"\n\n[[machine]]\nname = \"pi-1\"   # the desk one\n"),
+            "{text}"
+        );
+        let f = d.flock().unwrap();
+        assert_eq!(f.flock_names(), ["default", "work"]);
+        assert_eq!(f.machine_flock("pi-1"), Some("default"));
+        d.add_flock("play", false).unwrap();
+        assert_eq!(
+            d.flock().unwrap().flock_names(),
+            ["default", "work", "play"]
+        );
+        assert!(
+            d.to_string()
+                .contains("name = \"work\"\n\n[[flock]]\nname = \"play\"\n\n[[machine]]"),
+            "{d}"
+        );
+        assert_eq!(
+            d.add_flock("work", false).unwrap_err(),
+            EditError::FlockExists("work".into())
+        );
+    }
+
+    #[test]
+    fn moving_a_machine_names_its_flock() {
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        assert_eq!(
+            d.move_machine("pi-3", "work").unwrap_err(),
+            EditError::UnknownFlock("work".into())
+        );
+        d.add_flock("work", false).unwrap();
+        d.move_machine("pi-3", "work").unwrap();
+        assert_eq!(d.flock().unwrap().machine_flock("pi-3"), Some("work"));
+        assert!(d.to_string().contains("# spare\n"), "{d}");
+        assert_eq!(
+            d.move_machine("pi-9", "work").unwrap_err(),
+            EditError::UnknownMachine("pi-9".into())
+        );
+        let mut m = pi("pi-5");
+        m.flock = Some("nope".into());
+        assert_eq!(
+            d.add_machine(&m).unwrap_err(),
+            EditError::UnknownFlock("nope".into())
+        );
+        m.flock = Some("work".into());
+        d.add_machine(&m).unwrap();
+        assert_eq!(d.flock().unwrap().machine_flock("pi-5"), Some("work"));
+    }
+
+    /// Changing the default changes where new work goes, not where the
+    /// machines are: those with no flock of their own get the old one.
+    #[test]
+    fn a_new_default_keeps_the_machines_in_their_flocks() {
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        d.add_flock("work", true).unwrap();
+        let f = d.flock().unwrap();
+        assert_eq!(f.default_flock(), "work");
+        assert_eq!(f.machine_flock("pi-1"), Some("default"));
+        assert_eq!(f.machine_flock("pi-3"), Some("default"));
+        d.set_default("default").unwrap();
+        assert_eq!(d.flock().unwrap().default_flock(), "default");
+        d.set_default("default").unwrap();
+        assert_eq!(
+            d.set_default("nope").unwrap_err(),
+            EditError::UnknownFlock("nope".into())
+        );
+    }
+
+    #[test]
+    fn a_flock_is_removed_only_when_empty_and_not_the_default() {
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        d.add_flock("work", false).unwrap();
+        d.move_machine("pi-3", "work").unwrap();
+        assert_eq!(
+            d.remove_flock("work").unwrap_err(),
+            EditError::FlockHasMachines {
+                flock: "work".into(),
+                machines: vec!["pi-3".into()],
+            }
+        );
+        assert_eq!(
+            d.remove_flock("default").unwrap_err(),
+            EditError::RemovingDefault("default".into())
+        );
+        assert_eq!(
+            d.remove_flock("nope").unwrap_err(),
+            EditError::UnknownFlock("nope".into())
+        );
+        d.move_machine("pi-3", "default").unwrap();
+        d.remove_flock("work").unwrap();
+        assert_eq!(d.flock().unwrap().flock_names(), ["default"]);
+    }
+
+    #[test]
+    fn a_doc_saves_atomically_and_refuses_a_bad_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flock.toml");
+        let mut d = FlockDoc::open(&path).unwrap();
+        d.add_machine(&pi("a")).unwrap();
+        d.save(&path).unwrap();
+        assert_eq!(Flock::load(&path).unwrap().machines, vec![pi("a")]);
+        assert!(!path.with_extension("toml.tmp").exists());
+        std::fs::write(&path, "[[flock]]\nname = \"x\"\n").unwrap();
+        let err = format!("{:#}", FlockDoc::open(&path).err().unwrap());
+        assert!(err.contains("no flock has default"), "{err}");
     }
 
     #[test]

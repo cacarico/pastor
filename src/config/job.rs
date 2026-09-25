@@ -52,6 +52,9 @@ pub struct DispatchTable {
     pub branch: Option<String>,
     pub tags: Vec<String>,
     pub machine: Option<String>,
+    /// Where the job's tasks go; `None`: the flock of `machine`, else the
+    /// default flock.
+    pub flock: Option<String>,
     pub timeout: Option<String>,
     pub max_tasks_per_run: Option<u32>,
     pub backfill: Option<String>,
@@ -73,6 +76,9 @@ pub struct Job {
     /// `repo` and `branch` are unrendered templates too; the scheduler renders
     /// a copy per task.
     pub spec: DispatchSpec,
+    /// `dispatch.flock`, checked against flock.toml at each run (see
+    /// `Flock::task_flock`): the job file does not know the flocks.
+    pub flock: Option<String>,
 }
 
 impl Job {
@@ -147,6 +153,7 @@ impl Job {
             prompt: d.prompt,
             max_tasks_per_run,
             backfill,
+            flock: d.flock,
             spec: DispatchSpec {
                 agent: d.agent.unwrap_or_else(|| defaults.agent.clone()),
                 agent_args: defaults.agent_args_or(d.agent_args),
@@ -326,6 +333,7 @@ repo = "~/work/support"
 worktree = true
 branch = "pastor/{{ item.key }}"
 tags = ["fast"]
+flock = "work"
 timeout = "2h"
 max_tasks_per_run = 5
 backfill = "0s"
@@ -359,6 +367,7 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert!(job.spec.worktree);
         assert_eq!(job.spec.branch.as_deref(), Some("pastor/{{ item.key }}"));
         assert_eq!(job.spec.tags, vec!["fast"]);
+        assert_eq!(job.flock.as_deref(), Some("work"));
         assert_eq!(job.spec.timeout_secs, 7200);
         assert_eq!(job.max_tasks_per_run, 5);
         assert_eq!(job.backfill, Duration::ZERO);

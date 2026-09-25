@@ -1723,3 +1723,177 @@ fn flock_edits_reach_a_running_head() {
         "{list}"
     );
 }
+
+/// The code of a runtime error (JSON on stderr, exit 1).
+fn error_code(out: &std::process::Output) -> String {
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stderr)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
+    v["code"].as_str().unwrap().to_string()
+}
+
+fn ok(out: std::process::Output) -> String {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// `flock` and `machine move` edit flock.toml in place: what they do not
+/// touch, comments included, stays as the user wrote it.
+#[test]
+fn flock_commands_edit_the_file_and_keep_its_comments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "# the fleet\n\n[[machine]]\nname = \"pi-1\"   # desk\nlocal = true\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let file = || std::fs::read_to_string(config.join("flock.toml")).unwrap();
+    ok(run(&["flock", "add", "work"]));
+    let text = file();
+    assert!(text.starts_with("# the fleet\n"), "{text}");
+    assert!(text.contains("name = \"pi-1\"   # desk"), "{text}");
+    ok(run(&[
+        "machine",
+        "add",
+        "pi-3",
+        "user@pi-3",
+        "--flock",
+        "work",
+    ]));
+    assert_eq!(
+        error_code(&run(&[
+            "machine",
+            "add",
+            "pi-4",
+            "user@pi-4",
+            "--flock",
+            "nope"
+        ])),
+        "unknown_flock"
+    );
+
+    let list: serde_json::Value =
+        serde_json::from_str(&ok(run(&["flock", "list", "--json"]))).unwrap();
+    assert_eq!(list[0]["name"], "default");
+    assert_eq!(list[0]["default"], true);
+    assert_eq!(list[0]["machines"], serde_json::json!(["pi-1"]));
+    assert_eq!(list[1]["name"], "work");
+    assert_eq!(list[1]["default"], false);
+    assert_eq!(list[1]["machines"], serde_json::json!(["pi-3"]));
+    assert_eq!(list[1]["queued"], 0);
+    let table = ok(run(&["flock", "list"]));
+    let header: Vec<&str> = table.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(header, ["NAME", "DEFAULT", "MACHINES", "AGENTS", "QUEUED"]);
+
+    assert_eq!(
+        error_code(&run(&["flock", "remove", "work"])),
+        "flock_not_empty"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "remove", "default"])),
+        "flock_is_default"
+    );
+    assert_eq!(
+        error_code(&run(&["machine", "move", "pi-1", "nope"])),
+        "unknown_flock"
+    );
+    assert_eq!(
+        error_code(&run(&["machine", "move", "nope", "work"])),
+        "unknown_machine"
+    );
+    ok(run(&["machine", "move", "pi-3", "default"]));
+    ok(run(&["flock", "remove", "work"]));
+    assert_eq!(
+        error_code(&run(&["flock", "remove", "work"])),
+        "unknown_flock"
+    );
+
+    // A new default takes new work; the machines stay where they were.
+    ok(run(&["flock", "add", "play", "--default"]));
+    let list: serde_json::Value =
+        serde_json::from_str(&ok(run(&["flock", "list", "--json"]))).unwrap();
+    assert_eq!(list[1]["name"], "play");
+    assert_eq!(list[1]["default"], true);
+    assert_eq!(list[0]["machines"], serde_json::json!(["pi-1", "pi-3"]));
+    ok(run(&["flock", "default", "default"]));
+    assert_eq!(
+        error_code(&run(&["flock", "default", "nope"])),
+        "unknown_flock"
+    );
+    assert!(file().contains("# desk"), "{}", file());
+}
+
+/// `task run --flock` against a running head: the task waits for a machine
+/// of its flock, `--machine` outside it is refused, `task list --flock`
+/// narrows to it, and moving a machine in hands it the task.
+#[test]
+fn a_task_waits_for_its_flock_end_to_end() {
+    let env = start();
+    ok(env.cmd(&["flock", "add", "work"]));
+    let t: serde_json::Value = serde_json::from_str(&ok(
+        env.cmd(&["task", "run", "hello", "--flock", "work", "--json"])
+    ))
+    .unwrap();
+    assert_eq!(t["flock"], "work", "{t}");
+    assert_eq!(t["state"], "queued", "no machine in work yet: {t}");
+    assert_eq!(
+        error_code(&env.cmd(&["task", "run", "x", "--flock", "work", "--machine", "fake"])),
+        "flock_mismatch"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["task", "run", "x", "--flock", "nope"])),
+        "unknown_flock"
+    );
+    let id = t["id"].as_i64().unwrap();
+    let listed = |flock: &str| -> Vec<i64> {
+        let out = ok(env.cmd(&["task", "list", "--all", "--flock", flock, "--json"]));
+        let v: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+        v.iter().map(|t| t["id"].as_i64().unwrap()).collect()
+    };
+    assert_eq!(listed("work"), [id]);
+    assert!(listed("default").is_empty());
+    let table = ok(env.cmd(&["task", "list"]));
+    let header: Vec<&str> = table.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(header[..4], ["ID", "STATE", "MACHINE", "FLOCK"], "{table}");
+    assert!(
+        ok(env.cmd(&["task", "show", &format!("t-{id}")])).contains("flock:      work"),
+        "task show names the flock"
+    );
+
+    ok(env.cmd(&["machine", "move", "fake", "work"]));
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
+            "task",
+            "show",
+            &format!("t-{id}"),
+            "--json",
+        ])))
+        .unwrap();
+        if t["machine"] == "fake" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never dispatched: {t}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

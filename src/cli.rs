@@ -102,6 +102,7 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
                 t.display_id(),
                 t.state.to_string(),
                 t.machine.clone().unwrap_or_else(|| "-".into()),
+                t.flock.clone().unwrap_or_else(|| "-".into()),
                 t.spec.agent.clone(),
                 t.job.clone(),
                 age(t.created_at),
@@ -155,6 +156,7 @@ pub fn task_detail(t: &Task) -> String {
         ("id", t.display_id()),
         ("state", t.state.to_string()),
         ("job", t.job.clone()),
+        ("flock", opt(&t.flock)),
         ("machine", opt(&t.machine)),
         ("agent", t.spec.agent.clone()),
         ("agent args", args),
@@ -229,7 +231,76 @@ pub fn mark_removed(rows: &mut [Vec<String>], tasks: &[Task], flock: &Flock) {
     }
 }
 
-pub const TASK_HEADER: [&str; 7] = ["ID", "STATE", "MACHINE", "AGENT", "JOB", "AGE", "NOTE"];
+pub const TASK_HEADER: [&str; 8] = [
+    "ID", "STATE", "MACHINE", "FLOCK", "AGENT", "JOB", "AGE", "NOTE",
+];
+
+/// One flock in `pastor flock list`. `agents` is the live agents on its
+/// machines, known only from a running head; `queued` counts the tasks
+/// waiting for one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FlockRow {
+    pub name: String,
+    pub default: bool,
+    pub machines: Vec<String>,
+    pub agents: Option<usize>,
+    pub queued: usize,
+}
+
+pub const FLOCK_HEADER: [&str; 5] = ["NAME", "DEFAULT", "MACHINES", "AGENTS", "QUEUED"];
+
+/// `flock`'s flocks in file order. `live` is each machine's live agents from
+/// the head, `None` without one; `queued` the queued tasks, whose flock
+/// (`None`: a row from before flocks) reads as the default.
+pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]) -> Vec<FlockRow> {
+    flock
+        .flock_names()
+        .into_iter()
+        .map(|name| {
+            let machines: Vec<String> = flock
+                .machines
+                .iter()
+                .filter(|m| flock.flock_of(m) == name)
+                .map(|m| m.name.clone())
+                .collect();
+            let agents = live.map(|ms| {
+                ms.iter()
+                    .filter(|s| machines.contains(&s.name))
+                    .map(|s| s.live)
+                    .sum()
+            });
+            let queued = queued
+                .iter()
+                .filter(|t| t.flock.as_deref().unwrap_or(flock.default_flock()) == name)
+                .count();
+            FlockRow {
+                name: name.to_string(),
+                default: name == flock.default_flock(),
+                machines,
+                agents,
+                queued,
+            }
+        })
+        .collect()
+}
+
+pub fn flock_rows(rows: &[FlockRow]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|f| {
+            vec![
+                f.name.clone(),
+                if f.default { "yes" } else { "no" }.into(),
+                if f.machines.is_empty() {
+                    "-".into()
+                } else {
+                    f.machines.join(",")
+                },
+                f.agents.map_or_else(|| "-".into(), |n| n.to_string()),
+                f.queued.to_string(),
+            ]
+        })
+        .collect()
+}
 
 /// One line per orphaned agent, for under the `pastor list` table. With
 /// `machine`, only that machine's, as `task list --machine` shows only its
@@ -400,10 +471,11 @@ pub fn in_(at: chrono::DateTime<Utc>) -> String {
     }
 }
 
-pub const JOB_HEADER: [&str; 7] = [
+pub const JOB_HEADER: [&str; 8] = [
     "NAME",
     "SCHEDULE",
     "ENABLED",
+    "FLOCK",
     "CONNECTOR",
     "LAST RUN",
     "NEXT",
@@ -424,6 +496,7 @@ pub fn job_rows(jobs: &[JobStatus]) -> Vec<Vec<String>> {
                 j.name.clone(),
                 j.schedule.clone().unwrap_or_else(|| "-".into()),
                 if j.enabled { "yes" } else { "no" }.into(),
+                j.flock.clone().unwrap_or_else(|| "-".into()),
                 j.connector.clone().unwrap_or_else(|| "-".into()),
                 j.last_run_at
                     .map(|t| format!("{} ago", age(t)))
@@ -747,6 +820,7 @@ mod tests {
             last_result: Some("ok: 1 items, 1 tasks".into()),
             next_due: Some(now + chrono::Duration::seconds(210)),
             running: false,
+            flock: Some("work".into()),
         };
         let broken = JobStatus {
             name: "b".into(),
@@ -758,6 +832,7 @@ mod tests {
             last_result: None,
             next_due: None,
             running: true,
+            flock: None,
         };
         let rows = job_rows(&[ok, broken]);
         assert_eq!(
@@ -766,6 +841,7 @@ mod tests {
                 "a",
                 "every 5m",
                 "yes",
+                "work",
                 "clock",
                 "1m ago",
                 "in 3m",
@@ -778,6 +854,7 @@ mod tests {
                 "b",
                 "-",
                 "no",
+                "-",
                 "-",
                 "never",
                 "-",
