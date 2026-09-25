@@ -26,7 +26,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and local herdr version. `--json` is now `{"head": {...}, "machines": [...]}`
   instead of a bare array.
 - Without `pastor serve`, `pastor machine list` probes each machine directly
-  instead of printing the flock file with no live data. `pastor machine status`
+  instead of printing the flock file with no live data. CHANNEL reads
+  `probed`, `server down`, `unreachable` or `error`. `pastor machine status`
   is folded into it and stays as a hidden alias.
 
 ### Changed

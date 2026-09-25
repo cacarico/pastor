@@ -74,10 +74,14 @@ on its PATH (`-` when there is none); it is not a machine and takes no tasks.
 With `pastor serve` running, CHANNEL is the head's live channel state and
 AGENTS counts pastor's tasks against `max_agents`. Without it, the command
 probes each machine itself (a ping and an `agent.list`, one at a time, with no
-time limit), CHANNEL reads `probed` or `unreachable`, AGENTS counts every
-agent herdr reports, and stderr says so. `--json` prints
-`{"head": {...}, "machines": [...]}`. `pastor machine status` is the old
-spelling, kept as a hidden alias.
+time limit); CHANNEL reads one of four values: `probed` (the ping answered),
+`server down` (a local endpoint's own socket has nothing listening), `unreachable`
+(any other transport failure), or `error` (the ping failed some other way, such
+as an old protocol or a failed `agent.list`). AGENTS counts every agent herdr
+reports, and stderr says so. `--json` prints
+`{"head": {...}, "machines": [...]}`, with `channel` one of the same four
+probe values (or the head's live channel state when `pastor serve` is
+running). `pastor machine status` is the old spelling, kept as a hidden alias.
 
 Jobs are one TOML file each in `~/.config/pastor/jobs/`. On every `tick` the
 daemon re-reads files that changed (a file that stops parsing keeps its last

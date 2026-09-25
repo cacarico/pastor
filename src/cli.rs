@@ -192,8 +192,9 @@ pub fn herdr_version_from(output: &str) -> Option<String> {
 /// One machine in `machine list`, from the head's live view or from a direct
 /// probe when no head runs. The fields and names are `MachineStatus`'s, so the
 /// JSON matches what the events log carries; `channel` is a plain string
-/// because a probe reports `probed` or `unreachable`, which no live channel
-/// is, and `live` is absent when a probe could not count the agents.
+/// because a probe reports one of `probed`, `server down`, `unreachable` or
+/// `error`, none of which is a live channel state, and `live` is absent when
+/// a probe could not count the agents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MachineRow {
     pub name: String,
