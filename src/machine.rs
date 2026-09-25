@@ -2367,7 +2367,8 @@ mod tests {
             machine: None,
             tags: vec![],
             timeout_secs: 3600,
-            reopen_worktree: false,
+            checkout: None,
+            reopen: None,
         }
     }
 
@@ -3166,8 +3167,11 @@ mod tests {
         fake.exit_pane(first.pane_id.as_deref().unwrap());
         wait_for("failed", || state_of(&store, first.id) == TaskState::Failed).await;
 
+        let first = store.get_task(first.id).unwrap().unwrap();
+        let checkout = first.spec.checkout.clone().expect("checkout recorded");
+        assert_eq!(checkout.branch, branch);
         let retry = store.insert_retry(first.id).unwrap();
-        assert_eq!(retry.spec.branch.as_deref(), Some(branch.as_str()));
+        assert_eq!(retry.spec.reopen.as_ref().unwrap().path, checkout.path);
         let t = h.dispatch(retry.id).await.unwrap();
         assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
         assert_eq!(calls(&fake, "worktree.create").len(), 1, "created once");
@@ -3179,13 +3183,74 @@ mod tests {
         fake.exit_pane(t.pane_id.as_deref().unwrap());
         wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
         let again = store.insert_retry(t.id).unwrap();
-        assert_eq!(again.spec.branch.as_deref(), Some(branch.as_str()));
+        assert_eq!(again.spec.reopen.as_ref().unwrap().branch, branch);
         let t = h.dispatch(again.id).await.unwrap();
         assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
         assert_eq!(calls(&fake, "worktree.create").len(), 1);
+        assert_eq!(t.spec.checkout, Some(checkout));
     }
 
-    /// A retry whose old checkout was removed meanwhile creates it again.
+    /// A task can fail before herdr made its worktree, here because another
+    /// task already has the branch the job names. That checkout is not the
+    /// failed task's, so its retry must not reopen it: it gets a branch and a
+    /// worktree of its own.
+    #[tokio::test]
+    async fn a_retry_never_reopens_a_checkout_its_task_did_not_make() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let on_branch = |store: &Store| {
+            let mut t = worktree_task(store);
+            t.spec.branch = Some("fix/x".into());
+            store.update_task(&mut t).unwrap();
+            t
+        };
+        let owner = h.dispatch(on_branch(&store).id).await.unwrap();
+        assert_eq!(owner.state, TaskState::Running, "{:?}", owner.error);
+        let loser = on_branch(&store);
+        h.dispatch(loser.id).await.unwrap_err();
+        let loser = store.get_task(loser.id).unwrap().unwrap();
+        assert_eq!(loser.state, TaskState::Failed);
+        assert_eq!(loser.spec.checkout, None);
+
+        let retry = store.insert_retry(loser.id).unwrap();
+        let t = h.dispatch(retry.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+        assert!(calls(&fake, "worktree.open").is_empty());
+        let created = calls(&fake, "worktree.create");
+        assert_eq!(created.len(), 3);
+        assert_eq!(created[2]["branch"], format!("pastor/t-{}", retry.id));
+    }
+
+    /// A failed task whose agent is still listed may be at work in its
+    /// checkout, and one whose checkout is now somewhere else is not the one
+    /// it made. Neither is reopened: the retry gets a new branch and worktree.
+    #[tokio::test]
+    async fn a_retry_reopens_only_a_checkout_whose_agent_is_gone_at_the_same_path() {
+        for moved in [false, true] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let first = h.dispatch(worktree_task(&store).id).await.unwrap();
+            let mut first = store.get_task(first.id).unwrap().unwrap();
+            first.state = TaskState::Failed;
+            if moved {
+                fake.exit_pane(first.pane_id.as_deref().unwrap());
+                first.spec.checkout.as_mut().unwrap().path = "/elsewhere".into();
+            }
+            store.update_task(&mut first).unwrap();
+
+            let retry = store.insert_retry(first.id).unwrap();
+            let t = h.dispatch(retry.id).await.unwrap();
+            assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+            assert!(calls(&fake, "worktree.open").is_empty(), "moved: {moved}");
+            let created = calls(&fake, "worktree.create");
+            assert_eq!(created.len(), 2);
+            assert_eq!(created[1]["branch"], format!("pastor/t-{}", retry.id));
+        }
+    }
+
+    /// A retry whose old checkout was removed meanwhile gets a new one.
     #[tokio::test]
     async fn a_retry_creates_the_worktree_when_the_old_one_is_gone() {
         let fake = FakeHerdr::new();
@@ -3209,7 +3274,7 @@ mod tests {
         assert!(calls(&fake, "worktree.open").is_empty());
         let created = calls(&fake, "worktree.create");
         assert_eq!(created.len(), 2);
-        assert_eq!(created[1]["branch"], format!("pastor/t-{}", first.id));
+        assert_eq!(created[1]["branch"], format!("pastor/t-{}", retry.id));
     }
 
     /// A stale task may still have its agent at work in its checkout, so its

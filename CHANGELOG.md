@@ -68,10 +68,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is done) leaves a running task `done`, not `failed` with "agent process
   exited". An exit while starting, blocked or working still fails the task.
 - `pastor task retry` of a failed worktree task no longer fails with git's
-  "fatal: '<path>' already exists": the retry keeps the old task's branch
-  and reopens its checkout with `worktree.open` when it is still on disk.
-  Only a failed task's retry does: a stale task's agent may still be at
-  work in its checkout, so its retry gets its own branch and worktree.
+  "fatal: '<path>' already exists": the retry reopens the old task's
+  checkout with `worktree.open`, on its branch, when the old task made that
+  checkout, it is still on disk at the same path and the old agent is gone.
+  Any other retry, a stale task's included, gets its own branch and
+  worktree.
 - A task whose agent finished its work and sat idle, waiting for input, no
   longer stays `running` until the session ends when the daemon restarted,
   or the flock or settings were reloaded, while the agent worked: whether

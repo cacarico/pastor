@@ -100,12 +100,33 @@ pub struct DispatchSpec {
     pub tags: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    /// Work on in the checkout of `branch` when it is still on disk, instead
-    /// of creating it. Only `Store::insert_retry` sets it, and only for a
-    /// retry of a failed task: that task's agent is gone and its work is in
-    /// the checkout. A stale task's agent may still be at work there.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reopen_worktree: bool,
+    /// The worktree this task works in, recorded by dispatch once herdr
+    /// has made (or reopened) it, so a retry knows the checkout is this
+    /// task's own. `None` until then, and on a task without a worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<Box<Checkout>>,
+    /// The checkout of the failed task this one retries, set only by
+    /// `Store::insert_retry` from that task's `checkout`. Dispatch reopens it
+    /// only when it is still on disk at the same path and that task's agent
+    /// is gone (`dispatch::reopenable`); otherwise the retry gets a new
+    /// branch and worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopen: Option<Box<Reopen>>,
+}
+
+/// A worktree herdr made for a task: its branch and where it is on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkout {
+    pub branch: String,
+    pub path: String,
+}
+
+/// A checkout a retry may go back to, and the agent that owned it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reopen {
+    pub branch: String,
+    pub path: String,
+    pub agent: String,
 }
 
 fn default_timeout() -> u64 {
@@ -315,7 +336,8 @@ mod tests {
                 machine: None,
                 tags: vec![],
                 timeout_secs: 10,
-                reopen_worktree: false,
+                checkout: None,
+                reopen: None,
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),

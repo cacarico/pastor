@@ -6,7 +6,7 @@ use tokio::time::Instant;
 use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
 };
-use crate::task::{DispatchSpec, Task, TaskState};
+use crate::task::{Checkout, DispatchSpec, Reopen, Task, TaskState};
 
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
 const READY_POLL: Duration = Duration::from_millis(500);
@@ -153,20 +153,20 @@ async fn dispatch_steps(
     if let Some(dir) = repo.as_deref() {
         check_repo_exists(conn, dir, task.machine.as_deref()).await?;
     }
-    let created = if spec.worktree {
+    let (created, branch) = if spec.worktree {
         let repo = repo
             .as_deref()
             .ok_or_else(|| HerdrError::Protocol("worktree = true needs repo".into()))?;
-        let branch = spec
-            .branch
-            .clone()
-            .unwrap_or_else(|| format!("pastor/{name}"));
-        open_worktree(conn, task, repo, &branch, name).await?
+        let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
+        (created, Some(branch))
     } else {
-        conn.workspace_create(repo.as_deref(), name).await?
+        (conn.workspace_create(repo.as_deref(), name).await?, None)
     };
     task.workspace_id = Some(created.workspace.workspace_id.clone());
     task.pane_id = Some(created.root_pane.pane_id.clone());
+    if let (Some(repo), Some(branch)) = (repo.as_deref(), branch) {
+        task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
+    }
 
     // herdr's `agent.start` returns as soon as it has launched the agent in the
     // pane; it never reports `agent_not_ready` (its errors are about the name,
@@ -185,29 +185,79 @@ async fn dispatch_steps(
     Ok(outcome)
 }
 
-/// The workspace of a worktree task. A retry of a failed task goes back to
-/// that task's checkout when it is still on disk (`Store::insert_retry` pins
-/// the branch and sets `reopen_worktree`): the failed task's work is there,
-/// and `worktree.create` would fail on it with git's "already exists".
-/// Anything else, a stale task's retry included, or a checkout removed
-/// since, gets a new one.
+/// The workspace of a worktree task, and the branch it is on: the checkout
+/// a retry may reopen (`reopenable`), or else a new worktree on the task's
+/// branch, `pastor/<name>` by default.
 async fn open_worktree(
     conn: &dyn Connector,
-    task: &Task,
+    spec: &DispatchSpec,
     repo: &str,
-    branch: &str,
     name: &str,
-) -> Result<Created, DispatchError> {
-    if task.spec.reopen_worktree
-        && conn
-            .worktree_list(repo)
-            .await?
-            .iter()
-            .any(|w| w.branch.as_deref() == Some(branch))
-    {
-        return Ok(conn.worktree_open(repo, branch, name).await?);
+) -> Result<(Created, String), DispatchError> {
+    if let Some(reopen) = reopenable(conn, spec, repo).await? {
+        let created = conn.worktree_open(repo, &reopen.branch, name).await?;
+        return Ok((created, reopen.branch.clone()));
     }
-    Ok(conn.worktree_create(repo, branch, name).await?)
+    let branch = spec
+        .branch
+        .clone()
+        .unwrap_or_else(|| format!("pastor/{name}"));
+    Ok((conn.worktree_create(repo, &branch, name).await?, branch))
+}
+
+/// The one rule for reopening a checkout. A retry goes back to the checkout
+/// of the failed task it retries (`DispatchSpec::reopen`, which
+/// `Store::insert_retry` sets only from the checkout that task's own
+/// dispatch recorded) only while it is on disk at the same path, on the same
+/// branch, and that task's agent is gone: the failed task's work is there,
+/// and nobody else is at work in it. Anything else is `None` and gets a new
+/// branch and worktree, since the checkout may now be another task's or the
+/// old agent may still be editing it.
+async fn reopenable<'a>(
+    conn: &dyn Connector,
+    spec: &'a DispatchSpec,
+    repo: &str,
+) -> Result<Option<&'a Reopen>, DispatchError> {
+    let Some(reopen) = spec.reopen.as_ref() else {
+        return Ok(None);
+    };
+    let on_disk = conn
+        .worktree_list(repo)
+        .await?
+        .iter()
+        .any(|w| w.path == reopen.path && w.branch.as_deref() == Some(reopen.branch.as_str()));
+    if !on_disk {
+        return Ok(None);
+    }
+    let agent_listed = conn
+        .agent_list()
+        .await?
+        .iter()
+        .any(|a| a.name.as_deref() == Some(reopen.agent.as_str()));
+    Ok((!agent_listed).then_some(reopen))
+}
+
+/// The checkout herdr just made or reopened for this task, recorded so that
+/// a retry knows it is this task's own. Taken from `worktree.list`, the
+/// listing `reopenable` compares against, by the workspace showing it.
+async fn find_checkout(
+    conn: &dyn Connector,
+    repo: &str,
+    branch: String,
+    created: &Created,
+) -> Result<Option<Box<Checkout>>, DispatchError> {
+    let workspace = created.workspace.workspace_id.as_str();
+    Ok(conn
+        .worktree_list(repo)
+        .await?
+        .into_iter()
+        .find(|w| w.open_workspace_id.as_deref() == Some(workspace))
+        .map(|w| {
+            Box::new(Checkout {
+                branch: w.branch.unwrap_or(branch),
+                path: w.path,
+            })
+        }))
 }
 
 /// `agent.start`, retried while herdr says the pane is busy: its shell has not
@@ -444,7 +494,8 @@ mod tests {
             machine: None,
             tags: vec![],
             timeout_secs: 60,
-            reopen_worktree: false,
+            checkout: None,
+            reopen: None,
         }
     }
 

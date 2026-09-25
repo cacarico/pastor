@@ -451,7 +451,8 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
         machine: a.machine.clone(),
         tags: a.tags.clone(),
         timeout_secs: timeout.as_secs(),
-        reopen_worktree: false,
+        checkout: None,
+        reopen: None,
     })
 }
 

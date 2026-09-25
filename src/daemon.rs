@@ -1329,7 +1329,8 @@ mod tests {
             machine: None,
             tags: vec![],
             timeout_secs: 60,
-            reopen_worktree: false,
+            checkout: None,
+            reopen: None,
         }
     }
 
