@@ -839,7 +839,7 @@ impl Fleet {
 /// the fleet. The CLI says the same for a change it makes on its own.
 pub fn agent_refusal(task: &str) -> String {
     format!(
-        "{task} is an agent pastor started, and agents may not change the fleet (run, send to or close tasks, run jobs, edit machines, flocks or jobs); set agents_change_fleet = true in pastor.toml to allow it"
+        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink plugins, edit machines, flocks or jobs); set agents_change_fleet = true in pastor.toml to allow it"
     )
 }
 
@@ -2854,6 +2854,34 @@ mod tests {
             ask_from_task(&socket, &list).await,
             IpcResponse::Tasks(_)
         ));
+    }
+
+    /// The refusal names every operation it covers, so its advice holds for
+    /// whichever one was refused.
+    #[test]
+    fn the_agent_refusal_names_every_refused_operation() {
+        let message = agent_refusal("t-9");
+        for op in [
+            "run",
+            "send",
+            "attach",
+            "retry",
+            "close",
+            "prune",
+            "tick",
+            "dry",
+            "reload",
+            "install",
+            "link",
+            "uninstall",
+            "unlink",
+            "plugins",
+            "machines",
+            "flocks",
+            "jobs",
+        ] {
+            assert!(message.contains(op), "{op}: {message}");
+        }
     }
 
     /// `agents_change_fleet = true` in pastor.toml turns the guard off.
