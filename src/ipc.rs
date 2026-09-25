@@ -227,15 +227,32 @@ pub fn connect_error_means_no_daemon(err: &std::io::Error) -> bool {
     )
 }
 
-pub async fn probe_daemon(socket: &Path) -> DaemonProbe {
+/// What one ping at the head's socket found, with the pong's fields when
+/// there was one: `probe_daemon`, keeping what the head said about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadPing {
+    NotRunning,
+    Unresponsive,
+    Pong { version: String, protocol: u32 },
+}
+
+pub async fn ping_head(socket: &Path) -> HeadPing {
     let stream = match tokio::net::UnixStream::connect(socket).await {
         Ok(s) => s,
-        Err(err) if connect_error_means_no_daemon(&err) => return DaemonProbe::NotRunning,
-        Err(_) => return DaemonProbe::Unresponsive,
+        Err(err) if connect_error_means_no_daemon(&err) => return HeadPing::NotRunning,
+        Err(_) => return HeadPing::Unresponsive,
     };
     match tokio::time::timeout(PING_TIMEOUT, round_trip(stream, &IpcRequest::Ping)).await {
-        Ok(Ok(IpcResponse::Pong { .. })) => DaemonProbe::Running,
-        _ => DaemonProbe::Unresponsive,
+        Ok(Ok(IpcResponse::Pong { version, protocol })) => HeadPing::Pong { version, protocol },
+        _ => HeadPing::Unresponsive,
+    }
+}
+
+pub async fn probe_daemon(socket: &Path) -> DaemonProbe {
+    match ping_head(socket).await {
+        HeadPing::NotRunning => DaemonProbe::NotRunning,
+        HeadPing::Unresponsive => DaemonProbe::Unresponsive,
+        HeadPing::Pong { .. } => DaemonProbe::Running,
     }
 }
 

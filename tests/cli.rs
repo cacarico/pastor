@@ -421,12 +421,13 @@ fn machine_add_and_remove_edit_the_file() {
 }
 
 /// Copilot 4102376166: a socket that accepts but never answers `Ping` is
-/// `Unresponsive` (a busy head), not the same as no daemon at all. `machine
-/// add` must not send the "start pastor serve" advice in that case, since a
-/// live head is sitting right there; it tells the user the next scheduler
-/// tick will pick up the edit instead.
+/// `Unresponsive` (a busy head), not the same as no daemon at all, so
+/// `machine add` must not send the "start pastor serve" advice. Copilot
+/// 4106353416: nor may it write the edit, since that head may be one from
+/// before flocks that reloads it later as one flock; it is refused
+/// (`head_too_old`) with flock.toml untouched.
 #[test]
-fn machine_add_tells_a_wedged_head_apart_from_no_head() {
+fn machine_add_refuses_a_wedged_head_rather_than_taking_it_for_no_head() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
@@ -445,20 +446,13 @@ fn machine_add_tells_a_wedged_head_apart_from_no_head() {
         .env("PASTOR_STATE_DIR", &state)
         .output()
         .unwrap();
+    assert_eq!(error_code(&out), "head_too_old");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        !stderr.contains("start pastor serve") && stderr.contains("not answering"),
+        "a busy head must not get the start advice: {stderr}"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(
-        !stdout.contains("start pastor serve"),
-        "a busy head must not get the start advice: {stdout}"
-    );
-    assert!(
-        stdout.contains("not answering") && stdout.contains("next scheduler tick"),
-        "{stdout}"
-    );
+    assert!(!config.join("flock.toml").exists());
 }
 
 #[test]
@@ -1444,6 +1438,41 @@ fn machine_list_without_daemon_shows_a_local_machine_s_pastor_version() {
     );
 }
 
+/// A head at `socket` that records each request's op and answers every one
+/// with `reply`.
+fn fake_head(
+    socket: &std::path::Path,
+    reply: &'static [u8],
+) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = ops.clone();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            seen.lock()
+                .unwrap()
+                .push(req["op"].as_str().unwrap_or_default().to_string());
+            let _ = stream.write_all(reply);
+        }
+    });
+    ops
+}
+
+/// What a 0.3.0 head answers to ping: a pong with no protocol.
+const OLD_PONG: &[u8] = b"{\"kind\":\"pong\",\"data\":{\"version\":\"0.3.0\"}}\n";
+
+/// A head that takes the connection but never answers ping with a pong, as
+/// a busy or wedged one looks from outside.
+const NO_PONG: &[u8] = b"{\"kind\":\"error\",\"data\":{\"code\":\"boom\",\"message\":\"nope\"}}\n";
+
+const NAMED_FLOCKS: &str =
+    "[[flock]]\nname = \"work\"\ndefault = true\n\n[[machine]]\nname = \"pi-1\"\nlocal = true\n";
+
 /// A head from before flocks ignores the `flock` field of a `run` request
 /// (serde skips unknown fields) and would queue the task in any flock. The
 /// CLI asks the head's IPC protocol first and refuses `--flock` on an old
@@ -1457,25 +1486,7 @@ fn flock_flags_refuse_a_head_from_before_flocks() {
     let state = tmp.path().join("s");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::create_dir_all(&state).unwrap();
-
-    let socket = state.join("pastor.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let seen = ops.clone();
-    std::thread::spawn(move || {
-        use std::io::{BufRead, Write};
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { return };
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
-            let req: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
-            seen.lock()
-                .unwrap()
-                .push(req["op"].as_str().unwrap_or_default().to_string());
-            // What a 0.3.0 head answers: a pong with no protocol.
-            let _ = stream.write_all(b"{\"kind\":\"pong\",\"data\":{\"version\":\"0.3.0\"}}\n");
-        }
-    });
+    let ops = fake_head(&state.join("pastor.sock"), OLD_PONG);
 
     let run = |args: &[&str]| {
         pastor()
@@ -1485,14 +1496,14 @@ fn flock_flags_refuse_a_head_from_before_flocks() {
             .output()
             .unwrap()
     };
-    assert_eq!(
-        error_code(&run(&["task", "run", "hi", "--flock", "work"])),
-        "head_too_old"
-    );
-    assert_eq!(
-        error_code(&run(&["task", "list", "--flock", "work"])),
-        "head_too_old"
-    );
+    for args in [
+        &["task", "run", "hi", "--flock", "work"][..],
+        &["task", "list", "--flock", "work"],
+        // Copilot 4106353529: an old head's machines carry no flock.
+        &["machine", "list", "--flock", "work"],
+    ] {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+    }
 
     // Copilot 4106204671: flock.toml edits the old head would reload but not
     // honour (it reads every machine as one flock) are refused before the
@@ -1504,12 +1515,90 @@ fn flock_flags_refuse_a_head_from_before_flocks() {
         &["flock", "add", "work"][..],
         &["flock", "add", "work", "--default"],
         &["flock", "default", "default"],
+        &["flock", "remove", "default"],
         &["machine", "add", "pi-2", "--local"],
         &["machine", "move", "pi-1", "default"],
+        &["machine", "remove", "pi-1"],
     ] {
         assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
         assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), before);
     }
+    let ops = ops.lock().unwrap();
+    assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
+}
+
+/// Copilot 4106353474: once flock.toml declares named flocks, a command with
+/// no `--flock` still means "the default flock", which an old head would
+/// read as every machine. So every path that talks to or reloads the head
+/// asks its protocol first, not only the ones that take `--flock`.
+#[test]
+fn named_flocks_refuse_every_head_path_on_a_head_from_before_flocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(config.join("flock.toml"), NAMED_FLOCKS).unwrap();
+    let ops = fake_head(&state.join("pastor.sock"), OLD_PONG);
+
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["task", "run", "hi"][..],
+        &["task", "list"],
+        &["task", "show", "t-1"],
+        &["machine", "list"],
+        &["flock", "list"],
+        &["job", "list"],
+        &["tick"],
+    ] {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+    }
+    let ops = ops.lock().unwrap();
+    assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
+}
+
+/// Copilot 4106353416: a head that is listening but does not answer ping
+/// may be an old one, busy. With flocks in play it is refused like one,
+/// never taken for no head at all, which would write the edit for it to
+/// reload later as one flock.
+#[test]
+fn an_unresponsive_head_is_refused_when_flocks_are_in_play() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let flock_file = config.join("flock.toml");
+    let before = "[[machine]]\nname = \"pi-1\"\nlocal = true\n";
+    std::fs::write(&flock_file, before).unwrap();
+    let ops = fake_head(&state.join("pastor.sock"), NO_PONG);
+
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["flock", "add", "work"][..],
+        &["flock", "remove", "default"],
+        &["machine", "move", "pi-1", "default"],
+        &["task", "run", "hi", "--flock", "work"],
+    ] {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+        assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), before);
+    }
+    std::fs::write(&flock_file, NAMED_FLOCKS).unwrap();
+    assert_eq!(error_code(&run(&["task", "run", "hi"])), "head_too_old");
     let ops = ops.lock().unwrap();
     assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
 }

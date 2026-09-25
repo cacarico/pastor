@@ -264,11 +264,15 @@ its run before the connector is asked for anything, with the reason in
 `pastor job list`. A flock removed while the connector runs gets none of that
 run's tasks: each item fails, and the cursor holds for the next run. `pastor task retry` keeps the flock of the task it copies, and is refused
 (`unknown_flock`) once that flock has been removed. A head
-started from a pastor before flocks would ignore `--flock`, so `task run` and
-`task list` refuse it there (`head_too_old`): restart `pastor serve` after an
-upgrade. It would also reload `flock.toml` and ignore the flocks in it, so
-`flock add|default|remove` and `machine add|move` refuse to edit the file
-while such a head runs.
+started from a pastor before flocks would ignore `--flock` and read
+`flock.toml` as one flock, so while flocks are in play every command that
+talks to or reloads the head asks its protocol first and refuses an old one
+(`head_too_old`): restart `pastor serve` after an upgrade. Flocks are in play
+when the command takes `--flock`, edits `flock.toml` (`flock add|default|remove`,
+`machine add|remove|move`), or `flock.toml` declares named flocks, since then
+no `--flock` means the default flock rather than every machine. A head that
+is listening but does not answer is refused the same way, since it may be an
+old one; only a head that is not running at all is passed by.
 
 `pastor machine move` changes the flock of tasks dispatched after it; tasks
 already on the machine keep running there, and its connection stays up. A

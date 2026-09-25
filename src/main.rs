@@ -7,7 +7,9 @@ use pastor::config::flock::{EditError, Flock, FlockDoc, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{PastorConfig, Paths, parse_duration};
 use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
-use pastor::ipc::{DaemonProbe, IpcRequest, IpcResponse, daemon_running, probe_daemon, request};
+use pastor::ipc::{
+    DaemonProbe, HeadPing, IpcRequest, IpcResponse, daemon_running, probe_daemon, request,
+};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
 use pastor::task::{DispatchSpec, Task, TaskState, parse_task_id};
@@ -288,6 +290,9 @@ fn main() {
     };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async {
+        if flocks_in_play(&command, &paths) {
+            require_flock_head(&paths).await?;
+        }
         match command {
             Command::Serve => pastor::daemon::serve(paths).await,
             Command::Task { cmd } => task(&paths, cmd).await,
@@ -341,39 +346,69 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
     Ok(resp)
 }
 
-/// Before a request carrying `--flock` goes to the head: a head from before
-/// flocks would ignore the field and act on every flock, so it is refused.
+/// The one gate before a command talks to or reloads the head while flocks
+/// are in play (`flocks_in_play`). A head from before flocks ignores the
+/// `flock` field of a request (serde skips unknown fields) and reads
+/// flock.toml as one flock, so it would dispatch, list or reload across
+/// every flock. Only a head that is not running passes unchecked; one that
+/// listens but does not answer ping may be an old head, busy, and is refused
+/// like one rather than taken for no head.
 async fn require_flock_head(paths: &Paths) -> anyhow::Result<()> {
-    let IpcResponse::Pong { version, protocol } = ask(paths, IpcRequest::Ping).await? else {
-        fail("runtime_error", "the head did not answer ping with pong");
-    };
-    if protocol < pastor::ipc::FLOCK_PROTOCOL {
-        fail(
+    let too_old = |why: String| {
+        Err(pastor::cli::CliError::err(
             "head_too_old",
-            &format!(
-                "the running pastor serve ({version}) predates flocks and would ignore --flock; restart it"
-            ),
-        );
+            format!("{why}; restart it, or stop it to work without a head"),
+        ))
+    };
+    match pastor::ipc::ping_head(&paths.socket_file()).await {
+        HeadPing::NotRunning => Ok(()),
+        HeadPing::Pong { protocol, .. } if protocol >= pastor::ipc::FLOCK_PROTOCOL => Ok(()),
+        HeadPing::Pong { version, .. } => too_old(format!(
+            "the running pastor serve ({version}) predates flocks and would act on every flock"
+        )),
+        HeadPing::Unresponsive => too_old(
+            "pastor serve is listening but not answering, so it cannot be checked to understand flocks"
+                .into(),
+        ),
     }
-    Ok(())
 }
 
-/// Before a flock.toml edit that changes which flock a machine is in, when a
-/// head runs: the reload after it would reach a head from before flocks,
-/// which reads every machine as one flock and dispatches across the edit.
-async fn require_flock_head_if_running(paths: &Paths) -> anyhow::Result<()> {
-    if daemon_running(&paths.socket_file()).await {
-        require_flock_head(paths).await?;
-    }
-    Ok(())
+/// Whether `command` talks to or reloads the head with flocks in play: it
+/// takes `--flock`, it edits flock.toml, or flock.toml declares named flocks
+/// (then no `--flock` means the default flock, not every machine). A
+/// flock.toml that does not load counts as declaring them.
+fn flocks_in_play(command: &Command, paths: &Paths) -> bool {
+    use pastor::plugin::cli::PluginCmd;
+    let (talks, flocky) = match command {
+        Command::Task { cmd } => (
+            true,
+            match cmd {
+                TaskCmd::Run(a) => a.flock.is_some(),
+                TaskCmd::List(a) => a.flock.is_some(),
+                _ => false,
+            },
+        ),
+        Command::Machine { cmd } => (
+            true,
+            match cmd {
+                MachineCmd::List { flock, .. } => flock.is_some(),
+                _ => true,
+            },
+        ),
+        Command::Flock { cmd } => (true, !matches!(cmd, FlockCmd::List { .. })),
+        Command::Tick(_) | Command::Job { .. } => (true, false),
+        Command::Plugin { cmd } => (
+            !matches!(cmd, PluginCmd::List { .. } | PluginCmd::Run { .. }),
+            false,
+        ),
+        _ => (false, false),
+    };
+    talks && (flocky || Flock::load(&paths.flock_file()).map_or(true, |f| !f.flocks.is_empty()))
 }
 
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     let config = PastorConfig::load(&paths.config_file())?;
     let spec = run_spec(&a, &config)?;
-    if a.flock.is_some() {
-        require_flock_head(paths).await?;
-    }
     let IpcResponse::Task(t) = ask(
         paths,
         IpcRequest::Run {
@@ -680,9 +715,6 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         flock: a.flock.clone(),
     };
     let daemon_up = daemon_running(&paths.socket_file()).await;
-    if daemon_up && filter.flock.is_some() {
-        require_flock_head(paths).await?;
-    }
     let tasks = if daemon_up {
         let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
             unreachable!()
@@ -807,7 +839,6 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
             flock,
             herdr,
         } => {
-            require_flock_head_if_running(paths).await?;
             let mut doc = FlockDoc::open(&path)?;
             let m = MachineConfig {
                 name: name.clone(),
@@ -892,7 +923,6 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
             }
         }
         MachineCmd::Move { name, flock } => {
-            require_flock_head_if_running(paths).await?;
             let mut doc = FlockDoc::open(&path)?;
             doc.move_machine(&name, &flock).map_err(edit_error)?;
             doc.save(&path)?;
@@ -921,7 +951,6 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
     let done = match cmd {
         FlockCmd::List { json } => return flock_list(paths, json).await,
         FlockCmd::Add { name, default } => {
-            require_flock_head_if_running(paths).await?;
             edit(&|d| d.add_flock(&name, default))?;
             if default {
                 format!("added flock {name}, now the default")
@@ -933,7 +962,6 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
             // With a head, the head checks and edits under the lock `task
             // run` takes, so no task can be queued in the flock in between.
             if daemon_running(&paths.socket_file()).await {
-                require_flock_head(paths).await?;
                 let IpcResponse::Text(done) = ask(paths, IpcRequest::FlockRemove { name }).await?
                 else {
                     unreachable!()
@@ -954,7 +982,6 @@ async fn flock(paths: &Paths, cmd: FlockCmd) -> anyhow::Result<()> {
             format!("removed flock {name}")
         }
         FlockCmd::Default { name } => {
-            require_flock_head_if_running(paths).await?;
             edit(&|d| d.set_default(&name))?;
             format!("{name} is the default flock; machines stay in their flocks")
         }
