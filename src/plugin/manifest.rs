@@ -307,13 +307,30 @@ impl std::fmt::Display for Version {
 }
 
 pub fn pastor_version() -> Version {
-    Version::parse(env!("CARGO_PKG_VERSION")).expect("the crate version is major.minor.patch")
+    crate_version(env!("CARGO_PKG_VERSION"))
+}
+
+/// The crate version as `min_pastor_version` compares it: the release it
+/// leads up to, without a pre-release or build suffix. A release candidate
+/// (`0.4.0-rc.1`) has that release's features, so it counts as `0.4.0`.
+fn crate_version(v: &str) -> Version {
+    let release = v.split(['-', '+']).next().unwrap_or(v);
+    Version::parse(release).expect("the crate version starts with major.minor.patch")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_pre_release_crate_version_compares_as_its_release() {
+        assert_eq!(crate_version("0.4.0-rc.1"), Version(0, 4, 0));
+        assert_eq!(crate_version("0.4.0+build.7"), Version(0, 4, 0));
+        assert_eq!(crate_version("0.3.0"), Version(0, 3, 0));
+        // Whatever Cargo.toml says, this must not panic.
+        let _ = pastor_version();
+    }
 
     const SPEC_EXAMPLE: &str = r#"
 id = "slack"
