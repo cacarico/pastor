@@ -45,7 +45,7 @@ case "$os/$arch" in
     Linux/riscv64) target=riscv64gc-unknown-linux-musl ;;
     Darwin/arm64) target=aarch64-apple-darwin ;;
     Darwin/x86_64) target=x86_64-apple-darwin ;;
-    *) fail "no prebuilt pastor for $os/$arch; build one with: cargo install --git https://github.com/$repo --locked --bin pastor" ;;
+    *) fail "no prebuilt pastor for $os/$arch; build one with: cargo install pastor-cli --locked" ;;
 esac
 # A 64-bit kernel over a 32-bit userland (common on Raspberry Pi OS) reports
 # aarch64 but cannot run a 64-bit binary.

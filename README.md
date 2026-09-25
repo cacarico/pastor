@@ -59,11 +59,13 @@ curl -fsSL https://raw.githubusercontent.com/cacarico/pastor/main/install.sh | s
 It picks the release tarball for your OS and architecture, checks it against
 the release's `SHA256SUMS`, and puts one binary in `~/.local/bin`.
 `PASTOR_VERSION` and `PASTOR_INSTALL_DIR` override the version and the
-directory. The same binary through cargo, or built from source:
+directory. The same binary through cargo, or built from source. On
+crates.io the crate is `pastor-cli` (`pastor` there is another project); the
+command it installs is still `pastor`:
 
 ```sh
-cargo binstall --git https://github.com/cacarico/pastor pastor       # the release tarball
-cargo install --git https://github.com/cacarico/pastor --locked --bin pastor   # from source: Rust 1.88+ and a C compiler
+cargo binstall pastor-cli          # the release tarball
+cargo install pastor-cli --locked  # from source: Rust 1.88+ and a C compiler
 ```
 
 Every release ships `SHA256SUMS` and a GitHub build provenance attestation;

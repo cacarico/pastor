@@ -81,6 +81,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   move the three `plugins/` directories to `connectors/`, or reinstall. A
   connector still holds a connector command, event hooks, or both. "Plugin"
   is kept for a later idea: code that changes how pastor itself behaves.
+
+- The crate is `pastor-cli` on crates.io, because `pastor` there belongs to
+  another project: `cargo install pastor-cli` and `cargo binstall pastor-cli`
+  install the `pastor` binary. The command, the release tarballs and
+  `install.sh` keep the name pastor, and `fake-herdr` is left out of the
+  published package.
+
 - Agent args follow the agent they were written for: `[defaults] agent_args`
   no longer reach a task that runs another agent than `[defaults] agent`
   (`pastor task run --agent codex` used to get Claude's `--model`).

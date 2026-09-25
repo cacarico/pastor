@@ -1,5 +1,8 @@
+# Published on crates.io as pastor-cli, because the `pastor` name there
+# belongs to another project. The library and the installed binary are
+# still called pastor.
 [package]
-name = "pastor"
+name = "pastor-cli"
 version = "0.4.0"
 edition = "2024"
 # Let chains (stable since 1.88) are used throughout; raising this is a
@@ -7,6 +10,32 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/cacarico/pastor"
+description = "Run coding agents on machines you own, through herdr"
+readme = "README.md"
+keywords = ["agents", "herdr", "fleet", "daemon", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# What `cargo publish` uploads: what the pastor binary builds from, and
+# nothing else. fake-herdr (src/bin) is a test double for the suite, so it
+# stays out and `cargo install pastor-cli` installs pastor alone.
+include = [
+    "/src/**/*.rs",
+    "!/src/bin/**",
+    "/skills/pastor/SKILL.md",
+    "/contrib/systemd/*.service",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/CHANGELOG.md",
+]
+
+[lib]
+name = "pastor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pastor"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -36,28 +65,29 @@ strip = true
 lto = true
 
 # cargo-binstall fetches the tarballs that .github/workflows/release.yml
-# publishes instead of compiling. The crate is not on crates.io (the name is
-# taken there), so it is used as
-#   cargo binstall --git https://github.com/cacarico/pastor pastor
-# Only musl Linux binaries are released; the overrides send glibc hosts to
-# them so one Linux flavour covers every distro.
+# publishes instead of compiling:
+#   cargo binstall pastor-cli
+# The tarballs keep the binary's name, pastor, not the crate's, so the URLs
+# spell it out rather than use { name }. Only musl Linux binaries are
+# released; the overrides send glibc hosts to them so one Linux flavour
+# covers every distro.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
-bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-url = "{ repo }/releases/download/v{ version }/pastor-{ version }-{ target }.tar.gz"
+bin-dir = "pastor-{ version }-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-x86_64-unknown-linux-musl.tar.gz"
-bin-dir = "{ name }-{ version }-x86_64-unknown-linux-musl/{ bin }"
+pkg-url = "{ repo }/releases/download/v{ version }/pastor-{ version }-x86_64-unknown-linux-musl.tar.gz"
+bin-dir = "pastor-{ version }-x86_64-unknown-linux-musl/{ bin }"
 
 [package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-aarch64-unknown-linux-musl.tar.gz"
-bin-dir = "{ name }-{ version }-aarch64-unknown-linux-musl/{ bin }"
+pkg-url = "{ repo }/releases/download/v{ version }/pastor-{ version }-aarch64-unknown-linux-musl.tar.gz"
+bin-dir = "pastor-{ version }-aarch64-unknown-linux-musl/{ bin }"
 
 [package.metadata.binstall.overrides.riscv64gc-unknown-linux-gnu]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-riscv64gc-unknown-linux-musl.tar.gz"
-bin-dir = "{ name }-{ version }-riscv64gc-unknown-linux-musl/{ bin }"
+pkg-url = "{ repo }/releases/download/v{ version }/pastor-{ version }-riscv64gc-unknown-linux-musl.tar.gz"
+bin-dir = "pastor-{ version }-riscv64gc-unknown-linux-musl/{ bin }"
 
 [package.metadata.binstall.overrides.armv7-unknown-linux-gnueabihf]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-armv7-unknown-linux-musleabihf.tar.gz"
-bin-dir = "{ name }-{ version }-armv7-unknown-linux-musleabihf/{ bin }"
+pkg-url = "{ repo }/releases/download/v{ version }/pastor-{ version }-armv7-unknown-linux-musleabihf.tar.gz"
+bin-dir = "pastor-{ version }-armv7-unknown-linux-musleabihf/{ bin }"

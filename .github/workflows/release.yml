@@ -11,6 +11,8 @@
 # install.sh and cargo-binstall pick up. The tarballs and SHA256SUMS get a
 # GitHub build provenance attestation, so a download can be tied back to
 # this workflow, this commit and this tag with `gh attestation verify`.
+# crates.io is not published from here: the maintainer runs `cargo publish`
+# from the tag by hand (the crate is pastor-cli there, see CONTRIBUTING.md).
 name: release
 
 on:
@@ -68,7 +70,8 @@ jobs:
       - run: make check
 
   # One tarball per target, named pastor-<version>-<target>.tar.gz, which is
-  # what install.sh and the binstall metadata in Cargo.toml expect. The
+  # what install.sh and the binstall metadata in Cargo.toml expect. The name
+  # is the binary's, not the crate's (pastor-cli). The
   # smoke step runs the binary where the runner can execute it: it catches
   # a build that links but cannot start, which a cross-compile alone would
   # not.

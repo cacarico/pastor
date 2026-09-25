@@ -71,7 +71,11 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   `vX.Y.Z` on `main`. `.github/workflows/release.yml` builds the tarballs
   and drafts the GitHub release with that section as notes. Before
   publishing the draft, check the tag's signature with `git tag -v vX.Y.Z`;
-  an unsigned or unverified tag is deleted, not published.
+  an unsigned or unverified tag is deleted, not published. Then publish the
+  crate from that tag: `git checkout vX.Y.Z && cargo publish`. It goes to
+  crates.io as `pastor-cli`, since `pastor` is taken there, and installs the
+  `pastor` binary only (`fake-herdr` is left out of the package).
+  `cargo publish --dry-run` shows what would go up without a token.
 - Artifacts are never replaced and a tag is never moved. A bad release gets
   a new patch release and a warning in its own notes.
 - Before 1.0, only the latest minor gets fixes.
