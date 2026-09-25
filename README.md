@@ -50,15 +50,50 @@ spend time deciding what to do, not typing it. The longer story is in
 
 ## Install
 
+One line, no Rust toolchain and no sudo:
+
 ```sh
-cargo install --git https://github.com/cacarico/pastor --locked --bin pastor
+curl -fsSL https://raw.githubusercontent.com/cacarico/pastor/main/install.sh | sh
 ```
 
-Every machine in the fleet needs [herdr](https://herdr.dev) 0.9 or newer with
-its server running. A machine on another host is reached over ssh, which must
-work from the head without a passphrase prompt; the head itself joins as a
-local machine with no ssh at all. The agents themselves (`claude`, `opencode`,
-...) are installed on each machine the usual way.
+It picks the release tarball for your OS and architecture, checks it against
+the release's `SHA256SUMS`, and puts one binary in `~/.local/bin`.
+`PASTOR_VERSION` and `PASTOR_INSTALL_DIR` override the version and the
+directory. The same binary through cargo, or built from source:
+
+```sh
+cargo binstall --git https://github.com/cacarico/pastor pastor       # the release tarball
+cargo install --git https://github.com/cacarico/pastor --locked --bin pastor   # from source: Rust 1.88+ and a C compiler
+```
+
+Every release ships `SHA256SUMS` and a GitHub build provenance attestation;
+`gh attestation verify pastor-<version>-<target>.tar.gz --repo cacarico/pastor`
+checks a download by hand. Releases are built by
+`.github/workflows/release.yml`; the policy is in `CONTRIBUTING.md`.
+
+### Supported platforms
+
+| Platform | Tier |
+|---|---|
+| Linux x86_64, aarch64 | 1: built, tested in CI and released |
+| Linux armv7, riscv64 | 2: built and released, not tested in CI |
+| macOS arm64, x86_64 | 2: built and released, not tested in CI; config lands under `~/Library/Application Support` and a local herdr is not found yet |
+| FreeBSD x86_64 | 3: `cargo check` on every pull request, no binaries |
+| Windows | not supported; use WSL2 |
+
+Linux binaries are static (musl), so one tarball per architecture runs on
+every distro and every Raspberry Pi OS release.
+
+### Runtime dependencies
+
+- **herdr** 0.9 or newer on every machine in the fleet, with its server
+  running. See [herdr.dev](https://herdr.dev).
+- **ssh** on the head, to reach machines on other hosts. It must work
+  without a passphrase prompt; the head itself joins as a local machine with
+  no ssh at all.
+- **git** on the head, for `pastor plugin install`.
+- The agents themselves (`claude`, `opencode`, ...) are installed on each
+  machine the usual way.
 
 ## Quick start
 
