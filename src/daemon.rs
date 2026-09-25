@@ -100,6 +100,50 @@ pub struct Daemon {
     events: broadcast::Sender<PastorEvent>,
 }
 
+/// SIGTERM and SIGHUP, alongside ctrl_c's SIGINT, so `run_with_listener` can
+/// select over all three without an attribute on a `tokio::select!` branch
+/// (the macro does not support `#[cfg(...)]` there). Unix-only underneath,
+/// like the rest of this file's `tokio::net::UnixListener`; on any other
+/// platform `recv` simply never resolves, leaving ctrl_c as the only way in.
+#[cfg(unix)]
+struct ExtraSignals {
+    sigterm: tokio::signal::unix::Signal,
+    sighup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ExtraSignals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(ExtraSignals {
+            sigterm: signal(SignalKind::terminate())?,
+            sighup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    /// The log line for whichever signal arrived first.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.sigterm.recv() => "shutting down on SIGTERM; agents keep running",
+            _ = self.sighup.recv() => "shutting down on SIGHUP; agents keep running",
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ExtraSignals;
+
+#[cfg(not(unix))]
+impl ExtraSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(ExtraSignals)
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        std::future::pending().await
+    }
+}
+
 impl Daemon {
     pub async fn start(
         paths: Paths,
@@ -250,9 +294,17 @@ impl Daemon {
     }
 
     /// The accept/tick/event loop, given a socket this daemon already owns.
+    ///
+    /// systemd counts SIGTERM, SIGHUP and SIGINT as a clean exit and will not
+    /// restart a `Restart=on-failure` unit after any of them. Before this,
+    /// `pastor serve` only handled SIGINT (ctrl-c), so a stray SIGTERM or
+    /// SIGHUP from outside a terminal killed the head silently: no log line
+    /// past the start message, the socket file left behind, and the unit
+    /// stayed down. All three now take the same shutdown path.
     pub async fn run_with_listener(self, listener: tokio::net::UnixListener) -> anyhow::Result<()> {
         let socket = self.socket_path();
         let daemon = Arc::new(self);
+        let mut extra_signals = ExtraSignals::new()?;
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -273,6 +325,11 @@ impl Daemon {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("shutting down; agents keep running");
+                    let _ = std::fs::remove_file(&socket);
+                    return Ok(());
+                }
+                msg = extra_signals.recv() => {
+                    tracing::info!("{msg}");
                     let _ = std::fs::remove_file(&socket);
                     return Ok(());
                 }
@@ -578,8 +635,10 @@ mod tests {
 
     /// `run` must replace a stale socket file left behind by an unclean shutdown
     /// (nothing is listening on it) instead of refusing to start. Shutdown-time
-    /// removal of the socket is not exercised here: `run` only exits on ctrl-c,
-    /// and sending that signal from a test would affect the whole test process.
+    /// removal of the socket is not exercised here: `run` only exits on
+    /// ctrl-c/SIGTERM/SIGHUP, and sending one of those to this process would
+    /// affect the whole test process. `tests/cli.rs` covers the SIGTERM path
+    /// against a real `pastor serve` child instead.
     #[tokio::test]
     async fn run_replaces_a_stale_socket_file() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;

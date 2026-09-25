@@ -924,3 +924,104 @@ fn machine_status_creates_the_ssh_dir_private_before_ssh_runs() {
         assert_eq!(mode, 0o700, "{} is {mode:o}", dir.display());
     }
 }
+
+/// systemd counts SIGTERM as a clean exit and would not restart a
+/// `Restart=on-failure` unit after one; `pastor serve` used to only handle
+/// SIGINT (ctrl-c), so a SIGTERM from `systemctl stop` on the wrong signal,
+/// an OOM killer, or a shell job control quirk killed the head silently,
+/// with the socket file left behind and the unit never coming back. Drives
+/// a real `pastor serve` child (no fake-herdr machine is needed: an empty
+/// flock is enough to bind the socket), sends it SIGTERM and checks that it
+/// exits cleanly, removes its socket, and logs which signal it got.
+#[test]
+fn sigterm_shuts_the_daemon_down_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+
+    // `pastor serve` refuses an empty flock, so it needs one machine; a
+    // `command` machine backed by fake-herdr is the cheapest way to get one
+    // without a real fleet.
+    let socket = tmp.path().join("herdr.sock");
+    let mut herdr = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+        .arg("--listen")
+        .arg(&socket)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        format!(
+            "[[machine]]\nname = \"fake\"\ncommand = [\"{}\", \"--connect\", \"{}\"]\nmax_agents = 2\n",
+            env!("CARGO_BIN_EXE_fake-herdr"),
+            socket.display()
+        ),
+    )
+    .unwrap();
+
+    let stderr_path = tmp.path().join("serve.stderr");
+    let mut serve = pastor()
+        .args(["serve"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+
+    let cmd = |args: &[&str]| -> std::process::Output {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = cmd(&["machine", "list", "--json"]);
+        if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("\"connected\"") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never reported the machine connected: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let pid = serve.id().to_string();
+    let killed = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    assert!(killed.success(), "kill -TERM {pid} failed to run");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exit = loop {
+        if let Some(status) = serve.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pastor serve did not exit within 5s of SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(exit.success(), "pastor serve exited {exit:?}, not cleanly");
+
+    let socket_file = state.join("pastor.sock");
+    assert!(
+        !socket_file.exists(),
+        "pastor.sock was left behind after SIGTERM"
+    );
+
+    let log = std::fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        log.contains("SIGTERM"),
+        "log did not mention SIGTERM: {log}"
+    );
+
+    let _ = herdr.kill();
+    let _ = herdr.wait();
+}
