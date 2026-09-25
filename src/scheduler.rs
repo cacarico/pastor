@@ -257,17 +257,14 @@ pub async fn run_job(
             return report;
         }
     };
-    // The job's flock, else its pinned machine's, else the default. Checked
-    // once per run, before the connector, from the flock file as the run
-    // found it. A flock that does not fit is the job file's fault, not the
-    // connector's: no backoff, the next scheduled run tries again. Each insert
-    // works it out again under the dispatch lock, since the flock can go
-    // while the connector runs.
-    if let Err(err) = fleet
-        .flock()
-        .task_flock(job.flock.as_deref(), job.spec.machine.as_deref())
-    {
-        let err = err.to_string();
+    // The job's flock, else its pinned machine's, else the default, and a
+    // pinned machine still in the flock. Checked once per run, before the
+    // connector, from the flock file as the run found it. A flock or pin that
+    // does not fit is the job file's fault, not the connector's: no backoff,
+    // the next scheduled run tries again. Each insert checks again under the
+    // dispatch lock, since the flock can change while the connector runs.
+    if let Err(err) = fleet.job_task_flock(job) {
+        let err = format!("{err:#}");
         tracing::warn!(job = %job.name, %err, "job run refused");
         report.outcome = RunOutcome::Failed;
         report.error = Some(err.clone());
@@ -3293,6 +3290,16 @@ mod tests {
                 },
                 "machine w is in flock work, not home",
             ),
+            (
+                Job {
+                    spec: DispatchSpec {
+                        machine: Some("gone".into()),
+                        ..job("d").spec
+                    },
+                    ..job("d")
+                },
+                "machine gone is not in the flock",
+            ),
         ] {
             let src = Scripted::with_keys(&["k1"]);
             let report = run_job(&fleet, &bad, &src, &tx, Utc::now(), false).await;
@@ -3362,6 +3369,66 @@ mod tests {
         assert!(report.created.is_empty(), "{report:?}");
         let err = report.error.unwrap();
         assert!(err.contains("k1") && err.contains("spare"), "{err}");
+        assert!(store.get_task(1).unwrap().is_none());
+        assert!(!store.is_seen("j", "k1").unwrap());
+        let state = store.job_state("j").unwrap().unwrap();
+        assert!(state.cursor.is_none(), "the cursor holds: {state:?}");
+    }
+
+    /// A connector that, while it runs, takes machine `w` out of the flock:
+    /// what a reload after `machine remove` does between a run's first check
+    /// and its inserts.
+    struct RemovesMachine {
+        fleet: Arc<Fleet>,
+    }
+
+    impl ItemSource for RemovesMachine {
+        fn id(&self) -> &str {
+            "removes-machine"
+        }
+        fn run<'a>(&'a self, _input: RunInput) -> RunFuture<'a> {
+            Box::pin(async move {
+                let mut flock = home_and_work();
+                flock.machines.retain(|m| m.name != "w");
+                self.fleet.replace_flock(flock).await;
+                Ok(RunOutput {
+                    items: vec![item("k1")],
+                    cursor: Some("c-new".into()),
+                    logs: vec![],
+                    batch: 0,
+                })
+            })
+        }
+    }
+
+    /// Copilot 4106669917: a job pinned to a machine that left the flock
+    /// while the connector ran queues nothing. `task_flock` reads a missing
+    /// pin as no pin, so the task would land in the default flock where no
+    /// dispatch can place it; the insert refuses under the dispatch lock,
+    /// as `queue_run` does, and the cursor holds.
+    #[tokio::test]
+    async fn a_machine_removed_during_a_job_run_takes_no_task() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let fleet = Arc::new(fleet_with(&store, home_and_work()));
+        let (tx, _rx) = events();
+        let pinned = Job {
+            spec: DispatchSpec {
+                machine: Some("w".into()),
+                ..job("j").spec
+            },
+            ..job("j")
+        };
+        let src = RemovesMachine {
+            fleet: fleet.clone(),
+        };
+        let report = run_job(&fleet, &pinned, &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
+        assert!(report.created.is_empty(), "{report:?}");
+        let err = report.error.unwrap();
+        assert!(
+            err.contains("k1") && err.contains("machine w is not in the flock"),
+            "{err}"
+        );
         assert!(store.get_task(1).unwrap().is_none());
         assert!(!store.is_seen("j", "k1").unwrap());
         let state = store.job_state("j").unwrap().unwrap();

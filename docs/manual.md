@@ -259,10 +259,11 @@ A task's flock is fixed when it is created: `--flock` on `pastor task run`, or
 `flock` under a job's `[dispatch]`; else the flock of the machine it is pinned
 to (`--machine`, a job's `machine`); else the default flock. `--machine` with
 a `--flock` the machine is not in is refused (`flock_mismatch`), as is a flock
-that does not exist (`unknown_flock`). A job whose flock does not fit fails
-its run before the connector is asked for anything, with the reason in
-`pastor job list`. A flock removed while the connector runs gets none of that
-run's tasks: each item fails, and the cursor holds for the next run. `pastor task retry` keeps the flock of the task it copies, and is refused
+that does not exist (`unknown_flock`). A job whose flock does not fit, or
+whose pinned machine is not in the flock, fails its run before the connector
+is asked for anything, with the reason in `pastor job list`. A flock or a
+pinned machine removed while the connector runs gets none of that run's tasks:
+each item fails, and the cursor holds for the next run. `pastor task retry` keeps the flock of the task it copies, and is refused
 (`unknown_flock`) once that flock has been removed. A head
 started from a pastor before flocks would ignore `--flock` and read
 `flock.toml` as one flock, so while flocks are in play every command that

@@ -307,13 +307,40 @@ impl Fleet {
 
     /// Is `name` in the flock? For a managed fleet that is the flock last
     /// applied, so a removed machine held only until its old actor ends is
-    /// not. A fixed fleet has no applied flock; its machines are the flock.
+    /// not. A fixed fleet has no applied flock; its machines are the flock,
+    /// plus those of the flock file it was given (`with_flock`), which is
+    /// all the daemon-less scheduler has.
     pub fn in_flock(&self, name: &str) -> bool {
+        let wanted = self.wanted.read().unwrap().get(name).is_some();
         if self.spawner.is_some() {
-            self.wanted.read().unwrap().get(name).is_some()
+            wanted
         } else {
-            self.get(name).is_some()
+            wanted || self.get(name).is_some()
         }
+    }
+
+    /// The flock `job`'s tasks go to (`Flock::task_flock`), refusing a pin
+    /// to a machine that is not in the flock: `task_flock` reads such a pin
+    /// as none, and the task would wait in the default flock for a machine
+    /// no dispatch can find. `run_job` checks this before the connector and
+    /// `queue_job_task` again under the dispatch lock.
+    pub fn job_task_flock(&self, job: &crate::config::job::Job) -> anyhow::Result<String> {
+        if let Some(m) = &job.spec.machine
+            && !self.in_flock(m)
+        {
+            anyhow::bail!("machine {m} is not in the flock");
+        }
+        Ok(self
+            .flock()
+            .task_flock(job.flock.as_deref(), job.spec.machine.as_deref())?)
+    }
+
+    /// Swap the wanted flock under the dispatch lock, as `apply_flock` does
+    /// for a managed fleet, without touching any actor.
+    #[cfg(test)]
+    pub async fn replace_flock(&self, flock: Flock) {
+        let _pass = self.dispatch_lock.lock().await;
+        *self.wanted.write().unwrap() = flock;
     }
 
     /// Is any machine waiting for its old actor to end?
@@ -505,10 +532,11 @@ impl Fleet {
     }
 
     /// Queue one task of a scheduled job's run for `item`, in the job's flock
-    /// (see `Flock::task_flock`) as the wanted flock stands now. Under the
-    /// dispatch lock, like `queue_run`: a `flock remove` either sees the task
-    /// queued, or goes first and this fails, so the run records the item's
-    /// error and holds its cursor rather than queue into a flock that is gone.
+    /// (see `job_task_flock`) as the wanted flock stands now. Under the
+    /// dispatch lock, like `queue_run`: a `flock remove`, or a reload that
+    /// drops the machine the job is pinned to, either sees the task queued,
+    /// or goes first and this fails, so the run records the item's error and
+    /// holds its cursor rather than queue a task no dispatch can place.
     pub async fn queue_job_task(
         &self,
         job: &crate::config::job::Job,
@@ -516,9 +544,7 @@ impl Fleet {
         render: impl FnOnce(i64) -> Result<(String, crate::task::DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
         let _pass = self.dispatch_lock.lock().await;
-        let flock = self
-            .flock()
-            .task_flock(job.flock.as_deref(), job.spec.machine.as_deref())?;
+        let flock = self.job_task_flock(job)?;
         self.store.insert_job_task(&job.name, &flock, item, render)
     }
 
