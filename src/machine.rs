@@ -930,11 +930,15 @@ impl Actor {
         let agents = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
             .map_err(|_| TimedOut("agent.list", timeout))??;
-        // The pane the row records while it owns one; otherwise (failed,
-        // closed, no row) whatever agent still carries the task's name.
+        // The pane the row records, whatever its state: a failed task can
+        // hold a pane with no agent in it (a dispatch that failed at
+        // `agent.start`), which no name lookup would find. Not a closed row's:
+        // pastor closed that pane itself, and herdr may have handed its id
+        // out again. Otherwise (closed, no ids, no row) whatever agent still
+        // carries the task's name.
         let recorded = row
             .as_ref()
-            .filter(|t| t.state.occupies_pane())
+            .filter(|t| t.state != TaskState::Closed)
             .and_then(|t| t.pane_id.clone().map(|p| (p, t.workspace_id.clone())));
         let target = recorded.or_else(|| {
             agents
@@ -2399,6 +2403,50 @@ mod tests {
 
         let err = h.close(99, false).await.unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    /// A dispatch that fails at `agent.start` records the workspace and pane
+    /// and leaves them open with no agent in them. Close must use those ids:
+    /// looking for an agent by name finds nothing and would leak the pane,
+    /// and refuse `--remove-worktree`.
+    #[tokio::test]
+    async fn close_uses_the_recorded_pane_of_a_failed_task_with_no_agent() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        fake.set_start_behaviour(crate::herdr::fake::StartBehaviour::Fail("boom".into()));
+        let plain = new_task(&store).id;
+        let wt = worktree_task(&store).id;
+        let _ = h.dispatch(plain).await;
+        let _ = h.dispatch(wt).await;
+        let plain = store.get_task(plain).unwrap().unwrap();
+        let wt = store.get_task(wt).unwrap().unwrap();
+        for t in [&plain, &wt] {
+            assert_eq!(t.state, TaskState::Failed, "{t:?}");
+            assert!(t.pane_id.is_some() && t.workspace_id.is_some(), "{t:?}");
+        }
+        assert!(fake.agents().is_empty());
+        assert_eq!(
+            fake.workspaces().len(),
+            2,
+            "the failed dispatch left both open"
+        );
+
+        let closed = h.close(plain.id, false).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(
+            calls(&fake, "pane.close"),
+            vec![serde_json::json!({"pane_id": plain.pane_id.clone().unwrap()})]
+        );
+        let closed = h.close(wt.id, true).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(
+            calls(&fake, "worktree.remove"),
+            vec![
+                serde_json::json!({"workspace_id": wt.workspace_id.clone().unwrap(), "force": false})
+            ]
+        );
+        assert!(fake.workspaces().is_empty());
     }
 
     #[tokio::test]
