@@ -1,13 +1,8 @@
-//! Plugins: a directory with `pastor-plugin.toml` and commands, providing a
-//! connector, event hooks, or both. Each lives at `<data>/plugins/<id>/`,
-//! either a managed checkout (`plugin install`) or a symlink to a directory
-//! the user develops in (`plugin link`).
-
-pub mod cli;
-pub mod env;
-pub mod exec;
-pub mod install;
-pub mod manifest;
+//! Installed connectors: a directory with `pastor-connector.toml` and
+//! commands, providing a connector command, event hooks, or both. Each lives
+//! at `<data>/connectors/<id>/`, either a managed checkout (`connector
+//! install`) or a symlink to a directory the user develops in (`connector
+//! link`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,15 +11,15 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use serde_json::Value;
 
+use super::env::{self, Redactor};
+use super::manifest::{self, MANIFEST_FILE, Manifest};
 use crate::config::Paths;
 use crate::connector::{self, Builtins, Catalog, ItemSource};
-use env::Redactor;
-use manifest::{MANIFEST_FILE, Manifest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Plugin {
+pub struct Connector {
     pub id: String,
-    /// The directory commands run in: the link's target for a linked plugin.
+    /// The directory commands run in: the link's target for a linked connector.
     pub dir: PathBuf,
     pub linked: bool,
     pub manifest: Manifest,
@@ -32,7 +27,7 @@ pub struct Plugin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Discovered {
-    Valid(Box<Plugin>),
+    Valid(Box<Connector>),
     Invalid {
         id: String,
         dir: PathBuf,
@@ -51,7 +46,7 @@ impl Discovered {
 }
 
 /// Read and validate the manifest in `dir`, which must declare `id`: the
-/// directory name is the id pastor, jobs and hooks know the plugin by.
+/// directory name is the id pastor, jobs and hooks know the connector by.
 pub fn load_manifest(dir: &Path, id: Option<&str>) -> Result<Manifest, String> {
     let path = dir.join(MANIFEST_FILE);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -68,11 +63,11 @@ pub fn load_manifest(dir: &Path, id: Option<&str>) -> Result<Manifest, String> {
     Ok(m)
 }
 
-/// Every plugin under the plugins dir, sorted by id, each valid or invalid
+/// Every connector under the connectors dir, sorted by id, each valid or invalid
 /// with its reason. Entries starting with `.` are pastor's own scratch (an
-/// install in progress) and skipped. A missing directory is no plugins.
+/// install in progress) and skipped. A missing directory is no connectors.
 pub fn discover(paths: &Paths) -> anyhow::Result<Vec<Discovered>> {
-    let root = paths.plugins_dir();
+    let root = paths.connectors_dir();
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(&root) {
         Ok(e) => e,
@@ -108,7 +103,7 @@ pub fn discover(paths: &Paths) -> anyhow::Result<Vec<Discovered>> {
             continue;
         };
         match manifest::check_id(&id).and_then(|_| load_manifest(&dir, Some(&id))) {
-            Ok(manifest) => out.push(Discovered::Valid(Box::new(Plugin {
+            Ok(manifest) => out.push(Discovered::Valid(Box::new(Connector {
                 id,
                 dir,
                 linked,
@@ -126,13 +121,13 @@ pub fn discover(paths: &Paths) -> anyhow::Result<Vec<Discovered>> {
     Ok(out)
 }
 
-impl Plugin {
-    /// The plugin's `.env`, as loaded into its commands. A declared secret
+impl Connector {
+    /// The connector's `.env`, as loaded into its commands. A declared secret
     /// with a line break is refused: output is redacted one line at a time,
     /// so no line would ever contain the whole value and it would reach the
     /// logs in pieces.
     pub fn env(&self, paths: &Paths) -> anyhow::Result<Vec<(String, String)>> {
-        let file = paths.plugin_env_file(&self.id);
+        let file = paths.connector_env_file(&self.id);
         let env = env::load(&file)?;
         for (name, value) in &env {
             if self.manifest.secrets.contains_key(name) && value.contains(['\n', '\r']) {
@@ -159,10 +154,10 @@ impl Plugin {
         Redactor::new(self.manifest.secrets.keys().map(String::as_str), env)
     }
 
-    /// The environment every command of this plugin gets, connector or hook:
-    /// its `.env`, then `PASTOR_PLUGIN_ID`, `PASTOR_JOB` (when there is a
+    /// The environment every command of this connector gets, connector command or hook:
+    /// its `.env`, then `PASTOR_CONNECTOR_ID`, `PASTOR_JOB` (when there is a
     /// job), `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and
-    /// `PASTOR_PLUGIN_STATE_DIR`, the job's scratch dir (`@<id>` without a
+    /// `PASTOR_CONNECTOR_STATE_DIR`, the job's scratch dir (`@<id>` without a
     /// job), created 0700. Plus the redactor for what the command prints.
     pub fn command_env(
         &self,
@@ -174,80 +169,84 @@ impl Plugin {
         let scope = job
             .map(str::to_string)
             .unwrap_or_else(|| format!("@{}", self.id));
-        let state_dir = paths.plugin_state_dir(&scope);
+        let state_dir = paths.connector_state_dir(&scope);
         crate::config::create_private_dir(&state_dir)?;
         let dir = |p: &Path| p.to_string_lossy().into_owned();
         let mut env = dotenv;
-        env.push(("PASTOR_PLUGIN_ID".into(), self.id.clone()));
+        env.push(("PASTOR_CONNECTOR_ID".into(), self.id.clone()));
         if let Some(job) = job {
             env.push(("PASTOR_JOB".into(), job.to_string()));
         }
         env.push(("PASTOR_CONFIG_DIR".into(), dir(&paths.config_dir)));
         env.push(("PASTOR_STATE_DIR".into(), dir(&paths.state_dir)));
-        env.push(("PASTOR_PLUGIN_STATE_DIR".into(), dir(&state_dir)));
+        env.push(("PASTOR_CONNECTOR_STATE_DIR".into(), dir(&state_dir)));
         Ok((env, redactor))
     }
 }
 
-/// The built-in connectors plus every valid plugin that has a connector,
-/// read once from the plugins dir. Plugins change only through `plugin
+/// The built-in connectors plus every valid connector that has a connector command,
+/// read once from the connectors dir. Connectors change only through `connector
 /// install|link|uninstall|unlink`, so a daemon rebuilds this on reload rather
 /// than watching the directory.
-pub struct PluginCatalog {
+pub struct ConnectorCatalog {
     paths: Paths,
-    plugins: BTreeMap<String, Arc<Plugin>>,
+    connectors: BTreeMap<String, Arc<Connector>>,
     /// id -> why it is unusable, so a job naming it says so.
     invalid: BTreeMap<String, String>,
-    /// Sources handed out so far, keyed by (plugin, job): a stream connector
+    /// Sources handed out so far, keyed by (connector, job): a stream connector
     /// must be one process however often the scheduler asks for it.
     sources: Mutex<HashMap<SourceKey, Arc<dyn ItemSource>>>,
 }
 
-/// (plugin id, job name).
+/// (connector id, job name).
 type SourceKey = (String, Option<String>);
 
-impl PluginCatalog {
-    pub fn load(paths: &Paths) -> anyhow::Result<PluginCatalog> {
-        let mut plugins = BTreeMap::new();
+impl ConnectorCatalog {
+    pub fn load(paths: &Paths) -> anyhow::Result<ConnectorCatalog> {
+        let mut connectors = BTreeMap::new();
         let mut invalid = BTreeMap::new();
         for d in discover(paths)? {
             match d {
                 Discovered::Valid(p) => {
-                    plugins.insert(p.id.clone(), Arc::from(p));
+                    connectors.insert(p.id.clone(), Arc::from(p));
                 }
                 Discovered::Invalid { id, error, .. } => {
                     invalid.insert(id, error);
                 }
             }
         }
-        Ok(PluginCatalog {
+        Ok(ConnectorCatalog {
             paths: paths.clone(),
-            plugins,
+            connectors,
             invalid,
             sources: Mutex::default(),
         })
     }
 
-    pub fn plugin(&self, id: &str) -> Option<&Arc<Plugin>> {
-        self.plugins.get(id)
+    pub fn connector(&self, id: &str) -> Option<&Arc<Connector>> {
+        self.connectors.get(id)
     }
 
     fn source_keyed(&self, id: &str, job: Option<&str>) -> Option<Arc<dyn ItemSource>> {
         if let Some(b) = connector::builtin(id) {
             return Some(b);
         }
-        let plugin = self.plugins.get(id)?;
-        plugin.manifest.connector.as_ref()?;
+        let connector = self.connectors.get(id)?;
+        connector.manifest.connector.as_ref()?;
         let key = (id.to_string(), job.map(str::to_string));
         let mut sources = self.sources.lock().unwrap_or_else(|p| p.into_inner());
         let src = sources.entry(key).or_insert_with(|| {
-            connector::process::source(plugin.clone(), self.paths.clone(), job.map(str::to_string))
+            connector::process::source(
+                connector.clone(),
+                self.paths.clone(),
+                job.map(str::to_string),
+            )
         });
         Some(src.clone())
     }
 }
 
-impl Catalog for PluginCatalog {
+impl Catalog for ConnectorCatalog {
     fn source(&self, id: &str) -> Option<Arc<dyn ItemSource>> {
         self.source_keyed(id, None)
     }
@@ -270,11 +269,11 @@ impl Catalog for PluginCatalog {
         if connector::builtin(id).is_some() {
             return Builtins.check(id, config);
         }
-        if let Some(p) = self.plugins.get(id) {
+        if let Some(p) = self.connectors.get(id) {
             return p.manifest.check_config(config);
         }
         if let Some(why) = self.invalid.get(id) {
-            return Err(format!("plugin {id:?} is invalid: {why}"));
+            return Err(format!("connector {id:?} is invalid: {why}"));
         }
         Builtins.check(id, config)
     }
@@ -284,7 +283,7 @@ impl Catalog for PluginCatalog {
 mod tests {
     use super::*;
 
-    fn write_plugin(dir: &Path, id: &str, extra: &str) {
+    fn write_connector(dir: &Path, id: &str, extra: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
             dir.join(MANIFEST_FILE),
@@ -296,17 +295,20 @@ mod tests {
     }
 
     #[test]
-    fn discovers_managed_linked_and_broken_plugins() {
+    fn discovers_managed_linked_and_broken_connectors() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        assert!(discover(&paths).unwrap().is_empty(), "no dir, no plugins");
-        let root = paths.plugins_dir();
-        write_plugin(&root.join("alpha"), "alpha", "");
-        write_plugin(&root.join("mismatch"), "other", "");
+        assert!(
+            discover(&paths).unwrap().is_empty(),
+            "no dir, no connectors"
+        );
+        let root = paths.connectors_dir();
+        write_connector(&root.join("alpha"), "alpha", "");
+        write_connector(&root.join("mismatch"), "other", "");
         std::fs::create_dir_all(root.join(".install-1")).unwrap();
         std::fs::write(root.join("stray-file"), "").unwrap();
         let dev = tmp.path().join("dev/beta");
-        write_plugin(&dev, "beta", "");
+        write_connector(&dev, "beta", "");
         std::os::unix::fs::symlink(&dev, root.join("beta")).unwrap();
         std::os::unix::fs::symlink(tmp.path().join("gone"), root.join("dangling")).unwrap();
 
@@ -339,21 +341,21 @@ mod tests {
     fn the_catalog_checks_config_and_reuses_sources() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        let root = paths.plugins_dir();
-        write_plugin(
+        let root = paths.connectors_dir();
+        write_connector(
             &root.join("slack"),
             "slack",
             "[connector.config.channel]\nrequired = true\n",
         );
-        write_plugin(&root.join("clock"), "clock", "");
-        write_plugin(&root.join("broken"), "nope", "");
+        write_connector(&root.join("clock"), "clock", "");
+        write_connector(&root.join("broken"), "nope", "");
         std::fs::create_dir_all(root.join("ntfy")).unwrap();
         std::fs::write(
             root.join("ntfy").join(MANIFEST_FILE),
             "id = \"ntfy\"\nversion = \"0.1.0\"\n[[events]]\non = [\"task.done\"]\ncommand = [\"x\"]\n",
         )
         .unwrap();
-        let cat = PluginCatalog::load(&paths).unwrap();
+        let cat = ConnectorCatalog::load(&paths).unwrap();
         let cfg = serde_json::json!({"channel": "C1"});
         assert!(cat.check("slack", &cfg).is_ok());
         let err = cat.check("slack", &serde_json::json!({})).unwrap_err();
@@ -374,7 +376,7 @@ mod tests {
         let a = cat.source_for_job("slack", "j1").unwrap();
         let b = cat.source_for_job("slack", "j1").unwrap();
         let c = cat.source_for_job("slack", "j2").unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "one source per (plugin, job)");
+        assert!(Arc::ptr_eq(&a, &b), "one source per (connector, job)");
         assert!(!Arc::ptr_eq(&a, &c));
         assert_eq!(a.id(), "slack");
 
@@ -391,14 +393,14 @@ mod tests {
     fn missing_secrets_and_redaction_follow_the_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        let dir = paths.plugins_dir().join("slack");
-        write_plugin(&dir, "slack", "[secrets.TOKEN]\n[secrets.SIGNING]\n");
+        let dir = paths.connectors_dir().join("slack");
+        write_connector(&dir, "slack", "[secrets.TOKEN]\n[secrets.SIGNING]\n");
         let Discovered::Valid(p) = discover(&paths).unwrap().remove(0) else {
             panic!()
         };
         assert!(p.env(&paths).unwrap().is_empty());
         assert_eq!(p.missing_secrets(&[]), vec!["SIGNING", "TOKEN"]);
-        let env_file = paths.plugin_env_file("slack");
+        let env_file = paths.connector_env_file("slack");
         std::fs::create_dir_all(env_file.parent().unwrap()).unwrap();
         std::fs::write(&env_file, "TOKEN=xoxb-9999\nSIGNING=\nOTHER=abcdef\n").unwrap();
         let env = p.env(&paths).unwrap();
@@ -416,12 +418,12 @@ mod tests {
     fn a_multiline_declared_secret_is_refused_at_load() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        let dir = paths.plugins_dir().join("slack");
-        write_plugin(&dir, "slack", "[secrets.TOKEN]\n");
+        let dir = paths.connectors_dir().join("slack");
+        write_connector(&dir, "slack", "[secrets.TOKEN]\n");
         let Discovered::Valid(p) = discover(&paths).unwrap().remove(0) else {
             panic!()
         };
-        let env_file = paths.plugin_env_file("slack");
+        let env_file = paths.connector_env_file("slack");
         std::fs::create_dir_all(env_file.parent().unwrap()).unwrap();
         for value in [r#""part-one\npart-two""#, "\"part-one\rpart-two\""] {
             std::fs::write(&env_file, format!("TOKEN={value}\n")).unwrap();

@@ -3,8 +3,8 @@
 //! state dir. `pastor events` reads the file, not the daemon, so it works with
 //! the daemon down; `--follow` tails it.
 //!
-//! The JSON of `EventRecord` is also what plugin event hooks get on stdin, so
-//! it is a plugin-facing format: fields are only ever added, never renamed.
+//! The JSON of `EventRecord` is also what connector event hooks get on stdin, so
+//! it is a connector-facing format: fields are only ever added, never renamed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};

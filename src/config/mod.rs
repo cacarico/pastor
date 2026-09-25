@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 pub struct Paths {
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,
-    /// Managed plugin checkouts live here (`~/.local/share/pastor`).
+    /// Managed connector checkouts live here (`~/.local/share/pastor`).
     pub data_dir: PathBuf,
 }
 
@@ -131,21 +131,21 @@ impl Paths {
         self.data_dir.clone()
     }
 
-    /// One directory per plugin: a managed checkout, or a symlink made by
-    /// `plugin link`.
-    pub fn plugins_dir(&self) -> PathBuf {
-        self.data_dir.join("plugins")
+    /// One directory per connector: a managed checkout, or a symlink made by
+    /// `connector link`.
+    pub fn connectors_dir(&self) -> PathBuf {
+        self.data_dir.join("connectors")
     }
 
-    /// Secrets and settings for one plugin, written by the user.
-    pub fn plugin_env_file(&self, id: &str) -> PathBuf {
-        self.config_dir.join("plugins").join(id).join(".env")
+    /// Secrets and settings for one connector, written by the user.
+    pub fn connector_env_file(&self, id: &str) -> PathBuf {
+        self.config_dir.join("connectors").join(id).join(".env")
     }
 
     /// Per-job scratch a connector may use; pastor owns the directory, the
-    /// plugin owns what is in it.
-    pub fn plugin_state_dir(&self, job: &str) -> PathBuf {
-        self.state_dir.join("plugins").join(job)
+    /// connector owns what is in it.
+    pub fn connector_state_dir(&self, job: &str) -> PathBuf {
+        self.state_dir.join("connectors").join(job)
     }
 
     /// Captured connector and hook output for one job, `<ts>.log` per run.
@@ -1243,19 +1243,19 @@ mod tests {
     }
 
     #[test]
-    fn plugin_paths() {
+    fn connector_paths() {
         let p = Paths::new("/tmp/c", "/tmp/s");
         assert_eq!(p.data_dir(), PathBuf::from("/tmp/s/data"));
-        assert_eq!(p.plugins_dir(), PathBuf::from("/tmp/s/data/plugins"));
+        assert_eq!(p.connectors_dir(), PathBuf::from("/tmp/s/data/connectors"));
         let p = p.with_data_dir("/tmp/d");
-        assert_eq!(p.plugins_dir(), PathBuf::from("/tmp/d/plugins"));
+        assert_eq!(p.connectors_dir(), PathBuf::from("/tmp/d/connectors"));
         assert_eq!(
-            p.plugin_env_file("slack"),
-            PathBuf::from("/tmp/c/plugins/slack/.env")
+            p.connector_env_file("slack"),
+            PathBuf::from("/tmp/c/connectors/slack/.env")
         );
         assert_eq!(
-            p.plugin_state_dir("support"),
-            PathBuf::from("/tmp/s/plugins/support")
+            p.connector_state_dir("support"),
+            PathBuf::from("/tmp/s/connectors/support")
         );
         assert_eq!(p.runs_dir("support"), PathBuf::from("/tmp/s/runs/support"));
     }

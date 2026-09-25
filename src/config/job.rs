@@ -191,7 +191,7 @@ impl Job {
     }
 }
 
-/// Job names appear in `tasks.job`, in `{{ job.name }}` and, for a plugin
+/// Job names appear in `tasks.job`, in `{{ job.name }}` and, for a connector
 /// connector, as a directory under the state dir, so they are kept to a safe alphabet. `run`
 /// is what one-off tasks carry in `tasks.job`. Public so `job_path` callers
 /// outside a full `Job::parse` (the CLI's `enable`/`disable`) can reject a
@@ -444,7 +444,7 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert!(err.contains("not available"), "{err}");
     }
 
-    /// A catalog's reason (a plugin that is missing, or a config key its
+    /// A catalog's reason (a connector that is missing, or a config key its
     /// manifest requires) is the job's `invalid` reason, and the config it
     /// checks is the table minus `use`.
     #[test]

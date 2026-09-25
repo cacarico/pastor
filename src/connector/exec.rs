@@ -1,4 +1,4 @@
-//! Running a plugin command: argv in the plugin's directory, env from its
+//! Running a connector command: argv in the connector's directory, env from its
 //! `.env` plus pastor's variables, one JSON object on stdin, stdout handed
 //! back line by line, stderr captured to a run log. Shared by connectors and,
 //! later, event hooks.
@@ -23,13 +23,13 @@ pub const LOG_KEEP: usize = 20;
 const STDERR_TAIL: usize = 5;
 /// The longest stdout or stderr line pastor holds in memory; the rest of a
 /// longer line is read and dropped. The same as the run log cap, since no
-/// longer line could be logged whole anyway, and a plugin that writes
+/// longer line could be logged whole anyway, and a connector that writes
 /// without newlines must not grow the daemon without bound.
 pub const LINE_MAX_BYTES: usize = 256 * 1024;
 
 /// `<runs>/<job>/<ts>.log`: what one run wrote to stderr, what pastor had to
 /// say about its stdout, and how it ended. Every line goes through the
-/// plugin's `Redactor` first.
+/// connector's `Redactor` first.
 pub struct RunLog {
     path: PathBuf,
     file: std::fs::File,
@@ -278,7 +278,7 @@ pub async fn run_started(
             stderr_tail: Vec::new(),
         };
     };
-    // A relative path with a slash (`./poll`, `bin/poll`) means the plugin's
+    // A relative path with a slash (`./poll`, `bin/poll`) means the connector's
     // file, whatever pastor's own cwd is.
     let program = if program.contains('/') && Path::new(program).is_relative() {
         inv.cwd.join(program).into_os_string()

@@ -2637,11 +2637,11 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
         &["tick", "--dry-run"],
         // herdr's agent terminal takes keys for any task's pane.
         &["task", "attach", "t-1"],
-        // The plugin catalog: each edit reloads the head's jobs.
-        &["plugin", "install", "acme/tools", "--yes"],
-        &["plugin", "link", tmp.path().to_str().unwrap()],
-        &["plugin", "uninstall", "echo"],
-        &["plugin", "unlink", "echo"],
+        // The connector catalog: each edit reloads the head's jobs.
+        &["connector", "install", "acme/tools", "--yes"],
+        &["connector", "link", tmp.path().to_str().unwrap()],
+        &["connector", "uninstall", "echo"],
+        &["connector", "unlink", "echo"],
         // A head started from the pane would dispatch with no request to
         // refuse.
         &["serve"],
@@ -2656,7 +2656,7 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
         before
     );
     ok(run(&["flock", "list"]));
-    ok(run(&["plugin", "list"]));
+    ok(run(&["connector", "list"]));
 
     std::fs::write(config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();
     ok(run(&["flock", "add", "work"]));

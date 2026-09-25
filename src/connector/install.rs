@@ -1,6 +1,6 @@
-//! Putting plugins in place and taking them away. `install` clones a GitHub
+//! Putting connectors in place and taking them away. `install` clones a GitHub
 //! repo into a managed directory; `link` symlinks a directory the user works
-//! in. Neither touches the plugin's `.env` or state, and removing a plugin
+//! in. Neither touches the connector's `.env` or state, and removing a connector
 //! leaves them too: they are the user's.
 
 use std::path::{Component, Path, PathBuf};
@@ -9,11 +9,11 @@ use std::process::Command;
 use anyhow::{Context, bail};
 
 use super::manifest::Manifest;
-use super::{Plugin, load_manifest};
+use super::{Connector, load_manifest};
 use crate::config::{Paths, create_private_dir};
 
 /// Where `owner/repo` is cloned from. Overridable (a mirror, or a local
-/// directory of repos in tests) with `PASTOR_PLUGIN_GIT_BASE`.
+/// directory of repos in tests) with `PASTOR_CONNECTOR_GIT_BASE`.
 pub const DEFAULT_GIT_BASE: &str = "https://github.com";
 
 /// `owner/repo[/subdir]`, resolved against a git base.
@@ -57,7 +57,7 @@ impl InstallSource {
 }
 
 pub fn git_base() -> String {
-    std::env::var("PASTOR_PLUGIN_GIT_BASE").unwrap_or_else(|_| DEFAULT_GIT_BASE.into())
+    std::env::var("PASTOR_CONNECTOR_GIT_BASE").unwrap_or_else(|_| DEFAULT_GIT_BASE.into())
 }
 
 /// Removes a half-done install whatever happens.
@@ -86,14 +86,14 @@ fn git(args: &[&str]) -> anyhow::Result<()> {
 }
 
 /// Clone, validate, ask, move into place. `confirm` sees the validated
-/// manifest before anything lands in the plugins dir and may refuse.
+/// manifest before anything lands in the connectors dir and may refuse.
 pub fn install(
     paths: &Paths,
     source: &InstallSource,
     git_ref: Option<&str>,
     confirm: impl FnOnce(&Manifest) -> anyhow::Result<bool>,
-) -> anyhow::Result<Plugin> {
-    let root = paths.plugins_dir();
+) -> anyhow::Result<Connector> {
+    let root = paths.connectors_dir();
     create_private_dir(&root)?;
     // Dot-named, so discovery never sees a half-done install.
     let nanos = std::time::SystemTime::now()
@@ -136,7 +136,7 @@ pub fn install(
     let target = root.join(&manifest.id);
     if target.symlink_metadata().is_ok() {
         bail!(
-            "plugin {:?} is already in {}; uninstall or unlink it first",
+            "connector {:?} is already in {}; uninstall or unlink it first",
             manifest.id,
             target.display()
         );
@@ -146,7 +146,7 @@ pub fn install(
     }
     std::fs::rename(&dir, &target)
         .with_context(|| format!("move {} to {}", dir.display(), target.display()))?;
-    Ok(Plugin {
+    Ok(Connector {
         id: manifest.id.clone(),
         dir: target,
         linked: false,
@@ -154,24 +154,24 @@ pub fn install(
     })
 }
 
-/// Symlink `path` into the plugins dir under its manifest's id, for
-/// developing a plugin in place.
-pub fn link(paths: &Paths, path: &Path) -> anyhow::Result<Plugin> {
+/// Symlink `path` into the connectors dir under its manifest's id, for
+/// developing a connector in place.
+pub fn link(paths: &Paths, path: &Path) -> anyhow::Result<Connector> {
     let dir = std::fs::canonicalize(path).with_context(|| format!("{}", path.display()))?;
     let manifest = load_manifest(&dir, None).map_err(anyhow::Error::msg)?;
-    let root = paths.plugins_dir();
+    let root = paths.connectors_dir();
     create_private_dir(&root)?;
     let target = root.join(&manifest.id);
     if target.symlink_metadata().is_ok() {
         bail!(
-            "plugin {:?} is already in {}; uninstall or unlink it first",
+            "connector {:?} is already in {}; uninstall or unlink it first",
             manifest.id,
             target.display()
         );
     }
     std::os::unix::fs::symlink(&dir, &target)
         .with_context(|| format!("link {} to {}", target.display(), dir.display()))?;
-    Ok(Plugin {
+    Ok(Connector {
         id: manifest.id.clone(),
         dir,
         linked: true,
@@ -186,11 +186,14 @@ enum Kind {
 
 fn kind_of(paths: &Paths, id: &str) -> anyhow::Result<(PathBuf, Kind)> {
     super::manifest::check_id(id).map_err(anyhow::Error::msg)?;
-    let path = paths.plugins_dir().join(id);
+    let path = paths.connectors_dir().join(id);
     let md = match path.symlink_metadata() {
         Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("no plugin {id:?} in {}", paths.plugins_dir().display())
+            bail!(
+                "no connector {id:?} in {}",
+                paths.connectors_dir().display()
+            )
         }
         Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
     };
@@ -202,11 +205,13 @@ fn kind_of(paths: &Paths, id: &str) -> anyhow::Result<(PathBuf, Kind)> {
     Ok((path, kind))
 }
 
-/// Delete a managed checkout. A linked plugin is refused: its directory is
+/// Delete a managed checkout. A linked connector is refused: its directory is
 /// the user's, and `unlink` is the command that leaves it alone.
 pub fn uninstall(paths: &Paths, id: &str) -> anyhow::Result<()> {
     match kind_of(paths, id)? {
-        (_, Kind::Linked) => bail!("plugin {id:?} is linked; use `pastor plugin unlink {id}`"),
+        (_, Kind::Linked) => {
+            bail!("connector {id:?} is linked; use `pastor connector unlink {id}`")
+        }
         (path, Kind::Managed) => {
             std::fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))
         }
@@ -217,7 +222,9 @@ pub fn uninstall(paths: &Paths, id: &str) -> anyhow::Result<()> {
 pub fn unlink(paths: &Paths, id: &str) -> anyhow::Result<()> {
     match kind_of(paths, id)? {
         (_, Kind::Managed) => {
-            bail!("plugin {id:?} is installed, not linked; use `pastor plugin uninstall {id}`")
+            bail!(
+                "connector {id:?} is installed, not linked; use `pastor connector uninstall {id}`"
+            )
         }
         (path, Kind::Linked) => {
             std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))
@@ -231,9 +238,9 @@ mod tests {
 
     #[test]
     fn parses_install_sources() {
-        let s = InstallSource::parse("cacarico/pastor/plugins/slack", DEFAULT_GIT_BASE).unwrap();
+        let s = InstallSource::parse("cacarico/pastor/connectors/slack", DEFAULT_GIT_BASE).unwrap();
         assert_eq!(s.url, "https://github.com/cacarico/pastor.git");
-        assert_eq!(s.subdir, Some(PathBuf::from("plugins/slack")));
+        assert_eq!(s.subdir, Some(PathBuf::from("connectors/slack")));
         let s = InstallSource::parse("o/r.git", "file:///tmp/repos/").unwrap();
         assert_eq!(s.url, "file:///tmp/repos/o/r.git");
         assert_eq!(s.subdir, None);

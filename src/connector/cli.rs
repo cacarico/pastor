@@ -1,5 +1,5 @@
-//! `pastor plugin ...`. Everything here works from files, with or without a
-//! daemon: plugins change only through these commands, and `run` dispatches
+//! `pastor connector ...`. Everything here works from files, with or without a
+//! daemon: connectors change only through these commands, and `run` dispatches
 //! nothing.
 
 use std::io::{BufRead, IsTerminal, Write};
@@ -12,15 +12,15 @@ use serde::Serialize;
 
 use super::install::{self, InstallSource};
 use super::manifest::Manifest;
-use super::{Discovered, Plugin, PluginCatalog, discover};
+use super::{Connector, ConnectorCatalog, Discovered, discover};
 use crate::config::job::{self, Loaded};
 use crate::config::{PastorConfig, Paths, parse_duration};
 use crate::connector::{self, RunInput};
 use crate::ipc::Head;
 
 #[derive(Subcommand, Debug)]
-pub enum PluginCmd {
-    /// Install a plugin from GitHub: owner/repo, or owner/repo/subdir
+pub enum ConnectorCmd {
+    /// Install a connector from GitHub: owner/repo, or owner/repo/subdir
     Install {
         source: String,
         /// Branch, tag or commit to check out
@@ -30,18 +30,18 @@ pub enum PluginCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Use a plugin from a local directory, in place (for developing one)
+    /// Use a connector from a local directory, in place (for developing one)
     Link { path: PathBuf },
-    /// Remove an installed plugin (its .env and state are kept)
+    /// Remove an installed connector (its .env and state are kept)
     Uninstall { id: String },
-    /// Remove a linked plugin; the directory itself is left alone
+    /// Remove a linked connector; the directory itself is left alone
     Unlink { id: String },
-    /// List plugins: version, connector, hooks, missing secrets
+    /// List connectors: version, connector, hooks, missing secrets
     List {
         #[arg(long)]
         json: bool,
     },
-    /// Run a plugin's connector once for a job and print its items; creates
+    /// Run a connector's command once for a job and print its items; creates
     /// no tasks and saves no cursor
     Run {
         id: String,
@@ -56,9 +56,9 @@ pub enum PluginCmd {
 
 /// `head` is what the CLI's one ping found before the command ran; a head
 /// that did not answer it stopped the command there.
-pub async fn run(paths: &Paths, cmd: PluginCmd, head: Head) -> anyhow::Result<()> {
+pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result<()> {
     match cmd {
-        PluginCmd::Install {
+        ConnectorCmd::Install {
             source,
             git_ref,
             yes,
@@ -81,7 +81,7 @@ pub async fn run(paths: &Paths, cmd: PluginCmd, head: Head) -> anyhow::Result<()
             after_change(paths, &p, head).await;
             Ok(())
         }
-        PluginCmd::Link { path } => {
+        ConnectorCmd::Link { path } => {
             let p = install::link(paths, &path)?;
             println!(
                 "linked {} {} from {}",
@@ -92,19 +92,19 @@ pub async fn run(paths: &Paths, cmd: PluginCmd, head: Head) -> anyhow::Result<()
             after_change(paths, &p, head).await;
             Ok(())
         }
-        PluginCmd::Uninstall { id } => {
+        ConnectorCmd::Uninstall { id } => {
             install::uninstall(paths, &id)?;
             println!("uninstalled {id}; jobs using it are invalid until it is back");
             reload_daemon(paths, head).await;
             Ok(())
         }
-        PluginCmd::Unlink { id } => {
+        ConnectorCmd::Unlink { id } => {
             install::unlink(paths, &id)?;
             println!("unlinked {id}; jobs using it are invalid until it is back");
             reload_daemon(paths, head).await;
             Ok(())
         }
-        PluginCmd::List { json } => {
+        ConnectorCmd::List { json } => {
             let rows = list_rows(paths)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -113,11 +113,11 @@ pub async fn run(paths: &Paths, cmd: PluginCmd, head: Head) -> anyhow::Result<()
             }
             Ok(())
         }
-        PluginCmd::Run { id, job, since } => run_once(paths, &id, &job, since.as_deref()).await,
+        ConnectorCmd::Run { id, job, since } => run_once(paths, &id, &job, since.as_deref()).await,
     }
 }
 
-/// What the plugin will run, shown before install asks.
+/// What the connector will run, shown before install asks.
 fn describe(m: &Manifest) -> String {
     let mut out = format!("{} {} ({})\n", m.id, m.version, m.name);
     if let Some(d) = &m.description {
@@ -157,20 +157,20 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
 
 /// Tell the user what is left to do, and have a running daemon reload its
 /// catalog.
-async fn after_change(paths: &Paths, p: &Plugin, head: Head) {
+async fn after_change(paths: &Paths, p: &Connector, head: Head) {
     let env = p.env(paths).unwrap_or_default();
     let missing = p.missing_secrets(&env);
     if !missing.is_empty() {
         eprintln!(
             "set {} in {}",
             missing.join(", "),
-            paths.plugin_env_file(&p.id).display()
+            paths.connector_env_file(&p.id).display()
         );
     }
     reload_daemon(paths, head).await;
 }
 
-/// A running daemon re-reads its plugins only on `Reload`; send it so the
+/// A running daemon re-reads its connectors only on `Reload`; send it so the
 /// change takes effect now. The change itself is already on disk, so a
 /// failed reload is a warning, not an error.
 async fn reload_daemon(paths: &Paths, head: Head) {
@@ -192,14 +192,14 @@ async fn reload_note(socket: &std::path::Path, head: Head) -> Option<String> {
             Ok(IpcResponse::Error { message, .. }) => {
                 format!("pastor serve did not reload ({message}); run `pastor job reload`")
             }
-            Ok(_) => "pastor serve reloaded its plugins and jobs".into(),
+            Ok(_) => "pastor serve reloaded its connectors and jobs".into(),
             Err(e) => format!("pastor serve did not reload ({e:#}); run `pastor job reload`"),
         },
     )
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct PluginRow {
+pub struct ConnectorRow {
     pub id: String,
     pub version: Option<String>,
     /// `poll`, `stream`, or none.
@@ -208,11 +208,11 @@ pub struct PluginRow {
     pub linked: bool,
     pub dir: PathBuf,
     pub missing_secrets: Vec<String>,
-    /// Why the plugin is unusable: a bad manifest, or an unreadable `.env`.
+    /// Why the connector is unusable: a bad manifest, or an unreadable `.env`.
     pub error: Option<String>,
 }
 
-pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<PluginRow>> {
+pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<ConnectorRow>> {
     Ok(discover(paths)?
         .into_iter()
         .map(|d| match d {
@@ -221,7 +221,7 @@ pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<PluginRow>> {
                     Ok(env) => (p.missing_secrets(&env), None),
                     Err(e) => (Vec::new(), Some(format!("{e:#}"))),
                 };
-                PluginRow {
+                ConnectorRow {
                     id: p.id.clone(),
                     version: Some(p.manifest.version.to_string()),
                     connector: p.manifest.connector.as_ref().map(|c| c.mode.to_string()),
@@ -237,7 +237,7 @@ pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<PluginRow>> {
                 dir,
                 linked,
                 error,
-            } => PluginRow {
+            } => ConnectorRow {
                 id,
                 version: None,
                 connector: None,
@@ -251,7 +251,7 @@ pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<PluginRow>> {
         .collect())
 }
 
-pub fn table(rows: &[PluginRow]) -> String {
+pub fn table(rows: &[ConnectorRow]) -> String {
     let dash = || "-".to_string();
     let body: Vec<Vec<String>> = rows
         .iter()
@@ -277,7 +277,7 @@ pub fn table(rows: &[PluginRow]) -> String {
     )
 }
 
-/// `plugin run`: the job's config if its file exists (and names this plugin),
+/// `connector run`: the job's config if its file exists (and names this connector),
 /// `{}` otherwise; no cursor; nothing written but the run log. Items go to
 /// stdout as JSON lines, everything else to stderr.
 async fn run_once(
@@ -288,16 +288,16 @@ async fn run_once(
 ) -> anyhow::Result<()> {
     // The name becomes the job-file, run-log and scratch paths below.
     job::check_name(job_name).map_err(anyhow::Error::msg)?;
-    let catalog = PluginCatalog::load(paths)?;
-    let Some(plugin) = catalog.plugin(id).cloned() else {
+    let catalog = ConnectorCatalog::load(paths)?;
+    let Some(connector) = catalog.connector(id).cloned() else {
         // Let the catalog explain: invalid, hooks only, or absent.
         let why = connector::Catalog::check(&catalog, id, &serde_json::json!({}))
             .err()
-            .unwrap_or_else(|| format!("{id:?} is built in, not a plugin"));
+            .unwrap_or_else(|| format!("{id:?} is built in, not a connector"));
         bail!("{why}");
     };
-    if plugin.manifest.connector.is_none() {
-        bail!("plugin {id:?} has no connector (it only provides event hooks)");
+    if connector.manifest.connector.is_none() {
+        bail!("connector {id:?} has no connector command (it only provides event hooks)");
     }
     let config = PastorConfig::load(&paths.config_file())?;
     let path = job::job_path(&paths.jobs_dir(), job_name);
@@ -331,8 +331,12 @@ async fn run_once(
         now,
     };
     let source =
-        connector::process::source(Arc::clone(&plugin), paths.clone(), Some(job_name.into()));
-    let spec = plugin.manifest.connector.as_ref().expect("checked above");
+        connector::process::source(Arc::clone(&connector), paths.clone(), Some(job_name.into()));
+    let spec = connector
+        .manifest
+        .connector
+        .as_ref()
+        .expect("checked above");
     let out = match spec.mode {
         // A stream never ends on its own: collect for its timeout, then stop
         // (dropping the source kills it).

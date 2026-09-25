@@ -1,10 +1,19 @@
 //! The seam between the scheduler and whatever produces items: the built-in
-//! `clock`, and process connectors from plugins (`process`) behind the same
-//! trait. A `Catalog` says which connector ids exist. Named `ItemSource` in code only because `herdr::Connector` is
-//! already the transport; wherever a user sees it, it is a connector.
+//! `clock`, and the commands of installed connectors (`process`) behind the
+//! same trait. A `Catalog` says which connector ids exist. Named `ItemSource`
+//! in code only because `herdr::Connector` is already the transport; wherever
+//! a user sees it, it is a connector. `package` finds the installed ones.
 
+pub mod cli;
 pub mod clock;
+pub mod env;
+pub mod exec;
+pub mod install;
+pub mod manifest;
+pub mod package;
 pub mod process;
+
+pub use package::{Connector, ConnectorCatalog, Discovered, discover, load_manifest};
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -35,7 +44,7 @@ impl Item {
     }
 }
 
-/// What a run receives; a plugin connector gets the same shape on its stdin.
+/// What a run receives; a process connector gets the same shape on its stdin.
 #[derive(Debug, Clone)]
 pub struct RunInput {
     /// The job's `[connector]` table minus `use`.
@@ -92,10 +101,10 @@ pub fn builtin(id: &str) -> Option<Arc<dyn ItemSource>> {
 /// it at run time.
 pub trait Catalog: Send + Sync {
     fn source(&self, id: &str) -> Option<Arc<dyn ItemSource>>;
-    /// Err(reason) for a missing plugin or a config key the manifest requires.
+    /// Err(reason) for a missing connector or a config key the manifest requires.
     fn check(&self, id: &str, config: &Value) -> Result<(), String>;
     /// The source for `id` running on behalf of `job`. A catalog whose
-    /// sources care which job they serve (plugins: `PASTOR_JOB`, run logs,
+    /// sources care which job they serve (connectors: `PASTOR_JOB`, run logs,
     /// scratch) overrides this; the default ignores the job.
     fn source_for_job(&self, id: &str, _job: &str) -> Option<Arc<dyn ItemSource>> {
         self.source(id)
@@ -106,7 +115,7 @@ pub trait Catalog: Send + Sync {
     fn retain_jobs(&self, _keep: &HashSet<(String, String)>) {}
 }
 
-/// Only what ships in the binary: the clock. What a daemon with no plugins,
+/// Only what ships in the binary: the clock. What a daemon with no connectors,
 /// and most tests, use.
 pub struct Builtins;
 
@@ -119,7 +128,7 @@ impl Catalog for Builtins {
         match builtin(id) {
             Some(_) => Ok(()),
             None => Err(format!(
-                "connector {id:?} is not available: no built-in connector or installed plugin has that id"
+                "connector {id:?} is not available: no built-in or installed connector has that id"
             )),
         }
     }

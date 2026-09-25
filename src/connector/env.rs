@@ -1,5 +1,5 @@
-//! A plugin's `.env`: secrets and settings the user writes, loaded into every
-//! command the plugin runs. `Redactor` keeps the secrets' values out of
+//! A connector's `.env`: secrets and settings the user writes, loaded into every
+//! command the connector runs. `Redactor` keeps the secrets' values out of
 //! captured output and logs.
 
 use std::path::Path;
@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::Context;
 
 /// `KEY=value` pairs in file order. A missing file is an empty env: most
-/// plugins need no settings.
+/// connectors need no settings.
 pub fn load(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,

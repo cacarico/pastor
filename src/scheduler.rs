@@ -584,11 +584,11 @@ pub struct Scheduler {
     fleet: Arc<Fleet>,
     events: broadcast::Sender<PastorEvent>,
     /// Which connectors exist: job files validate against it and runs
-    /// resolve through it. `Builtins` until `with_plugins`.
+    /// resolve through it. `Builtins` until `with_connectors`.
     catalog: Arc<dyn Catalog>,
-    /// Re-read the plugins dir on a forced reload (`pastor job reload`, which
-    /// `plugin install|link|uninstall|unlink` send).
-    plugins: bool,
+    /// Re-read the connectors dir on a forced reload (`pastor job reload`, which
+    /// `connector install|link|uninstall|unlink` send).
+    connectors: bool,
     /// Replaces the catalog's lookup when set.
     resolve: Option<Resolver>,
     /// The CLI's one-pass scheduler: it exits after the pass, so it cannot
@@ -640,7 +640,7 @@ impl Scheduler {
             fleet,
             events,
             catalog: Arc::new(Builtins),
-            plugins: false,
+            connectors: false,
             resolve: None,
             standalone: false,
             entries: HashMap::new(),
@@ -673,20 +673,20 @@ impl Scheduler {
         self
     }
 
-    /// Validate and resolve against the builtins plus the plugins installed
-    /// under the data dir. An unreadable plugins dir is logged and leaves the
-    /// builtins, so a bad plugin never keeps the daemon from starting.
-    pub fn with_plugins(mut self) -> Self {
-        self.plugins = true;
-        self.load_plugins();
+    /// Validate and resolve against the builtins plus the connectors installed
+    /// under the data dir. An unreadable connectors dir is logged and leaves the
+    /// builtins, so a bad connector never keeps the daemon from starting.
+    pub fn with_connectors(mut self) -> Self {
+        self.connectors = true;
+        self.load_connectors();
         self
     }
 
-    fn load_plugins(&mut self) {
-        match crate::plugin::PluginCatalog::load(&self.paths) {
+    fn load_connectors(&mut self) {
+        match crate::connector::ConnectorCatalog::load(&self.paths) {
             Ok(c) => self.catalog = Arc::new(c),
             Err(err) => {
-                tracing::error!(%err, "read plugins; only built-in connectors are available");
+                tracing::error!(%err, "read connectors; only built-in connectors are available");
                 self.catalog = Arc::new(Builtins);
             }
         }
@@ -852,10 +852,10 @@ impl Scheduler {
     /// fingerprint looks unchanged. What `pastor job reload` calls: the fingerprint
     /// is a cheap heuristic (mtime and size), not proof nothing changed.
     pub fn force_reload(&mut self) -> bool {
-        // Plugins change only by command, and those end in this reload. A new
+        // Connectors change only by command, and those end in this reload. A new
         // catalog also drops the old one's sources, which stops its streams.
-        if self.plugins {
-            self.load_plugins();
+        if self.connectors {
+            self.load_connectors();
         }
         self.fingerprint = None;
         self.reload()
@@ -1464,12 +1464,12 @@ mod tests {
         );
     }
 
-    /// With plugins on, job files validate against the plugin catalog: a job
-    /// on an installed plugin is valid and resolves to that plugin, scoped to
+    /// With connectors on, job files validate against the connector catalog: a job
+    /// on an installed connector is valid and resolves to that connector, scoped to
     /// the job; one missing a required key is invalid with the manifest's
-    /// reason. A plugin linked later is seen after a forced reload.
+    /// reason. A connector linked later is seen after a forced reload.
     #[test]
-    fn with_plugins_validates_and_resolves_against_the_catalog() {
+    fn with_connectors_validates_and_resolves_against_the_catalog() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let jobs = paths.jobs_dir();
@@ -1486,7 +1486,7 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut s = Scheduler::standalone(paths.clone(), &PastorConfig::default(), store)
             .unwrap()
-            .with_plugins();
+            .with_connectors();
         s.reload();
         let st = s.statuses(Utc::now());
         assert!(
@@ -1497,10 +1497,10 @@ mod tests {
             "{st:?}"
         );
 
-        std::fs::create_dir_all(paths.plugins_dir()).unwrap();
+        std::fs::create_dir_all(paths.connectors_dir()).unwrap();
         let fixture =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin/echo");
-        std::os::unix::fs::symlink(fixture, paths.plugins_dir().join("echo")).unwrap();
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/connector/echo");
+        std::os::unix::fs::symlink(fixture, paths.connectors_dir().join("echo")).unwrap();
         s.force_reload();
         let st = s.statuses(Utc::now());
         let bare = st.iter().find(|j| j.name == "bare").unwrap();
@@ -2069,13 +2069,14 @@ mod tests {
     /// cursor `cur-1` shortly after its first run starts it.
     fn fixture_stream(tmp: &std::path::Path) -> Arc<dyn ItemSource> {
         let paths = Paths::new(tmp.join("c"), tmp.join("s")).with_data_dir(tmp.join("d"));
-        std::fs::create_dir_all(paths.plugins_dir()).unwrap();
+        std::fs::create_dir_all(paths.connectors_dir()).unwrap();
         std::os::unix::fs::symlink(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin/stream"),
-            paths.plugins_dir().join("stream"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/connector/stream"),
+            paths.connectors_dir().join("stream"),
         )
         .unwrap();
-        let catalog = crate::plugin::PluginCatalog::load(&paths).unwrap();
+        let catalog = crate::connector::ConnectorCatalog::load(&paths).unwrap();
         catalog.source_for_job("stream", "j").unwrap()
     }
 
@@ -2161,7 +2162,7 @@ mod tests {
 
     /// A stream belongs to its job: when the job file goes, the next reload
     /// drops the job's source and its process stops, without waiting for a
-    /// forced plugin reload or a restart.
+    /// forced connector reload or a restart.
     #[tokio::test]
     async fn a_removed_job_stops_its_stream() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2178,7 +2179,7 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let mut s = Scheduler::standalone(paths.clone(), &PastorConfig::default(), store)
             .unwrap()
-            .with_plugins();
+            .with_connectors();
         s.reload();
         let src = s.source_for("stream", "j").unwrap();
         let _ = src
@@ -2190,7 +2191,7 @@ mod tests {
             })
             .await;
         drop(src);
-        let pid_file = paths.plugin_state_dir("j").join("pid");
+        let pid_file = paths.connector_state_dir("j").join("pid");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let pid = loop {
             if let Ok(p) = std::fs::read_to_string(&pid_file)

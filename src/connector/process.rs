@@ -1,4 +1,4 @@
-//! Connectors a plugin provides: its `[connector]` command behind the
+//! What an installed connector runs: its `[connector]` command behind the
 //! `ItemSource` seam. A poll connector runs once per job run; a stream
 //! connector is started once and kept alive, and each job run drains what it
 //! emitted since the last one, plus whatever earlier batch the scheduler has
@@ -19,9 +19,9 @@ use tokio::task::JoinHandle;
 
 use super::{Item, ItemSource, RunFuture, RunInput, RunOutput};
 use crate::config::Paths;
-use crate::plugin::Plugin;
-use crate::plugin::exec::{self, Invocation, RunLog, SharedLog};
-use crate::plugin::manifest::Mode;
+use crate::connector::Connector;
+use crate::connector::exec::{self, Invocation, RunLog, SharedLog};
+use crate::connector::manifest::Mode;
 
 /// One stdout line, understood.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +79,7 @@ impl Collected {
             None => {}
             Some(Line::Item(item)) => self.out.items.push(item),
             Some(Line::Cursor(c)) => self.out.cursor = Some(c),
-            // Log records reach the scheduler's log and `plugin run`, so they
+            // Log records reach the scheduler's log and `connector run`, so they
             // get the same redaction as stderr.
             Some(Line::Log(l)) => self.out.logs.push(lock(log).redact(&l)),
             Some(Line::Bad(why)) => {
@@ -91,13 +91,13 @@ impl Collected {
     }
 }
 
-/// What a plugin's connector needs to run for one job.
+/// What a connector's command needs to run for one job.
 #[derive(Clone)]
 struct Runner {
-    plugin: Arc<Plugin>,
+    connector: Arc<Connector>,
     paths: Paths,
     /// `None` when resolved by id alone; the run log then goes under
-    /// `runs/@<plugin id>/` and `PASTOR_JOB` is unset.
+    /// `runs/@<connector id>/` and `PASTOR_JOB` is unset.
     job: Option<String>,
 }
 
@@ -105,7 +105,7 @@ impl Runner {
     fn log_dir_name(&self) -> String {
         self.job
             .clone()
-            .unwrap_or_else(|| format!("@{}", self.plugin.id))
+            .unwrap_or_else(|| format!("@{}", self.connector.id))
     }
 
     /// The invocation and a fresh run log for it. Err when the `.env` does
@@ -115,14 +115,12 @@ impl Runner {
         input: &RunInput,
         timeout: Option<Duration>,
     ) -> Result<(Invocation, SharedLog), String> {
-        let spec = self
-            .plugin
-            .manifest
-            .connector
-            .as_ref()
-            .ok_or_else(|| format!("plugin {:?} has no connector", self.plugin.id))?;
+        let spec =
+            self.connector.manifest.connector.as_ref().ok_or_else(|| {
+                format!("connector {:?} has no connector command", self.connector.id)
+            })?;
         let (env, redactor) = self
-            .plugin
+            .connector
             .command_env(&self.paths, self.job.as_deref())
             .map_err(|e| format!("{e:#}"))?;
         let log = RunLog::create(&self.paths.runs_dir(&self.log_dir_name()), redactor)
@@ -137,7 +135,7 @@ impl Runner {
         Ok((
             Invocation {
                 argv: spec.command.clone(),
-                cwd: self.plugin.dir.clone(),
+                cwd: self.connector.dir.clone(),
                 env,
                 stdin,
                 timeout,
@@ -151,15 +149,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// The `ItemSource` for a plugin's connector, poll or stream by its manifest.
-pub fn source(plugin: Arc<Plugin>, paths: Paths, job: Option<String>) -> Arc<dyn ItemSource> {
-    let mode = plugin
+/// The `ItemSource` for a connector's command, poll or stream by its manifest.
+pub fn source(connector: Arc<Connector>, paths: Paths, job: Option<String>) -> Arc<dyn ItemSource> {
+    let mode = connector
         .manifest
         .connector
         .as_ref()
         .map(|c| c.mode)
         .unwrap_or_default();
-    let runner = Runner { plugin, paths, job };
+    let runner = Runner {
+        connector,
+        paths,
+        job,
+    };
     match mode {
         Mode::Poll => Arc::new(PollSource { runner }),
         Mode::Stream => Arc::new(StreamSource::new(runner, STREAM_BACKOFF_BASE)),
@@ -172,7 +174,7 @@ pub struct PollSource {
 
 impl ItemSource for PollSource {
     fn id(&self) -> &str {
-        &self.runner.plugin.id
+        &self.runner.connector.id
     }
 
     /// Exit 0 is success with whatever it printed; non-zero, a timeout or a
@@ -182,7 +184,7 @@ impl ItemSource for PollSource {
         Box::pin(async move {
             let timeout = self
                 .runner
-                .plugin
+                .connector
                 .manifest
                 .connector
                 .as_ref()
@@ -338,12 +340,19 @@ impl StreamSource {
 
     /// A stream with a custom first backoff, for tests that watch restarts.
     pub fn with_backoff(
-        plugin: Arc<Plugin>,
+        connector: Arc<Connector>,
         paths: Paths,
         job: Option<String>,
         base: Duration,
     ) -> StreamSource {
-        StreamSource::new(Runner { plugin, paths, job }, base)
+        StreamSource::new(
+            Runner {
+                connector,
+                paths,
+                job,
+            },
+            base,
+        )
     }
 
     /// (Re)start the supervisor when nothing runs or the job's config
@@ -392,7 +401,7 @@ impl Drop for StreamSource {
 
 impl ItemSource for StreamSource {
     fn id(&self) -> &str {
-        &self.runner.plugin.id
+        &self.runner.connector.id
     }
 
     /// Drain the buffer. A stream that is down with nothing buffered is a
@@ -406,7 +415,7 @@ impl ItemSource for StreamSource {
             if let Some(mut known) = self.ensure_started(&input) {
                 let bound = self
                     .runner
-                    .plugin
+                    .connector
                     .manifest
                     .connector
                     .as_ref()
@@ -436,7 +445,7 @@ impl ItemSource for StreamSource {
 }
 
 /// How long a stream's first run waits to hear whether it started, when
-/// the plugin has no connector table to take the timeout from.
+/// the connector has no `[connector]` table to take the timeout from.
 const STREAM_START_WAIT: Duration = Duration::from_secs(60);
 
 /// Keep the stream's process running. `reported` turns true the first time
@@ -493,7 +502,7 @@ async fn supervise(
         if started.elapsed() >= STREAM_HEALTHY_AFTER {
             backoff = base;
         }
-        tracing::warn!(plugin = %runner.plugin.id, job = ?runner.job, %reason, retry_in = ?backoff, "stream connector restarting");
+        tracing::warn!(connector = %runner.connector.id, job = ?runner.job, %reason, retry_in = ?backoff, "stream connector restarting");
         {
             let mut b = lock(&buffer);
             b.push_log(format!(

@@ -1,5 +1,5 @@
 //! Connector protocol tests with real child processes: the shell fixtures in
-//! tests/fixtures/plugin/ emit items, cursors and bad lines, and fail, hang or
+//! tests/fixtures/connector/ emit items, cursors and bad lines, and fail, hang or
 //! crash on demand.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use chrono::{TimeZone, Utc};
 use pastor::config::Paths;
 use pastor::connector::process::{self, StreamSource};
+use pastor::connector::{Connector, Discovered, discover};
 use pastor::connector::{ItemSource, RunInput};
-use pastor::plugin::{Discovered, Plugin, discover};
 use serde_json::json;
 
 /// How long a test waits for the daemon or the fake herdr to do something.
@@ -19,7 +19,7 @@ const WAIT: Duration = Duration::from_secs(60);
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/plugin")
+        .join("tests/fixtures/connector")
         .join(name)
 }
 
@@ -33,15 +33,15 @@ fn env_with(fixtures: &[&str]) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let paths =
         Paths::new(tmp.path().join("c"), tmp.path().join("s")).with_data_dir(tmp.path().join("d"));
-    std::fs::create_dir_all(paths.plugins_dir()).unwrap();
+    std::fs::create_dir_all(paths.connectors_dir()).unwrap();
     for f in fixtures {
-        std::os::unix::fs::symlink(fixture(f), paths.plugins_dir().join(f)).unwrap();
+        std::os::unix::fs::symlink(fixture(f), paths.connectors_dir().join(f)).unwrap();
     }
     Env { _tmp: tmp, paths }
 }
 
 impl Env {
-    fn plugin(&self, id: &str) -> Arc<Plugin> {
+    fn connector(&self, id: &str) -> Arc<Connector> {
         match discover(&self.paths)
             .unwrap()
             .into_iter()
@@ -54,7 +54,7 @@ impl Env {
     }
 
     fn dotenv(&self, id: &str, text: &str) {
-        let f = self.paths.plugin_env_file(id);
+        let f = self.paths.connector_env_file(id);
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         std::fs::write(f, text).unwrap();
     }
@@ -87,7 +87,7 @@ async fn a_poll_connector_gets_the_handshake_and_its_lines_are_parsed() {
     let env = env_with(&["echo"]);
     env.dotenv("echo", "FIXTURE_TOKEN=tok-sekrit-42\n");
     let src = process::source(
-        env.plugin("echo"),
+        env.connector("echo"),
         env.paths.clone(),
         Some("support".into()),
     );
@@ -135,14 +135,14 @@ async fn a_poll_connector_gets_the_handshake_and_its_lines_are_parsed() {
     assert!(!logs[0].contains("tok-sekrit-42"));
     assert!(logs[0].contains("[pastor: skipped stdout line 5: not JSON"));
     assert!(logs[0].ends_with("[pastor: exit 0]\n"), "{}", logs[0]);
-    assert!(env.paths.plugin_state_dir("support").is_dir());
+    assert!(env.paths.connector_state_dir("support").is_dir());
 }
 
 #[tokio::test]
 async fn a_failing_poll_is_an_error_and_its_output_is_discarded() {
     let env = env_with(&["echo"]);
     env.dotenv("echo", "FIXTURE_MODE=fail\n");
-    let src = process::source(env.plugin("echo"), env.paths.clone(), Some("j".into()));
+    let src = process::source(env.connector("echo"), env.paths.clone(), Some("j".into()));
     let err = src.run(input(json!({}), None)).await.unwrap_err();
     assert!(
         err.starts_with("exit 4: failing on purpose (log: "),
@@ -156,7 +156,7 @@ async fn a_failing_poll_is_an_error_and_its_output_is_discarded() {
 async fn a_hanging_poll_times_out() {
     let env = env_with(&["echo"]);
     env.dotenv("echo", "FIXTURE_MODE=hang\n");
-    let src = process::source(env.plugin("echo"), env.paths.clone(), Some("j".into()));
+    let src = process::source(env.connector("echo"), env.paths.clone(), Some("j".into()));
     let started = Instant::now();
     let err = src.run(input(json!({}), None)).await.unwrap_err();
     assert!(err.starts_with("timed out after 5s"), "{err}");
@@ -167,15 +167,15 @@ async fn a_hanging_poll_times_out() {
 async fn a_broken_env_file_fails_the_run() {
     let env = env_with(&["echo"]);
     env.dotenv("echo", "not an assignment\n");
-    let src = process::source(env.plugin("echo"), env.paths.clone(), Some("j".into()));
+    let src = process::source(env.connector("echo"), env.paths.clone(), Some("j".into()));
     let err = src.run(input(json!({}), None)).await.unwrap_err();
     assert!(err.contains(".env") && err.contains("line 1"), "{err}");
 }
 
 #[tokio::test]
-async fn without_a_job_logs_go_under_the_plugin_id() {
+async fn without_a_job_logs_go_under_the_connector_id() {
     let env = env_with(&["echo"]);
-    let src = process::source(env.plugin("echo"), env.paths.clone(), None);
+    let src = process::source(env.connector("echo"), env.paths.clone(), None);
     let out = src.run(input(json!({}), None)).await.unwrap();
     assert!(
         out.logs[1].starts_with("debug: env echo none "),
@@ -212,7 +212,7 @@ async fn drain_until(
 async fn a_stream_stays_up_and_each_run_drains_what_it_emitted() {
     let env = env_with(&["stream"]);
     env.dotenv("stream", "FIXTURE_TOKEN=tok-stream-77\n");
-    let src = process::source(env.plugin("stream"), env.paths.clone(), Some("s".into()));
+    let src = process::source(env.connector("stream"), env.paths.clone(), Some("s".into()));
     let cfg = json!({"room": "r1"});
     let (keys, cursors, logs) = drain_until(src.as_ref(), &cfg, 1).await;
     assert_eq!(keys, vec!["start-1"]);
@@ -235,7 +235,8 @@ async fn a_stream_stays_up_and_each_run_drains_what_it_emitted() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let out = src.run(input(cfg.clone(), None)).await.unwrap();
     assert!(out.items.is_empty());
-    let starts = std::fs::read_to_string(env.paths.plugin_state_dir("s").join("starts")).unwrap();
+    let starts =
+        std::fs::read_to_string(env.paths.connector_state_dir("s").join("starts")).unwrap();
     assert_eq!(starts.trim(), "1");
     // A changed config restarts it, resuming from the newest cursor.
     let (keys, _, logs) = drain_until(src.as_ref(), &json!({"room": "r2"}), 1).await;
@@ -255,7 +256,7 @@ async fn a_crashing_stream_is_restarted_with_backoff() {
     let env = env_with(&["stream"]);
     env.dotenv("stream", "FIXTURE_MODE=crash\n");
     let src = StreamSource::with_backoff(
-        env.plugin("stream"),
+        env.connector("stream"),
         env.paths.clone(),
         Some("s".into()),
         Duration::from_millis(100),
@@ -290,14 +291,14 @@ async fn a_crashing_stream_is_restarted_with_backoff() {
 #[tokio::test]
 async fn a_stream_whose_program_is_missing_fails_its_first_run() {
     let env = env_with(&[]);
-    let dir = env.paths.plugins_dir().join("ghost");
+    let dir = env.paths.connectors_dir().join("ghost");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        dir.join("pastor-plugin.toml"),
+        dir.join("pastor-connector.toml"),
         "id = \"ghost\"\nversion = \"0.1.0\"\n[connector]\nmode = \"stream\"\ncommand = [\"./no-such-program\"]\n",
     )
     .unwrap();
-    let src = process::source(env.plugin("ghost"), env.paths.clone(), Some("g".into()));
+    let src = process::source(env.connector("ghost"), env.paths.clone(), Some("g".into()));
     let err = src.run(input(json!({}), None)).await.unwrap_err();
     assert!(
         err.starts_with("stream connector stopped: could not start: ./no-such-program"),
@@ -309,7 +310,7 @@ async fn a_stream_whose_program_is_missing_fails_its_first_run() {
 async fn a_stream_with_a_broken_env_file_fails_its_first_run() {
     let env = env_with(&["stream"]);
     env.dotenv("stream", "not an assignment\n");
-    let src = process::source(env.plugin("stream"), env.paths.clone(), Some("s".into()));
+    let src = process::source(env.connector("stream"), env.paths.clone(), Some("s".into()));
     let err = src.run(input(json!({}), None)).await.unwrap_err();
     assert!(err.contains(".env") && err.contains("line 1"), "{err}");
 }
@@ -317,11 +318,11 @@ async fn a_stream_with_a_broken_env_file_fails_its_first_run() {
 #[tokio::test]
 async fn a_healthy_stream_first_run_succeeds() {
     let env = env_with(&["stream"]);
-    let src = process::source(env.plugin("stream"), env.paths.clone(), Some("s".into()));
+    let src = process::source(env.connector("stream"), env.paths.clone(), Some("s".into()));
     assert!(src.run(input(json!({}), None)).await.is_ok());
 }
 
-// ---- the `pastor plugin` commands, through the binary ----
+// ---- the `pastor connector` commands, through the binary ----
 
 struct Cli {
     tmp: tempfile::TempDir,
@@ -346,7 +347,7 @@ impl Cli {
             .env("PASTOR_STATE_DIR", self.dir("s"))
             .env("PASTOR_DATA_DIR", self.dir("d"))
             .env(
-                "PASTOR_PLUGIN_GIT_BASE",
+                "PASTOR_CONNECTOR_GIT_BASE",
                 format!("file://{}", self.dir("repos").display()),
             )
             .stdin(std::process::Stdio::null())
@@ -377,12 +378,12 @@ impl Cli {
     }
 
     /// A git repo at repos/<owner>/<repo>.git holding the echo fixture under
-    /// plugins/echo, with a tag v1 and a later commit that bumps the version.
+    /// connectors/echo, with a tag v1 and a later commit that bumps the version.
     fn repo(&self, owner: &str, repo: &str) {
         let r = self.dir("repos").join(owner).join(format!("{repo}.git"));
-        let sub = r.join("plugins/echo");
+        let sub = r.join("connectors/echo");
         std::fs::create_dir_all(&sub).unwrap();
-        for f in ["pastor-plugin.toml", "poll.sh", "hook.sh"] {
+        for f in ["pastor-connector.toml", "poll.sh", "hook.sh"] {
             std::fs::copy(fixture("echo").join(f), sub.join(f)).unwrap();
         }
         let git = |args: &[&str]| {
@@ -409,20 +410,20 @@ impl Cli {
                 String::from_utf8_lossy(&st.stderr)
             );
         };
-        // Two symlinked subdirs: one to the plugin inside the repo, one to a
-        // plugin outside it.
-        std::os::unix::fs::symlink("echo", r.join("plugins/alias")).unwrap();
+        // Two symlinked subdirs: one to the connector inside the repo, one to a
+        // connector outside it.
+        std::os::unix::fs::symlink("echo", r.join("connectors/alias")).unwrap();
         let outside = self.dir("elsewhere/echo");
         std::fs::create_dir_all(&outside).unwrap();
-        for f in ["pastor-plugin.toml", "poll.sh", "hook.sh"] {
+        for f in ["pastor-connector.toml", "poll.sh", "hook.sh"] {
             std::fs::copy(fixture("echo").join(f), outside.join(f)).unwrap();
         }
-        std::os::unix::fs::symlink(&outside, r.join("plugins/outside")).unwrap();
+        std::os::unix::fs::symlink(&outside, r.join("connectors/outside")).unwrap();
         git(&["init", "-q"]);
         git(&["add", "."]);
         git(&["commit", "-qm", "v1"]);
         git(&["tag", "v1"]);
-        let m = sub.join("pastor-plugin.toml");
+        let m = sub.join("pastor-connector.toml");
         let text = std::fs::read_to_string(&m).unwrap();
         std::fs::write(
             &m,
@@ -440,38 +441,52 @@ impl Cli {
 fn install_resolves_a_symlinked_subdir_and_refuses_one_outside_the_repo() {
     let cli = Cli::new();
     cli.repo("acme", "tools");
-    let err = cli.fails(&["plugin", "install", "acme/tools/plugins/outside", "--yes"]);
+    let err = cli.fails(&[
+        "connector",
+        "install",
+        "acme/tools/connectors/outside",
+        "--yes",
+    ]);
     assert!(err.contains("outside the repository"), "{err}");
-    assert!(!cli.dir("d/plugins/echo").exists());
+    assert!(!cli.dir("d/connectors/echo").exists());
 
-    let (out, _) = cli.ok(&["plugin", "install", "acme/tools/plugins/alias", "--yes"]);
+    let (out, _) = cli.ok(&[
+        "connector",
+        "install",
+        "acme/tools/connectors/alias",
+        "--yes",
+    ]);
     assert!(out.contains("installed echo 0.2.0"), "{out}");
-    let installed = cli.dir("d/plugins/echo");
+    let installed = cli.dir("d/connectors/echo");
     let md = std::fs::symlink_metadata(&installed).unwrap();
     assert!(md.is_dir(), "a directory, not a moved link");
-    assert!(installed.join("pastor-plugin.toml").exists());
-    let (out, _) = cli.ok(&["plugin", "list", "--json"]);
+    assert!(installed.join("pastor-connector.toml").exists());
+    let (out, _) = cli.ok(&["connector", "list", "--json"]);
     let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(rows[0]["error"], serde_json::Value::Null, "{out}");
-    let (out, _) = cli.ok(&["plugin", "run", "echo", "--job", "try"]);
-    assert_eq!(out.lines().count(), 3, "the installed plugin runs: {out}");
+    let (out, _) = cli.ok(&["connector", "run", "echo", "--job", "try"]);
+    assert_eq!(
+        out.lines().count(),
+        3,
+        "the installed connector runs: {out}"
+    );
 }
 
 #[test]
 fn install_list_and_uninstall_from_a_git_repo() {
     let cli = Cli::new();
     cli.repo("acme", "tools");
-    let err = cli.fails(&["plugin", "install", "acme/tools/plugins/echo"]);
+    let err = cli.fails(&["connector", "install", "acme/tools/connectors/echo"]);
     assert!(err.contains("pass --yes"), "no tty, no --yes: {err}");
     assert!(
-        !cli.dir("d/plugins/echo").exists(),
+        !cli.dir("d/connectors/echo").exists(),
         "nothing lands without confirmation"
     );
 
     let (out, err) = cli.ok(&[
-        "plugin",
+        "connector",
         "install",
-        "acme/tools/plugins/echo",
+        "acme/tools/connectors/echo",
         "--ref",
         "v1",
         "--yes",
@@ -482,16 +497,21 @@ fn install_list_and_uninstall_from_a_git_repo() {
         "shows what it runs: {err}"
     );
     assert!(err.contains("set FIXTURE_TOKEN in"), "{err}");
-    let leftovers: Vec<_> = std::fs::read_dir(cli.dir("d/plugins"))
+    let leftovers: Vec<_> = std::fs::read_dir(cli.dir("d/connectors"))
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(leftovers, vec!["echo"], "the scratch clone is gone");
 
-    let err = cli.fails(&["plugin", "install", "acme/tools/plugins/echo", "--yes"]);
+    let err = cli.fails(&[
+        "connector",
+        "install",
+        "acme/tools/connectors/echo",
+        "--yes",
+    ]);
     assert!(err.contains("already in"), "{err}");
 
-    let (out, _) = cli.ok(&["plugin", "list", "--json"]);
+    let (out, _) = cli.ok(&["connector", "list", "--json"]);
     let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(rows[0]["id"], "echo");
     assert_eq!(rows[0]["version"], "0.1.0");
@@ -501,46 +521,55 @@ fn install_list_and_uninstall_from_a_git_repo() {
         rows[0]["missing_secrets"],
         serde_json::json!(["FIXTURE_TOKEN"])
     );
-    let (out, _) = cli.ok(&["plugin", "list"]);
+    let (out, _) = cli.ok(&["connector", "list"]);
     assert!(out.starts_with("ID"), "{out}");
     assert!(out.contains("missing secrets: FIXTURE_TOKEN"), "{out}");
 
-    let err = cli.fails(&["plugin", "unlink", "echo"]);
-    assert!(err.contains("use `pastor plugin uninstall echo`"), "{err}");
-    cli.ok(&["plugin", "uninstall", "echo"]);
-    assert!(!cli.dir("d/plugins/echo").exists());
-    let err = cli.fails(&["plugin", "uninstall", "echo"]);
-    assert!(err.contains("no plugin \"echo\""), "{err}");
+    let err = cli.fails(&["connector", "unlink", "echo"]);
+    assert!(
+        err.contains("use `pastor connector uninstall echo`"),
+        "{err}"
+    );
+    cli.ok(&["connector", "uninstall", "echo"]);
+    assert!(!cli.dir("d/connectors/echo").exists());
+    let err = cli.fails(&["connector", "uninstall", "echo"]);
+    assert!(err.contains("no connector \"echo\""), "{err}");
 
     // Without --ref: the branch tip.
-    let (out, _) = cli.ok(&["plugin", "install", "acme/tools/plugins/echo", "--yes"]);
+    let (out, _) = cli.ok(&[
+        "connector",
+        "install",
+        "acme/tools/connectors/echo",
+        "--yes",
+    ]);
     assert!(out.contains("installed echo 0.2.0"), "{out}");
-    let err = cli.fails(&["plugin", "install", "acme/missing", "--yes"]);
+    let err = cli.fails(&["connector", "install", "acme/missing", "--yes"]);
     assert!(err.contains("git clone"), "{err}");
 }
 
-/// The stream fixture, copied with a 1s timeout so `plugin run` collects for
+/// The stream fixture, copied with a 1s timeout so `connector run` collects for
 /// a second rather than the default minute, and linked.
 fn link_quick_stream(cli: &Cli) {
     let dir = cli.dir("dev/stream");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(fixture("stream").join("stream.sh"), dir.join("stream.sh")).unwrap();
-    let manifest = std::fs::read_to_string(fixture("stream").join("pastor-plugin.toml")).unwrap();
+    let manifest =
+        std::fs::read_to_string(fixture("stream").join("pastor-connector.toml")).unwrap();
     std::fs::write(
-        dir.join("pastor-plugin.toml"),
+        dir.join("pastor-connector.toml"),
         manifest.replace("mode = \"stream\"", "mode = \"stream\"\ntimeout = \"1s\""),
     )
     .unwrap();
-    cli.ok(&["plugin", "link", dir.to_str().unwrap()]);
+    cli.ok(&["connector", "link", dir.to_str().unwrap()]);
 }
 
 /// A stream is drained twice, at start and after its timeout; nothing is
 /// acked in between, so each item must still print once.
 #[test]
-fn plugin_run_collects_a_stream_and_prints_each_item_once() {
+fn connector_run_collects_a_stream_and_prints_each_item_once() {
     let cli = Cli::new();
     link_quick_stream(&cli);
-    let (out, err) = cli.ok(&["plugin", "run", "stream", "--job", "try"]);
+    let (out, err) = cli.ok(&["connector", "run", "stream", "--job", "try"]);
     assert_eq!(out, "{\"key\":\"start-1\"}\n", "{err}");
     assert!(err.contains("collecting for 1s"), "{err}");
     assert!(err.contains("1 items, cursor cur-1"), "{err}");
@@ -576,7 +605,7 @@ fn a_standalone_tick_refuses_a_stream_job() {
         );
     }
     assert!(
-        !cli.dir("s/plugins/live/starts").exists(),
+        !cli.dir("s/connectors/live/starts").exists(),
         "the stream was never started"
     );
     let (out, _) = cli.ok(&["job", "list", "--json"]);
@@ -587,13 +616,13 @@ fn a_standalone_tick_refuses_a_stream_job() {
 #[test]
 fn link_run_and_unlink() {
     let cli = Cli::new();
-    let (out, _) = cli.ok(&["plugin", "link", fixture("echo").to_str().unwrap()]);
+    let (out, _) = cli.ok(&["connector", "link", fixture("echo").to_str().unwrap()]);
     assert!(out.contains("linked echo 0.1.0"), "{out}");
-    let err = cli.fails(&["plugin", "uninstall", "echo"]);
+    let err = cli.fails(&["connector", "uninstall", "echo"]);
     assert!(err.contains("is linked"), "{err}");
 
     // No job file: an empty config, items on stdout as JSON lines.
-    let (out, err) = cli.ok(&["plugin", "run", "echo", "--job", "try"]);
+    let (out, err) = cli.ok(&["connector", "run", "echo", "--job", "try"]);
     let items: Vec<serde_json::Value> = out
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -604,7 +633,7 @@ fn link_run_and_unlink() {
     assert!(err.contains("3 items, cursor c-2"), "{err}");
     assert!(cli.dir("s/runs/try").is_dir());
 
-    // A job file that uses the plugin: its config reaches the handshake.
+    // A job file that uses the connector: its config reaches the handshake.
     let jobs = cli.dir("c/jobs");
     std::fs::create_dir_all(&jobs).unwrap();
     std::fs::write(
@@ -612,7 +641,15 @@ fn link_run_and_unlink() {
         "every = \"5m\"\n[connector]\nuse = \"echo\"\nchannel = \"C9\"\n[dispatch]\nprompt = \"{{ item.title }}\"\n",
     )
     .unwrap();
-    let (_, err) = cli.ok(&["plugin", "run", "echo", "--job", "support", "--since", "1h"]);
+    let (_, err) = cli.ok(&[
+        "connector",
+        "run",
+        "echo",
+        "--job",
+        "support",
+        "--since",
+        "1h",
+    ]);
     assert!(err.contains(r#""config":{"channel":"C9"}"#), "{err}");
     // A job file missing the required key is invalid, and says why.
     std::fs::write(
@@ -620,42 +657,42 @@ fn link_run_and_unlink() {
         "every = \"5m\"\n[connector]\nuse = \"echo\"\n[dispatch]\nprompt = \"p\"\n",
     )
     .unwrap();
-    let err = cli.fails(&["plugin", "run", "echo", "--job", "bare"]);
+    let err = cli.fails(&["connector", "run", "echo", "--job", "bare"]);
     assert!(err.contains("requires connector.channel"), "{err}");
 
     // A failing run is an error naming its log.
-    let envf = cli.dir("c/plugins/echo/.env");
+    let envf = cli.dir("c/connectors/echo/.env");
     std::fs::create_dir_all(envf.parent().unwrap()).unwrap();
     std::fs::write(&envf, "FIXTURE_MODE=fail\n").unwrap();
-    let err = cli.fails(&["plugin", "run", "echo", "--job", "try"]);
+    let err = cli.fails(&["connector", "run", "echo", "--job", "try"]);
     assert!(err.contains("exit 4: failing on purpose"), "{err}");
 
-    // The job name becomes paths under jobs/, runs/ and plugins/; one that
+    // The job name becomes paths under jobs/, runs/ and connectors/; one that
     // could walk out of them is refused before anything is touched.
     for bad in ["../x", "a/b", "Upper"] {
-        let err = cli.fails(&["plugin", "run", "echo", "--job", bad]);
+        let err = cli.fails(&["connector", "run", "echo", "--job", bad]);
         assert!(err.contains("must match"), "{bad}: {err}");
     }
     assert!(!cli.dir("s/x").exists() && !cli.dir("s/runs/../x").exists());
     assert!(!cli.dir("x").exists());
-    let err = cli.fails(&["plugin", "run", "nope", "--job", "try"]);
+    let err = cli.fails(&["connector", "run", "nope", "--job", "try"]);
     assert!(err.contains("not available"), "{err}");
-    cli.ok(&["plugin", "unlink", "echo"]);
+    cli.ok(&["connector", "unlink", "echo"]);
     assert!(
-        fixture("echo").join("pastor-plugin.toml").exists(),
+        fixture("echo").join("pastor-connector.toml").exists(),
         "the linked dir stays"
     );
-    let (out, _) = cli.ok(&["plugin", "list", "--json"]);
+    let (out, _) = cli.ok(&["connector", "list", "--json"]);
     assert_eq!(out.trim(), "[]");
 }
 
-/// A job whose connector is a plugin: `pastor tick` (no daemon, so the pass
+/// A job on an installed connector: `pastor tick` (no daemon, so the pass
 /// runs in the CLI) runs the fixture, dedups its items and queues one task
 /// per new key, and the job's cursor is the fixture's last one.
 #[test]
-fn a_job_on_a_plugin_connector_queues_tasks_through_tick() {
+fn a_job_on_an_installed_connector_queues_tasks_through_tick() {
     let cli = Cli::new();
-    cli.ok(&["plugin", "link", fixture("echo").to_str().unwrap()]);
+    cli.ok(&["connector", "link", fixture("echo").to_str().unwrap()]);
     let jobs = cli.dir("c/jobs");
     std::fs::create_dir_all(&jobs).unwrap();
     std::fs::write(
@@ -669,7 +706,7 @@ fn a_job_on_a_plugin_connector_queues_tasks_through_tick() {
     assert_eq!(
         jobs[0]["error"],
         serde_json::Value::Null,
-        "valid against the plugin: {out}"
+        "valid against the connector: {out}"
     );
     assert_eq!(jobs[0]["connector"], "echo");
     let (out, _) = cli.ok(&["tick", "--json"]);
@@ -709,7 +746,7 @@ fn a_job_on_a_plugin_connector_queues_tasks_through_tick() {
 // ---- against a running daemon ----
 
 /// `pastor serve` with one fake-herdr machine whose agents finish on their
-/// own, and the plugin env of `Cli`.
+/// own, and the connector env of `Cli`.
 struct Serve {
     cli: Cli,
     children: Vec<std::process::Child>,
@@ -789,17 +826,17 @@ fn records(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The whole path: plugins linked while the daemon runs (link reloads it), a
-/// job on the plugin's connector ticked through the daemon, its tasks
-/// dispatched and done, and each plugin's hooks hearing about it: `echo`
+/// The whole path: connectors linked while the daemon runs (link reloads it), a
+/// job on the connector ticked through the daemon, its tasks
+/// dispatched and done, and each connector's hooks hearing about it: `echo`
 /// only about its own job's tasks, `notify` about every task.
 #[test]
-fn a_daemon_runs_plugin_jobs_and_hooks_hear_their_events() {
+fn a_daemon_runs_connector_jobs_and_hooks_hear_their_events() {
     let s = serve();
     let cli = &s.cli;
-    let (_, err) = cli.ok(&["plugin", "link", fixture("echo").to_str().unwrap()]);
+    let (_, err) = cli.ok(&["connector", "link", fixture("echo").to_str().unwrap()]);
     assert!(err.contains("reloaded"), "{err}");
-    cli.ok(&["plugin", "link", fixture("notify").to_str().unwrap()]);
+    cli.ok(&["connector", "link", fixture("notify").to_str().unwrap()]);
     let jobs = cli.dir("c/jobs");
     std::fs::create_dir_all(&jobs).unwrap();
     std::fs::write(
@@ -812,8 +849,8 @@ fn a_daemon_runs_plugin_jobs_and_hooks_hear_their_events() {
     assert_eq!(runs[0]["outcome"], "ran", "{out}");
     assert_eq!(runs[0]["created"].as_array().unwrap().len(), 2, "{out}");
 
-    let echo = cli.dir("s/plugins/support/hook-records.jsonl");
-    let notify = cli.dir("s/plugins/support/notify.jsonl");
+    let echo = cli.dir("s/connectors/support/hook-records.jsonl");
+    let notify = cli.dir("s/connectors/support/notify.jsonl");
     wait(60, "both tasks are done and every hook heard it", || {
         records(&echo)
             .iter()
@@ -840,12 +877,12 @@ fn a_daemon_runs_plugin_jobs_and_hooks_hear_their_events() {
     // A one-off task is nobody's: notify hears of it, echo (only_own) not.
     cli.ok(&["task", "run", "one-off", "--repo", "/tmp"]);
     // `task run` is not a job, so the hook gets no PASTOR_JOB and its own scratch.
-    let notify_run = cli.dir("s/plugins/@notify/notify.jsonl");
+    let notify_run = cli.dir("s/connectors/@notify/notify.jsonl");
     wait(60, "notify hears the one-off task end", || {
         !records(&notify_run).is_empty()
     });
     std::thread::sleep(Duration::from_millis(300));
-    assert!(!cli.dir("s/plugins/@echo/hook-records.jsonl").exists());
+    assert!(!cli.dir("s/connectors/@echo/hook-records.jsonl").exists());
     assert_eq!(records(&echo).len(), 4, "echo heard nothing more");
     assert_eq!(records(&notify_run)[0]["task"]["job"], "run");
 }
@@ -882,22 +919,22 @@ fn head_that_answers_one_ping(socket: &Path) -> Arc<std::sync::Mutex<Vec<String>
     ops
 }
 
-/// The CLI pings the head once before a plugin command; the reload after
+/// The CLI pings the head once before a connector command; the reload after
 /// the change acts on that ping. A head that stops answering pings after the
 /// first still gets its reload, and is never probed a second time.
 #[test]
-fn plugin_commands_reload_on_the_one_ping_the_cli_sent() {
+fn connector_commands_reload_on_the_one_ping_the_cli_sent() {
     let cli = Cli::new();
     std::fs::create_dir_all(cli.dir("s")).unwrap();
     let ops = head_that_answers_one_ping(&cli.dir("s").join("pastor.sock"));
 
-    let (_, err) = cli.ok(&["plugin", "link", fixture("echo").to_str().unwrap()]);
-    assert!(err.contains("reloaded its plugins"), "{err}");
+    let (_, err) = cli.ok(&["connector", "link", fixture("echo").to_str().unwrap()]);
+    assert!(err.contains("reloaded its connectors"), "{err}");
     assert_eq!(*ops.lock().unwrap(), ["ping", "reload"]);
 
     // Every later ping goes unanswered, so the CLI's own check now stops the
     // command before anything changes.
-    let out = cli.pastor(&["plugin", "unlink", "echo"]);
+    let out = cli.pastor(&["connector", "unlink", "echo"]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("head_unresponsive"), "{stderr}");

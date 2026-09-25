@@ -125,8 +125,8 @@ queues one task per new item up to `max_tasks_per_run`. The rest stay unseen
 for the next run. A job never overlaps itself; `pastor job run <name>` fires
 one regardless, and it starts once a run already going has finished. `every = "5m"` or `cron = "*/5 9-18 * * 1-5"` (local time)
 says when. The built-in connector is `clock`, one item per run keyed by the
-run time; any other connector is a plugin (see Plugins), and a job that names
-one that is not installed is `invalid`.
+run time; any other is an installed connector (see Connectors), and a job
+that names one that is not installed is `invalid`.
 A failed connector backs the job off, one minute doubling to an hour, and
 keeps its cursor.
 
@@ -503,7 +503,7 @@ one task's records, `--json` prints the records as stored, and `--follow`
 keeps printing as new ones are written. It reads the file, not the daemon, so
 it works with `pastor serve` down.
 
-A record, which is also what plugin event hooks get on stdin:
+A record, which is also what connector event hooks get on stdin:
 
 ```json
 {
@@ -655,23 +655,23 @@ running service is not restarted, since restarting herdr stops its agents: run
 A user service stops at logout unless lingering is on. Setup checks
 `loginctl show-user` and prints `loginctl enable-linger` when it is off.
 For `pastor.service` it also sets the config and state dirs to 0700 and the
-socket and plugin `.env` files to 0600, and says what it changed.
+socket and connector `.env` files to 0600, and says what it changed.
 
-## Plugins
+## Connectors
 
-A plugin is a directory with a `pastor-plugin.toml` and the commands it
-names. It can provide a connector (where a job's items come from), event
-hooks, or both. `tests/fixtures/plugin/` has small working examples (`echo`
+A connector is a directory with a `pastor-connector.toml` and the commands it
+names. It can provide a connector command (where a job's items come from),
+event hooks, or both. `tests/fixtures/connector/` has small working examples (`echo`
 and `stream` connectors, a `notify` hook).
 
 ```
-~/.local/share/pastor/plugins/<id>/     the plugin: a checkout, or a symlink for `plugin link`
-~/.config/pastor/plugins/<id>/.env      secrets and settings, written by you
-~/.local/state/pastor/plugins/<job>/    the job's scratch directory, owned by pastor
-~/.local/state/pastor/runs/<job>/       run logs, one <ts>.log per run
+~/.local/share/pastor/connectors/<id>/   the connector: a checkout, or a symlink for `connector link`
+~/.config/pastor/connectors/<id>/.env    secrets and settings, written by you
+~/.local/state/pastor/connectors/<job>/  the job's scratch directory, owned by pastor
+~/.local/state/pastor/runs/<job>/        run logs, one <ts>.log per run
 ```
 
-`PASTOR_DATA_DIR` overrides the first. The directory name is the plugin's id
+`PASTOR_DATA_DIR` overrides the first. The directory name is the connector's id
 and must equal `id` in the manifest.
 
 ### The manifest
@@ -685,7 +685,7 @@ description = "Watch a channel, report back in thread"
 
 [connector]
 mode = "poll"                        # poll (the default) or stream
-command = ["bash", "poll.sh"]        # argv, run in the plugin's directory
+command = ["bash", "poll.sh"]        # argv, run in the connector's directory
 timeout = "60s"                      # the default; bounds one poll run
 
 [connector.config.channel]           # what a job's [connector] table may carry
@@ -702,28 +702,28 @@ command = ["bash", "report.sh"]
 timeout = "60s"                      # the default
 ```
 
-The manifest is checked when pastor discovers the plugin, and a key it does
-not know is an error. A plugin needs a `[connector]`, at least one `[[events]]`
+The manifest is checked when pastor discovers the connector, and a key it does
+not know is an error. A connector needs a `[connector]`, at least one `[[events]]`
 hook, or both. Each `command` is an argv array with a program in its first
-place; a relative program with a slash (`./poll`) means the plugin's own file.
+place; a relative program with a slash (`./poll`) means the connector's own file.
 An `on` entry is an event type like `task.done`, and timeouts may not be
-zero. The id `clock` belongs to the built-in connector. A plugin that fails
+zero. The id `clock` belongs to the built-in connector. A connector that fails
 any of this, or asks for a newer pastor than the one running, is listed by
-`plugin list` as invalid with the reason, and a job that uses it is invalid
+`connector list` as invalid with the reason, and a job that uses it is invalid
 too.
 
 `config` and `secrets` are declarations, with no schema language beyond
 `required` and `description`: pastor checks that a job's `[connector]` table
 has every `required` key and passes the rest through untouched, and
-`plugin list` reports the secrets the `.env` leaves unset or empty. Secret
+`connector list` reports the secrets the `.env` leaves unset or empty. Secret
 names must look like environment variables (`[A-Z_][A-Z0-9_]*`).
 
 ### Connector protocol
 
-To run a connector, pastor starts its `command` in the plugin's directory
-with the plugin's `.env` in its environment plus `PASTOR_PLUGIN_ID`,
+To run a connector, pastor starts its `command` in the connector's directory
+with the connector's `.env` in its environment plus `PASTOR_CONNECTOR_ID`,
 `PASTOR_JOB`, `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and
-`PASTOR_PLUGIN_STATE_DIR` (the job's scratch directory, created 0700). It
+`PASTOR_CONNECTOR_STATE_DIR` (the job's scratch directory, created 0700). It
 writes one JSON line to stdin, then closes it:
 
 ```json
@@ -752,7 +752,7 @@ The connector answers in JSON lines on stdout, one object per line with a
 - `cursor` carries a string `value` for the connector to be handed back next
   time. The last one in a run wins.
 - `log` carries a `message` and an optional `level` (`info` by default). Pastor
-  logs it, and `plugin run` prints it.
+  logs it, and `connector run` prints it.
 - A blank line is ignored. Any other line (not JSON, not an object, an item
   without a key, an unknown `type`) is skipped, noted in the run log, and the
   rest of the output is used.
@@ -776,17 +776,17 @@ proxies nothing. If it exits it is started again with backoff (1s doubling to
 restarted process, in its handshake, the newest cursor the connector emitted
 before it exited, whether or not a job run has saved it yet, or the job's
 saved cursor if it has emitted none since the daemon started. How a job run takes a stream's output is
-under "Using a plugin in a job".
+under "Using a connector in a job".
 
 ### Secrets and the `.env` file
 
-Secrets and settings go in `~/.config/pastor/plugins/<id>/.env`, which every
-command of the plugin (connector and hooks) gets in its environment. The
+Secrets and settings go in `~/.config/pastor/connectors/<id>/.env`, which every
+command of the connector (connector command and hooks) gets in its environment. The
 format is the common dotenv subset: `KEY=value` lines, an optional `export `,
 `#` comments, single quotes for a literal value and double quotes for one with
 `\n`, `\"` and `\\` escapes, no interpolation; the last of a repeated key
-wins. A line that does not parse makes every command of that plugin fail
-naming the line, and `plugin list` shows the error. `pastor setup systemd`
+wins. A line that does not parse makes every command of that connector fail
+naming the line, and `connector list` shows the error. `pastor setup systemd`
 sets these files to 0600.
 
 Only what the manifest declares under `[secrets]` is treated as secret. What
@@ -798,36 +798,36 @@ is left alone, since hiding it would mangle the log and protect nothing). Redact
 declared secret may not contain a line break (a double-quoted `\n`): pastor
 refuses such a `.env` and names the variable. Each log is cut at 256 KiB, and
 each run directory keeps its newest 20: `runs/<job>/` for a job's connector
-runs, and `runs/@<id>/` for all of a plugin's hook runs together. A stdout or stderr line longer than 256 KiB is
+runs, and `runs/@<id>/` for all of a connector's hook runs together. A stdout or stderr line longer than 256 KiB is
 cut there and the rest of it dropped.
 
-### Plugin commands
+### Connector commands
 
 ```bash
-pastor plugin install owner/repo/plugins/slack        # owner/repo[/subdir], --ref, --yes
-pastor plugin link ~/src/my-plugin                    # use a working copy in place
-pastor plugin list [--json]                           # version, connector, hooks, missing secrets
-pastor plugin run slack --job support --since 1h      # run the connector once, print its items
-pastor plugin uninstall slack                         # or unlink, for a linked one
+pastor connector install owner/repo/connectors/slack     # owner/repo[/subdir], --ref, --yes
+pastor connector link ~/src/my-connector                 # use a working copy in place
+pastor connector list [--json]                           # version, mode, hooks, missing secrets
+pastor connector run slack --job support --since 1h      # run its command once, print its items
+pastor connector uninstall slack                         # or unlink, for a linked one
 ```
 
-`install` clones the repository from GitHub with `git` (`PASTOR_PLUGIN_GIT_BASE`
+`install` clones the repository from GitHub with `git` (`PASTOR_CONNECTOR_GIT_BASE`
 points it at a mirror), checks out `--ref` if given, validates the manifest and
-shows what the plugin will run (its connector and hook commands and its
+shows what the connector will run (its connector and hook commands and its
 secrets) before asking to continue. `--yes` skips the question, and it is
 required when stdin is not a terminal. `link` puts a symlink to a directory of
-yours in the plugins directory, for developing one. Both print the secrets
+yours in the connectors directory, for developing one. Both print the secrets
 still unset in the `.env`. `uninstall` removes a checkout and `unlink` a
 link (the directory itself stays); the `.env` and the state directory are
-kept, and jobs that use the plugin are invalid until it is back.
+kept, and jobs that use the connector are invalid until it is back.
 
-`list` shows one row per plugin: id, version, connector mode, number of hooks,
+`list` shows one row per connector: id, version, connector mode, number of hooks,
 whether it is installed or linked, and `ok`, the secrets still missing, or why
 it is invalid.
 
 `run` runs the connector once for a job and dispatches nothing. It uses the
 `[connector]` table of `~/.config/pastor/jobs/<job>.toml` if that file exists,
-and an empty config only when there is no such file, so you can try a plugin
+and an empty config only when there is no such file, so you can try a connector
 before writing the job. A job file that exists is never ignored: one that
 names a different connector, or that is invalid, is an error. The cursor is `null`, and `since` is `--since` before now, by
 default the job's `backfill`, or zero. Items are printed to stdout as JSON
@@ -836,16 +836,16 @@ run. Nothing is saved: no cursor, no tasks. A stream connector is collected for
 its `timeout` and then stopped.
 
 `install`, `link`, `uninstall` and `unlink` tell a running daemon to reload,
-so a plugin is usable without a restart (this also restarts stream
+so a connector is usable without a restart (this also restarts stream
 connectors). A daemon that is running but does not answer gets a warning to
 run `pastor job reload` yourself.
 
-### Using a plugin in a job
+### Using a connector in a job
 
-A job uses a plugin's connector by its id (`[connector] use = "slack"`, with
-the plugin's own keys beside it);
+A job uses a connector by its id (`[connector] use = "slack"`, with
+the connector's own keys beside it);
 `pastor serve` and `pastor tick` check the job's connector table against the
-keys the manifest marks `required`, and `job list` shows a job whose plugin is
+keys the manifest marks `required`, and `job list` shows a job whose connector is
 missing or unhappy as invalid, with the reason. A poll connector runs once per
 job run and must finish within its `timeout` (60s by default); a stream
 connector is started once, restarted with backoff when it exits (and stopped
@@ -862,15 +862,15 @@ characters; such an item is skipped and reported.
 
 ### Event hooks
 
-A plugin's `[[events]]` hooks run on the head for every event whose type is
+A connector's `[[events]]` hooks run on the head for every event whose type is
 in `on` (`task.queued`, `task.done`, `task.blocked`, `task.failed`,
 `job.failed`, `machine.lost`, ... as in `pastor events`). The hook gets the
 event record, the same JSON `pastor events --json` prints, on stdin, and the
 same environment as the connector (`PASTOR_JOB` is the task's job, and unset
 for an event about no job, such as `machine.lost`). With `only_own = true` it
-only hears about tasks and jobs whose connector is this plugin, found by
+only hears about tasks and jobs that use this connector, found by
 reading `connector.use` in the job's file; one-off `pastor task run` tasks
-belong to no plugin, and an event about no job passes.
+belong to no connector, and an event about no job passes.
 
 ```toml
 [[events]]
@@ -880,9 +880,9 @@ command = ["sh", "report.sh"]
 timeout = "60s"                     # the default
 ```
 
-Hooks of different plugins run at the same time; one plugin's hooks run one
+Hooks of different connectors run at the same time; one connector's hooks run one
 after another, in event order, from a queue that holds 256 events; when a
-plugin's hooks fall that far behind, the oldest waiting events are dropped
+connector's hooks fall that far behind, the oldest waiting events are dropped
 and logged. A hook that fails or times out is logged and not retried. Its output goes to `~/.local/state/pastor/runs/@<id>/`, redacted
 like connector logs.
 
@@ -924,7 +924,7 @@ So:
   in the pane of every agent it starts, and refuses a command from such a pane
   that changes the fleet: `task run`, `send`, `attach` (herdr's agent terminal
   types into any task's pane), `retry`, `close` and `prune`, `tick`
-  (`--dry-run` too), `job run` and `job reload`, `plugin install`, `link`,
+  (`--dry-run` too), `job run` and `job reload`, `connector install`, `link`,
   `uninstall` and `unlink`, edits of machines, flocks and jobs, `serve`
   and `setup` (a head started from the pane would dispatch with nothing to
   refuse), and `open` (herdr's full UI drives every pane) (`agent_refused`). A dry tick and a reload count because both apply
@@ -944,16 +944,16 @@ So:
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
 ~/.config/systemd/user/{pastor,herdr}.service   written by `pastor setup systemd`
-~/.config/pastor/plugins/<id>/.env   a plugin's secrets and settings
-~/.local/share/pastor/plugins/<id>/  installed plugins (a symlink for a linked one)
-~/.local/state/pastor/plugins/<job>/ a job's connector scratch
-~/.local/state/pastor/runs/<job>/    captured connector output, capped and pruned
-~/.local/state/pastor/runs/@<id>/    captured hook output (and job-less `plugin` runs)
+~/.config/pastor/connectors/<id>/.env   a connector's secrets and settings
+~/.local/share/pastor/connectors/<id>/  installed connectors (a symlink for a linked one)
+~/.local/state/pastor/connectors/<job>/ a job's connector scratch
+~/.local/state/pastor/runs/<job>/       captured connector output, capped and pruned
+~/.local/state/pastor/runs/@<id>/       captured hook output (and job-less `connector` runs)
 ```
 
 `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR` override the
-locations. `PASTOR_PLUGIN_GIT_BASE` (default `https://github.com`) is where
-`plugin install` clones `owner/repo` from.
+locations. `PASTOR_CONNECTOR_GIT_BASE` (default `https://github.com`) is where
+`connector install` clones `owner/repo` from.
 
 ```toml
 # pastor.toml, every key optional; these are the defaults

@@ -76,10 +76,10 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::setup::SetupCmd,
     },
-    /// Install, link, list and try out plugins
-    Plugin {
+    /// Install, link, list and try out connectors
+    Connector {
         #[command(subcommand)]
-        cmd: pastor::plugin::cli::PluginCmd,
+        cmd: pastor::connector::cli::ConnectorCmd,
     },
     /// The repos whose folder-trust prompt pastor answers on each machine
     Trust {
@@ -330,7 +330,7 @@ fn main() {
             }
             Command::Events(args) => pastor::events::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
-            Command::Plugin { cmd } => pastor::plugin::cli::run(&paths, cmd, head).await,
+            Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd),
         }
     });
@@ -418,7 +418,7 @@ async fn probe_head(paths: &Paths, flocks: bool, agents: bool) -> anyhow::Result
 /// brings flocks into play on its own: it takes `--flock`, or it edits
 /// flock.toml. `None` for a command that never talks to the head.
 fn head_use(command: &Command) -> Option<bool> {
-    use pastor::plugin::cli::PluginCmd;
+    use pastor::connector::cli::ConnectorCmd;
     match command {
         Command::Task { cmd } => match cmd {
             TaskCmd::Run(a) => Some(a.flock.is_some()),
@@ -434,8 +434,8 @@ fn head_use(command: &Command) -> Option<bool> {
         }),
         Command::Flock { cmd } => Some(!matches!(cmd, FlockCmd::List { .. })),
         Command::Tick(_) | Command::Job { .. } => Some(false),
-        Command::Plugin { cmd } => {
-            (!matches!(cmd, PluginCmd::List { .. } | PluginCmd::Run { .. })).then_some(false)
+        Command::Connector { cmd } => {
+            (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Run { .. })).then_some(false)
         }
         _ => None,
     }
@@ -443,12 +443,12 @@ fn head_use(command: &Command) -> Option<bool> {
 
 /// Whether `command` changes the fleet: the CLI's side of
 /// `IpcRequest::changes_fleet`, for the edits it makes without the head
-/// (machines, flocks, jobs, plugins, an offline tick). A tick, dry or not,
+/// (machines, flocks, jobs, connectors, an offline tick). A tick, dry or not,
 /// and a job reload apply pastor.toml and flock.toml, so they count. An agent
 /// pastor started (`ipc::TASK_ENV`) is refused these up front, head or no
 /// head.
 fn changes_fleet(command: &Command) -> bool {
-    use pastor::plugin::cli::PluginCmd;
+    use pastor::connector::cli::ConnectorCmd;
     match command {
         Command::Task { cmd } => matches!(
             cmd,
@@ -466,7 +466,9 @@ fn changes_fleet(command: &Command) -> bool {
         Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. }),
         // Install, link, uninstall and unlink edit the catalog and reload the
         // head's jobs, restarting its stream connectors.
-        Command::Plugin { cmd } => !matches!(cmd, PluginCmd::List { .. } | PluginCmd::Run { .. }),
+        Command::Connector { cmd } => {
+            !matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Run { .. })
+        }
         // A head started from an agent's pane schedules and dispatches with
         // no request to refuse; setup installs one that starts on login.
         Command::Serve | Command::Setup { .. } => true,
@@ -1383,7 +1385,7 @@ fn print_jobs(jobs: &[JobStatus], json: bool) -> anyhow::Result<()> {
 fn standalone(paths: &Paths) -> anyhow::Result<Scheduler> {
     let config = PastorConfig::load(&paths.config_file())?;
     let store = Arc::new(open_store(paths)?);
-    Ok(Scheduler::standalone(paths.clone(), &config, store)?.with_plugins())
+    Ok(Scheduler::standalone(paths.clone(), &config, store)?.with_connectors())
 }
 
 async fn tick(paths: &Paths, a: TickArgs, head: Head) -> anyhow::Result<()> {

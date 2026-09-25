@@ -1,7 +1,7 @@
 //! `pastor setup systemd [--herdr]`: install the shipped user unit, apply the
 //! requested systemd action, and check what a unit needs to outlive a login (lingering) and
 //! what pastor requires of its own files (config and state dirs 0700,
-//! socket and plugin `.env` files 0600).
+//! socket and connector `.env` files 0600).
 //!
 //! Every `systemctl` and `loginctl` call goes through [`Runner`], so the tests
 //! script their answers instead of touching the real user manager.
@@ -460,14 +460,14 @@ fn which(name: &str, path_var: &str) -> Option<PathBuf> {
 }
 
 /// Bring pastor's files to their required modes: config and state dirs
-/// 0700 (created if missing), the daemon socket and every plugin `.env` 0600.
+/// 0700 (created if missing), the daemon socket and every connector `.env` 0600.
 /// Returns one line per change. Symlinks are left alone: `create_private_dir`
-/// and `chmod` both follow them, so a symlinked root (or plugin directory)
+/// and `chmod` both follow them, so a symlinked root (or connector directory)
 /// is skipped entirely rather than tightening whatever it points at.
 pub fn secure(paths: &Paths) -> anyhow::Result<Vec<String>> {
     use std::os::unix::fs::PermissionsExt;
     let mut fixed = Vec::new();
-    // Whether config_dir turned out to be a symlink: the plugins scan below
+    // Whether config_dir turned out to be a symlink: the connectors scan below
     // lives under it, so it is skipped too.
     let mut config_dir_is_symlink = false;
     for dir in [&paths.config_dir, &paths.state_dir] {
@@ -490,17 +490,17 @@ pub fn secure(paths: &Paths) -> anyhow::Result<Vec<String>> {
         }
     }
     let mut files = vec![paths.socket_file()];
-    let plugins_dir = paths.config_dir.join("plugins");
-    let plugins_dir_is_symlink =
-        std::fs::symlink_metadata(&plugins_dir).is_ok_and(|m| m.file_type().is_symlink());
+    let connectors_dir = paths.config_dir.join("connectors");
+    let connectors_dir_is_symlink =
+        std::fs::symlink_metadata(&connectors_dir).is_ok_and(|m| m.file_type().is_symlink());
     if !config_dir_is_symlink
-        && !plugins_dir_is_symlink
-        && let Ok(entries) = std::fs::read_dir(&plugins_dir)
+        && !connectors_dir_is_symlink
+        && let Ok(entries) = std::fs::read_dir(&connectors_dir)
     {
         let mut envs: Vec<PathBuf> = entries
             .filter_map(Result::ok)
             // read_dir does not follow symlinks to list entries, but a
-            // symlinked plugin directory must not be walked into either.
+            // symlinked connector directory must not be walked into either.
             .filter(|e| !e.file_type().is_ok_and(|t| t.is_symlink()))
             .map(|e| e.path().join(".env"))
             .collect();
@@ -977,18 +977,18 @@ mod tests {
         chmod(&e.paths.config_dir, 0o755);
         std::fs::write(e.paths.socket_file(), "").unwrap();
         chmod(&e.paths.socket_file(), 0o666);
-        let plugin = e.paths.config_dir.join("plugins/github");
-        std::fs::create_dir_all(&plugin).unwrap();
-        std::fs::write(plugin.join(".env"), "GITHUB_TOKEN=x\n").unwrap();
-        chmod(&plugin.join(".env"), 0o644);
-        let quiet = e.paths.config_dir.join("plugins/linear");
+        let connector = e.paths.config_dir.join("connectors/github");
+        std::fs::create_dir_all(&connector).unwrap();
+        std::fs::write(connector.join(".env"), "GITHUB_TOKEN=x\n").unwrap();
+        chmod(&connector.join(".env"), 0o644);
+        let quiet = e.paths.config_dir.join("connectors/linear");
         std::fs::create_dir_all(&quiet).unwrap();
         std::fs::write(quiet.join(".env"), "").unwrap();
         chmod(&quiet.join(".env"), 0o600);
         // Owner-only modes other than 0600 (e.g. read-only 0400) still need
         // tightening: the contract is exactly 0600, not merely "no group or
         // other bits".
-        let readonly = e.paths.config_dir.join("plugins/jira");
+        let readonly = e.paths.config_dir.join("connectors/jira");
         std::fs::create_dir_all(&readonly).unwrap();
         std::fs::write(readonly.join(".env"), "").unwrap();
         chmod(&readonly.join(".env"), 0o400);
@@ -1001,7 +1001,7 @@ mod tests {
         assert!(fixed[3].contains("jira/.env: 0400 -> 0600"), "{fixed:?}");
         assert_eq!(mode(&e.paths.config_dir), 0o700);
         assert_eq!(mode(&e.paths.socket_file()), 0o600);
-        assert_eq!(mode(&plugin.join(".env")), 0o600);
+        assert_eq!(mode(&connector.join(".env")), 0o600);
         assert_eq!(mode(&readonly.join(".env")), 0o600);
     }
 
@@ -1012,9 +1012,9 @@ mod tests {
         let outside = e.tmp.path().join("outside.env");
         std::fs::write(&outside, "").unwrap();
         chmod(&outside, 0o644);
-        let plugin = e.paths.config_dir.join("plugins/linked");
-        std::fs::create_dir_all(&plugin).unwrap();
-        std::os::unix::fs::symlink(&outside, plugin.join(".env")).unwrap();
+        let connector = e.paths.config_dir.join("connectors/linked");
+        std::fs::create_dir_all(&connector).unwrap();
+        std::os::unix::fs::symlink(&outside, connector.join(".env")).unwrap();
 
         assert!(secure(&e.paths).unwrap().is_empty());
         assert_eq!(mode(&outside), 0o644);
@@ -1024,10 +1024,10 @@ mod tests {
     fn secure_leaves_a_symlinked_root_alone() {
         let e = env();
         let real = e.tmp.path().join("real-config");
-        std::fs::create_dir_all(real.join("plugins/github")).unwrap();
+        std::fs::create_dir_all(real.join("connectors/github")).unwrap();
         chmod(&real, 0o755);
-        std::fs::write(real.join("plugins/github/.env"), "").unwrap();
-        chmod(&real.join("plugins/github/.env"), 0o644);
+        std::fs::write(real.join("connectors/github/.env"), "").unwrap();
+        chmod(&real.join("connectors/github/.env"), 0o644);
         std::os::unix::fs::symlink(&real, &e.paths.config_dir).unwrap();
 
         let fixed = secure(&e.paths).unwrap();
@@ -1036,19 +1036,19 @@ mod tests {
             "{fixed:?}"
         );
         assert_eq!(mode(&real), 0o755);
-        assert_eq!(mode(&real.join("plugins/github/.env")), 0o644);
+        assert_eq!(mode(&real.join("connectors/github/.env")), 0o644);
     }
 
     #[test]
-    fn secure_skips_symlinked_plugin_dirs() {
+    fn secure_skips_symlinked_connector_dirs() {
         let e = env();
         e.paths.ensure().unwrap();
-        let outside = e.tmp.path().join("outside-plugin");
+        let outside = e.tmp.path().join("outside-connector");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join(".env"), "").unwrap();
         chmod(&outside.join(".env"), 0o644);
-        std::fs::create_dir_all(e.paths.config_dir.join("plugins")).unwrap();
-        std::os::unix::fs::symlink(&outside, e.paths.config_dir.join("plugins/linked")).unwrap();
+        std::fs::create_dir_all(e.paths.config_dir.join("connectors")).unwrap();
+        std::os::unix::fs::symlink(&outside, e.paths.config_dir.join("connectors/linked")).unwrap();
 
         assert!(secure(&e.paths).unwrap().is_empty());
         assert_eq!(mode(&outside.join(".env")), 0o644);

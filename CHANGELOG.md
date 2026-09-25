@@ -10,7 +10,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Agents pastor starts may no longer change the fleet. Every agent's pane gets
   `PASTOR_TASK=t-N`, and a command from it that runs, sends to, attaches to,
   retries, closes or prunes tasks, ticks (dry runs too), runs or reloads jobs,
-  installs, links, uninstalls or unlinks plugins, edits machines, flocks or
+  installs, links, uninstalls or unlinks connectors, edits machines, flocks or
   jobs, starts or sets up a head, or opens herdr's UI fails with `agent_refused`; reads still work. The head refuses such a
   request, and the CLI refuses the edits it makes on its own.
   `agents_change_fleet = true` in `pastor.toml` allows them again. A worktree
@@ -71,6 +71,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Breaking: plugins are now called connectors, everywhere, and the old names
+  are gone. `pastor plugin ...` is `pastor connector
+  install|link|uninstall|unlink|list|run`; the manifest is
+  `pastor-connector.toml`; commands get `PASTOR_CONNECTOR_ID` and
+  `PASTOR_CONNECTOR_STATE_DIR`; `PASTOR_PLUGIN_GIT_BASE` is
+  `PASTOR_CONNECTOR_GIT_BASE`; the `plugins/` directories under the config,
+  data and state dirs are `connectors/`. To upgrade, rename each manifest and
+  move the three `plugins/` directories to `connectors/`, or reinstall. A
+  connector still holds a connector command, event hooks, or both. "Plugin"
+  is kept for a later idea: code that changes how pastor itself behaves.
 - Agent args follow the agent they were written for: `[defaults] agent_args`
   no longer reach a task that runs another agent than `[defaults] agent`
   (`pastor task run --agent codex` used to get Claude's `--model`).
@@ -135,7 +145,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   answer is an error (`head_unresponsive`) on all of them, where `tick`,
   `job list`, `task list|show`, `flock list|remove` and `job enable|disable`
   used to take it for no head and work offline next to it, and `machine add`
-  and `plugin install|link|uninstall|unlink` made their change and only
+  and `connector install|link|uninstall|unlink` made their change and only
   warned. `task prune` answered `daemon_unresponsive` for this; it now
   answers `head_unresponsive` like the rest.
 - `pastor machine list` opens with a line about the head (its pastor and

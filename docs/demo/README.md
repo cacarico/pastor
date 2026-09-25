@@ -12,7 +12,7 @@ make demo
 ```
 
 `make demo` starts a head whose config, state and data directories all sit
-under `docs/demo/local/`, so your own config, task history and plugins are
+under `docs/demo/local/`, so your own config, task history and connectors are
 never read, run or shown; it clears the demo state first so ids start at
 `t-1`, records every tape, and stops the head. `docs/demo/local/` is ignored
 by git. Needs `vhs`, `ttyd`, `ffmpeg` and `fish` (the tapes' shell) on the

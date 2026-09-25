@@ -1,6 +1,6 @@
-//! `pastor-plugin.toml`: the file's shape (`ManifestFile`) and what survives
-//! validation (`Manifest`). Validation happens at discovery, so `plugin list`
-//! can show a broken plugin with its reason and a job naming it is `invalid`
+//! `pastor-connector.toml`: the file's shape (`ManifestFile`) and what survives
+//! validation (`Manifest`). Validation happens at discovery, so `connector list`
+//! can show a broken connector with its reason and a job naming it is `invalid`
 //! instead of failing at run time.
 
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::config::parse_duration;
 
-pub const MANIFEST_FILE: &str = "pastor-plugin.toml";
+pub const MANIFEST_FILE: &str = "pastor-connector.toml";
 
 /// A connector or hook that says nothing gets this long.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -123,7 +123,7 @@ impl Manifest {
     pub fn parse_for(text: &str, pastor: &Version) -> Result<Manifest, String> {
         let file: ManifestFile = toml::from_str(text).map_err(|e| e.to_string())?;
         check_id(&file.id)?;
-        // The catalog resolves a built-in id to the built-in, so a plugin by
+        // The catalog resolves a built-in id to the built-in, so a connector by
         // that name could never run; say so at install, not at the first job.
         if crate::connector::builtin(&file.id).is_some() {
             return Err(format!(
@@ -175,7 +175,7 @@ impl Manifest {
             });
         }
         if connector.is_none() && events.is_empty() {
-            return Err("a plugin must provide a [connector], [[events]] hooks, or both".into());
+            return Err("a connector must provide a [connector], [[events]] hooks, or both".into());
         }
         Ok(Manifest {
             name: file.name.unwrap_or_else(|| file.id.clone()),
@@ -195,7 +195,7 @@ impl Manifest {
     pub fn check_config(&self, config: &Value) -> Result<(), String> {
         let Some(c) = &self.connector else {
             return Err(format!(
-                "plugin {:?} has no connector (it only provides event hooks)",
+                "connector {:?} has no connector command (it only provides event hooks)",
                 self.id
             ));
         };
@@ -209,15 +209,15 @@ impl Manifest {
             return Ok(());
         }
         Err(format!(
-            "plugin {:?} requires connector.{}",
+            "connector {:?} requires connector.{}",
             self.id,
             missing.join(", connector.")
         ))
     }
 }
 
-/// Plugin ids are directory names under the data dir and appear in env vars
-/// and `plugin` commands, so they get the job names' safe alphabet.
+/// Connector ids are directory names under the data dir and appear in env vars
+/// and `connector` commands, so they get the job names' safe alphabet.
 pub fn check_id(id: &str) -> Result<(), String> {
     let first_ok = id
         .chars()

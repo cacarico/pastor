@@ -1,8 +1,8 @@
-//! Plugin event hooks: every `[[events]]` entry whose `on` lists an event's
+//! Connector event hooks: every `[[events]]` entry whose `on` lists an event's
 //! type runs on the head with that event's `EventRecord` JSON on stdin and the
-//! same environment as the plugin's connector. Hooks of different plugins run
-//! concurrently; one plugin's hooks run one at a time, in event order, so a
-//! plugin never races itself. A failed or timed-out hook is logged and never
+//! same environment as the connector's command. Hooks of different connectors run
+//! concurrently; one connector's hooks run one at a time, in event order, so a
+//! connector never races itself. A failed or timed-out hook is logged and never
 //! retried. Hooks read the daemon's broadcast on their own; they never write
 //! the events log.
 
@@ -13,11 +13,11 @@ use tokio::sync::{Notify, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::config::Paths;
+use crate::connector::exec::{self, Invocation, RunLog};
+use crate::connector::manifest::Hook;
+use crate::connector::{Connector, Discovered, discover};
 use crate::events::{EventRecord, MachineLookup};
 use crate::machine::PastorEvent;
-use crate::plugin::exec::{self, Invocation, RunLog};
-use crate::plugin::manifest::Hook;
-use crate::plugin::{Discovered, Plugin, discover};
 use crate::store::Store;
 
 /// The connector a job file names, read without validating the rest of the
@@ -31,11 +31,11 @@ pub fn job_connector(paths: &Paths, job: &str) -> Option<String> {
     v.get("connector")?.get("use")?.as_str().map(str::to_string)
 }
 
-/// Does `hook` of `plugin` want `rec`? Its `on` must list the type. With
+/// Does `hook` of `connector` want `rec`? Its `on` must list the type. With
 /// `only_own`, a record about a job (a task event, `job.failed`) must be
-/// about a job whose connector is this plugin; a record about no job
+/// about a job that uses this connector; a record about no job
 /// (`machine.*`) is nobody's and passes.
-pub fn wants(paths: &Paths, plugin: &Plugin, hook: &Hook, rec: &EventRecord) -> bool {
+pub fn wants(paths: &Paths, connector: &Connector, hook: &Hook, rec: &EventRecord) -> bool {
     if !hook.on.contains(&rec.kind) {
         return false;
     }
@@ -48,30 +48,30 @@ pub fn wants(paths: &Paths, plugin: &Plugin, hook: &Hook, rec: &EventRecord) -> 
         .or_else(|| rec.task.as_ref().map(|t| t.job.clone()));
     match job {
         None => true,
-        Some(job) => job_connector(paths, &job).as_deref() == Some(plugin.id.as_str()),
+        Some(job) => job_connector(paths, &job).as_deref() == Some(connector.id.as_str()),
     }
 }
 
 /// Run one hook for one record. Its output (stdout and stderr, redacted)
-/// goes to a run log under `runs/@<plugin id>/`, apart from the job's
+/// goes to a run log under `runs/@<connector id>/`, apart from the job's
 /// connector logs so hooks never prune those.
-pub async fn run_hook(paths: &Paths, plugin: &Plugin, hook: &Hook, rec: &EventRecord) {
+pub async fn run_hook(paths: &Paths, connector: &Connector, hook: &Hook, rec: &EventRecord) {
     let job = rec
         .job
         .clone()
         .or_else(|| rec.task.as_ref().map(|t| t.job.clone()));
     let job = job.filter(|j| crate::config::job::check_name(j).is_ok());
     let on = hook.on.join(",");
-    let prepared = plugin
+    let prepared = connector
         .command_env(paths, job.as_deref())
         .and_then(|(env, redactor)| {
-            let log = RunLog::create(&paths.runs_dir(&format!("@{}", plugin.id)), redactor)?;
+            let log = RunLog::create(&paths.runs_dir(&format!("@{}", connector.id)), redactor)?;
             Ok((env, log.shared()))
         });
     let (env, log) = match prepared {
         Ok(p) => p,
         Err(err) => {
-            tracing::warn!(plugin = %plugin.id, event = %rec.kind, hook = %on, err = %format!("{err:#}"), "hook not run");
+            tracing::warn!(connector = %connector.id, event = %rec.kind, hook = %on, err = %format!("{err:#}"), "hook not run");
             return;
         }
     };
@@ -79,7 +79,7 @@ pub async fn run_hook(paths: &Paths, plugin: &Plugin, hook: &Hook, rec: &EventRe
     stdin.push(b'\n');
     let inv = Invocation {
         argv: hook.command.clone(),
-        cwd: plugin.dir.clone(),
+        cwd: connector.dir.clone(),
         env,
         stdin,
         timeout: Some(hook.timeout),
@@ -98,11 +98,11 @@ pub async fn run_hook(paths: &Paths, plugin: &Plugin, hook: &Hook, rec: &EventRe
         .path()
         .to_path_buf();
     if done.exit.success() {
-        tracing::debug!(plugin = %plugin.id, event = %rec.kind, hook = %on, "hook ran");
+        tracing::debug!(connector = %connector.id, event = %rec.kind, hook = %on, "hook ran");
     } else {
         // `reason` carries the stderr tail, already redacted by the run log.
         tracing::warn!(
-            plugin = %plugin.id, event = %rec.kind, hook = %on,
+            connector = %connector.id, event = %rec.kind, hook = %on,
             reason = %done.reason(), log = %path.display(),
             "hook failed; not retried"
         );
@@ -110,20 +110,20 @@ pub async fn run_hook(paths: &Paths, plugin: &Plugin, hook: &Hook, rec: &EventRe
 }
 
 struct Work {
-    plugin: Arc<Plugin>,
+    connector: Arc<Connector>,
     hooks: Vec<Hook>,
     rec: Arc<EventRecord>,
 }
 
-/// Records a plugin's queue holds while its hooks run. A hook may take its
+/// Records a connector's queue holds while its hooks run. A hook may take its
 /// whole timeout per record, so without a bound a slow or stuck hook under
 /// a steady stream of events would grow the daemon without limit.
 pub const HOOK_QUEUE_MAX: usize = 256;
 
-/// One plugin's pending records. Full, it drops the oldest: hooks are
+/// One connector's pending records. Full, it drops the oldest: hooks are
 /// notifications, and the newest state matters more than a backlog.
 struct Queue {
-    plugin: String,
+    connector: String,
     max: usize,
     state: Mutex<QueueState>,
     ready: Notify,
@@ -150,7 +150,7 @@ impl Queue {
             st.dropped += 1;
             if st.dropped == 1 {
                 tracing::warn!(
-                    plugin = %self.plugin, max = self.max,
+                    connector = %self.connector, max = self.max,
                     "hook queue full; dropping the oldest events until its hooks catch up"
                 );
             }
@@ -168,7 +168,7 @@ impl Queue {
                 if let Some(w) = st.items.pop_front() {
                     if st.items.is_empty() && st.dropped > 0 {
                         tracing::info!(
-                            plugin = %self.plugin, dropped = st.dropped,
+                            connector = %self.connector, dropped = st.dropped,
                             "hook queue caught up"
                         );
                         st.dropped = 0;
@@ -191,7 +191,7 @@ impl Queue {
     }
 }
 
-/// Hands each record to one worker per plugin. Plugins are re-read for every
+/// Hands each record to one worker per connector. Connectors are re-read for every
 /// record: events are rare next to a directory listing, and it means an
 /// install or uninstall takes effect for hooks without a reload.
 pub struct Dispatcher {
@@ -214,32 +214,32 @@ impl Dispatcher {
     }
 
     pub fn deliver(&mut self, rec: EventRecord) {
-        let plugins = match discover(&self.paths) {
+        let connectors = match discover(&self.paths) {
             Ok(p) => p,
             Err(err) => {
-                tracing::warn!(%err, "hooks: cannot read plugins");
+                tracing::warn!(%err, "hooks: cannot read connectors");
                 return;
             }
         };
         let rec = Arc::new(rec);
-        for d in plugins {
-            let Discovered::Valid(plugin) = d else {
+        for d in connectors {
+            let Discovered::Valid(connector) = d else {
                 continue;
             };
-            let plugin: Arc<Plugin> = Arc::from(plugin);
-            let hooks: Vec<Hook> = plugin
+            let connector: Arc<Connector> = Arc::from(connector);
+            let hooks: Vec<Hook> = connector
                 .manifest
                 .events
                 .iter()
-                .filter(|h| wants(&self.paths, &plugin, h, &rec))
+                .filter(|h| wants(&self.paths, &connector, h, &rec))
                 .cloned()
                 .collect();
             if hooks.is_empty() {
                 continue;
             }
-            let (queue, worker) = self.workers.entry(plugin.id.clone()).or_insert_with(|| {
+            let (queue, worker) = self.workers.entry(connector.id.clone()).or_insert_with(|| {
                 let q = Arc::new(Queue {
-                    plugin: plugin.id.clone(),
+                    connector: connector.id.clone(),
                     max: self.queue_max,
                     state: Mutex::default(),
                     ready: Notify::new(),
@@ -253,7 +253,7 @@ impl Dispatcher {
                 *worker = spawn_worker(self.paths.clone(), queue.clone());
             }
             queue.push(Work {
-                plugin: plugin.clone(),
+                connector: connector.clone(),
                 hooks,
                 rec: rec.clone(),
             });
@@ -271,12 +271,12 @@ impl Drop for Dispatcher {
     }
 }
 
-/// One plugin's worker: its hooks, one after another, in event order.
+/// One connector's worker: its hooks, one after another, in event order.
 fn spawn_worker(paths: Paths, queue: Arc<Queue>) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(w) = queue.next().await {
             for hook in &w.hooks {
-                run_hook(&paths, &w.plugin, hook, &w.rec).await;
+                run_hook(&paths, &w.connector, hook, &w.rec).await;
             }
         }
     })
@@ -313,7 +313,7 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::manifest::MANIFEST_FILE;
+    use crate::connector::manifest::MANIFEST_FILE;
     use crate::task::DispatchSpec;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -339,10 +339,10 @@ mod tests {
     }
 
     impl Env {
-        /// A plugin whose hooks are shell snippets; each gets `$OUT` (the
+        /// A connector whose hooks are shell snippets; each gets `$OUT` (the
         /// test's output dir) and a secret `TOKEN` from its `.env`.
-        fn plugin(&self, id: &str, connector: bool, hooks: &[(&str, bool, &str, &str)]) {
-            let dir = self.paths.plugins_dir().join(id);
+        fn connector(&self, id: &str, connector: bool, hooks: &[(&str, bool, &str, &str)]) {
+            let dir = self.paths.connectors_dir().join(id);
             std::fs::create_dir_all(&dir).unwrap();
             let mut m = format!("id = \"{id}\"\nversion = \"0.1.0\"\n[secrets.TOKEN]\n");
             if connector {
@@ -355,7 +355,7 @@ mod tests {
                 ));
             }
             std::fs::write(dir.join(MANIFEST_FILE), m).unwrap();
-            let envf = self.paths.plugin_env_file(id);
+            let envf = self.paths.connector_env_file(id);
             std::fs::create_dir_all(envf.parent().unwrap()).unwrap();
             std::fs::write(
                 envf,
@@ -393,7 +393,7 @@ mod tests {
             }
         }
 
-        fn plugins(&self) -> Vec<Arc<Plugin>> {
+        fn connectors(&self) -> Vec<Arc<Connector>> {
             discover(&self.paths)
                 .unwrap()
                 .into_iter()
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn on_and_only_own_decide_who_gets_a_record() {
         let e = env();
-        e.plugin(
+        e.connector(
             "slack",
             true,
             &[
@@ -461,7 +461,7 @@ mod tests {
         );
         e.job("support", "slack");
         e.job("other", "clock");
-        let p = &e.plugins()[0];
+        let p = &e.connectors()[0];
         let (own, all) = (&p.manifest.events[0], &p.manifest.events[1]);
         let done_support = e.task_record("task.done", "support");
         let done_other = e.task_record("task.done", "other");
@@ -486,16 +486,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hook_gets_the_record_on_stdin_with_the_plugin_env_and_redacted_logs() {
+    async fn a_hook_gets_the_record_on_stdin_with_the_connector_env_and_redacted_logs() {
         let e = env();
-        e.plugin(
+        e.connector(
             "slack",
             true,
             &[(
                 "\"task.done\"",
                 true,
                 "5s",
-                "cat > \"$OUT/stdin.tmp\"; echo \"$PASTOR_PLUGIN_ID $PASTOR_JOB $(basename \"$PASTOR_PLUGIN_STATE_DIR\") $(pwd)\" > \"$OUT/env\"; echo \"token $TOKEN\"; echo \"err $TOKEN\" >&2; mv \"$OUT/stdin.tmp\" \"$OUT/stdin\"",
+                "cat > \"$OUT/stdin.tmp\"; echo \"$PASTOR_CONNECTOR_ID $PASTOR_JOB $(basename \"$PASTOR_CONNECTOR_STATE_DIR\") $(pwd)\" > \"$OUT/env\"; echo \"token $TOKEN\"; echo \"err $TOKEN\" >&2; mv \"$OUT/stdin.tmp\" \"$OUT/stdin\"",
             )],
         );
         e.job("support", "slack");
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(got["task"]["id"], rec.task.as_ref().unwrap().id);
         assert_eq!(got["job"], "support");
         let env_line = std::fs::read_to_string(e.out.join("env")).unwrap();
-        let dir = std::fs::canonicalize(e.paths.plugins_dir().join("slack")).unwrap();
+        let dir = std::fs::canonicalize(e.paths.connectors_dir().join("slack")).unwrap();
         assert_eq!(
             env_line.trim(),
             format!("slack support support {}", dir.display())
@@ -522,12 +522,12 @@ mod tests {
         assert!(!text.contains("sekrit"), "{text}");
     }
 
-    /// Two hooks of one plugin run one after the other; another plugin's
+    /// Two hooks of one connector run one after the other; another connector's
     /// hook runs meanwhile.
     #[tokio::test]
-    async fn sequential_within_a_plugin_concurrent_across_plugins() {
+    async fn sequential_within_a_connector_concurrent_across_connectors() {
         let e = env();
-        e.plugin(
+        e.connector(
             "a",
             false,
             &[
@@ -535,7 +535,7 @@ mod tests {
                 ("\"task.done\"", false, "5s", "[ -e \"$OUT/a1-end\" ] && echo yes > \"$OUT/a2-after-a1\" || echo no > \"$OUT/a2-after-a1\""),
             ],
         );
-        e.plugin(
+        e.connector(
             "b",
             false,
             &[(
@@ -552,11 +552,11 @@ mod tests {
     }
 
     /// A failing hook runs once per event, never again; a hook that
-    /// overruns its timeout is killed and the plugin's queue moves on.
+    /// overruns its timeout is killed and the connector's queue moves on.
     #[tokio::test]
     async fn failures_are_not_retried_and_timeouts_are_bounded() {
         let e = env();
-        e.plugin(
+        e.connector(
             "a",
             false,
             &[
@@ -593,14 +593,14 @@ mod tests {
         );
     }
 
-    /// A plugin whose hook is slower than its events keeps only the newest
+    /// A connector whose hook is slower than its events keeps only the newest
     /// `queue_max` waiting; the oldest go, so a stuck hook cannot grow the
     /// daemon's memory. (A current-thread runtime: the worker takes nothing
     /// until the test awaits, so all five are queued first.)
     #[tokio::test]
     async fn a_full_queue_drops_the_oldest_events() {
         let e = env();
-        e.plugin(
+        e.connector(
             "a",
             false,
             &[(
@@ -638,7 +638,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_builds_records_from_the_broadcast() {
         let e = env();
-        e.plugin(
+        e.connector(
             "a",
             false,
             &[(

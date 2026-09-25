@@ -8,8 +8,8 @@ well-scoped changes with clear tests are easiest to review.
 - Work on a branch and open a pull request. Do not push to `main`.
 - Read `AGENTS.md`, `README.md` and `docs/manual.md` before changing
   behavior.
-- Keep vocabulary consistent: machine, flock, head, job, task, plugin,
-  connector, and agent.
+- Keep vocabulary consistent: machine, flock, head, job, task, connector,
+  and agent.
 - Do not add runtime dependencies unless the pull request explains why the
   dependency is worth the maintenance and supply-chain cost.
 
@@ -55,7 +55,7 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   store, whose migrations are forward-only and automatic, with no downgrade
   (an older binary refuses a newer database); the CLI to head IPC, where a
   CLI and head from the same minor always work together and a mismatch is
-  `head_too_old`; the plugin protocol; and the minimum herdr version, which
+  `head_too_old`; the connector protocol; and the minimum herdr version, which
   only rises in a minor bump, noted under Changed.
 - Platforms: the README lists the tiers. Tier 1 is built and tested on every
   release, tier 2 built but not tested, tier 3 best effort. Moving a platform

@@ -839,7 +839,7 @@ impl Fleet {
 /// the fleet. The CLI says the same for a change it makes on its own.
 pub fn agent_refusal(task: &str) -> String {
     format!(
-        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink plugins, edit machines, flocks or jobs, serve or set up a head, open herdr's UI); set agents_change_fleet = true in pastor.toml to allow it"
+        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks or jobs, serve or set up a head, open herdr's UI); set agents_change_fleet = true in pastor.toml to allow it"
     )
 }
 
@@ -912,7 +912,7 @@ impl Daemon {
         // sees a task from before flocks without one.
         store.adopt_default_flock(flock.default_flock())?;
         let (events, log_rx) = broadcast::channel(1024);
-        // Plugin event hooks read the broadcast on their own, subscribed here
+        // Connector event hooks read the broadcast on their own, subscribed here
         // for the same reason as the log: before any actor can emit.
         let hooks_rx = events.subscribe();
         let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone()));
@@ -945,7 +945,7 @@ impl Daemon {
             fleet.clone(),
             events.clone(),
         )
-        .with_plugins()
+        .with_connectors()
         .with_config_baseline(on_disk)
         .spawn();
         Ok(Daemon {
@@ -2875,7 +2875,7 @@ mod tests {
             "link",
             "uninstall",
             "unlink",
-            "plugins",
+            "connectors",
             "machines",
             "flocks",
             "serve",

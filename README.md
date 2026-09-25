@@ -32,7 +32,7 @@ spend time deciding what to do, not typing it. The longer story is in
   key pastor has seen is never turned into a task again.
 - **Flocks.** Named groups of machines, such as work and personal ones on
   different accounts. A task only runs inside its own flock.
-- **Plugins.** Connectors that turn outside sources into work (the built-in
+- **Connectors.** Commands that turn outside sources into work (the built-in
   `clock`, or [GitHub issues](https://github.com/cacarico/pastor-plugins)),
   and event hooks that run when a task finishes or blocks.
 - **Task states you can trust.** herdr reports what the agent is doing, and
@@ -91,7 +91,7 @@ every distro and every Raspberry Pi OS release.
 - **ssh** on the head, to reach machines on other hosts. It must work
   without a passphrase prompt; the head itself joins as a local machine with
   no ssh at all.
-- **git** on the head, for `pastor plugin install`.
+- **git** on the head, for `pastor connector install`.
 - The agents themselves (`claude`, `opencode`, ...) are installed on each
   machine the usual way.
 
@@ -124,8 +124,9 @@ repo = "~/work/api"
 prompt = "It is {{ item.key }}. Run the test suite and fix what broke."
 ```
 
-Plugins add other connectors, so a job can turn Slack messages or GitHub
-issues into tasks, and event hooks that run when a task finishes or blocks.
+Installed connectors add other sources, so a job can turn Slack messages or
+GitHub issues into tasks, and event hooks that run when a task finishes or
+blocks.
 
 <p align="center">
   <img src="docs/demo/jobs.gif" alt="a job file, pastor job list, job run and the task it made" width="800">
