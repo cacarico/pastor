@@ -32,7 +32,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Without `pastor serve`, `pastor machine list` probes each machine directly
   instead of printing the flock file with no live data. CHANNEL reads
   `probed`, `server down`, `unreachable` or `error`. `pastor machine status`
-  is folded into it and stays as a hidden alias.
+  is folded into it.
 - `pastor machine list` has a PASTOR column after HERDR: the pastor installed
   on each machine (`-` when there is none or it cannot be known), and the
   head's own version on the head row. The head asks each machine once per
@@ -52,6 +52,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Item fields put into a job's `repo` or `branch` may not hold path
   separators, `..`, a leading `-` or control characters; such an item is
   skipped and reported.
+
+### Removed
+
+- The old spellings `pastor run`, `pastor list`, `pastor attach`,
+  `pastor reload` and `pastor machine status` are gone. Use
+  `pastor task run|list|attach`, `pastor job reload` and
+  `pastor machine list`.
 
 ### Fixed
 
