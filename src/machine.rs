@@ -460,6 +460,15 @@ fn task_id_of_agent(name: &str) -> Option<i64> {
     (id > 0 && Task::agent_name_for(id) == name).then_some(id)
 }
 
+/// Who asked for a close. `pastor task close` refuses what herdr refuses;
+/// auto-close of a done task closes the pane anyway when the worktree cannot
+/// go without force, and writes the row only while it is still `Done`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseBy {
+    Command,
+    AutoClose,
+}
+
 /// What the inner loop should do after a command: nothing, reopen the event
 /// subscription (the tracked pane set changed), or drop everything and reconnect
 /// (a request failed below the API, so the machine looks lost).
@@ -645,20 +654,31 @@ impl Actor {
                         }
                     }
                     _ = reconcile_tick.tick() => {
-                        match self.reconcile().await {
-                            Ok(false) => {}
-                            Ok(true) => match self.open_events().await {
-                                Ok(s) => events = s,
-                                Err(err) => match self.poll_after_resubscribe_failed(err).await {
-                                    PollExit::Subscribed(s) => events = *s,
-                                    PollExit::Shutdown => return,
-                                    PollExit::Reconnect(_) => break,
-                                },
-                            },
+                        let reconciled = match self.reconcile().await {
+                            Ok(false) => true,
+                            Ok(true) => {
+                                match self.open_events().await {
+                                    Ok(s) => events = s,
+                                    Err(err) => match self.poll_after_resubscribe_failed(err).await {
+                                        PollExit::Subscribed(s) => events = *s,
+                                        PollExit::Shutdown => return,
+                                        PollExit::Reconnect(_) => break,
+                                    },
+                                }
+                                true
+                            }
                             Err(err) => {
                                 if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "reconcile failed"); break; }
                                 tracing::warn!(machine = %self.name, %err, "reconcile failed; staying connected");
+                                false
                             }
+                        };
+                        // Only here, connected: the poll loop reconciles too, but
+                        // a machine whose events will not open is not one to
+                        // start closing panes on.
+                        if reconciled && let Err(err) = self.auto_close_done().await {
+                            if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "auto-close failed"); break; }
+                            tracing::warn!(machine = %self.name, %err, "auto-close failed; staying connected");
                         }
                     }
                 }
@@ -961,7 +981,9 @@ impl Actor {
                 remove_worktree,
                 reply,
             } => {
-                let (result, dead) = self.run_close(task_id, remove_worktree).await;
+                let (result, dead) = self
+                    .run_close(task_id, remove_worktree, CloseBy::Command)
+                    .await;
                 let _ = reply.send(result);
                 if dead {
                     CommandOutcome::Reconnect
@@ -1027,8 +1049,9 @@ impl Actor {
         &mut self,
         task_id: i64,
         remove_worktree: bool,
+        by: CloseBy,
     ) -> (anyhow::Result<Task>, bool) {
-        match self.close_inner(task_id, remove_worktree).await {
+        match self.close_inner(task_id, remove_worktree, by).await {
             Ok(t) => (Ok(t), false),
             Err(err) => {
                 let dead = is_outage(&err);
@@ -1037,9 +1060,23 @@ impl Actor {
         }
     }
 
-    async fn close_inner(&mut self, task_id: i64, remove_worktree: bool) -> anyhow::Result<Task> {
+    async fn close_inner(
+        &mut self,
+        task_id: i64,
+        remove_worktree: bool,
+        by: CloseBy,
+    ) -> anyhow::Result<Task> {
         let row = self.store.get_task(task_id)?;
         let name = Task::agent_name_for(task_id);
+        if by == CloseBy::AutoClose
+            && !row.as_ref().is_some_and(|t| {
+                t.state == TaskState::Done && t.machine.as_deref() == Some(&self.name)
+            })
+        {
+            anyhow::bail!("task {name} is no longer done on {}", self.name);
+        }
+        // What auto-close leaves behind and says so on the row.
+        let mut note = None;
         if let Some(t) = &row {
             if remove_worktree && !t.spec.worktree {
                 anyhow::bail!("task {name} has no worktree to remove");
@@ -1087,19 +1124,28 @@ impl Actor {
                 Some(t) if remove_worktree => {
                     anyhow::bail!(manual_worktree_cleanup(&t.display_id()))
                 }
+                Some(t) if by == CloseBy::AutoClose => self.finish_auto_close(t, None),
                 Some(t) => self.finish_close(t),
                 None => anyhow::bail!("task {name} not found"),
             };
         };
+        let mut close_pane = !remove_worktree;
+        let mut worktree_gone = false;
         if remove_worktree {
             let ws = workspace.with_context(|| format!("task {name} recorded no workspace"))?;
             // Closes the workspace, pane and agent with it: closing the pane
             // first would close the workspace and leave no id to remove by.
-            match tokio::time::timeout(timeout, self.connector.worktree_remove(&ws, false))
+            let removed = tokio::time::timeout(timeout, self.connector.worktree_remove(&ws, false))
                 .await
-                .map_err(|_| TimedOut("worktree.remove", timeout))?
-            {
-                Ok(()) => {}
+                .map_err(|_| TimedOut("worktree.remove", timeout))?;
+            match removed {
+                Ok(()) => worktree_gone = true,
+                // Already gone, pane and all: nothing left for herdr to remove.
+                Err(err)
+                    if by == CloseBy::AutoClose && err.code() == Some("workspace_not_found") =>
+                {
+                    worktree_gone = true;
+                }
                 // The recorded workspace is gone from herdr too: some other
                 // way it may have already been closed, or its checkout
                 // never existed to begin with. Either way there is no pane
@@ -1125,13 +1171,37 @@ impl Actor {
                         }
                     };
                 }
+                // Never forced: an agent's uncommitted work is worth more than
+                // a clean disk. The pane still goes; the checkout stays.
+                Err(err) if by == CloseBy::AutoClose && !err.is_transport() => {
+                    let t = row.as_ref().expect("auto-close has a row");
+                    let branch = t
+                        .spec
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| format!("pastor/{name}"));
+                    let why = match err.code() {
+                        Some("dirty_worktree_requires_force") => "uncommitted changes".to_string(),
+                        _ => format!("herdr refused to remove it: {err}"),
+                    };
+                    note = Some(format!(
+                        "worktree kept: {why} on branch {branch}{}; remove the checkout with `git worktree remove` once it is saved",
+                        t.spec
+                            .repo
+                            .as_deref()
+                            .map(|r| format!(" of {r}"))
+                            .unwrap_or_default()
+                    ));
+                    close_pane = true;
+                }
                 Err(err) => {
                     return Err(
                         anyhow::Error::from(err).context(format!("remove the worktree of {name}"))
                     );
                 }
             }
-        } else {
+        }
+        if close_pane {
             match tokio::time::timeout(timeout, self.connector.pane_close(&pane))
                 .await
                 .map_err(|_| TimedOut("pane.close", timeout))?
@@ -1152,6 +1222,12 @@ impl Actor {
             // The workspace is gone with the worktree. Clearing it is how
             // the row says so: prune keeps a worktree row that still
             // records one, since a plain close leaves the checkout on disk.
+            Some(mut t) if by == CloseBy::AutoClose => {
+                if worktree_gone {
+                    t.workspace_id = None;
+                }
+                self.finish_auto_close(t, note)
+            }
             Some(mut t) if remove_worktree => {
                 t.workspace_id = None;
                 self.store.update_task(&mut t)?;
@@ -1187,6 +1263,59 @@ impl Actor {
         }
         self.refresh_live();
         Ok(closed)
+    }
+
+    /// The row half of an auto-close: `t` is the row read as `Done` before
+    /// herdr was asked, so the optimistic write lands only if nothing moved it
+    /// since. `task.closed` is emitted here, once; `task close` goes through
+    /// `finish_close` instead.
+    fn finish_auto_close(&mut self, mut t: Task, note: Option<String>) -> anyhow::Result<Task> {
+        t.state = TaskState::Closed;
+        t.finished_at = t.finished_at.or_else(|| Some(Utc::now()));
+        if note.is_some() {
+            t.error = note;
+        }
+        self.store.update_task(&mut t)?;
+        self.activity_seen.remove(&t.id);
+        self.emit("task.closed", Some(t.id));
+        self.refresh_live();
+        Ok(t)
+    }
+
+    /// Close the done tasks on this machine that finished `close_done_after`
+    /// ago or more, through the same path as `pastor task close`. Failed,
+    /// blocked and stale tasks are never closed on their own. A task herdr
+    /// will not close is logged and tried again at the next reconcile; only a
+    /// failure below the API is returned, so the caller can reconnect.
+    async fn auto_close_done(&mut self) -> anyhow::Result<()> {
+        let Some(after) = self.settings.close_done_after else {
+            return Ok(());
+        };
+        let grace = chrono::Duration::from_std(after).unwrap_or(chrono::Duration::MAX);
+        let now = Utc::now();
+        let due: Vec<Task> = self
+            .store
+            .tasks_on_machine(&self.name)?
+            .into_iter()
+            .filter(|t| {
+                t.state == TaskState::Done && now - t.finished_at.unwrap_or(t.updated_at) >= grace
+            })
+            .collect();
+        for t in due {
+            let (result, dead) = self
+                .run_close(t.id, t.spec.worktree, CloseBy::AutoClose)
+                .await;
+            match result {
+                Ok(closed) => {
+                    tracing::info!(machine = %self.name, task = %closed.display_id(), ?after, note = ?closed.error, "auto-closed after close_done_after");
+                }
+                Err(err) if dead => return Err(err),
+                Err(err) => {
+                    tracing::warn!(machine = %self.name, task = %t.display_id(), err = format!("{err:#}"), "auto-close failed; trying again at the next reconcile");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Runs a dispatch and reports whether it failed below the API (a transport
@@ -2864,6 +2993,288 @@ mod tests {
         let err = h.close(other.id, false).await.unwrap_err();
         assert!(err.to_string().contains("elsewhere"), "{err}");
         assert_eq!(state_of(&store, other.id), TaskState::Running);
+    }
+
+    /// Settings for the auto-close tests: done tasks are closed 150ms after
+    /// they finish, checked by a reconcile every 100ms.
+    fn auto_close_settings() -> MachineSettings {
+        MachineSettings {
+            reconcile_every: Duration::from_millis(100),
+            close_done_after: Some(Duration::from_millis(150)),
+            ..settings()
+        }
+    }
+
+    /// Dispatch `task` and let its agent finish: it goes idle after working,
+    /// so the settle window marks it done.
+    async fn run_to_done(h: &MachineHandle, fake: &FakeHerdr, store: &Store, task: Task) -> Task {
+        let t = h.dispatch(task.id).await.unwrap();
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+        wait_for("done", || state_of(store, t.id) == TaskState::Done).await;
+        store.get_task(t.id).unwrap().unwrap()
+    }
+
+    fn count(
+        events: &mut broadcast::Receiver<PastorEvent>,
+        kind: &str,
+        id: i64,
+    ) -> Vec<PastorEvent> {
+        let mut found = vec![];
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind == kind && ev.task_id == Some(id) {
+                found.push(ev);
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn a_done_task_is_closed_after_close_done_after() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = run_to_done(&h, &fake, &store, new_task(&store)).await;
+        assert!(
+            calls(&fake, "pane.close").is_empty(),
+            "the pane stays open for the grace period"
+        );
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        let closed = store.get_task(t.id).unwrap().unwrap();
+        assert!(
+            (closed.finished_at.unwrap() - t.finished_at.unwrap()).num_milliseconds() == 0,
+            "closing keeps the finish time"
+        );
+        assert!(closed.error.is_none(), "{:?}", closed.error);
+        assert_eq!(
+            calls(&fake, "pane.close"),
+            vec![serde_json::json!({"pane_id": t.pane_id.clone().unwrap()})]
+        );
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        assert!(fake.agents().is_empty());
+        wait_for("live drops", || h.snapshot().live == 0).await;
+    }
+
+    #[tokio::test]
+    async fn auto_close_emits_task_closed_once() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let task = store
+            .insert_task(NewTask {
+                job: "nightly".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: spec(),
+            })
+            .unwrap();
+        let t = run_to_done(&h, &fake, &store, task).await;
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        // Two more reconcile passes, and the pane.closed event herdr sends.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let closed = count(&mut events, "task.closed", t.id);
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert_eq!(closed[0].job.as_deref(), Some("nightly"));
+        assert_eq!(closed[0].machine.as_deref(), Some("m"));
+        assert_eq!(calls(&fake, "pane.close").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn never_disables_auto_close() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_done_after: None,
+                ..auto_close_settings()
+            },
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = run_to_done(&h, &fake, &store, new_task(&store)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
+        assert!(calls(&fake, "pane.close").is_empty());
+    }
+
+    /// Failed, blocked and stale tasks are left for `task retry` and `task
+    /// close`, however long ago they stopped.
+    #[tokio::test]
+    async fn only_done_tasks_are_auto_closed() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let long_ago = Utc::now() - chrono::Duration::hours(1);
+        let mut ids = vec![];
+        // Each agent shows the status that keeps its task where it is, so
+        // only auto-close could move it.
+        for (state, status) in [
+            (TaskState::Failed, AgentStatus::Idle),
+            (TaskState::Blocked, AgentStatus::Blocked),
+            (TaskState::Stale, AgentStatus::Working),
+        ] {
+            let mut t = new_task(&store);
+            let pane = start_agent(&fake, &Task::agent_name_for(t.id)).await;
+            fake.set_status_silently(&pane, status);
+            t.state = state;
+            t.machine = Some("m".into());
+            t.pane_id = Some(pane);
+            t.agent_name = Some(Task::agent_name_for(t.id));
+            t.started_at = Some(Utc::now());
+            t.finished_at = Some(long_ago);
+            store.update_task(&mut t).unwrap();
+            ids.push((t.id, state));
+        }
+        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        for (id, state) in ids {
+            assert_eq!(state_of(&store, id), state);
+        }
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert!(calls(&fake, "worktree.remove").is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_close_removes_a_clean_worktree() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = run_to_done(&h, &fake, &store, worktree_task(&store)).await;
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        assert_eq!(
+            calls(&fake, "worktree.remove"),
+            vec![
+                serde_json::json!({"workspace_id": t.workspace_id.clone().unwrap(), "force": false})
+            ]
+        );
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert!(store.get_task(t.id).unwrap().unwrap().error.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_close_keeps_a_dirty_worktree() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        fake.dirty_worktrees(true);
+        let t = run_to_done(&h, &fake, &store, worktree_task(&store)).await;
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        let removes = calls(&fake, "worktree.remove");
+        assert_eq!(
+            removes,
+            vec![
+                serde_json::json!({"workspace_id": t.workspace_id.clone().unwrap(), "force": false})
+            ],
+            "never forced"
+        );
+        assert_eq!(
+            calls(&fake, "pane.close"),
+            vec![serde_json::json!({"pane_id": t.pane_id.clone().unwrap()})],
+            "the pane closes anyway"
+        );
+        let note = store.get_task(t.id).unwrap().unwrap().error.unwrap();
+        assert!(note.contains("worktree kept"), "{note}");
+        assert!(note.contains("pastor/t-"), "names the branch: {note}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(count(&mut events, "task.closed", t.id).len(), 1);
+        assert_eq!(calls(&fake, "worktree.remove").len(), 1, "not retried");
+    }
+
+    /// A done task whose pane the user already closed in herdr ends closed,
+    /// with no error, once, and later passes leave it alone.
+    #[tokio::test]
+    async fn auto_close_tolerates_a_missing_pane() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut t = worktree_task(&store);
+        t.state = TaskState::Done;
+        t.machine = Some("m".into());
+        t.workspace_id = Some("w77".into());
+        t.pane_id = Some("w77:p1".into());
+        t.agent_name = Some(Task::agent_name_for(t.id));
+        t.last_completion_seq = Some(1);
+        t.finished_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.update_task(&mut t).unwrap();
+        let (h, mut events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let closed = store.get_task(t.id).unwrap().unwrap();
+        assert!(closed.error.is_none(), "{:?}", closed.error);
+        assert_eq!(count(&mut events, "task.closed", t.id).len(), 1);
+    }
+
+    /// Auto-close waits for a connected machine: while polling, reconcile
+    /// runs on every poll tick, but a done task is only closed once the
+    /// events are back. (A lost machine runs no reconcile at all.)
+    #[tokio::test]
+    async fn a_polling_machine_does_not_auto_close() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut t = new_task(&store);
+        let pane = start_agent(&fake, &Task::agent_name_for(t.id)).await;
+        fake.set_status_silently(&pane, AgentStatus::Idle);
+        t.state = TaskState::Done;
+        t.machine = Some("m".into());
+        t.pane_id = Some(pane);
+        t.agent_name = Some(Task::agent_name_for(t.id));
+        t.last_completion_seq = Some(0);
+        t.finished_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.update_task(&mut t).unwrap();
+        let (events, _rx) = broadcast::channel(64);
+        let mut settings = auto_close_settings();
+        settings.poll_every = Duration::from_millis(50);
+        let h = spawn_machine(
+            "m".into(),
+            2,
+            vec![],
+            Arc::new(FlakyEvents {
+                subscribes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail_until: 6,
+                wedge_forever: false,
+                slow_ack: None,
+                fake: fake.clone(),
+            }),
+            store.clone(),
+            settings,
+            events,
+        );
+        wait_for("polling", || h.snapshot().channel == ChannelState::Polling).await;
+        let polls = lists(&fake);
+        wait_for("a few poll reconciles", || lists(&fake) >= polls + 3).await;
+        assert_eq!(h.snapshot().channel, ChannelState::Polling);
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
+        assert!(calls(&fake, "pane.close").is_empty());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
     }
 
     #[tokio::test]
