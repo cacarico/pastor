@@ -86,7 +86,6 @@ and stderr says so. `--json` prints
 `{"head": {...}, "machines": [...]}`, with `pastor_version` on the head and
 on each machine (`null` when unknown) and `channel` one of the same four probe
 values (or the head's live channel state when `pastor serve` is running).
-`pastor machine status` is the old spelling, kept as a hidden alias.
 
 Jobs are one TOML file each in `~/.config/pastor/jobs/`. On every `tick` the
 daemon re-reads files that changed (a file that stops parsing keeps its last
