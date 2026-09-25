@@ -181,6 +181,11 @@ impl Flock {
                     m.name
                 ));
             }
+            if let Some(target) = &m.ssh
+                && let Some(why) = ssh_target_problem(target)
+            {
+                return Err(format!("machine {}: ssh {target:?} {why}", m.name));
+            }
             if m.command.as_ref().is_some_and(|c| c.is_empty()) {
                 return Err(format!("machine {}: command is empty", m.name));
             }
@@ -694,6 +699,24 @@ impl std::fmt::Display for FlockDoc {
     }
 }
 
+/// Why `target`, the `ssh` of a machine, is not one plain destination. ssh
+/// parses a target that starts with `-` as an option (`-oProxyCommand=...`
+/// runs a local command), and pastor passes it after `--` as well; spaces and
+/// control characters have no place in a `[user@]host`.
+fn ssh_target_problem(target: &str) -> Option<&'static str> {
+    if target.is_empty() {
+        Some("is empty")
+    } else if target.starts_with('-') {
+        Some("starts with '-'")
+    } else if target.chars().any(char::is_control) {
+        Some("contains a control character")
+    } else if target.chars().any(char::is_whitespace) {
+        Some("contains whitespace")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,6 +1170,43 @@ flock = "work"
             }],
         };
         assert_eq!(f.validate().unwrap_err(), "machine x: command is empty");
+    }
+
+    /// ssh reads a target starting with `-` as an option, and
+    /// `-oProxyCommand=...` runs a local command at the next connect. A
+    /// target is one word: no option, no whitespace, no control characters.
+    #[test]
+    fn an_ssh_target_that_is_not_one_plain_word_is_refused() {
+        for (target, why) in [
+            ("-oProxyCommand=sh -c x", "starts with '-'"),
+            ("-p2222", "starts with '-'"),
+            ("", "is empty"),
+            ("user@pi 3", "whitespace"),
+            ("pi-3\n", "control"),
+        ] {
+            let f = Flock {
+                flocks: vec![],
+                machines: vec![MachineConfig {
+                    ssh: Some(target.into()),
+                    ..pi("x")
+                }],
+            };
+            let err = f.validate().unwrap_err();
+            assert!(
+                err.starts_with("machine x: ssh") && err.contains(why),
+                "{target:?}: {err}"
+            );
+        }
+        for target in ["pi-3", "fleet@pi-3", "fleet@192.0.2.3", "pi-3.lan"] {
+            let f = Flock {
+                flocks: vec![],
+                machines: vec![MachineConfig {
+                    ssh: Some(target.into()),
+                    ..pi("x")
+                }],
+            };
+            f.validate().unwrap_or_else(|e| panic!("{target}: {e}"));
+        }
     }
 
     #[test]

@@ -1316,8 +1316,7 @@ async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
         .unwrap_or_else(|| fail("unknown_machine", &machine));
     let err = if let Some(target) = &m.ssh {
         std::process::Command::new("ssh")
-            .arg("-t")
-            .arg(target)
+            .args(["-t", "--", target])
             .arg(attach_remote_command(&m.session, &agent))
             .exec()
     } else if m.local {

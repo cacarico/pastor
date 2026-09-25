@@ -213,7 +213,9 @@ fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -
             format!("ControlPersist={CONTROL_PERSIST_SECS}"),
         ]);
     }
-    argv.extend(["-T".to_string(), target.to_string(), remote]);
+    // `--` so a target is never read as an option; `Flock::validate` also
+    // refuses one that starts with `-`.
+    argv.extend(["-T".to_string(), "--".into(), target.to_string(), remote]);
     argv
 }
 
@@ -768,6 +770,8 @@ mod tests {
             "herdr --session default remote-api-bridge"
         );
         assert_eq!(argv[argv.len() - 2], "fleet@pi-3");
+        // `--` ends ssh's options, so the target is never read as one.
+        assert_eq!(argv[argv.len() - 3], "--");
     }
 
     /// `~` in a repo path is the home on the machine: ssh asks the remote

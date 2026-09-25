@@ -274,7 +274,10 @@ other bad flock file: `pastor serve` refuses to start on it, `pastor tick`
 and `pastor job list` without a head refuse it too, and a running head keeps
 the previous version. A file with no `[[flock]]` entry at all is
 one flock named `default` holding every machine, so files from before flocks
-load unchanged.
+load unchanged. A machine's `ssh` is one `[user@]host` word: one that is
+empty, starts with `-`, or holds whitespace or a control character makes the
+file fail to load the same way, since ssh would read it as an option. Put
+ports, keys and jump hosts in `~/.ssh/config` under a host alias instead.
 
 ```
 pastor flock list                       NAME, DEFAULT, MACHINES, AGENTS, QUEUED (--json)
