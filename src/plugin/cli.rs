@@ -16,6 +16,7 @@ use super::{Discovered, Plugin, PluginCatalog, discover};
 use crate::config::job::{self, Loaded};
 use crate::config::{PastorConfig, Paths, parse_duration};
 use crate::connector::{self, RunInput};
+use crate::ipc::Head;
 
 #[derive(Subcommand, Debug)]
 pub enum PluginCmd {
@@ -53,7 +54,9 @@ pub enum PluginCmd {
     },
 }
 
-pub async fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
+/// `head` is what the CLI's one ping found before the command ran; a head
+/// that did not answer it stopped the command there.
+pub async fn run(paths: &Paths, cmd: PluginCmd, head: Head) -> anyhow::Result<()> {
     match cmd {
         PluginCmd::Install {
             source,
@@ -75,7 +78,7 @@ pub async fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
                 p.manifest.version,
                 p.dir.display()
             );
-            after_change(paths, &p).await;
+            after_change(paths, &p, head).await;
             Ok(())
         }
         PluginCmd::Link { path } => {
@@ -86,19 +89,19 @@ pub async fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
                 p.manifest.version,
                 p.dir.display()
             );
-            after_change(paths, &p).await;
+            after_change(paths, &p, head).await;
             Ok(())
         }
         PluginCmd::Uninstall { id } => {
             install::uninstall(paths, &id)?;
             println!("uninstalled {id}; jobs using it are invalid until it is back");
-            reload_daemon(paths).await;
+            reload_daemon(paths, head).await;
             Ok(())
         }
         PluginCmd::Unlink { id } => {
             install::unlink(paths, &id)?;
             println!("unlinked {id}; jobs using it are invalid until it is back");
-            reload_daemon(paths).await;
+            reload_daemon(paths, head).await;
             Ok(())
         }
         PluginCmd::List { json } => {
@@ -154,7 +157,7 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
 
 /// Tell the user what is left to do, and have a running daemon reload its
 /// catalog.
-async fn after_change(paths: &Paths, p: &Plugin) {
+async fn after_change(paths: &Paths, p: &Plugin, head: Head) {
     let env = p.env(paths).unwrap_or_default();
     let missing = p.missing_secrets(&env);
     if !missing.is_empty() {
@@ -164,31 +167,25 @@ async fn after_change(paths: &Paths, p: &Plugin) {
             paths.plugin_env_file(&p.id).display()
         );
     }
-    reload_daemon(paths).await;
+    reload_daemon(paths, head).await;
 }
 
 /// A running daemon re-reads its plugins only on `Reload`; send it so the
 /// change takes effect now. The change itself is already on disk, so a
 /// failed reload is a warning, not an error.
-async fn reload_daemon(paths: &Paths) {
-    if let Some(note) = reload_note(&paths.socket_file()).await {
+async fn reload_daemon(paths: &Paths, head: Head) {
+    if let Some(note) = reload_note(&paths.socket_file(), head).await {
         eprintln!("{note}");
     }
 }
 
 /// What to tell the user about the reload: nothing when no daemon runs, a
-/// warning when one is there but did not answer or did not reload.
-async fn reload_note(socket: &std::path::Path) -> Option<String> {
-    use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
-    match crate::ipc::probe_daemon(socket).await {
-        DaemonProbe::NotRunning => return None,
-        DaemonProbe::Unresponsive => {
-            return Some(
-                "pastor serve is not responding, so it did not reload; run `pastor job reload` once it answers"
-                    .into(),
-            );
-        }
-        DaemonProbe::Running => {}
+/// warning when it did not reload. The head is not probed again: `head` is
+/// the command's one ping, so nothing later can read it differently.
+async fn reload_note(socket: &std::path::Path, head: Head) -> Option<String> {
+    use crate::ipc::{IpcRequest, IpcResponse};
+    if !head.is_live() {
+        return None;
     }
     Some(
         match crate::ipc::request(socket, &IpcRequest::Reload).await {
@@ -373,26 +370,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn reload_is_quiet_without_a_daemon_and_warns_when_it_does_not_answer() {
+    async fn reload_is_quiet_without_a_head_and_warns_when_it_does_not_reload() {
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("pastor.sock");
         assert_eq!(
-            reload_note(&socket).await,
+            reload_note(&socket, Head::Absent).await,
             None,
-            "no daemon, nothing to say"
+            "no head, nothing to say"
         );
-
-        // Something accepts on the socket and never answers.
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((s, _)) = listener.accept().await {
-                held.push(s);
-            }
-        });
-        let note = reload_note(&socket).await.expect("a warning");
+        // The ping found a head that is gone by the reload: a warning.
+        let note = reload_note(&socket, Head::Live).await.expect("a warning");
         assert!(
-            note.contains("not responding") && note.contains("pastor job reload"),
+            note.contains("did not reload") && note.contains("pastor job reload"),
             "{note}"
         );
     }

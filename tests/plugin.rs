@@ -849,3 +849,57 @@ fn a_daemon_runs_plugin_jobs_and_hooks_hear_their_events() {
     assert_eq!(records(&echo).len(), 4, "echo heard nothing more");
     assert_eq!(records(&notify_run)[0]["task"]["job"], "run");
 }
+
+/// A head that answers the first ping, then stops answering pings (a busy
+/// head looks like this from outside) while it still takes a reload. It
+/// records each request's op.
+fn head_that_answers_one_ping(socket: &Path) -> Arc<std::sync::Mutex<Vec<String>>> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = ops.clone();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let op = req["op"].as_str().unwrap_or_default().to_string();
+            let pings = {
+                let mut seen = seen.lock().unwrap();
+                seen.push(op.clone());
+                seen.iter().filter(|o| *o == "ping").count()
+            };
+            let reply = match op.as_str() {
+                "ping" if pings == 1 => json!({"kind": "pong", "data": {
+                    "version": "test", "protocol": pastor::ipc::FLOCK_PROTOCOL}}),
+                "reload" => json!({"kind": "jobs", "data": []}),
+                _ => json!({"kind": "error", "data": {"code": "busy", "message": "busy"}}),
+            };
+            let _ = writeln!(stream, "{reply}");
+        }
+    });
+    ops
+}
+
+/// The CLI pings the head once before a plugin command; the reload after
+/// the change acts on that ping. A head that stops answering pings after the
+/// first still gets its reload, and is never probed a second time.
+#[test]
+fn plugin_commands_reload_on_the_one_ping_the_cli_sent() {
+    let cli = Cli::new();
+    std::fs::create_dir_all(cli.dir("s")).unwrap();
+    let ops = head_that_answers_one_ping(&cli.dir("s").join("pastor.sock"));
+
+    let (_, err) = cli.ok(&["plugin", "link", fixture("echo").to_str().unwrap()]);
+    assert!(err.contains("reloaded its plugins"), "{err}");
+    assert_eq!(*ops.lock().unwrap(), ["ping", "reload"]);
+
+    // Every later ping goes unanswered, so the CLI's own check now stops the
+    // command before anything changes.
+    let out = cli.pastor(&["plugin", "unlink", "echo"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("head_unresponsive"), "{stderr}");
+    assert_eq!(*ops.lock().unwrap(), ["ping", "reload", "ping"]);
+}

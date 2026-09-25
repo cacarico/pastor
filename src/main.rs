@@ -330,7 +330,7 @@ fn main() {
             }
             Command::Events(args) => pastor::events::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
-            Command::Plugin { cmd } => pastor::plugin::cli::run(&paths, cmd).await,
+            Command::Plugin { cmd } => pastor::plugin::cli::run(&paths, cmd, head).await,
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd),
         }
     });
