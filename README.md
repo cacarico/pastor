@@ -33,10 +33,14 @@ straight away, usually because the agent is not installed on that machine. An
 agent that is blocked on its own startup question marks the task `blocked`;
 herdr drops the prompt then, so pastor sends it once someone answers and the
 agent leaves `blocked`. A task is `done` when its agent has gone idle (herdr's
-`idle` or `done`) after working on the prompt and stays idle for `settle`: herdr
-counts each agent state change, and the count must have moved past its value
-when the prompt went in and not moved again during the window. Task state lives
-in SQLite under `~/.local/state/pastor/`.
+`idle` or `done`) after working on the prompt and stays idle for `settle`.
+pastor must have seen the agent `working` or `blocked` since the prompt went in,
+from an event or from `agent.list`; `unknown` does not count. herdr also counts
+each agent state change, and the count must have moved past its value when the
+prompt went in and not moved again during the window. What pastor has seen is
+kept in memory, so after a daemon restart an agent found idle stays `running`
+until its task goes `stale`. Task state lives in SQLite under
+`~/.local/state/pastor/`.
 
 The CLI talks to `pastor serve` over a unix socket (`pastor.sock`) with
 newline-delimited JSON; each response is `{"kind": ..., "data": ...}`.

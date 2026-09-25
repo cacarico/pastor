@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -205,6 +205,7 @@ pub fn spawn_machine(
         status: status.clone(),
         rx,
         pending_done: HashMap::new(),
+        activity_seen: HashSet::new(),
         was_connected: false,
         failures: 0,
         lost_announced: false,
@@ -232,6 +233,12 @@ struct Actor {
     /// agent is still idle at that same sequence; with no sequence, the first
     /// check records one and starts the window over.
     pending_done: HashMap<i64, (Option<u64>, Instant)>,
+    /// Tasks whose agent this actor has seen `working` or `blocked` since the
+    /// prompt went in or the task last finished (`Task::activity_seen`). Kept
+    /// here, not in the store: `apply` copies it onto the task before each
+    /// transition. A restarted daemon starts empty; reconcile refills it for
+    /// agents it finds at work.
+    activity_seen: HashSet<i64>,
     /// Has the actor connected successfully at least once (ever)?
     was_connected: bool,
     /// Consecutive connect-attempt failures since the last success. Only decides
@@ -766,6 +773,7 @@ impl Actor {
             }
         };
         let dead = matches!(&outcome, Err(err) if err.is_transport());
+        self.set_activity(&task);
         if let Err(err) = self.store.update_task(&mut task) {
             return (Err(err), dead);
         }
@@ -862,6 +870,7 @@ impl Actor {
                 // State changes before the agent had our prompt (its launch,
                 // its startup question) are not this task's work: count from here.
                 task.last_completion_seq = Some(agent.state_change_seq);
+                task.activity_seen = agent.agent_status.is_activity();
             }
             // Blocked again, or between states: the next status event or
             // reconcile tries again.
@@ -876,6 +885,7 @@ impl Actor {
             }
         }
         self.pending_done.remove(&task.id);
+        self.set_activity(&task);
         // A Conflict here means the row moved on under us; the caller logs it
         // and the next event or reconcile works from the fresh row.
         self.store.update_task(&mut task)?;
@@ -931,10 +941,34 @@ impl Actor {
         Ok(())
     }
 
+    /// Record whether `task` (just prompted, so its flag is fresh) has shown
+    /// activity; see `Task::activity_seen`.
+    fn set_activity(&mut self, task: &Task) {
+        if task.activity_seen {
+            self.activity_seen.insert(task.id);
+        } else {
+            self.activity_seen.remove(&task.id);
+        }
+    }
+
     fn apply(&mut self, mut task: Task, observed: &Observed) {
+        // Any `working` or `blocked` after the prompt is activity, whether an
+        // event or `agent.list` showed it; `unknown` never is. Before the
+        // prompt reached the agent (`prompt_pending`) nothing counts.
+        if let Observed::Status { status, .. } = observed
+            && status.is_activity()
+            && !task.prompt_pending
+        {
+            self.activity_seen.insert(task.id);
+        }
+        task.activity_seen = self.activity_seen.contains(&task.id);
         let Some(to) = next_state(&task, observed) else {
             return;
         };
+        if to == TaskState::Done || !to.is_open() {
+            // The next completion needs activity of its own.
+            self.activity_seen.remove(&task.id);
+        }
         if let Observed::Status {
             state_change_seq,
             completion_seq,
@@ -1737,6 +1771,82 @@ mod tests {
         assert!(!saw(&mut events, "task.done", t.id));
     }
 
+    /// Count of `agent.list` requests the fake has answered so far.
+    fn lists(fake: &FakeHerdr) -> usize {
+        fake.requests()
+            .iter()
+            .filter(|r| r.method == "agent.list")
+            .count()
+    }
+
+    /// herdr stamps a new `state_change_seq` on `unknown` too, so an agent
+    /// that flickers `idle -> unknown -> idle` sits idle past its baseline
+    /// without having worked. With no `working` or `blocked` seen since the
+    /// prompt, no amount of settling makes that done.
+    #[tokio::test]
+    async fn idle_unknown_idle_without_activity_never_completes() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        let baseline = t.last_completion_seq.unwrap();
+        fake.set_status(&pane, AgentStatus::Unknown);
+        fake.set_status(&pane, AgentStatus::Idle);
+        assert!(fake.agents()[0].state_change_seq > baseline);
+        // Several settle windows (100ms) and reconciles (200ms).
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert!(!saw(&mut events, "task.done", t.id));
+    }
+
+    /// A working spell only `agent.list` saw (the event was missed) counts as
+    /// activity: the later idle completes the task after settle.
+    #[tokio::test]
+    async fn working_seen_only_by_reconcile_counts_as_activity() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status_silently(&pane, AgentStatus::Working);
+        // Two lists: the first may have been in flight before the change.
+        let before = lists(&fake);
+        wait_for("a reconcile saw it working", || lists(&fake) > before + 1).await;
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// `blocked` after the prompt is activity too: the agent asked a human,
+    /// got its answer and finished, so its idle completes the task.
+    #[tokio::test]
+    async fn blocked_then_idle_is_done_after_settle() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status_silently(&pane, AgentStatus::Blocked);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
     /// A task whose prompt herdr refused (blocked at startup) is not done when
     /// its agent goes idle while the prompt still cannot be delivered, even
     /// though the agent's `state_change_seq` has moved: the moves were its
@@ -1910,16 +2020,11 @@ mod tests {
         // Idle with no completed work must not fast-track to Done, and work
         // finished later must still wait out the settle window, same as the
         // pane-known path (mirrors `dispatch_then_events_drive_state`).
+        // Adopted panes get no status events until the next reconnect, so
+        // the working spell counts once a reconcile has listed it.
         fake.set_status(&created.root_pane.pane_id, AgentStatus::Working);
-        wait_for("baseline recorded", || {
-            store
-                .get_task(t.id)
-                .unwrap()
-                .unwrap()
-                .last_completion_seq
-                .is_some()
-        })
-        .await;
+        let before = lists(&fake);
+        wait_for("a reconcile saw it working", || lists(&fake) > before + 1).await;
         fake.set_status(&created.root_pane.pane_id, AgentStatus::Idle);
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(

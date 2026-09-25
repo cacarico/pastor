@@ -53,10 +53,17 @@ them too; they are repeated here because getting them wrong cost a day.
   sequence. Subscription events carry the status only, no sequence. So pastor
   takes the sequence from the `agent.prompt` reply as the task's baseline
   (column `last_completion_seq`, name kept for the schema) and calls a task
-  done when, after `settle`, `agent.list` shows it idle or done at a sequence
-  past that baseline and unchanged since it was first seen idle. herdr's own
-  `agent.prompt --wait` uses the same test. Unreleased herdr adds
-  `completion_seq` in the same sequence; pastor prefers it when present.
+  done when pastor has seen the agent `working` or `blocked` since the prompt
+  (event or `agent.list`) and, after `settle`, `agent.list` shows it idle or
+  done at a sequence past that baseline and unchanged since it was first seen
+  idle. The sequence alone is not proof of work: `unknown` bumps it too, so
+  `idle -> unknown -> idle` would pass. herdr's own `agent.prompt --wait` makes
+  the same two checks (`prompt_activity_statuses`, then
+  `after_state_change_seq`). The activity flag lives in the machine actor's
+  memory, not the store (a column would need a schema bump); after a restart
+  an agent found working or blocked counts again, one found idle stays running
+  until stale. Unreleased herdr adds `completion_seq` in the same sequence;
+  pastor prefers it when present, with no activity needed.
 - A herdr error reply is an API error with a code, never a dead connection.
   Only EOF before a reply, spawn failure or a non-zero exit with no reply are
   transport failures, and only those make a machine `lost`.
