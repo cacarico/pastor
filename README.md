@@ -136,7 +136,8 @@ worktree pastor created is removed if it is clean and kept with a note if it
 is not, and the task shows as `closed`. Failed and blocked tasks are left for
 `pastor task retry` or `pastor task close`. The grace period keeps the pane
 there for `pastor task attach`; the check runs with each reconcile, while
-the machine is connected.
+the machine is connected. An agent that herdr shows working or blocked again
+at that moment is left alone, and its task goes back to running or blocked.
 
 Everything else pastor closes only when asked; three commands do it, all
 with `--json`. `pastor task retry t-4` queues a new task

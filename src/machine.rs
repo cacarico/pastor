@@ -23,6 +23,12 @@ use crate::task::{Observed, Task, TaskState, next_state};
 #[error("{0} timed out after {1:?}")]
 struct TimedOut(&'static str, Duration);
 
+/// Auto-close found the agent of a done task no longer idle: not a failure,
+/// the task is simply not done any more.
+#[derive(Debug, thiserror::Error)]
+#[error("the agent is {0:?}, not idle")]
+struct NotIdle(AgentStatus);
+
 /// Whether an error from the connected loop means the machine is gone. Only a
 /// transport failure or a request that never answered does; a herdr API error
 /// or a local store error leaves the machine reachable, and reporting it as
@@ -1119,6 +1125,16 @@ impl Actor {
                 .find(|a| a.name.as_deref() == Some(name.as_str()))
                 .map(|a| (a.pane_id.clone(), Some(a.workspace_id.clone())))
         });
+        // The reconcile that found the task done listed a moment ago; the agent
+        // may have gone back to work since. Closing it now would kill running
+        // work: leave the row `Done` and let the status path move it on.
+        if by == CloseBy::AutoClose
+            && let Some((pane, _)) = &target
+            && let Some(agent) = agents.iter().find(|a| &a.pane_id == pane)
+            && !matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done)
+        {
+            return Err(NotIdle(agent.agent_status).into());
+        }
         let Some((pane, workspace)) = target else {
             return match row {
                 Some(t) if remove_worktree => {
@@ -1310,6 +1326,9 @@ impl Actor {
                     tracing::info!(machine = %self.name, task = %closed.display_id(), ?after, note = ?closed.error, "auto-closed after close_done_after");
                 }
                 Err(err) if dead => return Err(err),
+                Err(err) if err.is::<NotIdle>() => {
+                    tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed: the agent went back to work");
+                }
                 Err(err) => {
                     tracing::warn!(machine = %self.name, task = %t.display_id(), err = format!("{err:#}"), "auto-close failed; trying again at the next reconcile");
                 }
@@ -3226,6 +3245,100 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let closed = store.get_task(t.id).unwrap().unwrap();
         assert!(closed.error.is_none(), "{:?}", closed.error);
+        assert_eq!(count(&mut events, "task.closed", t.id).len(), 1);
+    }
+
+    /// A done task, past its grace period, whose agent is idle in herdr but
+    /// turns `Working` between a reconcile's `agent.list` and the fresh one
+    /// auto-close makes before closing. Returns the running machine, its
+    /// events, the task as seeded and its pane.
+    async fn done_task_that_resumes(
+        fake: &FakeHerdr,
+        store: &Arc<Store>,
+    ) -> (
+        MachineHandle,
+        broadcast::Receiver<PastorEvent>,
+        Task,
+        String,
+    ) {
+        let mut t = new_task(store);
+        let pane = start_agent(fake, &Task::agent_name_for(t.id)).await;
+        fake.set_status_silently(&pane, AgentStatus::Idle);
+        t.state = TaskState::Done;
+        t.machine = Some("m".into());
+        t.pane_id = Some(pane.clone());
+        t.agent_name = Some(Task::agent_name_for(t.id));
+        t.last_completion_seq = Some(fake.agents()[0].state_change_seq);
+        t.finished_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.update_task(&mut t).unwrap();
+        fake.set_status_between_lists(&pane, AgentStatus::Working);
+        // The first reconcile tick lists and auto-close lists right after it.
+        // A settle window well past that tick keeps the settle check's own
+        // `agent.list` from landing next to the reconcile's instead.
+        let settings = MachineSettings {
+            settle: Duration::from_millis(300),
+            ..auto_close_settings()
+        };
+        let (h, events) = spawn_with_settings(fake, store, settings);
+        // Or is closed at work, the bug this guards against.
+        wait_for("the agent resumes", || match fake.agents().first() {
+            Some(a) => a.agent_status == AgentStatus::Working,
+            None => true,
+        })
+        .await;
+        (h, events, t, pane)
+    }
+
+    /// Only the fresh `agent.list` saw the agent at work again: auto-close
+    /// leaves it, and the next reconcile moves the task back to running.
+    #[tokio::test]
+    async fn auto_close_skips_an_agent_that_resumed_work() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (_h, mut events, t, pane) = done_task_that_resumes(&fake, &store).await;
+        wait_for("running again, or closed", || {
+            matches!(
+                state_of(&store, t.id),
+                TaskState::Running | TaskState::Closed
+            )
+        })
+        .await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        assert_eq!(fake.agents().len(), 1);
+        assert_eq!(fake.agents()[0].pane_id, pane);
+        assert!(count(&mut events, "task.closed", t.id).is_empty());
+    }
+
+    /// The same task closes once its agent is idle again, done again, and
+    /// past the grace period from the new finish.
+    #[tokio::test]
+    async fn auto_close_closes_a_resumed_task_once_it_is_done_again() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (_h, mut events, t, pane) = done_task_that_resumes(&fake, &store).await;
+        wait_for("running again, or closed", || {
+            matches!(
+                state_of(&store, t.id),
+                TaskState::Running | TaskState::Closed
+            )
+        })
+        .await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done again", || state_of(&store, t.id) == TaskState::Done).await;
+        let done = store.get_task(t.id).unwrap().unwrap();
+        assert!(done.finished_at > t.finished_at, "a new finish time");
+        assert!(calls(&fake, "pane.close").is_empty(), "a new grace period");
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        assert_eq!(
+            calls(&fake, "pane.close"),
+            vec![serde_json::json!({"pane_id": pane})]
+        );
+        assert!(fake.agents().is_empty());
         assert_eq!(count(&mut events, "task.closed", t.id).len(), 1);
     }
 

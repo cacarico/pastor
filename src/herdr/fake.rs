@@ -70,6 +70,11 @@ struct State {
     /// Closed just before the next `events.subscribe` that names it (see
     /// `close_pane_before_subscribe`).
     close_before_subscribe: Option<String>,
+    /// Set silently just before the next `agent.list` that comes straight
+    /// after another one, within 50ms (see `set_status_between_lists`).
+    status_between_lists: Option<(String, AgentStatus)>,
+    /// When the last `agent.list` arrived.
+    last_list: Option<Instant>,
 }
 
 /// herdr 0.9.1 derives `agent_status` from a detected state (idle, working,
@@ -307,6 +312,15 @@ impl FakeHerdr {
         self.state.lock().unwrap().close_before_subscribe = Some(pane_id.into());
     }
 
+    /// The agent on `pane_id` changes to `status`, silently, just before the
+    /// next `agent.list` that follows another `agent.list` within 50ms with
+    /// nothing in between: a reconcile's list and the fresh one of the
+    /// auto-close that runs right after it, never two reconciles, which are
+    /// `reconcile_every` apart. One-shot.
+    pub fn set_status_between_lists(&self, pane_id: &str, status: AgentStatus) {
+        self.state.lock().unwrap().status_between_lists = Some((pane_id.into(), status));
+    }
+
     /// Does the fake have this pane: a workspace's root pane, or one with an
     /// agent on it.
     fn has_pane(s: &State, pane_id: &str) -> bool {
@@ -382,6 +396,16 @@ impl FakeHerdr {
         {
             let mut s = self.state.lock().unwrap();
             s.requests.push(req.clone());
+            if req.method == "agent.list" {
+                let back_to_back = s.requests.len() >= 2
+                    && s.requests[s.requests.len() - 2].method == "agent.list"
+                    && s.last_list
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(50));
+                if back_to_back && let Some((pane, status)) = s.status_between_lists.take() {
+                    change_status(&mut s, &pane, status);
+                }
+                s.last_list = Some(Instant::now());
+            }
             if let Some(path) = &s.request_log {
                 write_request_log(path, &s.requests);
             }
