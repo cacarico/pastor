@@ -179,7 +179,7 @@ Not yet assigned a plan:
 ## Where things live
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, defaults
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.local/state/pastor/pastor.db   tasks (schema 3: retry_of), seen keys, job state (SQLite)
@@ -203,5 +203,8 @@ state dir).
 In the code: `task retry|close|prune` are `src/task_cli.rs` (CLI), the
 `TaskRetry|TaskClose|TaskPrune` arms in `Daemon::handle`,
 `Store::{insert_retry, close_task, prune}` and `MachineCommand::Close` in
-the actor; orphan detection is `machine::orphan_agents`, used by reconcile
-and by the head-less probe in `machine list`.
+the actor; auto-close of done tasks after `close_done_after` is
+`Actor::auto_close_done`, run after each connected reconcile through the same
+`run_close` (`CloseBy::AutoClose`); orphan detection is
+`machine::orphan_agents`, used by reconcile and by the head-less probe in
+`machine list`.

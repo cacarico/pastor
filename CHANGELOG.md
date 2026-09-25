@@ -36,6 +36,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `flock.toml` and `pastor.toml` are reloaded while `pastor serve` runs:
   machines are added, removed or replaced and new timings and defaults apply
   without a restart. `pastor tick` reloads them too.
+- `close_done_after` in `pastor.toml` (default `15m`, `never` disables it):
+  pastor closes a done task's pane after the grace period, removes the
+  worktree it created when it is clean, and keeps a dirty one with a note on
+  the task. Failed, blocked and stale tasks are never closed on their own.
 
 ### Changed
 

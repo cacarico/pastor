@@ -130,8 +130,16 @@ matches herdr's entry by label only; when none matches but the same host is
 saved under another label, it prints that entry's remove command rather than
 guessing.
 
-pastor never closes panes or removes worktrees on its own; three commands do
-it when asked, all with `--json`. `pastor task retry t-4` queues a new task
+A task that reaches `done` is closed by pastor after `close_done_after`
+(`pastor.toml`, default `15m`; `never` disables it): the pane closes, a
+worktree pastor created is removed if it is clean and kept with a note if it
+is not, and the task shows as `closed`. Failed and blocked tasks are left for
+`pastor task retry` or `pastor task close`. The grace period keeps the pane
+there for `pastor task attach`; the check runs with each reconcile, while
+the machine is connected.
+
+Everything else pastor closes only when asked; three commands do it, all
+with `--json`. `pastor task retry t-4` queues a new task
 copying a failed or stale one (job, item, prompt and dispatch settings, with
 `retry_of` pointing back and a "retry of t-4" note in `task list`) and dispatches it
 at once. It gets a new id because the old agent `t-4`, named after the task, may
@@ -384,7 +392,7 @@ like connector logs.
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, defaults (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, defaults (all optional)
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.local/state/pastor/pastor.db   tasks (schema 3, with retry_of), seen keys, job state
@@ -410,6 +418,7 @@ settle = "10s"               # a finished agent stays idle this long before its 
 reconcile_every = "60s"
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
+close_done_after = "15m"     # a done task's pane closes after this; "never" keeps it
 [defaults]                   # for run flags and job keys that are left out
 agent = "claude"
 agent_args = []              # e.g. ["--model", "claude-opus-5-5"]
