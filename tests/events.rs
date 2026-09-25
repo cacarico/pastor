@@ -181,6 +181,7 @@ async fn the_daemon_writes_the_events_log() {
         paths.clone(),
         PastorConfig::default(),
         flock,
+        pastor::scheduler::ConfigFingerprint::sample(&paths),
         Some(Arc::new(move |_m: &MachineConfig| fake.clone()) as pastor::daemon::ConnectorFactory),
     )
     .await

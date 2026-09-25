@@ -570,10 +570,10 @@ pub struct Scheduler {
     /// `pastor.toml` as last applied. `tick`, `defaults` and the machine
     /// timings (`daemon::machine_settings`) all come from it.
     config: PastorConfig,
-    /// (path, mtime, size) of `pastor.toml` and `flock.toml` as last
-    /// applied. Taken in `new`: the caller (`Daemon::start`) has just loaded
-    /// both files, so only a later edit counts as a change.
-    config_fingerprint: Option<Vec<(PathBuf, Option<SystemTime>, u64)>>,
+    /// `pastor.toml` and `flock.toml` as last applied. `None` makes the next
+    /// `reload_config` apply whatever is on disk; `Daemon::start` sets it
+    /// with `with_config_baseline` to what its caller saw before loading.
+    config_fingerprint: Option<ConfigFingerprint>,
 }
 
 impl Scheduler {
@@ -602,15 +602,19 @@ impl Scheduler {
             first_seen: HashMap::new(),
             warned_queued: HashSet::new(),
             config: config.clone(),
-            // No baseline: the caller (`Daemon::start`) already loaded and
-            // applied `config` and `fleet` from disk, but an edit can land in
-            // the window between that load and this constructor sampling a
-            // fingerprint. Starting empty makes the scheduler's own first
-            // pass always verify and apply whatever is on disk right now,
-            // instead of trusting a fingerprint that might already reflect
-            // an edit the caller never saw.
             config_fingerprint: None,
         }
+    }
+
+    /// The config files as they were when `config` and the fleet's flock
+    /// were read, sampled by the caller before it read them. Sampling here,
+    /// after the load, would hide an edit that landed in between; starting
+    /// with no baseline instead would make the first pass replace a flock
+    /// the caller passed in whenever it differs from disk, even though
+    /// nothing on disk changed.
+    pub fn with_config_baseline(mut self, baseline: ConfigFingerprint) -> Self {
+        self.config_fingerprint = Some(baseline);
+        self
     }
 
     /// Replace the connector lookup. Builder style so `Scheduler::new(..)
@@ -801,7 +805,7 @@ impl Scheduler {
     /// changed on disk, else what the fleet did (often nothing).
     pub async fn reload_config(&mut self, force: bool) -> Option<FlockDiff> {
         let files = [self.paths.config_file(), self.paths.flock_file()];
-        let fp = file_fingerprint(&files);
+        let fp = ConfigFingerprint(file_fingerprint(&files));
         if !force && self.config_fingerprint.as_ref() == Some(&fp) {
             return None;
         }
@@ -1232,6 +1236,19 @@ impl Scheduler {
 /// (path, mtime, size) of each file. Like `fingerprint`, it follows
 /// symlinks, so a config file linked from a dotfiles repo is seen when its
 /// target changes. A missing file is `(path, None, 0)`.
+/// (path, mtime, size) of `pastor.toml` and `flock.toml`: what
+/// `Scheduler::reload_config` compares to decide whether either changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFingerprint(Vec<(PathBuf, Option<SystemTime>, u64)>);
+
+impl ConfigFingerprint {
+    /// Take it before reading the files, so an edit that lands after the
+    /// read still differs from it.
+    pub fn sample(paths: &Paths) -> ConfigFingerprint {
+        ConfigFingerprint(file_fingerprint(&[paths.config_file(), paths.flock_file()]))
+    }
+}
+
 fn file_fingerprint(files: &[PathBuf]) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
     files
         .iter()
@@ -2116,11 +2133,10 @@ mod tests {
         assert!(d.removed.is_empty() && d.retargeted.is_empty(), "{d:?}");
     }
 
-    /// Copilot 4102376228: an edit that lands between `Daemon::start`'s own
-    /// load-and-apply and `Scheduler::new` sampling the fingerprint must not
-    /// be invisible to every later pass. `Scheduler::new` must start with no
-    /// fingerprint, so its own first `reload_config` call always verifies and
-    /// applies whatever is on disk right now.
+    /// Copilot 4102376228: an edit that lands between the caller's load of
+    /// the config files and the scheduler starting must not be invisible to
+    /// every later pass. The baseline is sampled before the load, so the
+    /// edit differs from it.
     #[tokio::test]
     async fn a_startup_window_edit_is_not_skipped_by_the_first_pass() {
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -2139,8 +2155,9 @@ mod tests {
                 Arc::new(crate::herdr::fake::FakeHerdr::new()) as Arc<dyn crate::herdr::Connector>
             });
         let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
-        // `Daemon::start`'s own load and apply, exactly as it runs today,
-        // from what was on disk before the edit below.
+        // `serve`'s sample, load and apply, from what was on disk before
+        // the edit below.
+        let baseline = ConfigFingerprint::sample(&paths);
         let loaded = Flock::load(&paths.flock_file()).unwrap();
         fleet.apply_flock(&loaded, &machine_settings(&config)).await;
         assert!(fleet.get("a").is_some() && fleet.get("b").is_none());
@@ -2148,7 +2165,8 @@ mod tests {
         // The startup-window race: flock.toml grows a second machine before
         // `Scheduler::new` runs.
         std::fs::write(paths.flock_file(), FLOCK_AB).unwrap();
-        let mut s = Scheduler::new(paths, &config, store.clone(), fleet.clone(), events);
+        let mut s = Scheduler::new(paths, &config, store.clone(), fleet.clone(), events)
+            .with_config_baseline(baseline);
 
         // The scheduler's own first pass must still see and apply that edit,
         // not read it as "nothing changed since the caller already applied it".
@@ -2158,6 +2176,34 @@ mod tests {
             .expect("an edit made before the scheduler was built must not be invisible");
         assert_eq!(d.added, vec!["b".to_string()]);
         assert!(fleet.get("b").is_some());
+    }
+
+    /// CI run 36111067337: with a baseline and no edit since, the first pass
+    /// must leave the flock the caller applied alone, even when that flock
+    /// is not what the files hold (here there are no files at all, which
+    /// read as an empty flock). Without the baseline it stopped machine "a".
+    #[tokio::test]
+    async fn the_first_pass_leaves_an_unedited_startup_flock_alone() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (s, _tmp) = managed_scheduler(&store);
+        std::fs::remove_file(s.paths.config_file()).unwrap();
+        let baseline = ConfigFingerprint::sample(&s.paths);
+        let config = s.config.clone();
+        // Applied from memory, the way a caller hands `Daemon::start` a flock.
+        let flock: Flock = toml::from_str(FLOCK_A).unwrap();
+        s.fleet
+            .apply_flock(&flock, &machine_settings(&config))
+            .await;
+        assert!(s.fleet.get("a").is_some());
+        let mut s = s.with_config_baseline(baseline);
+        assert!(
+            s.reload_config(false).await.is_none(),
+            "nothing changed on disk"
+        );
+        assert!(
+            s.fleet.get("a").is_some(),
+            "the startup flock must survive the first pass"
+        );
     }
 
     /// Review Focus 1: a flock.toml that stops loading while the daemon runs

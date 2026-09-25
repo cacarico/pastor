@@ -10,7 +10,7 @@ use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
 use crate::machine::{MachineHandle, MachineSettings, OrphanClosed, PastorEvent, spawn_machine};
-use crate::scheduler::{Scheduler, SchedulerHandle};
+use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{NewTask, RetryError, Store, TaskFilter};
 use crate::task::Task;
 use crate::task::TaskState;
@@ -345,10 +345,14 @@ impl ExtraSignals {
 }
 
 impl Daemon {
+    /// `on_disk` is `ConfigFingerprint::sample` taken before `config` and
+    /// `flock` were read (or built): the scheduler keeps them until either
+    /// file changes from that, then reloads from disk.
     pub async fn start(
         paths: Paths,
         config: PastorConfig,
         flock: Flock,
+        on_disk: ConfigFingerprint,
         connect: Option<ConnectorFactory>,
     ) -> anyhow::Result<Daemon> {
         paths.ensure()?;
@@ -386,6 +390,7 @@ impl Daemon {
             events.clone(),
         )
         .with_plugins()
+        .with_config_baseline(on_disk)
         .spawn();
         Ok(Daemon {
             paths,
@@ -457,11 +462,12 @@ impl Daemon {
         paths: Paths,
         config: PastorConfig,
         flock: Flock,
+        on_disk: ConfigFingerprint,
         connect: Option<ConnectorFactory>,
     ) -> anyhow::Result<(Daemon, tokio::net::UnixListener)> {
         paths.ensure()?;
         let listener = Daemon::bind_socket(&paths.socket_file()).await?;
-        let daemon = Daemon::start(paths, config, flock, connect).await?;
+        let daemon = Daemon::start(paths, config, flock, on_disk, connect).await?;
         Ok((daemon, listener))
     }
 
@@ -787,13 +793,16 @@ impl Daemon {
 }
 
 pub async fn serve(paths: Paths) -> anyhow::Result<()> {
+    // Before the loads: an edit that lands after them must still read as a
+    // change on the scheduler's first pass.
+    let on_disk = ConfigFingerprint::sample(&paths);
     let config = PastorConfig::load(&paths.config_file())?;
     let flock = Flock::load(&paths.flock_file())?;
     anyhow::ensure!(
         !flock.machines.is_empty(),
         "flock is empty; add a machine with `pastor machine add`"
     );
-    let (daemon, listener) = Daemon::bind_and_start(paths, config, flock, None).await?;
+    let (daemon, listener) = Daemon::bind_and_start(paths, config, flock, on_disk, None).await?;
     tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.fleet.machines().len(), "pastor serve");
     daemon.run_with_listener(listener).await
 }
@@ -1060,7 +1069,8 @@ mod tests {
         )
         .unwrap();
         let named: Vec<(&str, FakeHerdr)> = fakes.iter().map(|(n, _, f)| (*n, f.clone())).collect();
-        let d = Daemon::start(paths, test_config(), flock, Some(factory(&named)))
+        let on_disk = ConfigFingerprint::sample(&paths);
+        let d = Daemon::start(paths, test_config(), flock, on_disk, Some(factory(&named)))
             .await
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1285,8 +1295,15 @@ mod tests {
         };
         let fake = FakeHerdr::new();
         let connect = factory(&[("a", fake.clone())]);
-        let err = match Daemon::bind_and_start(paths, PastorConfig::default(), flock, Some(connect))
-            .await
+        let on_disk = ConfigFingerprint::sample(&paths);
+        let err = match Daemon::bind_and_start(
+            paths,
+            PastorConfig::default(),
+            flock,
+            on_disk,
+            Some(connect),
+        )
+        .await
         {
             Ok(_) => panic!("expected bind_and_start to bail on a live socket"),
             Err(e) => e,
@@ -1295,6 +1312,30 @@ mod tests {
         assert!(
             fake.requests().is_empty(),
             "the second daemon's machine actor must never have contacted its connector"
+        );
+    }
+
+    /// CI run 36111067337: a daemon started with a flock that is not on disk
+    /// (no flock.toml at all) must keep that flock until the files change.
+    /// The scheduler's first pass used to read the missing file as an empty
+    /// flock and stop every machine the caller had just applied, so a task
+    /// queued right after start never dispatched. After a `Tick` reply the
+    /// scheduler has reloaded config at least once, so no timing is involved.
+    #[tokio::test]
+    async fn the_first_pass_keeps_the_flock_the_daemon_started_with() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let flock = Flock {
+            machines: vec![machine("a", 1)],
+        };
+        let on_disk = ConfigFingerprint::sample(&paths);
+        let d = Daemon::start(paths, test_config(), flock, on_disk, Some(factory(&[])))
+            .await
+            .unwrap();
+        d.scheduler().tick(None, true).await.unwrap();
+        assert!(
+            d.fleet().get("a").is_some(),
+            "unchanged (absent) config files must not replace the flock the daemon started with"
         );
     }
 
