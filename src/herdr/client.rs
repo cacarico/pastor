@@ -50,12 +50,13 @@ pub(crate) async fn read_capped_line<R: AsyncBufRead + Unpin>(
             None if chunk.is_empty() => (0, true),
             None => (chunk.len(), false),
         };
+        // One byte of slack while reading: it may be the `\r` of a CRLF whose
+        // `\n` is still in the next buffer. The exact length is checked once
+        // the line ending is stripped, so memory stays bounded at `max + 1`.
         let content = buf.len() + take - usize::from(done && take > 0);
-        if content > max {
+        if content > max + 1 {
             buf.clear();
-            return Err(HerdrError::Protocol(format!(
-                "herdr sent a line longer than {max} bytes"
-            )));
+            return Err(too_long(max));
         }
         buf.extend_from_slice(&chunk[..take]);
         reader.consume(take);
@@ -67,11 +68,18 @@ pub(crate) async fn read_capped_line<R: AsyncBufRead + Unpin>(
                     line.pop();
                 }
             }
+            if line.len() > max {
+                return Err(too_long(max));
+            }
             return String::from_utf8(line).map(Some).map_err(|e| {
                 HerdrError::Protocol(format!("herdr sent a line that is not UTF-8: {e}"))
             });
         }
     }
+}
+
+fn too_long(max: usize) -> HerdrError {
+    HerdrError::Protocol(format!("herdr sent a line longer than {max} bytes"))
 }
 
 /// A bridge process whose stdio this connection is speaking over. Kept so that a
@@ -725,6 +733,20 @@ mod tests {
         let mut r = BufReader::with_capacity(2, &b"12345678\n"[..]);
         let line = read_capped_line(&mut r, &mut Vec::new(), 8).await.unwrap();
         assert_eq!(line.as_deref(), Some("12345678"));
+        // The cap excludes a CRLF too, whole or split across two reads.
+        for cap in [2, 9, 16] {
+            let mut r = BufReader::with_capacity(cap, &b"12345678\r\n"[..]);
+            let line = read_capped_line(&mut r, &mut Vec::new(), 8).await.unwrap();
+            assert_eq!(line.as_deref(), Some("12345678"), "capacity {cap}");
+        }
+        // One byte over, with or without a trailing CR, is still refused.
+        for data in [&b"123456789\r\n"[..], &b"12345678\r"[..], &b"123456789"[..]] {
+            let mut r = BufReader::with_capacity(2, data);
+            let err = read_capped_line(&mut r, &mut Vec::new(), 8)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, HerdrError::Protocol(_)), "{data:?}: {err:?}");
+        }
     }
 
     #[tokio::test]
