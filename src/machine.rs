@@ -171,6 +171,9 @@ pub struct MachineSettings {
     /// How long a `done` task keeps its pane before reconcile closes it
     /// (`close_done_after` in `pastor.toml`). `None` turns auto-close off.
     pub close_done_after: Option<Duration>,
+    /// `[agents]` in `pastor.toml`: the keys that answer each agent's
+    /// folder-trust prompt.
+    pub agents: crate::config::Agents,
 }
 
 impl Default for MachineSettings {
@@ -184,6 +187,7 @@ impl Default for MachineSettings {
             agent_ready_timeout: Duration::from_secs(30),
             poll_every: Duration::from_secs(10),
             close_done_after: Some(Duration::from_secs(15 * 60)),
+            agents: crate::config::Agents::default(),
         }
     }
 }
@@ -2189,6 +2193,7 @@ mod tests {
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
             close_done_after: None,
+            agents: Default::default(),
         }
     }
 

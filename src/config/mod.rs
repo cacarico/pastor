@@ -202,6 +202,40 @@ impl Default for Defaults {
     }
 }
 
+/// One agent's definition under `[agents.<name>]` in `pastor.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentDef {
+    /// The keys that accept the agent's folder-trust prompt, for `pastor
+    /// task send --trust` and saved trust. Unset keeps the built-in keys;
+    /// an empty list means the agent has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_keys: Option<Vec<String>>,
+}
+
+/// `[agents.<name>]`, by agent name (`claude`, `codex`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Agents(pub std::collections::BTreeMap<String, AgentDef>);
+
+/// Claude's folder-trust dialog opens on "No, exit"; Down moves to "Yes,
+/// proceed" and Enter takes it.
+const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
+
+impl Agents {
+    /// The keys that accept `agent`'s folder-trust prompt: its own
+    /// `trust_keys`, else the built-in ones (only `claude` has any). `None`
+    /// when it has none.
+    pub fn trust_keys(&self, agent: &str) -> Option<Vec<String>> {
+        let keys = match self.0.get(agent).and_then(|d| d.trust_keys.clone()) {
+            Some(keys) => keys,
+            None if agent == "claude" => CLAUDE_TRUST_KEYS.map(str::to_string).to_vec(),
+            None => return None,
+        };
+        (!keys.is_empty()).then_some(keys)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PastorConfig {
@@ -219,6 +253,12 @@ pub struct PastorConfig {
     /// turns auto-close off.
     pub close_done_after: String,
     pub defaults: Defaults,
+    #[serde(skip_serializing_if = "is_empty_agents")]
+    pub agents: Agents,
+}
+
+fn is_empty_agents(a: &Agents) -> bool {
+    a.0.is_empty()
 }
 
 impl Default for PastorConfig {
@@ -231,6 +271,7 @@ impl Default for PastorConfig {
             agent_ready_timeout: "30s".into(),
             close_done_after: "15m".into(),
             defaults: Defaults::default(),
+            agents: Agents::default(),
         }
     }
 }
@@ -283,6 +324,14 @@ impl PastorConfig {
                 .map_err(|e| anyhow::anyhow!("{}: {name}: {e}", path.display()))?;
             if !zero_ok && d.is_zero() {
                 anyhow::bail!("{}: {name}: must not be zero", path.display());
+            }
+        }
+        for (name, def) in &cfg.agents.0 {
+            if def.trust_keys.iter().flatten().any(|k| k.trim().is_empty()) {
+                anyhow::bail!(
+                    "{}: agents.{name}.trust_keys: a key name must not be empty",
+                    path.display()
+                );
             }
         }
         if cfg.agent_ready_timeout_duration() >= cfg.request_timeout_duration() {
@@ -478,6 +527,37 @@ mod tests {
             PastorConfig::load_existing(&path).unwrap(),
             PastorConfig::default()
         );
+    }
+
+    #[test]
+    fn claude_has_built_in_trust_keys_and_agents_can_set_their_own() {
+        let cfg = PastorConfig::default();
+        assert_eq!(
+            cfg.agents.trust_keys("claude"),
+            Some(vec!["Down".to_string(), "Enter".to_string()])
+        );
+        assert_eq!(cfg.agents.trust_keys("codex"), None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.codex]\ntrust_keys = [\"Enter\"]\n[agents.claude]\ntrust_keys = []\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.agents.trust_keys("codex"), Some(vec!["Enter".into()]));
+        // An empty list turns the built-in keys off.
+        assert_eq!(cfg.agents.trust_keys("claude"), None);
+
+        // A definition that does not mention trust_keys keeps the built-in.
+        std::fs::write(&path, "[agents.claude]\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.agents.trust_keys("claude").map(|k| k.len()), Some(2));
+
+        std::fs::write(&path, "[agents.claude]\ntrust_keys = [\"Down\", \"\"]\n").unwrap();
+        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        assert!(err.contains("agents.claude.trust_keys"), "{err}");
     }
 
     #[test]

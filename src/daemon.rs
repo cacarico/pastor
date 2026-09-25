@@ -39,6 +39,7 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         agent_ready_timeout: config.agent_ready_timeout_duration(),
         poll_every: config.tick_duration(),
         close_done_after: config.close_done_after_duration(),
+        agents: config.agents.clone(),
         ..Default::default()
     }
 }
@@ -1287,6 +1288,7 @@ mod tests {
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
             close_done_after: None,
+            agents: Default::default(),
         }
     }
 
@@ -2405,6 +2407,29 @@ mod tests {
             d.store.update_task(&mut t).unwrap();
         }
         t
+    }
+
+    /// An `[agents]` edit reaches the actors like a timing change does, so
+    /// a reload restarts them with the new trust keys.
+    #[test]
+    fn machine_settings_carry_the_agents_trust_keys() {
+        let mut config = test_config();
+        assert_eq!(
+            machine_settings(&config).agents.trust_keys("claude"),
+            Some(vec!["Down".into(), "Enter".into()])
+        );
+        config.agents.0.insert(
+            "codex".into(),
+            crate::config::AgentDef {
+                trust_keys: Some(vec!["Enter".into()]),
+            },
+        );
+        let settings = machine_settings(&config);
+        assert_eq!(
+            settings.agents.trust_keys("codex"),
+            Some(vec!["Enter".into()])
+        );
+        assert_ne!(settings, machine_settings(&test_config()));
     }
 
     #[tokio::test]
