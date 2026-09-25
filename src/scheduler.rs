@@ -825,14 +825,16 @@ impl Scheduler {
             return Some(diff);
         }
         self.config_fingerprint = Some(fp);
-        // Both loaders read a missing file as the defaults, which is what
-        // `serve` wants at startup. Here it is a failure: a deleted file, or
-        // an editor that replaces it by delete and rename, must not empty the
-        // fleet or reset the timings. A file that exists but is empty still
-        // applies. Logged once per pass that reads the files, which is once
-        // per change on disk.
-        match files[0].exists().then(|| PastorConfig::load(&files[0])) {
-            Some(Ok(config)) => {
+        // `load_existing` reads a missing file as an error, unlike `load`
+        // (what `serve` wants at startup): a deleted file, or an editor that
+        // replaces it by delete and rename, must not empty the fleet or
+        // reset the timings. A file that exists but is empty still applies.
+        // Logged once per pass that reads the files, which is once per
+        // change on disk. `load_existing` does the exists-check and the read
+        // as one syscall, so a delete landing between the two can no longer
+        // be misread as an intentionally emptied file (Copilot 4103271200).
+        match PastorConfig::load_existing(&files[0]) {
+            Ok(config) => {
                 if config.defaults != self.config.defaults {
                     self.defaults = config.defaults.clone();
                     // Jobs were parsed with the old defaults.
@@ -841,25 +843,25 @@ impl Scheduler {
                 self.tick = config.tick_duration();
                 self.config = config;
             }
-            Some(Err(err)) => {
-                tracing::error!(%err, "pastor.toml does not load; the previous version stays in use")
-            }
-            None => tracing::warn!(
+            Err(err) if is_not_found(&err) => tracing::warn!(
                 path = %files[0].display(),
                 "pastor.toml is missing; the previous version stays in use"
             ),
-        }
-        let flock = match files[1].exists().then(|| Flock::load(&files[1])) {
-            Some(Ok(f)) => f,
-            Some(Err(err)) => {
-                tracing::error!(%err, "flock.toml does not load; the previous flock stays in use");
-                self.fleet.flock()
+            Err(err) => {
+                tracing::error!(%err, "pastor.toml does not load; the previous version stays in use")
             }
-            None => {
+        }
+        let flock = match Flock::load_existing(&files[1]) {
+            Ok(f) => f,
+            Err(err) if is_not_found(&err) => {
                 tracing::warn!(
                     path = %files[1].display(),
                     "flock.toml is missing; the previous flock stays in use"
                 );
+                self.fleet.flock()
+            }
+            Err(err) => {
+                tracing::error!(%err, "flock.toml does not load; the previous flock stays in use");
                 self.fleet.flock()
             }
         };
@@ -1289,6 +1291,13 @@ impl ConfigFingerprint {
     pub fn sample(paths: &Paths) -> ConfigFingerprint {
         ConfigFingerprint(file_fingerprint(&[paths.config_file(), paths.flock_file()]))
     }
+}
+
+/// Whether `err` (from `PastorConfig::load_existing` or `Flock::load_existing`)
+/// is the file being missing rather than a read or parse failure.
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn file_fingerprint(files: &[PathBuf]) -> Vec<(PathBuf, Option<SystemTime>, u64)> {

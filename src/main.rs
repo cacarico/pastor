@@ -702,9 +702,12 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
     } else {
         let mut rows = pastor::cli::task_rows(&tasks);
         // The flock file is the truth for "removed" whether or not a head
-        // runs (a running head re-reads it every tick). A flock that does not
-        // load marks nothing rather than everything.
-        if let Ok(flock) = Flock::load(&paths.flock_file()) {
+        // runs (a running head re-reads it every tick). `load_existing`
+        // rather than `load`: a flock.toml that is momentarily missing (an
+        // editor's delete-and-rename, or a race with `machine add|remove`
+        // rewriting it) must mark nothing, not everything (Copilot
+        // 4103271200, 4103271289, 4103271156).
+        if let Ok(flock) = Flock::load_existing(&paths.flock_file()) {
             pastor::cli::mark_removed(&mut rows, &tasks, &flock);
         }
         println!("{}", pastor::cli::table(&pastor::cli::TASK_HEADER, &rows));

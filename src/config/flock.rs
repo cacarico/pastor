@@ -49,6 +49,27 @@ impl Flock {
         Ok(flock)
     }
 
+    /// Like `load`, but a missing file is an error rather than the defaults:
+    /// for a reload, where the `exists()` check and the read used to race a
+    /// concurrent delete-and-rewrite and could momentarily see no machines.
+    /// One read; the error keeps `std::io::ErrorKind::NotFound` at the top so
+    /// callers can tell "missing" from "does not parse".
+    pub fn load_existing(path: &Path) -> anyhow::Result<Flock> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::new(e)
+            } else {
+                anyhow::Error::new(e).context(format!("read {}", path.display()))
+            }
+        })?;
+        let flock: Flock =
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        flock
+            .validate()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        Ok(flock)
+    }
+
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         self.validate().map_err(|e| anyhow::anyhow!(e))?;
         if let Some(parent) = path.parent() {
@@ -165,6 +186,23 @@ tags = ["fast"]
     fn missing_file_is_empty_flock() {
         let tmp = tempfile::tempdir().unwrap();
         let f = Flock::load(&tmp.path().join("flock.toml")).unwrap();
+        assert!(f.machines.is_empty());
+    }
+
+    /// `load_existing` is for a reload, where a missing file must not be
+    /// mistaken for an intentionally emptied flock (Copilot 4103271200).
+    #[test]
+    fn load_existing_errors_on_a_missing_path_and_reads_an_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flock.toml");
+        let err = Flock::load_existing(&path).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
+
+        std::fs::write(&path, "").unwrap();
+        let f = Flock::load_existing(&path).unwrap();
         assert!(f.machines.is_empty());
     }
 

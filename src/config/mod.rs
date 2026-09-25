@@ -237,8 +237,28 @@ impl PastorConfig {
         }
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        Self::parse(path, &text)
+    }
+
+    /// Like `load`, but a missing file is an error rather than the defaults:
+    /// for a reload, where the `exists()` check and the read used to race a
+    /// concurrent delete-and-rewrite. One read; the error keeps
+    /// `std::io::ErrorKind::NotFound` at the top so callers can tell
+    /// "missing" from "does not parse".
+    pub fn load_existing(path: &Path) -> anyhow::Result<PastorConfig> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::new(e)
+            } else {
+                anyhow::Error::new(e).context(format!("read {}", path.display()))
+            }
+        })?;
+        Self::parse(path, &text)
+    }
+
+    fn parse(path: &Path, text: &str) -> anyhow::Result<PastorConfig> {
         let cfg: PastorConfig =
-            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+            toml::from_str(text).with_context(|| format!("parse {}", path.display()))?;
         // tick, settle and reconcile_every all drive `tokio::time::interval`,
         // which panics on a zero period. Reject zero here so a bad config
         // fails to load instead of crashing the daemon at startup.
@@ -416,6 +436,25 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("settle")
+        );
+    }
+
+    /// `load_existing` is for a reload, where a missing file must not be
+    /// mistaken for an intentionally emptied config (Copilot 4103271200).
+    #[test]
+    fn load_existing_errors_on_a_missing_path_and_reads_an_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        let err = PastorConfig::load_existing(&path).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
+
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            PastorConfig::load_existing(&path).unwrap(),
+            PastorConfig::default()
         );
     }
 

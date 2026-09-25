@@ -1782,4 +1782,17 @@ fn flock_edits_reach_a_running_head() {
     // before the removal is done, which the default live view hides.
     let list = String::from_utf8_lossy(&env.cmd(&["task", "list", "--all"]).stdout).into_owned();
     assert!(list.contains("second (removed)"), "{list}");
+
+    // Copilot 4103271200, 4103271289, 4103271156: a flock.toml that is
+    // momentarily absent (an editor's delete-and-rename, a race with
+    // `machine add|remove` rewriting it) must not be read as an empty
+    // flock, which would mark every machine "(removed)". `machine remove`
+    // above already rewrote the file without "second"; deleting it outright
+    // stands in for that window.
+    std::fs::remove_file(env.config.join("flock.toml")).unwrap();
+    let list = String::from_utf8_lossy(&env.cmd(&["task", "list", "--all"]).stdout).into_owned();
+    assert!(
+        list.contains("second") && !list.contains("(removed)"),
+        "{list}"
+    );
 }
