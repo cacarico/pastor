@@ -255,6 +255,16 @@ pub async fn run_job(
             return report;
         }
     };
+    // A pin to a machine settles the flock; else the default. Worked out
+    // once per run, before the connector, from the flock file as the run found it.
+    let task_flock = match flock.task_flock(None, job.spec.machine.as_deref()) {
+        Ok(f) => f,
+        Err(err) => {
+            report.outcome = RunOutcome::Failed;
+            report.error = Some(err.to_string());
+            return report;
+        }
+    };
     let backfill =
         chrono::Duration::from_std(job.backfill).unwrap_or_else(|_| chrono::Duration::zero());
     let input = RunInput {
@@ -338,7 +348,7 @@ pub async fn run_job(
             report.created.push(item.key.clone());
             continue;
         }
-        match store.insert_job_task(&job.name, flock.default_flock(), &value, |id| {
+        match store.insert_job_task(&job.name, &task_flock, &value, |id| {
             render_task(job, &value, id)
         }) {
             Ok(t) => {
@@ -664,7 +674,14 @@ impl Scheduler {
     /// For the CLI when no daemon runs: no machines to dispatch to, nobody
     /// listening for events. Tasks it queues wait for the next `pastor serve`.
     pub fn standalone(paths: Paths, config: &PastorConfig, store: Arc<Store>) -> Scheduler {
-        let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()));
+        // The tasks a pass queues take their flock from the file; one that
+        // does not load leaves the implicit default flock, as the head would
+        // refuse to start on it anyway.
+        let flock = Flock::load(&paths.flock_file()).unwrap_or_else(|err| {
+            tracing::warn!(%err, "flock.toml does not load; tasks go to the default flock");
+            Flock::default()
+        });
+        let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()).with_flock(flock));
         let (events, _) = broadcast::channel(1);
         Scheduler {
             standalone: true,
@@ -1249,6 +1266,29 @@ impl Scheduler {
                         job = %t.job,
                         machine = m,
                         "queued for a machine that is not in the flock; it stays queued until the machine is added back"
+                    );
+                }
+                continue;
+            }
+            // `pastor machine move` took the pinned machine to another flock.
+            // The task keeps the flock it was made for, so no pass places it
+            // until the machine moves back.
+            let wanted = self.fleet.flock();
+            if let Some((m, now_in)) = t
+                .spec
+                .machine
+                .as_deref()
+                .and_then(|m| Some((m, wanted.machine_flock(m)?)))
+                .filter(|(_, f)| Some(*f) != t.flock.as_deref())
+            {
+                if self.warned_queued.insert(t.id) {
+                    tracing::warn!(
+                        task = %t.display_id(),
+                        job = %t.job,
+                        machine = m,
+                        machine_flock = now_in,
+                        task_flock = t.flock.as_deref().unwrap_or(wanted.default_flock()),
+                        "queued for a machine that moved to another flock; it stays queued until the machine moves back"
                     );
                 }
                 continue;
@@ -3204,6 +3244,81 @@ mod tests {
             !a.running,
             "job list must reap a finished run itself, not wait for the next (1h) tick"
         );
+    }
+
+    const HOME_AND_WORK: &str = "[[flock]]\nname = \"home\"\ndefault = true\n[[flock]]\nname = \"work\"\n\n[[machine]]\nname = \"h\"\ncommand = [\"fake\"]\n\n[[machine]]\nname = \"w\"\ncommand = [\"fake\"]\nflock = \"work\"\n";
+
+    fn home_and_work() -> Flock {
+        let f: Flock = toml::from_str(HOME_AND_WORK).unwrap();
+        f.validate().unwrap();
+        f
+    }
+
+    /// A job's tasks go to the default flock, or to the flock of the machine
+    /// the job is pinned to.
+    #[tokio::test]
+    async fn a_jobs_tasks_land_in_the_default_flock_or_their_machines() {
+        let store = Store::open_in_memory().unwrap();
+        let (tx, _rx) = events();
+        let flock = home_and_work();
+        let src = Scripted::with_keys(&["k1"]);
+        run_job(&store, &job("a"), &flock, &src, &tx, Utc::now(), false).await;
+        let pinned = Job {
+            spec: DispatchSpec {
+                machine: Some("w".into()),
+                ..job("b").spec
+            },
+            ..job("b")
+        };
+        let src = Scripted::with_keys(&["k1"]);
+        run_job(&store, &pinned, &flock, &src, &tx, Utc::now(), false).await;
+        let flocks: Vec<Option<String>> = [1, 2]
+            .iter()
+            .map(|id| store.get_task(*id).unwrap().unwrap().flock)
+            .collect();
+        assert_eq!(flocks, [Some("home".into()), Some("work".into())]);
+    }
+
+    /// `pastor tick` without a head queues into the flocks flock.toml
+    /// declares, not an implicit `default`.
+    #[tokio::test]
+    async fn the_offline_scheduler_reads_the_flock_file() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        std::fs::write(paths.flock_file(), HOME_AND_WORK).unwrap();
+        let s = Scheduler::standalone(paths, &PastorConfig::default(), store);
+        assert_eq!(s.fleet.flock().default_flock(), "home");
+    }
+
+    /// A task pinned to a machine that has since moved to another flock is
+    /// still queued for its own flock; the scheduler says why, once.
+    #[tokio::test]
+    async fn a_pin_that_moved_flock_is_warned_once() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (s, _tmp) = scheduler_with(&store);
+        let mut s = Scheduler {
+            fleet: Arc::new(Fleet::new(vec![], store.clone()).with_flock(home_and_work())),
+            ..s
+        };
+        let t = store
+            .insert_task(crate::store::NewTask {
+                job: "run".into(),
+                item: Value::Null,
+                prompt: "p".into(),
+                spec: DispatchSpec {
+                    machine: Some("w".into()),
+                    ..job("j").spec
+                },
+                flock: "home".into(),
+            })
+            .unwrap();
+        let now = Utc::now();
+        s.warn_long_queued(now);
+        s.warn_long_queued(now);
+        assert_eq!(s.warned_queued.len(), 1);
+        assert!(s.warned_queued.contains(&t.id));
     }
 
     #[tokio::test]

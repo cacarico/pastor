@@ -301,6 +301,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
         IpcRequest::Run {
             prompt: a.prompt,
             spec,
+            flock: None,
         },
     )
     .await?

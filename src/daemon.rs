@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
-use crate::config::flock::{Flock, MachineConfig};
+use crate::config::flock::{Flock, MachineConfig, TaskFlockError};
 use crate::config::{PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
@@ -98,6 +98,27 @@ pub fn warn_removed(store: &Store, flock: &Flock, warned: &mut HashSet<i64>) -> 
     }
 }
 
+/// The flock `name` is in according to `flock`; a machine the file does not
+/// have (a fixed fleet's, or one held until its actor ends) is in the default
+/// flock, the only one a fixed fleet has.
+fn flock_of(flock: &Flock, name: &str) -> String {
+    flock
+        .machine_flock(name)
+        .unwrap_or(flock.default_flock())
+        .to_string()
+}
+
+/// The part of a machine's entry its actor is built from. The flock is not:
+/// it only decides which tasks the machine is offered, which dispatch reads
+/// from the flock last applied, so moving a machine keeps its connection and
+/// the tasks already on it.
+fn actor_config(m: &MachineConfig) -> MachineConfig {
+    MachineConfig {
+        flock: None,
+        ..m.clone()
+    }
+}
+
 /// What `apply_flock` changed, by machine name, in flock order (`removed` in
 /// the previous order).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -128,6 +149,8 @@ impl FlockDiff {
 pub enum QueueError<E = anyhow::Error> {
     /// Pinned to a machine that is not in the flock.
     UnknownMachine(String),
+    /// Names a flock that does not exist, or one its pinned machine is not in.
+    Flock(TaskFlockError),
     /// The insert failed; for `queue_retry`, the `RetryError` that says why.
     Store(E),
 }
@@ -185,6 +208,14 @@ impl Fleet {
             spawner: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// A fixed fleet that knows `flock`'s flocks, for the daemon-less
+    /// scheduler: nothing is dispatched from it, but the tasks it queues must
+    /// land in the flocks flock.toml declares.
+    pub fn with_flock(self, flock: Flock) -> Fleet {
+        *self.wanted.write().unwrap() = flock;
+        self
     }
 
     /// An empty fleet that `apply_flock` fills, spawning one actor per machine
@@ -288,7 +319,7 @@ impl Fleet {
         }
         let mut plan: Vec<Step> = Vec::new();
         for m in &flock.machines {
-            let want = (m.clone(), settings.clone());
+            let want = (actor_config(m), settings.clone());
             plan.push(match old.iter().position(|o| o.handle.name == m.name) {
                 Some(i) if !old[i].shutting_down && old[i].spawned_from.as_ref() == Some(&want) => {
                     Step::Keep(old.remove(i))
@@ -376,12 +407,13 @@ impl Fleet {
         );
         Member {
             handle,
-            spawned_from: Some((m.clone(), settings.clone())),
+            spawned_from: Some((actor_config(m), settings.clone())),
             shutting_down: false,
         }
     }
 
     pub fn views(&self) -> Vec<MachineView> {
+        let wanted = self.flock();
         self.members
             .read()
             .unwrap()
@@ -396,25 +428,45 @@ impl Fleet {
                     // An aborted actor answers nothing, and a dispatch to
                     // it would wait for as long as it stays wedged.
                     healthy: !m.shutting_down && s.channel.accepts_dispatch(),
+                    flock: flock_of(&wanted, &m.handle.name),
                 }
             })
             .collect()
     }
 
-    /// Queue `new`, first checking that a machine it is pinned to is in the
-    /// flock. Both happen under the dispatch lock, so an `apply_flock` cannot
-    /// drop the machine between the check and the insert. The check reads
-    /// the wanted flock, not the running set: a removed machine held only
-    /// until its old actor ends is not in it, and would never take the task.
-    /// A fixed fleet has no wanted flock, so its machines are the flock.
-    pub async fn queue_task(&self, new: NewTask) -> Result<Task, QueueError> {
+    /// Queue a one-off task (`pastor task run`) in the flock it asks for
+    /// (see `Flock::task_flock`), first checking that a machine it is pinned
+    /// to is in the flock file. All under the dispatch lock, so an
+    /// `apply_flock` cannot drop or move the machine between the check and
+    /// the insert. The check reads the wanted flock, not the running set: a
+    /// removed machine held only until its old actor ends is not in it, and
+    /// would never take the task. A fixed fleet has no wanted flock, so its
+    /// machines are the flock, all in the default one.
+    pub async fn queue_run(
+        &self,
+        prompt: String,
+        spec: crate::task::DispatchSpec,
+        flock: Option<&str>,
+    ) -> Result<Task, QueueError> {
         let _pass = self.dispatch_lock.lock().await;
-        if let Some(m) = &new.spec.machine
+        if let Some(m) = &spec.machine
             && !self.in_flock(m)
         {
             return Err(QueueError::UnknownMachine(m.clone()));
         }
-        self.store.insert_task(new).map_err(QueueError::Store)
+        let flock = self
+            .flock()
+            .task_flock(flock, spec.machine.as_deref())
+            .map_err(QueueError::Flock)?;
+        self.store
+            .insert_task(NewTask {
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt,
+                spec,
+                flock,
+            })
+            .map_err(QueueError::Store)
     }
 
     /// `queue_task` for a retry of task `id` (`Store::insert_retry`). The
@@ -448,8 +500,10 @@ impl Fleet {
                 return;
             }
         };
+        let flock = self.flock();
         for task in queued {
-            let Some(name) = pick_machine(&self.views(), &task.spec) else {
+            let target = task.flock.as_deref().unwrap_or(flock.default_flock());
+            let Some(name) = pick_machine(&self.views(), target, &task.spec) else {
                 continue;
             };
             let Some(handle) = self.get(&name) else {
@@ -705,7 +759,11 @@ impl Daemon {
             IpcRequest::Ping => IpcResponse::Pong {
                 version: env!("CARGO_PKG_VERSION").into(),
             },
-            IpcRequest::Run { prompt, spec } => {
+            IpcRequest::Run {
+                prompt,
+                spec,
+                flock,
+            } => {
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
                 if spec.worktree && spec.repo.is_none() {
@@ -714,15 +772,14 @@ impl Daemon {
                         "a worktree task needs a repo to branch from",
                     );
                 }
-                let new = NewTask {
-                    job: "run".into(),
-                    item: serde_json::Value::Null,
-                    prompt,
-                    spec,
-                    flock: self.fleet.flock().default_flock().to_string(),
-                };
-                let task = match self.fleet.queue_task(new).await {
+                let task = match self.fleet.queue_run(prompt, spec, flock.as_deref()).await {
                     Ok(t) => t,
+                    Err(QueueError::Flock(err @ TaskFlockError::UnknownFlock(_))) => {
+                        return IpcResponse::error("unknown_flock", err);
+                    }
+                    Err(QueueError::Flock(err @ TaskFlockError::MachineElsewhere { .. })) => {
+                        return IpcResponse::error("flock_mismatch", err);
+                    }
                     Err(QueueError::UnknownMachine(m)) => {
                         return IpcResponse::error(
                             "unknown_machine",
@@ -843,6 +900,10 @@ impl Daemon {
                     "unknown_machine",
                     format!("t-{id} is pinned to machine {m}, which is not in the flock"),
                 );
+            }
+            // A retry keeps the flock of the task it copies; nothing chooses one.
+            Err(QueueError::Flock(err)) => {
+                return IpcResponse::error("unknown_flock", err);
             }
             Err(QueueError::Store(err @ RetryError::NotFound(_))) => {
                 return IpcResponse::error("task_not_found", err);
@@ -1396,12 +1457,20 @@ mod tests {
     }
 
     async fn daemon(fakes: &[(&str, u32, FakeHerdr)]) -> (Daemon, tempfile::TempDir) {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let flock = Flock {
             flocks: vec![],
             machines: fakes.iter().map(|(n, max, _)| machine(n, *max)).collect(),
         };
+        daemon_with_flock(flock, fakes).await
+    }
+
+    /// `flock` names the machines; `fakes` gives each its herdr.
+    async fn daemon_with_flock(
+        flock: Flock,
+        fakes: &[(&str, u32, FakeHerdr)],
+    ) -> (Daemon, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         // On disk too, as `serve` would have found them: a `pastor job reload`
         // re-reads both, and a missing file would read as an empty flock and
         // default timings.
@@ -1432,6 +1501,7 @@ mod tests {
             .handle(IpcRequest::Run {
                 prompt: "hi".into(),
                 spec: spec(),
+                flock: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -1478,6 +1548,7 @@ mod tests {
             .handle(IpcRequest::Run {
                 prompt: "1".into(),
                 spec: spec(),
+                flock: None,
             })
             .await
         else {
@@ -1488,6 +1559,7 @@ mod tests {
             .handle(IpcRequest::Run {
                 prompt: "2".into(),
                 spec: spec(),
+                flock: None,
             })
             .await
         else {
@@ -1523,6 +1595,7 @@ mod tests {
                     machine: Some("zzz".into()),
                     ..spec()
                 },
+                flock: None,
             })
             .await;
         let IpcResponse::Error { code, .. } = resp else {
@@ -1547,6 +1620,7 @@ mod tests {
                     machine: Some("b".into()),
                     ..spec()
                 },
+                flock: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -1554,6 +1628,145 @@ mod tests {
         };
         assert_eq!(t.machine.as_deref(), Some("b"));
         assert_eq!(t.state, TaskState::Running);
+    }
+
+    /// `home` (the default) holds `h`, `work` holds `w`.
+    fn home_and_work() -> Flock {
+        use crate::config::flock::FlockEntry;
+        Flock {
+            flocks: vec![
+                FlockEntry {
+                    name: "home".into(),
+                    default: true,
+                },
+                FlockEntry {
+                    name: "work".into(),
+                    default: false,
+                },
+            ],
+            machines: vec![
+                machine("h", 2),
+                MachineConfig {
+                    flock: Some("work".into()),
+                    ..machine("w", 2)
+                },
+            ],
+        }
+    }
+
+    async fn flocked_daemon() -> (Daemon, tempfile::TempDir) {
+        daemon_with_flock(
+            home_and_work(),
+            &[("h", 2, FakeHerdr::new()), ("w", 2, FakeHerdr::new())],
+        )
+        .await
+    }
+
+    fn run_in(flock: Option<&str>, machine: Option<&str>) -> IpcRequest {
+        IpcRequest::Run {
+            prompt: "x".into(),
+            spec: DispatchSpec {
+                machine: machine.map(Into::into),
+                ..spec()
+            },
+            flock: flock.map(Into::into),
+        }
+    }
+
+    /// Only the task's flock takes it: the default one when it names none,
+    /// the flock of the machine it is pinned to when it names that.
+    #[tokio::test]
+    async fn run_lands_in_its_flock() {
+        let (d, _tmp) = flocked_daemon().await;
+        for (flock, machine, want_flock, want_machine) in [
+            (None, None, "home", "h"),
+            (Some("work"), None, "work", "w"),
+            (None, Some("w"), "work", "w"),
+            (Some("home"), Some("h"), "home", "h"),
+        ] {
+            let resp = d.handle(run_in(flock, machine)).await;
+            let IpcResponse::Task(t) = resp else {
+                panic!("{resp:?}")
+            };
+            assert_eq!(
+                t.flock.as_deref(),
+                Some(want_flock),
+                "{flock:?} {machine:?}"
+            );
+            assert_eq!(
+                t.machine.as_deref(),
+                Some(want_machine),
+                "{flock:?} {machine:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_refuses_a_machine_outside_its_flock_and_an_unknown_flock() {
+        let (d, _tmp) = flocked_daemon().await;
+        let resp = d.handle(run_in(Some("home"), Some("w"))).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "flock_mismatch");
+        assert_eq!(message, "machine w is in flock work, not home");
+        assert_eq!(
+            error_code(d.handle(run_in(Some("play"), None)).await),
+            "unknown_flock"
+        );
+        assert!(
+            d.store()
+                .list_tasks(&TaskFilter::default())
+                .unwrap()
+                .is_empty(),
+            "nothing queued"
+        );
+    }
+
+    /// A pinned machine moved to another flock after the task was queued
+    /// leaves it queued: it keeps the flock it was made for.
+    #[tokio::test]
+    async fn a_pin_that_moved_flock_leaves_the_task_queued() {
+        let (d, _tmp) = flocked_daemon().await;
+        let t = d
+            .store()
+            .insert_task(NewTask {
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "p".into(),
+                spec: DispatchSpec {
+                    machine: Some("w".into()),
+                    ..spec()
+                },
+                flock: "home".into(),
+            })
+            .unwrap();
+        d.fleet().dispatch_queued().await;
+        let t = d.store().get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued);
+        assert_eq!(t.machine, None);
+    }
+
+    /// Moving a machine changes where new tasks go, not its actor: its
+    /// channel, and the tasks already on it, carry on.
+    #[tokio::test]
+    async fn moving_a_machine_keeps_its_actor() {
+        let (d, _tmp) = flocked_daemon().await;
+        let mut moved = home_and_work();
+        moved.machines[0].flock = Some("work".into());
+        let diff = d
+            .fleet()
+            .apply_flock(&moved, &machine_settings(&test_config()))
+            .await;
+        assert!(diff.is_empty(), "{diff:?}");
+        let views = d.fleet().views();
+        let h = views.iter().find(|v| v.name == "h").unwrap();
+        assert_eq!(h.flock, "work");
+        let resp = d.handle(run_in(Some("home"), None)).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.state, TaskState::Queued, "home has no machine left");
     }
 
     /// Copilot 4103544623: a machine a reload removed but whose old actor
@@ -1571,6 +1784,7 @@ mod tests {
                     machine: Some("b".into()),
                     ..spec()
                 },
+                flock: None,
             })
             .await;
         let IpcResponse::Error { code, .. } = resp else {
@@ -1625,6 +1839,7 @@ mod tests {
             &IpcRequest::Run {
                 prompt: "hi".into(),
                 spec: spec(),
+                flock: None,
             },
         )
         .await
@@ -2002,6 +2217,7 @@ mod tests {
             .handle(IpcRequest::Run {
                 prompt: "x".into(),
                 spec: spec(),
+                flock: None,
             })
             .await
         else {
@@ -2031,6 +2247,7 @@ mod tests {
             .handle(IpcRequest::Run {
                 prompt: "x".into(),
                 spec: spec(),
+                flock: None,
             })
             .await
         else {
@@ -2393,6 +2610,7 @@ mod tests {
                     worktree: true,
                     ..spec()
                 },
+                flock: None,
             })
             .await;
         assert_eq!(error_code(resp), "worktree_needs_repo");

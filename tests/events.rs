@@ -241,6 +241,7 @@ async fn the_daemon_writes_the_events_log() {
                 tags: vec![],
                 timeout_secs: 60,
             },
+            flock: None,
         },
     )
     .await

@@ -45,6 +45,19 @@ pub struct FlockEntry {
     pub default: bool,
 }
 
+/// Why a task cannot have the flock it asked for (`Flock::task_flock`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TaskFlockError {
+    #[error("flock {0} does not exist")]
+    UnknownFlock(String),
+    #[error("machine {machine} is in flock {flock}, not {requested}")]
+    MachineElsewhere {
+        machine: String,
+        flock: String,
+        requested: String,
+    },
+}
+
 /// `flock.toml`: the declared flocks and the machines, each in one of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flock {
@@ -192,6 +205,35 @@ impl Flock {
         self.get(name).map(|m| self.flock_of(m))
     }
 
+    /// The flock a new task targets: the one it names, else the flock of the
+    /// machine it is pinned to, else the default. A named flock must exist,
+    /// and a pinned machine must be in it. A pin to a machine this file does
+    /// not have settles nothing: the caller refuses that machine itself.
+    pub fn task_flock(
+        &self,
+        requested: Option<&str>,
+        pinned: Option<&str>,
+    ) -> Result<String, TaskFlockError> {
+        if let Some(f) = requested
+            && !self.has_flock(f)
+        {
+            return Err(TaskFlockError::UnknownFlock(f.to_string()));
+        }
+        let pinned = pinned.and_then(|m| Some((m, self.machine_flock(m)?)));
+        match (requested, pinned) {
+            (Some(want), Some((machine, flock))) if want != flock => {
+                Err(TaskFlockError::MachineElsewhere {
+                    machine: machine.to_string(),
+                    flock: flock.to_string(),
+                    requested: want.to_string(),
+                })
+            }
+            (Some(want), _) => Ok(want.to_string()),
+            (None, Some((_, flock))) => Ok(flock.to_string()),
+            (None, None) => Ok(self.default_flock().to_string()),
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<&MachineConfig> {
         self.machines.iter().find(|m| m.name == name)
     }
@@ -331,6 +373,45 @@ flock = "work"
         .unwrap();
         f.save(&path).unwrap();
         assert_eq!(Flock::load(&path).unwrap(), f);
+    }
+
+    fn home_and_work() -> Flock {
+        flocks(
+            "[[flock]]\nname = \"home\"\ndefault = true\n[[flock]]\nname = \"work\"\n\n[[machine]]\nname = \"h\"\nlocal = true\n\n[[machine]]\nname = \"w\"\nssh = \"w\"\nflock = \"work\"\n",
+        )
+        .unwrap()
+    }
+
+    /// Naming a flock picks it; a pinned machine settles it; neither is the
+    /// default flock. A machine outside the flock asked for is refused.
+    #[test]
+    fn task_flock_follows_the_request_then_the_pin_then_the_default() {
+        let f = home_and_work();
+        assert_eq!(f.task_flock(None, None).unwrap(), "home");
+        assert_eq!(f.task_flock(Some("work"), None).unwrap(), "work");
+        assert_eq!(f.task_flock(None, Some("w")).unwrap(), "work");
+        assert_eq!(f.task_flock(Some("work"), Some("w")).unwrap(), "work");
+        assert_eq!(
+            f.task_flock(Some("home"), Some("w")).unwrap_err(),
+            TaskFlockError::MachineElsewhere {
+                machine: "w".into(),
+                flock: "work".into(),
+                requested: "home".into(),
+            }
+        );
+        assert_eq!(
+            f.task_flock(Some("play"), None).unwrap_err(),
+            TaskFlockError::UnknownFlock("play".into())
+        );
+        assert_eq!(
+            f.task_flock(Some("home"), Some("w"))
+                .unwrap_err()
+                .to_string(),
+            "machine w is in flock work, not home"
+        );
+        // A pin to a machine the file does not have settles nothing; the
+        // caller refuses the machine on its own terms.
+        assert_eq!(f.task_flock(None, Some("gone")).unwrap(), "home");
     }
 
     #[test]

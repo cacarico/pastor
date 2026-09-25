@@ -16,6 +16,9 @@ pub enum IpcRequest {
     Run {
         prompt: String,
         spec: DispatchSpec,
+        /// `None`: the flock of the pinned machine, or the default flock.
+        #[serde(default)]
+        flock: Option<String>,
     },
     List {
         filter: TaskFilter,

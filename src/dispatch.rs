@@ -26,13 +26,17 @@ pub struct MachineView {
     pub tags: Vec<String>,
     pub live: usize,
     pub healthy: bool,
+    /// The flock the machine is in now.
+    pub flock: String,
 }
 
-/// Pinned machine wins. Otherwise: healthy, has every required tag, below capacity,
-/// fewest live tasks. Ties keep flock order.
-pub fn pick_machine(machines: &[MachineView], spec: &DispatchSpec) -> Option<String> {
+/// Only machines in `flock`, the task's, qualify. Of those the pinned machine
+/// wins. Otherwise: healthy, has every required tag, below capacity, fewest
+/// live tasks. Ties keep flock order.
+pub fn pick_machine(machines: &[MachineView], flock: &str, spec: &DispatchSpec) -> Option<String> {
     let fits = |m: &MachineView| {
-        m.healthy
+        m.flock == flock
+            && m.healthy
             && (m.live as u64) < m.max_agents as u64
             && spec.tags.iter().all(|t| m.tags.contains(t))
     };
@@ -369,7 +373,38 @@ mod tests {
             tags: tags.iter().map(|s| s.to_string()).collect(),
             live,
             healthy,
+            flock: "default".into(),
         }
+    }
+
+    /// Only the task's flock takes it, whatever the others have free.
+    #[test]
+    fn pick_machine_keeps_to_the_tasks_flock() {
+        let ms = vec![
+            mv("home-1", 2, 1, &[], true),
+            MachineView {
+                flock: "work".into(),
+                ..mv("work-1", 2, 0, &[], true)
+            },
+        ];
+        assert_eq!(
+            pick_machine(&ms, "default", &spec()).as_deref(),
+            Some("home-1")
+        );
+        assert_eq!(
+            pick_machine(&ms, "work", &spec()).as_deref(),
+            Some("work-1")
+        );
+        assert_eq!(pick_machine(&ms, "play", &spec()), None);
+        let pinned_elsewhere = DispatchSpec {
+            machine: Some("work-1".into()),
+            ..spec()
+        };
+        assert_eq!(
+            pick_machine(&ms, "default", &pinned_elsewhere),
+            None,
+            "a pinned machine that moved to another flock takes nothing"
+        );
     }
 
     fn spec() -> DispatchSpec {
@@ -461,9 +496,9 @@ mod tests {
             mv("b", 2, 1, &[], true),
             mv("c", 2, 0, &[], true),
         ];
-        assert_eq!(pick_machine(&ms, &spec()).as_deref(), Some("c"));
+        assert_eq!(pick_machine(&ms, "default", &spec()).as_deref(), Some("c"));
         let full = vec![mv("a", 1, 1, &[], true)];
-        assert_eq!(pick_machine(&full, &spec()), None);
+        assert_eq!(pick_machine(&full, "default", &spec()), None);
     }
 
     #[test]
@@ -476,6 +511,7 @@ mod tests {
         assert_eq!(
             pick_machine(
                 &ms,
+                "default",
                 &DispatchSpec {
                     machine: Some("c".into()),
                     ..spec()
@@ -487,6 +523,7 @@ mod tests {
         assert_eq!(
             pick_machine(
                 &ms,
+                "default",
                 &DispatchSpec {
                     machine: Some("b".into()),
                     ..spec()
@@ -498,6 +535,7 @@ mod tests {
         assert_eq!(
             pick_machine(
                 &ms,
+                "default",
                 &DispatchSpec {
                     machine: Some("zzz".into()),
                     ..spec()
@@ -509,6 +547,7 @@ mod tests {
         assert_eq!(
             pick_machine(
                 &ms,
+                "default",
                 &DispatchSpec {
                     tags: vec!["gpu".into()],
                     ..spec()
@@ -520,6 +559,7 @@ mod tests {
         assert_eq!(
             pick_machine(
                 &ms,
+                "default",
                 &DispatchSpec {
                     tags: vec!["fast".into()],
                     ..spec()
@@ -532,6 +572,7 @@ mod tests {
         assert_eq!(
             pick_machine(
                 &ms,
+                "default",
                 &DispatchSpec {
                     tags: vec!["nope".into()],
                     ..spec()
