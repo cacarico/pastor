@@ -30,7 +30,7 @@ Runtime errors are one JSON object on stderr, `{"code": ..., "message": ...}`, w
 pastor machine list
 ```
 
-With a head running, it prints one row per machine: `NAME`, `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `PASTOR` (the pastor installed there, `-` when unknown), `AGENTS` (live tasks over `max_agents`), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head, it says so on stderr and lists the flock file with nothing connected; say that to the user rather than starting `pastor serve` yourself, which is a long-running daemon.
+With a head running, it prints one row per machine: `NAME`, `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `PASTOR` (the pastor installed there, `-` when unknown), `AGENTS` (live tasks over `max_agents`), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head running, it says so on stderr and probes each machine directly instead: CHANNEL is then `probed` (herdr answered), `server down` (a local socket with no server), `unreachable` (ssh or transport failed) or `error` (herdr answered the ping with an error), and HERDR, PASTOR and AGENTS come from that probe. Report what it shows rather than starting `pastor serve` yourself, which is a long-running daemon.
 
 ```bash
 pastor task list          # live tasks: queued, starting, running, blocked
