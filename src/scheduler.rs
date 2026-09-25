@@ -682,6 +682,8 @@ impl Scheduler {
                         SchedulerCommand::Tick { job, dry_run, reply } => {
                             // The runs are spawned; only collecting their
                             // reports waits, and that waits off this loop.
+                            // Config first, the same order as `tick_now`.
+                            self.reload_config(false).await;
                             self.reap().await;
                             let reports = self.tick_start(job.as_deref(), dry_run, Utc::now());
                             tokio::spawn(async move {
@@ -1041,6 +1043,9 @@ impl Scheduler {
         dry_run: bool,
         now: DateTime<Utc>,
     ) -> Vec<JobRunReport> {
+        // pastor.toml first, so new defaults reach the job files this pass,
+        // the same order `pass` uses for a timer tick.
+        self.reload_config(false).await;
         self.reap().await;
         self.tick_start(only, dry_run, now).await
     }
@@ -2240,6 +2245,34 @@ mod tests {
         std::fs::write(&flock_file, FLOCK_A).unwrap();
         handle.reload().await.unwrap();
         assert!(fleet.get("a").is_some());
+    }
+
+    /// Copilot 4102376270: `pastor tick` (`tick_now`, the `SchedulerCommand::Tick`
+    /// arm) must reload pastor.toml and flock.toml before its pass, the same
+    /// as a timer tick (`pass`), not run jobs against whatever config and
+    /// fleet the scheduler already had in memory.
+    #[tokio::test]
+    async fn manual_tick_reloads_configuration_before_its_pass() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (mut s, _tmp) = managed_scheduler(&store);
+        std::fs::write(s.paths.flock_file(), FLOCK_A).unwrap();
+        s.reload_config(false).await.unwrap();
+        assert!(s.fleet.get("a").is_some() && s.fleet.get("b").is_none());
+
+        // Edited just before `pastor tick` runs, the same window a timer
+        // tick would pick up on its own next pass.
+        std::fs::write(s.paths.flock_file(), FLOCK_AB).unwrap();
+        std::fs::write(s.paths.config_file(), "tick = \"30s\"\n").unwrap();
+        s.tick_now(None, true, Utc::now()).await;
+        assert!(
+            s.fleet.get("b").is_some(),
+            "a manual tick must reload flock.toml before its pass, like a timer tick does"
+        );
+        assert_eq!(
+            s.tick,
+            Duration::from_secs(30),
+            "a manual tick must also pick up a changed interval"
+        );
     }
 
     fn write_job(paths: &Paths, name: &str, text: &str) {
