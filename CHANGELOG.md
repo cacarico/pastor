@@ -33,6 +33,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on each machine (`-` when there is none or it cannot be known), and the
   head's own version on the head row. The head asks each machine once per
   connect; `--json` carries it as `pastor_version`.
+- `flock.toml` and `pastor.toml` are reloaded while `pastor serve` runs:
+  machines are added, removed or replaced and new timings and defaults apply
+  without a restart. `pastor tick` reloads them too.
 
 ### Changed
 
