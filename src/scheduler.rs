@@ -84,6 +84,49 @@ pub fn backoff_for(failures: u32) -> Duration {
     Duration::from_secs(60u64 << steps).min(Duration::from_secs(3600))
 }
 
+/// Why `value`, substituted from an item into `repo` or `branch`, is unsafe:
+/// it would climb or cross directories, read as an option to git or ssh, or
+/// carry control characters to the machine's shell.
+fn path_value_problem(value: &str) -> Option<&'static str> {
+    if value.contains('/') || value.contains('\\') {
+        Some("contains a path separator")
+    } else if value.contains("..") {
+        Some("contains \"..\"")
+    } else if value.starts_with('-') {
+        Some("starts with '-'")
+    } else if value.chars().any(char::is_control) {
+        Some("contains a control character")
+    } else {
+        None
+    }
+}
+
+/// Item fields are untrusted (a chat message, an issue title). Every
+/// `{{ item.* }}` value that `repo` or `branch` would take is checked before
+/// rendering; the job's own literal text around it, such as `~/work/`, is
+/// the user's and is not.
+pub fn check_item_paths(job: &Job, item: &Value) -> Result<(), String> {
+    let ctx = serde_json::json!({ "item": item });
+    for (field, text) in [
+        ("repo", job.spec.repo.as_deref()),
+        ("branch", job.spec.branch.as_deref()),
+    ] {
+        let Some(text) = text else { continue };
+        for path in template::placeholders(text).map_err(|e| format!("{field}: {e}"))? {
+            if !path.starts_with("item.") {
+                continue;
+            }
+            let value = template::render(&format!("{{{{ {path} }}}}"), &ctx)
+                .map_err(|e| format!("{field}: {e}"))?
+                .text;
+            if let Some(why) = path_value_problem(&value) {
+                return Err(format!("{field}: {{{{ {path} }}}} = {value:?} {why}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Render prompt, repo and branch for one task. A placeholder with no value
 /// renders empty and is logged: an item that failed to render would stay
 /// unseen and fail again every run.
@@ -99,6 +142,7 @@ pub fn render_task(job: &Job, item: &Value, id: i64) -> Result<(String, Dispatch
         missing.extend(r.missing.into_iter().map(|m| format!("{field}: {m}")));
         Ok(r.text)
     };
+    check_item_paths(job, item)?;
     let prompt = render("prompt", &job.prompt)?;
     let repo = job
         .spec
@@ -202,6 +246,8 @@ pub async fn run_job(
     report.items = output.items.len();
     let mut in_run: HashSet<&str> = HashSet::new();
     let mut insert_failed = false;
+    // Rejected items and failed inserts, for `report.error` and `job list`.
+    let mut problems: Vec<String> = Vec::new();
     for item in &output.items {
         if item.key.is_empty() {
             tracing::warn!(job = %job.name, "item without a key skipped");
@@ -222,6 +268,14 @@ pub async fn run_job(
                 return report;
             }
         }
+        let value = item.as_value();
+        // The item's own fault, and it will not change on a retry: report it
+        // and move on, so one bad message cannot hold the job's cursor.
+        if let Err(why) = check_item_paths(job, &value) {
+            tracing::warn!(job = %job.name, key = %item.key, %why, "item rejected");
+            problems.push(format!("{}: rejected: {why}", item.key));
+            continue;
+        }
         if report.created.len() as u32 >= job.max_tasks_per_run {
             report.deferred += 1;
             continue;
@@ -230,7 +284,6 @@ pub async fn run_job(
             report.created.push(item.key.clone());
             continue;
         }
-        let value = item.as_value();
         match store.insert_job_task(&job.name, &value, |id| render_task(job, &value, id)) {
             Ok(t) => {
                 tracing::info!(job = %job.name, task = %t.display_id(), key = %item.key, "task queued");
@@ -244,7 +297,7 @@ pub async fn run_job(
             }
             Err(e) => {
                 tracing::error!(job = %job.name, key = %item.key, %e, "create task");
-                report.error = Some(format!("{}: {e:#}", item.key));
+                problems.push(format!("{}: {e:#}", item.key));
                 insert_failed = true;
             }
         }
@@ -256,6 +309,9 @@ pub async fn run_job(
             max = job.max_tasks_per_run,
             "max_tasks_per_run reached; the rest stay unseen for the next run"
         );
+    }
+    if !problems.is_empty() {
+        report.error = Some(problems.join("; "));
     }
     if insert_failed {
         report.outcome = RunOutcome::Failed;
@@ -270,7 +326,8 @@ pub async fn run_job(
         // The cursor and `since` move past every item the connector returned,
         // so they only advance when every new item became a task. A deferred
         // or failed item must be asked for again; the seen-store drops the
-        // ones that did land.
+        // ones that did land. A rejected item is the item's own fault and a
+        // retry cannot fix it, so it does not hold them.
         if report.deferred == 0 && !insert_failed {
             state.last_ok_at = Some(now);
             if output.cursor.is_some() {
@@ -285,15 +342,15 @@ pub async fn run_job(
                 report.created.len(),
                 first_line(&err)
             ));
-            state.last_error = Some(err);
         } else {
             state.last_result = Some(format!(
                 "ok: {} items, {} tasks",
                 report.items,
                 report.created.len()
             ));
-            state.last_error = None;
         }
+        // Rejected or uninserted items, if any; `job list` shows it.
+        state.last_error = report.error.clone();
         if let Err(e) = store.save_job_state(&state) {
             tracing::error!(job = %job.name, %e, "save job state");
         }
@@ -1457,6 +1514,114 @@ mod tests {
         let s = store.job_state("j").unwrap().unwrap();
         assert_eq!(s.failures, 0);
         assert!(s.backoff_until.is_none() && s.last_error.is_none());
+    }
+
+    /// An item that could not be inserted is still unseen; if the cursor
+    /// moved past it anyway, a connector that resumes from the cursor would
+    /// never emit it again. The cursor and `since` hold until a run inserts
+    /// everything it meant to.
+    #[tokio::test]
+    async fn a_failed_insert_keeps_the_cursor_and_since() {
+        let store = Store::open_in_memory().unwrap();
+        let (tx, _rx) = events();
+        let t0 = Utc::now() - chrono::Duration::hours(1);
+        store
+            .save_job_state(&JobState {
+                name: "j".into(),
+                cursor: Some("c-old".into()),
+                last_ok_at: Some(t0),
+                ..Default::default()
+            })
+            .unwrap();
+        let src = Scripted::with_keys(&["k1"]);
+        *src.cursor.lock().unwrap() = Some("c-new".into());
+        let mut j = job("j");
+        // Valid when checked at load, but this Job is built by hand: rendering
+        // fails inside the store's insert transaction.
+        j.prompt = "{{ item.title".into();
+        let now = Utc::now();
+        let report = run_job(&store, &j, &src, &tx, now, false).await;
+        assert!(report.created.is_empty());
+        assert!(
+            report.error.as_deref().unwrap().contains("k1"),
+            "{report:?}"
+        );
+        let st = store.job_state("j").unwrap().unwrap();
+        assert_eq!(st.cursor.as_deref(), Some("c-old"), "cursor held");
+        assert_eq!(st.last_ok_at, Some(t0), "since held");
+        assert_eq!(st.last_run_at, Some(now));
+        assert!(
+            st.last_result.as_deref().unwrap().contains("not inserted"),
+            "{st:?}"
+        );
+        assert!(!store.is_seen("j", "k1").unwrap());
+
+        // The next run inserts it; now the cursor moves.
+        let report = run_job(&store, &job("j"), &src, &tx, now, false).await;
+        assert_eq!(report.created.len(), 1);
+        let st = store.job_state("j").unwrap().unwrap();
+        assert_eq!(st.cursor.as_deref(), Some("c-new"));
+        assert_eq!(st.last_ok_at, Some(now));
+    }
+
+    /// Item fields come from outside (a Slack message, an issue title). Put
+    /// into `repo` or `branch` they must not climb directories, pose as an
+    /// option, or smuggle control characters to the machine.
+    #[test]
+    fn render_task_rejects_unsafe_item_values_in_repo_and_branch() {
+        let mut j = job("j");
+        j.spec.repo = Some("~/work/{{ item.repo }}".into());
+        j.spec.branch = Some("pastor/{{ item.key }}".into());
+        let ok = json!({"key": "1727000123.000200", "repo": "api_v2-x"});
+        let (_, spec) = render_task(&j, &ok, 1).unwrap();
+        assert_eq!(spec.repo.as_deref(), Some("~/work/api_v2-x"));
+        assert_eq!(spec.branch.as_deref(), Some("pastor/1727000123.000200"));
+        for (field, value) in [
+            ("repo", "../../etc"),
+            ("repo", "a/b"),
+            ("repo", "a\\b"),
+            ("repo", ".."),
+            ("key", "-oProxyCommand=x"),
+            ("key", "x\ny"),
+            ("key", "bell\u{7}"),
+        ] {
+            let mut item = ok.clone();
+            item[field] = json!(value);
+            let err = render_task(&j, &item, 1).unwrap_err();
+            let target = if field == "repo" { "repo" } else { "branch" };
+            assert!(
+                err.contains(target) && err.contains(&format!("item.{field}")),
+                "{value:?}: {err}"
+            );
+        }
+        // The prompt is free text: anything goes there.
+        let mut item = ok.clone();
+        item["title"] = json!("../../etc\n-rf");
+        assert!(render_task(&job("j"), &item, 1).is_ok());
+    }
+
+    /// A rejected item creates no task and is reported, but it is the item's
+    /// fault, not a transient failure: the run still counts and the cursor
+    /// moves, so one bad message cannot stall the job forever.
+    #[tokio::test]
+    async fn an_unsafe_item_is_skipped_and_reported_without_holding_the_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        let (tx, _rx) = events();
+        let mut bad = item("../evil");
+        bad.fields.insert("title".into(), json!("t"));
+        let src = Scripted {
+            items: Mutex::new(vec![bad, item("good")]),
+            cursor: Mutex::new(Some("c-1".into())),
+            fail: Mutex::new(None),
+            inputs: Mutex::new(Vec::new()),
+        };
+        let report = run_job(&store, &job("j"), &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.created.len(), 1);
+        let err = report.error.as_deref().unwrap();
+        assert!(err.contains("../evil") && err.contains("rejected"), "{err}");
+        let st = store.job_state("j").unwrap().unwrap();
+        assert_eq!(st.cursor.as_deref(), Some("c-1"));
+        assert_eq!(store.list_tasks(&TaskFilter::default()).unwrap().len(), 1);
     }
 
     #[tokio::test]
