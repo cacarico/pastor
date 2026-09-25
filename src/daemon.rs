@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
 use crate::config::flock::{EditError, Flock, FlockDoc, MachineConfig, TaskFlockError};
@@ -851,6 +852,46 @@ pub struct Daemon {
     events: broadcast::Sender<PastorEvent>,
 }
 
+/// The longest IPC request line, newline excluded. The largest real one is a
+/// `task run` prompt, far below this.
+const MAX_IPC_REQUEST: usize = 1024 * 1024;
+
+/// How long a client gets to send its request line. The CLI sends it at once;
+/// a connection that stays silent is holding a file descriptor for nothing.
+const IPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The pause after a failed `accept`, so EMFILE does not spin the loop.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+enum RequestReadError {
+    TooLarge,
+    TimedOut,
+    Io,
+}
+
+/// One request line from `r`, newline included when there is one, read
+/// within `time` and refused past `max` bytes.
+async fn read_request<R: tokio::io::AsyncRead + Unpin>(
+    r: R,
+    max: usize,
+    time: Duration,
+) -> Result<String, RequestReadError> {
+    let mut buf = Vec::new();
+    let mut r = BufReader::new(r.take(max as u64 + 1));
+    match tokio::time::timeout(time, r.read_until(b'\n', &mut buf)).await {
+        Err(_) => return Err(RequestReadError::TimedOut),
+        Ok(Err(_)) => return Err(RequestReadError::Io),
+        Ok(Ok(_)) => {}
+    }
+    let content = buf.len() - usize::from(buf.last() == Some(&b'\n'));
+    if content > max {
+        return Err(RequestReadError::TooLarge);
+    }
+    // Not UTF-8 is not JSON either; let the parser say so.
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// SIGTERM and SIGHUP, alongside ctrl_c's SIGINT, so `run_with_listener` can
 /// select over all three without an attribute on a `tokio::select!` branch
 /// (the macro does not support `#[cfg(...)]` there). Unix-only underneath,
@@ -1047,15 +1088,31 @@ impl Daemon {
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let (stream, _) = accepted?;
+                    let stream = match accepted {
+                        Ok((stream, _)) => stream,
+                        // Out of file descriptors, or a client that hung up
+                        // mid-accept: the listener is fine, and exiting would
+                        // hand every other client a restart loop. Back off so
+                        // EMFILE does not spin, then keep serving.
+                        Err(e) => {
+                            tracing::warn!(error = %e, "accept on the socket failed");
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                            continue;
+                        }
+                    };
                     let d = daemon.clone();
                     tokio::spawn(async move {
                         let (r, mut w) = stream.into_split();
-                        let mut line = String::new();
-                        if BufReader::new(r).read_line(&mut line).await.is_err() { return; }
-                        let resp = match crate::ipc::parse_request_line(line.trim()) {
-                            Ok((req, from_task)) => d.handle_from(req, from_task.as_deref()).await,
-                            Err(err) => IpcResponse::error("invalid_request", err),
+                        let resp = match read_request(r, MAX_IPC_REQUEST, IPC_READ_TIMEOUT).await {
+                            Ok(line) => match crate::ipc::parse_request_line(line.trim()) {
+                                Ok((req, from_task)) => d.handle_from(req, from_task.as_deref()).await,
+                                Err(err) => IpcResponse::error("invalid_request", err),
+                            },
+                            Err(RequestReadError::TooLarge) => IpcResponse::error(
+                                "request_too_large",
+                                format!("a request is at most {MAX_IPC_REQUEST} bytes"),
+                            ),
+                            Err(_) => return,
                         };
                         let mut out = serde_json::to_string(&resp).unwrap_or_else(|e| format!("{{\"kind\":\"error\",\"code\":\"internal\",\"message\":\"{e}\"}}"));
                         out.push('\n');
@@ -2898,6 +2955,50 @@ mod tests {
         let socket = serving(d).await;
         let resp = ask_from_task(&socket, &run_hi()).await;
         assert!(matches!(resp, IpcResponse::Task(_)), "{resp:?}");
+    }
+
+    /// A request is one line. A client that sends more than the cap, or
+    /// nothing at all, must not hold memory or a file descriptor forever:
+    /// the first is answered with an error, the second is hung up on.
+    #[tokio::test]
+    async fn ipc_requests_are_bounded_in_size_and_time() {
+        let read = |data: &'static [u8], max| read_request(data, max, Duration::from_secs(5));
+        assert_eq!(read(b"{\"a\":1}\nrest", 16).await.unwrap(), "{\"a\":1}\n");
+        assert_eq!(read(b"no newline", 16).await.unwrap(), "no newline");
+        assert_eq!(
+            read(b"0123456789abcdef\n", 16).await.unwrap(),
+            "0123456789abcdef\n"
+        );
+        assert!(matches!(
+            read(b"0123456789abcdefg\n", 16).await,
+            Err(RequestReadError::TooLarge)
+        ));
+        let (_client, server) = tokio::io::duplex(64);
+        let started = Instant::now();
+        let got = read_request(server, 16, Duration::from_millis(50)).await;
+        assert!(matches!(got, Err(RequestReadError::TimedOut)), "{got:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_ipc_request_is_refused_and_the_daemon_lives_on() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let socket = d.socket_path();
+        tokio::spawn(d.run());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::ipc::daemon_running(&socket).await {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let big = vec![b'x'; MAX_IPC_REQUEST + 1];
+        // The daemon may hang up before taking it all; that is fine.
+        let _ = w.write_all(&big).await;
+        let mut line = String::new();
+        BufReader::new(r).read_line(&mut line).await.unwrap();
+        assert!(line.contains("request_too_large"), "{line}");
+        assert!(crate::ipc::daemon_running(&socket).await);
     }
 
     /// `run` must replace a stale socket file left behind by an unclean shutdown
