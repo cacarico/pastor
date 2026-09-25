@@ -14,8 +14,7 @@ use crate::machine::{
 };
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{NewTask, RetryError, Store, TaskFilter};
-use crate::task::Task;
-use crate::task::TaskState;
+use crate::task::{PANE_OWNING_STATES, Task, TaskState};
 
 /// Builds a machine's transport from its flock entry. `serve` uses
 /// `endpoint_factory`; tests hand out fakes by machine name.
@@ -44,17 +43,20 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
 /// Open tasks (holding a pane) on machines `flock` does not have. No actor
 /// reconciles them, so their state is the last one seen. They are never
 /// marked done or failed and not counted toward capacity.
+///
+/// `states` narrows the SQL query to `PANE_OWNING_STATES` rather than
+/// loading every historical task and filtering in Rust (Copilot 4103271094):
+/// same idea as `Store::tasks_on_machine`, so a fleet with a long closed or
+/// failed history does not have every row of it read on each pass.
 pub fn tasks_on_removed_machines(store: &Store, flock: &Flock) -> anyhow::Result<Vec<Task>> {
     Ok(store
         .list_tasks(&TaskFilter {
             job: None,
             machine: None,
-            states: None,
+            states: Some(PANE_OWNING_STATES.to_vec()),
         })?
         .into_iter()
-        .filter(|t| {
-            t.state.occupies_pane() && t.machine.as_deref().is_some_and(|m| flock.get(m).is_none())
-        })
+        .filter(|t| t.machine.as_deref().is_some_and(|m| flock.get(m).is_none()))
         .collect())
 }
 
@@ -1232,6 +1234,42 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec![running_gone, blocked_gone]);
+    }
+
+    /// Copilot 4103271094: the SQL query, not a Rust filter after the fact,
+    /// keeps a long closed/failed history off this path. A store with many
+    /// finished rows on removed machines and one open one still returns just
+    /// the open one.
+    #[test]
+    fn tasks_on_removed_machines_filters_pane_owning_states_in_sql() {
+        let store = Store::open_in_memory().unwrap();
+        let put = |machine: &str, state: TaskState| {
+            let mut t = store
+                .insert_task(NewTask {
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                })
+                .unwrap();
+            t.machine = Some(machine.into());
+            t.state = state;
+            store.update_task(&mut t).unwrap();
+            t.id
+        };
+        for _ in 0..50 {
+            put("gone", TaskState::Closed);
+            put("gone", TaskState::Failed);
+        }
+        let open = put("gone", TaskState::Blocked);
+        put("a", TaskState::Running);
+
+        let ids: Vec<i64> = tasks_on_removed_machines(&store, &flock_of(&[("a", 2)]))
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec![open]);
     }
 
     #[tokio::test]
