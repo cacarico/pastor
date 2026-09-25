@@ -90,7 +90,13 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
     };
     let stdin = std::io::stdin();
     let interactive = stdin.is_terminal();
-    confirm(&install, yes, interactive, &mut stdin.lock())?;
+    confirm(
+        &install,
+        yes,
+        interactive,
+        &mut stdin.lock(),
+        &mut std::io::stdout(),
+    )?;
     let report = install.run(&SystemRunner, paths)?;
     print!("{report}");
     Ok(())
@@ -98,12 +104,15 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
 
 /// Show what setup will do and wait for `yes`, unless `--yes` was given.
 /// Without a terminal nobody can answer, so that fails at once instead of
-/// blocking on a read.
+/// blocking on a read. The prompt goes to `out` (stdout in the CLI), because a
+/// declined or failed prompt ends in a JSON error that must be the only thing
+/// on stderr.
 fn confirm(
     install: &Install,
     yes: bool,
     interactive: bool,
     input: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     if yes {
         return Ok(());
@@ -115,11 +124,16 @@ fn confirm(
             install.action
         );
     }
-    eprintln!("About to install {}", install.unit.file_name());
-    eprintln!("  unit dir: {}", install.unit_dir.display());
-    eprintln!("  ExecStart: {}", install.exec.display());
-    eprintln!("  action: {}", install.action);
-    eprint!("Continue? Type 'yes' to proceed: ");
+    write!(
+        out,
+        "About to install {}\n  unit dir: {}\n  ExecStart: {}\n  action: {}\nContinue? Type 'yes' to proceed: ",
+        install.unit.file_name(),
+        install.unit_dir.display(),
+        install.exec.display(),
+        install.action
+    )
+    .and_then(|()| out.flush())
+    .context("write confirmation prompt")?;
     let mut answer = String::new();
     input.read_line(&mut answer).context("read confirmation")?;
     if answer.trim() != "yes" {
@@ -592,16 +606,74 @@ mod tests {
         let e = env();
         let install = e.install(Unit::Pastor);
         // --yes skips the prompt without reading anything.
-        confirm(&install, true, false, &mut "".as_bytes()).unwrap();
-        confirm(&install, true, true, &mut "".as_bytes()).unwrap();
+        confirm(
+            &install,
+            true,
+            false,
+            &mut "".as_bytes(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        confirm(
+            &install,
+            true,
+            true,
+            &mut "".as_bytes(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
         // At a terminal only `yes` goes ahead.
-        confirm(&install, false, true, &mut "yes\n".as_bytes()).unwrap();
-        let err = confirm(&install, false, true, &mut "no\n".as_bytes()).unwrap_err();
+        confirm(
+            &install,
+            false,
+            true,
+            &mut "yes\n".as_bytes(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        let err = confirm(
+            &install,
+            false,
+            true,
+            &mut "no\n".as_bytes(),
+            &mut std::io::sink(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("aborted"), "{err}");
         // Without a terminal it fails at once, even with `yes` waiting on
         // stdin, and names the flag that makes it scriptable.
-        let err = confirm(&install, false, false, &mut "yes\n".as_bytes()).unwrap_err();
+        let err = confirm(
+            &install,
+            false,
+            false,
+            &mut "yes\n".as_bytes(),
+            &mut std::io::sink(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--yes"), "{err}");
+    }
+
+    /// A declined prompt ends in a JSON error on stderr, which must be the only
+    /// thing there, so the prompt goes to the writer it is given (stdout).
+    #[test]
+    fn the_prompt_goes_to_the_given_writer() {
+        let e = env();
+        let install = e.install(Unit::Pastor);
+        let mut out = Vec::new();
+        let err = confirm(&install, false, true, &mut "no\n".as_bytes(), &mut out).unwrap_err();
+        assert!(err.to_string().contains("aborted"), "{err}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("About to install pastor.service"), "{text}");
+        assert!(text.contains("action: enable --now"), "{text}");
+        assert!(
+            text.ends_with("Continue? Type 'yes' to proceed: "),
+            "{text}"
+        );
+        // --yes and a refused non-terminal write nothing at all.
+        let mut out = Vec::new();
+        confirm(&install, true, true, &mut "".as_bytes(), &mut out).unwrap();
+        confirm(&install, false, false, &mut "".as_bytes(), &mut out).unwrap_err();
+        assert!(out.is_empty());
     }
 
     #[test]
