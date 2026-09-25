@@ -107,7 +107,6 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `Cargo.toml` declares the minimum Rust version (1.88) and the repository,
   and carries cargo-binstall metadata pointing at the GitHub release
   tarballs.
-||||||| parent of ec9412e (docs(changelog): record the security fixes under Unreleased)
 
 ### Security
 
