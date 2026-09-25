@@ -30,15 +30,20 @@ test-machine: ## the machine actor tests five times, to catch timing flakes
 	@for i in 1 2 3 4 5; do cargo test --lib machine:: -q || exit 1; done
 
 # The repository is public; CI runs this same scan. The rules are gitleaks'
-# own defaults at the pinned version, fetched outside the checkout; no
-# .gitleaksignore and no inline gitleaks:allow comment is honoured, so a branch
-# cannot loosen the policy it is checked against. Needs the gitleaks binary (a system package, not a cargo one).
+# own defaults at the pinned version, fetched outside the checkout; the scan
+# runs in a throwaway worktree with any .gitleaksignore or gitleaks.toml
+# removed (gitleaks reads ./.gitleaksignore whatever --gitleaks-ignore-path
+# says), and inline gitleaks:allow comments are ignored, so nothing in a
+# branch can loosen the policy it is checked against. Needs the gitleaks
+# binary (a system package, not a cargo one).
 GITLEAKS_VERSION ?= 8.30.1
 leaks: ## scan the whole git history for secrets, as CI does
-	@set -e; tmp=$$(mktemp -d); trap 'rm -rf $$tmp' EXIT; \
+	@set -e; tmp=$$(mktemp -d); trap 'git worktree remove --force $$tmp/wt >/dev/null 2>&1 || true; rm -rf $$tmp' EXIT; \
 	curl -sSfL -o $$tmp/gitleaks.toml https://raw.githubusercontent.com/gitleaks/gitleaks/v$(GITLEAKS_VERSION)/config/gitleaks.toml; \
 	mkdir $$tmp/no-ignore; \
-	gitleaks git --redact --no-banner --exit-code 1 --ignore-gitleaks-allow --config $$tmp/gitleaks.toml --gitleaks-ignore-path $$tmp/no-ignore --log-opts="--all" .
+	git worktree add --quiet --detach $$tmp/wt HEAD; \
+	rm -f $$tmp/wt/.gitleaksignore $$tmp/wt/.gitleaks.toml $$tmp/wt/gitleaks.toml; \
+	gitleaks git --redact --no-banner --exit-code 1 --ignore-gitleaks-allow --config $$tmp/gitleaks.toml --gitleaks-ignore-path $$tmp/no-ignore --log-opts="--all" $$tmp/wt
 
 # Needs herdr 0.9+ running with the named session on this host. Nothing else
 # in the suite touches a real herdr, so this is the smoke test to run on a
