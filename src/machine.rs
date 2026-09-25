@@ -35,6 +35,15 @@ fn is_outage(err: &anyhow::Error) -> bool {
     })
 }
 
+/// The advice given when `--remove-worktree` has no herdr workspace left to
+/// remove the checkout by: the checkout itself may still be on disk, so
+/// removing it is left to the operator.
+fn manual_worktree_cleanup(display_id: &str) -> String {
+    format!(
+        "task {display_id} has no open workspace left to remove the worktree from; remove the checkout with `git worktree remove`"
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelState {
@@ -952,10 +961,9 @@ impl Actor {
         });
         let Some((pane, workspace)) = target else {
             return match row {
-                Some(t) if remove_worktree => anyhow::bail!(
-                    "task {} has no open workspace left to remove the worktree from; remove the checkout with `git worktree remove`",
-                    t.display_id()
-                ),
+                Some(t) if remove_worktree => {
+                    anyhow::bail!(manual_worktree_cleanup(&t.display_id()))
+                }
                 Some(t) => self.finish_close(t),
                 None => anyhow::bail!("task {name} not found"),
             };
@@ -964,10 +972,41 @@ impl Actor {
             let ws = workspace.with_context(|| format!("task {name} recorded no workspace"))?;
             // Closes the workspace, pane and agent with it: closing the pane
             // first would close the workspace and leave no id to remove by.
-            tokio::time::timeout(timeout, self.connector.worktree_remove(&ws, false))
+            match tokio::time::timeout(timeout, self.connector.worktree_remove(&ws, false))
                 .await
                 .map_err(|_| TimedOut("worktree.remove", timeout))?
-                .with_context(|| format!("remove the worktree of {name}"))?;
+            {
+                Ok(()) => {}
+                // The recorded workspace is gone from herdr too: some other
+                // way it may have already been closed, or its checkout
+                // never existed to begin with. Either way there is no pane
+                // left to worry about here either, so this is the no-target
+                // outcome in disguise -- close the row and hand back the
+                // same manual-cleanup note rather than failing the close.
+                Err(err) if err.code() == Some("workspace_not_found") => {
+                    self.forget_orphan(&pane);
+                    self.pending_done.remove(&task_id);
+                    return match row {
+                        Some(t) => {
+                            let note = manual_worktree_cleanup(&t.display_id());
+                            self.finish_close_with_note(t, note)
+                        }
+                        None => {
+                            self.refresh_live();
+                            Err(OrphanClosed {
+                                agent: name,
+                                machine: self.name.clone(),
+                            }
+                            .into())
+                        }
+                    };
+                }
+                Err(err) => {
+                    return Err(
+                        anyhow::Error::from(err).context(format!("remove the worktree of {name}"))
+                    );
+                }
+            }
         } else {
             match tokio::time::timeout(timeout, self.connector.pane_close(&pane))
                 .await
@@ -996,6 +1035,16 @@ impl Actor {
                 .into())
             }
         }
+    }
+
+    /// `finish_close`, but stamping `note` on the row first (it becomes the
+    /// `NOTE` column the CLI shows): for a close that succeeds yet still has
+    /// something the operator needs to know, like a checkout `--remove-worktree`
+    /// could not reach through herdr.
+    fn finish_close_with_note(&mut self, mut t: Task, note: String) -> anyhow::Result<Task> {
+        t.error = Some(note);
+        self.store.update_task(&mut t)?;
+        self.finish_close(t)
     }
 
     fn finish_close(&mut self, t: Task) -> anyhow::Result<Task> {
@@ -2479,6 +2528,35 @@ mod tests {
             vec![serde_json::json!({"workspace_id": workspace, "force": false})]
         );
         assert!(fake.workspaces().is_empty());
+    }
+
+    /// The recorded workspace can be gone from herdr entirely by the time
+    /// `--remove-worktree` reaches it -- closed some other way, say. That is
+    /// the no-target outcome in disguise: the close still succeeds, closing
+    /// the row (the pane is gone with the workspace), and reports the same
+    /// manual-cleanup note the no-target path gives instead of failing with
+    /// `close_failed`.
+    #[tokio::test]
+    async fn close_remove_worktree_handles_a_recorded_workspace_herdr_has_lost() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        // herdr has lost the workspace and its pane both, without going
+        // through pastor's close, and the row is marked closed without
+        // reaching herdr: the workspace id is still recorded, but herdr no
+        // longer has it, so `worktree.remove` answers `workspace_not_found`.
+        fake.close_pane(&pane);
+        store.close_task(t.id).unwrap();
+        assert_eq!(state_of(&store, t.id), TaskState::Closed);
+
+        let closed = h.close(t.id, true).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(
+            closed.error.as_deref(),
+            Some(manual_worktree_cleanup(&closed.display_id()).as_str())
+        );
     }
 
     #[tokio::test]
