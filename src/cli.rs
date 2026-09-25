@@ -604,7 +604,7 @@ mod tests {
     }
 
     fn head() -> HeadRow {
-        HeadRow::new("darkbeat".into(), Some("0.9.1".into()))
+        HeadRow::new("desk".into(), Some("0.9.1".into()))
     }
 
     fn row(name: &str, host: &str) -> MachineRow {
@@ -655,23 +655,21 @@ mod tests {
     #[test]
     fn the_head_line_names_the_head_when_it_is_a_machine() {
         let v = env!("CARGO_PKG_VERSION");
-        let mut rows = vec![row("pi-3", "user@pi-3"), row("darkbeat", "local")];
+        let mut rows = vec![row("pi-3", "user@pi-3"), row("desk", "local")];
         assert_eq!(
             head_line(&head(), &rows),
-            format!(
-                "pastor {v} on darkbeat (herdr 0.9.1), 2 machines, darkbeat is the head of the flock"
-            )
+            format!("pastor {v} on desk (herdr 0.9.1), 2 machines, desk is the head of the flock")
         );
         rows.remove(1);
-        let bare = HeadRow::new("darkbeat".into(), None);
+        let bare = HeadRow::new("desk".into(), None);
         assert_eq!(
             head_line(&bare, &rows),
-            format!("pastor {v} on darkbeat (herdr -), 1 machine"),
+            format!("pastor {v} on desk (herdr -), 1 machine"),
             "a head that runs no agents: no ending, and no herdr is a dash"
         );
         assert_eq!(
             head_line(&head(), &[]),
-            format!("pastor {v} on darkbeat (herdr 0.9.1), 0 machines")
+            format!("pastor {v} on desk (herdr 0.9.1), 0 machines")
         );
     }
 
@@ -712,7 +710,7 @@ mod tests {
         let head = head();
         let v = serde_json::to_value(machine_list_json(&head, &rows)).unwrap();
         assert_eq!(v["head"]["name"], "pastor");
-        assert_eq!(v["head"]["host"], "darkbeat");
+        assert_eq!(v["head"]["host"], "desk");
         assert_eq!(v["head"]["channel"], "head");
         assert_eq!(v["head"]["herdr_version"], "0.9.1");
         assert_eq!(v["head"]["pastor_version"], env!("CARGO_PKG_VERSION"));

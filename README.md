@@ -29,6 +29,7 @@ local machine with no ssh at all. The agents themselves (`claude`, `opencode`,
 ```sh
 pastor machine add pi-1 user@pi-1        # a machine you can ssh to
 pastor machine add here --local          # this machine can take tasks too
+pastor machine add pi-2 user@pi-2 --flock work   # after `pastor flock add work`
 pastor setup systemd                     # run the head as a user service
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api'
 pastor task list                         # queued, starting, running, blocked
@@ -61,10 +62,14 @@ issues into tasks, and event hooks that run when a task finishes or blocks.
 
 - **The head** runs `pastor serve`. It owns the queue, the schedule and the
   task history, in SQLite under `~/.local/state/pastor/`.
-- **The flock** is the machines in `~/.config/pastor/flock.toml`: the head
+- **The machines** are listed in `~/.config/pastor/flock.toml`: the head
   itself as a local machine, and other hosts reached over one multiplexed ssh
   connection each. A machine takes up to `max_agents` tasks at once; tags
   steer a task to the right one.
+- **A flock** is a named group of machines, such as work and personal ones
+  that run agents on different accounts. Every machine is in one flock, every
+  task and job targets one, and only that flock's machines take its tasks.
+  With no flock declared there is one, `default`.
 - **A task** is one agent in one herdr pane, in a repo or a fresh worktree of
   it. Its states are `queued`, `starting`, `running`, `blocked`, `done`, `stale`, `failed`
   and `closed`; `done` means the agent stopped, not that the work is good.

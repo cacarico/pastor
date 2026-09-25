@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- Named flocks. `[[flock]]` entries in `flock.toml` declare them, one with
+  `default = true`, and `flock = "..."` puts a machine in one; a machine
+  without it is in the default flock. A file with no `[[flock]]` entry is one
+  flock named `default`, so existing files load unchanged.
+- A task and a job target one flock and only its machines take their tasks:
+  `--flock` on `pastor task run`, `flock` under a job's `[dispatch]`, else the
+  pinned machine's flock, else the default. `--machine` outside `--flock` is
+  refused (`flock_mismatch`), an unknown flock too (`unknown_flock`).
+  `pastor task retry` keeps the flock.
+- `pastor flock list|add [--default]|remove|default`, `pastor machine move`,
+  and `--flock` on `machine add`, `machine list` and `task list`. `task list`,
+  `task show` and `job list` show the flock, and task events carry it in the
+  task row.
+
+### Changed
+
+- `pastor machine list` opens with a line about the head (its pastor and
+  herdr versions, its host, the number of machines, and which machine it is
+  when it is one) instead of a first table row named `pastor`, and has a
+  FLOCK column after HOST. The head's own machine comes first. `--json`
+  keeps its shape, with `flock` on each machine.
+- `machine add|remove` and the new flock commands edit `flock.toml` in place,
+  keeping comments and layout; they used to rewrite the whole file.
+- The database is schema 4: each task stores its flock. Rows from before
+  flocks join the default flock.
+
 ## 0.3.0 - 2026-09-25
 
 ### Changed

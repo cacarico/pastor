@@ -55,18 +55,27 @@ when it's not (`task list` says so on stderr); `task attach` always reads the st
 directly, since it only needs the task's machine and agent name to hand off
 to `ssh`/`herdr`.
 
-`pastor machine list` shows the head first, then each machine in the flock:
+`pastor machine list` opens with a line about the head, then lists the
+machines:
 
 ```
-NAME    HOST        CHANNEL    HERDR  PASTOR  AGENTS  ORPHANS  TAGS  ERROR
-pastor  desk        head       0.9.1  0.2.0   -       -        -
-pi-3    user@pi-3   connected  0.9.1  0.2.0   1/2     -        fast
+pastor 0.4.0 on desk (herdr 0.9.1), 2 machines, desk is the head of the flock
+
+NAME  HOST       FLOCK     CHANNEL    HERDR  PASTOR  AGENTS  ORPHANS  TAGS  ERROR
+desk  local      personal  connected  0.9.1  0.4.0   0/2     -        -
+pi-3  user@pi-3  work      connected  0.9.1  0.4.0   1/2     -        fast
 ```
 
+The line names the head's pastor version, its hostname, the version of the
+`herdr` on its PATH (`-` when there is none) and how many machines follow.
+When the head is itself a machine (a `local` one) the line ends by naming it,
+and its row comes first; a head that runs no agents gets the line without
+that ending. With no head running, the line is replaced by the notice on
+stderr that the machines were probed directly. `--flock F` lists only that
+flock's machines, and the line counts those.
 HOST is the ssh target, `local`, or the program a `command` machine runs.
-The head row carries this machine's hostname, the version of the `herdr`
-on its PATH (`-` when there is none) and its own pastor version; it is not a
-machine and takes no tasks. PASTOR is the pastor installed on the machine:
+FLOCK is the flock the machine is in (see Flocks). PASTOR is the pastor
+installed on the machine:
 over the ssh master, pastor runs `pastor --version` in a shell that has
 `~/.cargo/bin` and `~/.local/bin` on its PATH, since ssh's non-login shell
 often lacks them. A `local` machine is the head's own pastor; a `command`
@@ -84,8 +93,9 @@ failed `agent.list` still counts as `probed`, with the reason in ERROR),
 back with a non-transport API error). AGENTS counts every agent herdr reports,
 and stderr says so. `--json` prints
 `{"head": {...}, "machines": [...]}`, with `pastor_version` on the head and
-on each machine (`null` when unknown) and `channel` one of the same four probe
-values (or the head's live channel state when `pastor serve` is running).
+on each machine (`null` when unknown), `flock` on each machine, and `channel`
+one of the same four probe values (or the head's live channel state when
+`pastor serve` is running).
 
 Jobs are one TOML file each in `~/.config/pastor/jobs/`. On every `tick` the
 daemon re-reads files that changed (a file that stops parsing keeps its last
@@ -108,8 +118,8 @@ conditional update, so a machine is never given more than `max_agents`.
 `pastor task list` shows live tasks only: queued, starting, running and blocked.
 Finished ones (done, failed, stale, closed) appear with `--all`, and an empty
 default list says so on stderr. `--blocked` and `--done` narrow to just that
-state, `--job` and `--machine` narrow whichever set is shown, and `--json`
-prints the same selection. `pastor task read t-1` fetches recent output from the
+state, `--job`, `--flock` and `--machine` narrow whichever set is shown, and
+`--json` prints the same selection. FLOCK is the flock the task targets. `pastor task read t-1` fetches recent output from the
 task's pane over the machine channel. `pastor open pi-3` execs the full herdr
 UI against a flock machine (`herdr --remote` for an SSH one, `herdr` directly
 for a local one) instead of showing pastor's own view; herdr refuses to start
@@ -168,6 +178,72 @@ and `pastor task close t-N` closes one, with or without a row. pastor finds
 them when it reconciles (every `reconcile_every`). It assumes it is the only
 pastor naming agents `t-N` on each herdr.
 
+## Flocks
+
+A flock is a named group of machines. Every machine is in exactly one, and
+every task and job targets one: only that flock's machines take its tasks.
+Flocks keep kinds of work apart, such as work and personal machines that run
+agents on different accounts. A flock is only a name; it has no settings of
+its own.
+
+```toml
+# flock.toml
+[[flock]]
+name = "personal"
+default = true            # tasks and jobs that name no flock go here
+
+[[flock]]
+name = "work"
+
+[[machine]]
+name = "desk"
+local = true              # no `flock`: the default flock
+
+[[machine]]
+name = "pi-3"
+ssh = "user@pi-3"
+flock = "work"
+```
+
+`[[flock]]` entries declare the flocks, so a flock can have no machines yet.
+Names are unique and exactly one has `default = true`. A machine naming an
+undeclared flock, two defaults, or none makes the file fail to load, like any
+other bad flock file: `pastor serve` refuses to start on it, and a running
+head keeps the previous version. A file with no `[[flock]]` entry at all is
+one flock named `default` holding every machine, so files from before flocks
+load unchanged.
+
+```
+pastor flock list                       NAME, DEFAULT, MACHINES, AGENTS, QUEUED (--json)
+pastor flock add <name> [--default]
+pastor flock remove <name>              refused while it has machines or is the default
+pastor flock default <name>             new tasks and jobs go to <name>
+pastor machine add ... [--flock F]      default: the default flock
+pastor machine move <name> <flock>
+pastor machine list [--flock F]
+```
+
+These commands edit `flock.toml` in place: comments, order and layout that
+the edit does not touch stay as they were, and a running head picks the
+change up at once, as it does for `machine add|remove`. The first `flock add`
+on a file with no `[[flock]]` entry writes the implicit flock down as
+`default` first. `flock default` writes the old default flock onto every
+machine that named none, so changing where new work goes moves no machine.
+AGENTS in `flock list` needs a running head and is `-` without one.
+
+A task's flock is fixed when it is created: `--flock` on `pastor task run`, or
+`flock` under a job's `[dispatch]`; else the flock of the machine it is pinned
+to (`--machine`, a job's `machine`); else the default flock. `--machine` with
+a `--flock` the machine is not in is refused (`flock_mismatch`), as is a flock
+that does not exist (`unknown_flock`). A job whose flock does not fit fails
+its run before the connector is asked for anything, with the reason in
+`pastor job list`. `pastor task retry` keeps the flock of the task it copies.
+
+`pastor machine move` changes the flock of tasks dispatched after it; tasks
+already on the machine keep running there, and its connection stays up. A
+queued task pinned to a machine that has moved to another flock stays queued
+for its own flock, and the head logs a warning once.
+
 ## Events
 
 `pastor serve` appends every task, job and machine event to
@@ -198,12 +274,14 @@ A record, which is also what plugin event hooks will get on stdin:
   `job.failed`, `machine.connected`, `machine.lost`.
 - `task`: the full task row (the same object as `pastor task show --json`) at
   that moment, on `task.*` events; `null` otherwise or if the row is gone.
+  `task.flock` is the task's flock, so a hook can route work and personal
+  notifications apart.
 - `job`: the job name. For a task event it is the task's `job` (`run` for a
   one-off `pastor task run` task); for `job.failed`, the job that failed.
 - `machine`: on `machine.*` events, the machine's status as an entry of
   `machines` in `pastor machine list --json` shows it (`name`, `host`,
   `endpoint`, `channel`, `herdr_version`, `pastor_version`, `protocol`,
-  `error`, `live`, `max_agents`, `tags`); `null` on other events.
+  `error`, `live`, `max_agents`, `tags`, `flock`); `null` on other events.
   A task's machine is `task.machine`.
 
 Fields may be added; none will be renamed or removed. Unreadable lines (a
@@ -222,10 +300,13 @@ ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
 make install                         # pastor and fake-herdr into ~/.cargo/bin
 pastor machine add pi-3 user@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
 pastor machine add here --local
-pastor machine list                  # the head, then each machine: host, channel, herdr, pastor, agents
+pastor flock add work                # a second flock; the machines above stay in `default`
+pastor machine move pi-3 work
+pastor machine list                  # a line about the head, then each machine: host, flock, channel, herdr, pastor, agents
 pastor setup systemd                 # confirm, then install and enable --now; or `pastor serve &`
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
 pastor task run "Review the open PR" --agent-arg=--model --agent-arg=claude-opus-5-5
+pastor task run "Triage the inbox" --flock work   # only work machines take it
 mkdir -p ~/.config/pastor/jobs
 cat > ~/.config/pastor/jobs/hourly.toml <<'EOF'
 every = "1h"
@@ -258,7 +339,7 @@ expands it to the head's home first. A `command` machine cannot report a home,
 and neither can one whose shell has no absolute `$HOME`; give those absolute
 paths.
 
-`pastor task run` takes `--repo`, `--machine`, `--agent`, `--agent-arg`,
+`pastor task run` takes `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
 `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
 `--timeout` and `--json`. `--agent-arg` hands one argument to the agent,
 through herdr's `agent.start`; repeat it for more, in order. It always takes the
@@ -387,9 +468,9 @@ like connector logs.
 
 ```
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, defaults (all optional)
-~/.config/pastor/flock.toml       machines
+~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks (schema 3, with retry_of), seen keys, job state
+~/.local/state/pastor/pastor.db   tasks (schema 4, with retry_of and flock), seen keys, job state
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host

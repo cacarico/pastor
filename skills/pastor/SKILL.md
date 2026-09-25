@@ -5,7 +5,7 @@ description: "Drive pastor, a daemon that runs coding agents on a fleet of machi
 
 # pastor
 
-pastor runs coding agents on machines the user owns. One machine runs the head, `pastor serve`, which talks over ssh to the flock: machines listed in `flock.toml`, each running a herdr server. A task is one agent in one herdr pane, optionally in its own git worktree; a job is a TOML file that queues tasks on a schedule.
+pastor runs coding agents on machines the user owns. One machine runs the head, `pastor serve`, which talks over ssh to the machines listed in `flock.toml`, each running a herdr server. Every machine is in one flock, a named group; a task goes only to machines of its flock. A task is one agent in one herdr pane, optionally in its own git worktree; a job is a TOML file that queues tasks on a schedule.
 
 ## Learn the current CLI
 
@@ -16,6 +16,7 @@ pastor --help
 pastor task --help
 pastor job --help
 pastor machine --help
+pastor flock --help
 pastor events --help
 pastor setup --help
 ```
@@ -30,7 +31,7 @@ Runtime errors are one JSON object on stderr, `{"code": ..., "message": ...}`, w
 pastor machine list
 ```
 
-With a head running, it prints one row per machine: `NAME`, `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `PASTOR` (the pastor installed there, `-` when unknown), `AGENTS` (live tasks over `max_agents`), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head running, it says so on stderr and probes each machine directly instead: CHANNEL is then `probed` (herdr answered), `server down` (a local socket with no server), `unreachable` (ssh or transport failed) or `error` (herdr answered the ping with an error), and HERDR, PASTOR and AGENTS come from that probe. Report what it shows rather than starting `pastor serve` yourself, which is a long-running daemon.
+With a head running, it opens with a line about the head (its pastor and herdr versions, its host, how many machines follow), then one row per machine: `NAME`, `HOST`, `FLOCK`, `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `PASTOR` (the pastor installed there, `-` when unknown), `AGENTS` (live tasks over `max_agents`), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head running, it says so on stderr and probes each machine directly instead: CHANNEL is then `probed` (herdr answered), `server down` (a local socket with no server), `unreachable` (ssh or transport failed) or `error` (herdr answered the ping with an error), and HERDR, PASTOR and AGENTS come from that probe. Report what it shows rather than starting `pastor serve` yourself, which is a long-running daemon.
 
 ```bash
 pastor task list          # live tasks: queued, starting, running, blocked
@@ -48,7 +49,8 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
   --repo '~/work/api' --worktree --branch fix/flaky-ci --json
 ```
 
-- `--machine M` pins the task. `--tag T` (repeatable) instead restricts it to machines that carry every given tag in `flock.toml`; it is a filter, not a label on the task. With neither, any machine with a free slot takes it.
+- `--flock F` sends the task to that flock's machines only. Without it the task goes to the flock of `--machine`, else the default flock (`pastor flock list` marks it). `--machine` in another flock than `--flock` is refused with `flock_mismatch`.
+- `--machine M` pins the task. `--tag T` (repeatable) instead restricts it to machines that carry every given tag in `flock.toml`; it is a filter, not a label on the task. With neither, any machine of the task's flock with a free slot takes it.
 - `--repo` is a path on the machine that runs the agent. Quote a leading `~` so your shell does not expand it. pastor checks that it is a directory on that machine before it creates anything (`test -d` over ssh); a missing repo fails the task with `repo <path> does not exist on <machine>`. A `command` machine cannot be checked.
 - `--worktree` makes a git worktree of `--repo` for the task, on `--branch` or `pastor/t-N`. It needs `--repo` and the repo cloned on that machine.
 - `--agent-arg` passes one argument to the agent and always takes the next word, dashes included. Repeat it, in order.
@@ -104,7 +106,7 @@ tags = ["arm"]
 prompt = "It is {{ item.key }}. Run the suite and fix what broke. Task {{ task.id }}."
 ```
 
-`[dispatch]` takes the same things as `pastor task run`: `agent`, `agent_args`, `repo`, `worktree`, `branch`, `tags`, `machine`, `timeout`, plus `max_tasks_per_run` and the `prompt` template.
+`[dispatch]` takes the same things as `pastor task run`: `agent`, `agent_args`, `repo`, `worktree`, `branch`, `tags`, `flock`, `machine`, `timeout`, plus `max_tasks_per_run` and the `prompt` template.
 
 ```bash
 pastor job list            # schedule, enabled, last and next run, errors
@@ -115,18 +117,26 @@ pastor job reload          # re-read the files now instead of at the next tick
 pastor tick --dry-run --job hourly   # what a run would create, creating nothing
 ```
 
-The head picks up job file edits by itself. A file that stops parsing keeps its last good version and shows the error in `pastor job list`. It also re-reads `flock.toml` and `pastor.toml`, so `pastor machine add`, `pastor machine remove` and config edits need no restart (`pastor tick` reloads them too); one of those that stops parsing also keeps its last good version, but reports it in the daemon log only (`journalctl --user -u pastor`), not in `pastor job list`.
+The head picks up job file edits by itself. A file that stops parsing keeps its last good version and shows the error in `pastor job list`. It also re-reads `flock.toml` and `pastor.toml`, so `pastor machine add`, `pastor machine remove`, `pastor machine move`, the `pastor flock` commands and config edits need no restart (`pastor tick` reloads them too); one of those that stops parsing also keeps its last good version, but reports it in the daemon log only (`journalctl --user -u pastor`), not in `pastor job list`.
 
 ## The fleet
 
-`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2) and `tags`.
+`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2), `tags` and `flock`. `[[flock]]` entries (`name`, and `default = true` on one of them) declare the flocks; a machine with no `flock` is in the default one, and a file with no `[[flock]]` has a single flock named `default`.
 
 ```bash
-pastor machine add pi-3 fleet@pi-3 --max-agents 2 --tag arm --herdr
+pastor machine add pi-3 user@pi-3 --max-agents 2 --tag arm --herdr
 pastor machine add here --local
+pastor machine add pi-5 user@pi-5 --flock work
+pastor machine move pi-3 work   # new tasks only; tasks already on it stay
 pastor machine remove pi-3 --herdr
 pastor machine list        # connects to each machine now: ssh, herdr version, agents
+pastor flock list          # each flock: default, machines, live agents, queued tasks
+pastor flock add work [--default]
+pastor flock default work  # new tasks and jobs go there; machines stay put
+pastor flock remove work   # refused while it has machines or is the default
 ```
+
+These commands edit `flock.toml` in place, keeping its comments.
 
 Every machine needs a herdr server running, and the head needs passwordless ssh to it. Start herdr with `herdr server`, or better as a user service: `pastor setup systemd --herdr --yes` on that machine. The head itself runs as a service with `pastor setup systemd --yes`. Setup needs `--yes` when stdin is not a terminal. Ask the user before installing services.
 
@@ -152,7 +162,7 @@ You are a pastor task when `HERDR_ENV=1` is set, your herdr agent and workspace 
 
 ## When something goes wrong
 
-- A task stays `queued`: no connected machine carries all its tags or has a free slot. Compare `pastor machine list` with the task's tags. The head logs a warning after an hour.
+- A task stays `queued`: no connected machine of its flock carries all its tags or has a free slot. Compare `pastor machine list` (FLOCK, TAGS) with the task's flock and tags. The head logs a warning after an hour, and at once for a task pinned to a machine that has moved to another flock.
 - `failed` with `agent_pane_busy`: herdr refused to start the agent because the pane was not at an idle shell prompt.
 - `failed` with "agent t-N not found": the agent's pane vanished before it was done (closed by hand, herdr restarted, or the agent crashed).
 - `failed` soon after start: the agent is usually not installed, or not on the PATH herdr sees on that machine.
