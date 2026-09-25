@@ -229,7 +229,8 @@ struct Actor {
     rx: mpsc::Receiver<MachineCommand>,
     /// task id -> (the agent's `state_change_seq` when it was seen idle, if the
     /// observation carried one; when). Confirmed as Done after `settle` if the
-    /// agent is still idle at that same sequence.
+    /// agent is still idle at that same sequence; with no sequence, the first
+    /// check records one and starts the window over.
     pending_done: HashMap<i64, (Option<u64>, Instant)>,
     /// Has the actor connected successfully at least once (ever)?
     was_connected: bool,
@@ -889,7 +890,9 @@ impl Actor {
     /// the `state_change_seq` it had when it was seen going idle, and that the sequence
     /// is past the task's baseline (`next_state`). Only then is the task done. A newer
     /// sequence while still idle means it worked again in between, unseen by events
-    /// (a stream that fell behind, or polling): the window starts over.
+    /// (a stream that fell behind, or polling): the window starts over. So does an
+    /// unknown one (an idle event carries none): the window restarts from the
+    /// sequence listed now, so a done task always sat a full window at one sequence.
     async fn confirm_pending_done(&mut self) -> anyhow::Result<()> {
         let due: Vec<i64> = self
             .pending_done
@@ -918,7 +921,9 @@ impl Actor {
                 continue;
             };
             let idle_like = matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done);
-            if idle_like && seen_seq.is_some_and(|seq| seq != agent.state_change_seq) {
+            // No sequence yet (the candidate came from an event) is as good as a
+            // moved one: the agent may have worked again inside the window.
+            if idle_like && seen_seq != Some(agent.state_change_seq) {
                 self.pending_done
                     .insert(id, (Some(agent.state_change_seq), Instant::now()));
                 continue;
@@ -1101,12 +1106,15 @@ impl Actor {
                     ) {
                         // Never mark Done from a reconcile directly: the settle
                         // window applies here too. An entry from an idle event has
-                        // no sequence yet; record the one seen now, keeping its time.
+                        // no sequence yet; record the one seen now and start its
+                        // window here, since what came before it is unknown.
                         let entry = self
                             .pending_done
                             .entry(task.id)
                             .or_insert((None, Instant::now()));
-                        entry.0.get_or_insert(agent.state_change_seq);
+                        if entry.0.is_none() {
+                            *entry = (Some(agent.state_change_seq), Instant::now());
+                        }
                         continue;
                     }
                     self.apply(task, &observed_from(agent));
@@ -1595,6 +1603,68 @@ mod tests {
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
     }
 
+    /// An idle event carries no sequence, so the first settle check cannot tell
+    /// whether the agent worked again, unseen, inside the window. It must not
+    /// mark the task done: it records the sequence `agent.list` shows and starts
+    /// a new window from there. A moved sequence restarts the window again; an
+    /// unchanged one at the next check is done.
+    #[tokio::test]
+    async fn an_idle_event_without_a_sequence_waits_a_window_from_the_listed_one() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                // Keep reconcile out of the way: only settle checks list agents.
+                reconcile_every: Duration::from_secs(60),
+                ..settings_with_settle(Duration::from_millis(400))
+            },
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        let lists = || {
+            fake.requests()
+                .iter()
+                .filter(|r| r.method == "agent.list")
+                .count()
+        };
+        let before = lists();
+
+        // Idle event, no sequence; the agent's sequence is past the baseline.
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("first settle check", || lists() > before).await;
+        // The check is logged when it arrives; give it time to act.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "an unknown sequence starts a window, it does not finish one"
+        );
+
+        // Worked and went idle again inside the new window, unseen by events.
+        fake.set_status_silently(&pane, AgentStatus::Working);
+        fake.set_status_silently(&pane, AgentStatus::Idle);
+        wait_for("second settle check", || lists() > before + 1).await;
+        // The check is logged when it arrives; give it time to act.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "a moved sequence restarts the window"
+        );
+        assert!(!saw(&mut events, "task.done", t.id));
+
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        assert!(
+            lists() > before + 2,
+            "done needs a third check at an unchanged sequence"
+        );
+    }
     /// An agent that went idle and back to work within `settle` is not done,
     /// even when the flip back to work was missed on the event stream: the
     /// settle check sees `state_change_seq` moved past the value it recorded
