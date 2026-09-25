@@ -975,6 +975,12 @@ impl Daemon {
         if input.is_empty() {
             return IpcResponse::error("nothing_to_send", "give text, --key or --trust");
         }
+        if input.trust && (input.text.is_some() || !input.keys.is_empty()) {
+            return IpcResponse::error(
+                "usage_error",
+                "--trust sends the agent's own keys; give no text or --key with it",
+            );
+        }
         let task = match self.store.get_task(id) {
             Ok(Some(t)) => t,
             Ok(None) => return IpcResponse::error("task_not_found", format!("t-{id}")),
@@ -1002,7 +1008,19 @@ impl Daemon {
             );
         }
         let what = describe_input(&input);
+        let trust = input.trust;
         match handle.send(id, input).await {
+            Ok(t) if trust => IpcResponse::Text(match &t.spec.repo {
+                Some(repo) => format!(
+                    "sent the trust keys to {}; {repo} on {} is trusted from now on",
+                    t.display_id(),
+                    handle.name
+                ),
+                None => format!(
+                    "sent the trust keys to {}; it has no --repo, so nothing was saved",
+                    t.display_id()
+                ),
+            }),
             Ok(t) => IpcResponse::Text(format!("sent {what} to {}", t.display_id())),
             Err(err) => match err.downcast_ref::<SendRefused>() {
                 Some(r) => IpcResponse::error(r.code, r),
@@ -2486,6 +2504,16 @@ mod tests {
             })
             .await;
         assert_eq!(error_code(resp), "nothing_to_send");
+        let resp = d
+            .handle(IpcRequest::TaskSend {
+                id: t.id,
+                input: crate::machine::SendInput {
+                    trust: true,
+                    ..keys
+                },
+            })
+            .await;
+        assert_eq!(error_code(resp), "usage_error");
     }
 
     #[tokio::test]

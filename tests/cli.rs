@@ -38,6 +38,12 @@ fn start() -> Env {
 /// Like `start()`, but writes each `(name, text)` to `config/jobs/<name>.toml`
 /// before spawning `pastor serve`, so the scheduler picks the jobs up at start.
 fn start_with_jobs(jobs: &[(&str, &str)]) -> Env {
+    start_with(jobs, &[])
+}
+
+/// Like `start_with_jobs`, with extra env for the fake herdr
+/// (`FAKE_HERDR_TRUST_PROMPT`, ...).
+fn start_with(jobs: &[(&str, &str)], herdr_env: &[(&str, &str)]) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
@@ -67,6 +73,7 @@ fn start_with_jobs(jobs: &[(&str, &str)]) -> Env {
         // this run exercises dispatch's readiness wait and not just the happy
         // path where the agent is up the instant it is started.
         .env("FAKE_HERDR_READY_MS", "200")
+        .envs(herdr_env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -2114,4 +2121,73 @@ fn task_send_types_into_a_live_task_and_refuses_a_finished_one() {
     assert_eq!(out.status.code(), Some(1));
     let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
     assert_eq!(err["code"], "task_not_live", "{err}");
+}
+
+/// Polls `task show` until `task` is in `state`.
+fn wait_state(env: &Env, task: &str, state: &str) -> serde_json::Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let out = env.cmd(&["task", "show", task, "--json"]);
+        let t: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if t["state"] == state {
+            return t;
+        }
+        assert!(Instant::now() < deadline, "task never became {state}: {t}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn task_send_trust_answers_the_prompt_and_trust_list_and_remove_show_it() {
+    let env = start_with(&[], &[("FAKE_HERDR_TRUST_PROMPT", "Down,Enter")]);
+    let out = env.cmd(&["task", "run", "hi", "--repo", "/tmp/app", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_state(&env, "t-1", "blocked");
+
+    let out = env.cmd(&["task", "send", "t-1", "--trust", "--key", "Enter"]);
+    assert_eq!(out.status.code(), Some(2), "--trust takes no other input");
+    let out = env.cmd(&["task", "send", "t-1", "--trust"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("trusted"));
+    // Answered, the agent gets the prompt it was started for.
+    wait_state(&env, "t-1", "running");
+    assert_eq!(
+        herdr_calls(&env, "pane.send_keys")[0]["keys"],
+        serde_json::json!(["Down", "Enter"])
+    );
+
+    let out = env.cmd(&["trust", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list[0]["machine"], "fake");
+    assert_eq!(list[0]["repo"], "/tmp/app");
+    let out = env.cmd(&["trust", "list"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("/tmp/app"));
+
+    let out = env.cmd(&["trust", "remove", "fake", "/tmp/app"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = env.cmd(&["trust", "remove", "fake", "/tmp/app"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["code"], "not_trusted", "{err}");
+    let out = env.cmd(&["trust", "list", "--json"]);
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list, serde_json::json!([]));
 }

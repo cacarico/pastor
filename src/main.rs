@@ -80,6 +80,11 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::plugin::cli::PluginCmd,
     },
+    /// The repos whose folder-trust prompt pastor answers on each machine
+    Trust {
+        #[command(subcommand)]
+        cmd: pastor::trust_cli::TrustCmd,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -299,6 +304,7 @@ fn main() {
             Command::Events(args) => pastor::events::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Plugin { cmd } => pastor::plugin::cli::run(&paths, cmd).await,
+            Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd),
         }
     });
     if let Err(err) = result {

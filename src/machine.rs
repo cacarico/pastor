@@ -247,6 +247,10 @@ pub struct SendInput {
     /// Named keys (`Enter`, `Down`, `esc`, `ctrl+c`), pressed after the text.
     #[serde(default)]
     pub keys: Vec<String>,
+    /// Send the agent's trust keys instead (`[agents] trust_keys`), and save
+    /// the task's (machine, repo) as trusted. Never with text or keys.
+    #[serde(default)]
+    pub trust: bool,
 }
 
 impl SendInput {
@@ -257,7 +261,7 @@ impl SendInput {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.is_none() && self.keys.is_empty()
+        self.text.is_none() && self.keys.is_empty() && !self.trust
     }
 
     /// What `task.input` records: the key names and the length of the text,
@@ -1229,10 +1233,25 @@ impl Actor {
             };
             return (Err(err.into()), false);
         }
-        let keys = input.key_sequence();
+        let (text, keys, detail) = if input.trust {
+            let Some(keys) = self.settings.agents.trust_keys(&task.spec.agent) else {
+                let err = SendRefused {
+                    code: "no_trust_keys",
+                    message: format!(
+                        "agent {} has no trust_keys; set [agents.{}] trust_keys in pastor.toml",
+                        task.spec.agent, task.spec.agent
+                    ),
+                };
+                return (Err(err.into()), false);
+            };
+            let detail = serde_json::json!({"keys": keys, "trust": true});
+            (None, keys, detail)
+        } else {
+            (input.text.clone(), input.key_sequence(), input.detail())
+        };
         let timeout = self.settings.request_timeout;
         let sent = tokio::time::timeout(timeout, async {
-            if let Some(text) = &input.text {
+            if let Some(text) = &text {
                 self.connector.pane_send_text(&pane, text).await?;
             }
             if !keys.is_empty() {
@@ -1249,7 +1268,18 @@ impl Actor {
             }
             Err(_) => return (Err(TimedOut("pane input", timeout).into()), true),
         }
-        self.emit_with("task.input", Some(task.id), Some(input.detail()));
+        self.emit_with("task.input", Some(task.id), Some(detail));
+        if input.trust {
+            // The prompt is answered: saved trust must not answer it again.
+            if let Err(err) = self.store.claim_trust_sent(task.id) {
+                return (Err(err), false);
+            }
+            if let Some(repo) = &task.spec.repo
+                && let Err(err) = self.store.trust_repo(&self.name, repo)
+            {
+                return (Err(err), false);
+            }
+        }
         (Ok(task), false)
     }
 
@@ -3401,6 +3431,86 @@ mod tests {
         );
         assert_eq!(evs[2].detail, Some(serde_json::json!({"text_len": 4})));
         assert!(!format!("{evs:?}").contains("secret"));
+    }
+
+    fn repo_task(store: &Store, agent: &str, repo: Option<&str>) -> Task {
+        store
+            .insert_task(NewTask {
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    agent: agent.into(),
+                    repo: repo.map(str::to_string),
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    fn trust() -> SendInput {
+        SendInput {
+            trust: true,
+            ..Default::default()
+        }
+    }
+
+    /// The folder-trust dialog answered by hand: `--trust` sends the agent's
+    /// trust keys, the agent goes on to get its prompt, and the repo is saved
+    /// as trusted on this machine.
+    #[tokio::test]
+    async fn send_trust_answers_the_prompt_and_saves_the_repo() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h
+            .dispatch(repo_task(&store, "claude", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        h.send(t.id, trust()).await.unwrap();
+        assert_eq!(
+            fake.pane_input(t.pane_id.as_deref().unwrap()),
+            [PaneInput::Keys(vec!["Down".into(), "Enter".into()])]
+        );
+        assert!(store.is_trusted("m", "~/src/app").unwrap());
+        wait_for("the pending prompt delivered", || {
+            state_of(&store, t.id) == TaskState::Running
+        })
+        .await;
+        let evs = input_events(&mut events);
+        assert_eq!(
+            evs[0].detail,
+            Some(serde_json::json!({"keys": ["Down", "Enter"], "trust": true}))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_trust_needs_trust_keys_and_saves_nothing_without_a_repo() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let codex = h
+            .dispatch(repo_task(&store, "codex", Some("/r")).id)
+            .await
+            .unwrap();
+        let err = h.send(codex.id, trust()).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<SendRefused>().map(|r| r.code),
+            Some("no_trust_keys"),
+            "{err:#}"
+        );
+        assert!(calls(&fake, "pane.send_keys").is_empty());
+
+        let bare = h
+            .dispatch(repo_task(&store, "claude", None).id)
+            .await
+            .unwrap();
+        h.send(bare.id, trust()).await.unwrap();
+        assert_eq!(calls(&fake, "pane.send_keys").len(), 1);
+        assert!(store.trusted_repos().unwrap().is_empty());
     }
 
     #[tokio::test]

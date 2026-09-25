@@ -45,6 +45,9 @@ pub struct SendArgs {
     /// Type the text without pressing Enter after it
     #[arg(long, requires = "text")]
     pub no_enter: bool,
+    /// Accept the agent's folder-trust prompt with its trust keys, and trust the task's repo on its machine from now on
+    #[arg(long, group = "send_input", conflicts_with_all = ["text", "keys", "no_enter"])]
+    pub trust: bool,
     #[arg(long)]
     pub json: bool,
 }
@@ -146,13 +149,14 @@ pub async fn close(paths: &Paths, a: CloseArgs) -> anyhow::Result<()> {
     }
 }
 
-/// `pastor task send t-N [TEXT] [--key K]... [--no-enter]`.
+/// `pastor task send t-N [TEXT] [--key K]... [--no-enter] | --trust`.
 pub async fn send(paths: &Paths, a: SendArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
     let input = SendInput {
         enter: a.text.is_some() && !a.no_enter,
         text: a.text,
         keys: a.keys,
+        trust: a.trust,
     };
     match ask(paths, IpcRequest::TaskSend { id, input }).await? {
         IpcResponse::Text(msg) if a.json => {

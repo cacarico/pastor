@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -31,6 +31,24 @@ const V2_TABLES: &str = "CREATE TABLE IF NOT EXISTS seen (
         failures INTEGER NOT NULL DEFAULT 0,
         backoff_until TEXT
      );";
+
+/// Schema 5: the (machine, repo) pairs whose folder-trust prompt pastor
+/// answers on its own. `repo` is a task's `--repo` as given, so every
+/// worktree task of one repo shares its entry.
+const V5_TABLES: &str = "CREATE TABLE IF NOT EXISTS trusted_repos (
+        machine TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        trusted_at TEXT NOT NULL,
+        PRIMARY KEY (machine, repo)
+     );";
+
+/// One saved trust, as `pastor trust list` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedRepo {
+    pub machine: String,
+    pub repo: String,
+    pub trusted_at: DateTime<Utc>,
+}
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -195,6 +213,7 @@ impl Store {
                         prompt_pending INTEGER NOT NULL DEFAULT 0,
                         retry_of INTEGER,
                         flock TEXT,
+                        trust_sent INTEGER NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -204,6 +223,7 @@ impl Store {
                      CREATE INDEX IF NOT EXISTS tasks_machine ON tasks(machine);",
                 )?;
                 tx.execute_batch(V2_TABLES)?;
+                tx.execute_batch(V5_TABLES)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
@@ -211,7 +231,10 @@ impl Store {
             }
             // The pastor before plan 2 already wrote version 2 without the
             // job tables, so a current file still gets them if missing.
-            Some(v) if v == SCHEMA_VERSION => tx.execute_batch(V2_TABLES)?,
+            Some(v) if v == SCHEMA_VERSION => {
+                tx.execute_batch(V2_TABLES)?;
+                tx.execute_batch(V5_TABLES)?;
+            }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
                 // first whatever the version: a version-2 file from before
@@ -239,6 +262,12 @@ impl Store {
                 // fills them in once the caller has read flock.toml.
                 if v < 4 {
                     add_column(&tx, "flock", "flock TEXT")?;
+                }
+                // Saved folder trust, and whether a task has had its trust
+                // keys sent (`claim_trust_sent`).
+                if v < 5 {
+                    tx.execute_batch(V5_TABLES)?;
+                    add_column(&tx, "trust_sent", "trust_sent INTEGER NOT NULL DEFAULT 0")?;
                 }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -656,6 +685,66 @@ impl Store {
         self.conn.lock().unwrap().execute_batch(sql).unwrap();
     }
 
+    /// Save `repo` on `machine` as trusted. Returns whether it was new.
+    pub fn trust_repo(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO trusted_repos (machine, repo, trusted_at) VALUES (?1, ?2, ?3)",
+            params![machine, repo, Utc::now().to_rfc3339()],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn is_trusted(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM trusted_repos WHERE machine = ?1 AND repo = ?2)",
+            params![machine, repo],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Every saved trust, by machine then repo.
+    pub fn trusted_repos(&self) -> anyhow::Result<Vec<TrustedRepo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT machine, repo, trusted_at FROM trusted_repos ORDER BY machine, repo",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let at: String = r.get(2)?;
+            Ok(TrustedRepo {
+                machine: r.get(0)?,
+                repo: r.get(1)?,
+                trusted_at: DateTime::parse_from_rfc3339(&at)
+                    .map(|d| d.with_timezone(&Utc))
+                    .map_err(conversion_failure)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Forget a saved trust. Returns whether there was one.
+    pub fn untrust(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM trusted_repos WHERE machine = ?1 AND repo = ?2",
+            params![machine, repo],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Mark task `id` as having had its trust keys sent. True only for the
+    /// call that set it, so the keys go to a task once, across restarts.
+    /// `update_task` never writes the column, so no stale copy resets it.
+    pub fn claim_trust_sent(&self, id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE tasks SET trust_sent = 1 WHERE id = ?1 AND trust_sent = 0",
+            params![id],
+        )?;
+        Ok(n == 1)
+    }
+
     #[cfg(test)]
     pub(crate) fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
@@ -1048,11 +1137,11 @@ mod tests {
             s.insert_task(new_task("run")).unwrap();
             s.execute_raw("DROP TABLE seen; DROP TABLE job_state;");
         }
-        assert_eq!(table_names(&path), vec!["meta", "tasks"]);
+        assert_eq!(table_names(&path), vec!["meta", "tasks", "trusted_repos"]);
         let s = Store::open(&path).unwrap();
         assert_eq!(
             table_names(&path),
-            vec!["job_state", "meta", "seen", "tasks"]
+            vec!["job_state", "meta", "seen", "tasks", "trusted_repos"]
         );
         assert!(!s.is_seen("j", "k").unwrap());
         assert!(s.job_state("j").unwrap().is_none());
@@ -1085,7 +1174,7 @@ mod tests {
         drop(Store::open(&fresh).unwrap());
         assert_eq!(
             table_names(&fresh),
-            vec!["job_state", "meta", "seen", "tasks"]
+            vec!["job_state", "meta", "seen", "tasks", "trusted_repos"]
         );
     }
 
@@ -1375,7 +1464,10 @@ mod tests {
             );
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "4");
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
         assert_eq!(s.get_task(1).unwrap().unwrap().flock, None);
         let fresh = s
             .insert_task(NewTask {
@@ -1408,6 +1500,71 @@ mod tests {
         set_state(&s, t.id, TaskState::Failed);
         let r = s.insert_retry(t.id).unwrap();
         assert_eq!(r.flock.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn trusted_repos_are_saved_listed_and_removed() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(!s.is_trusted("m", "~/src/app").unwrap());
+        assert!(s.trust_repo("m", "~/src/app").unwrap(), "newly trusted");
+        assert!(!s.trust_repo("m", "~/src/app").unwrap(), "already trusted");
+        s.trust_repo("a", "/srv/x").unwrap();
+        assert!(s.is_trusted("m", "~/src/app").unwrap());
+        // Keyed on both: the same repo on another machine is another folder.
+        assert!(!s.is_trusted("a", "~/src/app").unwrap());
+        let list: Vec<(String, String)> = s
+            .trusted_repos()
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.machine, t.repo))
+            .collect();
+        assert_eq!(
+            list,
+            [
+                ("a".to_string(), "/srv/x".to_string()),
+                ("m".to_string(), "~/src/app".to_string())
+            ]
+        );
+        assert!(s.untrust("m", "~/src/app").unwrap());
+        assert!(!s.untrust("m", "~/src/app").unwrap());
+        assert!(!s.is_trusted("m", "~/src/app").unwrap());
+    }
+
+    #[test]
+    fn trust_is_sent_to_a_task_once() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        assert!(s.claim_trust_sent(t.id).unwrap());
+        assert!(!s.claim_trust_sent(t.id).unwrap());
+        // A write of the row from a copy read before does not reset it.
+        let mut copy = s.get_task(t.id).unwrap().unwrap();
+        copy.error = Some("x".into());
+        s.update_task(&mut copy).unwrap();
+        assert!(!s.claim_trust_sent(t.id).unwrap());
+    }
+
+    /// A v4 database predates saved trust; opening it adds the table and
+    /// the column.
+    #[test]
+    fn a_v4_database_gains_saved_trust() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "DROP TABLE trusted_repos;
+                 ALTER TABLE tasks DROP COLUMN trust_sent;
+                 UPDATE meta SET value = '4' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        assert!(s.trust_repo("m", "/r").unwrap());
+        assert!(s.claim_trust_sent(1).unwrap());
     }
 
     /// A v2 database predates `retry_of`; opening it adds the column empty.
@@ -1466,9 +1623,11 @@ mod tests {
                 "ALTER TABLE tasks DROP COLUMN prompt_pending;
                  ALTER TABLE tasks DROP COLUMN retry_of;
                  ALTER TABLE tasks DROP COLUMN flock;
+                 ALTER TABLE tasks DROP COLUMN trust_sent;
+                 DROP TABLE trusted_repos;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '4' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '5' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -1489,10 +1648,16 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(
-            !cols
-                .iter()
-                .any(|c| c == "prompt_pending" || c == "retry_of" || c == "flock"),
+            !cols.iter().any(|c| c == "prompt_pending"
+                || c == "retry_of"
+                || c == "flock"
+                || c == "trust_sent"),
             "rolled back: {cols:?}"
+        );
+        drop(conn);
+        assert!(
+            !table_names(&path).contains(&"trusted_repos".to_string()),
+            "rolled back"
         );
     }
 
