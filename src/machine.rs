@@ -121,6 +121,9 @@ pub struct MachineSettings {
     /// While `Polling`, how often `agent.list` reconciles. The daemon passes its
     /// `tick`, the spec's "each tick for a polling machine".
     pub poll_every: Duration,
+    /// How long a `done` task keeps its pane before reconcile closes it
+    /// (`close_done_after` in `pastor.toml`). `None` turns auto-close off.
+    pub close_done_after: Option<Duration>,
 }
 
 impl Default for MachineSettings {
@@ -133,6 +136,7 @@ impl Default for MachineSettings {
             request_timeout: Duration::from_secs(60),
             agent_ready_timeout: Duration::from_secs(30),
             poll_every: Duration::from_secs(10),
+            close_done_after: Some(Duration::from_secs(15 * 60)),
         }
     }
 }
@@ -1755,6 +1759,7 @@ mod tests {
             request_timeout: Duration::from_secs(5),
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
+            close_done_after: None,
         }
     }
 

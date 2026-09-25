@@ -214,6 +214,10 @@ pub struct PastorConfig {
     /// How long dispatch waits between `agent.start` and a prompt herdr
     /// accepts. Runs inside `request_timeout`, so it must be shorter.
     pub agent_ready_timeout: String,
+    /// How long a `done` task keeps its pane before pastor closes it, so
+    /// `pastor task attach` can still show the agent's last screen. `never`
+    /// turns auto-close off.
+    pub close_done_after: String,
     pub defaults: Defaults,
 }
 
@@ -225,6 +229,7 @@ impl Default for PastorConfig {
             reconcile_every: "60s".into(),
             request_timeout: "60s".into(),
             agent_ready_timeout: "30s".into(),
+            close_done_after: "15m".into(),
             defaults: Defaults::default(),
         }
     }
@@ -269,7 +274,11 @@ impl PastorConfig {
             ("request_timeout", &cfg.request_timeout, false),
             ("agent_ready_timeout", &cfg.agent_ready_timeout, false),
             ("defaults.timeout", &cfg.defaults.timeout, true),
+            ("close_done_after", &cfg.close_done_after, false),
         ] {
+            if name == "close_done_after" && v == CLOSE_NEVER {
+                continue;
+            }
             let d = parse_duration(v)
                 .map_err(|e| anyhow::anyhow!("{}: {name}: {e}", path.display()))?;
             if !zero_ok && d.is_zero() {
@@ -308,6 +317,16 @@ impl PastorConfig {
             &PastorConfig::default().request_timeout,
         )
     }
+    /// `None` when auto-close is off (`never`).
+    pub fn close_done_after_duration(&self) -> Option<Duration> {
+        if self.close_done_after == CLOSE_NEVER {
+            return None;
+        }
+        Some(duration_or_default(
+            &self.close_done_after,
+            &PastorConfig::default().close_done_after,
+        ))
+    }
     pub fn agent_ready_timeout_duration(&self) -> Duration {
         duration_or_default(
             &self.agent_ready_timeout,
@@ -315,6 +334,9 @@ impl PastorConfig {
         )
     }
 }
+
+/// The `close_done_after` value that turns auto-close off.
+const CLOSE_NEVER: &str = "never";
 
 /// Parse `value`, falling back to `default` (assumed valid) if `value` is bad.
 fn duration_or_default(value: &str, default: &str) -> Duration {
@@ -531,6 +553,43 @@ mod tests {
             PathBuf::from("/tmp/s/plugins/support")
         );
         assert_eq!(p.runs_dir("support"), PathBuf::from("/tmp/s/runs/support"));
+    }
+
+    #[test]
+    fn close_done_after_defaults_to_fifteen_minutes_and_never_disables() {
+        let d = PastorConfig::default();
+        assert_eq!(d.close_done_after, "15m");
+        assert_eq!(
+            d.close_done_after_duration(),
+            Some(Duration::from_secs(15 * 60))
+        );
+        let c = PastorConfig {
+            close_done_after: "never".into(),
+            ..Default::default()
+        };
+        assert_eq!(c.close_done_after_duration(), None);
+    }
+
+    #[test]
+    fn close_done_after_parses_never_and_rejects_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "close_done_after = \"never\"\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.close_done_after_duration(), None);
+        std::fs::write(&path, "close_done_after = \"2h\"\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.close_done_after_duration(),
+            Some(Duration::from_secs(7200))
+        );
+        std::fs::write(&path, "close_done_after = \"0s\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("close_done_after"), "{err}");
+        assert!(err.contains("must not be zero"), "{err}");
+        std::fs::write(&path, "close_done_after = \"later\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("close_done_after"), "{err}");
     }
 
     #[test]

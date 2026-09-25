@@ -38,6 +38,7 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         request_timeout: config.request_timeout_duration(),
         agent_ready_timeout: config.agent_ready_timeout_duration(),
         poll_every: config.tick_duration(),
+        close_done_after: config.close_done_after_duration(),
         ..Default::default()
     }
 }
@@ -1091,6 +1092,7 @@ mod tests {
             request_timeout: Duration::from_secs(5),
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
+            close_done_after: None,
         }
     }
 
