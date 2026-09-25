@@ -100,6 +100,12 @@ pub struct DispatchSpec {
     pub tags: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Work on in the checkout of `branch` when it is still on disk, instead
+    /// of creating it. Only `Store::insert_retry` sets it, and only for a
+    /// retry of a failed task: that task's agent is gone and its work is in
+    /// the checkout. A stale task's agent may still be at work there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reopen_worktree: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -309,6 +315,7 @@ mod tests {
                 machine: None,
                 tags: vec![],
                 timeout_secs: 10,
+                reopen_worktree: false,
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),

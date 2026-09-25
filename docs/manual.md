@@ -187,8 +187,10 @@ still be running. The retry of a failed worktree task works on the same
 branch (`pastor/t-4` unless the task named its own) and, when the old
 checkout is still on disk, in that checkout: herdr's `worktree.open`
 instead of `worktree.create`, which git would refuse with "already exists".
-A checkout removed since is created again. A stale task's agent is still
-working in its checkout, so its retry gets a branch of its own. `pastor task close
+A checkout removed since is created again. A stale task's agent may still
+be working in its checkout, so its retry never reopens it: it gets a branch
+of its own (`pastor/t-<new id>`, even when the task named one) and a new
+worktree. `pastor task close
 t-4` closes the task's pane (and the agent in it) and marks it `closed`; a
 queued task only has its row closed. `--remove-worktree` removes the task's
 worktree instead, which closes its workspace, pane included. herdr refuses a

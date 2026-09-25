@@ -185,11 +185,12 @@ async fn dispatch_steps(
     Ok(outcome)
 }
 
-/// The workspace of a worktree task. A retry goes back to the checkout of
-/// the task it retries when that is still on disk (`Store::insert_retry` pins
-/// the branch): the failed task's work is there, and `worktree.create` would
-/// fail on it with git's "already exists". Anything else, or a checkout
-/// removed since, gets a new one.
+/// The workspace of a worktree task. A retry of a failed task goes back to
+/// that task's checkout when it is still on disk (`Store::insert_retry` pins
+/// the branch and sets `reopen_worktree`): the failed task's work is there,
+/// and `worktree.create` would fail on it with git's "already exists".
+/// Anything else, a stale task's retry included, or a checkout removed
+/// since, gets a new one.
 async fn open_worktree(
     conn: &dyn Connector,
     task: &Task,
@@ -197,7 +198,7 @@ async fn open_worktree(
     branch: &str,
     name: &str,
 ) -> Result<Created, DispatchError> {
-    if task.retry_of.is_some()
+    if task.spec.reopen_worktree
         && conn
             .worktree_list(repo)
             .await?
@@ -443,6 +444,7 @@ mod tests {
             machine: None,
             tags: vec![],
             timeout_secs: 60,
+            reopen_worktree: false,
         }
     }
 

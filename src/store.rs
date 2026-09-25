@@ -396,8 +396,10 @@ impl Store {
     /// A failed worktree task's branch is pinned to the one `of` worked on
     /// (its own, or `pastor/t-<of>` by default), so the retry, and a retry of
     /// it, goes back to that checkout (see `dispatch`) rather than a fresh
-    /// branch. A stale task's agent is still at work in its checkout, so its
-    /// retry keeps a branch of its own.
+    /// branch, and marked `reopen_worktree`. A stale task's agent may still
+    /// be at work in its checkout, so its retry drops the branch, even one
+    /// the job named, and gets its own (`pastor/t-<new id>`) and a new
+    /// worktree; it never reopens.
     pub fn insert_retry(&self, of: i64) -> Result<Task, RetryError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
@@ -406,11 +408,13 @@ impl Store {
         let n = conn.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, state, retry_of, created_at, updated_at)
              SELECT job, item, prompt,
-                    CASE WHEN state = 'failed'
-                              AND COALESCE(json_extract(spec, '$.worktree'), 0) != 0
-                              AND json_extract(spec, '$.branch') IS NULL
-                         THEN json_set(spec, '$.branch', 'pastor/t-' || id)
-                         ELSE spec END,
+                    CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
+                         THEN json_remove(spec, '$.reopen_worktree')
+                         WHEN state = 'failed'
+                         THEN json_set(spec,
+                                       '$.branch', COALESCE(json_extract(spec, '$.branch'), 'pastor/t-' || id),
+                                       '$.reopen_worktree', json('true'))
+                         ELSE json_remove(spec, '$.branch', '$.reopen_worktree') END,
                     flock, 'queued', id, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now],
@@ -904,6 +908,7 @@ mod tests {
             machine: None,
             tags: vec!["fast".into()],
             timeout_secs: 60,
+            reopen_worktree: false,
         }
     }
 
@@ -1537,9 +1542,10 @@ mod tests {
         assert_eq!(r.flock.as_deref(), Some("work"));
     }
 
-    /// A failed worktree task's retry keeps its branch; a stale one's does
-    /// not (its agent is still in that checkout), and neither does a task
-    /// without a worktree or with a branch of its own.
+    /// A failed worktree task's retry keeps its branch and may reopen its
+    /// checkout. A stale one's may not (its agent may still be at work in
+    /// that checkout), so it gets a branch of its own, even over one the job
+    /// named. A task without a worktree has nothing to reopen.
     #[test]
     fn a_retry_of_a_failed_worktree_task_pins_its_branch() {
         let s = Store::open_in_memory().unwrap();
@@ -1550,15 +1556,31 @@ mod tests {
             n.spec.branch = branch.map(str::to_string);
             let t = s.insert_task(n).unwrap();
             set_state(&s, t.id, state);
-            s.insert_retry(t.id).unwrap().spec.branch
+            let r = s.insert_retry(t.id).unwrap();
+            (r.spec.branch, r.spec.reopen_worktree)
         };
         let failed = task(true, None, TaskState::Failed);
-        assert_eq!(failed.as_deref(), Some("pastor/t-1"));
-        assert_eq!(task(true, None, TaskState::Stale), None);
-        assert_eq!(task(false, None, TaskState::Failed), None);
+        assert_eq!(failed, (Some("pastor/t-1".into()), true));
+        assert_eq!(task(true, None, TaskState::Stale), (None, false));
+        assert_eq!(task(false, None, TaskState::Failed), (None, false));
         assert_eq!(
-            task(true, Some("fix/x"), TaskState::Failed).as_deref(),
-            Some("fix/x")
+            task(true, Some("fix/x"), TaskState::Failed),
+            (Some("fix/x".into()), true)
+        );
+        assert_eq!(task(true, Some("fix/x"), TaskState::Stale), (None, false));
+
+        // A stale retry of a reopening retry reopens nothing.
+        let mut n = new_task("run");
+        n.spec.repo = Some("/r".into());
+        n.spec.worktree = true;
+        let t = s.insert_task(n).unwrap();
+        set_state(&s, t.id, TaskState::Failed);
+        let r = s.insert_retry(t.id).unwrap();
+        set_state(&s, r.id, TaskState::Stale);
+        let again = s.insert_retry(r.id).unwrap();
+        assert_eq!(
+            (again.spec.branch, again.spec.reopen_worktree),
+            (None, false)
         );
     }
 
@@ -1834,7 +1856,19 @@ mod tests {
             assert_eq!(r.state, TaskState::Queued);
             assert_eq!((r.job.as_str(), r.prompt.as_str()), ("j", "p"));
             assert_eq!(r.item, item);
-            assert_eq!(r.spec, spec());
+            // What a retry changes in the spec: see
+            // `a_retry_of_a_failed_worktree_task_pins_its_branch`.
+            let copied = match state {
+                TaskState::Failed => DispatchSpec {
+                    reopen_worktree: true,
+                    ..spec()
+                },
+                _ => DispatchSpec {
+                    branch: None,
+                    ..spec()
+                },
+            };
+            assert_eq!(r.spec, copied);
             assert_eq!((r.machine, r.pane_id, r.error), (None, None, None));
             assert_eq!(s.get_task(r.id).unwrap().unwrap().retry_of, Some(old.id));
         }

@@ -36,6 +36,7 @@ fn task(id: i64) -> Task {
                 machine: None,
                 tags: vec![],
                 timeout_secs: 60,
+                reopen_worktree: false,
             },
             flock: "default".into(),
         })
@@ -241,6 +242,7 @@ async fn the_daemon_writes_the_events_log() {
                 machine: None,
                 tags: vec![],
                 timeout_secs: 60,
+                reopen_worktree: false,
             },
             flock: None,
         },

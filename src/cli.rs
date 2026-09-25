@@ -753,6 +753,7 @@ mod tests {
             machine: None,
             tags: vec![],
             timeout_secs: 60,
+            reopen_worktree: false,
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -803,6 +804,7 @@ mod tests {
             machine: None,
             tags: vec!["fast".into()],
             timeout_secs: 7200,
+            reopen_worktree: false,
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -838,6 +840,7 @@ mod tests {
             machine: None,
             tags: vec![],
             timeout_secs: 60,
+            reopen_worktree: false,
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);

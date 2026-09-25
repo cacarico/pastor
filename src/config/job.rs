@@ -163,6 +163,7 @@ impl Job {
                 machine: d.machine,
                 tags: d.tags,
                 timeout_secs: timeout.as_secs(),
+                reopen_worktree: false,
             },
         })
     }

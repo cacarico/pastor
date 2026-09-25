@@ -2367,6 +2367,7 @@ mod tests {
             machine: None,
             tags: vec![],
             timeout_secs: 3600,
+            reopen_worktree: false,
         }
     }
 
@@ -3209,6 +3210,35 @@ mod tests {
         let created = calls(&fake, "worktree.create");
         assert_eq!(created.len(), 2);
         assert_eq!(created[1]["branch"], format!("pastor/t-{}", first.id));
+    }
+
+    /// A stale task may still have its agent at work in its checkout, so its
+    /// retry never reopens it, even on a branch the job names: it gets a
+    /// branch and a worktree of its own.
+    #[tokio::test]
+    async fn a_retry_of_a_stale_task_gets_its_own_worktree() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let mut task = worktree_task(&store);
+        task.spec.branch = Some("fix/x".into());
+        store.update_task(&mut task).unwrap();
+        let first = h.dispatch(task.id).await.unwrap();
+        store
+            .update_task(&mut Task {
+                state: TaskState::Stale,
+                ..store.get_task(first.id).unwrap().unwrap()
+            })
+            .unwrap();
+
+        let retry = store.insert_retry(first.id).unwrap();
+        let t = h.dispatch(retry.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+        assert!(calls(&fake, "worktree.open").is_empty());
+        let created = calls(&fake, "worktree.create");
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[0]["branch"], "fix/x");
+        assert_eq!(created[1]["branch"], format!("pastor/t-{}", retry.id));
     }
 
     #[tokio::test]
