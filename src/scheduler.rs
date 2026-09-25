@@ -693,6 +693,8 @@ impl Scheduler {
                             tokio::spawn(async move {
                                 let _ = reply.send(reports.await);
                             });
+                            // The reload above may have changed the interval.
+                            retime(&mut tick, self.tick);
                         }
                         SchedulerCommand::Fire { name, reply } => {
                             self.reload();
@@ -2319,6 +2321,34 @@ mod tests {
             Duration::from_secs(30),
             "a manual tick must also pick up a changed interval"
         );
+    }
+
+    /// Copilot 4102963075: once `pastor tick` picks up a new interval, the
+    /// timer runs at it. Here the interval drops from an hour to a second, so
+    /// only a retimed timer applies the flock edit made after the manual tick.
+    #[tokio::test]
+    async fn manual_tick_retimes_the_timer_to_a_new_interval() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (s, _tmp) = managed_scheduler(&store);
+        std::fs::write(s.paths.config_file(), "tick = \"1h\"\n").unwrap();
+        let fleet = s.fleet.clone();
+        let paths = s.paths.clone();
+        let handle = s.spawn();
+        // The first timer tick is immediate and reads the hour-long interval.
+        handle.job_list().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        std::fs::write(paths.config_file(), "tick = \"1s\"\n").unwrap();
+        handle.tick(None, true).await.unwrap();
+        std::fs::write(paths.flock_file(), FLOCK_A).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while fleet.get("a").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the timer still runs at the old interval after a manual tick"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     fn write_job(paths: &Paths, name: &str, text: &str) {
