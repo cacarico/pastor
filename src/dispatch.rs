@@ -3,7 +3,7 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::time::Instant;
 
-use crate::herdr::{AgentStatus, CallError, Connector, ConnectorExt, HerdrError};
+use crate::herdr::{AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, HerdrError};
 use crate::task::{DispatchSpec, Task, TaskState};
 
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
@@ -98,6 +98,7 @@ pub async fn dispatch(
     task.state = TaskState::Starting;
     task.error = None;
     task.prompt_pending = false;
+    task.activity_seen = false;
 
     let result = dispatch_steps(conn, task, &name, ready_timeout).await;
     match &result {
@@ -160,10 +161,13 @@ async fn dispatch_steps(
     )
     .await?;
 
-    let (outcome, prompted_at) = prompt_when_ready(conn, task, name, ready_timeout).await?;
-    // The baseline a completion must move past; see `task::completed_since_prompt`.
-    if let Some(seq) = prompted_at {
-        task.last_completion_seq = Some(seq);
+    let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
+    // The baseline a completion must move past, and whether the agent was
+    // already at work when the prompt went in; see
+    // `task::completed_since_prompt`.
+    if let Some(agent) = prompted {
+        task.last_completion_seq = Some(agent.state_change_seq);
+        task.activity_seen = agent.agent_status.is_activity();
     }
     Ok(outcome)
 }
@@ -216,7 +220,7 @@ async fn prompt_when_ready(
     task: &Task,
     name: &str,
     ready_timeout: Duration,
-) -> Result<(DispatchOutcome, Option<u64>), DispatchError> {
+) -> Result<(DispatchOutcome, Option<AgentInfo>), DispatchError> {
     let machine = task.machine.as_deref().unwrap_or("that machine");
     let deadline = Instant::now() + ready_timeout;
     loop {
@@ -247,9 +251,9 @@ async fn prompt_when_ready(
             // still launching: fall through to the wait below
         } else if can_prompt {
             match conn.agent_prompt(name, &task.prompt).await {
-                // The reply carries the agent's `state_change_seq` as the
-                // prompt went in.
-                Ok(agent) => return Ok((DispatchOutcome::Running, Some(agent.state_change_seq))),
+                // The reply carries the agent's `state_change_seq` and status
+                // as the prompt went in.
+                Ok(agent) => return Ok((DispatchOutcome::Running, Some(agent))),
                 // The agent is up and waiting for a human, not for us. herdr
                 // did not send the prompt; the machine sends it after the block.
                 Err(err) if err.code() == Some("agent_blocked") => {
@@ -326,6 +330,7 @@ mod tests {
             error: None,
             last_completion_seq: None,
             prompt_pending: false,
+            activity_seen: false,
             created_at: now,
             started_at: None,
             finished_at: None,

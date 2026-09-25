@@ -477,6 +477,8 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
             .transpose()
             .map_err(conversion_failure)?,
         prompt_pending: row.get("prompt_pending")?,
+        // Held in the machine actor's memory, never stored.
+        activity_seen: false,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,

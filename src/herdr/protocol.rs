@@ -73,6 +73,16 @@ pub enum AgentStatus {
     Unknown,
 }
 
+impl AgentStatus {
+    /// Does this status show the agent at work on something? `working` and
+    /// `blocked` do, the pair herdr's `agent.prompt --wait` waits for before
+    /// it trusts a later idle (`prompt_activity_statuses`). `unknown` does
+    /// not: herdr reports it whenever detection has nothing to go on.
+    pub fn is_activity(&self) -> bool {
+        matches!(self, AgentStatus::Working | AgentStatus::Blocked)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub pane_id: String,

@@ -117,6 +117,18 @@ pub struct Task {
     /// launching. The machine sends it once the agent is past both.
     #[serde(default)]
     pub prompt_pending: bool,
+    /// pastor has seen this task's agent `working` or `blocked` since the
+    /// prompt went in (or since it last finished). A newer `state_change_seq`
+    /// alone does not prove work: herdr stamps one on every change of the
+    /// detected state, `unknown` included, so `idle -> unknown -> idle` moves
+    /// it too. herdr's `agent.prompt --wait` gates on the same activity
+    /// (`prompt_activity_statuses` in `src/api/wait.rs`). Not stored: the
+    /// machine actor keeps it in memory and sets it here before each
+    /// transition, so a daemon restart forgets it; an agent found working or
+    /// blocked afterwards counts again, one found idle stays running until it
+    /// goes stale.
+    #[serde(skip)]
+    pub activity_seen: bool,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -159,13 +171,19 @@ pub enum Observed {
 
 /// Did an agent now idle (or done) finish work it was given? herdr 0.9.1 has
 /// no completion counter; `agent_status` is idle or done either way (`done`
-/// only means nobody has looked at the pane since). What shows work happened
-/// is `state_change_seq` moving past the value it had when the prompt went
-/// in: to be idle again at a newer sequence the agent must have left idle.
-/// herdr's own `agent.prompt` wait uses the same test (`src/api/wait.rs`,
-/// `after_state_change_seq`). A prompt that was never delivered has nothing
-/// to complete. A `completion_seq`, when herdr reports one, is the same
-/// sequence stamped only on real completions, so it is preferred.
+/// only means nobody has looked at the pane since, and herdr also shows it
+/// after `unknown -> idle`). Two things together show work happened: pastor
+/// saw the agent `working` or `blocked` after the prompt
+/// (`Task::activity_seen`), and `state_change_seq` has moved past the value
+/// it had when the prompt went in, so the agent left that state since. The
+/// sequence alone is not enough: `unknown` moves it too. herdr's own
+/// `agent.prompt --wait` makes the same two checks (`src/api/wait.rs`,
+/// `prompt_activity_statuses` then `after_state_change_seq`). A prompt that
+/// was never delivered has nothing to complete. A task with no baseline at
+/// all is a row from a build that recorded neither; the sequence decides for
+/// it. A `completion_seq`, when herdr reports one, is the same sequence
+/// stamped only on real completions, so it is preferred and needs no
+/// activity.
 fn completed_since_prompt(
     task: &Task,
     state_change_seq: Option<u64>,
@@ -175,9 +193,11 @@ fn completed_since_prompt(
         return false;
     }
     let baseline = task.last_completion_seq.unwrap_or(0);
-    completion_seq
-        .or(state_change_seq)
-        .is_some_and(|seq| seq > baseline)
+    if let Some(seq) = completion_seq {
+        return seq > baseline;
+    }
+    let active = task.activity_seen || task.last_completion_seq.is_none();
+    active && state_change_seq.is_some_and(|seq| seq > baseline)
 }
 
 /// Pure transition. `None` means no change. The settle window for `Done` is the
@@ -270,10 +290,19 @@ mod tests {
             error: None,
             last_completion_seq,
             prompt_pending: false,
+            activity_seen: false,
             created_at: now,
             started_at: Some(now),
             finished_at: None,
             updated_at: now,
+        }
+    }
+
+    /// A task pastor has seen `working` or `blocked` since its prompt.
+    fn active(state: TaskState, last_completion_seq: Option<u64>) -> Task {
+        Task {
+            activity_seen: true,
+            ..task(state, last_completion_seq)
         }
     }
 
@@ -330,14 +359,14 @@ mod tests {
         );
         assert_eq!(
             next_state(
-                &task(TaskState::Running, Some(1)),
+                &active(TaskState::Running, Some(1)),
                 &status(AgentStatus::Done, Some(2))
             ),
             Some(TaskState::Done)
         );
         assert_eq!(
             next_state(
-                &task(TaskState::Running, Some(2)),
+                &active(TaskState::Running, Some(2)),
                 &status(AgentStatus::Idle, Some(2))
             ),
             None
@@ -376,11 +405,53 @@ mod tests {
             state_change_seq: Some(state_change_seq),
             completion_seq,
         };
-        let t = task(TaskState::Running, Some(5));
+        let t = active(TaskState::Running, Some(5));
         assert_eq!(next_state(&t, &seen(6, Some(6))), Some(TaskState::Done));
         assert_eq!(next_state(&t, &seen(6, Some(4))), None);
         assert_eq!(next_state(&t, &seen(6, None)), Some(TaskState::Done));
         assert_eq!(next_state(&t, &seen(5, None)), None);
+    }
+
+    /// herdr stamps a new `state_change_seq` on every change of the detected
+    /// state, `unknown` included: `idle -> unknown -> idle` leaves an agent
+    /// idle past its baseline without doing any work. Without a `working` or
+    /// `blocked` seen since the prompt, that is not a completion.
+    #[test]
+    fn a_newer_sequence_without_activity_is_not_done() {
+        let t = task(TaskState::Running, Some(3));
+        assert_eq!(next_state(&t, &status(AgentStatus::Idle, Some(5))), None);
+        assert_eq!(next_state(&t, &status(AgentStatus::Done, Some(5))), None);
+        assert_eq!(
+            next_state(
+                &active(TaskState::Running, Some(3)),
+                &status(AgentStatus::Idle, Some(5))
+            ),
+            Some(TaskState::Done)
+        );
+        // Blocked counts as activity too: idle after the human answered is
+        // done, not back to running, once the sequence moved.
+        assert_eq!(
+            next_state(
+                &task(TaskState::Blocked, Some(3)),
+                &status(AgentStatus::Idle, Some(5))
+            ),
+            Some(TaskState::Running)
+        );
+        assert_eq!(
+            next_state(
+                &active(TaskState::Blocked, Some(3)),
+                &status(AgentStatus::Idle, Some(5))
+            ),
+            Some(TaskState::Done)
+        );
+        // A `completion_seq` is stamped only on real completions: it needs
+        // no activity seen.
+        let completed = Observed::Status {
+            status: AgentStatus::Idle,
+            state_change_seq: Some(5),
+            completion_seq: Some(5),
+        };
+        assert_eq!(next_state(&t, &completed), Some(TaskState::Done));
     }
 
     /// A subscription event carries no sequence at all; it is never enough on
@@ -520,10 +591,11 @@ mod tests {
             ),
             None
         );
-        // A real completion (state_change_seq moves on) still moves it to Done.
+        // A real completion (activity, then state_change_seq moves on) still
+        // moves it to Done.
         assert_eq!(
             next_state(
-                &task(TaskState::Stale, Some(1)),
+                &active(TaskState::Stale, Some(1)),
                 &status(AgentStatus::Idle, Some(2))
             ),
             Some(TaskState::Done)
