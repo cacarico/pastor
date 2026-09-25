@@ -552,9 +552,12 @@ The connector answers in JSON lines on stdout, one object per line with a
   rest of the output is used.
 
 A poll connector exits when it is done. Exit 0 succeeds: its items become
-tasks and its cursor is saved, once every new item has become a task (a run
-capped by `max_tasks_per_run` keeps the old cursor and `since`, and the
-items that landed are not made twice). A non-zero exit, a timeout (the whole
+tasks and its cursor is saved, once every new item has been dealt with: a run
+that defers items (`max_tasks_per_run`) or fails to insert one keeps the old
+cursor and `since`, and the items that landed are not made twice. An item
+pastor rejects (an item field used in the job's `repo` or `branch` template
+whose value is unsafe there) is reported in the job's last error and skipped;
+it does not hold the cursor back, since a retry cannot fix it. A non-zero exit, a timeout (the whole
 process group is killed) or a program that will not start fails the run: its
 items and cursor are discarded, `job.failed` is emitted, the job backs off,
 and the error names the run log. What the connector writes to stderr goes to
@@ -563,8 +566,10 @@ that log.
 A stream connector gets the same handshake once, when it is started, and
 answers in the same lines at any time; it owns its own sockets and pastor
 proxies nothing. If it exits it is started again with backoff (1s doubling to
-5 minutes; a run that stayed up a minute starts it over), with the newest
-cursor it reported in the handshake. How a job run takes a stream's output is
+5 minutes; a run that stayed up a minute starts it over). Pastor hands the
+restarted process, in its handshake, the newest cursor the connector emitted
+before it exited, whether or not a job run has saved it yet, or the job's
+saved cursor if it has emitted none since the daemon started. How a job run takes a stream's output is
 under "Using a plugin in a job".
 
 ### Secrets and the `.env` file
@@ -614,9 +619,10 @@ whether it is installed or linked, and `ok`, the secrets still missing, or why
 it is invalid.
 
 `run` runs the connector once for a job and dispatches nothing. It uses the
-`[connector]` table of `~/.config/pastor/jobs/<job>.toml` if that file exists
-(and names this plugin), else an empty config, so you can try a plugin before
-writing the job. The cursor is `null`, and `since` is `--since` before now, by
+`[connector]` table of `~/.config/pastor/jobs/<job>.toml` if that file exists,
+and an empty config only when there is no such file, so you can try a plugin
+before writing the job. A job file that exists is never ignored: one that
+names a different connector, or that is invalid, is an error. The cursor is `null`, and `since` is `--since` before now, by
 default the job's `backfill`, or zero. Items are printed to stdout as JSON
 lines; logs and the summary go to stderr, and the run log is written as for any
 run. Nothing is saved: no cursor, no tasks. A stream connector is collected for
