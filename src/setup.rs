@@ -704,7 +704,7 @@ mod tests {
             let t = unit.template();
             for line in [
                 "After=network-online.target",
-                "Restart=on-failure",
+                "Restart=always",
                 "StandardOutput=journal",
                 "WantedBy=default.target",
             ] {
@@ -736,7 +736,7 @@ mod tests {
                 "Environment=PASTOR_STATE_DIR=/s/100%%",
             ]
         );
-        assert!(text.contains("Restart=on-failure\n"));
+        assert!(text.contains("Restart=always\n"));
     }
 
     #[test]

@@ -18,7 +18,7 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/herdr server
-Restart=on-failure
+Restart=always
 RestartSec=5s
 StandardOutput=journal
 StandardError=journal

@@ -214,8 +214,11 @@ fails at once rather than wait for an answer. With no action flag it runs `syste
 unit. `--enable`, `--start`, `--enable --now`, `--enable --start` and `--stop`
 map to the same `systemctl --user` actions after the unit is written.
 `pastor setup systemd --herdr` does the same with `herdr.service` (the herdr
-server) and belongs on every machine in the flock. Both units restart on failure
-and log to the journal (`journalctl --user -u pastor`). Setup points `ExecStart`
+server) and belongs on every machine in the flock. Both units always restart
+(`Restart=always`, so a head killed by a stray signal comes back) and log to
+the journal (`journalctl --user -u pastor`); `systemctl --user stop` still
+stops one for good, since systemd does not restart after an explicit stop.
+Setup points `ExecStart`
 at the binary it finds (the running pastor, or `herdr` on PATH) and copies your
 shell's `PATH` into the unit, so `ssh`, `herdr` and the agents resolve under
 systemd the way they do in a terminal; re-run it after moving a binary. A unit

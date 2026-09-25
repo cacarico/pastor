@@ -3,6 +3,20 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- `pastor serve` now also shuts down cleanly on SIGTERM and SIGHUP, not just
+  SIGINT (ctrl-c). systemd counts all three as a clean exit; the head used to
+  handle only SIGINT, so a SIGTERM (a plain `kill`, an OOM killer, a stray
+  signal) killed it silently, left the socket file behind, and the
+  `Restart=on-failure` unit never came back.
+- The `pastor.service` and `herdr.service` templates now use
+  `Restart=always` instead of `Restart=on-failure`, so a head or herdr
+  server killed by a signal systemd treats as clean restarts too.
+  `systemctl --user stop` still stops it for good.
+
 ## 0.2.0 - 2026-09-25
 
 ### Added
