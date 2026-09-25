@@ -1,7 +1,9 @@
 name: gitleaks
 
-# The repository is public. Every push and pull request is scanned over the
-# whole history it brings, so a secret cannot land quietly in an old commit.
+# The repository is public. Every push and pull request scans the whole
+# history of every ref, so a secret cannot sit quietly in an old commit.
+# gitleaks-action only scans the commits of the event that triggered it, so
+# the binary runs here directly, pinned by version and checksum.
 on:
   push:
   pull_request:
@@ -11,13 +13,24 @@ on:
 permissions:
   contents: read
 
+env:
+  GITLEAKS_VERSION: 8.30.1
+
 jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install gitleaks
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -sSfL -o gitleaks.tgz "${base}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o checksums.txt "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" checksums.txt | sed 's/ .*/  gitleaks.tgz/' | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks
+      - name: Scan every ref
+        run: |
+          git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*'
+          ./gitleaks git --redact --no-banner --log-opts="--all" --exit-code 1 .
