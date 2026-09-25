@@ -19,6 +19,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   present), and installs the binary to `~/.local/bin` without sudo.
   `PASTOR_VERSION`, `PASTOR_INSTALL_DIR` and `PASTOR_DOWNLOAD_URL` override
   the version, the directory and the download source.
+- CI runs a `portability` job on every pull request: `cargo check` of the
+  whole crate for x86_64 musl, armv7 musl and x86_64 FreeBSD through zig, so
+  a change that only compiles against glibc fails on the pull request, not
+  on the release tag.
 
 ### Changed
 

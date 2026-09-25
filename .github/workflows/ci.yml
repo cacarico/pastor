@@ -5,9 +5,9 @@
 # again on push to main would just repeat that same run for runner time, so
 # it is dropped; `workflow_dispatch` keeps a manual way to run it (for a
 # direct push to main that skipped a PR, or to re-check main by hand).
-# `check` and `test-machine` only exercise what they build or read, so
-# `paths:` skips docs-only changes; gitleaks has no such filter because a
-# secret can land in any file.
+# `check`, `test-machine` and `portability` only exercise what they build
+# or read, so `paths:` skips docs-only changes; gitleaks has no such filter
+# because a secret can land in any file.
 name: ci
 
 on:
@@ -21,6 +21,7 @@ on:
       - "Cargo.lock"
       - "Makefile"
       - ".github/workflows/ci.yml"
+      - ".github/actions/**"
   workflow_dispatch:
 
 concurrency:
@@ -44,3 +45,24 @@ jobs:
       - run: make check
       # The machine actor tests five times over, to catch timing flakes.
       - run: make test-machine
+
+  # The release builds are static musl binaries and a FreeBSD build is the
+  # source-only route, so a change that only compiles against glibc on
+  # x86_64 must fail here, on the pull request, not on the tag. This is a
+  # `cargo check`, not a build or a test: it catches platform-specific code
+  # (cfg gates, libc constants, missing symbols) at compile time, which is
+  # where every portability break so far would have shown up. aarch64 is
+  # left out because it goes through the same musl code paths as x86_64.
+  portability:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, armv7-unknown-linux-musleabihf, x86_64-unknown-freebsd
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/zig
+      - run: |
+          for target in x86_64-unknown-linux-musl armv7-unknown-linux-musleabihf x86_64-unknown-freebsd; do
+            cargo-zigbuild check --locked --all-targets --target "$target"
+          done
