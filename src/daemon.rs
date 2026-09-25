@@ -324,7 +324,7 @@ impl Daemon {
                     });
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("shutting down; agents keep running");
+                    tracing::info!("shutting down on SIGINT; agents keep running");
                     let _ = std::fs::remove_file(&socket);
                     return Ok(());
                 }
