@@ -919,11 +919,19 @@ So:
   every later task on that machine.
 - Give each flock its own machines and accounts when work and personal data
   must not meet; a flock is a routing rule, not a sandbox.
+- Any process running as the head's user can drive the fleet through
+  `pastor.sock`, an agent on the head included. pastor sets `PASTOR_TASK=t-N`
+  in the pane of every agent it starts, and refuses a command from such a
+  pane that changes the fleet: `task run`, `send`, `retry`, `close` and
+  `prune`, `tick` and `job run`, and edits of machines, flocks and jobs
+  (`agent_refused`). Reads still work. `agents_change_fleet = true` in
+  `pastor.toml` turns this off. It stops an agent acting on its own, not a
+  determined one: it runs as the same user and can unset the variable.
 
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, defaults, agents (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, defaults, agents (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.local/state/pastor/pastor.db   tasks (schema 6, with retry_of, flock, trust_sent and activity_seen), seen keys, job state, trusted repos
@@ -950,6 +958,7 @@ reconcile_every = "60s"
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "15m"     # a done task's pane closes after this; "never" keeps it
+agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
 [defaults]                   # for run flags, job keys and flock keys that are left out
 agent = "claude"
 agent_args = []              # e.g. ["--model", "claude-opus-5-5"]

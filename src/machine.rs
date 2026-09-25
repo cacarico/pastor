@@ -3240,6 +3240,20 @@ mod tests {
             .collect()
     }
 
+    /// The `pane.close` calls that close a task's pane, without the one a
+    /// worktree dispatch makes right after it splits the agent's pane off
+    /// herdr's (see `dispatch`).
+    fn closes(fake: &FakeHerdr) -> Vec<serde_json::Value> {
+        let reqs = fake.requests();
+        reqs.iter()
+            .enumerate()
+            .filter(|(i, r)| {
+                r.method == "pane.close" && (*i == 0 || reqs[i - 1].method != "pane.split")
+            })
+            .map(|(_, r)| r.params.clone())
+            .collect()
+    }
+
     fn worktree_task(store: &Store) -> Task {
         store
             .insert_task(NewTask {
@@ -3491,7 +3505,7 @@ mod tests {
             vec![serde_json::json!({"workspace_id": clean.workspace_id.unwrap(), "force": false})]
         );
         assert!(
-            calls(&fake, "pane.close").is_empty(),
+            closes(&fake).is_empty(),
             "worktree.remove closes the pane itself"
         );
 
@@ -3617,7 +3631,7 @@ mod tests {
         let closed = h.close(plain.id, false).await.unwrap();
         assert_eq!(closed.state, TaskState::Closed);
         assert_eq!(
-            calls(&fake, "pane.close"),
+            closes(&fake),
             vec![serde_json::json!({"pane_id": plain.pane_id.clone().unwrap()})]
         );
         let closed = h.close(wt.id, true).await.unwrap();
@@ -4308,7 +4322,7 @@ mod tests {
                 serde_json::json!({"workspace_id": t.workspace_id.clone().unwrap(), "force": false})
             ]
         );
-        assert!(calls(&fake, "pane.close").is_empty());
+        assert!(closes(&fake).is_empty());
         assert!(store.get_task(t.id).unwrap().unwrap().error.is_none());
     }
 
@@ -4333,7 +4347,7 @@ mod tests {
             "never forced"
         );
         assert_eq!(
-            calls(&fake, "pane.close"),
+            closes(&fake),
             vec![serde_json::json!({"pane_id": t.pane_id.clone().unwrap()})],
             "the pane closes anyway"
         );
@@ -4368,7 +4382,7 @@ mod tests {
         })
         .await;
         assert_eq!(state_of(&store, t.id), TaskState::Done);
-        assert!(calls(&fake, "pane.close").is_empty());
+        assert!(closes(&fake).is_empty());
         assert_eq!(
             calls(&fake, "worktree.remove").len(),
             1,

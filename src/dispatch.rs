@@ -165,6 +165,9 @@ async fn dispatch_steps(
                 expand_home(conn, &format!("env {key}"), value, task.machine.as_deref()).await?;
         }
     }
+    // The mark the head refuses fleet changes by (`ipc::TASK_ENV`). Last,
+    // so an `[agents]` env cannot clear it.
+    env.insert(crate::ipc::TASK_ENV.into(), name.to_string());
     if let Some(dir) = repo.as_deref() {
         check_repo_exists(conn, dir, task.machine.as_deref()).await?;
     }
@@ -186,9 +189,10 @@ async fn dispatch_steps(
         task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
     }
     let mut pane_id = created.root_pane.pane_id.clone();
-    if spec.worktree && !env.is_empty() {
-        // `worktree.create` and `worktree.open` take no env, so the agent
-        // gets a pane split off the worktree's with it, and the pane without
+    if spec.worktree {
+        // `worktree.create` and `worktree.open` take no env, and every agent
+        // has one (`TASK_ENV`), so the agent gets a pane split off the
+        // worktree's with it, and the pane without
         // it goes: a task keeps one pane, whose close ends the workspace.
         let cwd = task.spec.checkout.as_ref().map(|c| c.path.clone());
         let pane = conn.pane_split(&pane_id, cwd.as_deref(), &env).await?;
@@ -812,6 +816,7 @@ mod tests {
             .unwrap();
         let want = serde_json::json!({
             "CLAUDE_CONFIG_DIR": "/home/fake/.claude-personal",
+            "PASTOR_TASK": "t-7",
             "PLAIN": "a~b",
         });
         assert_eq!(ws.params["env"], want);
@@ -857,16 +862,37 @@ mod tests {
         );
         assert_eq!(t.workspace_id.as_deref(), Some("w1"));
 
-        // Without an env, a worktree task keeps herdr's own pane.
+        assert_eq!(fake.pane_env(&pane)["PASTOR_TASK"], "t-7");
+    }
+
+    /// Every agent pastor starts has `PASTOR_TASK` in its pane, so the head
+    /// knows its requests for an agent's (`Daemon::handle_from`), even with
+    /// no env of its own and in a worktree, which gets its env only through a
+    /// split pane.
+    #[tokio::test]
+    async fn every_agent_pane_is_marked_with_its_task() {
+        let fake = FakeHerdr::new();
+        let mut t = task(spec());
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.pane_env(t.pane_id.as_deref().unwrap()),
+            serde_json::json!({"PASTOR_TASK": "t-7"})
+        );
+
         let fake = FakeHerdr::new();
         let mut t = task(DispatchSpec {
             worktree: true,
             branch: Some("pastor/k2".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &personal(), READY).await.unwrap();
-        assert!(!fake.requests().iter().any(|r| r.method == "pane.split"));
-        assert_eq!(t.pane_id.as_deref(), Some("w1:p1"));
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        assert_ne!(pane, "w1:p1");
+        assert_eq!(fake.pane_env(&pane)["PASTOR_TASK"], "t-7");
     }
 
     #[tokio::test]

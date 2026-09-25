@@ -8,7 +8,11 @@ use std::time::{Duration, Instant};
 const WAIT: Duration = Duration::from_secs(60);
 
 fn pastor() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pastor"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
+    // The suite may itself run in an agent's pane, which pastor marks; the
+    // tests that want the mark set it.
+    c.env_remove("PASTOR_TASK");
+    c
 }
 
 struct Env {
@@ -470,7 +474,7 @@ fn an_agent_definition_reaches_herdr_as_its_kind_and_env() {
         .unwrap();
     assert_eq!(
         ws["params"]["env"],
-        serde_json::json!({"CLAUDE_CONFIG_DIR": "/srv/claude-personal"}),
+        serde_json::json!({"CLAUDE_CONFIG_DIR": "/srv/claude-personal", "PASTOR_TASK": "t-1"}),
         "{ws}"
     );
     let out = env.cmd(&["task", "show", "t-1"]);
@@ -2574,4 +2578,69 @@ fn run_takes_exactly_one_of_prompt_and_prompt_file() {
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(serde_json::from_slice::<serde_json::Value>(&out.stderr).is_err());
     }
+}
+
+/// An agent pastor started has `PASTOR_TASK` in its pane. `pastor task run`
+/// from it gets a clear refusal and queues nothing; reads still work.
+#[test]
+fn an_agent_pastor_started_is_refused_a_task_run() {
+    let env = start();
+    let out = pastor()
+        .args(["task", "run", "go on", "--repo", "/tmp"])
+        .env("PASTOR_CONFIG_DIR", &env.config)
+        .env("PASTOR_STATE_DIR", &env.state)
+        .env("PASTOR_TASK", "t-3")
+        .output()
+        .unwrap();
+    assert_eq!(error_code(&out), "agent_refused");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("t-3"), "{err}");
+    assert!(err.contains("agents_change_fleet"), "{err}");
+    let out = pastor()
+        .args(["task", "list", "--json"])
+        .env("PASTOR_CONFIG_DIR", &env.config)
+        .env("PASTOR_STATE_DIR", &env.state)
+        .env("PASTOR_TASK", "t-3")
+        .output()
+        .unwrap();
+    let tasks: serde_json::Value = serde_json::from_slice(&ok(out).into_bytes()).unwrap();
+    assert_eq!(tasks, serde_json::json!([]), "nothing was queued");
+}
+
+/// Machine, flock and job edits need no head, so the CLI refuses them
+/// itself, and leaves flock.toml as it was; `agents_change_fleet = true`
+/// turns that off.
+#[test]
+fn an_agent_pastor_started_may_not_edit_the_flock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    let before = "[[machine]]\nname = \"pi-1\"\nlocal = true\n";
+    std::fs::write(config.join("flock.toml"), before).unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .env("PASTOR_TASK", "t-3")
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["flock", "add", "work"][..],
+        &["machine", "add", "pi-2", "--local"],
+        &["machine", "remove", "pi-1"],
+        &["job", "disable", "nightly"],
+    ] {
+        assert_eq!(error_code(&run(args)), "agent_refused", "{args:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(config.join("flock.toml")).unwrap(),
+        before
+    );
+    ok(run(&["flock", "list"]));
+
+    std::fs::write(config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();
+    ok(run(&["flock", "add", "work"]));
 }

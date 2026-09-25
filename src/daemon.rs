@@ -212,6 +212,9 @@ pub struct Fleet {
     /// `[agents]` as last applied: whether a queued task's agent can take
     /// its tool lists (`Agents::launch_args`).
     agents: RwLock<Agents>,
+    /// `agents_change_fleet` as last applied: whether the head takes a
+    /// fleet-changing request from an agent it started.
+    agents_change_fleet: std::sync::atomic::AtomicBool,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
@@ -234,6 +237,7 @@ impl Fleet {
             wanted: RwLock::default(),
             defaults: RwLock::default(),
             agents: RwLock::default(),
+            agents_change_fleet: Default::default(),
             store,
             spawner: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
@@ -260,6 +264,7 @@ impl Fleet {
             wanted: RwLock::default(),
             defaults: RwLock::default(),
             agents: RwLock::default(),
+            agents_change_fleet: Default::default(),
             store,
             spawner: Some(Spawner { connect, events }),
             dispatch_lock: tokio::sync::Mutex::new(()),
@@ -311,6 +316,17 @@ impl Fleet {
     pub fn set_config(&self, config: &PastorConfig) {
         *self.defaults.write().unwrap() = config.defaults.clone();
         *self.agents.write().unwrap() = config.agents.clone();
+        self.agents_change_fleet.store(
+            config.agents_change_fleet,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Whether `pastor.toml` as last applied lets an agent pastor started
+    /// change the fleet.
+    pub fn agents_change_fleet(&self) -> bool {
+        self.agents_change_fleet
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The agent a task in `flock` gets on `machine` (none before one is
@@ -819,6 +835,14 @@ impl Fleet {
     }
 }
 
+/// Why an agent pastor started, in task `task`, was refused a change to
+/// the fleet. The CLI says the same for a change it makes on its own.
+pub fn agent_refusal(task: &str) -> String {
+    format!(
+        "{task} is an agent pastor started, and agents may not change the fleet (run, send to or close tasks, run jobs, edit machines, flocks or jobs); set agents_change_fleet = true in pastor.toml to allow it"
+    )
+}
+
 pub struct Daemon {
     paths: Paths,
     store: Arc<Store>,
@@ -1029,8 +1053,8 @@ impl Daemon {
                         let (r, mut w) = stream.into_split();
                         let mut line = String::new();
                         if BufReader::new(r).read_line(&mut line).await.is_err() { return; }
-                        let resp = match serde_json::from_str::<IpcRequest>(line.trim()) {
-                            Ok(req) => d.handle(req).await,
+                        let resp = match crate::ipc::parse_request_line(line.trim()) {
+                            Ok((req, from_task)) => d.handle_from(req, from_task.as_deref()).await,
                             Err(err) => IpcResponse::error("invalid_request", err),
                         };
                         let mut out = serde_json::to_string(&resp).unwrap_or_else(|e| format!("{{\"kind\":\"error\",\"code\":\"internal\",\"message\":\"{e}\"}}"));
@@ -1050,6 +1074,19 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// `handle`, for a caller that says it runs in a task's pane
+    /// (`ipc::TASK_ENV`): unless `agents_change_fleet` is on, such a caller
+    /// may read but not change the fleet.
+    pub async fn handle_from(&self, req: IpcRequest, from_task: Option<&str>) -> IpcResponse {
+        if let Some(task) = from_task
+            && req.changes_fleet()
+            && !self.fleet.agents_change_fleet()
+        {
+            return IpcResponse::error("agent_refused", agent_refusal(task));
+        }
+        self.handle(req).await
     }
 
     pub async fn handle(&self, req: IpcRequest) -> IpcResponse {
@@ -2753,6 +2790,83 @@ mod tests {
         BufReader::new(r).read_line(&mut line).await.unwrap();
         assert!(line.contains("invalid_request"), "{line}");
         assert!(crate::ipc::daemon_running(&socket).await);
+    }
+
+    /// One raw line to the head's socket, as a client in task `t-9`'s pane
+    /// sends it, and the reply.
+    async fn ask_from_task(socket: &std::path::Path, req: &IpcRequest) -> IpcResponse {
+        let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let line = crate::ipc::request_line(req, Some("t-9")).unwrap();
+        w.write_all(line.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        BufReader::new(r).read_line(&mut reply).await.unwrap();
+        serde_json::from_str(reply.trim()).unwrap()
+    }
+
+    async fn serving(d: Daemon) -> std::path::PathBuf {
+        let socket = d.socket_path();
+        tokio::spawn(d.run());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::ipc::daemon_running(&socket).await {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        socket
+    }
+
+    fn run_hi() -> IpcRequest {
+        IpcRequest::Run {
+            prompt: "hi".into(),
+            spec: spec(),
+            flock: None,
+            agent: None,
+        }
+    }
+
+    /// An agent pastor started (its pane has `PASTOR_TASK`) gets a clear
+    /// refusal for `pastor task run`, and nothing is queued; it may still
+    /// read.
+    #[tokio::test]
+    async fn an_agent_pastor_started_is_refused_a_task_run() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let store = d.store.clone();
+        let socket = serving(d).await;
+        let IpcResponse::Error { code, message } = ask_from_task(&socket, &run_hi()).await else {
+            panic!("an agent's task run was not refused")
+        };
+        assert_eq!(code, "agent_refused");
+        assert!(message.contains("t-9"), "{message}");
+        assert!(message.contains("agents_change_fleet"), "{message}");
+        assert!(store.list_tasks(&TaskFilter::default()).unwrap().is_empty());
+        let send = IpcRequest::TaskSend {
+            id: 1,
+            input: crate::machine::SendInput::default(),
+        };
+        assert!(matches!(
+            ask_from_task(&socket, &send).await,
+            IpcResponse::Error { code, .. } if code == "agent_refused"
+        ));
+        let list = IpcRequest::List {
+            filter: TaskFilter::default(),
+        };
+        assert!(matches!(
+            ask_from_task(&socket, &list).await,
+            IpcResponse::Tasks(_)
+        ));
+    }
+
+    /// `agents_change_fleet = true` in pastor.toml turns the guard off.
+    #[tokio::test]
+    async fn agents_change_fleet_lets_an_agent_run_a_task() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        d.fleet().set_config(&PastorConfig {
+            agents_change_fleet: true,
+            ..test_config()
+        });
+        let socket = serving(d).await;
+        let resp = ask_from_task(&socket, &run_hi()).await;
+        assert!(matches!(resp, IpcResponse::Task(_)), "{resp:?}");
     }
 
     /// `run` must replace a stale socket file left behind by an unclean shutdown

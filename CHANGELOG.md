@@ -7,6 +7,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Agents pastor starts may no longer change the fleet. Every agent's pane
+  gets `PASTOR_TASK=t-N`, and a command from it that runs, sends to, retries,
+  closes or prunes tasks, ticks, runs a job, or edits machines, flocks or
+  jobs fails with `agent_refused`; reads still work. The head refuses such a
+  request, and the CLI refuses the edits it makes on its own.
+  `agents_change_fleet = true` in `pastor.toml` allows them again. A worktree
+  task's agent now always runs in a pane split off the worktree's, since the
+  mark is env and herdr's worktree calls take none.
+
 - `pastor task run --prompt-file <path>` reads the prompt from a file on the
   machine running the CLI (`-` for stdin), so a long prompt with quotes needs
   no shell quoting. It conflicts with the positional prompt; exactly one is

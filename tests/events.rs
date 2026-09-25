@@ -15,6 +15,7 @@ const WAIT: Duration = Duration::from_secs(60);
 
 fn pastor(state: &std::path::Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
+    c.env_remove("PASTOR_TASK");
     c.env("PASTOR_CONFIG_DIR", state.join("c"))
         .env("PASTOR_STATE_DIR", state.join("s"));
     c

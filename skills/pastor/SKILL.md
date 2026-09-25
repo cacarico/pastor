@@ -168,13 +168,14 @@ It reads the log file, so it works with the head down.
 
 ## When pastor dispatched you
 
-You are a pastor task when `HERDR_ENV=1` is set, your herdr agent and workspace are named `t-N`, and the prompt reads like a self-contained work order. Then:
+You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `HERDR_ENV=1` is set, your herdr agent and workspace are named `t-N`), and the prompt reads like a self-contained work order. Then:
 
 - Work only in the directory you started in: your worktree and branch. Never touch other worktrees, branches or panes.
 - Commit and push exactly as the prompt says, and write the report it asks for.
 - Do not ask questions. Nobody is watching; a permission prompt or a question leaves the task `blocked` until a human happens to attach. If something is missing, say so in your report and stop.
 - Print `DONE` as your last line when finished, then go idle.
 - Do not close your pane or exit to clean up. That is the user's job.
+- Do not run, send to, retry or close tasks, or edit machines, flocks or jobs. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. Reading (`task list`, `show`, `read`) is fine.
 
 ## When something goes wrong
 

@@ -341,6 +341,7 @@ impl Cli {
     fn pastor(&self, args: &[&str]) -> std::process::Output {
         std::process::Command::new(env!("CARGO_BIN_EXE_pastor"))
             .args(args)
+            .env_remove("PASTOR_TASK")
             .env("PASTOR_CONFIG_DIR", self.dir("c"))
             .env("PASTOR_STATE_DIR", self.dir("s"))
             .env("PASTOR_DATA_DIR", self.dir("d"))
@@ -753,6 +754,7 @@ fn serve() -> Serve {
     .unwrap();
     let daemon = Command::new(env!("CARGO_BIN_EXE_pastor"))
         .arg("serve")
+        .env_remove("PASTOR_TASK")
         .env("PASTOR_CONFIG_DIR", cli.dir("c"))
         .env("PASTOR_STATE_DIR", cli.dir("s"))
         .env("PASTOR_DATA_DIR", cli.dir("d"))

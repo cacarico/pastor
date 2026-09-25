@@ -294,6 +294,12 @@ fn main() {
         Ok(p) => p,
         Err(err) => fail("config_error", &err.to_string()),
     };
+    if let Some(task) = pastor::ipc::caller_task()
+        && changes_fleet(&command)
+        && !agents_change_fleet(&paths)
+    {
+        fail("agent_refused", &pastor::daemon::agent_refusal(&task));
+    }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async {
         // Commands that never talk to the head do not read `head`.
@@ -432,6 +438,34 @@ fn head_use(command: &Command) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+/// Whether `command` changes the fleet: the CLI's side of
+/// `IpcRequest::changes_fleet`, for the edits it makes without the head
+/// (machines, flocks, jobs, an offline tick). An agent pastor started
+/// (`ipc::TASK_ENV`) is refused these up front, head or no head.
+fn changes_fleet(command: &Command) -> bool {
+    match command {
+        Command::Task { cmd } => matches!(
+            cmd,
+            TaskCmd::Run(_)
+                | TaskCmd::Retry(_)
+                | TaskCmd::Close(_)
+                | TaskCmd::Prune(_)
+                | TaskCmd::Send(_)
+        ),
+        Command::Machine { cmd } => !matches!(cmd, MachineCmd::List { .. }),
+        Command::Flock { cmd } => !matches!(cmd, FlockCmd::List { .. }),
+        Command::Tick(a) => !a.dry_run,
+        Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. } | JobCmd::Reload),
+        _ => false,
+    }
+}
+
+/// `agents_change_fleet` in pastor.toml. A file that does not load counts
+/// as off: the refusal is the safe side.
+fn agents_change_fleet(paths: &Paths) -> bool {
+    PastorConfig::load(&paths.config_file()).is_ok_and(|c| c.agents_change_fleet)
 }
 
 /// Whether `command` can make the head queue a task, whose agent the head

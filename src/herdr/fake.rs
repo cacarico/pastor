@@ -707,10 +707,17 @@ impl FakeHerdr {
                     }
                 };
                 let label = p.get("label").cloned().unwrap_or(Value::Null);
+                // An open workspace answers with a pane it still has: its
+                // first may have been closed for a split (see `dispatch`).
+                let root = s
+                    .panes
+                    .get(&ws)
+                    .and_then(|p| p.first().cloned())
+                    .unwrap_or_else(|| format!("{ws}:p1"));
                 Ok(
                     json!({"type": "worktree_opened", "already_open": already_open,
                     "workspace": {"workspace_id": ws, "label": label}, "tab": {"tab_id": format!("{ws}:t1")},
-                    "root_pane": {"pane_id": format!("{ws}:p1"), "workspace_id": ws},
+                    "root_pane": {"pane_id": root, "workspace_id": ws},
                     "worktree": {"path": path, "branch": checkout.1}}),
                 )
             }

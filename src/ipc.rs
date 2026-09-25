@@ -16,6 +16,17 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`).
 pub const IPC_PROTOCOL: u32 = 2;
 
+/// The variable pastor sets in the pane of every agent it starts, to the
+/// task's agent name (`t-7`). The CLI passes it on to the head as
+/// `FROM_TASK_FIELD`, and the head refuses such a caller any request that
+/// changes the fleet unless `agents_change_fleet` allows it. It is a guard
+/// against an agent acting on its own, not a boundary: the agent runs as the
+/// same user and can unset it.
+pub const TASK_ENV: &str = "PASTOR_TASK";
+
+/// The field beside a request's own that names the task it comes from.
+pub const FROM_TASK_FIELD: &str = "from_task";
+
 /// The first protocol whose head honours `flock` in a request.
 pub const FLOCK_PROTOCOL: u32 = 1;
 
@@ -95,6 +106,61 @@ pub enum IpcRequest {
         states: Vec<TaskState>,
         older_than_secs: u64,
     },
+}
+
+impl IpcRequest {
+    /// Whether the request can start, stop, feed or reshape work: anything
+    /// but a read, a dry tick or a reload (which only re-reads the files). An
+    /// agent pastor started is refused these (`TASK_ENV`).
+    pub fn changes_fleet(&self) -> bool {
+        match self {
+            IpcRequest::Ping
+            | IpcRequest::List { .. }
+            | IpcRequest::TaskShow { .. }
+            | IpcRequest::TaskRead { .. }
+            | IpcRequest::FlockList
+            | IpcRequest::JobList
+            | IpcRequest::Reload => false,
+            IpcRequest::Tick { dry_run, .. } => !dry_run,
+            IpcRequest::Run { .. }
+            | IpcRequest::FlockRemove { .. }
+            | IpcRequest::JobRun { .. }
+            | IpcRequest::TaskRetry { .. }
+            | IpcRequest::TaskClose { .. }
+            | IpcRequest::TaskSend { .. }
+            | IpcRequest::TaskPrune { .. } => true,
+        }
+    }
+}
+
+/// The line a request crosses the socket as: the request, plus
+/// `FROM_TASK_FIELD` when the caller runs in a task's pane. A head that
+/// predates the field skips it, as serde skips any unknown field.
+pub fn request_line(req: &IpcRequest, from_task: Option<&str>) -> anyhow::Result<String> {
+    let mut v = serde_json::to_value(req)?;
+    if let (Some(task), Some(obj)) = (from_task, v.as_object_mut()) {
+        obj.insert(FROM_TASK_FIELD.into(), task.into());
+    }
+    let mut line = serde_json::to_string(&v)?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// The head's side of `request_line`: the request, and the task it says it
+/// comes from.
+pub fn parse_request_line(line: &str) -> serde_json::Result<(IpcRequest, Option<String>)> {
+    let mut v: serde_json::Value = serde_json::from_str(line)?;
+    let from_task = v
+        .as_object_mut()
+        .and_then(|obj| obj.remove(FROM_TASK_FIELD))
+        .and_then(|t| t.as_str().map(str::to_string));
+    Ok((serde_json::from_value(v)?, from_task))
+}
+
+/// The task this process runs in, from `TASK_ENV`: `None` outside a pane
+/// pastor started, or when the variable is empty.
+pub fn caller_task() -> Option<String> {
+    std::env::var(TASK_ENV).ok().filter(|t| !t.is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,8 +265,7 @@ async fn round_trip(
     req: &IpcRequest,
 ) -> anyhow::Result<IpcResponse> {
     let (r, mut w) = stream.into_split();
-    let mut line = serde_json::to_string(req)?;
-    line.push('\n');
+    let line = request_line(req, caller_task().as_deref())?;
     w.write_all(line.as_bytes()).await?;
     w.flush().await?;
     let mut reply = String::new();
@@ -476,6 +541,82 @@ mod tests {
         .unwrap();
         assert_eq!(v["op"], "task_prune");
         assert_eq!(v["states"][0], "failed");
+    }
+
+    /// What an agent pastor started may still ask for: reads, a dry tick
+    /// and a reload, which only re-reads files. Everything else changes the
+    /// fleet (`IpcRequest::changes_fleet`).
+    #[test]
+    fn only_reads_leave_the_fleet_alone() {
+        let reads = [
+            IpcRequest::Ping,
+            IpcRequest::List {
+                filter: TaskFilter::default(),
+            },
+            IpcRequest::TaskShow { id: 1 },
+            IpcRequest::TaskRead { id: 1, lines: 5 },
+            IpcRequest::FlockList,
+            IpcRequest::JobList,
+            IpcRequest::Reload,
+            IpcRequest::Tick {
+                job: None,
+                dry_run: true,
+            },
+        ];
+        for req in reads {
+            assert!(!req.changes_fleet(), "{req:?}");
+        }
+        let changes = [
+            IpcRequest::Run {
+                prompt: "p".into(),
+                spec: minimal_task().spec,
+                flock: None,
+                agent: None,
+            },
+            IpcRequest::TaskSend {
+                id: 1,
+                input: crate::machine::SendInput::default(),
+            },
+            IpcRequest::TaskRetry { id: 1 },
+            IpcRequest::TaskClose {
+                id: 1,
+                remove_worktree: false,
+            },
+            IpcRequest::TaskPrune {
+                states: vec![],
+                older_than_secs: 0,
+            },
+            IpcRequest::FlockRemove { name: "f".into() },
+            IpcRequest::Tick {
+                job: None,
+                dry_run: false,
+            },
+            IpcRequest::JobRun { name: "j".into() },
+        ];
+        for req in changes {
+            assert!(req.changes_fleet(), "{req:?}");
+        }
+    }
+
+    /// The CLI tells the head which task it runs in, beside the request's
+    /// own fields, and says nothing outside one.
+    #[test]
+    fn a_request_line_carries_the_task_it_comes_from() {
+        let line = request_line(&IpcRequest::FlockList, Some("t-4")).unwrap();
+        assert!(line.ends_with('\n'));
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["op"], "flock_list");
+        assert_eq!(v[FROM_TASK_FIELD], "t-4");
+        let (req, from) = parse_request_line(line.trim()).unwrap();
+        assert!(matches!(req, IpcRequest::FlockList));
+        assert_eq!(from.as_deref(), Some("t-4"));
+
+        let line = request_line(&IpcRequest::FlockList, None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(v.get(FROM_TASK_FIELD).is_none(), "{v}");
+        let (_, from) = parse_request_line(line.trim()).unwrap();
+        assert_eq!(from, None);
+        assert!(parse_request_line("not json").is_err());
     }
 
     #[tokio::test]

@@ -495,6 +495,12 @@ pub struct PastorConfig {
     /// `pastor task attach` can still show the agent's last screen. `never`
     /// turns auto-close off.
     pub close_done_after: String,
+    /// Whether an agent pastor started (`ipc::TASK_ENV` in its pane) may
+    /// change the fleet: run, send to, retry, close or prune tasks, run jobs,
+    /// and edit machines, flocks and jobs. Off by default, so the head
+    /// refuses it. A guard against an agent acting on its own; the agent runs
+    /// as the same user, so it is not a security boundary.
+    pub agents_change_fleet: bool,
     pub defaults: Defaults,
     #[serde(skip_serializing_if = "is_empty_agents")]
     pub agents: Agents,
@@ -513,6 +519,7 @@ impl Default for PastorConfig {
             request_timeout: "60s".into(),
             agent_ready_timeout: "30s".into(),
             close_done_after: "15m".into(),
+            agents_change_fleet: false,
             defaults: Defaults::default(),
             agents: Agents::default(),
         }
@@ -690,6 +697,15 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
+    /// Agents pastor started may not change the fleet unless pastor.toml
+    /// says so.
+    #[test]
+    fn agents_change_fleet_is_off_unless_set() {
+        assert!(!PastorConfig::default().agents_change_fleet);
+        let cfg: PastorConfig = toml::from_str("agents_change_fleet = true").unwrap();
+        assert!(cfg.agents_change_fleet);
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
