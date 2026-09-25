@@ -57,7 +57,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   keeps its shape, with `flock` on each machine.
 - `machine add|remove` and the new flock commands edit `flock.toml` in place,
   keeping comments and layout; they used to rewrite the whole file.
-- The database is schema 5. Schema 4 stores each task's flock; rows from
+- The database is schema 6. Schema 4 stores each task's flock; rows from
   before flocks join the default flock. Schema 5 adds the `trusted_repos`
   table and a `trust_sent` flag on each task. Schema 6 stores whether the
   task's agent has been seen at work since its prompt (`activity_seen`).
