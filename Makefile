@@ -34,13 +34,17 @@ test-machine: ## the machine actor tests five times, to catch timing flakes
 # runs in a throwaway worktree with any .gitleaksignore or gitleaks.toml
 # removed (gitleaks reads ./.gitleaksignore whatever --gitleaks-ignore-path
 # says), and inline gitleaks:allow comments are ignored, so nothing in a
-# branch can loosen the policy it is checked against. Needs the gitleaks
-# binary (a system package, not a cargo one).
+# branch can loosen the policy it is checked against. Every remote's refs are
+# fetched first and a shallow clone is refused, so the scan covers the same
+# history CI sees. Needs the gitleaks binary (a system package, not a cargo
+# one).
 GITLEAKS_VERSION ?= 8.30.1
 leaks: ## scan the whole git history for secrets, as CI does
 	@set -e; tmp=$$(mktemp -d); trap 'git worktree remove --force $$tmp/wt >/dev/null 2>&1 || true; rm -rf $$tmp' EXIT; \
 	curl -sSfL -o $$tmp/gitleaks.toml https://raw.githubusercontent.com/gitleaks/gitleaks/v$(GITLEAKS_VERSION)/config/gitleaks.toml; \
 	mkdir $$tmp/no-ignore; \
+	if [ "$$(git rev-parse --is-shallow-repository)" = true ]; then echo 'make leaks: this clone is shallow; run git fetch --unshallow first' >&2; exit 1; fi; \
+	git fetch --quiet --all; \
 	git worktree add --quiet --detach $$tmp/wt HEAD; \
 	rm -f $$tmp/wt/.gitleaksignore $$tmp/wt/.gitleaks.toml $$tmp/wt/gitleaks.toml; \
 	gitleaks git --redact --no-banner --exit-code 1 --ignore-gitleaks-allow --config $$tmp/gitleaks.toml --gitleaks-ignore-path $$tmp/no-ignore --log-opts="--all" $$tmp/wt
