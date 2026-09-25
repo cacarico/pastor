@@ -1,7 +1,7 @@
 name: gitleaks
 
-# The repository is public. Every pull request and every push to main scans
-# the whole history of every ref, so a secret cannot sit quietly in an old
+# The repository is public. Every push and pull request scans the whole
+# history of every ref, so a secret cannot sit quietly in an old
 # commit. gitleaks-action only scans the commits of the triggering event, so
 # the binary runs here directly, pinned by version and checksum. The rules
 # come from gitleaks' own default config at that same version, fetched
@@ -9,7 +9,6 @@ name: gitleaks
 # cannot loosen the policy it is checked against.
 on:
   push:
-    branches: [main]
   pull_request:
   schedule:
     - cron: "17 4 * * 1"
