@@ -101,12 +101,44 @@ fn path_value_problem(value: &str) -> Option<&'static str> {
     }
 }
 
+/// Why `rendered`, the text of `template` after substitution, is unsafe in
+/// a way no single value shows: `{{ item.a }}{{ item.b }}` with `.` and `.`
+/// is `..`, and an empty value in front of `/` makes the path absolute.
+/// Only the parts placeholders produced are judged; a `..` the job writes
+/// literally is the user's own. Values hold no `/` (see `path_value_problem`),
+/// so the template and the rendered text split into the same components.
+fn rendered_path_problem(template: &str, rendered: &str) -> Option<&'static str> {
+    if rendered.chars().any(char::is_control) {
+        return Some("contains a control character");
+    }
+    let rooted = |s: &str| s.starts_with('/') || s.starts_with('~');
+    if rooted(rendered) && !rooted(template) {
+        return Some("is absolute but the template is not");
+    }
+    let tpl: Vec<&str> = template.split('/').collect();
+    let out: Vec<&str> = rendered.split('/').collect();
+    if tpl.len() != out.len() {
+        return Some("does not keep the template's path components");
+    }
+    let climbs = tpl
+        .iter()
+        .zip(&out)
+        .any(|(t, o)| t.contains("{{") && *o == "..");
+    climbs.then_some("has a \"..\" component")
+}
+
 /// Item fields are untrusted (a chat message, an issue title). Every
 /// `{{ item.* }}` value that `repo` or `branch` would take is checked before
-/// rendering; the job's own literal text around it, such as `~/work/`, is
-/// the user's and is not.
+/// rendering, and then the rendered text as a whole; the job's own literal
+/// text around it, such as `~/work/`, is the user's and is not.
 pub fn check_item_paths(job: &Job, item: &Value) -> Result<(), String> {
     let ctx = serde_json::json!({ "item": item });
+    // The task id is not known yet; any id renders to the same shape.
+    let full = serde_json::json!({
+        "item": item,
+        "job": {"name": job.name},
+        "task": {"id": "t-0"},
+    });
     for (field, text) in [
         ("repo", job.spec.repo.as_deref()),
         ("branch", job.spec.branch.as_deref()),
@@ -123,8 +155,19 @@ pub fn check_item_paths(job: &Job, item: &Value) -> Result<(), String> {
                 return Err(format!("{field}: {{{{ {path} }}}} = {value:?} {why}"));
             }
         }
+        let rendered = template::render(text, &full)
+            .map_err(|e| format!("{field}: {e}"))?
+            .text;
+        check_rendered(field, text, &rendered)?;
     }
     Ok(())
+}
+
+fn check_rendered(field: &str, template: &str, rendered: &str) -> Result<(), String> {
+    match rendered_path_problem(template, rendered) {
+        Some(why) => Err(format!("{field}: renders to {rendered:?}, which {why}")),
+        None => Ok(()),
+    }
 }
 
 /// Render prompt, repo and branch for one task. A placeholder with no value
@@ -156,6 +199,15 @@ pub fn render_task(job: &Job, item: &Value, id: i64) -> Result<(String, Dispatch
         .as_deref()
         .map(|b| render("branch", b))
         .transpose()?;
+    // Checked again on the real text: the task id is known only now.
+    for (field, template, rendered) in [
+        ("repo", job.spec.repo.as_deref(), repo.as_deref()),
+        ("branch", job.spec.branch.as_deref(), branch.as_deref()),
+    ] {
+        if let (Some(t), Some(r)) = (template, rendered) {
+            check_rendered(field, t, r)?;
+        }
+    }
     if !missing.is_empty() {
         tracing::warn!(job = %job.name, task = %format!("t-{id}"), ?missing, "placeholders with no value rendered empty");
     }
@@ -1627,6 +1679,56 @@ mod tests {
         let mut item = ok.clone();
         item["title"] = json!("../../etc\n-rf");
         assert!(render_task(&job("j"), &item, 1).is_ok());
+    }
+
+    /// Each value can pass on its own and still assemble into something
+    /// unsafe: `.` next to `.` is `..`, and an empty value in front of a `/`
+    /// makes the path absolute. The rendered path is checked too, but only
+    /// where placeholders put text; the job's literal text is trusted.
+    #[test]
+    fn render_task_rejects_unsafe_paths_assembled_from_several_values() {
+        let item = json!({"a": ".", "b": ".", "owner": "cacarico", "repo": "pastor", "empty": ""});
+        for (repo, why) in [
+            ("{{ item.a }}{{ item.b }}", "\"..\""),
+            ("~/work/{{ item.a }}{{ item.b }}/x", "\"..\""),
+            ("{{ item.empty }}/etc", "absolute"),
+            ("{{ item.empty }}~/x", "absolute"),
+        ] {
+            let mut j = job("j");
+            j.spec.repo = Some(repo.into());
+            let err = render_task(&j, &item, 1).unwrap_err();
+            assert!(
+                err.starts_with("repo:") && err.contains(why),
+                "{repo}: {err}"
+            );
+            assert_eq!(check_item_paths(&j, &item).unwrap_err(), err, "{repo}");
+        }
+        let mut j = job("j");
+        j.spec.branch = Some("pastor/{{ item.a }}{{ item.b }}".into());
+        let err = render_task(&j, &item, 1).unwrap_err();
+        assert!(
+            err.starts_with("branch:") && err.contains("\"..\""),
+            "{err}"
+        );
+
+        // A `..` in one of two values is still caught, by the per-value check.
+        let mut j = job("j");
+        j.spec.repo = Some("{{ item.a }}/{{ item.b }}".into());
+        let mut bad = item.clone();
+        bad["b"] = json!("..");
+        let err = render_task(&j, &bad, 1).unwrap_err();
+        assert!(err.contains("item.b") && err.contains("\"..\""), "{err}");
+
+        // Literal text keeps its freedom, `..` included.
+        let mut j = job("j");
+        j.spec.repo = Some("~/ghq/{{ item.owner }}/{{ item.repo }}".into());
+        j.spec.branch = Some("pastor/{{ task.id }}".into());
+        let (_, spec) = render_task(&j, &item, 7).unwrap();
+        assert_eq!(spec.repo.as_deref(), Some("~/ghq/cacarico/pastor"));
+        assert_eq!(spec.branch.as_deref(), Some("pastor/t-7"));
+        j.spec.repo = Some("/srv/../work/{{ item.repo }}".into());
+        let (_, spec) = render_task(&j, &item, 7).unwrap();
+        assert_eq!(spec.repo.as_deref(), Some("/srv/../work/pastor"));
     }
 
     /// A rejected item creates no task and is reported, but it is the item's
