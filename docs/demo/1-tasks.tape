@@ -16,7 +16,7 @@ Type "pastor machine list"
 Enter
 Sleep 2.5s
 
-Type 'pastor task run "Explain what this repository does, in three lines" --repo ~/ghq/github.com/cacarico/pastor'
+Type `pastor task run "Explain what this repository does, in three lines" --repo '~/ghq/github.com/cacarico/pastor'`
 Enter
 Sleep 8s
 
