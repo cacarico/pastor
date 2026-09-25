@@ -223,11 +223,24 @@ fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -
 /// path, a version or `yes`/`no`, plus whatever the rc files print.
 const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 
+/// How long a probe may take, ssh handshake included. ssh's own keepalive
+/// gives up on a dead link after 45s; this also covers a machine whose shell
+/// answers the connection and then never exits.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Run a probe to completion and collect its output, like `Command::output`
-/// but refusing more than `PROBE_OUTPUT_LIMIT` bytes on either stream: the
-/// machine answering is not trusted to stop, and one misbehaving machine must
-/// not exhaust the head's memory. Over the limit the probe is killed.
+/// but refusing more than `PROBE_OUTPUT_LIMIT` bytes on either stream and
+/// more than `PROBE_TIMEOUT` in all: the machine answering is not trusted to
+/// stop, and one misbehaving machine must not exhaust the head's memory or
+/// hold it forever. Over either limit the probe is killed.
 async fn probe_output(argv: &[String]) -> Result<std::process::Output, ConnectError> {
+    probe_output_within(argv, PROBE_TIMEOUT).await
+}
+
+async fn probe_output_within(
+    argv: &[String],
+    time: std::time::Duration,
+) -> Result<std::process::Output, ConnectError> {
     use tokio::io::AsyncReadExt;
     let mut child = tokio::process::Command::new(&argv[0])
         .args(&argv[1..])
@@ -242,37 +255,56 @@ async fn probe_output(argv: &[String]) -> Result<std::process::Output, ConnectEr
     let read = |pipe: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>| async move {
         let mut buf = Vec::new();
         if let Some(pipe) = pipe {
-            // The pipe is dropped once the cap is hit, so a probe still
-            // writing gets EPIPE and exits instead of blocking the other read.
             pipe.take(PROBE_OUTPUT_LIMIT as u64 + 1)
                 .read_to_end(&mut buf)
                 .await?;
         }
-        Ok::<_, std::io::Error>(buf)
+        if buf.len() > PROBE_OUTPUT_LIMIT {
+            // An error, so `try_join!` stops waiting on the other stream,
+            // which the probe may hold open for as long as it likes.
+            return Err(ProbeError::TooLarge);
+        }
+        Ok(buf)
     };
     let stdout = child.stdout.take().map(|p| Box::new(p) as _);
     let stderr = child.stderr.take().map(|p| Box::new(p) as _);
-    let (stdout, stderr) =
-        tokio::try_join!(read(stdout), read(stderr)).map_err(|e| ConnectError {
-            message: format!("{}: read: {e}", argv[0]),
-        })?;
-    if stdout.len() > PROBE_OUTPUT_LIMIT || stderr.len() > PROBE_OUTPUT_LIMIT {
-        // Dropping `child` kills it (`kill_on_drop`).
-        return Err(ConnectError {
-            message: format!(
+    let collected = tokio::time::timeout(time, async {
+        let (stdout, stderr) = tokio::try_join!(read(stdout), read(stderr))?;
+        let status = child.wait().await?;
+        Ok::<_, ProbeError>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await;
+    let message = match collected {
+        Ok(Ok(out)) => return Ok(out),
+        Ok(Err(ProbeError::TooLarge)) => {
+            format!(
                 "{}: probe wrote more than {PROBE_OUTPUT_LIMIT} bytes",
                 argv[0]
-            ),
-        });
+            )
+        }
+        Ok(Err(ProbeError::Io(e))) => format!("{}: {e}", argv[0]),
+        Err(_) => format!("{}: probe timed out after {time:?}", argv[0]),
+    };
+    // Kill now and reap it, rather than leave it to `kill_on_drop`: the
+    // error is only returned once the probe is gone.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    Err(ConnectError { message })
+}
+
+enum ProbeError {
+    TooLarge,
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for ProbeError {
+    fn from(e: std::io::Error) -> Self {
+        ProbeError::Io(e)
     }
-    let status = child.wait().await.map_err(|e| ConnectError {
-        message: format!("{}: wait: {e}", argv[0]),
-    })?;
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
 }
 
 /// Reads the answer to `REMOTE_HOME_COMMAND`. Only ssh failing to reach the
@@ -975,6 +1007,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stdout.len(), PROBE_OUTPUT_LIMIT);
+    }
+
+    /// Past the cap on one stream, a probe that keeps its other pipe open
+    /// is killed at once instead of holding the head until it exits.
+    #[tokio::test]
+    async fn an_overflowing_probe_is_killed_at_once() {
+        let argv = |script: &str| vec!["sh".to_string(), "-c".into(), script.into()];
+        for script in [
+            format!("head -c {} /dev/zero; sleep 30", PROBE_OUTPUT_LIMIT + 1),
+            format!("head -c {} /dev/zero >&2; sleep 30", PROBE_OUTPUT_LIMIT + 1),
+        ] {
+            let started = std::time::Instant::now();
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                probe_output(&argv(&script)),
+            )
+            .await
+            .expect("probe_output hung past the cap")
+            .unwrap_err();
+            assert!(err.message.contains("more than"), "{}", err.message);
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
+    }
+
+    /// A probe that never answers, or never closes its pipes, is given up
+    /// on after its time, not waited on forever.
+    #[tokio::test]
+    async fn a_silent_probe_times_out() {
+        let argv = vec!["sh".to_string(), "-c".into(), "sleep 30".into()];
+        let started = std::time::Instant::now();
+        let err = probe_output_within(&argv, std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("timed out"), "{}", err.message);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
