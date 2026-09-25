@@ -4,6 +4,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::config::AgentChoice;
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::store::TaskFilter;
@@ -28,6 +29,11 @@ pub enum IpcRequest {
         /// `None`: the flock of the pinned machine, or the default flock.
         #[serde(default)]
         flock: Option<String>,
+        /// What the run's flags said about the agent; the head fills in
+        /// the rest from the task's flock and `[defaults]`. `None` from a
+        /// client that predates it: `spec` already holds the agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentChoice>,
     },
     List {
         filter: TaskFilter,

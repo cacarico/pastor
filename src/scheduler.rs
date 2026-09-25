@@ -624,6 +624,7 @@ impl Scheduler {
         fleet: Arc<Fleet>,
         events: broadcast::Sender<PastorEvent>,
     ) -> Scheduler {
+        fleet.set_defaults(config.defaults.clone());
         Scheduler {
             paths,
             defaults: config.defaults.clone(),
@@ -887,6 +888,7 @@ impl Scheduler {
             Ok(config) => {
                 if config.defaults != self.config.defaults {
                     self.defaults = config.defaults.clone();
+                    self.fleet.set_defaults(config.defaults.clone());
                     // Jobs were parsed with the old defaults.
                     self.fingerprint = None;
                 }
@@ -1579,6 +1581,7 @@ mod tests {
                 checkout: None,
                 reopen: None,
             },
+            agent: Default::default(),
             flock: None,
         }
     }
@@ -2604,6 +2607,11 @@ mod tests {
         let d = s.reload_config(true).await.unwrap();
         assert_eq!(s.tick, Duration::from_secs(30));
         assert_eq!(s.defaults.agent, "codex");
+        assert_eq!(
+            s.fleet.resolve_agent(&Default::default(), "default").agent,
+            "codex",
+            "`pastor task run` through the head sees the new defaults too"
+        );
         assert!(
             s.fingerprint.is_none(),
             "job files are re-read with the new defaults"

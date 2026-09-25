@@ -247,6 +247,7 @@ async fn the_daemon_writes_the_events_log() {
                 reopen: None,
             },
             flock: None,
+            agent: None,
         },
     )
     .await

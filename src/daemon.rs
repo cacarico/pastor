@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
 use crate::config::flock::{EditError, Flock, FlockDoc, MachineConfig, TaskFlockError};
-use crate::config::{PastorConfig, Paths};
+use crate::config::{AgentChoice, AgentPick, Defaults, PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
@@ -201,6 +201,9 @@ pub struct Fleet {
     /// The flock last passed to `apply_flock`. Differs from what `members`
     /// runs while a machine is shutting down.
     wanted: RwLock<Flock>,
+    /// `[defaults]` as last applied (`set_defaults`): what a queued task's
+    /// agent falls back to after its flock's (`resolve_agent`).
+    defaults: RwLock<Defaults>,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
@@ -221,6 +224,7 @@ impl Fleet {
         Fleet {
             members: RwLock::new(members),
             wanted: RwLock::default(),
+            defaults: RwLock::default(),
             store,
             spawner: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
@@ -245,6 +249,7 @@ impl Fleet {
         Fleet {
             members: RwLock::new(Vec::new()),
             wanted: RwLock::default(),
+            defaults: RwLock::default(),
             store,
             spawner: Some(Spawner { connect, events }),
             dispatch_lock: tokio::sync::Mutex::new(()),
@@ -289,6 +294,23 @@ impl Fleet {
     /// fleet.
     pub fn flock(&self) -> Flock {
         self.wanted.read().unwrap().clone()
+    }
+
+    /// Take `[defaults]` from `pastor.toml` as now loaded; the scheduler
+    /// calls it at start and on every reload that reads the file.
+    pub fn set_defaults(&self, defaults: Defaults) {
+        *self.defaults.write().unwrap() = defaults;
+    }
+
+    /// The agent a task queued in `flock` gets, given what its run or job
+    /// asked for (`Defaults::resolve_agent`), from the flock and defaults as
+    /// they stand now.
+    pub fn resolve_agent(&self, ask: &AgentChoice, flock: &str) -> AgentPick {
+        let wanted = self.wanted.read().unwrap();
+        self.defaults
+            .read()
+            .unwrap()
+            .resolve_agent(ask, wanted.entry(flock))
     }
 
     /// The store the fleet queues tasks in.
@@ -504,11 +526,15 @@ impl Fleet {
     /// removed machine held only until its old actor ends is not in it, and
     /// would never take the task. A fixed fleet has no wanted flock, so its
     /// machines are the flock, all in the default one.
+    /// `ask` is what the run's flags said about the agent; the flock and
+    /// `[defaults]` fill in the rest. `None`, from a client that predates
+    /// it, keeps the agent `spec` already carries.
     pub async fn queue_run(
         &self,
         prompt: String,
-        spec: crate::task::DispatchSpec,
+        mut spec: crate::task::DispatchSpec,
         flock: Option<&str>,
+        ask: Option<&AgentChoice>,
     ) -> Result<Task, QueueError> {
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
@@ -520,6 +546,9 @@ impl Fleet {
             .flock()
             .task_flock(flock, spec.machine.as_deref())
             .map_err(QueueError::Flock)?;
+        if let Some(ask) = ask {
+            self.resolve_agent(ask, &flock).apply_to(&mut spec);
+        }
         self.store
             .insert_task(NewTask {
                 job: "run".into(),
@@ -537,6 +566,8 @@ impl Fleet {
     /// drops the machine the job is pinned to, either sees the task queued,
     /// or goes first and this fails, so the run records the item's error and
     /// holds its cursor rather than queue a task no dispatch can place.
+    /// The task's agent is the job's own, else that flock's, else
+    /// `[defaults]` (`resolve_agent`).
     pub async fn queue_job_task(
         &self,
         job: &crate::config::job::Job,
@@ -545,7 +576,12 @@ impl Fleet {
     ) -> anyhow::Result<Task> {
         let _pass = self.dispatch_lock.lock().await;
         let flock = self.job_task_flock(job)?;
-        self.store.insert_job_task(&job.name, &flock, item, render)
+        let pick = self.resolve_agent(&job.agent, &flock);
+        self.store.insert_job_task(&job.name, &flock, item, |id| {
+            let (prompt, mut spec) = render(id)?;
+            pick.apply_to(&mut spec);
+            Ok((prompt, spec))
+        })
     }
 
     /// `flock remove` with a head running: refuse while queued tasks name
@@ -881,6 +917,7 @@ impl Daemon {
                 prompt,
                 spec,
                 flock,
+                agent,
             } => {
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
@@ -890,7 +927,19 @@ impl Daemon {
                         "a worktree task needs a repo to branch from",
                     );
                 }
-                let task = match self.fleet.queue_run(prompt, spec, flock.as_deref()).await {
+                // `[defaults]` as pastor.toml reads now, not as of the last
+                // tick: `task run` has always taken an edit at once. A file
+                // that does not load leaves the last good one in use.
+                if agent.is_some()
+                    && let Ok(config) = PastorConfig::load_existing(&self.paths.config_file())
+                {
+                    self.fleet.set_defaults(config.defaults);
+                }
+                let task = match self
+                    .fleet
+                    .queue_run(prompt, spec, flock.as_deref(), agent.as_ref())
+                    .await
+                {
                     Ok(t) => t,
                     Err(QueueError::Flock(err @ TaskFlockError::UnknownFlock(_))) => {
                         return IpcResponse::error("unknown_flock", err);
@@ -1709,6 +1758,7 @@ mod tests {
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
+                agent: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -1756,6 +1806,7 @@ mod tests {
                 prompt: "1".into(),
                 spec: spec(),
                 flock: None,
+                agent: None,
             })
             .await
         else {
@@ -1767,6 +1818,7 @@ mod tests {
                 prompt: "2".into(),
                 spec: spec(),
                 flock: None,
+                agent: None,
             })
             .await
         else {
@@ -1803,6 +1855,7 @@ mod tests {
                     ..spec()
                 },
                 flock: None,
+                agent: None,
             })
             .await;
         let IpcResponse::Error { code, .. } = resp else {
@@ -1828,6 +1881,7 @@ mod tests {
                     ..spec()
                 },
                 flock: None,
+                agent: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -1845,10 +1899,12 @@ mod tests {
                 FlockEntry {
                     name: "home".into(),
                     default: true,
+                    ..Default::default()
                 },
                 FlockEntry {
                     name: "work".into(),
                     default: false,
+                    ..Default::default()
                 },
             ],
             machines: vec![
@@ -1877,7 +1933,91 @@ mod tests {
                 ..spec()
             },
             flock: flock.map(Into::into),
+            agent: None,
         }
+    }
+
+    /// A run or job task that names no agent takes its flock's, then
+    /// `[defaults]`; one that names its own keeps it; a client from before
+    /// flock agents (`agent: None`) keeps the spec it sent.
+    #[tokio::test]
+    async fn queued_tasks_take_their_flocks_agent_unless_they_name_one() {
+        let mut flock = home_and_work();
+        flock.flocks[1].agent = Some("codex".into());
+        flock.flocks[1].agent_args = Some(vec!["--model".into(), "gpt-x".into()]);
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("h", 2, FakeHerdr::new()), ("w", 2, FakeHerdr::new())],
+        )
+        .await;
+        let run = |flock: &str, agent: Option<AgentChoice>| IpcRequest::Run {
+            prompt: "x".into(),
+            spec: spec(),
+            flock: Some(flock.into()),
+            agent,
+        };
+        let queued = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => (t.spec.agent, t.spec.agent_args.join(" ")),
+            other => panic!("{other:?}"),
+        };
+
+        let none = Some(AgentChoice::default());
+        assert_eq!(
+            queued(d.handle(run("work", none.clone())).await),
+            ("codex".into(), "--model gpt-x".into())
+        );
+        assert_eq!(
+            queued(d.handle(run("home", none)).await),
+            ("claude".into(), String::new())
+        );
+        let own = Some(AgentChoice {
+            agent: Some("aider".into()),
+            agent_args: None,
+        });
+        assert_eq!(
+            queued(d.handle(run("work", own)).await),
+            ("aider".into(), String::new())
+        );
+        assert_eq!(
+            queued(d.handle(run("work", None)).await),
+            ("claude".into(), String::new())
+        );
+
+        let job = |extra: &str| {
+            let text = format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nflock = \"work\"\nprompt = \"p\"\n{extra}"
+            );
+            crate::config::job::Job::parse(
+                &text,
+                "j",
+                &test_config().defaults,
+                &crate::connector::Builtins,
+            )
+            .unwrap()
+        };
+        let item = serde_json::json!({"key": "k"});
+        let bare = job("");
+        let t = d
+            .fleet()
+            .queue_job_task(&bare, &item, |_| Ok(("p".into(), bare.spec.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            (t.spec.agent.as_str(), t.spec.agent_args.len()),
+            ("codex", 2)
+        );
+        let own = job("agent = \"claude\"\nagent_args = []\n");
+        let t = d
+            .fleet()
+            .queue_job_task(&own, &serde_json::json!({"key": "k2"}), |_| {
+                Ok(("p".into(), own.spec.clone()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (t.spec.agent.as_str(), t.spec.agent_args.len()),
+            ("claude", 0)
+        );
     }
 
     /// `home_and_work` plus `spare`, a flock with no machine.
@@ -1886,6 +2026,7 @@ mod tests {
         flock.flocks.push(crate::config::flock::FlockEntry {
             name: "spare".into(),
             default: false,
+            ..Default::default()
         });
         daemon_with_flock(
             flock,
@@ -1990,7 +2131,11 @@ mod tests {
             };
             let run = {
                 let fleet = fleet.clone();
-                async move { fleet.queue_run("x".into(), spec(), Some("spare")).await }
+                async move {
+                    fleet
+                        .queue_run("x".into(), spec(), Some("spare"), None)
+                        .await
+                }
             };
             // Each waits on the held lock before the next is started.
             let (remove, run) = if remove_first {
@@ -2135,6 +2280,7 @@ mod tests {
                     ..spec()
                 },
                 flock: None,
+                agent: None,
             })
             .await;
         let IpcResponse::Error { code, .. } = resp else {
@@ -2190,6 +2336,7 @@ mod tests {
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
+                agent: None,
             },
         )
         .await
@@ -2347,6 +2494,7 @@ mod tests {
             flocks: vec![crate::config::flock::FlockEntry {
                 name: "personal".into(),
                 default: true,
+                ..Default::default()
             }],
             machines: vec![machine("a", 1)],
         };
@@ -2548,6 +2696,7 @@ mod tests {
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
+                agent: None,
             })
             .await
         else {
@@ -2657,6 +2806,7 @@ mod tests {
                 prompt: "x".into(),
                 spec: spec(),
                 flock: None,
+                agent: None,
             })
             .await
         else {
@@ -2687,6 +2837,7 @@ mod tests {
                 prompt: "x".into(),
                 spec: spec(),
                 flock: None,
+                agent: None,
             })
             .await
         else {
@@ -3050,6 +3201,7 @@ mod tests {
                     ..spec()
                 },
                 flock: None,
+                agent: None,
             })
             .await;
         assert_eq!(error_code(resp), "worktree_needs_repo");

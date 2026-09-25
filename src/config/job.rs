@@ -10,7 +10,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::config::{Defaults, parse_duration};
+use crate::config::{AgentChoice, Defaults, parse_duration};
 use crate::connector::Catalog;
 use crate::schedule::Schedule;
 use crate::task::DispatchSpec;
@@ -74,8 +74,12 @@ pub struct Job {
     pub max_tasks_per_run: u32,
     pub backfill: Duration,
     /// `repo` and `branch` are unrendered templates too; the scheduler renders
-    /// a copy per task.
+    /// a copy per task. Its agent is the job's own, else `[defaults]`: the
+    /// flock's is only known when a task is queued, which re-resolves it
+    /// from `agent` (`Fleet::queue_job_task`).
     pub spec: DispatchSpec,
+    /// What `[dispatch]` itself says about the agent.
+    pub agent: AgentChoice,
     /// `dispatch.flock`, checked against flock.toml at each run (see
     /// `Flock::task_flock`): the job file does not know the flocks.
     pub flock: Option<String>,
@@ -144,6 +148,11 @@ impl Job {
         if max_tasks_per_run == 0 {
             return Err("dispatch.max_tasks_per_run must be at least 1".into());
         }
+        let agent = AgentChoice {
+            agent: d.agent,
+            agent_args: d.agent_args,
+        };
+        let pick = defaults.resolve_agent(&agent, None);
         Ok(Job {
             name,
             schedule,
@@ -154,9 +163,10 @@ impl Job {
             max_tasks_per_run,
             backfill,
             flock: d.flock,
+            agent,
             spec: DispatchSpec {
-                agent: d.agent.unwrap_or_else(|| defaults.agent.clone()),
-                agent_args: defaults.agent_args_or(d.agent_args),
+                agent: pick.agent,
+                agent_args: pick.agent_args,
                 repo: d.repo,
                 worktree: d.worktree,
                 branch: d.branch,
@@ -387,9 +397,12 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         let absent = SPEC_EXAMPLE.replace("agent_args = []\n", "");
         let job = Job::parse(&absent, "support-slack", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent_args, vec!["--model", "claude-opus-5-5"]);
+        // The job's own word is kept apart, for the flock to fill in later.
+        assert_eq!(job.agent.agent_args, None);
 
         let empty = Job::parse(SPEC_EXAMPLE, "support-slack", &d, &Builtins).unwrap();
         assert!(empty.spec.agent_args.is_empty(), "explicit [] opts out");
+        assert_eq!(empty.agent.agent_args, Some(vec![]));
 
         let own = SPEC_EXAMPLE.replace("agent_args = []", "agent_args = [\"--model\", \"x\"]");
         let job = Job::parse(&own, "support-slack", &d, &Builtins).unwrap();

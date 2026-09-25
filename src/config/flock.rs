@@ -34,15 +34,23 @@ pub struct MachineConfig {
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
 pub const DEFAULT_FLOCK: &str = "default";
 
-/// One `[[flock]]` entry. A flock is only a name for now; which machines are
-/// in it is each machine's `flock` field, so a machine is in exactly one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One `[[flock]]` entry: a name, and the agent its tasks get when the task
+/// or job says nothing. Which machines are in it is each machine's `flock`
+/// field, so a machine is in exactly one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlockEntry {
     pub name: String,
     /// Where tasks and jobs that name no flock go. Exactly one entry has it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
+    /// The agent for this flock's tasks that name none; `None` falls through
+    /// to `[defaults] agent` (see `Defaults::resolve_agent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Like `agent`, for the agent's args; `[]` means none, not `[defaults]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_args: Option<Vec<String>>,
 }
 
 /// Why a task cannot have the flock it asked for (`Flock::task_flock`).
@@ -188,6 +196,12 @@ impl Flock {
         } else {
             self.flocks.iter().map(|f| f.name.as_str()).collect()
         }
+    }
+
+    /// The `[[flock]]` entry named `name`; `None` for the implicit flock of
+    /// a file that declares none, which has no settings.
+    pub fn entry(&self, name: &str) -> Option<&FlockEntry> {
+        self.flocks.iter().find(|f| f.name == name)
     }
 
     pub fn has_flock(&self, name: &str) -> bool {
@@ -762,6 +776,28 @@ flock = "work"
         // A pin to a machine the file does not have settles nothing; the
         // caller refuses the machine on its own terms.
         assert_eq!(f.task_flock(None, Some("gone")).unwrap(), "home");
+    }
+
+    #[test]
+    fn a_flock_entry_can_carry_an_agent_and_its_args() {
+        let f = flocks(
+            "[[flock]]\nname = \"home\"\ndefault = true\n[[flock]]\nname = \"work\"\nagent = \"codex\"\nagent_args = [\"--model\", \"gpt-x\"]\n",
+        )
+        .unwrap();
+        let work = f.entry("work").unwrap();
+        assert_eq!(work.agent.as_deref(), Some("codex"));
+        assert_eq!(
+            work.agent_args.as_deref(),
+            Some(&["--model".to_string(), "gpt-x".to_string()][..])
+        );
+        let home = f.entry("home").unwrap();
+        assert_eq!(
+            (home.agent.as_ref(), home.agent_args.as_ref()),
+            (None, None)
+        );
+        assert!(f.entry("play").is_none());
+        // The implicit flock of a file with no `[[flock]]` has no entry.
+        assert!(Flock::default().entry(DEFAULT_FLOCK).is_none());
     }
 
     const COMMENTED: &str = "# my fleet\n\n[[machine]]\nname = \"pi-1\"   # the desk one\nlocal = true\n\n# spare\n[[machine]]\nname = \"pi-3\"\nssh = \"user@pi-3\"\n";

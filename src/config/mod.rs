@@ -175,19 +175,64 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 pub struct Defaults {
     pub agent: String,
     /// Extra argv for the agent (`["--model", "claude-opus-5-5"]`), for tasks
-    /// whose run flags or job file give none. See `agent_args_or`.
+    /// whose run flags, job file and flock give none. See `resolve_agent`.
     pub agent_args: Vec<String>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
 }
 
+/// What `pastor task run` flags or a job file's `[dispatch]` say about the
+/// agent, before the flock and `[defaults]` fill in the rest. `None` means it
+/// said nothing; `Some(vec![])` for `agent_args` means "no args".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChoice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_args: Option<Vec<String>>,
+}
+
+/// The agent a task runs, as `Defaults::resolve_agent` settled it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPick {
+    pub agent: String,
+    pub agent_args: Vec<String>,
+}
+
+impl AgentPick {
+    pub fn apply_to(&self, spec: &mut crate::task::DispatchSpec) {
+        spec.agent = self.agent.clone();
+        spec.agent_args = self.agent_args.clone();
+    }
+}
+
 impl Defaults {
-    /// The agent args a task gets. `given` is what `pastor run --agent-arg` or
-    /// a job file's `agent_args` said, `None` when they said nothing; only
-    /// then do `[defaults] agent_args` apply. The one place that rule lives,
-    /// so run and jobs cannot drift apart.
-    pub fn agent_args_or(&self, given: Option<Vec<String>>) -> Vec<String> {
-        given.unwrap_or_else(|| self.agent_args.clone())
+    /// The agent a task gets: from the first of `ask` (run flags, a job
+    /// file), `flock` (its `[[flock]]` entry) and these defaults that names
+    /// one. Its args come from the first of the three that sets
+    /// `agent_args` and was written for that agent: one that names no agent,
+    /// or names the same one. So a flock's `--model` for codex never reaches
+    /// a task that asked for claude. The one place the rule lives, so run and
+    /// jobs cannot drift apart.
+    pub fn resolve_agent(&self, ask: &AgentChoice, flock: Option<&flock::FlockEntry>) -> AgentPick {
+        let flock = flock.map(|f| (f.agent.as_deref(), f.agent_args.as_ref()));
+        let agent = ask
+            .agent
+            .as_deref()
+            .or(flock.and_then(|(a, _)| a))
+            .unwrap_or(&self.agent)
+            .to_string();
+        let layers = [
+            (ask.agent.as_deref(), ask.agent_args.as_ref()),
+            flock.unwrap_or((None, None)),
+            (Some(self.agent.as_str()), Some(&self.agent_args)),
+        ];
+        let agent_args = layers
+            .into_iter()
+            .find_map(|(for_agent, args)| args.filter(|_| for_agent.is_none_or(|a| a == agent)))
+            .cloned()
+            .unwrap_or_default();
+        AgentPick { agent, agent_args }
     }
 }
 
@@ -572,9 +617,101 @@ mod tests {
         .unwrap();
         let d = PastorConfig::load(&path).unwrap().defaults;
         assert_eq!(d.agent_args, vec!["--model", "claude-opus-5-5"]);
-        assert_eq!(d.agent_args_or(None), vec!["--model", "claude-opus-5-5"]);
-        assert_eq!(d.agent_args_or(Some(vec!["-v".into()])), vec!["-v"]);
-        assert!(d.agent_args_or(Some(vec![])).is_empty());
+        let args = |given: Option<Vec<String>>| {
+            let ask = AgentChoice {
+                agent_args: given,
+                ..Default::default()
+            };
+            d.resolve_agent(&ask, None).agent_args
+        };
+        assert_eq!(args(None), vec!["--model", "claude-opus-5-5"]);
+        assert_eq!(args(Some(vec!["-v".into()])), vec!["-v"]);
+        assert!(args(Some(vec![])).is_empty());
+    }
+
+    /// The task or job wins, then its flock, then `[defaults]`; each key on
+    /// its own, and `[]` from a flock is a choice, not a gap.
+    #[test]
+    fn the_agent_comes_from_the_ask_then_the_flock_then_the_defaults() {
+        let d = Defaults {
+            agent: "claude".into(),
+            agent_args: vec!["--model".into(), "claude-sonnet-5".into()],
+            ..Default::default()
+        };
+        let work = flock::FlockEntry {
+            name: "work".into(),
+            agent: Some("codex".into()),
+            agent_args: Some(vec!["--model".into(), "gpt-x".into()]),
+            ..Default::default()
+        };
+        let bare = flock::FlockEntry {
+            name: "home".into(),
+            ..Default::default()
+        };
+        let none = AgentChoice::default();
+        let pick = |ask: &AgentChoice, f: Option<&flock::FlockEntry>| {
+            let p = d.resolve_agent(ask, f);
+            (p.agent, p.agent_args.join(" "))
+        };
+
+        assert_eq!(
+            pick(&none, None),
+            ("claude".into(), "--model claude-sonnet-5".into())
+        );
+        assert_eq!(pick(&none, Some(&bare)), pick(&none, None));
+        assert_eq!(
+            pick(&none, Some(&work)),
+            ("codex".into(), "--model gpt-x".into())
+        );
+
+        let own = AgentChoice {
+            agent: Some("aider".into()),
+            agent_args: Some(vec!["-v".into()]),
+        };
+        assert_eq!(pick(&own, Some(&work)), ("aider".into(), "-v".into()));
+        // Args follow the agent they were written for: the flock's are for
+        // codex, so a task that asks for claude gets `[defaults]`' instead.
+        let claude = AgentChoice {
+            agent: Some("claude".into()),
+            agent_args: None,
+        };
+        assert_eq!(
+            pick(&claude, Some(&work)),
+            ("claude".into(), "--model claude-sonnet-5".into())
+        );
+        let codex = AgentChoice {
+            agent: Some("codex".into()),
+            agent_args: None,
+        };
+        assert_eq!(
+            pick(&codex, Some(&work)),
+            ("codex".into(), "--model gpt-x".into())
+        );
+        // ...and `[defaults]`' are for claude, so codex outside the flock gets none.
+        assert_eq!(pick(&codex, Some(&bare)), ("codex".into(), String::new()));
+        // A flock that sets only args lends them to whatever agent runs.
+        let args_only = flock::FlockEntry {
+            agent_args: Some(vec!["--fast".into()]),
+            ..bare.clone()
+        };
+        assert_eq!(
+            pick(&codex, Some(&args_only)),
+            ("codex".into(), "--fast".into())
+        );
+
+        let no_args = flock::FlockEntry {
+            agent_args: Some(vec![]),
+            ..bare.clone()
+        };
+        assert_eq!(
+            pick(&none, Some(&no_args)),
+            ("claude".into(), String::new())
+        );
+        // Nothing set anywhere: the built-in.
+        assert_eq!(
+            Defaults::default().resolve_agent(&none, None).agent,
+            "claude"
+        );
     }
 
     #[test]

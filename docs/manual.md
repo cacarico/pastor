@@ -226,8 +226,7 @@ pastor naming agents `t-N` on each herdr.
 A flock is a named group of machines. Every machine is in exactly one, and
 every task and job targets one: only that flock's machines take its tasks.
 Flocks keep kinds of work apart, such as work and personal machines that run
-agents on different accounts. A flock is only a name; it has no settings of
-its own.
+agents on different accounts. A flock can also say which agent its tasks run.
 
 ```toml
 # flock.toml
@@ -237,6 +236,8 @@ default = true            # tasks and jobs that name no flock go here
 
 [[flock]]
 name = "work"
+agent = "claude"          # optional: the agent for this flock's tasks
+agent_args = ["--model", "claude-sonnet-5"]
 
 [[machine]]
 name = "desk"
@@ -294,6 +295,32 @@ when the command takes `--flock`, edits `flock.toml` (`flock add|default|remove`
 no `--flock` means the default flock rather than every machine. A head that
 is listening but does not answer is refused whether flocks are in play or not
 (`head_unresponsive`); only a head that is not running at all is passed by.
+
+### A flock's agent
+
+`agent` and `agent_args` under a `[[flock]]` entry are the agent its tasks and
+jobs run when they name none. Each task settles its agent when it is queued,
+from the first of these that says:
+
+1. `--agent` and `--agent-arg` on `pastor task run`, or `agent` and
+   `agent_args` under a job's `[dispatch]`;
+2. the task's flock, in `flock.toml`;
+3. `[defaults]` in `pastor.toml`;
+4. the built-in: `claude` with no args.
+
+The agent and its args are looked up on their own, with one rule: args follow
+the agent they were written for. A layer's `agent_args` only apply when that
+layer names no `agent`, or names the one the task runs. So with the `work`
+flock above, `pastor task run --flock work --agent codex` runs codex without
+`--model claude-sonnet-5`, and `[defaults] agent_args` (written for
+`[defaults] agent`) do not reach a flock that runs another agent. An
+`agent_args = []` is a choice, not a gap: it stops the lookup with no args.
+
+`pastor task show` prints the agent and args a task resolved to; the task keeps
+them, so a later edit of `flock.toml` or `pastor.toml` changes only tasks
+queued after it. The head reads `pastor.toml` again for every `task run`; a
+hand edit of `flock.toml` reaches it on the next tick, or at once with `pastor
+job reload`.
 
 `pastor machine move` changes the flock of tasks dispatched after it; tasks
 already on the machine keep running there, and its connection stays up. A
@@ -412,9 +439,10 @@ next word as its value, even one that starts with a dash, so
 `=` form just reads more clearly. There is no single-string form: pastor would
 have to split it on spaces, and that breaks any argument that contains one. A
 job file's `agent_args` does the same for its tasks. When neither says
-anything, `[defaults] agent_args` in pastor.toml applies; a job file that sets
-`agent_args = []` opts out of it. `pastor task show t-1` prints the args a task
-was started with.
+anything, the flock's `agent_args` apply, then `[defaults] agent_args` in
+pastor.toml (see [A flock's agent](#a-flocks-agent)); a job file that sets
+`agent_args = []` opts out of both. `pastor task show t-1` prints the agent and
+args a task was started with.
 
 `--prompt-file` reads the prompt from a file on the machine that runs the CLI,
 not on the agent's machine; `-` reads standard input. It spares a long prompt
@@ -722,7 +750,7 @@ reconcile_every = "60s"
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "15m"     # a done task's pane closes after this; "never" keeps it
-[defaults]                   # for run flags and job keys that are left out
+[defaults]                   # for run flags, job keys and flock keys that are left out
 agent = "claude"
 agent_args = []              # e.g. ["--model", "claude-opus-5-5"]
 max_tasks_per_run = 5

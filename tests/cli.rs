@@ -340,7 +340,8 @@ fn help_footer_points_agents_at_the_skill() {
 }
 
 /// `--agent-arg` reaches herdr's `agent.start` as `args`, in order, and shows
-/// in `task show` and `task list --json`; without it, `[defaults] agent_args` does.
+/// in `task show` and `task list --json`; without it, the flock's
+/// `agent_args` do, then `[defaults] agent_args`.
 #[test]
 fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     let env = start();
@@ -393,6 +394,41 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
         start["args"],
         serde_json::json!(["--model", "claude-sonnet-5"]),
         "{start}"
+    );
+
+    // A flock's own agent_args come before `[defaults]`, and `task show`
+    // prints what the task resolved to.
+    let flock = env.config.join("flock.toml");
+    // A third slot, so t-3 need not wait for the first two to settle.
+    let machines = std::fs::read_to_string(&flock)
+        .unwrap()
+        .replace("max_agents = 2", "max_agents = 3");
+    std::fs::write(
+        &flock,
+        format!(
+            "[[flock]]\nname = \"default\"\ndefault = true\nagent_args = [\"--model\", \"claude-haiku-4-5\"]\n\n{machines}"
+        ),
+    )
+    .unwrap();
+    assert!(env.cmd(&["job", "reload"]).status.success());
+    let out = env.cmd(&["task", "run", "third", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let start = env.agent_start_params("t-3");
+    assert_eq!(
+        start["args"],
+        serde_json::json!(["--model", "claude-haiku-4-5"]),
+        "{start}"
+    );
+    let out = env.cmd(&["task", "show", "t-3"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("agent:      claude\n"), "{text}");
+    assert!(
+        text.contains("agent args: --model claude-haiku-4-5"),
+        "{text}"
     );
 }
 

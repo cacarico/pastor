@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use pastor::cli::{CliError, request_failure};
 use pastor::config::flock::{EditError, Flock, FlockDoc, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
-use pastor::config::{PastorConfig, Paths, parse_duration};
+use pastor::config::{AgentChoice, PastorConfig, Paths, parse_duration};
 use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{Head, HeadPing, IpcRequest, IpcResponse, request};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
@@ -137,7 +137,8 @@ struct RunArgs {
     #[arg(long)]
     agent: Option<String>,
     /// One argument for the agent; repeat it, in order, for more. Replaces
-    /// `[defaults] agent_args`. The next word is always the value, dashes and all.
+    /// the flock's and `[defaults]` agent_args. The next word is always the
+    /// value, dashes and all.
     #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
     agent_args: Vec<String>,
     /// A git worktree per task, branched from --repo (so it needs --repo)
@@ -456,6 +457,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     let IpcResponse::Task(t) = ask(
         paths,
         IpcRequest::Run {
+            agent: Some(agent_choice(&a)),
             prompt,
             spec,
             flock: a.flock,
@@ -469,8 +471,18 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `pastor task run`'s flags say about the agent; the head fills in the
+/// rest from the task's flock and `[defaults]`.
+fn agent_choice(a: &RunArgs) -> AgentChoice {
+    AgentChoice {
+        agent: a.agent.clone(),
+        agent_args: (!a.agent_args.is_empty()).then(|| a.agent_args.clone()),
+    }
+}
+
 /// What `pastor task run`'s flags ask for, with pastor.toml's `[defaults]` filling
-/// in what they leave out.
+/// in what they leave out. The agent in it is only what a head from before
+/// flock agents would run: a current head resolves it again, with the flock.
 fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> {
     let timeout = a
         .timeout
@@ -479,10 +491,10 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
         .transpose()
         .map_err(|e| anyhow::anyhow!(e))?
         .unwrap_or(config.timeout_duration());
-    let given = (!a.agent_args.is_empty()).then(|| a.agent_args.clone());
+    let pick = config.defaults.resolve_agent(&agent_choice(a), None);
     Ok(DispatchSpec {
-        agent: a.agent.clone().unwrap_or(config.defaults.agent.clone()),
-        agent_args: config.defaults.agent_args_or(given),
+        agent: pick.agent,
+        agent_args: pick.agent_args,
         repo: a.repo.clone(),
         worktree: a.worktree,
         branch: a.branch.clone(),
@@ -1400,6 +1412,21 @@ mod tests {
         assert_eq!(spec.agent_args, vec!["--model", "claude-sonnet-5"]);
         let spec = run_spec(&run_args(&["hi", "--agent-arg=--verbose"]), &config).unwrap();
         assert_eq!(spec.agent_args, vec!["--verbose"]);
+    }
+
+    /// The head resolves the agent with the task's flock, so the request
+    /// carries only what the flags said: nothing, when they said nothing.
+    #[test]
+    fn run_sends_only_the_agent_its_flags_name() {
+        assert_eq!(agent_choice(&run_args(&["hi"])), AgentChoice::default());
+        let a = run_args(&["hi", "--agent", "codex", "--agent-arg=-v"]);
+        assert_eq!(
+            agent_choice(&a),
+            AgentChoice {
+                agent: Some("codex".into()),
+                agent_args: Some(vec!["-v".into()]),
+            }
+        );
     }
 
     fn list_args(argv: &[&str]) -> ListArgs {

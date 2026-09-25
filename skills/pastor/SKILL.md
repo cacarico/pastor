@@ -54,6 +54,7 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 - `--repo` is a path on the machine that runs the agent. Quote a leading `~` so your shell does not expand it. pastor checks that it is a directory on that machine before it creates anything (`test -d` over ssh); a missing repo fails the task with `repo <path> does not exist on <machine>`. A `command` machine cannot be checked.
 - `--worktree` makes a git worktree of `--repo` for the task, on `--branch` or `pastor/t-N`. It needs `--repo` and the repo cloned on that machine.
 - `--agent-arg` passes one argument to the agent and always takes the next word, dashes included. Repeat it, in order.
+- Without `--agent` and `--agent-arg`, the task takes its flock's `agent` and `agent_args` from `flock.toml`, then `[defaults]` in `pastor.toml`, then `claude`. Args follow the agent they were written for: a flock's args for codex never reach a task run with `--agent claude`. `pastor task show t-N` prints what the task resolved to.
 - `--timeout` bounds the task; past it the task goes `stale`.
 - `--prompt-file PATH` takes the prompt from a file on the machine running the CLI (`-` is stdin) in place of the argument; give exactly one of the two. Use it for a long prompt: quotes, backticks and `$` need no escaping, and trailing newlines are dropped. An unreadable file fails with `prompt_file_unreadable`, an empty one with `prompt_file_empty`.
 
@@ -134,7 +135,7 @@ The head picks up job file edits by itself. A file that stops parsing keeps its 
 
 ## The fleet
 
-`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2), `tags` and `flock`. `[[flock]]` entries (`name`, and `default = true` on one of them) declare the flocks; a machine with no `flock` is in the default one, and a file with no `[[flock]]` has a single flock named `default`.
+`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2), `tags` and `flock`. `[[flock]]` entries (`name`, `default = true` on one of them, and optionally the `agent` and `agent_args` its tasks and jobs get when they name none) declare the flocks; a machine with no `flock` is in the default one, and a file with no `[[flock]]` has a single flock named `default`.
 
 ```bash
 pastor machine add pi-3 user@pi-3 --max-agents 2 --tag arm --herdr

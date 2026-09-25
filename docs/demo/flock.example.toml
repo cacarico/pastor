@@ -1,5 +1,15 @@
 # Copy to docs/demo/local/flock.toml. The recording shows these names and
 # hosts as written, so use ssh aliases rather than addresses.
+#
+# To give the demo's tasks a model without passing --agent-arg each time,
+# declare the flock and its agent:
+#
+# [[flock]]
+# name = "default"
+# default = true
+# agent = "claude"
+# agent_args = ["--model", "claude-sonnet-5"]
+
 [[machine]]
 name = "pi-1"
 ssh = "pi-1"

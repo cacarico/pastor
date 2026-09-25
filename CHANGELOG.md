@@ -12,6 +12,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   no shell quoting. It conflicts with the positional prompt; exactly one is
   required. Trailing newlines are trimmed. An unreadable file fails with
   `prompt_file_unreadable`, an empty one with `prompt_file_empty`.
+
+- A flock can name the agent its tasks run: `agent` and `agent_args` under a
+  `[[flock]]` entry in `flock.toml`. A task or job that names none takes its
+  flock's, then `[defaults]`, then the built-in `claude`; `--agent` and
+  `--agent-arg` always win. The head settles the agent when it queues the
+  task, and `pastor task show` prints what it resolved to.
+
 - A release workflow (`.github/workflows/release.yml`). Pushing a `vX.Y.Z`
   tag builds static musl binaries for x86_64, aarch64, armv7 and riscv64
   Linux and native macOS arm64 and x86_64 binaries, packs each as
@@ -30,6 +37,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on the release tag.
 
 ### Changed
+
+- Agent args follow the agent they were written for: `[defaults] agent_args`
+  no longer reach a task that runs another agent than `[defaults] agent`
+  (`pastor task run --agent codex` used to get Claude's `--model`).
+- The head, not the CLI, settles a `pastor task run` task's agent, since only
+  it knows the task's flock. It still reads `pastor.toml` afresh for each run.
 
 - `cargo install` and `make install` install only the `pastor` binary
   (`--bin pastor`); `fake-herdr` is a test double and no longer lands on
