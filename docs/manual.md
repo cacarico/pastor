@@ -1071,8 +1071,27 @@ ln -s ~/ghq/github.com/cacarico/pastor/skills/pastor .claude/skills/pastor     #
 
 An agent that pastor dispatched runs on a flock machine, where this checkout
 may not exist; if pastor is installed there, it can run `pastor --skill`.
-A unit test checks that every command and flag the skill names exists, so a
-CLI change that breaks it fails `make check`.
+A unit test checks that every command and flag the skills name exists, so a
+CLI change that breaks one fails `make check`.
+
+`skills/spec/SKILL.md` plans work for the flock. It starts from the
+superpowers brainstorm, then writes a plan in which every task has a flock or
+machine, a repo, its own branch, a model with a one-line reason, a timeout
+and a prompt file an agent can finish with nobody answering it. The plan, the
+prompt files and a ledger live on a plan branch, `pastor/<name>`, in the repo
+being worked on: each task resets to that branch, does its part, appends
+`Task N: complete` to the ledger and pushes, so any machine can pick up the
+next one. Tasks run one after another; a task starts only once the ledger
+says the one before it is complete. Each task's Dispatch block holds the
+command that starts it, `pastor task run --prompt-file ...`, so long prompts
+need no shell quoting. `skills/spec/plan-format.md` is the layout and
+`skills/spec/example/` a whole plan. The skill plans only; it never starts a
+task.
+
+The repository is also a Claude Code plugin named `pastor`
+(`.claude-plugin/plugin.json`), which is how the skills other than the
+built-in one travel: installed as a plugin, the skill is `/pastor:spec`;
+linked like the one above, it is `/spec`.
 
 ## Development
 

@@ -17,6 +17,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   task's agent now always runs in a pane split off the worktree's, since the
   mark is env and herdr's worktree calls take none.
 
+- A second agent skill, `skills/spec` (`/pastor:spec` once the repo is
+  installed as a Claude Code plugin; `.claude-plugin/plugin.json` makes it
+  one). It starts from a superpowers brainstorm and writes a plan whose tasks
+  each carry a flock, repo, branch, model, timeout and a prompt file that
+  needs no answers, run with `pastor task run --prompt-file`. The plan, its
+  prompts and a ledger live on a plan branch so any machine can resume;
+  tasks run one after another.
+
 - `pastor task run --prompt-file <path>` reads the prompt from a file on the
   machine running the CLI (`-` for stdin), so a long prompt with quotes needs
   no shell quoting. It conflicts with the positional prompt; exactly one is

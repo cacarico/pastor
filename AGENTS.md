@@ -86,6 +86,15 @@ down here because getting them wrong cost a day.
   Agents are never renamed; hosts are not "sheep". "Plugin" is kept free
   for code that changes how pastor itself behaves; what installs a connector
   command or event hooks is a connector.
+
+  a unit test fails when any Markdown file under `skills/` names a command
+  or flag that does not exist, or a SKILL.md's frontmatter is off. The other
+  skills (`skills/spec/`) are not built in; they install with the repo as the
+  Claude Code plugin `pastor` (`.claude-plugin/plugin.json`, whose version
+  follows `Cargo.toml`). `tests/cli.rs` runs the spec skill's example plan's
+  first task against the fake herdr.
+- Vocabulary is fixed: machine, flock, head, job, task, plugin,
+  connector, agent. Agents are never renamed; hosts are not "sheep".
 - Runtime CLI errors are JSON on stderr with a stable code and exit 1; clap
   usage errors stay plain text with exit 2.
 - Rust edition 2024, toolchain from mise. No new runtime dependencies without
@@ -155,6 +164,8 @@ Still open as of the last review; none of them blocks normal use.
 ~/.local/state/pastor/runs/<job>/       connector run logs, 256 KiB each, newest 20 kept
 ~/.local/state/pastor/runs/@<id>/       hook logs (and `connector` runs with no job)
 skills/pastor/SKILL.md            agent skill, in the repo; `pastor --skill` prints it
+skills/spec/                      plan-for-the-flock skill, its plan format and example
+.claude-plugin/plugin.json        makes the repo a Claude Code plugin named pastor
 ```
 
 `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR` override these;

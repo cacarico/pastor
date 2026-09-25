@@ -162,6 +162,8 @@ blocks.
 - [Skill for agents](skills/pastor/SKILL.md): what a coding agent needs to
   know to use pastor, or to behave when pastor started it. `pastor --skill`
   prints the copy built into the binary.
+- [Spec skill](skills/spec/SKILL.md): `/pastor:spec` turns an idea into a
+  plan a flock can run with nobody watching, one task after another.
 - [Changelog](CHANGELOG.md).
 
 Development: `make check` runs fmt, clippy and the whole suite against a fake
