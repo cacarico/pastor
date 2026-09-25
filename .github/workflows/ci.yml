@@ -8,6 +8,8 @@
 # `check` and `test-machine` only exercise what they build or read, so
 # `paths:` skips docs-only changes; gitleaks has no such filter because a
 # secret can land in any file.
+name: ci
+
 on:
   pull_request:
     paths:
