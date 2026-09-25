@@ -276,7 +276,7 @@ a server, and a bridge per request.
 
 ```bash
 FAKE_HERDR_AUTO_DONE_MS=500 fake-herdr --listen /tmp/fake-herdr.sock &
-pastor machine add fake --command fake-herdr --connect /tmp/fake-herdr.sock
+pastor machine add fake --command "fake-herdr --connect /tmp/fake-herdr.sock"
 pastor serve
 ```
 

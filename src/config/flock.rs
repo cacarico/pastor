@@ -77,6 +77,9 @@ impl Flock {
                     m.name
                 ));
             }
+            if m.command.as_ref().is_some_and(|c| c.is_empty()) {
+                return Err(format!("machine {}: command is empty", m.name));
+            }
             if m.max_agents == 0 {
                 return Err(format!("machine {}: max_agents must be at least 1", m.name));
             }
@@ -121,6 +124,18 @@ mod tests {
             max_agents: 2,
             tags: vec![],
         }
+    }
+
+    #[test]
+    fn an_empty_command_is_refused() {
+        let f = Flock {
+            machines: vec![MachineConfig {
+                ssh: None,
+                command: Some(vec![]),
+                ..pi("x")
+            }],
+        };
+        assert_eq!(f.validate().unwrap_err(), "machine x: command is empty");
     }
 
     #[test]

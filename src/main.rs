@@ -203,8 +203,11 @@ enum MachineCmd {
         ssh: Option<String>,
         #[arg(long)]
         local: bool,
-        #[arg(long, num_args = 1.., allow_hyphen_values = true)]
-        command: Option<Vec<String>>,
+        /// Developer option: the bridge command as one string, split on
+        /// whitespace (`--command "fake-herdr --connect /tmp/h.sock"`).
+        /// Words containing spaces go in flock.toml by hand.
+        #[arg(long, value_name = "COMMAND")]
+        command: Option<String>,
         #[arg(long, default_value = "default")]
         session: String,
         #[arg(long, default_value_t = 2)]
@@ -439,6 +442,12 @@ type ProbeFields = (
     Option<usize>,
     Option<String>,
 );
+
+/// `--command` as argv: one value split on whitespace. It used to be
+/// `num_args = 1..`, which swallowed every option after it.
+fn command_argv(s: &str) -> Vec<String> {
+    s.split_whitespace().map(str::to_string).collect()
+}
 
 fn probe_fields(
     ping: Result<pastor::herdr::Pong, pastor::herdr::CallError>,
@@ -778,7 +787,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd) -> anyhow::Result<()> {
                 name: name.clone(),
                 local,
                 ssh,
-                command,
+                command: command.as_deref().map(command_argv),
                 session,
                 max_agents,
                 tags,
@@ -1445,6 +1454,47 @@ mod tests {
             moved_hint("run", "task run", true).as_deref(),
             Some("pastor run is now pastor task run")
         );
+    }
+
+    /// `--command` used to take every following word, pastor's own options
+    /// included. It is one value now, and options after it are pastor's.
+    #[test]
+    fn machine_add_command_is_one_value() {
+        let cli = Cli::try_parse_from([
+            "pastor",
+            "machine",
+            "add",
+            "fake",
+            "--command",
+            "fake-herdr --connect /tmp/h.sock",
+            "--max-agents",
+            "1",
+            "--tag",
+            "t",
+        ])
+        .unwrap();
+        let Some(Command::Machine {
+            cmd:
+                MachineCmd::Add {
+                    command,
+                    max_agents,
+                    tags,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("parsed as another command")
+        };
+        assert_eq!(
+            command.as_deref().map(command_argv),
+            Some(vec![
+                "fake-herdr".to_string(),
+                "--connect".into(),
+                "/tmp/h.sock".into()
+            ])
+        );
+        assert_eq!(max_agents, 1, "options after --command are pastor's");
+        assert_eq!(tags, vec!["t".to_string()]);
     }
 
     #[test]
