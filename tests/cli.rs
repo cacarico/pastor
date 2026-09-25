@@ -1660,6 +1660,13 @@ fn task_retry_close_and_prune_end_to_end() {
     }
     let all = env.cmd(&["task", "list", "--all"]);
     assert!(String::from_utf8_lossy(&all.stdout).contains("orphan"));
+    // --flock narrows the orphans to that flock's machines too.
+    env.cmd(&["flock", "add", "work"]);
+    let work = env.cmd(&["task", "list", "--all", "--flock", "work"]);
+    let text = String::from_utf8_lossy(&work.stdout);
+    assert!(!text.contains("orphan"), "{text}");
+    let default = env.cmd(&["task", "list", "--all", "--flock", "default"]);
+    assert!(String::from_utf8_lossy(&default.stdout).contains("orphan"));
 
     let closed = env.json(&["task", "close", "t-1", "--json"]);
     assert_eq!(closed["state"], "closed");

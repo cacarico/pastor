@@ -304,10 +304,16 @@ pub fn flock_rows(rows: &[FlockRow]) -> Vec<Vec<String>> {
 
 /// One line per orphaned agent, for under the `pastor list` table. With
 /// `machine`, only that machine's, as `task list --machine` shows only its
-/// tasks.
-pub fn orphan_lines(ms: &[MachineStatus], machine: Option<&str>) -> Vec<String> {
+/// tasks; with `flock`, only its machines' (a machine with no flock, from a
+/// head before flocks, is in the default one, as in `MachineRow`).
+pub fn orphan_lines(
+    ms: &[MachineStatus],
+    machine: Option<&str>,
+    flock: Option<&str>,
+) -> Vec<String> {
     ms.iter()
         .filter(|m| machine.is_none_or(|name| m.name == name))
+        .filter(|m| flock.is_none_or(|f| m.flock.as_deref().unwrap_or(DEFAULT_FLOCK) == f))
         .flat_map(|m| {
             m.orphans.iter().map(move |o| {
                 format!(
@@ -940,7 +946,7 @@ mod tests {
             orphans: vec![],
             ..m.clone()
         };
-        let lines = orphan_lines(&[m.clone(), none.clone()], None);
+        let lines = orphan_lines(&[m.clone(), none.clone()], None, None);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("orphan t-4 on pi:"), "{}", lines[0]);
         assert!(lines[1].contains("pastor task close t-9"));
@@ -951,11 +957,26 @@ mod tests {
             ..m.clone()
         };
         let both = [m.clone(), other];
-        assert_eq!(orphan_lines(&both, None).len(), 3);
-        let lines = orphan_lines(&both, Some("pi-2"));
+        assert_eq!(orphan_lines(&both, None, None).len(), 3);
+        let lines = orphan_lines(&both, Some("pi-2"), None);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("orphan t-5 on pi-2:"), "{}", lines[0]);
-        assert!(orphan_lines(&both, Some("nope")).is_empty());
+        assert!(orphan_lines(&both, Some("nope"), None).is_empty());
+        // `task list --flock work` likewise: only the orphans of work's
+        // machines. A machine with no flock (a head from before flocks) is
+        // in the default flock, as its row in `machine list` says.
+        let work = MachineStatus {
+            name: "pi-3".into(),
+            orphans: vec!["t-6".into()],
+            flock: Some("work".into()),
+            ..m.clone()
+        };
+        let three = [m.clone(), both[1].clone(), work];
+        let lines = orphan_lines(&three, None, Some("work"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("orphan t-6 on pi-3:"), "{}", lines[0]);
+        assert_eq!(orphan_lines(&three, None, Some(DEFAULT_FLOCK)).len(), 3);
+        assert!(orphan_lines(&three, Some("pi-3"), Some(DEFAULT_FLOCK)).is_empty());
         let rows = machine_rows(&[MachineRow::from(&m), MachineRow::from(&none)]);
         assert_eq!(rows[0][6], "3/4");
         assert_eq!(rows[0][7], "t-4,t-9");

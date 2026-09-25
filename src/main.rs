@@ -659,7 +659,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         job: a.job,
         machine: a.machine.clone(),
         states,
-        flock: a.flock,
+        flock: a.flock.clone(),
     };
     let daemon_up = daemon_running(&paths.socket_file()).await;
     if daemon_up && filter.flock.is_some() {
@@ -705,7 +705,7 @@ async fn list(paths: &Paths, a: ListArgs) -> anyhow::Result<()> {
         let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
             unreachable!()
         };
-        for line in pastor::cli::orphan_lines(&ms, a.machine.as_deref()) {
+        for line in pastor::cli::orphan_lines(&ms, a.machine.as_deref(), a.flock.as_deref()) {
             println!("{line}");
         }
     }
