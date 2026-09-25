@@ -1,10 +1,10 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
-use crate::config::flock::Flock;
+use crate::config::flock::{Flock, MachineConfig};
 use crate::config::{PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
@@ -15,37 +15,200 @@ use crate::store::{NewTask, RetryError, Store};
 use crate::task::Task;
 use crate::task::TaskState;
 
+/// Builds a machine's transport from its flock entry. `serve` uses
+/// `endpoint_factory`; tests hand out fakes by machine name.
+pub type ConnectorFactory = Arc<dyn Fn(&MachineConfig) -> Arc<dyn Connector> + Send + Sync>;
+
+/// The transports `pastor serve` uses: ssh, the local socket or a command.
+pub fn endpoint_factory(paths: Paths) -> ConnectorFactory {
+    Arc::new(move |m: &MachineConfig| {
+        Arc::new(Endpoint::from_machine(m, &paths)) as Arc<dyn Connector>
+    })
+}
+
+/// The actor timings `pastor.toml` sets. One place, so the daemon's start
+/// and a reload build the same value and a reload can tell whether it changed.
+pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
+    MachineSettings {
+        settle: config.settle_duration(),
+        reconcile_every: config.reconcile_duration(),
+        request_timeout: config.request_timeout_duration(),
+        agent_ready_timeout: config.agent_ready_timeout_duration(),
+        poll_every: config.tick_duration(),
+        ..Default::default()
+    }
+}
+
+/// What `apply_flock` changed, by machine name, in flock order (`removed` in
+/// the previous order).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FlockDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Same name, different entry (target, session, capacity, tags) or
+    /// different timings: the actor was replaced. Its tasks stay; the new
+    /// actor reconciles them.
+    pub retargeted: Vec<String>,
+}
+
+impl FlockDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.retargeted.is_empty()
+    }
+}
+
+struct Member {
+    handle: MachineHandle,
+    /// What the actor was spawned from; `None` for handles given to
+    /// `Fleet::new`, which `apply_flock` never manages.
+    spawned_from: Option<(MachineConfig, MachineSettings)>,
+}
+
+struct Spawner {
+    connect: ConnectorFactory,
+    events: broadcast::Sender<PastorEvent>,
+}
+
 /// The machines plus the one lock every dispatch pass takes. Shared by the
-/// daemon (a `pastor task run` dispatches inline) and the scheduler (each tick, and
-/// after a job run queues tasks), so two passes never read the same capacity
-/// snapshot and both fill the last slot.
+/// daemon (a `pastor task run` dispatches inline) and the scheduler (each
+/// tick, and after a job run queues tasks), so two passes never read the same
+/// capacity snapshot and both fill the last slot.
+///
+/// The set can change while the daemon runs (`apply_flock`, from a reload of
+/// `flock.toml` or `pastor.toml`). Readers take a snapshot: `machines()` and
+/// `get` hand out clones, never a reference into the set.
 pub struct Fleet {
-    machines: Vec<MachineHandle>,
+    members: RwLock<Vec<Member>>,
     store: Arc<Store>,
+    /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
+    spawner: Option<Spawner>,
     dispatch_lock: tokio::sync::Mutex<()>,
 }
 
 impl Fleet {
+    /// A fixed set of machines; `apply_flock` leaves it alone.
     pub fn new(machines: Vec<MachineHandle>, store: Arc<Store>) -> Fleet {
+        let members = machines
+            .into_iter()
+            .map(|handle| Member {
+                handle,
+                spawned_from: None,
+            })
+            .collect();
         Fleet {
-            machines,
+            members: RwLock::new(members),
             store,
+            spawner: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// Every machine in flock order. Read-only: the set is fixed for the
-    /// daemon's lifetime, so callers iterate and never hold a slot.
-    pub fn machines(&self) -> &[MachineHandle] {
-        &self.machines
+    /// An empty fleet that `apply_flock` fills, spawning one actor per machine
+    /// through `connect`.
+    pub fn managed(
+        store: Arc<Store>,
+        events: broadcast::Sender<PastorEvent>,
+        connect: ConnectorFactory,
+    ) -> Fleet {
+        Fleet {
+            members: RwLock::new(Vec::new()),
+            store,
+            spawner: Some(Spawner { connect, events }),
+            dispatch_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
-    pub fn get(&self, name: &str) -> Option<&MachineHandle> {
-        self.machines.iter().find(|h| h.name == name)
+    /// Every machine in flock order, as of now.
+    pub fn machines(&self) -> Vec<MachineHandle> {
+        self.members
+            .read()
+            .unwrap()
+            .iter()
+            .map(|m| m.handle.clone())
+            .collect()
+    }
+
+    pub fn get(&self, name: &str) -> Option<MachineHandle> {
+        self.members
+            .read()
+            .unwrap()
+            .iter()
+            .find(|m| m.handle.name == name)
+            .map(|m| m.handle.clone())
+    }
+
+    /// The flock as last applied: what a reload falls back to when
+    /// `flock.toml` does not load.
+    pub fn flock(&self) -> Flock {
+        Flock {
+            machines: self
+                .members
+                .read()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m.spawned_from.as_ref().map(|(c, _)| c.clone()))
+                .collect(),
+        }
+    }
+
+    /// Make the running set match `flock` and `settings`: spawn actors for
+    /// new machines, stop the ones for machines that are gone, and replace
+    /// the ones whose entry or timings changed. A machine whose entry is the
+    /// same keeps its actor, connection and event stream.
+    ///
+    /// Takes the dispatch lock, so no pass is holding a handle that is being
+    /// stopped. Stopping an actor touches nothing on its machine; tasks left
+    /// there keep their last state.
+    pub async fn apply_flock(&self, flock: &Flock, settings: &MachineSettings) -> FlockDiff {
+        let Some(spawner) = &self.spawner else {
+            return FlockDiff::default();
+        };
+        let _pass = self.dispatch_lock.lock().await;
+        let mut diff = FlockDiff::default();
+        let mut members = self.members.write().unwrap();
+        let mut old: Vec<Member> = std::mem::take(&mut *members);
+        for m in &flock.machines {
+            let want = (m.clone(), settings.clone());
+            match old.iter().position(|o| o.handle.name == m.name) {
+                Some(i) if old[i].spawned_from.as_ref() == Some(&want) => {
+                    members.push(old.remove(i));
+                }
+                Some(i) => {
+                    old.remove(i).handle.shutdown();
+                    diff.retargeted.push(m.name.clone());
+                    members.push(self.spawn(spawner, m, settings));
+                }
+                None => {
+                    diff.added.push(m.name.clone());
+                    members.push(self.spawn(spawner, m, settings));
+                }
+            }
+        }
+        for gone in old {
+            gone.handle.shutdown();
+            diff.removed.push(gone.handle.name.clone());
+        }
+        diff
+    }
+
+    fn spawn(&self, spawner: &Spawner, m: &MachineConfig, settings: &MachineSettings) -> Member {
+        let handle = spawn_machine(
+            m.name.clone(),
+            m.max_agents,
+            m.tags.clone(),
+            (spawner.connect)(m),
+            self.store.clone(),
+            settings.clone(),
+            spawner.events.clone(),
+        );
+        Member {
+            handle,
+            spawned_from: Some((m.clone(), settings.clone())),
+        }
     }
 
     pub fn views(&self) -> Vec<MachineView> {
-        self.machines
+        self.machines()
             .iter()
             .map(|m| {
                 let s = m.snapshot();
@@ -151,7 +314,7 @@ impl Daemon {
         paths: Paths,
         config: PastorConfig,
         flock: Flock,
-        connectors: Option<Vec<Arc<dyn Connector>>>,
+        connect: Option<ConnectorFactory>,
     ) -> anyhow::Result<Daemon> {
         paths.ensure()?;
         let store = Arc::new(Store::open(&paths.db_file())?);
@@ -159,43 +322,9 @@ impl Daemon {
         // Plugin event hooks read the broadcast on their own, subscribed here
         // for the same reason as the log: before any actor can emit.
         let hooks_rx = events.subscribe();
-        let settings = MachineSettings {
-            settle: config.settle_duration(),
-            reconcile_every: config.reconcile_duration(),
-            request_timeout: config.request_timeout_duration(),
-            agent_ready_timeout: config.agent_ready_timeout_duration(),
-            poll_every: config.tick_duration(),
-            ..Default::default()
-        };
-        let connectors: Vec<Arc<dyn Connector>> = match connectors {
-            Some(c) => c,
-            None => flock
-                .machines
-                .iter()
-                .map(|m| Arc::new(Endpoint::from_machine(m, &paths)) as Arc<dyn Connector>)
-                .collect(),
-        };
-        anyhow::ensure!(
-            connectors.len() == flock.machines.len(),
-            "one connector per machine"
-        );
-        let machines = flock
-            .machines
-            .iter()
-            .zip(connectors)
-            .map(|(m, c)| {
-                spawn_machine(
-                    m.name.clone(),
-                    m.max_agents,
-                    m.tags.clone(),
-                    c,
-                    store.clone(),
-                    settings.clone(),
-                    events.clone(),
-                )
-            })
-            .collect();
-        let fleet = Arc::new(Fleet::new(machines, store.clone()));
+        let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone()));
+        let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
+        fleet.apply_flock(&flock, &machine_settings(&config)).await;
         // Subscribed in `start`, before any actor runs, so the log sees the
         // first events too. The log holds the fleet weakly (see `spawn_log`),
         // so dropping the daemon still winds the tasks down.
@@ -292,11 +421,11 @@ impl Daemon {
         paths: Paths,
         config: PastorConfig,
         flock: Flock,
-        connectors: Option<Vec<Arc<dyn Connector>>>,
+        connect: Option<ConnectorFactory>,
     ) -> anyhow::Result<(Daemon, tokio::net::UnixListener)> {
         paths.ensure()?;
         let listener = Daemon::bind_socket(&paths.socket_file()).await?;
-        let daemon = Daemon::start(paths, config, flock, connectors).await?;
+        let daemon = Daemon::start(paths, config, flock, connect).await?;
         Ok((daemon, listener))
     }
 
@@ -513,7 +642,7 @@ impl Daemon {
             let Some(handle) = self
                 .fleet
                 .machines()
-                .iter()
+                .into_iter()
                 .find(|m| m.snapshot().orphans.contains(&name))
             else {
                 return IpcResponse::error(
@@ -670,21 +799,191 @@ mod tests {
         }
     }
 
+    /// The config every `daemon()` in these tests runs with; a test that
+    /// applies a flock by hand passes `machine_settings(&test_config())` so
+    /// it does not look like a timing change.
+    fn test_config() -> PastorConfig {
+        PastorConfig {
+            settle: "1s".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Hands out the fake registered under a machine's name, or a fresh one.
+    fn factory(fakes: &[(&str, FakeHerdr)]) -> ConnectorFactory {
+        let by_name: std::collections::HashMap<String, FakeHerdr> = fakes
+            .iter()
+            .map(|(n, f)| (n.to_string(), f.clone()))
+            .collect();
+        Arc::new(move |m: &MachineConfig| {
+            Arc::new(by_name.get(&m.name).cloned().unwrap_or_else(FakeHerdr::new))
+                as Arc<dyn Connector>
+        })
+    }
+
+    fn fast() -> MachineSettings {
+        MachineSettings {
+            settle: Duration::from_millis(100),
+            reconcile_every: Duration::from_millis(200),
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(200),
+            request_timeout: Duration::from_secs(5),
+            agent_ready_timeout: Duration::from_millis(500),
+            poll_every: Duration::from_millis(200),
+        }
+    }
+
+    fn managed(fakes: &[(&str, FakeHerdr)]) -> (Arc<Fleet>, Arc<Store>) {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, _) = broadcast::channel(64);
+        let fleet = Arc::new(Fleet::managed(store.clone(), events, factory(fakes)));
+        (fleet, store)
+    }
+
+    fn flock_of(machines: &[(&str, u32)]) -> Flock {
+        Flock {
+            machines: machines.iter().map(|(n, max)| machine(n, *max)).collect(),
+        }
+    }
+
+    async fn healthy(fleet: &Fleet, name: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fleet.views().iter().any(|v| v.name == name && v.healthy) {
+            assert!(Instant::now() < deadline, "{name} never connected");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_flock_adds_removes_and_retargets() {
+        let (fleet, _store) = managed(&[]);
+        let d = fleet
+            .apply_flock(&flock_of(&[("a", 2), ("b", 2)]), &fast())
+            .await;
+        assert_eq!(
+            d,
+            FlockDiff {
+                added: vec!["a".into(), "b".into()],
+                ..Default::default()
+            }
+        );
+        let a = fleet.get("a").unwrap();
+        let b = fleet.get("b").unwrap();
+
+        let d = fleet.apply_flock(&flock_of(&[("a", 3)]), &fast()).await;
+        assert_eq!(d.removed, vec!["b".to_string()]);
+        assert_eq!(d.retargeted, vec!["a".to_string()], "max_agents changed");
+        assert!(d.added.is_empty());
+        assert!(fleet.get("b").is_none());
+        assert_eq!(fleet.get("a").unwrap().max_agents, 3);
+        assert_eq!(fleet.flock(), flock_of(&[("a", 3)]));
+        wait_until("old actors stopped", || {
+            a.tx.is_closed() && b.tx.is_closed()
+        })
+        .await;
+    }
+
+    /// Review Focus 2: an editor re-save, or `machine add other`, must not
+    /// restart the actors of machines whose entry did not change.
+    #[tokio::test]
+    async fn unchanged_machines_keep_their_actor() {
+        let (fleet, _store) = managed(&[]);
+        fleet
+            .apply_flock(&flock_of(&[("a", 2), ("b", 2)]), &fast())
+            .await;
+        let a = fleet.get("a").unwrap();
+        let d = fleet
+            .apply_flock(&flock_of(&[("a", 2), ("b", 2)]), &fast())
+            .await;
+        assert!(d.is_empty(), "{d:?}");
+        let d = fleet
+            .apply_flock(&flock_of(&[("a", 2), ("b", 2), ("c", 1)]), &fast())
+            .await;
+        assert_eq!(d.added, vec!["c".to_string()]);
+        assert!(d.removed.is_empty() && d.retargeted.is_empty(), "{d:?}");
+        assert!(
+            a.tx.same_channel(&fleet.get("a").unwrap().tx),
+            "a kept its actor"
+        );
+        assert!(!a.tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn a_timing_change_replaces_every_actor() {
+        let (fleet, _store) = managed(&[]);
+        fleet.apply_flock(&flock_of(&[("a", 2)]), &fast()).await;
+        let slower = MachineSettings {
+            settle: Duration::from_millis(300),
+            ..fast()
+        };
+        let d = fleet.apply_flock(&flock_of(&[("a", 2)]), &slower).await;
+        assert_eq!(d.retargeted, vec!["a".to_string()]);
+    }
+
+    /// Review Focus 4: a machine removed and added back (or retargeted to a
+    /// new address for the same host) gets its old tasks back: the new actor
+    /// finds their panes, keeps them running and counts them again.
+    #[tokio::test]
+    async fn readding_a_machine_reconciles_its_old_tasks() {
+        let fake = FakeHerdr::new();
+        let (fleet, store) = managed(&[("a", fake.clone())]);
+        fleet.apply_flock(&flock_of(&[("a", 2)]), &fast()).await;
+        healthy(&fleet, "a").await;
+        let t = store
+            .insert_task(NewTask {
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "p".into(),
+                spec: spec(),
+            })
+            .unwrap();
+        fleet.dispatch_queued().await;
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Running
+        );
+
+        let d = fleet.apply_flock(&Flock::default(), &fast()).await;
+        assert_eq!(d.removed, vec!["a".to_string()]);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Running,
+            "nothing watches a removed machine's tasks, so nothing changes them"
+        );
+
+        let d = fleet.apply_flock(&flock_of(&[("a", 2)]), &fast()).await;
+        assert_eq!(d.added, vec!["a".to_string()]);
+        healthy(&fleet, "a").await;
+        tokio::time::sleep(Duration::from_millis(500)).await; // two reconciles
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Running
+        );
+        assert_eq!(fleet.get("a").unwrap().snapshot().live, 1);
+    }
+
+    #[tokio::test]
+    async fn a_fixed_fleet_ignores_apply_flock() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let fleet = Fleet::new(vec![], store);
+        assert!(
+            fleet
+                .apply_flock(&flock_of(&[("a", 2)]), &fast())
+                .await
+                .is_empty()
+        );
+        assert!(fleet.machines().is_empty());
+    }
+
     async fn daemon(fakes: &[(&str, u32, FakeHerdr)]) -> (Daemon, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         let flock = Flock {
             machines: fakes.iter().map(|(n, max, _)| machine(n, *max)).collect(),
         };
-        let connectors = fakes
-            .iter()
-            .map(|(_, _, f)| Arc::new(f.clone()) as Arc<dyn Connector>)
-            .collect();
-        let config = PastorConfig {
-            settle: "1s".into(),
-            ..Default::default()
-        };
-        let d = Daemon::start(paths, config, flock, Some(connectors))
+        let named: Vec<(&str, FakeHerdr)> = fakes.iter().map(|(n, _, f)| (*n, f.clone())).collect();
+        let d = Daemon::start(paths, test_config(), flock, Some(factory(&named)))
             .await
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -908,14 +1207,13 @@ mod tests {
             machines: vec![machine("a", 2)],
         };
         let fake = FakeHerdr::new();
-        let connectors: Vec<Arc<dyn Connector>> = vec![Arc::new(fake.clone())];
-        let err =
-            match Daemon::bind_and_start(paths, PastorConfig::default(), flock, Some(connectors))
-                .await
-            {
-                Ok(_) => panic!("expected bind_and_start to bail on a live socket"),
-                Err(e) => e,
-            };
+        let connect = factory(&[("a", fake.clone())]);
+        let err = match Daemon::bind_and_start(paths, PastorConfig::default(), flock, Some(connect))
+            .await
+        {
+            Ok(_) => panic!("expected bind_and_start to bail on a live socket"),
+            Err(e) => e,
+        };
         assert!(err.to_string().contains("already running"), "{err}");
         assert!(
             fake.requests().is_empty(),

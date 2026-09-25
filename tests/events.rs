@@ -181,7 +181,7 @@ async fn the_daemon_writes_the_events_log() {
         paths.clone(),
         PastorConfig::default(),
         flock,
-        Some(vec![fake]),
+        Some(Arc::new(move |_m: &MachineConfig| fake.clone()) as pastor::daemon::ConnectorFactory),
     )
     .await
     .unwrap();
