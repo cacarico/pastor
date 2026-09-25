@@ -769,8 +769,10 @@ fn setup_systemd_without_a_terminal_fails_fast_and_names_yes() {
         .spawn()
         .unwrap();
     // Hold stdin open: a read_line would block here until the deadline.
+    // This guard starts no daemon, so it keeps a short deadline of its own:
+    // a regression that blocks on stdin should fail fast, not after WAIT.
     let stdin = child.stdin.take().unwrap();
-    let deadline = Instant::now() + WAIT;
+    let deadline = Instant::now() + Duration::from_secs(10);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
             let _ = child.kill();
@@ -1112,7 +1114,7 @@ fn assert_daemon_shuts_down_cleanly_on(signal: &str) {
         }
         assert!(
             Instant::now() < deadline,
-            "pastor serve did not exit within 5s of SIG{signal}"
+            "pastor serve did not exit within {WAIT:?} of SIG{signal}"
         );
         std::thread::sleep(Duration::from_millis(50));
     };
