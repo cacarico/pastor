@@ -1617,6 +1617,10 @@ fn an_unresponsive_head_is_a_hard_error_on_every_head_path() {
         assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), before);
     }
     assert!(!state.join("pastor.db").exists(), "nothing ran offline");
+    // `task attach` goes to the machine directly, so a head that does not
+    // answer must not stop it: it fails on the missing task, not the head.
+    let out = run(&["task", "attach", "t-9"]);
+    assert_ne!(error_code(&out), "head_unresponsive");
     let ops = ops.lock().unwrap();
     assert_eq!(ops.len(), paths.len(), "one ping per command: {ops:?}");
     assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");

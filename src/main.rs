@@ -384,11 +384,14 @@ async fn probe_head(paths: &Paths, flocks: bool) -> anyhow::Result<Head> {
 fn head_use(command: &Command) -> Option<bool> {
     use pastor::plugin::cli::PluginCmd;
     match command {
-        Command::Task { cmd } => Some(match cmd {
-            TaskCmd::Run(a) => a.flock.is_some(),
-            TaskCmd::List(a) => a.flock.is_some(),
-            _ => false,
-        }),
+        Command::Task { cmd } => match cmd {
+            TaskCmd::Run(a) => Some(a.flock.is_some()),
+            TaskCmd::List(a) => Some(a.flock.is_some()),
+            // Attach goes straight to the machine over ssh and herdr; a busy
+            // or old head must not stand between the user and a pane.
+            TaskCmd::Attach { .. } => None,
+            _ => Some(false),
+        },
         Command::Machine { cmd } => Some(match cmd {
             MachineCmd::List { flock, .. } => flock.is_some(),
             _ => true,
