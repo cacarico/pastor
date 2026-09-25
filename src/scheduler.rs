@@ -227,10 +227,11 @@ fn first_line(s: &str) -> String {
 /// One pass of one job. Never panics and never returns early without a
 /// report; the report is what the log and `pastor tick` show. With `dry_run`
 /// nothing is written: no tasks, no seen keys, no job state, no event.
+/// Tasks are queued through `fleet` (`Fleet::queue_job_task`), under the
+/// dispatch lock `flock remove` takes.
 pub async fn run_job(
-    store: &Store,
+    fleet: &Fleet,
     job: &Job,
-    flock: &Flock,
     source: &dyn ItemSource,
     events: &broadcast::Sender<PastorEvent>,
     now: DateTime<Utc>,
@@ -244,6 +245,7 @@ pub async fn run_job(
             RunOutcome::Ran
         },
     );
+    let store = fleet.store();
     let mut state = match store.job_state(&job.name) {
         Ok(s) => s.unwrap_or_else(|| JobState {
             name: job.name.clone(),
@@ -255,28 +257,30 @@ pub async fn run_job(
             return report;
         }
     };
-    // The job's flock, else its pinned machine's, else the default. Worked
-    // out once per run, before the connector, from the flock file as the run
+    // The job's flock, else its pinned machine's, else the default. Checked
+    // once per run, before the connector, from the flock file as the run
     // found it. A flock that does not fit is the job file's fault, not the
-    // connector's: no backoff, the next scheduled run tries again.
-    let task_flock = match flock.task_flock(job.flock.as_deref(), job.spec.machine.as_deref()) {
-        Ok(f) => f,
-        Err(err) => {
-            let err = err.to_string();
-            tracing::warn!(job = %job.name, %err, "job run refused");
-            report.outcome = RunOutcome::Failed;
-            report.error = Some(err.clone());
-            if !dry_run {
-                state.last_run_at = Some(now);
-                state.last_result = Some(format!("failed: {err}"));
-                state.last_error = Some(err);
-                if let Err(e) = store.save_job_state(&state) {
-                    tracing::error!(job = %job.name, %e, "save job state");
-                }
+    // connector's: no backoff, the next scheduled run tries again. Each insert
+    // works it out again under the dispatch lock, since the flock can go
+    // while the connector runs.
+    if let Err(err) = fleet
+        .flock()
+        .task_flock(job.flock.as_deref(), job.spec.machine.as_deref())
+    {
+        let err = err.to_string();
+        tracing::warn!(job = %job.name, %err, "job run refused");
+        report.outcome = RunOutcome::Failed;
+        report.error = Some(err.clone());
+        if !dry_run {
+            state.last_run_at = Some(now);
+            state.last_result = Some(format!("failed: {err}"));
+            state.last_error = Some(err);
+            if let Err(e) = store.save_job_state(&state) {
+                tracing::error!(job = %job.name, %e, "save job state");
             }
-            return report;
         }
-    };
+        return report;
+    }
     let backfill =
         chrono::Duration::from_std(job.backfill).unwrap_or_else(|_| chrono::Duration::zero());
     let input = RunInput {
@@ -361,9 +365,10 @@ pub async fn run_job(
             report.created.push(item.key.clone());
             continue;
         }
-        match store.insert_job_task(&job.name, &task_flock, &value, |id| {
-            render_task(job, &value, id)
-        }) {
+        match fleet
+            .queue_job_task(job, &value, |id| render_task(job, &value, id))
+            .await
+        {
             Ok(t) => {
                 tracing::info!(job = %job.name, task = %t.display_id(), key = %item.key, "task queued");
                 let _ = events.send(PastorEvent {
@@ -1101,7 +1106,6 @@ impl Scheduler {
         dry_run: bool,
         dispatch: bool,
     ) -> oneshot::Receiver<JobRunReport> {
-        let store = self.store.clone();
         let fleet = self.fleet.clone();
         let events = self.events.clone();
         let name = job.name.clone();
@@ -1112,16 +1116,7 @@ impl Scheduler {
             if let Some(t) = turn.as_mut() {
                 t.wait().await;
             }
-            let report = run_job(
-                &store,
-                &job,
-                &fleet.flock(),
-                source.as_ref(),
-                &events,
-                now,
-                dry_run,
-            )
-            .await;
+            let report = run_job(&fleet, &job, source.as_ref(), &events, now, dry_run).await;
             drop(turn); // the next run of this job may start
             if dispatch && !dry_run && !report.created.is_empty() {
                 // Do not wait for the next tick to place what this run queued.
@@ -1589,6 +1584,15 @@ mod tests {
         }
     }
 
+    /// A fixed fleet with no machines over `store`, for `run_job`.
+    fn fleet(store: &Arc<Store>) -> Fleet {
+        Fleet::new(vec![], store.clone())
+    }
+
+    fn fleet_with(store: &Arc<Store>, flock: Flock) -> Fleet {
+        fleet(store).with_flock(flock)
+    }
+
     fn events() -> (
         broadcast::Sender<PastorEvent>,
         broadcast::Receiver<PastorEvent>,
@@ -1598,12 +1602,12 @@ mod tests {
 
     #[tokio::test]
     async fn creates_one_task_per_new_item_with_rendered_templates() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let src = Scripted::with_keys(&["k1", "k2"]);
         *src.cursor.lock().unwrap() = Some("c1".into());
         let (tx, mut rx) = events();
         let now = Utc::now();
-        let report = run_job(&store, &job("j"), &Flock::default(), &src, &tx, now, false).await;
+        let report = run_job(&fleet(&store), &job("j"), &src, &tx, now, false).await;
         assert_eq!(report.outcome, RunOutcome::Ran);
         for id in [1, 2] {
             let ev = rx.try_recv().expect("task.queued emitted");
@@ -1649,16 +1653,7 @@ mod tests {
 
         // Second run: since = last ok run, cursor = the persisted one.
         let later = now + chrono::Duration::seconds(60);
-        run_job(
-            &store,
-            &job("j"),
-            &Flock::default(),
-            &src,
-            &tx,
-            later,
-            false,
-        )
-        .await;
+        run_job(&fleet(&store), &job("j"), &src, &tx, later, false).await;
         let input = src.inputs.lock().unwrap()[1].clone();
         assert_eq!(input.since, state.last_ok_at.unwrap());
         assert_eq!(input.cursor.as_deref(), Some("c1"));
@@ -1666,30 +1661,12 @@ mod tests {
 
     #[tokio::test]
     async fn seen_keys_and_in_run_duplicates_create_one_task() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
         let src = Scripted::with_keys(&["k1"]);
-        run_job(
-            &store,
-            &job("j"),
-            &Flock::default(),
-            &src,
-            &tx,
-            Utc::now(),
-            false,
-        )
-        .await;
+        run_job(&fleet(&store), &job("j"), &src, &tx, Utc::now(), false).await;
         *src.items.lock().unwrap() = vec![item("k1"), item("k1"), item("k2"), item("k2")];
-        let report = run_job(
-            &store,
-            &job("j"),
-            &Flock::default(),
-            &src,
-            &tx,
-            Utc::now(),
-            false,
-        )
-        .await;
+        let report = run_job(&fleet(&store), &job("j"), &src, &tx, Utc::now(), false).await;
         assert_eq!(report.items, 4);
         assert_eq!(
             report.created,
@@ -1700,9 +1677,8 @@ mod tests {
         assert_eq!(store.list_tasks(&TaskFilter::default()).unwrap().len(), 2);
         // Seen is per job: another job sees k1 as new.
         let report = run_job(
-            &store,
+            &fleet(&store),
             &job("other"),
-            &Flock::default(),
             &Scripted::with_keys(&["k1"]),
             &tx,
             Utc::now(),
@@ -1714,19 +1690,19 @@ mod tests {
 
     #[tokio::test]
     async fn max_tasks_per_run_defers_the_rest_unseen() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
         let mut j = job("j");
         j.max_tasks_per_run = 2;
         let src = Scripted::with_keys(&["k1", "k2", "k3", "k4"]);
-        let report = run_job(&store, &j, &Flock::default(), &src, &tx, Utc::now(), false).await;
+        let report = run_job(&fleet(&store), &j, &src, &tx, Utc::now(), false).await;
         assert_eq!(report.created, vec!["t-1", "t-2"]);
         assert_eq!(report.deferred, 2);
         assert!(
             !store.is_seen("j", "k3").unwrap(),
             "deferred items stay unseen"
         );
-        let report = run_job(&store, &j, &Flock::default(), &src, &tx, Utc::now(), false).await;
+        let report = run_job(&fleet(&store), &j, &src, &tx, Utc::now(), false).await;
         assert_eq!(report.created, vec!["t-3", "t-4"]);
         assert_eq!(report.skipped_seen, 2);
         assert_eq!(report.deferred, 0);
@@ -1734,7 +1710,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_capped_run_keeps_the_old_cursor_and_since() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
         let t0 = Utc::now() - chrono::Duration::hours(1);
         store
@@ -1752,7 +1728,7 @@ mod tests {
         *src.cursor.lock().unwrap() = Some("new".into());
 
         let t1 = Utc::now();
-        let report = run_job(&store, &j, &Flock::default(), &src, &tx, t1, false).await;
+        let report = run_job(&fleet(&store), &j, &src, &tx, t1, false).await;
         assert_eq!(report.deferred, 2);
         let s = store.job_state("j").unwrap().unwrap();
         assert_eq!(
@@ -1766,7 +1742,7 @@ mod tests {
         // The next run is asked from the old cursor and picks the rest up;
         // with nothing deferred, the new cursor is kept.
         let t2 = t1 + chrono::Duration::seconds(60);
-        let report = run_job(&store, &j, &Flock::default(), &src, &tx, t2, false).await;
+        let report = run_job(&fleet(&store), &j, &src, &tx, t2, false).await;
         let input = src.inputs.lock().unwrap()[1].clone();
         assert_eq!(input.cursor.as_deref(), Some("old"));
         assert_eq!(input.since, t0);
@@ -1779,14 +1755,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_insert_keeps_the_old_cursor() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
         let mut j = job("j");
         j.prompt = "{{ unclosed".into();
         let src = Scripted::with_keys(&["k1"]);
         *src.cursor.lock().unwrap() = Some("new".into());
         let t1 = Utc::now();
-        let report = run_job(&store, &j, &Flock::default(), &src, &tx, t1, false).await;
+        let report = run_job(&fleet(&store), &j, &src, &tx, t1, false).await;
         assert!(report.error.is_some(), "{report:?}");
         let s = store.job_state("j").unwrap().unwrap();
         assert!(s.cursor.is_none(), "{s:?}");
@@ -1802,7 +1778,7 @@ mod tests {
         j.prompt = "{{ unclosed".into();
         let src = Scripted::with_keys(&["k1"]);
         let t1 = Utc::now();
-        let report = run_job(&store, &j, &Flock::default(), &src, &tx, t1, false).await;
+        let report = run_job(&fleet(&store), &j, &src, &tx, t1, false).await;
         assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
         let s = store.job_state("j").unwrap().unwrap();
         assert!(s.last_error.as_deref().unwrap().contains("k1"), "{s:?}");
@@ -1832,12 +1808,12 @@ mod tests {
 
     #[tokio::test]
     async fn missing_item_field_renders_empty_and_warns() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
         let mut j = job("j");
         j.prompt = "[{{ item.title }}] {{ item.author }}!".into();
         let src = Scripted::with_keys(&["k1"]);
-        let report = run_job(&store, &j, &Flock::default(), &src, &tx, Utc::now(), false).await;
+        let report = run_job(&fleet(&store), &j, &src, &tx, Utc::now(), false).await;
         assert_eq!(report.created, vec!["t-1"]);
         let t = store.get_task(1).unwrap().unwrap();
         assert_eq!(t.prompt, "[title of k1] !");
@@ -1846,17 +1822,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_connector_backs_off_keeps_cursor_and_emits_job_failed() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, mut rx) = events();
         let src = Scripted::with_keys(&["k1"]);
         *src.cursor.lock().unwrap() = Some("c1".into());
         let t0 = Utc::now();
-        run_job(&store, &job("j"), &Flock::default(), &src, &tx, t0, false).await;
+        run_job(&fleet(&store), &job("j"), &src, &tx, t0, false).await;
         assert_eq!(rx.try_recv().unwrap().kind, "task.queued");
 
         *src.fail.lock().unwrap() = Some("boom: 503 from upstream".into());
         let t1 = t0 + chrono::Duration::seconds(60);
-        let report = run_job(&store, &job("j"), &Flock::default(), &src, &tx, t1, false).await;
+        let report = run_job(&fleet(&store), &job("j"), &src, &tx, t1, false).await;
         assert_eq!(report.outcome, RunOutcome::Failed);
         assert!(report.error.as_deref().unwrap().contains("boom"));
         let s = store.job_state("j").unwrap().unwrap();
@@ -1873,16 +1849,15 @@ mod tests {
         assert!(ev.machine.is_none() && ev.task_id.is_none());
 
         let t2 = t1 + chrono::Duration::seconds(120);
-        run_job(&store, &job("j"), &Flock::default(), &src, &tx, t2, false).await;
+        run_job(&fleet(&store), &job("j"), &src, &tx, t2, false).await;
         let s = store.job_state("j").unwrap().unwrap();
         assert_eq!(s.failures, 2);
         assert_eq!(s.backoff_until, Some(t2 + chrono::Duration::seconds(120)));
 
         *src.fail.lock().unwrap() = None;
         run_job(
-            &store,
+            &fleet(&store),
             &job("j"),
-            &Flock::default(),
             &src,
             &tx,
             t2 + chrono::Duration::seconds(300),
@@ -1900,7 +1875,7 @@ mod tests {
     /// everything it meant to.
     #[tokio::test]
     async fn a_failed_insert_keeps_the_cursor_and_since() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
         let t0 = Utc::now() - chrono::Duration::hours(1);
         store
@@ -1918,7 +1893,7 @@ mod tests {
         // fails inside the store's insert transaction.
         j.prompt = "{{ item.title".into();
         let now = Utc::now();
-        let report = run_job(&store, &j, &Flock::default(), &src, &tx, now, false).await;
+        let report = run_job(&fleet(&store), &j, &src, &tx, now, false).await;
         assert!(report.created.is_empty());
         assert!(
             report.error.as_deref().unwrap().contains("k1"),
@@ -1935,7 +1910,7 @@ mod tests {
         assert!(!store.is_seen("j", "k1").unwrap());
 
         // The next run inserts it; now the cursor moves.
-        let report = run_job(&store, &job("j"), &Flock::default(), &src, &tx, now, false).await;
+        let report = run_job(&fleet(&store), &job("j"), &src, &tx, now, false).await;
         assert_eq!(report.created.len(), 1);
         let st = store.job_state("j").unwrap().unwrap();
         assert_eq!(st.cursor.as_deref(), Some("c-new"));
@@ -2033,7 +2008,7 @@ mod tests {
     /// moves, so one bad message cannot stall the job forever.
     #[tokio::test]
     async fn an_unsafe_item_is_skipped_and_reported_without_holding_the_cursor() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
         let mut bad = item("../evil");
         bad.fields.insert("title".into(), json!("t"));
@@ -2043,16 +2018,7 @@ mod tests {
             fail: Mutex::new(None),
             inputs: Mutex::new(Vec::new()),
         };
-        let report = run_job(
-            &store,
-            &job("j"),
-            &Flock::default(),
-            &src,
-            &tx,
-            Utc::now(),
-            false,
-        )
-        .await;
+        let report = run_job(&fleet(&store), &job("j"), &src, &tx, Utc::now(), false).await;
         assert_eq!(report.created.len(), 1);
         let err = report.error.as_deref().unwrap();
         assert!(err.contains("../evil") && err.contains("rejected"), "{err}");
@@ -2063,19 +2029,10 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_writes_nothing() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, mut rx) = events();
         let src = Scripted::with_keys(&["k1", "k2"]);
-        let report = run_job(
-            &store,
-            &job("j"),
-            &Flock::default(),
-            &src,
-            &tx,
-            Utc::now(),
-            true,
-        )
-        .await;
+        let report = run_job(&fleet(&store), &job("j"), &src, &tx, Utc::now(), true).await;
         assert_eq!(report.outcome, RunOutcome::DryRun);
         assert_eq!(
             report.created,
@@ -2087,16 +2044,7 @@ mod tests {
         assert!(store.job_state("j").unwrap().is_none());
         // A failing dry run does not back the job off either.
         *src.fail.lock().unwrap() = Some("boom".into());
-        let report = run_job(
-            &store,
-            &job("j"),
-            &Flock::default(),
-            &src,
-            &tx,
-            Utc::now(),
-            true,
-        )
-        .await;
+        let report = run_job(&fleet(&store), &job("j"), &src, &tx, Utc::now(), true).await;
         assert_eq!(report.outcome, RunOutcome::Failed);
         assert!(store.job_state("j").unwrap().is_none());
         assert!(rx.try_recv().is_err(), "no job.failed on a dry run");
@@ -2118,7 +2066,7 @@ mod tests {
 
     /// Run `j` until the stream's item shows up in a report.
     async fn run_until_items(
-        store: &Store,
+        store: &Arc<Store>,
         j: &Job,
         src: &dyn ItemSource,
         tx: &broadcast::Sender<PastorEvent>,
@@ -2126,7 +2074,7 @@ mod tests {
     ) -> JobRunReport {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let r = run_job(store, j, &Flock::default(), src, tx, Utc::now(), dry_run).await;
+            let r = run_job(&fleet(store), j, src, tx, Utc::now(), dry_run).await;
             if r.items > 0 {
                 return r;
             }
@@ -2141,14 +2089,13 @@ mod tests {
     async fn a_dry_run_leaves_a_streams_items_for_the_real_run() {
         let tmp = tempfile::tempdir().unwrap();
         let src = fixture_stream(tmp.path());
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
         let r = run_until_items(&store, &job("j"), src.as_ref(), &tx, true).await;
         assert_eq!(r.created, vec!["start-1"]);
         let r = run_job(
-            &store,
+            &fleet(&store),
             &job("j"),
-            &Flock::default(),
             src.as_ref(),
             &tx,
             Utc::now(),
@@ -2159,9 +2106,8 @@ mod tests {
         let st = store.job_state("j").unwrap().unwrap();
         assert_eq!(st.cursor.as_deref(), Some("cur-1"));
         let r = run_job(
-            &store,
+            &fleet(&store),
             &job("j"),
-            &Flock::default(),
             src.as_ref(),
             &tx,
             Utc::now(),
@@ -2177,7 +2123,7 @@ mod tests {
     async fn a_failed_insert_leaves_a_streams_items_for_the_next_run() {
         let tmp = tempfile::tempdir().unwrap();
         let src = fixture_stream(tmp.path());
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
         let mut broken = job("j");
         broken.prompt = "{{ item.title".into();
@@ -2185,9 +2131,8 @@ mod tests {
         assert!(r.created.is_empty(), "{r:?}");
         assert!(store.job_state("j").unwrap().unwrap().cursor.is_none());
         let r = run_job(
-            &store,
+            &fleet(&store),
             &job("j"),
-            &Flock::default(),
             src.as_ref(),
             &tx,
             Utc::now(),
@@ -3290,11 +3235,11 @@ mod tests {
     /// the job is pinned to.
     #[tokio::test]
     async fn a_jobs_tasks_land_in_the_default_flock_or_their_machines() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
-        let flock = home_and_work();
+        let fleet = fleet_with(&store, home_and_work());
         let src = Scripted::with_keys(&["k1"]);
-        run_job(&store, &job("a"), &flock, &src, &tx, Utc::now(), false).await;
+        run_job(&fleet, &job("a"), &src, &tx, Utc::now(), false).await;
         let pinned = Job {
             spec: DispatchSpec {
                 machine: Some("w".into()),
@@ -3303,7 +3248,7 @@ mod tests {
             ..job("b")
         };
         let src = Scripted::with_keys(&["k1"]);
-        run_job(&store, &pinned, &flock, &src, &tx, Utc::now(), false).await;
+        run_job(&fleet, &pinned, &src, &tx, Utc::now(), false).await;
         let flocks: Vec<Option<String>> = [1, 2]
             .iter()
             .map(|id| store.get_task(*id).unwrap().unwrap().flock)
@@ -3316,15 +3261,15 @@ mod tests {
     /// the connector is asked for anything.
     #[tokio::test]
     async fn a_job_names_its_flock_and_a_bad_one_fails_the_run() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         let (tx, _rx) = events();
-        let flock = home_and_work();
+        let fleet = fleet_with(&store, home_and_work());
         let work = Job {
             flock: Some("work".into()),
             ..job("a")
         };
         let src = Scripted::with_keys(&["k1"]);
-        run_job(&store, &work, &flock, &src, &tx, Utc::now(), false).await;
+        run_job(&fleet, &work, &src, &tx, Utc::now(), false).await;
         assert_eq!(
             store.get_task(1).unwrap().unwrap().flock.as_deref(),
             Some("work")
@@ -3350,7 +3295,7 @@ mod tests {
             ),
         ] {
             let src = Scripted::with_keys(&["k1"]);
-            let report = run_job(&store, &bad, &flock, &src, &tx, Utc::now(), false).await;
+            let report = run_job(&fleet, &bad, &src, &tx, Utc::now(), false).await;
             assert_eq!(report.outcome, RunOutcome::Failed, "{why}");
             assert_eq!(report.error.as_deref(), Some(why));
             assert!(
@@ -3361,6 +3306,66 @@ mod tests {
             assert_eq!(state.last_error.as_deref(), Some(why));
             assert!(state.last_run_at.is_some(), "waits for its next run");
         }
+    }
+
+    /// A connector that, while it runs, has `flock remove` take the job's
+    /// flock away: what a head's `flock remove` does between a run's first
+    /// flock check and its inserts.
+    struct RemovesFlock {
+        fleet: Arc<Fleet>,
+        file: PathBuf,
+    }
+
+    impl ItemSource for RemovesFlock {
+        fn id(&self) -> &str {
+            "removes-flock"
+        }
+        fn run<'a>(&'a self, _input: RunInput) -> RunFuture<'a> {
+            Box::pin(async move {
+                self.fleet.remove_flock(&self.file, "spare").await.unwrap();
+                Ok(RunOutput {
+                    items: vec![item("k1")],
+                    cursor: Some("c-new".into()),
+                    logs: vec![],
+                    batch: 0,
+                })
+            })
+        }
+    }
+
+    /// Copilot 4106204719: a job's tasks are queued under the dispatch lock
+    /// `flock remove` takes, with the flock worked out again there. A flock
+    /// removed while the connector ran is no longer queued into (no
+    /// dispatch could place it); the item fails like any failed insert and
+    /// the cursor holds.
+    #[tokio::test]
+    async fn a_flock_removed_during_a_job_run_takes_no_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("flock.toml");
+        let text = format!("{HOME_AND_WORK}\n[[flock]]\nname = \"spare\"\n");
+        std::fs::write(&file, &text).unwrap();
+        let flock: Flock = toml::from_str(&text).unwrap();
+        flock.validate().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let fleet = Arc::new(fleet_with(&store, flock));
+        let (tx, _rx) = events();
+        let spare = Job {
+            flock: Some("spare".into()),
+            ..job("j")
+        };
+        let src = RemovesFlock {
+            fleet: fleet.clone(),
+            file,
+        };
+        let report = run_job(&fleet, &spare, &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
+        assert!(report.created.is_empty(), "{report:?}");
+        let err = report.error.unwrap();
+        assert!(err.contains("k1") && err.contains("spare"), "{err}");
+        assert!(store.get_task(1).unwrap().is_none());
+        assert!(!store.is_seen("j", "k1").unwrap());
+        let state = store.job_state("j").unwrap().unwrap();
+        assert!(state.cursor.is_none(), "the cursor holds: {state:?}");
     }
 
     /// `pastor tick` without a head queues into the flocks flock.toml

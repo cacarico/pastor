@@ -291,6 +291,11 @@ impl Fleet {
         self.wanted.read().unwrap().clone()
     }
 
+    /// The store the fleet queues tasks in.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
     /// Is `name` held in the fleet only until its old actor ends?
     pub fn shutting_down(&self, name: &str) -> bool {
         self.members
@@ -497,6 +502,24 @@ impl Fleet {
                 flock,
             })
             .map_err(QueueError::Store)
+    }
+
+    /// Queue one task of a scheduled job's run for `item`, in the job's flock
+    /// (see `Flock::task_flock`) as the wanted flock stands now. Under the
+    /// dispatch lock, like `queue_run`: a `flock remove` either sees the task
+    /// queued, or goes first and this fails, so the run records the item's
+    /// error and holds its cursor rather than queue into a flock that is gone.
+    pub async fn queue_job_task(
+        &self,
+        job: &crate::config::job::Job,
+        item: &serde_json::Value,
+        render: impl FnOnce(i64) -> Result<(String, crate::task::DispatchSpec), String>,
+    ) -> anyhow::Result<Task> {
+        let _pass = self.dispatch_lock.lock().await;
+        let flock = self
+            .flock()
+            .task_flock(job.flock.as_deref(), job.spec.machine.as_deref())?;
+        self.store.insert_job_task(&job.name, &flock, item, render)
     }
 
     /// `flock remove` with a head running: refuse while queued tasks name
