@@ -49,7 +49,7 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 ```
 
 - `--machine M` pins the task. `--tag T` (repeatable) instead restricts it to machines that carry every given tag in `flock.toml`; it is a filter, not a label on the task. With neither, any machine with a free slot takes it.
-- `--repo` is a path on the machine that runs the agent. Quote a leading `~` so your shell does not expand it. pastor does not check that the path exists: herdr silently opens the pane in the home directory instead, so confirm the repo is there first.
+- `--repo` is a path on the machine that runs the agent. Quote a leading `~` so your shell does not expand it. pastor checks that it is a directory on that machine before it creates anything (`test -d` over ssh); a missing repo fails the task with `repo <path> does not exist on <machine>`. A `command` machine cannot be checked.
 - `--worktree` makes a git worktree of `--repo` for the task, on `--branch` or `pastor/t-N`. It needs `--repo` and the repo cloned on that machine.
 - `--agent-arg` passes one argument to the agent and always takes the next word, dashes included. Repeat it, in order.
 - `--timeout` bounds the task; past it the task goes `stale`.
