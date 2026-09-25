@@ -3151,6 +3151,66 @@ mod tests {
             .unwrap()
     }
 
+    /// The fleet bug: `pastor task retry` of a failed worktree task died with
+    /// git's "fatal: '<path>' already exists", because the failed task's
+    /// checkout is still on disk. The retry works on in that checkout, on the
+    /// same branch, instead of creating it again; a retry of the retry too.
+    #[tokio::test]
+    async fn a_retry_reopens_the_worktree_of_the_task_it_retries() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let first = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let branch = format!("pastor/t-{}", first.id);
+        fake.exit_pane(first.pane_id.as_deref().unwrap());
+        wait_for("failed", || state_of(&store, first.id) == TaskState::Failed).await;
+
+        let retry = store.insert_retry(first.id).unwrap();
+        assert_eq!(retry.spec.branch.as_deref(), Some(branch.as_str()));
+        let t = h.dispatch(retry.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+        assert_eq!(calls(&fake, "worktree.create").len(), 1, "created once");
+        let opened = calls(&fake, "worktree.open");
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0]["cwd"], "/r");
+        assert_eq!(opened[0]["branch"], branch.as_str());
+
+        fake.exit_pane(t.pane_id.as_deref().unwrap());
+        wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+        let again = store.insert_retry(t.id).unwrap();
+        assert_eq!(again.spec.branch.as_deref(), Some(branch.as_str()));
+        let t = h.dispatch(again.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+        assert_eq!(calls(&fake, "worktree.create").len(), 1);
+    }
+
+    /// A retry whose old checkout was removed meanwhile creates it again.
+    #[tokio::test]
+    async fn a_retry_creates_the_worktree_when_the_old_one_is_gone() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let first = h.dispatch(worktree_task(&store).id).await.unwrap();
+        fake.worktree_remove(first.workspace_id.as_deref().unwrap(), true)
+            .await
+            .unwrap();
+        wait_for("gone", || !state_of(&store, first.id).is_open()).await;
+        store
+            .update_task(&mut Task {
+                state: TaskState::Failed,
+                ..store.get_task(first.id).unwrap().unwrap()
+            })
+            .unwrap();
+
+        let retry = store.insert_retry(first.id).unwrap();
+        let t = h.dispatch(retry.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+        assert!(calls(&fake, "worktree.open").is_empty());
+        let created = calls(&fake, "worktree.create");
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[1]["branch"], format!("pastor/t-{}", first.id));
+    }
+
     #[tokio::test]
     async fn close_closes_the_pane_then_the_row() {
         let fake = FakeHerdr::new();

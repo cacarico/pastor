@@ -179,9 +179,12 @@ with `--json`. `pastor task retry t-4` queues a new task
 copying a failed or stale one (job, item, prompt and dispatch settings, with
 `retry_of` pointing back and a "retry of t-4" note in `task list`) and dispatches it
 at once. It gets a new id because the old agent `t-4`, named after the task, may
-still be running. A retried job task keeps the branch it was rendered with, so
-if that branch has no `{{ task.id }}` in it and the old worktree is still
-there, close the old task with `--remove-worktree` first. `pastor task close
+still be running. The retry of a failed worktree task works on the same
+branch (`pastor/t-4` unless the task named its own) and, when the old
+checkout is still on disk, in that checkout: herdr's `worktree.open`
+instead of `worktree.create`, which git would refuse with "already exists".
+A checkout removed since is created again. A stale task's agent is still
+working in its checkout, so its retry gets a branch of its own. `pastor task close
 t-4` closes the task's pane (and the agent in it) and marks it `closed`; a
 queued task only has its row closed. `--remove-worktree` removes the task's
 worktree instead, which closes its workspace, pane included. herdr refuses a

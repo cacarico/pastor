@@ -150,6 +150,22 @@ pub struct WorktreeRemoved {
     pub workspace_id: String,
 }
 
+/// One checkout in `worktree.list`'s reply (herdr 0.9.1). Only what pastor
+/// reads is decoded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    pub path: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub open_workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeList {
+    pub worktrees: Vec<WorktreeInfo>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentList {
     pub agents: Vec<AgentInfo>,

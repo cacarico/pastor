@@ -90,7 +90,7 @@ pastor task close t-4 --remove-worktree    # removes the worktree too; refused i
 pastor task prune --done --older-than 3d   # deletes finished rows; --failed and --closed add those states
 ```
 
-`retry` re-dispatches the task's job, item, prompt and dispatch settings as a new task; the old agent may still be running under its own id. `close` also closes an orphaned agent, a `t-N` pane with no open task. `prune` never deletes a row whose worktree may still be on disk; it names the ones it keeps, and `task close t-N --remove-worktree` clears them so the next prune takes them. A pruned task's item stays seen, so a job never queues it again.
+`retry` re-dispatches the task's job, item, prompt and dispatch settings as a new task; the old agent may still be running under its own id. Retrying a failed worktree task reuses its branch and, if still on disk, its checkout. `close` also closes an orphaned agent, a `t-N` pane with no open task. `prune` never deletes a row whose worktree may still be on disk; it names the ones it keeps, and `task close t-N --remove-worktree` clears them so the next prune takes them. A pruned task's item stays seen, so a job never queues it again.
 
 ## Answering a blocked task
 

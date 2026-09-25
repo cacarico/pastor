@@ -10,7 +10,7 @@ use tokio::io::{
 use super::transport::{ConnectError, Connector};
 use super::{
     AgentInfo, AgentList, AgentResult, Created, Event, HerdrError, Incoming, PaneRead, Pong,
-    Request, Response, WorktreeRemoved,
+    Request, Response, WorktreeInfo, WorktreeList, WorktreeRemoved,
 };
 
 pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
@@ -389,6 +389,31 @@ pub trait ConnectorExt: Connector {
     ) -> Result<Created, CallError> {
         self.call_as(
             "worktree.create",
+            serde_json::json!({"cwd": cwd, "branch": branch, "label": label, "focus": false}),
+        )
+        .await
+    }
+
+    /// `worktree.list` (herdr 0.9.1): the checkouts of the repo at `cwd`,
+    /// whether or not a workspace shows them.
+    async fn worktree_list(&self, cwd: &str) -> Result<Vec<WorktreeInfo>, CallError> {
+        Ok(self
+            .call_as::<WorktreeList>("worktree.list", serde_json::json!({"cwd": cwd}))
+            .await?
+            .worktrees)
+    }
+
+    /// `worktree.open` (herdr 0.9.1): a workspace on the existing checkout of
+    /// `branch`, or the one already showing it. The reply has
+    /// `worktree.create`'s shape.
+    async fn worktree_open(
+        &self,
+        cwd: &str,
+        branch: &str,
+        label: &str,
+    ) -> Result<Created, CallError> {
+        self.call_as(
+            "worktree.open",
             serde_json::json!({"cwd": cwd, "branch": branch, "label": label, "focus": false}),
         )
         .await

@@ -3,7 +3,9 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::time::Instant;
 
-use crate::herdr::{AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, HerdrError};
+use crate::herdr::{
+    AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
+};
 use crate::task::{DispatchSpec, Task, TaskState};
 
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
@@ -159,7 +161,7 @@ async fn dispatch_steps(
             .branch
             .clone()
             .unwrap_or_else(|| format!("pastor/{name}"));
-        conn.worktree_create(repo, &branch, name).await?
+        open_worktree(conn, task, repo, &branch, name).await?
     } else {
         conn.workspace_create(repo.as_deref(), name).await?
     };
@@ -181,6 +183,30 @@ async fn dispatch_steps(
         task.activity_seen = agent.agent_status.is_activity();
     }
     Ok(outcome)
+}
+
+/// The workspace of a worktree task. A retry goes back to the checkout of
+/// the task it retries when that is still on disk (`Store::insert_retry` pins
+/// the branch): the failed task's work is there, and `worktree.create` would
+/// fail on it with git's "already exists". Anything else, or a checkout
+/// removed since, gets a new one.
+async fn open_worktree(
+    conn: &dyn Connector,
+    task: &Task,
+    repo: &str,
+    branch: &str,
+    name: &str,
+) -> Result<Created, DispatchError> {
+    if task.retry_of.is_some()
+        && conn
+            .worktree_list(repo)
+            .await?
+            .iter()
+            .any(|w| w.branch.as_deref() == Some(branch))
+    {
+        return Ok(conn.worktree_open(repo, branch, name).await?);
+    }
+    Ok(conn.worktree_create(repo, branch, name).await?)
 }
 
 /// `agent.start`, retried while herdr says the pane is busy: its shell has not

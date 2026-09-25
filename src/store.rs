@@ -381,6 +381,12 @@ impl Store {
     /// old one: the agent is named after the id, and the old agent `t-<of>`
     /// may still be alive on its machine (a stale task always is). Refused
     /// unless `of` is failed or stale. The `seen` row keeps pointing at `of`.
+    ///
+    /// A failed worktree task's branch is pinned to the one `of` worked on
+    /// (its own, or `pastor/t-<of>` by default), so the retry, and a retry of
+    /// it, goes back to that checkout (see `dispatch`) rather than a fresh
+    /// branch. A stale task's agent is still at work in its checkout, so its
+    /// retry keeps a branch of its own.
     pub fn insert_retry(&self, of: i64) -> Result<Task, RetryError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
@@ -388,7 +394,13 @@ impl Store {
         // finished by another writer in between is not retried.
         let n = conn.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, state, retry_of, created_at, updated_at)
-             SELECT job, item, prompt, spec, flock, 'queued', id, ?2, ?2 FROM tasks
+             SELECT job, item, prompt,
+                    CASE WHEN state = 'failed'
+                              AND COALESCE(json_extract(spec, '$.worktree'), 0) != 0
+                              AND json_extract(spec, '$.branch') IS NULL
+                         THEN json_set(spec, '$.branch', 'pastor/t-' || id)
+                         ELSE spec END,
+                    flock, 'queued', id, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now],
         )?;
@@ -1513,6 +1525,31 @@ mod tests {
         set_state(&s, t.id, TaskState::Failed);
         let r = s.insert_retry(t.id).unwrap();
         assert_eq!(r.flock.as_deref(), Some("work"));
+    }
+
+    /// A failed worktree task's retry keeps its branch; a stale one's does
+    /// not (its agent is still in that checkout), and neither does a task
+    /// without a worktree or with a branch of its own.
+    #[test]
+    fn a_retry_of_a_failed_worktree_task_pins_its_branch() {
+        let s = Store::open_in_memory().unwrap();
+        let task = |worktree: bool, branch: Option<&str>, state| {
+            let mut n = new_task("run");
+            n.spec.repo = Some("/r".into());
+            n.spec.worktree = worktree;
+            n.spec.branch = branch.map(str::to_string);
+            let t = s.insert_task(n).unwrap();
+            set_state(&s, t.id, state);
+            s.insert_retry(t.id).unwrap().spec.branch
+        };
+        let failed = task(true, None, TaskState::Failed);
+        assert_eq!(failed.as_deref(), Some("pastor/t-1"));
+        assert_eq!(task(true, None, TaskState::Stale), None);
+        assert_eq!(task(false, None, TaskState::Failed), None);
+        assert_eq!(
+            task(true, Some("fix/x"), TaskState::Failed).as_deref(),
+            Some("fix/x")
+        );
     }
 
     #[test]

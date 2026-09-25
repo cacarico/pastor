@@ -66,6 +66,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - An agent that exits between turns (a human typing `/exit` once the work
   is done) leaves a running task `done`, not `failed` with "agent process
   exited". An exit while starting, blocked or working still fails the task.
+- `pastor task retry` of a failed worktree task no longer fails with git's
+  "fatal: '<path>' already exists": the retry keeps the old task's branch
+  and reopens its checkout with `worktree.open` when it is still on disk.
 
 ## 0.3.0 - 2026-09-25
 

@@ -37,6 +37,11 @@ struct State {
     dirty: HashSet<String>,
     /// Every new worktree starts dirty (see `dirty_worktrees`).
     all_dirty: bool,
+    /// Worktree checkouts on disk, as (repo cwd, branch) -> path. They outlive
+    /// their workspace, as git worktrees do: only `worktree.remove` deletes one.
+    checkouts: HashMap<(String, String), String>,
+    /// Open worktree workspace -> the checkout (repo cwd, branch) it shows.
+    workspace_checkout: HashMap<String, (String, String)>,
     agents: HashMap<String, AgentInfo>,
     /// pane id -> when `agent.start` ran, for the `ready_after` window.
     started: HashMap<String, Instant>,
@@ -380,6 +385,8 @@ impl FakeHerdr {
             let mut s = self.state.lock().unwrap();
             s.agents.remove(pane_id);
             s.workspaces.remove(&ws);
+            // The checkout stays on disk.
+            s.workspace_checkout.remove(&ws);
         }
         self.pane_closed_event(pane_id, &ws);
     }
@@ -569,11 +576,29 @@ impl FakeHerdr {
         match req.method.as_str() {
             "ping" => Ok(json!({"type": "pong", "version": "fake", "protocol": s.protocol})),
             "workspace.create" | "worktree.create" => {
+                let checkout = (
+                    p["cwd"].as_str().unwrap_or("").to_string(),
+                    p["branch"].as_str().unwrap_or("").to_string(),
+                );
+                if req.method == "worktree.create" {
+                    // herdr passes git's own refusal through.
+                    if let Some(path) = s.checkouts.get(&checkout) {
+                        return Err((
+                            "worktree_create_failed".into(),
+                            format!("fatal: '{path}' already exists"),
+                        ));
+                    }
+                    let path = format!("/fake/worktrees/{}", checkout.1.replace('/', "-"));
+                    s.checkouts.insert(checkout.clone(), path);
+                }
                 s.next_ws += 1;
                 let ws = format!("w{}", s.next_ws);
                 let pane = format!("{ws}:p1");
                 let is_worktree = req.method == "worktree.create";
                 s.workspaces.insert(ws.clone(), is_worktree);
+                if is_worktree {
+                    s.workspace_checkout.insert(ws.clone(), checkout);
+                }
                 if is_worktree && s.all_dirty {
                     s.dirty.insert(ws.clone());
                 }
@@ -588,6 +613,66 @@ impl FakeHerdr {
                     result["worktree"] = json!({"path": p.get("cwd").cloned().unwrap_or(Value::Null), "branch": p.get("branch").cloned().unwrap_or(Value::Null)});
                 }
                 Ok(result)
+            }
+            // herdr 0.9.1: `worktree.list {cwd}` lists the repo's checkouts,
+            // each with the workspace showing it, if one is open.
+            "worktree.list" => {
+                let cwd = p["cwd"].as_str().unwrap_or("");
+                let worktrees: Vec<Value> = s
+                    .checkouts
+                    .iter()
+                    .filter(|((repo, _), _)| repo == cwd)
+                    .map(|((repo, branch), path)| {
+                        let key = (repo.clone(), branch.clone());
+                        let open = s
+                            .workspace_checkout
+                            .iter()
+                            .find(|(_, c)| **c == key)
+                            .map(|(ws, _)| ws.clone());
+                        json!({"branch": branch, "path": path, "open_workspace_id": open,
+                               "is_bare": false, "is_detached": false, "is_prunable": false,
+                               "is_linked_worktree": true, "label": "r"})
+                    })
+                    .collect();
+                Ok(json!({"type": "worktree_list", "worktrees": worktrees}))
+            }
+            // herdr 0.9.1: `worktree.open {cwd, branch, label}` opens a
+            // workspace on an existing checkout, or answers the one already
+            // showing it with `already_open`.
+            "worktree.open" => {
+                let checkout = (
+                    p["cwd"].as_str().unwrap_or("").to_string(),
+                    p["branch"].as_str().unwrap_or("").to_string(),
+                );
+                let Some(path) = s.checkouts.get(&checkout).cloned() else {
+                    return Err((
+                        "worktree_not_found".into(),
+                        format!("no worktree for branch {}", checkout.1),
+                    ));
+                };
+                let open = s
+                    .workspace_checkout
+                    .iter()
+                    .find(|(_, c)| **c == checkout)
+                    .map(|(ws, _)| ws.clone());
+                let already_open = open.is_some();
+                let ws = match open {
+                    Some(ws) => ws,
+                    None => {
+                        s.next_ws += 1;
+                        let ws = format!("w{}", s.next_ws);
+                        s.workspaces.insert(ws.clone(), true);
+                        s.workspace_checkout.insert(ws.clone(), checkout.clone());
+                        ws
+                    }
+                };
+                let label = p.get("label").cloned().unwrap_or(Value::Null);
+                Ok(
+                    json!({"type": "worktree_opened", "already_open": already_open,
+                    "workspace": {"workspace_id": ws, "label": label}, "tab": {"tab_id": format!("{ws}:t1")},
+                    "root_pane": {"pane_id": format!("{ws}:p1"), "workspace_id": ws},
+                    "worktree": {"path": path, "branch": checkout.1}}),
+                )
             }
             "agent.start" => {
                 let pane_id = p["pane_id"].as_str().unwrap_or("").to_string();
@@ -776,6 +861,7 @@ impl FakeHerdr {
                 }
                 s.agents.remove(&pane_id);
                 s.dirty.remove(&ws);
+                s.workspace_checkout.remove(&ws);
                 drop(s);
                 self.pane_closed_event(&pane_id, &ws);
                 Ok(json!({"type": "ok"}))
@@ -810,6 +896,9 @@ impl FakeHerdr {
                 }
                 s.workspaces.remove(&ws);
                 s.dirty.remove(&ws);
+                if let Some(checkout) = s.workspace_checkout.remove(&ws) {
+                    s.checkouts.remove(&checkout);
+                }
                 let pane_id = format!("{ws}:p1");
                 s.agents.remove(&pane_id);
                 drop(s);
