@@ -542,7 +542,9 @@ impl FlockDoc {
     /// task left naming a removed one would wait forever.
     pub fn remove_flock(&mut self, name: &str, queued: &[String]) -> Result<(), EditError> {
         let f = self.current()?;
-        if !f.flocks.iter().any(|e| e.name == name) {
+        // `has_flock` counts the implicit `default` of a file with no
+        // `[[flock]]`, so removing it reads as removing the default.
+        if !f.has_flock(name) {
             return Err(EditError::UnknownFlock(name.into()));
         }
         if f.default_flock() == name {
@@ -891,6 +893,15 @@ flock = "work"
         );
         d.remove_flock("work", &[]).unwrap();
         assert_eq!(d.flock().unwrap().flock_names(), ["default"]);
+    }
+
+    #[test]
+    fn the_implicit_default_flock_is_refused_as_the_default() {
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        assert_eq!(
+            d.remove_flock("default", &[]).unwrap_err(),
+            EditError::RemovingDefault("default".into())
+        );
     }
 
     #[test]
