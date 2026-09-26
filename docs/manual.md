@@ -957,11 +957,15 @@ pastor connector uninstall slack                         # or unlink, for a link
 ```
 
 `install` clones the repository from GitHub with `git` (`PASTOR_CONNECTOR_GIT_BASE`
-points it at a mirror), checks out `--ref` if given, validates the manifest and
-shows what the connector will run (its connector and hook commands and its
-secrets) before asking to continue. `--yes` skips the question, and it is
-required when stdin is not a terminal. `link` puts a symlink to a directory of
-yours in the connectors directory, for developing one. Both print the secrets
+points it at a mirror), checks out `--ref` if given (a ref that starts with `-`
+is refused), validates the manifest and shows what the connector will run (its
+connector and hook commands, shell-quoted and with control characters escaped,
+which hooks hear about every job's tasks, and its secrets) before asking to
+continue. `--yes` skips the question, and it is required when stdin is not a
+terminal. `link` puts a symlink to a directory of yours in the connectors
+directory, for developing one; it shows the same description, and warns when
+the directory or its manifest is group- or world-writable or owned by another
+user, since whoever can change it changes what runs next. Both print the secrets
 still unset in the `.env`. `uninstall` removes a checkout and `unlink` a
 link (the directory itself stays); the `.env` and the state directory are
 kept, and jobs that use the connector are invalid until it is back.

@@ -83,6 +83,10 @@ pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result
         }
         ConnectorCmd::Link { path } => {
             let p = install::link(paths, &path)?;
+            eprint!("{}", describe(&p.manifest));
+            for w in install::link_warnings(&p.dir, unsafe { libc::geteuid() }) {
+                eprintln!("warning: {w}; whoever can change it changes what pastor runs");
+            }
             println!(
                 "linked {} {} from {}",
                 p.id,
@@ -117,24 +121,37 @@ pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result
     }
 }
 
-/// What the connector will run, shown before install asks.
+/// What the connector will run, shown before install asks and when it is
+/// linked. The manifest is its author's text, so every string is escaped
+/// (`one_line`) and each command shell-quoted: an escape sequence in it could
+/// otherwise erase the real command line and draw a harmless one.
 fn describe(m: &Manifest) -> String {
-    let mut out = format!("{} {} ({})\n", m.id, m.version, m.name);
+    use crate::cli::one_line;
+    let argv = |cmd: &[String]| {
+        one_line(
+            &cmd.iter()
+                .map(|a| crate::herdr::shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    };
+    let mut out = format!("{} {} ({})\n", m.id, m.version, one_line(&m.name));
     if let Some(d) = &m.description {
-        out.push_str(&format!("  {d}\n"));
+        out.push_str(&format!("  {}\n", one_line(d)));
     }
     if let Some(c) = &m.connector {
-        out.push_str(&format!(
-            "  connector ({}): {}\n",
-            c.mode,
-            c.command.join(" ")
-        ));
+        out.push_str(&format!("  connector ({}): {}\n", c.mode, argv(&c.command)));
     }
     for h in &m.events {
+        let every = if h.only_own {
+            ""
+        } else {
+            " (every job's tasks, without item or prompt)"
+        };
         out.push_str(&format!(
-            "  hook on {}: {}\n",
-            h.on.join(", "),
-            h.command.join(" ")
+            "  hook on {}{every}: {}\n",
+            one_line(&h.on.join(", ")),
+            argv(&h.command)
         ));
     }
     if !m.secrets.is_empty() {
@@ -372,6 +389,45 @@ async fn run_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manifest is the connector author's text: escapes in its strings
+    /// could erase the real command line and draw another, so they are
+    /// shown escaped, and each argv is shell-quoted so its words are plain.
+    #[test]
+    fn describe_escapes_manifest_strings_and_quotes_commands() {
+        let m = Manifest::parse(
+            r#"id = "demo"
+name = "Demo\u001b[1A\u001b[2K"
+version = "0.1.0"
+description = "fine\nconnector: harmless"
+
+[connector]
+command = ["sh", "-c", "curl x | sh"]
+
+[[events]]
+on = ["task.done"]
+command = ["sh", "hook.sh"]
+
+[[events]]
+on = ["task.done"]
+only_own = true
+command = ["sh", "own.sh"]
+"#,
+        )
+        .unwrap();
+        let out = describe(&m);
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out:?}");
+        assert!(out.contains("Demo\\x1b[1A\\x1b[2K"), "{out}");
+        assert!(out.contains("fine\\nconnector: harmless"), "{out}");
+        assert!(out.contains("sh -c 'curl x | sh'"), "{out}");
+        assert!(
+            out.contains(
+                "hook on task.done (every job's tasks, without item or prompt): sh hook.sh"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("hook on task.done: sh own.sh"), "{out}");
+    }
 
     #[tokio::test]
     async fn reload_is_quiet_without_a_head_and_warns_when_it_does_not_reload() {

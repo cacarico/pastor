@@ -93,6 +93,12 @@ pub fn install(
     git_ref: Option<&str>,
     confirm: impl FnOnce(&Manifest) -> anyhow::Result<bool>,
 ) -> anyhow::Result<Connector> {
+    // `git checkout` would read a ref that starts with `-` as an option.
+    if let Some(r) = git_ref
+        && (r.is_empty() || r.starts_with('-'))
+    {
+        bail!("ref {r:?} is not a branch, tag or commit");
+    }
     let root = paths.connectors_dir();
     create_private_dir(&root)?;
     // Dot-named, so discovery never sees a half-done install.
@@ -106,10 +112,18 @@ pub fn install(
     match git_ref {
         // A shallow clone cannot check out an arbitrary commit.
         Some(r) => {
-            git(&["clone", "--quiet", &source.url, &checkout_s])?;
+            git(&["clone", "--quiet", "--", &source.url, &checkout_s])?;
             git(&["-C", &checkout_s, "checkout", "--quiet", r])?;
         }
-        None => git(&["clone", "--quiet", "--depth", "1", &source.url, &checkout_s])?,
+        None => git(&[
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "--",
+            &source.url,
+            &checkout_s,
+        ])?,
     }
     // Move the real directory, never a link: renaming a symlinked subdir
     // would move the link, and dropping the scratch clone would then delete
@@ -179,6 +193,32 @@ pub fn link(paths: &Paths, path: &Path) -> anyhow::Result<Connector> {
     })
 }
 
+/// Why the code in a directory about to be linked could change under pastor:
+/// the directory or its manifest is writable by group or others, or owned by
+/// a uid other than `euid`. A linked connector runs from that directory, and
+/// hooks re-read their connector on every event, so whoever can change it
+/// changes what runs next. Empty when there is nothing to say.
+pub fn link_warnings(dir: &Path, euid: u32) -> Vec<String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let mut out = Vec::new();
+    for path in [dir.to_path_buf(), dir.join(super::manifest::MANIFEST_FILE)] {
+        let Ok(md) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let mode = md.permissions().mode();
+        let shown = path.display();
+        if mode & 0o002 != 0 {
+            out.push(format!("{shown} is world-writable"));
+        } else if mode & 0o020 != 0 {
+            out.push(format!("{shown} is group-writable"));
+        }
+        if md.uid() != euid {
+            out.push(format!("{shown} is owned by uid {}, not you", md.uid()));
+        }
+    }
+    out
+}
+
 enum Kind {
     Linked,
     Managed,
@@ -235,6 +275,48 @@ pub fn unlink(paths: &Paths, id: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ref is handed to `git checkout`, which would read `-...` as an
+    /// option; it is refused before anything is cloned.
+    #[test]
+    fn a_ref_that_looks_like_an_option_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let src = InstallSource::parse("o/r", "file:///nonexistent").unwrap();
+        for r in ["-b", "--orphan=x", ""] {
+            let err = install(&paths, &src, Some(r), |_| Ok(true)).unwrap_err();
+            assert!(format!("{err:#}").contains("ref"), "{r}: {err:#}");
+        }
+    }
+
+    /// `link` runs code from a directory pastor does not manage; one that
+    /// others can write to, or that someone else owns, is worth a warning,
+    /// since a change there runs at the next event.
+    #[test]
+    fn link_warns_about_a_directory_others_can_change() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("conn");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("pastor-connector.toml"), "").unwrap();
+        let mode =
+            |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(&dir, 0o755);
+        mode(&dir.join("pastor-connector.toml"), 0o644);
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        assert_eq!(link_warnings(&dir, me), Vec::<String>::new());
+
+        mode(&dir, 0o777);
+        mode(&dir.join("pastor-connector.toml"), 0o664);
+        let w = link_warnings(&dir, me).join("\n");
+        assert!(w.contains("conn is world-writable"), "{w}");
+        assert!(w.contains("pastor-connector.toml is group-writable"), "{w}");
+
+        mode(&dir, 0o755);
+        mode(&dir.join("pastor-connector.toml"), 0o644);
+        let w = link_warnings(&dir, me + 1).join("\n");
+        assert!(w.contains(&format!("owned by uid {me}")), "{w}");
+    }
 
     #[test]
     fn parses_install_sources() {
