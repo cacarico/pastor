@@ -49,14 +49,17 @@ pub fn strip_controls(s: &str) -> String {
         .collect()
 }
 
-/// `v` with `strip_controls` applied to every string in it, keys included.
+/// `v` with `strip_controls` applied to every string value in it. Keys stay
+/// as they are: stripping one could make a key the item never had (a
+/// `title` out of `title\u{1b}`) or overwrite a real one. A key only reaches
+/// a prompt inside a whole object, which renders as JSON and escapes it.
 pub fn strip_controls_deep(v: &Value) -> Value {
     match v {
         Value::String(s) => Value::String(strip_controls(s)),
         Value::Array(a) => Value::Array(a.iter().map(strip_controls_deep).collect()),
         Value::Object(o) => Value::Object(
             o.iter()
-                .map(|(k, v)| (strip_controls(k), strip_controls_deep(v)))
+                .map(|(k, v)| (k.clone(), strip_controls_deep(v)))
                 .collect(),
         ),
         other => other.clone(),
@@ -132,8 +135,11 @@ mod tests {
         );
         assert_eq!(
             strip_controls_deep(&json!({"k\u{1b}": ["x\u{3}", 1, null, {"y": "\u{9b}z"}]})),
-            json!({"k": ["x", 1, null, {"y": "z"}]})
+            json!({"k\u{1b}": ["x", 1, null, {"y": "z"}]})
         );
+        // A stripped key must not turn into a field the item never had.
+        let item = strip_controls_deep(&json!({"title\u{1b}": "v"}));
+        assert!(item.get("title").is_none(), "{item}");
     }
 
     #[test]
