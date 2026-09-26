@@ -154,7 +154,7 @@ label = "pastor"
 [dispatch]
 repo = "~/work/widgets"
 worktree = true
-branch = "issue-{{ item.key }}"
+branch = "pastor/issue-{{ item.key }}"
 prompt = """
 Fix issue #{{ item.key }}: {{ item.title }}
 
