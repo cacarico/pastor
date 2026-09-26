@@ -168,8 +168,12 @@ guessing.
 
 A task that reaches `done` is closed by pastor after `close_done_after`
 (`pastor.toml`, default `15m`; `never` disables it): the pane closes, a
-worktree pastor created is removed if it is clean and kept with a note if it
-is not, and the task shows as `closed`. Failed and stale tasks are left for
+worktree pastor created is removed if it is clean, and the task shows as
+`closed`. Clean means no uncommitted changes and no commits that are on no
+remote (`git rev-list HEAD --not --remotes` is empty; a repo with no remote
+at all always has some). A worktree that is not clean is kept, with a note
+on the task naming the branch, for you to save and remove with `git worktree
+remove`. herdr never deletes the branch, even for a worktree it removes. Failed and stale tasks are left for
 `pastor task retry`; blocked tasks need their prompt answered
 (`pastor task send` or `pastor task attach`) or `pastor task close`. None of them is closed on its
 own. The grace period keeps the pane there for `pastor task attach`; the

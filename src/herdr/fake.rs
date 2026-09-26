@@ -72,6 +72,9 @@ struct State {
     home: Option<String>,
     /// Paths `Connector::dir_exists` reports missing; every other path exists.
     missing_dirs: HashSet<String>,
+    /// Checkouts, by path, holding commits that are on no remote: what
+    /// `Connector::unpushed_commits` reports.
+    unpushed: HashSet<String>,
     /// What `Connector::pastor_version` reports.
     pastor_version: Option<String>,
     /// The started agent vanishes immediately, as it does when the agent binary
@@ -201,6 +204,10 @@ impl FakeHerdr {
             .unwrap()
             .missing_dirs
             .insert(path.to_string());
+    }
+    /// The checkout at `path` has commits on no remote.
+    pub fn set_unpushed(&self, path: &str) {
+        self.state.lock().unwrap().unpushed.insert(path.to_string());
     }
     pub fn set_protocol(&self, p: u32) {
         self.state.lock().unwrap().protocol = p;
@@ -1029,6 +1036,10 @@ impl super::transport::Connector for FakeHerdr {
     fn dir_exists(&self, path: &str) -> super::transport::DirFuture<'_> {
         let exists = !self.state.lock().unwrap().missing_dirs.contains(path);
         Box::pin(async move { Ok(Some(exists)) })
+    }
+    fn unpushed_commits(&self, path: &str) -> super::transport::DirFuture<'_> {
+        let unpushed = self.state.lock().unwrap().unpushed.contains(path);
+        Box::pin(async move { Ok(Some(unpushed)) })
     }
     fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
         let version = self.state.lock().unwrap().pastor_version.clone();

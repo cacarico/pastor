@@ -86,6 +86,23 @@ fn manual_worktree_cleanup(display_id: &str) -> String {
     )
 }
 
+/// The note on a task whose worktree auto-close kept, and why.
+fn worktree_kept_note(t: &Task, name: &str, why: &str) -> String {
+    let branch = t
+        .spec
+        .branch
+        .clone()
+        .unwrap_or_else(|| format!("pastor/{name}"));
+    format!(
+        "worktree kept: {why} on branch {branch}{}; remove the checkout with `git worktree remove` once it is saved",
+        t.spec
+            .repo
+            .as_deref()
+            .map(|r| format!(" of {r}"))
+            .unwrap_or_default()
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelState {
@@ -1544,7 +1561,31 @@ impl Actor {
         };
         let mut close_pane = !remove_worktree;
         let mut worktree_gone = false;
-        if remove_worktree {
+        let mut keep_worktree = false;
+        // herdr removes a clean checkout even when its commits are on no
+        // remote: a push that failed leaves the work only there. Auto-close
+        // keeps it, as it keeps a dirty one. Unknown (no checkout recorded,
+        // git could not tell) removes as before; herdr keeps the branch.
+        if by == CloseBy::AutoClose
+            && remove_worktree
+            && let Some(checkout) = row.as_ref().and_then(|t| t.spec.checkout.as_deref())
+        {
+            let unpushed =
+                tokio::time::timeout(timeout, self.connector.unpushed_commits(&checkout.path))
+                    .await
+                    .map_err(|_| TimedOut("git rev-list", timeout))?
+                    .map_err(CallError::from)
+                    .with_context(|| {
+                        format!("look for unpushed commits in the worktree of {name}")
+                    })?;
+            if unpushed == Some(true) {
+                let t = row.as_ref().expect("auto-close has a row");
+                note = Some(worktree_kept_note(t, &name, "commits on no remote"));
+                keep_worktree = true;
+                close_pane = true;
+            }
+        }
+        if remove_worktree && !keep_worktree {
             let ws = workspace.with_context(|| format!("task {name} recorded no workspace"))?;
             // Closes the workspace, pane and agent with it: closing the pane
             // first would close the workspace and leave no id to remove by.
@@ -1591,23 +1632,11 @@ impl Actor {
                 // so it falls to the branch below and is retried whole.
                 Err(err) if by == CloseBy::AutoClose && err.code().is_some() => {
                     let t = row.as_ref().expect("auto-close has a row");
-                    let branch = t
-                        .spec
-                        .branch
-                        .clone()
-                        .unwrap_or_else(|| format!("pastor/{name}"));
                     let why = match err.code() {
                         Some("dirty_worktree_requires_force") => "uncommitted changes".to_string(),
                         _ => format!("herdr refused to remove it: {err}"),
                     };
-                    note = Some(format!(
-                        "worktree kept: {why} on branch {branch}{}; remove the checkout with `git worktree remove` once it is saved",
-                        t.spec
-                            .repo
-                            .as_deref()
-                            .map(|r| format!(" of {r}"))
-                            .unwrap_or_default()
-                    ));
+                    note = Some(worktree_kept_note(t, &name, &why));
                     close_pane = true;
                 }
                 Err(err) => {
@@ -4627,6 +4656,50 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(count(&mut events, "task.closed", t.id).len(), 1);
         assert_eq!(calls(&fake, "worktree.remove").len(), 1, "not retried");
+    }
+
+    /// A clean checkout with commits on no remote (a push that failed) is
+    /// kept like a dirty one: herdr's `worktree.remove` only refuses
+    /// uncommitted changes, so pastor asks git first and never calls it.
+    #[tokio::test]
+    async fn auto_close_keeps_a_worktree_with_unpushed_commits() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let checkout = t
+            .spec
+            .checkout
+            .clone()
+            .expect("dispatch records the checkout");
+        fake.set_unpushed(&checkout.path);
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        assert!(
+            calls(&fake, "worktree.remove").is_empty(),
+            "the checkout stays"
+        );
+        assert_eq!(
+            closes(&fake),
+            vec![serde_json::json!({"pane_id": t.pane_id.clone().unwrap()})],
+            "the pane closes anyway"
+        );
+        let closed = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            closed.workspace_id, t.workspace_id,
+            "the checkout is still there"
+        );
+        let note = closed.error.unwrap();
+        assert!(note.contains("worktree kept"), "{note}");
+        assert!(note.contains("commits on no remote"), "{note}");
+        assert!(note.contains(&checkout.branch), "names the branch: {note}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(count(&mut events, "task.closed", t.id).len(), 1);
+        assert!(calls(&fake, "worktree.remove").is_empty(), "not retried");
     }
 
     /// A malformed `worktree.remove` reply is a decoding failure, not herdr

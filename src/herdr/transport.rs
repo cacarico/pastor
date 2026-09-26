@@ -382,6 +382,13 @@ pub trait Connector: Send + Sync {
     fn dir_exists(&self, _path: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// Whether the git checkout at `path` on the machine has commits that are
+    /// on no remote. herdr's `worktree.remove` refuses only uncommitted
+    /// changes, so auto-close asks this first and keeps such a checkout.
+    /// `None` when it cannot be known.
+    fn unpushed_commits(&self, _path: &str) -> DirFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// The version of pastor installed on the machine, for `machine list`: a
     /// fleet runs whatever each machine last installed, and a skill or CLI
     /// that an agent there calls is that version's. `None` when there is no
@@ -407,6 +414,10 @@ impl Connector for Endpoint {
     fn dir_exists(&self, path: &str) -> DirFuture<'_> {
         let path = path.to_string();
         Box::pin(async move { dir_exists(self, &path).await })
+    }
+    fn unpushed_commits(&self, path: &str) -> DirFuture<'_> {
+        let path = path.to_string();
+        Box::pin(async move { unpushed_commits(self, &path).await })
     }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
@@ -455,6 +466,71 @@ async fn dir_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectEr
         }
         // An arbitrary bridge command says nothing about where it lands.
         Endpoint::Command { .. } => Ok(None),
+    }
+}
+
+async fn unpushed_commits(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectError> {
+    let (target, argv) = match ep {
+        // The head and this herdr share a machine, and so a git.
+        Endpoint::Local { .. } => (
+            "local".to_string(),
+            vec!["sh".to_string(), "-c".into(), remote_unpushed_command(path)],
+        ),
+        Endpoint::Ssh {
+            target,
+            control_path,
+            ..
+        } => {
+            ensure_control_dir(control_path.as_deref())?;
+            let argv = ssh_argv_running(
+                target,
+                control_path.as_deref(),
+                remote_unpushed_command(path),
+            );
+            (target.clone(), argv)
+        }
+        // An arbitrary bridge command says nothing about what else is there.
+        Endpoint::Command { .. } => return Ok(None),
+    };
+    let out = probe_output(&argv).await?;
+    remote_unpushed_answer(&target, &out)
+}
+
+/// Counts the commits of the checkout's HEAD that no remote-tracking branch
+/// has, answered on stdout as a number. A repo with no remote counts every
+/// commit, so its checkouts are always kept.
+fn remote_unpushed_command(path: &str) -> String {
+    format!(
+        "git -C {} rev-list --count HEAD --not --remotes",
+        shell_quote(path)
+    )
+}
+
+/// Reads the answer to `remote_unpushed_command`. As with `remote_home`, only
+/// ssh failing to reach the machine is an error; git failing (no checkout
+/// there, no git on the PATH) is unknown. rc-file noise comes before the
+/// answer, so the answer is the last line.
+fn remote_unpushed_answer(
+    target: &str,
+    out: &std::process::Output,
+) -> Result<Option<bool>, ConnectError> {
+    if matches!(out.status.code(), Some(255) | None) {
+        return Err(ConnectError {
+            message: format!(
+                "ssh {target}: {} ({})",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                out.status
+            ),
+        });
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let last = raw.trim_end().lines().last().unwrap_or("").trim();
+    match last.parse::<u64>() {
+        Ok(n) if out.status.success() => Ok(Some(n > 0)),
+        _ => {
+            tracing::warn!(%target, status = %out.status, stdout = ?raw, stderr = %String::from_utf8_lossy(&out.stderr).trim(), "no count of unpushed commits from git");
+            Ok(None)
+        }
     }
 }
 
@@ -989,6 +1065,75 @@ mod tests {
         assert_eq!(remote_dir_answer("t", &out(0, "")).unwrap(), None);
         assert_eq!(remote_dir_answer("t", &out(1, "")).unwrap(), None);
         assert!(remote_dir_answer("t", &out(255, "")).is_err());
+    }
+
+    #[test]
+    fn remote_unpushed_answer_reads_the_count() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"boom".to_vec(),
+        };
+        assert_eq!(
+            remote_unpushed_answer("t", &out(0, "2\n")).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            remote_unpushed_answer("t", &out(0, "0\n")).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            remote_unpushed_answer("t", &out(0, "welcome to pi\n0\n")).unwrap(),
+            Some(false)
+        );
+        assert_eq!(remote_unpushed_answer("t", &out(128, "")).unwrap(), None);
+        assert!(remote_unpushed_answer("t", &out(255, "")).is_err());
+    }
+
+    /// Against a real git: a commit is unpushed until a remote has it.
+    #[tokio::test]
+    async fn a_local_checkout_reports_unpushed_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                // The developer's own git config (commit signing, hooks) must
+                // not reach a throwaway repo.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{args:?}: {st:?}");
+        };
+        git(&["init", "-q", "work"]);
+        git(&["init", "-q", "--bare", "origin.git"]);
+        git(&["-C", "work", "commit", "-q", "--allow-empty", "-m", "one"]);
+        let ep = Endpoint::Local {
+            session: "s".into(),
+        };
+        let work = dir.path().join("work");
+        let work = work.to_str().unwrap();
+        assert_eq!(ep.unpushed_commits(work).await.unwrap(), Some(true));
+        git(&["-C", "work", "remote", "add", "origin", "../origin.git"]);
+        git(&["-C", "work", "push", "-q", "origin", "HEAD:main"]);
+        assert_eq!(ep.unpushed_commits(work).await.unwrap(), Some(false));
+        let missing = dir.path().join("gone");
+        assert_eq!(
+            ep.unpushed_commits(missing.to_str().unwrap())
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// Only ssh itself failing (255, or killed) means the machine was not
