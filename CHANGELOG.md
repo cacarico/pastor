@@ -28,7 +28,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   directory owned by another user, or a symlink owned by another user, instead
   of using it. With `PASTOR_STATE_DIR` under a shared path such as `/tmp`,
   someone else could otherwise plant the dir that receives the ssh and IPC
-  sockets. A symlink of the user's own is still followed.
+  sockets. A symlink of the user's own is still followed. Before making a
+  missing dir it checks the ancestors that exist and refuses a symlink owned
+  by neither the user nor root, or a dir anyone can write to without the
+  sticky bit that neither owns.
 - A hook hearing about a task of a job another connector owns, or of a
   one-off task, gets the task with `item` null and `prompt` empty, and its own
   `@<id>` scratch dir as `PASTOR_CONNECTOR_STATE_DIR` rather than the job's.

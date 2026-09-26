@@ -332,7 +332,8 @@ pub fn migrate_legacy_dir(legacy: &Path, paths: &Paths) -> anyhow::Result<Option
 /// through a symlink another uid owns, is refused rather than used, since a
 /// state dir under a shared path such as /tmp could otherwise be planted by
 /// someone else and receive the ssh and IPC sockets. A symlink the user owns
-/// (a config dir kept in dotfiles) is followed.
+/// (a config dir kept in dotfiles) is followed. A missing dir is made only
+/// under ancestors nobody else can swap out (`safe_ancestors`).
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
     create_private_dir_as(dir, unsafe { libc::geteuid() })
 }
@@ -354,6 +355,7 @@ fn create_private_dir_as(dir: &Path, euid: u32) -> anyhow::Result<()> {
         Ok(md) => md,
         // Missing, or a parent is in the way: creating says which.
         Err(_) => {
+            safe_ancestors(dir, euid)?;
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
             std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?
         }
@@ -373,6 +375,45 @@ fn create_private_dir_as(dir: &Path, euid: u32) -> anyhow::Result<()> {
     if md.permissions().mode() & 0o777 != 0o700 {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("chmod {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Check the ancestors of `dir` that exist before `create_dir_all` makes the
+/// rest through them. One that someone else could swap for a path of their
+/// choosing is refused: a symlink owned by neither the user nor root, or a dir
+/// anyone can write to, without the sticky bit, owned by neither. A sticky
+/// shared dir such as /tmp, root's dirs and the user's own pass.
+fn safe_ancestors(dir: &Path, euid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let trusted = |uid: u32| uid == euid || uid == 0;
+    for anc in dir.ancestors().skip(1) {
+        if anc.as_os_str().is_empty() {
+            continue;
+        }
+        let Ok(link) = std::fs::symlink_metadata(anc) else {
+            continue;
+        };
+        if link.file_type().is_symlink() && !trusted(link.uid()) {
+            anyhow::bail!(
+                "{}: its parent {} is a symlink owned by uid {}; refusing to create it there",
+                dir.display(),
+                anc.display(),
+                link.uid()
+            );
+        }
+        let Ok(md) = std::fs::metadata(anc) else {
+            continue;
+        };
+        let mode = md.permissions().mode();
+        if md.is_dir() && mode & 0o002 != 0 && mode & 0o1000 == 0 && !trusted(md.uid()) {
+            anyhow::bail!(
+                "{}: its parent {} is writable by anyone and owned by uid {}; refusing to create it there",
+                dir.display(),
+                anc.display(),
+                md.uid()
+            );
+        }
     }
     Ok(())
 }
@@ -1036,6 +1077,56 @@ mod tests {
         create_private_dir(&link).unwrap();
         let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    /// A missing dir is created through its existing ancestors, so each one
+    /// is checked first: a symlink another user owns, or a dir anyone can
+    /// write to without the sticky bit that is neither root's nor the user's,
+    /// would let someone else swap in a parent of their choosing. Nothing is
+    /// created under a refused ancestor.
+    #[test]
+    fn create_private_dir_refuses_an_unsafe_ancestor() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let other = std::fs::metadata(&real).unwrap().uid() + 1;
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = create_private_dir_as(&link.join("state/ssh"), other).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err:#}");
+        assert!(!real.join("state").exists(), "nothing is made under it");
+
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = create_private_dir_as(&open.join("state/ssh"), other).unwrap_err();
+        assert!(err.to_string().contains("writable"), "{err:#}");
+        assert!(!open.join("state").exists(), "nothing is made under it");
+    }
+
+    /// The usual ancestors pass: the user's own dirs, a link of their own, one
+    /// they own that others can write to, and a sticky shared dir like /tmp.
+    #[test]
+    fn create_private_dir_accepts_safe_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        create_private_dir(&link.join("a/b")).unwrap();
+        assert!(real.join("a/b").is_dir());
+
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        create_private_dir(&open.join("a")).unwrap();
+
+        let sticky = tmp.path().join("sticky");
+        std::fs::create_dir(&sticky).unwrap();
+        std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        create_private_dir(&sticky.join("a")).unwrap();
     }
 
     #[test]
