@@ -765,8 +765,9 @@ at the binary it finds (the running pastor, or `herdr` on PATH) and copies your
 shell's `PATH` into the unit, so `ssh`, `herdr` and the agents resolve under
 systemd the way they do in a terminal; re-run it after moving a binary.
 Entries anyone could plant a binary in are left out and named on stderr: an
-empty or relative entry (`.`, `node_modules/.bin`) and a world-writable
-directory. `herdr` is looked up in the `PATH` the unit keeps, and setup fails
+empty or relative entry (`.`, `node_modules/.bin`), a world-writable
+directory and one that does not exist, since someone else could create it
+later. `herdr` is looked up in the `PATH` the unit keeps, and setup fails
 if it is only in an entry left out. A value with a line break is refused, since it would start a new
 directive, and a `$` in the binary's path is written `$$`, since systemd
 expands it in `ExecStart`.

@@ -59,9 +59,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `session` may not contain a backslash or a control character.
 - `pastor.service` runs with `NoNewPrivileges`, `UMask=0077`,
   `LockPersonality` and `RestrictRealtime`. `pastor setup systemd` leaves
-  empty, relative and world-writable entries out of the unit's `PATH`, looks
-  `herdr` up only in the entries it keeps, refuses
-  a value with a line break and writes `$` in `ExecStart` as `$$`.
+  empty, relative, missing and world-writable entries out of the unit's
+  `PATH`, looks `herdr` up only in the entries it keeps, refuses a value with
+  a line break and writes `$` in `ExecStart` as `$$`.
 
 ## 0.5.0 - 2026-09-26
 

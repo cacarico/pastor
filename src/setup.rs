@@ -158,7 +158,7 @@ fn exec_and_env_from(
     let (path_var, dropped) = unit_path(shell_path);
     if !dropped.is_empty() {
         eprintln!(
-            "left out of the service's PATH (empty, relative or world-writable): {}",
+            "left out of the service's PATH (empty, relative, missing or world-writable): {}",
             dropped.join(", ")
         );
     }
@@ -187,16 +187,19 @@ fn exec_and_env_from(
 /// keeps it for good, for ssh, herdr and every agent, so an entry where
 /// someone else could plant a binary is dropped: an empty or relative one
 /// (it resolves against whatever the working dir is) and a world-writable
-/// directory (`/tmp/bin`, say). A missing directory is kept; it may appear.
+/// directory (`/tmp/bin`, say), and a missing one, which anyone able to
+/// create it could fill later.
 fn unit_path(path_var: &str) -> (String, Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
     let (mut kept, mut dropped) = (Vec::new(), Vec::new());
     for entry in path_var.split(':') {
-        let world_writable =
-            std::fs::metadata(entry).is_ok_and(|m| m.permissions().mode() & 0o002 != 0);
+        // A missing entry, or one that is not a dir, is dropped too: someone
+        // else could create it after setup and fill it.
+        let unsafe_dir = std::fs::metadata(entry)
+            .map_or(true, |m| !m.is_dir() || m.permissions().mode() & 0o002 != 0);
         if entry.is_empty() {
             dropped.push("(empty)".to_string());
-        } else if !entry.starts_with('/') || world_writable {
+        } else if !entry.starts_with('/') || unsafe_dir {
             dropped.push(entry.to_string());
         } else {
             kept.push(entry);
@@ -979,10 +982,10 @@ mod tests {
 
     /// PATH is copied from the shell that ran setup into a unit that runs
     /// for good. Entries anyone could plant a binary in (empty or relative
-    /// ones, which resolve against the working dir, and world-writable
-    /// dirs) are left out.
+    /// ones, which resolve against the working dir, world-writable dirs, and
+    /// missing ones, which someone else may create later) are left out.
     #[test]
-    fn unit_path_drops_relative_empty_and_world_writable_entries() {
+    fn unit_path_drops_relative_empty_missing_and_world_writable_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let (good, open) = (tmp.path().join("good"), tmp.path().join("open"));
         std::fs::create_dir_all(&good).unwrap();
@@ -995,7 +998,7 @@ mod tests {
             open.display()
         );
         let (kept, dropped) = unit_path(&var);
-        assert_eq!(kept, format!("{}:/nonexistent/bin", good.display()));
+        assert_eq!(kept, good.display().to_string());
         assert_eq!(
             dropped,
             vec![
@@ -1003,6 +1006,7 @@ mod tests {
                 ".".into(),
                 "node_modules/.bin".into(),
                 open.display().to_string(),
+                "/nonexistent/bin".into(),
             ]
         );
     }
