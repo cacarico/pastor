@@ -22,6 +22,7 @@ include = [
     "!/src/bin/**",
     "/skills/pastor/SKILL.md",
     "/contrib/systemd/*.service",
+    "/contrib/launchd/*.plist",
     "/Cargo.toml",
     "/Cargo.lock",
     "/LICENSE",
