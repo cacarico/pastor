@@ -17,6 +17,7 @@ on:
       - "tests/**"
       - "skills/pastor/SKILL.md"
       - "contrib/systemd/**"
+      - "contrib/launchd/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"

@@ -76,7 +76,7 @@ enum Command {
     Completions { shell: clap_complete::Shell },
     /// Show the events log (task, job and machine events)
     Events(pastor::events::EventsArgs),
-    /// Install pastor or herdr as a systemd user service
+    /// Install pastor or herdr as a user service (systemd, or launchd on macOS)
     Setup {
         #[command(subcommand)]
         cmd: pastor::setup::SetupCmd,

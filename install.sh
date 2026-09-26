@@ -13,7 +13,8 @@
 # no Rust. Every download is checked against SHA256SUMS from the same
 # release, and the provenance attestation is verified when a logged-in gh
 # is around. Completions and the systemd unit are the binary's own job
-# afterwards: `pastor completions <shell>` and `pastor setup systemd`.
+# afterwards: `pastor completions <shell>` and `pastor setup systemd` (or
+# `pastor setup launchd` on macOS).
 set -eu
 
 repo=cacarico/pastor
@@ -91,4 +92,4 @@ case ":$PATH:" in
     *":$dir:"*) ;;
     *) echo "note: $dir is not on your PATH" >&2 ;;
 esac
-echo "next: pastor completions bash|fish|zsh, then pastor setup systemd"
+echo "next: pastor completions bash|fish|zsh, then pastor setup systemd (setup launchd on macOS)"

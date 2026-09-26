@@ -44,7 +44,7 @@ spend time deciding what to do, not typing it. The longer story is in
 - **An events log** of pastor's task, job and machine events, with
   `pastor events --follow`.
 - **Runs as a service.** `pastor setup systemd` installs the head as a user
-  unit, and flock or config edits reload it without a restart.
+  unit (`pastor setup launchd` on macOS), and flock or config edits reload it without a restart.
 - **Scriptable.** `--json` on the list and show commands, and shell
   completions from `make install`.
 
@@ -79,7 +79,7 @@ checks a download by hand. Releases are built by
 |---|---|
 | Linux x86_64, aarch64 | 1: built, tested in CI and released |
 | Linux armv7, riscv64 | 2: built and released, not tested in CI |
-| macOS arm64, x86_64 | 2: built and released, not tested in CI; config lands under `~/Library/Application Support` and a local herdr is not found yet |
+| macOS arm64, x86_64 | 2: built and released, not tested in CI; same `~/.config` and `~/.local/state` layout as Linux, `pastor setup launchd` for the service |
 | FreeBSD x86_64 | 3: `cargo check` on every pull request, no binaries |
 | Windows | not supported; use WSL2 |
 
@@ -103,7 +103,7 @@ every distro and every Raspberry Pi OS release.
 pastor machine add pi-1 user@pi-1        # a machine you can ssh to
 pastor machine add here --local          # this machine can take tasks too
 pastor machine add pi-2 user@pi-2 --flock work   # after `pastor flock add work`
-pastor setup systemd                     # run the head as a user service
+pastor setup systemd                     # run the head as a user service (setup launchd on macOS)
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api'
 pastor task list                         # queued, starting, running, blocked
 pastor task read t-1                     # the agent's recent output

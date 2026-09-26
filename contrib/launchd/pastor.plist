@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  pastor serve as a launchd user agent, for a head on macOS.
+
+  `pastor setup launchd` installs this to ~/Library/LaunchAgents/ and loads
+  it. On the way it points ProgramArguments at the pastor binary it was run
+  as, adds an EnvironmentVariables PATH copied from that shell, so `ssh` and
+  `herdr` resolve the way they do interactively, and sends output to
+  ~/Library/Logs/pastor.serve.log. Installing by hand works too: fix the
+  program path, then `launchctl bootstrap gui/$(id -u) <this file>`.
+
+  A LaunchAgent runs while you are logged in and starts again at login.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>pastor.serve</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/pastor</string>
+		<string>serve</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+</dict>
+</plist>

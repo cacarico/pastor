@@ -271,6 +271,9 @@ _pastor() {
             pastor__subcmd__help__subcmd__machine,remove)
                 cmd="pastor__subcmd__help__subcmd__machine__subcmd__remove"
                 ;;
+            pastor__subcmd__help__subcmd__setup,launchd)
+                cmd="pastor__subcmd__help__subcmd__setup__subcmd__launchd"
+                ;;
             pastor__subcmd__help__subcmd__setup,systemd)
                 cmd="pastor__subcmd__help__subcmd__setup__subcmd__systemd"
                 ;;
@@ -397,11 +400,17 @@ _pastor() {
             pastor__subcmd__setup,help)
                 cmd="pastor__subcmd__setup__subcmd__help"
                 ;;
+            pastor__subcmd__setup,launchd)
+                cmd="pastor__subcmd__setup__subcmd__launchd"
+                ;;
             pastor__subcmd__setup,systemd)
                 cmd="pastor__subcmd__setup__subcmd__systemd"
                 ;;
             pastor__subcmd__setup__subcmd__help,help)
                 cmd="pastor__subcmd__setup__subcmd__help__subcmd__help"
+                ;;
+            pastor__subcmd__setup__subcmd__help,launchd)
+                cmd="pastor__subcmd__setup__subcmd__help__subcmd__launchd"
                 ;;
             pastor__subcmd__setup__subcmd__help,systemd)
                 cmd="pastor__subcmd__setup__subcmd__help__subcmd__systemd"
@@ -1546,8 +1555,22 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help__subcmd__setup)
-            opts="systemd"
+            opts="systemd launchd"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__setup__subcmd__launchd)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -2256,7 +2279,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__setup)
-            opts="-h --help systemd help"
+            opts="-h --help systemd launchd help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2270,7 +2293,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__setup__subcmd__help)
-            opts="systemd help"
+            opts="systemd launchd help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2297,9 +2320,37 @@ _pastor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        pastor__subcmd__setup__subcmd__help__subcmd__launchd)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         pastor__subcmd__setup__subcmd__help__subcmd__systemd)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__setup__subcmd__launchd)
+            opts="-y -h --herdr --enable --start --now --stop --yes --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

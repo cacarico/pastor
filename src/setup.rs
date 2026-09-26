@@ -1,4 +1,5 @@
-//! `pastor setup systemd [--herdr]`: install the shipped user unit, apply the
+//! `pastor setup systemd|launchd [--herdr]`: install the shipped user unit
+//! (or, on macOS, LaunchAgent; see [`launchd`]), apply the
 //! requested systemd action, and check what a unit needs to outlive a login (lingering) and
 //! what pastor requires of its own files (config and state dirs 0700,
 //! socket and connector `.env` files 0600).
@@ -12,6 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::config::{Paths, create_private_dir};
+
+mod launchd;
 
 const PASTOR_UNIT: &str = include_str!("../contrib/systemd/pastor.service");
 const HERDR_UNIT: &str = include_str!("../contrib/systemd/herdr.service");
@@ -44,20 +47,100 @@ pub enum SetupCmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Install and manage a launchd user agent on macOS: pastor.serve, or pastor.herdr with --herdr
+    ///
+    /// The agent goes to ~/Library/LaunchAgents. With no action flag it is
+    /// installed, enabled and loaded, which starts it. --enable, --start,
+    /// --enable --start, --enable --now and --stop choose a different action
+    /// instead: --enable clears a launchctl disable so it loads at login,
+    /// --start loads it (or kickstarts it when already loaded), --stop
+    /// unloads it until the next login.
+    Launchd {
+        /// Install pastor.herdr (the herdr server) instead, for a flock machine
+        #[arg(long)]
+        herdr: bool,
+        /// Enable the agent at login
+        #[arg(long)]
+        enable: bool,
+        /// Start the agent now
+        #[arg(long, conflicts_with = "stop")]
+        start: bool,
+        /// With --enable, start the agent now too
+        #[arg(long, requires = "enable", conflicts_with_all = ["start", "stop"])]
+        now: bool,
+        /// Stop the agent now
+        #[arg(long, conflicts_with_all = ["enable", "start", "now"])]
+        stop: bool,
+        /// Skip the confirmation prompt; needed when stdin is not a terminal
+        /// (a script, a task, `ssh host pastor setup launchd`)
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 /// Entry point for `pastor setup`.
 pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
-    let SetupCmd::Systemd {
-        herdr,
-        enable,
-        start,
-        now,
-        stop,
-        yes,
-    } = cmd;
-    let unit = if herdr { Unit::Herdr } else { Unit::Pastor };
-    let action = Action::from_flags(enable, start, now, stop);
+    match cmd {
+        SetupCmd::Systemd {
+            herdr,
+            enable,
+            start,
+            now,
+            stop,
+            yes,
+        } => {
+            if cfg!(target_os = "macos") {
+                anyhow::bail!("macOS has no systemd; use `pastor setup launchd`");
+            }
+            let unit = if herdr { Unit::Herdr } else { Unit::Pastor };
+            let (exec, env) = exec_and_env(unit, paths)?;
+            let unit_dir = crate::config::config_home()
+                .context("no config dir")?
+                .join("systemd/user");
+            let install = Install {
+                unit,
+                unit_dir,
+                exec,
+                env,
+                action: Action::from_flags(enable, start, now, stop),
+            };
+            ask(&install.plan(), yes)?;
+            let report = install.run(&SystemRunner, paths)?;
+            print!("{report}");
+        }
+        SetupCmd::Launchd {
+            herdr,
+            enable,
+            start,
+            now,
+            stop,
+            yes,
+        } => {
+            if !cfg!(target_os = "macos") {
+                anyhow::bail!("launchd is macOS only; use `pastor setup systemd`");
+            }
+            let unit = if herdr { Unit::Herdr } else { Unit::Pastor };
+            let (exec, env) = exec_and_env(unit, paths)?;
+            let home = dirs::home_dir().context("no home dir")?;
+            let install = launchd::Install {
+                unit,
+                agent_dir: home.join("Library/LaunchAgents"),
+                log_dir: home.join("Library/Logs"),
+                exec,
+                env,
+                action: Action::from_flags(enable, start, now, stop),
+            };
+            ask(&install.plan(), yes)?;
+            let report = install.run(&SystemRunner, paths)?;
+            print!("{report}");
+        }
+    }
+    Ok(())
+}
+
+/// The binary a unit runs and the environment it gets: the PATH of this shell,
+/// plus, for pastor, any dir override the shell runs with.
+fn exec_and_env(unit: Unit, paths: &Paths) -> anyhow::Result<(PathBuf, Vec<(String, String)>)> {
     let path_var = std::env::var("PATH").unwrap_or_default();
     let exec = match unit {
         Unit::Pastor => std::env::current_exe().context("locate the pastor binary")?,
@@ -78,28 +161,32 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
             }
         }
     }
-    let unit_dir = dirs::config_dir()
-        .context("no config dir")?
-        .join("systemd/user");
-    let install = Install {
-        unit,
-        unit_dir,
-        exec,
-        env,
-        action,
-    };
+    Ok((exec, env))
+}
+
+fn ask(plan: &Plan, yes: bool) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let interactive = stdin.is_terminal();
     confirm(
-        &install,
+        plan,
         yes,
         interactive,
         &mut stdin.lock(),
         &mut std::io::stdout(),
-    )?;
-    let report = install.run(&SystemRunner, paths)?;
-    print!("{report}");
-    Ok(())
+    )
+}
+
+/// What the confirmation prompt shows about one install.
+pub struct Plan<'a> {
+    /// The file written: `pastor.service`, `pastor.serve.plist`.
+    pub file: &'a str,
+    /// `unit dir` or `agent dir`, and the directory the file goes to.
+    pub dir_label: &'a str,
+    pub dir: &'a Path,
+    /// `ExecStart` or `program`, and the binary the service runs.
+    pub exec_label: &'a str,
+    pub exec: &'a Path,
+    pub action: Action,
 }
 
 /// Show what setup will do and wait for `yes`, unless `--yes` was given.
@@ -108,7 +195,7 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
 /// declined or failed prompt ends in a JSON error that must be the only thing
 /// on stderr.
 fn confirm(
-    install: &Install,
+    plan: &Plan,
     yes: bool,
     interactive: bool,
     input: &mut dyn std::io::BufRead,
@@ -120,17 +207,19 @@ fn confirm(
     if !interactive {
         anyhow::bail!(
             "stdin is not a terminal, so setup cannot ask for confirmation; pass --yes to install {} with action {}",
-            install.unit.file_name(),
-            install.action
+            plan.file,
+            plan.action
         );
     }
     write!(
         out,
-        "About to install {}\n  unit dir: {}\n  ExecStart: {}\n  action: {}\nContinue? Type 'yes' to proceed: ",
-        install.unit.file_name(),
-        install.unit_dir.display(),
-        install.exec.display(),
-        install.action
+        "About to install {}\n  {}: {}\n  {}: {}\n  action: {}\nContinue? Type 'yes' to proceed: ",
+        plan.file,
+        plan.dir_label,
+        plan.dir.display(),
+        plan.exec_label,
+        plan.exec.display(),
+        plan.action
     )
     .and_then(|()| out.flush())
     .context("write confirmation prompt")?;
@@ -346,32 +435,51 @@ impl Install {
 
     fn write(&self, unit_path: &Path) -> anyhow::Result<Written> {
         let text = render(self.unit.template(), &self.exec, &self.env);
-        std::fs::create_dir_all(&self.unit_dir)
-            .with_context(|| format!("create {}", self.unit_dir.display()))?;
-        let backup = match std::fs::read_to_string(unit_path) {
-            Ok(old) if old == text => return Ok(Written::Unchanged),
-            Ok(_) => Some(unit_path.with_extension("service.bak")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).with_context(|| format!("read {}", unit_path.display())),
-        };
-        // Write to a sibling temp file first and rename it into place last.
-        // A rename is atomic, so a failed or partial write (disk full,
-        // process killed) leaves either the old unit or the new one intact,
-        // never neither: the old unit only moves aside once the new
-        // contents are safely on disk.
-        let tmp_path = unit_path.with_extension("service.tmp");
-        std::fs::write(&tmp_path, text).with_context(|| format!("write {}", tmp_path.display()))?;
-        if let Some(backup) = &backup {
-            std::fs::rename(unit_path, backup)
-                .with_context(|| format!("back up {}", unit_path.display()))?;
-        }
-        std::fs::rename(&tmp_path, unit_path)
-            .with_context(|| format!("install {}", unit_path.display()))?;
-        Ok(match backup {
-            Some(backup) => Written::Updated { backup },
-            None => Written::Created,
-        })
+        write_file(&self.unit_dir, unit_path, &text)
     }
+
+    fn plan(&self) -> Plan<'_> {
+        Plan {
+            file: self.unit.file_name(),
+            dir_label: "unit dir",
+            dir: &self.unit_dir,
+            exec_label: "ExecStart",
+            exec: &self.exec,
+            action: self.action,
+        }
+    }
+}
+
+/// Write `text` to `path` in `dir`, keeping a different previous file as
+/// `<name>.bak`.
+fn write_file(dir: &Path, path: &Path, text: &str) -> anyhow::Result<Written> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let sibling = |suffix: &str| {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(suffix);
+        path.with_file_name(name)
+    };
+    let backup = match std::fs::read_to_string(path) {
+        Ok(old) if old == text => return Ok(Written::Unchanged),
+        Ok(_) => Some(sibling(".bak")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    // Write to a sibling temp file first and rename it into place last.
+    // A rename is atomic, so a failed or partial write (disk full,
+    // process killed) leaves either the old file or the new one intact,
+    // never neither: the old file only moves aside once the new
+    // contents are safely on disk.
+    let tmp_path = sibling(".tmp");
+    std::fs::write(&tmp_path, text).with_context(|| format!("write {}", tmp_path.display()))?;
+    if let Some(backup) = &backup {
+        std::fs::rename(path, backup).with_context(|| format!("back up {}", path.display()))?;
+    }
+    std::fs::rename(&tmp_path, path).with_context(|| format!("install {}", path.display()))?;
+    Ok(match backup {
+        Some(backup) => Written::Updated { backup },
+        None => Written::Created,
+    })
 }
 
 /// The shipped unit with ExecStart's program replaced by `exec` and one
@@ -531,13 +639,15 @@ mod tests {
     type Reply = Box<dyn Fn(&str) -> std::io::Result<CmdOutput>>;
 
     /// Records every call and answers from `reply`.
-    struct FakeRunner {
+    pub(super) struct FakeRunner {
         calls: Mutex<Vec<String>>,
         reply: Reply,
     }
 
     impl FakeRunner {
-        fn new(reply: impl Fn(&str) -> std::io::Result<CmdOutput> + 'static) -> FakeRunner {
+        pub(super) fn new(
+            reply: impl Fn(&str) -> std::io::Result<CmdOutput> + 'static,
+        ) -> FakeRunner {
             FakeRunner {
                 calls: Mutex::new(Vec::new()),
                 reply: Box::new(reply),
@@ -557,7 +667,7 @@ mod tests {
                 })
             })
         }
-        fn calls(&self) -> Vec<String> {
+        pub(super) fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -607,7 +717,7 @@ mod tests {
         let install = e.install(Unit::Pastor);
         // --yes skips the prompt without reading anything.
         confirm(
-            &install,
+            &install.plan(),
             true,
             false,
             &mut "".as_bytes(),
@@ -615,7 +725,7 @@ mod tests {
         )
         .unwrap();
         confirm(
-            &install,
+            &install.plan(),
             true,
             true,
             &mut "".as_bytes(),
@@ -624,7 +734,7 @@ mod tests {
         .unwrap();
         // At a terminal only `yes` goes ahead.
         confirm(
-            &install,
+            &install.plan(),
             false,
             true,
             &mut "yes\n".as_bytes(),
@@ -632,7 +742,7 @@ mod tests {
         )
         .unwrap();
         let err = confirm(
-            &install,
+            &install.plan(),
             false,
             true,
             &mut "no\n".as_bytes(),
@@ -643,7 +753,7 @@ mod tests {
         // Without a terminal it fails at once, even with `yes` waiting on
         // stdin, and names the flag that makes it scriptable.
         let err = confirm(
-            &install,
+            &install.plan(),
             false,
             false,
             &mut "yes\n".as_bytes(),
@@ -660,7 +770,14 @@ mod tests {
         let e = env();
         let install = e.install(Unit::Pastor);
         let mut out = Vec::new();
-        let err = confirm(&install, false, true, &mut "no\n".as_bytes(), &mut out).unwrap_err();
+        let err = confirm(
+            &install.plan(),
+            false,
+            true,
+            &mut "no\n".as_bytes(),
+            &mut out,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("aborted"), "{err}");
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("About to install pastor.service"), "{text}");
@@ -671,8 +788,8 @@ mod tests {
         );
         // --yes and a refused non-terminal write nothing at all.
         let mut out = Vec::new();
-        confirm(&install, true, true, &mut "".as_bytes(), &mut out).unwrap();
-        confirm(&install, false, false, &mut "".as_bytes(), &mut out).unwrap_err();
+        confirm(&install.plan(), true, true, &mut "".as_bytes(), &mut out).unwrap();
+        confirm(&install.plan(), false, false, &mut "".as_bytes(), &mut out).unwrap_err();
         assert!(out.is_empty());
     }
 

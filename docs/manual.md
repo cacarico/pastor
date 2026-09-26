@@ -679,6 +679,31 @@ A user service stops at logout unless lingering is on. Setup checks
 For `pastor.service` it also sets the config and state dirs to 0700 and the
 socket and connector `.env` files to 0600, and says what it changed.
 
+## Run under launchd (macOS)
+
+`pastor setup launchd` is the macOS counterpart, with the same flags and the
+same ask-first prompt. It writes `contrib/launchd/pastor.plist` to
+`~/Library/LaunchAgents/pastor.serve.plist` (label `pastor.serve`; with
+`--herdr`, `pastor.herdr` from `contrib/launchd/herdr.plist`), pointing
+ProgramArguments at the binary it finds and copying your shell's `PATH` into
+EnvironmentVariables. Output goes to `~/Library/Logs/<label>.log`. The actions
+run in your `gui/<uid>` domain: `--enable` is `launchctl enable`, `--start`
+is `launchctl bootstrap` (or `kickstart` when the agent is already loaded),
+`--stop` is `launchctl bootout`, and no flag means enable and start. Both
+agents have `RunAtLoad` and `KeepAlive`, so they come back after a crash and
+at the next login, and run only while you are logged in. A changed plist is
+kept as `<label>.plist.bak`; a loaded agent keeps the old one until you
+`launchctl bootout` and `bootstrap` it again, which setup prints.
+
+On macOS pastor uses the same XDG layout as Linux (`~/.config/pastor`,
+`~/.local/state/pastor`, `~/.local/share/pastor`), next to herdr's own
+`~/.config/herdr`. A config left in `~/Library/Application Support/pastor` by
+an older pastor is moved there on the first run, with a note on stderr. That
+pastor still said plugins: the checkouts it kept in `plugins/` go to
+`~/.local/share/pastor/connectors` and their `.env` files to
+`~/.config/pastor/connectors`. Rename each `pastor-plugin.toml` to
+`pastor-connector.toml` by hand, as for any upgrade from plugins.
+
 ## Connectors
 
 A connector is a directory with a `pastor-connector.toml` and the commands it
@@ -1055,6 +1080,7 @@ two pastor edits of one file never interleave.
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
 ~/.config/systemd/user/{pastor,herdr}.service   written by `pastor setup systemd`
+~/Library/LaunchAgents/pastor.{serve,herdr}.plist   written by `pastor setup launchd` (macOS)
 ~/.config/pastor/connectors/<id>/.env   a connector's secrets and settings
 ~/.local/share/pastor/connectors/<id>/  installed connectors (a symlink for a linked one)
 ~/.local/state/pastor/connectors/<job>/ a job's connector scratch

@@ -139,6 +139,7 @@ jobs:
           cp contrib/completions/pastor.bash contrib/completions/pastor.fish "$dir/completions/"
           case "$TARGET" in
             *-linux-*) cp -r contrib/systemd "$dir/systemd" ;;
+            *-apple-*) cp -r contrib/launchd "$dir/launchd" ;;
           esac
           tar -czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

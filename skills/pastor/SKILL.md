@@ -161,7 +161,7 @@ pastor flock describe work --json     # one flock: default, agent, machines, liv
 
 These commands edit `flock.toml` in place, keeping its comments.
 
-Every machine needs a herdr server running, and the head needs passwordless ssh to it. Start herdr with `herdr server`, or better as a user service: `pastor setup systemd --herdr --yes` on that machine. The head itself runs as a service with `pastor setup systemd --yes`. Setup needs `--yes` when stdin is not a terminal. Ask the user before installing services.
+Every machine needs a herdr server running, and the head needs passwordless ssh to it. Start herdr with `herdr server`, or better as a user service: `pastor setup systemd --herdr --yes` on that machine. The head itself runs as a service with `pastor setup systemd --yes`. On macOS use `pastor setup launchd` with the same flags. Setup needs `--yes` when stdin is not a terminal. Ask the user before installing services.
 
 ## Events
 

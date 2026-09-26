@@ -41,6 +41,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   edited at its target. `editor_failed` and `edit_conflict` cover an editor
   that fails and a file changed during the edit.
 
+- `pastor setup launchd [--herdr]` installs pastor (or the herdr server) as a
+  macOS LaunchAgent in `~/Library/LaunchAgents`, with the same action flags
+  and confirmation prompt as `pastor setup systemd`.
 - `pastor task run --prompt-file <path>` reads the prompt from a file on the
   machine running the CLI (`-` for stdin), so a long prompt with quotes needs
   no shell quoting. It conflicts with the positional prompt; exactly one is
@@ -112,6 +115,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `install.sh` keep the name pastor, and `fake-herdr` is left out of the
   published package.
 
+- On macOS the config, state and data dirs follow the XDG layout, as on
+  Linux: `~/.config/pastor`, `~/.local/state/pastor`, `~/.local/share/pastor`
+  instead of `~/Library/Application Support/pastor`. A config left in the old
+  place is moved once, with a note; its `plugins/` goes to the new
+  `connectors/` dirs.
 - Agent args follow the agent they were written for: `[defaults] agent_args`
   no longer reach a task that runs another agent than `[defaults] agent`
   (`pastor task run --agent codex` used to get Claude's `--model`).
@@ -158,6 +166,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `SECURITY.md` and the manual's new Trust model section state that the
   head's user is the fleet's trust boundary, that `local = true` machines
   should not run untrusted work, and what plugins inherit.
+
+### Fixed
+
+- A `local = true` machine on macOS finds herdr's socket under
+  `~/.config/herdr`, where herdr puts it.
+- The ssh ControlPath length check uses macOS's 104-byte socket path limit
+  there, not Linux's 108, so a long state dir no longer breaks multiplexing.
 
 ## 0.4.0 - 2026-09-25
 

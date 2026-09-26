@@ -732,6 +732,40 @@ fn setup_systemd_help_names_the_default_action() {
     );
 }
 
+/// `setup launchd` offers the same action flags as `setup systemd`.
+#[test]
+fn setup_launchd_help_names_the_default_action_and_flags() {
+    let out = pastor()
+        .args(["setup", "launchd", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("With no action flag"), "{help}");
+    for flag in ["--herdr", "--enable", "--start", "--now", "--stop", "--yes"] {
+        assert!(help.contains(flag), "{flag}: {help}");
+    }
+}
+
+/// launchd exists only on macOS; elsewhere the command says so and points at
+/// systemd, as a JSON error, before writing anything.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn setup_launchd_off_macos_points_at_systemd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = pastor()
+        .env("PASTOR_CONFIG_DIR", tmp.path().join("c"))
+        .env("PASTOR_STATE_DIR", tmp.path().join("s"))
+        .env("HOME", tmp.path())
+        .args(["setup", "launchd", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("setup systemd"), "{err}");
+    assert!(!tmp.path().join("Library").exists());
+}
+
 /// `--yes`/`-y` installs with no prompt, so setup runs from a script, a task
 /// or `ssh host pastor setup systemd --yes`. Stdin here is not a terminal.
 #[test]
