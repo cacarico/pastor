@@ -910,10 +910,12 @@ names must look like environment variables (`[A-Z_][A-Z0-9_]*`).
 
 `authors`, `homepage`, `repository` and `license` are for people reading
 `connector describe`; pastor shows them and checks nothing about them. They
-are new in the release after 0.5.0, and pastor 0.5.0 rejects a manifest that
-uses them as a key it does not know, so a connector that adds them should
-raise its `min_pastor_version` to that release: an older pastor then says it
-needs a newer one instead of naming the key.
+are new in the release after 0.5.0. pastor 0.5.0 reads a manifest strictly and
+rejects these fields as unknown keys, naming the key; that can't be changed in
+a release already out. From this release on, pastor checks
+`min_pastor_version` before the strict read, so a connector that adds fields a
+future pastor introduces, and raises its `min_pastor_version` to match, gets
+"needs pastor X or later" on an older one instead of an unknown key.
 
 ### Connector protocol
 

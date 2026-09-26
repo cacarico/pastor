@@ -360,7 +360,7 @@ pub fn connector_text(c: &ConnectorDescription) -> String {
         ("repository", text(&c.repository)),
         ("license", text(&c.license)),
         ("status", status),
-        ("dir", c.dir.clone()),
+        ("dir", one_line(&c.dir)),
     ];
     let unknown = || "unknown".to_string();
     match &c.origin {
@@ -392,10 +392,13 @@ pub fn connector_text(c: &ConnectorDescription) -> String {
         }
         Origin::Linked { path, exists } => {
             let gone = if *exists { "" } else { " (missing)" };
-            rows.push(("linked to", format!("{}{gone}", path.display())));
+            rows.push((
+                "linked to",
+                format!("{}{gone}", one_line(&path.display().to_string())),
+            ));
         }
     }
-    rows.push(("env file", c.env_file.clone()));
+    rows.push(("env file", one_line(&c.env_file)));
     let mut out = fields(&rows);
     let command = c
         .connector

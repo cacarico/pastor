@@ -132,6 +132,17 @@ impl Manifest {
     }
 
     pub fn parse_for(text: &str, pastor: &Version) -> Result<Manifest, String> {
+        // `min_pastor_version` first, from a loose read: a manifest written
+        // for a newer pastor may carry keys this one doesn't know, and the
+        // strict read below would name one of those instead of saying a
+        // newer pastor is needed.
+        if let Ok(loose) = text.parse::<toml::Table>()
+            && let Some(min) = loose.get("min_pastor_version").and_then(|v| v.as_str())
+            && let Ok(min) = Version::parse(min)
+            && &min > pastor
+        {
+            return Err(format!("needs pastor {min} or later; this is {pastor}"));
+        }
         let file: ManifestFile = toml::from_str(text).map_err(|e| e.to_string())?;
         check_id(&file.id)?;
         // The catalog resolves a built-in id to the built-in, so a connector by
@@ -490,6 +501,14 @@ command = ["bash", "dm-me.sh"]
             (
                 format!(
                     "id = \"ok\"\nversion = \"0.1.0\"\nmin_pastor_version = \"99.0.0\"\n{conn}"
+                ),
+                "needs pastor 99.0.0",
+            ),
+            // A key this pastor doesn't know yet, in a manifest for a newer
+            // pastor: the version is what gets reported, not the key.
+            (
+                format!(
+                    "id = \"ok\"\nversion = \"0.1.0\"\nmin_pastor_version = \"99.0.0\"\nfuture_key = 1\n{conn}"
                 ),
                 "needs pastor 99.0.0",
             ),
