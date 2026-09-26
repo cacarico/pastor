@@ -707,7 +707,9 @@ an older pastor is moved there on the first run, with a note on stderr,
 unless `PASTOR_CONFIG_DIR` or `XDG_CONFIG_HOME` points the config elsewhere. That
 pastor still said plugins: the checkouts it kept in `plugins/` go to
 `~/.local/share/pastor/connectors` and their `.env` files to
-`~/.config/pastor/connectors`. Rename each `pastor-plugin.toml` to
+`~/.config/pastor/connectors`. A linked connector's `.env` sat in its own
+checkout (the link pointed there) and stays there; the note names it, to copy
+by hand. Rename each `pastor-plugin.toml` to
 `pastor-connector.toml` by hand, as for any upgrade from plugins.
 A move that fails part way leaves `~/.config/pastor/.pastor-migrating`
 behind, and the next run finishes it.

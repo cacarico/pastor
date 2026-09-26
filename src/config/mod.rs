@@ -285,18 +285,30 @@ pub fn migrate_legacy_dir(legacy: &Path, paths: &Paths) -> anyhow::Result<Option
         let mut ids: Vec<_> = std::fs::read_dir(&connectors)
             .with_context(|| format!("read {}", connectors.display()))?
             .filter_map(Result::ok)
-            // A `connector link` symlink points into the user's own checkout,
-            // whose `.env` is theirs to move.
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            // Follows a `connector link` symlink, so a linked connector is
+            // seen as the directory it points at.
+            .filter(|e| e.path().is_dir())
             .map(|e| e.file_name())
             .collect();
         ids.sort();
+        let mut linked_envs = Vec::new();
         for id in ids {
-            let from = connectors.join(&id).join(".env");
+            let dir = connectors.join(&id);
+            let from = dir.join(".env");
+            let to = paths.connector_env_file(&id.to_string_lossy());
+            if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_symlink()) {
+                // The legacy `plugins/<id>/.env` resolved through the link, so
+                // a linked connector's `.env` sits in the user's own checkout.
+                // That is their file: leave it, and say where it now goes.
+                if from.is_file() {
+                    let real = std::fs::canonicalize(&from).unwrap_or(from);
+                    linked_envs.push(format!("{} to {}", real.display(), to.display()));
+                }
+                continue;
+            }
             if !std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file()) {
                 continue;
             }
-            let to = paths.connector_env_file(&id.to_string_lossy());
             if let Some(dir) = to.parent() {
                 create_private_dir(dir)?;
             }
@@ -304,6 +316,12 @@ pub fn migrate_legacy_dir(legacy: &Path, paths: &Paths) -> anyhow::Result<Option
                 .with_context(|| format!("move {} to {}", from.display(), to.display()))?;
         }
         note.push_str(&format!(", and its connectors to {}", connectors.display()));
+        if !linked_envs.is_empty() {
+            note.push_str(&format!(
+                "; linked connectors keep their .env in their own checkout, copy {} if they still need it",
+                linked_envs.join(", ")
+            ));
+        }
     }
     std::fs::remove_file(&marker).with_context(|| format!("remove {}", marker.display()))?;
     Ok(Some(note))
@@ -1498,6 +1516,44 @@ mod tests {
 
         // A second run has nothing to move.
         assert_eq!(migrate_legacy_dir(&legacy, &paths).unwrap(), None);
+    }
+
+    /// A `connector link` symlink kept its `.env` inside the user's own
+    /// checkout, since the legacy config and data dirs were one directory and
+    /// `plugins/<id>/.env` resolved through the link. That file is left where
+    /// it is, and the note says where pastor now reads it from.
+    #[test]
+    fn a_linked_connector_keeps_its_env_and_the_note_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (legacy, paths) = legacy_layout(tmp.path());
+        let checkout = tmp.path().join("src/linked");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join(".env"), "K=v\n").unwrap();
+        std::os::unix::fs::symlink(&checkout, legacy.join("plugins/linked")).unwrap();
+
+        let note = migrate_legacy_dir(&legacy, &paths).unwrap().unwrap();
+        let link = paths.connectors_dir().join("linked");
+        assert!(link.symlink_metadata().unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(checkout.join(".env")).unwrap(),
+            "K=v\n"
+        );
+        assert!(!paths.connector_env_file("linked").exists());
+        assert!(
+            note.contains(
+                &std::fs::canonicalize(checkout.join(".env"))
+                    .unwrap()
+                    .display()
+                    .to_string()
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains(&paths.connector_env_file("linked").display().to_string()),
+            "{note}"
+        );
+        // The managed one still moves as before.
+        assert!(paths.connector_env_file("github").is_file());
     }
 
     /// A step that fails after the config has moved leaves the migration
