@@ -8,7 +8,11 @@ version.
 `pastor serve` runs on one machine, the head. herdr answers one request per
 connection and then closes it, so pastor opens a connection per request: an
 `ssh` running `herdr --session <s> remote-api-bridge`, which pipes herdr's
-socket protocol over stdio. Those connections are cheap because all of a
+socket protocol over stdio. Every command pastor runs over ssh (this one, the
+probes below, `task attach`) goes as `sh -c '<command>'`, so a remote login
+shell that is not POSIX, such as fish, only parses one quoted word; sh parses
+the rest. For the same reason a machine's `session` may not contain a
+backslash, and a repo path with one needs a POSIX login shell. Those connections are cheap because all of a
 machine's share one multiplexed ssh master
 (`ControlMaster=auto`, `ControlPath=~/.local/state/pastor/ssh/<machine>-%C`,
 `ControlPersist=600`), so only the first one authenticates. A long machine name

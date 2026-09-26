@@ -195,8 +195,19 @@ fn ssh_argv(target: &str, session: &str, control_path: Option<&Path>) -> Vec<Str
     ssh_argv_running(target, control_path, bridge_command(session))
 }
 
-/// ssh argv that runs `remote` (parsed by the remote shell) over the shared
-/// master when there is one.
+/// `command` as a remote login shell should see it: `sh -c '<command>'`.
+/// sshd hands the command to the user's login shell, which may be fish or
+/// csh; wrapped, that shell parses only a word and one single-quoted string
+/// (no backslash in it, which fish would read as an escape), and sh parses
+/// the POSIX command inside. A session name with a backslash is refused by
+/// `Flock::validate` for this reason; a repo path with one needs a POSIX
+/// login shell.
+pub fn posix_command(command: &str) -> String {
+    format!("sh -c {}", shell_quote(command))
+}
+
+/// ssh argv that runs `remote` (a POSIX shell command, run through
+/// `posix_command`) over the shared master when there is one.
 fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -> Vec<String> {
     let mut argv = vec![
         "ssh".to_string(),
@@ -222,7 +233,12 @@ fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -
     }
     // `--` so a target is never read as an option; `Flock::validate` also
     // refuses one that starts with `-`.
-    argv.extend(["-T".to_string(), "--".into(), target.to_string(), remote]);
+    argv.extend([
+        "-T".to_string(),
+        "--".into(),
+        target.to_string(),
+        posix_command(&remote),
+    ]);
     argv
 }
 
@@ -565,7 +581,7 @@ async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
 /// install` puts pastor) and `~/.local/bin`, so the command adds them. It
 /// answers `none` when there is no pastor, so a missing binary is an answer
 /// and not a failure.
-const REMOTE_PASTOR_VERSION_COMMAND: &str = r#"sh -c 'PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"; command -v pastor >/dev/null 2>&1 && pastor --version || printf none'"#;
+const REMOTE_PASTOR_VERSION_COMMAND: &str = r#"PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"; command -v pastor >/dev/null 2>&1 && pastor --version || printf none"#;
 
 /// Reads the answer to `REMOTE_PASTOR_VERSION_COMMAND`: `pastor 0.2.0` is
 /// `0.2.0`, `none` is no pastor. As with `remote_home`, only ssh failing to
@@ -883,7 +899,7 @@ mod tests {
         // The remote command is the only element a shell ever parses.
         assert_eq!(
             argv.last().unwrap(),
-            "herdr --session default remote-api-bridge"
+            "sh -c 'herdr --session default remote-api-bridge'"
         );
         assert_eq!(argv[argv.len() - 2], "fleet@pi-3");
         // `--` ends ssh's options, so the target is never read as one.
@@ -900,7 +916,7 @@ mod tests {
             Some(Path::new("/tmp/s/ssh/pi-3-%C")),
             REMOTE_HOME_COMMAND.to_string(),
         );
-        assert_eq!(argv.last().unwrap(), "printf %s \"$HOME\"");
+        assert_eq!(argv.last().unwrap(), "sh -c 'printf %s \"$HOME\"'");
         assert_eq!(argv[argv.len() - 2], "fleet@pi-3");
         assert!(
             argv.windows(2)
@@ -965,7 +981,8 @@ mod tests {
         assert!(
             argv.last()
                 .unwrap()
-                .starts_with("sh -c 'PATH=\"$HOME/.cargo/bin:")
+                .starts_with("sh -c 'PATH=\"$HOME/.cargo/bin:"),
+            "{argv:?}"
         );
         assert!(
             argv.windows(2)
@@ -1036,6 +1053,33 @@ mod tests {
             stderr: vec![],
         };
         assert!(remote_pastor_version("t", &killed).is_err());
+    }
+
+    /// ssh hands its command to the remote user's login shell, which may be
+    /// fish or csh. Every remote command is wrapped as `sh -c '<command>'`,
+    /// so that shell only parses one word and one single-quoted string, and
+    /// sh parses the rest. Run here the way sshd runs it, through a shell's
+    /// `-c`, the path comes out whole.
+    #[test]
+    fn remote_commands_run_under_sh_whatever_the_login_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("my app's $HOME `x`");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.to_str().unwrap();
+        let argv = ssh_argv_running("fleet@pi-3", None, remote_dir_command(path));
+        let remote = argv.last().unwrap();
+        assert!(remote.starts_with("sh -c 'if test -d "), "{remote}");
+        let out = std::process::Command::new("sh")
+            .args(["-c", remote])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "yes");
+        assert!(
+            ssh_argv("fleet@pi-3", "default", None)
+                .last()
+                .unwrap()
+                .starts_with("sh -c 'herdr --session default remote-api-bridge'")
+        );
     }
 
     #[test]
@@ -1290,7 +1334,7 @@ mod tests {
         );
         assert_eq!(
             argv.last().unwrap(),
-            "herdr --session default remote-api-bridge"
+            "sh -c 'herdr --session default remote-api-bridge'"
         );
     }
 

@@ -1444,7 +1444,9 @@ async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     let err = if let Some(target) = &m.ssh {
         std::process::Command::new("ssh")
             .args(["-t", "--", target])
-            .arg(attach_remote_command(&m.session, &agent))
+            .arg(pastor::herdr::posix_command(&attach_remote_command(
+                &m.session, &agent,
+            )))
             .exec()
     } else if m.local {
         std::process::Command::new("herdr")

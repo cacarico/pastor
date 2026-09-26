@@ -190,6 +190,14 @@ impl Flock {
             if m.command.as_ref().is_some_and(|c| c.is_empty()) {
                 return Err(format!("machine {}: command is empty", m.name));
             }
+            // It goes into commands a remote login shell parses; fish reads
+            // a backslash in single quotes as an escape (see `posix_command`).
+            if m.session.contains('\\') || m.session.chars().any(char::is_control) {
+                return Err(format!(
+                    "machine {}: session {:?} contains a backslash or a control character",
+                    m.name, m.session
+                ));
+            }
             if m.max_agents == 0 {
                 return Err(format!("machine {}: max_agents must be at least 1", m.name));
             }
@@ -1207,6 +1215,24 @@ flock = "work"
                 }],
             };
             f.validate().unwrap_or_else(|e| panic!("{target}: {e}"));
+        }
+    }
+
+    /// A session name goes into a command a remote login shell parses, and
+    /// fish reads a backslash inside single quotes as an escape, so one could
+    /// end the quoted word early there.
+    #[test]
+    fn a_session_name_with_a_backslash_or_control_character_is_refused() {
+        for session in ["a\\b", "x'\\", "s\n"] {
+            let f = Flock {
+                flocks: vec![],
+                machines: vec![MachineConfig {
+                    session: session.into(),
+                    ..pi("x")
+                }],
+            };
+            let err = f.validate().unwrap_err();
+            assert!(err.starts_with("machine x: session"), "{session:?}: {err}");
         }
     }
 
