@@ -2710,6 +2710,50 @@ fn spec_example_plan_runs_its_first_task() {
     env.wait_done(&format!("t-{}", t["id"]));
 }
 
+#[test]
+fn spec_example_prompts_rebase_before_the_ledger_and_retry_the_push() {
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/spec/example");
+    let mut checked = 0;
+    for dir in std::fs::read_dir(&example).unwrap() {
+        let dir = dir.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        // A plan dir is `<date>-<name>`; the plan branch is `pastor/<name>`.
+        let stem = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let name = stem.get(11..).expect("a dated plan dir");
+        let rebase = format!("git rebase origin/pastor/{name}");
+        let ledger_commit = format!("{stem}.ledger.md and commit it");
+        for file in std::fs::read_dir(&dir).unwrap() {
+            let file = file.unwrap().path();
+            if file.extension().is_none_or(|e| e != "md") {
+                continue;
+            }
+            let p = std::fs::read_to_string(&file).unwrap();
+            let at = |needle: &str| {
+                p.find(needle)
+                    .unwrap_or_else(|| panic!("{} lacks {needle:?}", file.display()))
+            };
+            assert!(
+                at(&rebase) < at(&ledger_commit),
+                "{} must rebase before the ledger commit",
+                file.display()
+            );
+            let step = p.lines().find(|l| l.contains(&rebase)).unwrap();
+            assert!(
+                step.contains("git fetch origin"),
+                "{} must fetch in the rebase step: {step}",
+                file.display()
+            );
+            at("rejected as not a fast-forward, do steps 1 and 3 once more");
+            at("keep both sides' lines");
+            at("PUSH FAILED");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 2, "only {checked} prompt files checked");
+}
+
 /// The first fenced block after the first `**Dispatch:**` line, joined across
 /// trailing backslashes and split into words the way sh would for the plain
 /// and single-quoted words a plan uses.
