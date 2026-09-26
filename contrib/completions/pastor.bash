@@ -2970,7 +2970,13 @@ _pastor_names() {
     local cur="${COMP_WORDS[COMP_CWORD]}" names
     if names=$(pastor __complete bash -- "${COMP_WORDS[@]:1:COMP_CWORD-1}" "${cur}" 2>/dev/null); then
         [[ ${cur} == "=" ]] && cur=""
-        COMPREPLY=( $(compgen -W "${names}" -- "${cur}") )
+        # One name per line, kept whole: a flock or machine name may hold a
+        # space, which compgen -W would split into two words.
+        COMPREPLY=()
+        local name
+        while IFS= read -r name; do
+            [[ -n ${name} && ${name} == "${cur}"* ]] && COMPREPLY+=( "${name}" )
+        done <<< "${names}"
         return 0
     fi
     _pastor "$@"
