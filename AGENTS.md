@@ -166,6 +166,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/systemd/user/*.service  from `pastor setup systemd [--herdr]`
 ~/.config/pastor/connectors/<id>/.env   connector secrets and settings
 ~/.local/share/pastor/connectors/<id>/  connector checkouts or links (PASTOR_DATA_DIR)
+~/.local/share/pastor/connectors/.<id>.install.json  where `connector install` got it
 ~/.local/state/pastor/connectors/<job>/ connector scratch per job (PASTOR_CONNECTOR_STATE_DIR)
 ~/.local/state/pastor/connectors/@<id>/ connector scratch for hooks and runs with no job
 ~/.local/state/pastor/runs/<job>/       connector run logs, 256 KiB each, newest 20 kept

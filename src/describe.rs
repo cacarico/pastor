@@ -1,4 +1,4 @@
-//! `pastor job|machine|flock describe`: one thing in full, for a human, or
+//! `pastor job|machine|flock|connector describe`: one thing in full, for a human, or
 //! as JSON with `--json`. The CLI gathers the parts (from the head when one
 //! runs, else from the files and the store); this module holds their shape
 //! and how they read.
@@ -6,9 +6,13 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::cli::{MachineRow, TASK_HEADER, age, in_, one_line, table, task_rows};
+use crate::cli::{
+    JOB_HEADER, MachineRow, TASK_HEADER, age, in_, job_rows, one_line, table, task_rows,
+};
+use crate::connector::install::Origin;
 use crate::events::EventRecord;
 use crate::herdr::shell_quote;
+use crate::scheduler::JobStatus;
 use crate::task::Task;
 
 /// How many recent tasks and events a description lists.
@@ -67,6 +71,77 @@ pub struct FlockDescription {
     pub agents: Option<usize>,
     /// Its queued, starting, running and blocked tasks, newest first.
     pub tasks: Vec<Task>,
+}
+
+/// One connector. Everything from its manifest is `None` or empty when the
+/// manifest does not load; `error` then says why.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorDescription {
+    pub id: String,
+    /// `ok`, `missing_secrets`, or `invalid` (see `error`).
+    pub status: String,
+    pub error: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub version: Option<String>,
+    pub min_pastor_version: Option<String>,
+    pub authors: Vec<String>,
+    pub homepage: Option<String>,
+    pub repository: Option<String>,
+    pub license: Option<String>,
+    /// Where commands run: the checkout, or a link's target.
+    pub dir: String,
+    pub origin: Origin,
+    pub connector: Option<ConnectorCommand>,
+    pub hooks: Vec<ConnectorHook>,
+    pub env_file: String,
+    /// Declared secrets and whether the `.env` sets them; never their values.
+    pub secrets: Vec<ConnectorSecret>,
+    pub missing_secrets: Vec<String>,
+    /// The jobs whose `[connector] use` names it, as `job list` has them.
+    pub jobs: Vec<JobStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorCommand {
+    pub mode: String,
+    pub command: Vec<String>,
+    pub timeout_secs: u64,
+    pub config: Vec<ConfigKey>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigKey {
+    pub key: String,
+    pub required: bool,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorHook {
+    pub on: Vec<String>,
+    pub only_own: bool,
+    pub command: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorSecret {
+    pub name: String,
+    pub description: Option<String>,
+    pub set: bool,
+}
+
+/// An argv as one line a shell would read back: each word quoted, control
+/// characters escaped. A manifest is its author's text, and an escape
+/// sequence in it could otherwise draw a harmless command over the real one.
+pub fn argv(cmd: &[String]) -> String {
+    one_line(
+        &cmd.iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// The last `RECENT` of `events` that `keep` selects, in log order.
@@ -264,6 +339,122 @@ pub fn flock_text(f: &FlockDescription) -> String {
         ("agents", dash(f.agents.map(|n| n.to_string()))),
     ]);
     section(&mut out, "tasks", task_table(&f.tasks));
+    out.join("\n")
+}
+
+pub fn connector_text(c: &ConnectorDescription) -> String {
+    let text = |v: &Option<String>| dash(v.as_deref().map(one_line));
+    let status = match c.status.as_str() {
+        "missing_secrets" => format!("missing secrets: {}", c.missing_secrets.join(", ")),
+        "invalid" => format!("invalid: {}", one_line(c.error.as_deref().unwrap_or(""))),
+        s => s.to_string(),
+    };
+    let mut rows = vec![
+        ("id", c.id.clone()),
+        ("name", text(&c.name)),
+        ("version", dash(c.version.clone())),
+        ("min pastor", dash(c.min_pastor_version.clone())),
+        ("description", text(&c.description)),
+        ("authors", dash(Some(one_line(&c.authors.join(", "))))),
+        ("homepage", text(&c.homepage)),
+        ("repository", text(&c.repository)),
+        ("license", text(&c.license)),
+        ("status", status),
+        ("dir", c.dir.clone()),
+    ];
+    let unknown = || "unknown".to_string();
+    match &c.origin {
+        Origin::Installed {
+            source,
+            url,
+            git_ref,
+            commit,
+            installed_at,
+        } => {
+            rows.push((
+                "installed from",
+                source
+                    .clone()
+                    .unwrap_or_else(|| "unknown (installed before pastor recorded it)".into()),
+            ));
+            rows.push(("git url", url.clone().unwrap_or_else(unknown)));
+            let asked = match (git_ref, source) {
+                (Some(r), _) => one_line(r),
+                (None, Some(_)) => "- (the default branch)".into(),
+                (None, None) => unknown(),
+            };
+            rows.push(("ref", asked));
+            rows.push(("commit", commit.clone().unwrap_or_else(unknown)));
+            rows.push((
+                "installed at",
+                installed_at.map_or_else(unknown, |at| ago(Some(at))),
+            ));
+        }
+        Origin::Linked { path, exists } => {
+            let gone = if *exists { "" } else { " (missing)" };
+            rows.push(("linked to", format!("{}{gone}", path.display())));
+        }
+    }
+    rows.push(("env file", c.env_file.clone()));
+    let mut out = fields(&rows);
+    let command = c
+        .connector
+        .as_ref()
+        .map(|k| {
+            vec![
+                format!("mode: {}", k.mode),
+                format!("command: {}", argv(&k.command)),
+                format!("timeout: {}s", k.timeout_secs),
+            ]
+        })
+        .unwrap_or_default();
+    section(&mut out, "connector", command);
+    let config = c
+        .connector
+        .iter()
+        .flat_map(|k| &k.config)
+        .map(|k| {
+            let req = if k.required { " (required)" } else { "" };
+            format!("{}{req}: {}", one_line(&k.key), text(&k.description))
+        })
+        .collect();
+    section(&mut out, "config", config);
+    let hooks = c
+        .hooks
+        .iter()
+        .map(|h| {
+            let whose = if h.only_own {
+                "own jobs only"
+            } else {
+                "every job's tasks"
+            };
+            format!(
+                "on {} ({whose}): {} [timeout {}s]",
+                one_line(&h.on.join(", ")),
+                argv(&h.command),
+                h.timeout_secs
+            )
+        })
+        .collect();
+    section(&mut out, "hooks", hooks);
+    let secrets = c
+        .secrets
+        .iter()
+        .map(|s| {
+            let set = if s.set { "set" } else { "missing" };
+            format!("{} ({set}): {}", s.name, text(&s.description))
+        })
+        .collect();
+    section(&mut out, "secrets", secrets);
+    let jobs = if c.jobs.is_empty() {
+        vec![]
+    } else {
+        table(&JOB_HEADER, &job_rows(&c.jobs))
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    section(&mut out, "jobs", jobs);
     out.join("\n")
 }
 

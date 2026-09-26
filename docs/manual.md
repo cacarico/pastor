@@ -868,6 +868,10 @@ name = "Slack"                       # optional, defaults to the id
 version = "0.1.0"                    # required: major.minor.patch, numbers only
 min_pastor_version = "0.1.0"         # optional: refuse to load on an older pastor
 description = "Watch a channel, report back in thread"
+authors = ["Ana <ana@example.org>"]  # optional, like the next three
+homepage = "https://example.org/slack-connector"
+repository = "https://github.com/owner/repo"
+license = "MIT"
 
 [connector]
 mode = "poll"                        # poll (the default) or stream
@@ -903,6 +907,13 @@ too.
 has every `required` key and passes the rest through untouched, and
 `connector list` reports the secrets the `.env` leaves unset or empty. Secret
 names must look like environment variables (`[A-Z_][A-Z0-9_]*`).
+
+`authors`, `homepage`, `repository` and `license` are for people reading
+`connector describe`; pastor shows them and checks nothing about them. They
+are new in the release after 0.5.0, and pastor 0.5.0 rejects a manifest that
+uses them as a key it does not know, so a connector that adds them should
+raise its `min_pastor_version` to that release: an older pastor then says it
+needs a newer one instead of naming the key.
 
 ### Connector protocol
 
@@ -999,6 +1010,7 @@ cut there and the rest of it dropped.
 pastor connector install owner/repo/connectors/slack     # owner/repo[/subdir], --ref, --yes
 pastor connector link ~/src/my-connector                 # use a working copy in place
 pastor connector list [--json]                           # version, mode, hooks, missing secrets
+pastor connector describe slack [--json]                 # one connector in full, and the jobs that use it
 pastor connector run slack --job support --since 1h      # run its command once, print its items
 pastor connector uninstall slack                         # or unlink, for a linked one
 ```
@@ -1020,6 +1032,24 @@ kept, and jobs that use the connector are invalid until it is back.
 `list` shows one row per connector: id, version, connector mode, number of hooks,
 whether it is installed or linked, and `ok`, the secrets still missing, or why
 it is invalid.
+
+`describe` shows one connector in full: its manifest (name, description,
+version, `min_pastor_version`, authors, homepage, repository, license); how it
+got here; its connector command's mode, argv and timeout and each hook's
+events, `only_own` and argv; its config keys, required ones marked; its
+secrets, each `set` or `missing` in the `.env` (names only, never values);
+the jobs whose `[connector] use` names it, with their last run and result as
+`job list` has them (from the head when one runs); and its status, `ok`, the
+missing secrets, or why it does not load. A connector that does not load
+still shows its directory, origin and jobs. `install` writes where a
+connector came from to `.<id>.install.json` beside the checkout: the source
+(`owner/repo/subdir`), the clone URL, the `--ref` asked for (none means the
+default branch), the commit checked out and when; `uninstall` removes it. A
+connector installed before pastor wrote that file shows its origin as
+unknown, except the commit and remote of a checkout that is a whole
+repository, read from its `.git`. A linked connector shows the directory it
+points to, marked `(missing)` when that is gone. `list` keeps to its columns
+so it still fits 80 columns; the detail is here.
 
 `run` runs the connector once for a job and dispatches nothing. It uses the
 `[connector]` table of `~/.config/pastor/jobs/<job>.toml` if that file exists,
@@ -1192,6 +1222,7 @@ one in full, `edit` its file.
 pastor job describe <name>       schedule, connector and its config, dispatch, last runs and errors, next run, recent tasks and job events
 pastor machine describe <name>   host, flock, session, channel, herdr, protocol and pastor versions, agents, orphans, tags, its tasks, recent errors
 pastor flock describe <name>     default or not, its agent, agent args, allow and deny, machines, live agents, queued and running tasks
+pastor connector describe <id>   manifest, origin, commands, config, secrets set or missing, jobs using it, status
 pastor task describe <id>        the same as `pastor task show`
 pastor job edit <name>           ~/.config/pastor/jobs/<name>.toml
 pastor flock edit                ~/.config/pastor/flock.toml
@@ -1240,6 +1271,7 @@ two pastor edits of one file never interleave.
 ~/Library/LaunchAgents/pastor.{serve,herdr}.plist   written by `pastor setup launchd` (macOS)
 ~/.config/pastor/connectors/<id>/.env   a connector's secrets and settings
 ~/.local/share/pastor/connectors/<id>/  installed connectors (a symlink for a linked one)
+~/.local/share/pastor/connectors/.<id>.install.json   where `connector install` got it from
 ~/.local/state/pastor/connectors/<job>/ a job's connector scratch
 ~/.local/state/pastor/runs/<job>/       captured connector output, capped and pruned
 ~/.local/state/pastor/runs/@<id>/       captured hook output (and job-less `connector` runs)

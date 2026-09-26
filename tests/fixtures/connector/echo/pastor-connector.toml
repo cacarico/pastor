@@ -6,6 +6,9 @@ name = "Echo"
 version = "0.1.0"
 min_pastor_version = "0.1.0"
 description = "Fixture: emits items, a cursor, bad lines; fails on demand"
+authors = ["Ana Example <ana@example.org>"]
+repository = "https://example.org/acme/tools"
+license = "MIT"
 
 [connector]
 mode = "poll"

@@ -42,18 +42,19 @@ complete -c pastor -n "__fish_pastor_needs_command" -f -a "connector" -d 'Instal
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "trust" -d 'The repos whose folder-trust prompt pastor answers on each machine'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand serve" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "run" -d 'Create a one-off task and dispatch it'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "show" -d 'Show one task row'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "describe" -d 'Show one task row'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "read" -d 'Read recent output from a task\'s pane'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "run" -d 'Create a one-off task and dispatch it'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "show" -d 'Show one task row'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "describe" -d 'Show one task row'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "read" -d 'Read recent output from a task\'s pane'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "done" -d 'Mark a task done, its pane to close after close_done_after; an agent may end its own'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list show describe read attach retry close prune send done help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l prompt-file -d 'Read the prompt from this file on this machine (\'-\' for stdin); it spares long prompts the shell\'s quoting' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l repo -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l flock -d 'Only this flock\'s machines take the task (default: the flock of --machine, else the default flock)' -r
@@ -99,6 +100,8 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l trust -d 'Accept the agent\'s folder-trust prompt with its trust keys, and trust the task\'s repo on its machine from now on'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l json
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from done" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from done" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "run" -d 'Create a one-off task and dispatch it'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "show" -d 'Show one task row'
@@ -108,6 +111,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "done" -d 'Mark a task done, its pane to close after close_done_after; an agent may end its own'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list describe help" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and not __fish_seen_subcommand_from add remove move list describe help" -f -a "add"
@@ -225,14 +229,15 @@ complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_sub
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from help" -f -a "systemd" -d 'Install and manage a systemd user unit: pastor.service, or herdr.service with --herdr'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from help" -f -a "launchd" -d 'Install and manage a launchd user agent on macOS: pastor.serve, or pastor.herdr with --herdr'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list run help" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list run help" -f -a "install" -d 'Install a connector from GitHub: owner/repo, or owner/repo/subdir'
-complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list run help" -f -a "link" -d 'Use a connector from a local directory, in place (for developing one)'
-complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list run help" -f -a "uninstall" -d 'Remove an installed connector (its .env and state are kept)'
-complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list run help" -f -a "unlink" -d 'Remove a linked connector; the directory itself is left alone'
-complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list run help" -f -a "list" -d 'List connectors: version, connector, hooks, missing secrets'
-complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list run help" -f -a "run" -d 'Run a connector\'s command once for a job and print its items; creates no tasks and saves no cursor'
-complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list run help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list describe run help" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list describe run help" -f -a "install" -d 'Install a connector from GitHub: owner/repo, or owner/repo/subdir'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list describe run help" -f -a "link" -d 'Use a connector from a local directory, in place (for developing one)'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list describe run help" -f -a "uninstall" -d 'Remove an installed connector (its .env and state are kept)'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list describe run help" -f -a "unlink" -d 'Remove a linked connector; the directory itself is left alone'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list describe run help" -f -a "list" -d 'List connectors: version, connector, hooks, missing secrets'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list describe run help" -f -a "describe" -d 'One connector in full: manifest, origin, commands, config, secrets, jobs'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list describe run help" -f -a "run" -d 'Run a connector\'s command once for a job and print its items; creates no tasks and saves no cursor'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and not __fish_seen_subcommand_from install link uninstall unlink list describe run help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from install" -l ref -d 'Branch, tag or commit to check out' -r
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from install" -l yes -d 'Do not ask for confirmation'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from install" -s h -l help -d 'Print help'
@@ -241,6 +246,8 @@ complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from unlink" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from list" -l json
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from describe" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from describe" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from run" -l job -d 'The job whose [connector] config to use; need not exist yet' -r
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from run" -l since -d 'How far back `since` points (default: the job\'s backfill, or 0s)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from run" -s h -l help -d 'Print help'
@@ -249,6 +256,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from help" -f -a "uninstall" -d 'Remove an installed connector (its .env and state are kept)'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from help" -f -a "unlink" -d 'Remove a linked connector; the directory itself is left alone'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from help" -f -a "list" -d 'List connectors: version, connector, hooks, missing secrets'
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from help" -f -a "describe" -d 'One connector in full: manifest, origin, commands, config, secrets, jobs'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from help" -f -a "run" -d 'Run a connector\'s command once for a job and print its items; creates no tasks and saves no cursor'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list remove help" -s h -l help -d 'Print help'
@@ -284,6 +292,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "close" -d 'Close a task\'s pane (and with --remove-worktree its worktree), or an orphaned agent'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "prune" -d 'Delete old finished tasks; their items stay seen'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "send" -d 'Type text or press keys in a live task\'s agent, to answer what it is waiting on'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "done" -d 'Mark a task done, its pane to close after close_done_after; an agent may end its own'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "describe" -d 'Show one task row'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "add"
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from machine" -f -a "remove"
@@ -311,6 +320,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from connector" -f -a "uninstall" -d 'Remove an installed connector (its .env and state are kept)'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from connector" -f -a "unlink" -d 'Remove a linked connector; the directory itself is left alone'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from connector" -f -a "list" -d 'List connectors: version, connector, hooks, missing secrets'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from connector" -f -a "describe" -d 'One connector in full: manifest, origin, commands, config, secrets, jobs'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from connector" -f -a "run" -d 'Run a connector\'s command once for a job and print its items; creates no tasks and saves no cursor'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "list" -d 'Every saved trust: machine, repo, and when it was saved'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "remove" -d 'Forget a saved trust; the repo\'s next task asks again'

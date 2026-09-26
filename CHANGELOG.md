@@ -7,6 +7,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `pastor connector describe <id> [--json]` shows one connector in full: its
+  manifest, where it came from (source, ref, commit and install time for an
+  installed one, the directory for a linked one and whether it still exists),
+  its connector command and hooks, its config keys, which declared secrets
+  its `.env` is missing (names only), the jobs that use it with their last
+  run and result, and its status, or why it does not load. `connector
+  install` now records its origin in `.<id>.install.json` beside the
+  checkout; a connector installed earlier shows what its checkout still
+  tells, and unknown for the rest. Manifests may carry `authors`,
+  `homepage`, `repository` and `license`; pastor 0.5.0 rejects them, so a
+  connector that adds them should raise its `min_pastor_version`.
+
 - `pastor task done` lets an agent end its own task from its pane (the task
   defaults to `PASTOR_TASK`), the one change the fleet guard allows an agent;
   another task's is refused with `agent_refused`. The task is `done` at once

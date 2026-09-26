@@ -497,11 +497,16 @@ fn install_list_and_uninstall_from_a_git_repo() {
         "shows what it runs: {err}"
     );
     assert!(err.contains("set FIXTURE_TOKEN in"), "{err}");
-    let leftovers: Vec<_> = std::fs::read_dir(cli.dir("d/connectors"))
+    let mut leftovers: Vec<_> = std::fs::read_dir(cli.dir("d/connectors"))
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(leftovers, vec!["echo"], "the scratch clone is gone");
+    leftovers.sort();
+    assert_eq!(
+        leftovers,
+        vec![".echo.install.json", "echo"],
+        "the scratch clone is gone; the install record stays beside the checkout"
+    );
 
     let err = cli.fails(&[
         "connector",
@@ -532,6 +537,10 @@ fn install_list_and_uninstall_from_a_git_repo() {
     );
     cli.ok(&["connector", "uninstall", "echo"]);
     assert!(!cli.dir("d/connectors/echo").exists());
+    assert!(
+        !cli.dir("d/connectors/.echo.install.json").exists(),
+        "the record goes with the checkout"
+    );
     let err = cli.fails(&["connector", "uninstall", "echo"]);
     assert!(err.contains("no connector \"echo\""), "{err}");
 
@@ -741,6 +750,209 @@ fn a_job_on_an_installed_connector_queues_tasks_through_tick() {
     let runs: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(runs[0]["created"], serde_json::json!([]), "{out}");
     assert_eq!(runs[0]["skipped_seen"], 2, "{out}");
+}
+
+impl Cli {
+    fn describe(&self, id: &str) -> (serde_json::Value, String) {
+        let (json, _) = self.ok(&["connector", "describe", id, "--json"]);
+        let (text, _) = self.ok(&["connector", "describe", id]);
+        (serde_json::from_str(&json).unwrap(), text)
+    }
+
+    fn job(&self, name: &str, text: &str) {
+        let jobs = self.dir("c/jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::write(jobs.join(format!("{name}.toml")), text).unwrap();
+    }
+
+    fn git_out(&self, dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+}
+
+/// An installed connector says where it came from (source, ref, commit,
+/// when), what its manifest says, what it runs and needs, and which jobs use
+/// it with their last run.
+#[test]
+fn describe_a_connector_installed_from_github() {
+    let cli = Cli::new();
+    cli.repo("acme", "tools");
+    let v1 = cli.git_out(
+        &cli.dir("repos/acme/tools.git"),
+        &["rev-parse", "v1^{commit}"],
+    );
+    cli.ok(&[
+        "connector",
+        "install",
+        "acme/tools/connectors/echo",
+        "--ref",
+        "v1",
+        "--yes",
+    ]);
+    cli.job(
+        "support",
+        "every = \"5m\"\n[connector]\nuse = \"echo\"\nchannel = \"C9\"\n[dispatch]\nprompt = \"p\"\n",
+    );
+    cli.job(
+        "other",
+        "every = \"5m\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n",
+    );
+
+    let (d, text) = cli.describe("echo");
+    assert_eq!(d["id"], "echo");
+    assert_eq!(d["name"], "Echo");
+    assert_eq!(d["version"], "0.1.0");
+    assert_eq!(d["min_pastor_version"], "0.1.0");
+    assert_eq!(
+        d["authors"],
+        serde_json::json!(["Ana Example <ana@example.org>"])
+    );
+    assert_eq!(d["repository"], "https://example.org/acme/tools");
+    assert_eq!(d["license"], "MIT");
+    assert_eq!(d["homepage"], serde_json::Value::Null);
+    assert_eq!(d["origin"]["kind"], "installed");
+    assert_eq!(d["origin"]["source"], "acme/tools/connectors/echo");
+    assert_eq!(d["origin"]["git_ref"], "v1");
+    assert_eq!(d["origin"]["commit"], v1.as_str());
+    assert!(d["origin"]["installed_at"].is_string(), "{d}");
+    assert_eq!(d["connector"]["mode"], "poll");
+    assert_eq!(
+        d["connector"]["command"],
+        serde_json::json!(["sh", "poll.sh"])
+    );
+    assert_eq!(d["connector"]["timeout_secs"], 5);
+    assert_eq!(d["connector"]["config"][0]["key"], "channel");
+    assert_eq!(d["connector"]["config"][0]["required"], true);
+    assert_eq!(
+        d["hooks"][0]["on"],
+        serde_json::json!(["task.queued", "task.done"])
+    );
+    assert_eq!(d["hooks"][0]["only_own"], true);
+    assert_eq!(d["secrets"][0]["name"], "FIXTURE_TOKEN");
+    assert_eq!(d["secrets"][0]["set"], false);
+    assert_eq!(d["missing_secrets"], serde_json::json!(["FIXTURE_TOKEN"]));
+    assert_eq!(d["status"], "missing_secrets");
+    let jobs: Vec<&str> = d["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(jobs, ["support"], "only the jobs that use it: {d}");
+
+    for want in [
+        "installed from: acme/tools/connectors/echo",
+        "ref:",
+        &v1,
+        "authors:",
+        "Ana Example <ana@example.org>",
+        "license:",
+        "command: sh poll.sh",
+        "channel (required): Echoed back in the first item",
+        "FIXTURE_TOKEN (missing)",
+        "on task.queued, task.done (own jobs only): sh hook.sh",
+        "status:",
+        "missing secrets: FIXTURE_TOKEN",
+        "support",
+    ] {
+        assert!(text.contains(want), "{want}:\n{text}");
+    }
+    assert!(!text.contains("\nother "), "{text}");
+
+    // Once the secret is set, the status is ok; the value never shows.
+    let envf = cli.dir("c/connectors/echo/.env");
+    std::fs::create_dir_all(envf.parent().unwrap()).unwrap();
+    std::fs::write(&envf, "FIXTURE_TOKEN=tok-sekrit-42\n").unwrap();
+    let (d, text) = cli.describe("echo");
+    assert_eq!(d["status"], "ok", "{d}");
+    assert_eq!(d["secrets"][0]["set"], true);
+    assert!(!d.to_string().contains("tok-sekrit-42") && !text.contains("tok-sekrit-42"));
+
+    // Installed before pastor kept a record: what the checkout still says,
+    // and unknown for the rest.
+    std::fs::remove_file(cli.dir("d/connectors/.echo.install.json")).unwrap();
+    let (d, text) = cli.describe("echo");
+    assert_eq!(d["origin"]["kind"], "installed");
+    assert_eq!(d["origin"]["source"], serde_json::Value::Null);
+    assert_eq!(d["origin"]["commit"], serde_json::Value::Null);
+    assert!(text.contains("installed from: unknown"), "{text}");
+}
+
+#[test]
+fn describe_a_linked_connector() {
+    let cli = Cli::new();
+    cli.ok(&["connector", "link", fixture("echo").to_str().unwrap()]);
+    let (d, text) = cli.describe("echo");
+    let target = std::fs::canonicalize(fixture("echo")).unwrap();
+    assert_eq!(d["origin"]["kind"], "linked");
+    assert_eq!(d["origin"]["path"], target.to_str().unwrap());
+    assert_eq!(d["origin"]["exists"], true);
+    assert_eq!(d["jobs"], serde_json::json!([]));
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("linked to:") && l.ends_with(target.to_str().unwrap())),
+        "{text}"
+    );
+    assert!(text.contains("jobs: none"), "{text}");
+}
+
+/// A connector that does not load still says what can be known: why, where
+/// it is, and the jobs that name it (invalid with it).
+#[test]
+fn describe_a_broken_connector() {
+    let cli = Cli::new();
+    let dev = cli.dir("dev/gone");
+    std::fs::create_dir_all(&dev).unwrap();
+    for f in ["pastor-connector.toml", "poll.sh", "hook.sh"] {
+        std::fs::copy(fixture("echo").join(f), dev.join(f)).unwrap();
+    }
+    cli.ok(&["connector", "link", dev.to_str().unwrap()]);
+    std::fs::remove_dir_all(&dev).unwrap();
+    cli.job(
+        "support",
+        "every = \"5m\"\n[connector]\nuse = \"echo\"\nchannel = \"C9\"\n[dispatch]\nprompt = \"p\"\n",
+    );
+    let (d, text) = cli.describe("echo");
+    assert_eq!(d["status"], "invalid");
+    assert!(
+        d["error"].as_str().unwrap().contains("link target is gone"),
+        "{d}"
+    );
+    assert_eq!(d["origin"]["kind"], "linked");
+    assert_eq!(d["origin"]["exists"], false);
+    assert_eq!(d["name"], serde_json::Value::Null);
+    assert_eq!(d["jobs"][0]["name"], "support");
+    assert!(d["jobs"][0]["error"].is_string(), "{d}");
+    assert!(text.contains("invalid: link target is gone"), "{text}");
+    assert!(text.contains("(missing)"), "{text}");
+
+    // A managed checkout whose manifest does not parse.
+    let bad = cli.dir("d/connectors/bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(
+        bad.join("pastor-connector.toml"),
+        "id = \"bad\"\nversion = \"1\"\n",
+    )
+    .unwrap();
+    let (d, text) = cli.describe("bad");
+    assert_eq!(d["status"], "invalid");
+    assert!(
+        d["error"].as_str().unwrap().contains("major.minor.patch"),
+        "{d}"
+    );
+    assert_eq!(d["origin"]["kind"], "installed");
+    assert!(text.contains("installed from: unknown"), "{text}");
+
+    let out = cli.pastor(&["connector", "describe", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).lines().last().unwrap()).unwrap();
+    assert_eq!(err["code"], "connector_not_found", "{err}");
 }
 
 // ---- against a running daemon ----

@@ -41,6 +41,12 @@ pub enum ConnectorCmd {
         #[arg(long)]
         json: bool,
     },
+    /// One connector in full: manifest, origin, commands, config, secrets, jobs
+    Describe {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a connector's command once for a job and print its items; creates
     /// no tasks and saves no cursor
     Run {
@@ -117,6 +123,15 @@ pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result
             }
             Ok(())
         }
+        ConnectorCmd::Describe { id, json } => {
+            let d = describe_connector(paths, &id, head).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&d)?);
+            } else {
+                println!("{}", crate::describe::connector_text(&d));
+            }
+            Ok(())
+        }
         ConnectorCmd::Run { id, job, since } => run_once(paths, &id, &job, since.as_deref()).await,
     }
 }
@@ -127,14 +142,7 @@ pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result
 /// otherwise erase the real command line and draw a harmless one.
 fn describe(m: &Manifest) -> String {
     use crate::cli::one_line;
-    let argv = |cmd: &[String]| {
-        one_line(
-            &cmd.iter()
-                .map(|a| crate::herdr::shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
-    };
+    use crate::describe::argv;
     let mut out = format!("{} {} ({})\n", m.id, m.version, one_line(&m.name));
     if let Some(d) = &m.description {
         out.push_str(&format!("  {}\n", one_line(d)));
@@ -213,6 +221,167 @@ async fn reload_note(socket: &std::path::Path, head: Head) -> Option<String> {
             Err(e) => format!("pastor serve did not reload ({e:#}); run `pastor job reload`"),
         },
     )
+}
+
+/// `connector describe`: what discovery makes of `id`, its origin, and the
+/// jobs that name it, from the head when one runs and else from the files.
+async fn describe_connector(
+    paths: &Paths,
+    id: &str,
+    head: Head,
+) -> anyhow::Result<crate::describe::ConnectorDescription> {
+    use crate::describe::{
+        ConfigKey, ConnectorCommand, ConnectorDescription, ConnectorHook, ConnectorSecret,
+    };
+    let Some(found) = discover(paths)?.into_iter().find(|d| d.id() == id) else {
+        return Err(crate::cli::CliError::err(
+            "connector_not_found",
+            format!(
+                "no connector {id:?} in {}",
+                paths.connectors_dir().display()
+            ),
+        ));
+    };
+    let users = job_users(paths, id);
+    let jobs = job_statuses(paths, head)
+        .await?
+        .into_iter()
+        .filter(|j| users.contains(&j.name))
+        .collect();
+    let env_file = paths.connector_env_file(id).display().to_string();
+    let (p, dir, linked, error) = match found {
+        Discovered::Valid(p) => {
+            let (dir, linked) = (p.dir.clone(), p.linked);
+            (Some(p), dir, linked, None)
+        }
+        Discovered::Invalid {
+            dir, linked, error, ..
+        } => (None, dir, linked, Some(error)),
+    };
+    let origin = install::origin(paths, id, &dir, linked);
+    let mut d = ConnectorDescription {
+        id: id.to_string(),
+        status: "invalid".into(),
+        error,
+        name: None,
+        description: None,
+        version: None,
+        min_pastor_version: None,
+        authors: Vec::new(),
+        homepage: None,
+        repository: None,
+        license: None,
+        dir: dir.display().to_string(),
+        origin,
+        connector: None,
+        hooks: Vec::new(),
+        env_file,
+        secrets: Vec::new(),
+        missing_secrets: Vec::new(),
+        jobs,
+    };
+    let Some(p) = p else { return Ok(d) };
+    let m = &p.manifest;
+    d.name = Some(m.name.clone());
+    d.description = m.description.clone();
+    d.version = Some(m.version.to_string());
+    d.min_pastor_version = m.min_pastor_version.map(|v| v.to_string());
+    d.authors = m.authors.clone();
+    d.homepage = m.homepage.clone();
+    d.repository = m.repository.clone();
+    d.license = m.license.clone();
+    d.connector = m.connector.as_ref().map(|c| ConnectorCommand {
+        mode: c.mode.to_string(),
+        command: c.command.clone(),
+        timeout_secs: c.timeout.as_secs(),
+        config: c
+            .config
+            .iter()
+            .map(|(k, v)| ConfigKey {
+                key: k.clone(),
+                required: v.required,
+                description: v.description.clone(),
+            })
+            .collect(),
+    });
+    d.hooks = m
+        .events
+        .iter()
+        .map(|h| ConnectorHook {
+            on: h.on.clone(),
+            only_own: h.only_own,
+            command: h.command.clone(),
+            timeout_secs: h.timeout.as_secs(),
+        })
+        .collect();
+    let env = match p.env(paths) {
+        Ok(env) => env,
+        Err(e) => {
+            d.error = Some(format!("{e:#}"));
+            Vec::new()
+        }
+    };
+    d.missing_secrets = p.missing_secrets(&env);
+    d.secrets = m
+        .secrets
+        .iter()
+        .map(|(name, s)| ConnectorSecret {
+            name: name.clone(),
+            description: s.description.clone(),
+            set: !d.missing_secrets.contains(name),
+        })
+        .collect();
+    d.status = match (&d.error, d.missing_secrets.is_empty()) {
+        (Some(_), _) => "invalid",
+        (None, true) => "ok",
+        (None, false) => "missing_secrets",
+    }
+    .into();
+    Ok(d)
+}
+
+/// The jobs whose file names connector `id` in `[connector] use`, read as
+/// TOML only, so a job that is invalid (because of the connector, say) is
+/// still found.
+fn job_users(paths: &Paths, id: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(paths.jobs_dir()) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| toml::from_str::<toml::Table>(&t).ok())
+                .and_then(|t| t.get("connector")?.get("use")?.as_str().map(|u| u == id))
+                .unwrap_or(false)
+        })
+        .filter_map(|p| p.file_stem()?.to_str().map(str::to_string))
+        .collect()
+}
+
+/// Every job as `job list` shows it: from the head when one runs, else from
+/// the job files and the store.
+async fn job_statuses(
+    paths: &Paths,
+    head: Head,
+) -> anyhow::Result<Vec<crate::scheduler::JobStatus>> {
+    use crate::ipc::{IpcRequest, IpcResponse};
+    if head.is_live() {
+        return match crate::ipc::request(&paths.socket_file(), &IpcRequest::JobList).await? {
+            IpcResponse::Jobs(jobs) => Ok(jobs),
+            IpcResponse::Error { message, .. } => bail!("{message}"),
+            other => bail!("unexpected reply to a job list: {other:?}"),
+        };
+    }
+    let config = PastorConfig::load(&paths.config_file())?;
+    paths.ensure()?;
+    let store = Arc::new(crate::store::Store::open(&paths.db_file())?);
+    let mut s =
+        crate::scheduler::Scheduler::standalone(paths.clone(), &config, store)?.with_connectors();
+    s.reload();
+    Ok(s.statuses(chrono::Utc::now()))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

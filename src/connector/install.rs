@@ -7,6 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use super::manifest::Manifest;
 use super::{Connector, load_manifest};
@@ -19,6 +21,8 @@ pub const DEFAULT_GIT_BASE: &str = "https://github.com";
 /// `owner/repo[/subdir]`, resolved against a git base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallSource {
+    /// `owner/repo[/subdir]`, as the install records it.
+    pub spec: String,
     pub url: String,
     pub subdir: Option<PathBuf>,
 }
@@ -49,7 +53,12 @@ impl InstallSource {
             }
         };
         let repo = repo.strip_suffix(".git").unwrap_or(repo);
+        let spec = match &subdir {
+            Some(s) => format!("{owner}/{repo}/{}", s.display()),
+            None => format!("{owner}/{repo}"),
+        };
         Ok(InstallSource {
+            spec,
             url: format!("{}/{owner}/{repo}.git", base.trim_end_matches('/')),
             subdir,
         })
@@ -69,7 +78,8 @@ impl Drop for Scratch {
     }
 }
 
-fn git(args: &[&str]) -> anyhow::Result<()> {
+/// Runs git and returns its stdout, trimmed.
+fn git(args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git")
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -82,7 +92,7 @@ fn git(args: &[&str]) -> anyhow::Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Clone, validate, ask, move into place. `confirm` sees the validated
@@ -115,15 +125,17 @@ pub fn install(
             git(&["clone", "--quiet", "--", &source.url, &checkout_s])?;
             git(&["-C", &checkout_s, "checkout", "--quiet", r])?;
         }
-        None => git(&[
-            "clone",
-            "--quiet",
-            "--depth",
-            "1",
-            "--",
-            &source.url,
-            &checkout_s,
-        ])?,
+        None => {
+            git(&[
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                "--",
+                &source.url,
+                &checkout_s,
+            ])?;
+        }
     }
     // Move the real directory, never a link: renaming a symlinked subdir
     // would move the link, and dropping the scratch clone would then delete
@@ -158,8 +170,21 @@ pub fn install(
     if !confirm(&manifest)? {
         bail!("install of {:?} cancelled", manifest.id);
     }
+    let commit = git(&["-C", &checkout_s, "rev-parse", "HEAD"]).ok();
     std::fs::rename(&dir, &target)
         .with_context(|| format!("move {} to {}", dir.display(), target.display()))?;
+    let record = InstallRecord {
+        source: source.spec.clone(),
+        url: source.url.clone(),
+        git_ref: git_ref.map(str::to_string),
+        commit,
+        installed_at: Utc::now(),
+    };
+    // The connector is in place either way; without the record `describe`
+    // says its origin is unknown.
+    if let Err(err) = write_record(paths, &manifest.id, &record) {
+        tracing::warn!(%err, id = manifest.id, "record where the connector came from");
+    }
     Ok(Connector {
         id: manifest.id.clone(),
         dir: target,
@@ -253,7 +278,99 @@ pub fn uninstall(paths: &Paths, id: &str) -> anyhow::Result<()> {
             bail!("connector {id:?} is linked; use `pastor connector unlink {id}`")
         }
         (path, Kind::Managed) => {
-            std::fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))
+            std::fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))?;
+            match std::fs::remove_file(record_path(paths, id)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(e).context("remove the install record")
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+/// Where an installed connector came from, written by `install` beside the
+/// checkout (`.<id>.install.json`, dot-named so discovery skips it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallRecord {
+    /// `owner/repo[/subdir]`.
+    pub source: String,
+    /// What was cloned: the source against the git base.
+    pub url: String,
+    /// The `--ref` asked for; `None` is the default branch.
+    pub git_ref: Option<String>,
+    /// The commit checked out.
+    pub commit: Option<String>,
+    pub installed_at: DateTime<Utc>,
+}
+
+pub fn record_path(paths: &Paths, id: &str) -> PathBuf {
+    paths.connectors_dir().join(format!(".{id}.install.json"))
+}
+
+fn write_record(paths: &Paths, id: &str, record: &InstallRecord) -> anyhow::Result<()> {
+    let path = record_path(paths, id);
+    std::fs::write(&path, serde_json::to_vec_pretty(record)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// How a connector got into the connectors dir, as far as can still be told.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Origin {
+    /// A managed checkout. Every field is `None` when it was installed
+    /// before pastor kept a record and its checkout has no `.git` to ask.
+    Installed {
+        source: Option<String>,
+        url: Option<String>,
+        git_ref: Option<String>,
+        commit: Option<String>,
+        installed_at: Option<DateTime<Utc>>,
+    },
+    /// A symlink to a directory of the user's.
+    Linked { path: PathBuf, exists: bool },
+}
+
+/// The origin of connector `id`, installed or linked (`linked`), whose
+/// checkout is `dir`. Without a record, a checkout that is a whole
+/// repository still has its `.git`: its commit and remote are read from it.
+pub fn origin(paths: &Paths, id: &str, dir: &Path, linked: bool) -> Origin {
+    if linked {
+        let link = paths.connectors_dir().join(id);
+        let path = std::fs::read_link(&link)
+            .map(|t| link.parent().map_or(t.clone(), |p| p.join(&t)))
+            .unwrap_or_else(|_| dir.to_path_buf());
+        let exists = path.is_dir();
+        return Origin::Linked { path, exists };
+    }
+    let record = std::fs::read(record_path(paths, id))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<InstallRecord>(&b).ok());
+    match record {
+        Some(r) => Origin::Installed {
+            source: Some(r.source),
+            url: Some(r.url),
+            git_ref: r.git_ref,
+            commit: r.commit,
+            installed_at: Some(r.installed_at),
+        },
+        None => {
+            let (commit, url) = if dir.join(".git").exists() {
+                let d = dir.to_string_lossy();
+                (
+                    git(&["-C", &d, "rev-parse", "HEAD"]).ok(),
+                    git(&["-C", &d, "remote", "get-url", "origin"]).ok(),
+                )
+            } else {
+                (None, None)
+            };
+            Origin::Installed {
+                source: None,
+                url,
+                git_ref: None,
+                commit,
+                installed_at: None,
+            }
         }
     }
 }
@@ -323,7 +440,9 @@ mod tests {
         let s = InstallSource::parse("cacarico/pastor/connectors/slack", DEFAULT_GIT_BASE).unwrap();
         assert_eq!(s.url, "https://github.com/cacarico/pastor.git");
         assert_eq!(s.subdir, Some(PathBuf::from("connectors/slack")));
+        assert_eq!(s.spec, "cacarico/pastor/connectors/slack");
         let s = InstallSource::parse("o/r.git", "file:///tmp/repos/").unwrap();
+        assert_eq!(s.spec, "o/r");
         assert_eq!(s.url, "file:///tmp/repos/o/r.git");
         assert_eq!(s.subdir, None);
         for bad in [

@@ -24,6 +24,11 @@ struct ManifestFile {
     version: String,
     min_pastor_version: Option<String>,
     description: Option<String>,
+    #[serde(default)]
+    authors: Vec<String>,
+    homepage: Option<String>,
+    repository: Option<String>,
+    license: Option<String>,
     connector: Option<ConnectorFile>,
     #[serde(default)]
     secrets: BTreeMap<String, SecretDecl>,
@@ -92,6 +97,12 @@ pub struct Manifest {
     pub version: Version,
     pub min_pastor_version: Option<Version>,
     pub description: Option<String>,
+    /// Who wrote it, as the author puts it (`Name <email>`).
+    pub authors: Vec<String>,
+    pub homepage: Option<String>,
+    pub repository: Option<String>,
+    /// An SPDX expression, by convention; not checked.
+    pub license: Option<String>,
     pub connector: Option<ConnectorSpec>,
     pub secrets: BTreeMap<String, SecretDecl>,
     pub events: Vec<Hook>,
@@ -183,6 +194,10 @@ impl Manifest {
             version,
             min_pastor_version,
             description: file.description,
+            authors: file.authors,
+            homepage: file.homepage,
+            repository: file.repository,
+            license: file.license,
             connector,
             secrets: file.secrets,
             events,
@@ -379,6 +394,24 @@ command = ["bash", "dm-me.sh"]
         assert!(!m.events[1].only_own);
         assert_eq!(m.events[1].on, vec!["task.blocked", "machine.lost"]);
         assert_eq!(m.events[1].timeout, DEFAULT_TIMEOUT);
+    }
+
+    /// Who wrote a connector and where it lives are optional; a manifest
+    /// without them loads as before.
+    #[test]
+    fn authors_homepage_repository_and_license_are_optional() {
+        let head = "id = \"a\"\nversion = \"0.1.0\"\n";
+        let conn = "[connector]\ncommand = [\"x\"]\n";
+        let m = Manifest::parse(&format!(
+            "{head}authors = [\"Ana <ana@example.org>\", \"Bo\"]\nhomepage = \"https://example.org\"\nrepository = \"https://example.org/r\"\nlicense = \"MIT\"\n{conn}"
+        ))
+        .unwrap();
+        assert_eq!(m.authors, ["Ana <ana@example.org>", "Bo"]);
+        assert_eq!(m.homepage.as_deref(), Some("https://example.org"));
+        assert_eq!(m.repository.as_deref(), Some("https://example.org/r"));
+        assert_eq!(m.license.as_deref(), Some("MIT"));
+        let m = Manifest::parse(&format!("{head}{conn}")).unwrap();
+        assert!(m.authors.is_empty() && m.homepage.is_none() && m.license.is_none());
     }
 
     #[test]

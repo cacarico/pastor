@@ -577,9 +577,10 @@ fn changes_fleet(command: &Command) -> bool {
         Command::Config { .. } => true,
         // Install, link, uninstall and unlink edit the catalog and reload the
         // head's jobs, restarting its stream connectors.
-        Command::Connector { cmd } => {
-            !matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Run { .. })
-        }
+        Command::Connector { cmd } => !matches!(
+            cmd,
+            ConnectorCmd::List { .. } | ConnectorCmd::Describe { .. } | ConnectorCmd::Run { .. }
+        ),
         // A head started from an agent's pane schedules and dispatches with
         // no request to refuse; setup installs one that starts on login.
         Command::Serve | Command::Setup { .. } => true,

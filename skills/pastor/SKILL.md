@@ -130,6 +130,7 @@ prompt = "It is {{ item.key }}. Run the suite and fix what broke. Task {{ task.i
 ```bash
 pastor job list            # schedule, enabled, last and next run, errors
 pastor job describe hourly --json   # one job: connector, dispatch, last runs and errors, recent tasks
+pastor connector describe github-issues --json   # one connector: origin, commands, config, missing secrets, jobs using it
 pastor job run hourly      # fire now, ignoring the schedule
 pastor job enable hourly
 pastor job disable hourly
@@ -185,7 +186,7 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - Do not ask questions. Nobody is watching; a permission prompt or a question leaves the task `blocked` until a human happens to attach. If something is missing, say so in your report and stop.
 - When finished, run `pastor task done` (it ends your own task, from `PASTOR_TASK`), print `DONE` as your last line, then go idle. pastor marks the task `done` at once and closes your pane after `close_done_after`, freeing the machine's slot.
 - Do not close your pane or exit to clean up; `pastor task done` is how you say you are finished.
-- Do not run, send to, attach to, retry, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `show`, `read`, and `describe` for jobs, machines and flocks) is fine.
+- Do not run, send to, attach to, retry, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `show`, `read`, and `describe` for jobs, machines, flocks and connectors) is fine.
 
 ## When something goes wrong
 
