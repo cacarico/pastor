@@ -119,7 +119,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Linux: `~/.config/pastor`, `~/.local/state/pastor`, `~/.local/share/pastor`
   instead of `~/Library/Application Support/pastor`. A config left in the old
   place is moved once, with a note; its `plugins/` goes to the new
-  `connectors/` dirs.
+  `connectors/` dirs, and a move that fails part way is finished by the next
+  run.
 - Agent args follow the agent they were written for: `[defaults] agent_args`
   no longer reach a task that runs another agent than `[defaults] agent`
   (`pastor task run --agent codex` used to get Claude's `--model`).

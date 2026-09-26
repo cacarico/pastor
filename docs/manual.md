@@ -708,6 +708,8 @@ pastor still said plugins: the checkouts it kept in `plugins/` go to
 `~/.local/share/pastor/connectors` and their `.env` files to
 `~/.config/pastor/connectors`. Rename each `pastor-plugin.toml` to
 `pastor-connector.toml` by hand, as for any upgrade from plugins.
+A move that fails part way leaves `~/.config/pastor/.pastor-migrating`
+behind, and the next run finishes it.
 
 ## Connectors
 

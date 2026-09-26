@@ -193,45 +193,80 @@ pub fn legacy_macos_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join("Library/Application Support/pastor"))
 }
 
+/// Marks a legacy move that has not finished: written into the legacy dir
+/// before it becomes the config dir, removed after the last step. It holds
+/// `connectors` when the old `plugins/` checkouts are to move to the data
+/// dir.
+const MIGRATING: &str = ".pastor-migrating";
+
 /// Move a config left at `legacy` into `paths`, once. The old macOS layout had
 /// config and data in one directory, and still used the old name for
 /// connectors, so `plugins/` held both the checkouts and each connector's
 /// `.env`: the checkouts go to `connectors/` in the data dir and the `.env`
 /// files to `<config>/connectors/<id>/`. Nothing happens when there is no
 /// legacy directory or the new config dir already exists (never merge two
-/// configs). Returns the note to show the user when something moved.
+/// configs), unless that config dir is a move a failed run left unfinished:
+/// then this run finishes it. Returns the note to show the user when
+/// something moved.
 pub fn migrate_legacy_dir(legacy: &Path, paths: &Paths) -> anyhow::Result<Option<String>> {
-    let is_dir = std::fs::symlink_metadata(legacy).is_ok_and(|m| m.is_dir());
-    if !is_dir || std::fs::symlink_metadata(&paths.config_dir).is_ok() {
-        return Ok(None);
-    }
-    if let Some(parent) = paths.config_dir.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::rename(legacy, &paths.config_dir).with_context(|| {
-        format!(
-            "move {} to {}",
-            legacy.display(),
-            paths.config_dir.display()
+    let is_real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    let marker = paths.config_dir.join(MIGRATING);
+    let move_connectors = if std::fs::symlink_metadata(&paths.config_dir).is_ok() {
+        match std::fs::read_to_string(&marker) {
+            Ok(text) => text.trim() == "connectors",
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| format!("read {}", marker.display()));
+            }
+        }
+    } else {
+        if !is_real_dir(legacy) {
+            return Ok(None);
+        }
+        // Decided once, before anything moves: a data dir that already has
+        // connectors holds someone else's checkouts, never merged with these.
+        let move_connectors = is_real_dir(&legacy.join("plugins"))
+            && std::fs::symlink_metadata(paths.connectors_dir()).is_err();
+        let legacy_marker = legacy.join(MIGRATING);
+        std::fs::write(
+            &legacy_marker,
+            if move_connectors {
+                "connectors\n"
+            } else {
+                "\n"
+            },
         )
-    })?;
+        .with_context(|| format!("write {}", legacy_marker.display()))?;
+        if let Some(parent) = paths.config_dir.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::rename(legacy, &paths.config_dir).with_context(|| {
+            format!(
+                "move {} to {}",
+                legacy.display(),
+                paths.config_dir.display()
+            )
+        })?;
+        move_connectors
+    };
     let mut note = format!(
         "note: moved the pastor config from {} to {}",
         legacy.display(),
         paths.config_dir.display()
     );
+    // Every step from here is safe to repeat, so a run that fails part way
+    // leaves the marker behind and the next run picks up where it stopped.
     let old_plugins = paths.config_dir.join("plugins");
     let connectors = paths.connectors_dir();
-    let is_real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
-    if is_real_dir(&old_plugins) && std::fs::symlink_metadata(&connectors).is_err() {
-        create_private_dir(&paths.data_dir)?;
-        std::fs::rename(&old_plugins, &connectors).with_context(|| {
-            format!(
-                "move {} to {}",
-                old_plugins.display(),
-                connectors.display()
-            )
-        })?;
+    let connectors_moved = std::fs::symlink_metadata(&connectors).is_ok();
+    if move_connectors && (connectors_moved || is_real_dir(&old_plugins)) {
+        if !connectors_moved {
+            create_private_dir(&paths.data_dir)?;
+            std::fs::rename(&old_plugins, &connectors).with_context(|| {
+                format!("move {} to {}", old_plugins.display(), connectors.display())
+            })?;
+        }
         let mut ids: Vec<_> = std::fs::read_dir(&connectors)
             .with_context(|| format!("read {}", connectors.display()))?
             .filter_map(Result::ok)
@@ -255,6 +290,7 @@ pub fn migrate_legacy_dir(legacy: &Path, paths: &Paths) -> anyhow::Result<Option
         }
         note.push_str(&format!(", and its connectors to {}", connectors.display()));
     }
+    std::fs::remove_file(&marker).with_context(|| format!("remove {}", marker.display()))?;
     Ok(Some(note))
 }
 
@@ -1432,6 +1468,71 @@ mod tests {
 
         // A second run has nothing to move.
         assert_eq!(migrate_legacy_dir(&legacy, &paths).unwrap(), None);
+    }
+
+    /// A step that fails after the config has moved leaves the migration
+    /// marked unfinished, and the next run completes it instead of taking the
+    /// moved config as a finished one.
+    #[test]
+    fn a_failed_legacy_move_finishes_on_the_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (legacy, paths) = legacy_layout(tmp.path());
+        // The data dir cannot be created while a file sits where its parent
+        // should be, so moving the checkouts fails after the config moved.
+        let blocker = tmp.path().join(".local/share");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, "").unwrap();
+
+        let err = migrate_legacy_dir(&legacy, &paths).unwrap_err();
+        assert!(format!("{err:#}").contains("create"), "{err:#}");
+        assert!(!legacy.exists());
+        assert!(paths.flock_file().is_file());
+        assert!(!paths.connectors_dir().exists());
+
+        std::fs::remove_file(&blocker).unwrap();
+        let note = migrate_legacy_dir(&legacy, &paths).unwrap().unwrap();
+        assert!(note.contains("connectors"), "{note}");
+        assert!(
+            paths
+                .connectors_dir()
+                .join("github/pastor-connector.toml")
+                .is_file()
+        );
+        assert!(!paths.connectors_dir().join("github/.env").exists());
+        assert_eq!(
+            std::fs::read_to_string(paths.connector_env_file("github")).unwrap(),
+            "TOKEN=x\n"
+        );
+        assert!(
+            !paths
+                .config_dir
+                .join("plugins/github/pastor-connector.toml")
+                .exists()
+        );
+        assert!(!paths.config_dir.join(MIGRATING).exists());
+
+        // Finished now: a third run has nothing to do.
+        assert_eq!(migrate_legacy_dir(&legacy, &paths).unwrap(), None);
+    }
+
+    /// Checkouts already in the data dir are not the legacy ones, so the move
+    /// leaves them, and the legacy `plugins/` stays with the config.
+    #[test]
+    fn existing_data_connectors_are_not_touched_by_the_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (legacy, paths) = legacy_layout(tmp.path());
+        std::fs::create_dir_all(paths.connectors_dir().join("other")).unwrap();
+        std::fs::write(paths.connectors_dir().join("other/.env"), "K=v\n").unwrap();
+
+        migrate_legacy_dir(&legacy, &paths).unwrap().unwrap();
+        assert!(paths.connectors_dir().join("other/.env").is_file());
+        assert!(
+            paths
+                .config_dir
+                .join("plugins/github/pastor-connector.toml")
+                .is_file()
+        );
+        assert!(!paths.config_dir.join(MIGRATING).exists());
     }
 
     #[test]
