@@ -140,8 +140,9 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The binary a unit runs and the environment it gets: the PATH of this shell,
-/// plus, for pastor, the dirs this shell resolves.
+/// The binary a unit runs and the environment it gets: the PATH of this shell
+/// (less what `unit_path` drops, which is named on stderr), plus, for pastor,
+/// the dirs this shell resolves.
 fn exec_and_env(unit: Unit, paths: &Paths) -> anyhow::Result<(PathBuf, Vec<(String, String)>)> {
     let path_var = std::env::var("PATH").unwrap_or_default();
     let exec = match unit {
@@ -149,11 +150,40 @@ fn exec_and_env(unit: Unit, paths: &Paths) -> anyhow::Result<(PathBuf, Vec<(Stri
         Unit::Herdr => which("herdr", &path_var)
             .context("herdr is not on PATH; install it or add its directory to PATH")?,
     };
+    let (path_var, dropped) = unit_path(&path_var);
+    if !dropped.is_empty() {
+        eprintln!(
+            "left out of the service's PATH (empty, relative or world-writable): {}",
+            dropped.join(", ")
+        );
+    }
     let mut env = vec![("PATH".to_string(), path_var)];
     if unit == Unit::Pastor {
         env.extend(dir_env(paths));
     }
     Ok((exec, env))
+}
+
+/// `path_var` as a service's PATH, and the entries left out of it. The unit
+/// keeps it for good, for ssh, herdr and every agent, so an entry where
+/// someone else could plant a binary is dropped: an empty or relative one
+/// (it resolves against whatever the working dir is) and a world-writable
+/// directory (`/tmp/bin`, say). A missing directory is kept; it may appear.
+fn unit_path(path_var: &str) -> (String, Vec<String>) {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+    for entry in path_var.split(':') {
+        let world_writable =
+            std::fs::metadata(entry).is_ok_and(|m| m.permissions().mode() & 0o002 != 0);
+        if entry.is_empty() {
+            dropped.push("(empty)".to_string());
+        } else if !entry.starts_with('/') || world_writable {
+            dropped.push(entry.to_string());
+        } else {
+            kept.push(entry);
+        }
+    }
+    (kept.join(":"), dropped)
 }
 
 /// The config, state and data dirs as absolute `PASTOR_*_DIR` values. A
@@ -444,7 +474,7 @@ impl Install {
     }
 
     fn write(&self, unit_path: &Path) -> anyhow::Result<Written> {
-        let text = render(self.unit.template(), &self.exec, &self.env);
+        let text = render(self.unit.template(), &self.exec, &self.env)?;
         write_file(&self.unit_dir, unit_path, &text)
     }
 
@@ -493,14 +523,25 @@ fn write_file(dir: &Path, path: &Path, text: &str) -> anyhow::Result<Written> {
 }
 
 /// The shipped unit with ExecStart's program replaced by `exec` and one
-/// `Environment=` line per assignment right after it.
-pub fn render(template: &str, exec: &Path, env: &[(String, String)]) -> String {
+/// `Environment=` line per assignment right after it. A line break in any of
+/// them would start a new directive, so it is refused; `$`, which systemd
+/// expands in ExecStart, is written `$$` there.
+pub fn render(template: &str, exec: &Path, env: &[(String, String)]) -> anyhow::Result<String> {
+    let exec = exec.to_string_lossy();
+    for (what, value) in std::iter::once(("ExecStart", exec.as_ref()))
+        .chain(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .chain(env.iter().map(|(k, _)| ("an Environment name", k.as_str())))
+    {
+        if value.contains(['\n', '\r']) {
+            anyhow::bail!("{what} {value:?} contains a line break; a unit file cannot hold it");
+        }
+    }
     let mut out = String::with_capacity(template.len() + 256);
     for line in template.lines() {
         if let Some(rest) = line.strip_prefix("ExecStart=") {
             let args = rest.split_once(' ').map(|(_, a)| a);
             out.push_str("ExecStart=");
-            out.push_str(&quote(&exec.to_string_lossy()));
+            out.push_str(&quote(&exec).replace('$', "$$"));
             if let Some(args) = args {
                 out.push(' ');
                 out.push_str(args);
@@ -516,7 +557,7 @@ pub fn render(template: &str, exec: &Path, env: &[(String, String)]) -> String {
             out.push('\n');
         }
     }
-    out
+    Ok(out)
 }
 
 /// A unit-file word: `%` doubled so systemd does not expand it as a
@@ -840,6 +881,21 @@ mod tests {
             assert_eq!(t.lines().filter(|l| l.starts_with("ExecStart=")).count(), 1);
         }
         assert!(PASTOR_UNIT.contains("ExecStart=%h/.cargo/bin/pastor serve"));
+        // pastor's own service is hardened where that costs nothing in a
+        // user unit; herdr's is left open, since its agents need the user's
+        // whole session (sudo included).
+        for line in [
+            "NoNewPrivileges=yes",
+            "UMask=0077",
+            "LockPersonality=yes",
+            "RestrictRealtime=yes",
+        ] {
+            assert!(
+                PASTOR_UNIT.lines().any(|l| l == line),
+                "pastor lacks {line}"
+            );
+            assert!(!HERDR_UNIT.contains(line), "herdr has {line}");
+        }
         assert!(HERDR_UNIT.contains("ExecStart=%h/.local/bin/herdr server"));
     }
 
@@ -849,7 +905,7 @@ mod tests {
             ("PATH".to_string(), "/usr/bin:/home/u/my bin".to_string()),
             ("PASTOR_STATE_DIR".to_string(), "/s/100%".to_string()),
         ];
-        let text = render(PASTOR_UNIT, Path::new("/home/u/.cargo/bin/pastor"), &env);
+        let text = render(PASTOR_UNIT, Path::new("/home/u/.cargo/bin/pastor"), &env).unwrap();
         let service: Vec<&str> = text
             .lines()
             .skip_while(|l| !l.starts_with("ExecStart="))
@@ -887,9 +943,54 @@ mod tests {
         );
     }
 
+    /// A line break in a value would start a new directive, and systemd
+    /// expands `$` in ExecStart: neither may come through as written.
+    #[test]
+    fn render_refuses_line_breaks_and_escapes_dollars() {
+        let env = vec![("PATH".to_string(), "/bin\nExecStartPre=/tmp/x".to_string())];
+        let err = render(PASTOR_UNIT, Path::new("/bin/pastor"), &env).unwrap_err();
+        assert!(format!("{err:#}").contains("line break"), "{err:#}");
+        assert!(render(PASTOR_UNIT, Path::new("/bin/pa\rstor"), &[]).is_err());
+        let text = render(PASTOR_UNIT, Path::new("/opt/$HOME/pastor"), &[]).unwrap();
+        assert!(
+            text.contains("ExecStart=/opt/$$HOME/pastor serve\n"),
+            "{text}"
+        );
+    }
+
+    /// PATH is copied from the shell that ran setup into a unit that runs
+    /// for good. Entries anyone could plant a binary in (empty or relative
+    /// ones, which resolve against the working dir, and world-writable
+    /// dirs) are left out.
+    #[test]
+    fn unit_path_drops_relative_empty_and_world_writable_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (good, open) = (tmp.path().join("good"), tmp.path().join("open"));
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        chmod(&good, 0o755);
+        chmod(&open, 0o777);
+        let var = format!(
+            "{}::.:node_modules/.bin:{}:/nonexistent/bin",
+            good.display(),
+            open.display()
+        );
+        let (kept, dropped) = unit_path(&var);
+        assert_eq!(kept, format!("{}:/nonexistent/bin", good.display()));
+        assert_eq!(
+            dropped,
+            vec![
+                "(empty)".to_string(),
+                ".".into(),
+                "node_modules/.bin".into(),
+                open.display().to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn render_quotes_an_awkward_binary_path() {
-        let text = render(HERDR_UNIT, Path::new("/opt/my \"tools\"/herdr"), &[]);
+        let text = render(HERDR_UNIT, Path::new("/opt/my \"tools\"/herdr"), &[]).unwrap();
         assert!(
             text.contains("ExecStart=\"/opt/my \\\"tools\\\"/herdr\" server\n"),
             "{text}"

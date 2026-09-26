@@ -7,6 +7,16 @@
 # ExecStart path, then `systemctl --user enable --now pastor.service`.
 #
 # A user unit stops at logout unless lingering is on: `loginctl enable-linger`.
+#
+# ssh runs with BatchMode=yes, so it cannot ask for a passphrase: give the
+# unit an agent (Environment=SSH_AUTH_SOCK=...) or use a key without one.
+#
+# Hardening: only what works in a user unit without user namespaces and
+# leaves pastor's writes alone. ProtectSystem=strict would stop ssh updating
+# ~/.ssh/known_hosts and connectors writing their caches, PrivateTmp would
+# hide a state dir kept under /tmp from the CLI, and ProtectHome would hide
+# ~/.ssh; all three also need unprivileged user namespaces, which some hosts
+# turn off, and the unit would then not start at all.
 
 [Unit]
 Description=pastor: run coding agents on machines you own
@@ -20,6 +30,10 @@ Restart=always
 RestartSec=5s
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=yes
+UMask=0077
+LockPersonality=yes
+RestrictRealtime=yes
 
 [Install]
 WantedBy=default.target

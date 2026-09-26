@@ -9,6 +9,10 @@
 #
 # Stopping this unit stops every agent it runs. A user unit stops at logout
 # unless lingering is on: `loginctl enable-linger`.
+#
+# No hardening on purpose: the agents herdr runs work in the user's whole
+# home, and may need sudo, new privileges or anything else the user's own
+# terminal allows. pastor.service is the one hardened.
 
 [Unit]
 Description=herdr server: terminals and agents for pastor

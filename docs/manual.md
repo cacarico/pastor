@@ -764,6 +764,11 @@ Setup points `ExecStart`
 at the binary it finds (the running pastor, or `herdr` on PATH) and copies your
 shell's `PATH` into the unit, so `ssh`, `herdr` and the agents resolve under
 systemd the way they do in a terminal; re-run it after moving a binary.
+Entries anyone could plant a binary in are left out and named on stderr: an
+empty or relative entry (`.`, `node_modules/.bin`) and a world-writable
+directory. A value with a line break is refused, since it would start a new
+directive, and a `$` in the binary's path is written `$$`, since systemd
+expands it in `ExecStart`.
 `pastor.service` also gets the config, state and data dirs this run resolved,
 as absolute `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR`, so
 the head uses the same dirs as the shell that set it up, whether they came from
@@ -771,6 +776,17 @@ an override, an XDG variable or the default. A unit
 that differs from what setup would write is kept as `<unit>.service.bak`, and a
 running service is not restarted, since restarting herdr stops its agents: run
 `systemctl --user restart pastor` (or `herdr`) yourself.
+
+`pastor.service` runs with `NoNewPrivileges=yes`, `UMask=0077`,
+`LockPersonality=yes` and `RestrictRealtime=yes`: what works in a user unit
+without user namespaces and leaves pastor's own writes alone.
+`ProtectSystem=strict`, `PrivateTmp` and `ProtectHome` are left off: they would
+stop ssh updating `known_hosts` and connectors writing their caches, hide a
+state dir under `/tmp` or `~/.ssh`, and on a host without unprivileged user
+namespaces keep the unit from starting. `herdr.service` has no hardening,
+since the agents it runs need what the user's own terminal allows. ssh runs
+with `BatchMode=yes`, so it cannot ask for a passphrase under systemd: add
+`Environment=SSH_AUTH_SOCK=...` for an agent, or use a key without one.
 
 A user service stops at logout unless lingering is on. Setup checks
 `loginctl show-user` and prints `loginctl enable-linger` when it is off.
