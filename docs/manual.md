@@ -1088,7 +1088,7 @@ job as failed, saying it needs `pastor serve`, and leaves it alone. Item fields 
 `repo` or `branch` may not be empty or `.`, or contain `/`, `\`, `..`, a
 leading `-` or control characters; such an item is skipped and reported.
 
-### What a plugin inherits
+### What a connector inherits
 
 A plugin is code you run as the head's user, not a sandboxed extension. Each
 command inherits:

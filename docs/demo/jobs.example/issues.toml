@@ -1,0 +1,18 @@
+# One task per open issue labelled "pastor", each on its own branch.
+every = "10m"
+enabled = false
+
+[connector]
+use = "github-issues"
+repo = "cacarico/pastor"
+label = "pastor"
+
+[dispatch]
+repo = "~/ghq/github.com/cacarico/pastor"
+worktree = true
+branch = "issue-{{ item.key }}"
+prompt = """
+Fix issue #{{ item.key }}: {{ item.title }}
+
+{{ item.body }}
+"""
