@@ -3742,6 +3742,51 @@ mod tests {
         assert_ne!(two.workspace_id, one.workspace_id);
     }
 
+    /// A retry reopens its checkout through `worktree.open`, which answers a
+    /// workspace already showing it with `already_open`: the failed task's
+    /// own (its pane stays after the agent exits) or one someone opened
+    /// since. That workspace is not the retry's, and its root pane is not
+    /// pastor's to close; only the root of a workspace herdr just made goes.
+    #[tokio::test]
+    async fn a_retry_never_closes_a_pane_of_a_workspace_already_open() {
+        for place in [Place::Own, Place::Pastor] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let first = h
+                .dispatch(placed_task(&store, place.clone(), true).id)
+                .await
+                .unwrap();
+            fake.exit_pane(first.pane_id.as_deref().unwrap());
+            wait_for("failed", || state_of(&store, first.id) == TaskState::Failed).await;
+            let first = store.get_task(first.id).unwrap().unwrap();
+            let checkout = first.spec.checkout.clone().unwrap();
+            // Someone's workspace on the checkout, with nobody at work in it.
+            let ws = match place {
+                Place::Own => first.workspace_id.clone().unwrap(),
+                _ => {
+                    fake.worktree_open("/r", &checkout.branch, "mine")
+                        .await
+                        .unwrap()
+                        .workspace
+                        .workspace_id
+                }
+            };
+            let before = fake.panes(&ws);
+
+            let opened = calls(&fake, "worktree.open").len();
+
+            let retry = store.insert_retry(first.id).unwrap();
+            let t = h.dispatch(retry.id).await.unwrap();
+            assert_eq!(t.state, TaskState::Running, "{place:?}: {:?}", t.error);
+            assert_eq!(calls(&fake, "worktree.open").len(), opened + 1, "{place:?}");
+            let panes = fake.panes(&ws);
+            for pane in &before {
+                assert!(panes.contains(pane), "{place:?}: {pane} closed: {panes:?}");
+            }
+        }
+    }
+
     /// A retry whose old checkout was removed meanwhile gets a new one.
     #[tokio::test]
     async fn a_retry_creates_the_worktree_when_the_old_one_is_gone() {

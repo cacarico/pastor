@@ -180,24 +180,26 @@ async fn dispatch_steps(
         // that pane is recorded, so closing the task closes only it.
         (Some(host), _) => {
             // A worktree is still made on disk, and the agent works in it;
-            // only the workspace herdr opens on it goes, with its one pane.
-            let mut worktree_pane = None;
+            // only a workspace herdr just opened on it goes, with its one
+            // pane. One that was already showing the checkout
+            // (`already_open`) is someone else's and stays as it was.
+            let mut worktree = None;
             if spec.worktree
                 && let Some(repo) = repo.as_deref()
             {
                 let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
                 task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
-                worktree_pane = Some(created.root_pane.pane_id);
+                worktree = Some(created);
             }
-            let cwd = match worktree_pane {
+            let cwd = match worktree {
                 Some(_) => task.spec.checkout.as_ref().map(|c| c.path.clone()),
                 None => repo.clone(),
             };
             let pane = conn.pane_split(&host.pane_id, cwd.as_deref(), &env).await?;
             task.workspace_id = Some(host.workspace_id);
             task.pane_id = Some(pane.pane_id.clone());
-            if let Some(root) = worktree_pane {
-                conn.pane_close(&root).await?;
+            if let Some(created) = worktree.filter(|c| !c.already_open) {
+                conn.pane_close(&created.root_pane.pane_id).await?;
             }
             pane.pane_id
         }
@@ -209,12 +211,16 @@ async fn dispatch_steps(
             // `worktree.create` and `worktree.open` take no env, and every
             // agent has one (`TASK_ENV`), so the agent gets a pane split off
             // the worktree's with it, and the pane without it goes: a task
-            // keeps one pane, whose close ends the workspace.
+            // keeps one pane, whose close ends the workspace. Unless
+            // `worktree.open` answered a workspace already showing the
+            // checkout: its root pane is someone else's, and stays.
             let root = created.root_pane.pane_id;
             let cwd = task.spec.checkout.as_ref().map(|c| c.path.clone());
             let pane = conn.pane_split(&root, cwd.as_deref(), &env).await?;
             task.pane_id = Some(pane.pane_id.clone());
-            conn.pane_close(&root).await?;
+            if !created.already_open {
+                conn.pane_close(&root).await?;
+            }
             pane.pane_id
         }
         (None, repo) => {

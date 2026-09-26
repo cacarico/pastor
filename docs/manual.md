@@ -278,7 +278,10 @@ close only the pane, never the workspace or its other panes (herdr still
 closes a workspace whose last pane closes, so one left with only the task's
 pane goes with it). A worktree task placed in `pastor` or `pane:<workspace>`
 still gets its worktree on disk and works in it; the workspace herdr opened on
-the checkout is closed once the agent's pane is split off the shared one.
+the checkout is closed once the agent's pane is split off the shared one. A
+retry whose `worktree.open` finds a workspace already showing the checkout
+(the failed task's own, or one someone opened) never closes anything in it:
+the retry's pane is split off it and the workspace keeps every pane it had.
 Removing that worktree (`--remove-worktree`, or auto-close of a clean one)
 closes the task's pane, has herdr open a workspace on the checkout
 (`worktree.open`) and removes that; when herdr refuses (uncommitted changes),
