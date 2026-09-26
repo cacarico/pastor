@@ -16,8 +16,13 @@ const CONTROL_PERSIST_SECS: u32 = 600;
 /// into place, so the staged name is 17 bytes longer than the ControlPath.
 const CONTROL_PATH_STAGING: usize = 17;
 
-/// `sun_path` is 108 bytes on Linux, including the terminating NUL.
-const UNIX_PATH_MAX: usize = 108;
+/// `sun_path` is 108 bytes on Linux and 104 on macOS and the BSDs, including
+/// the terminating NUL.
+const UNIX_PATH_MAX: usize = unix_path_max(cfg!(target_os = "linux"));
+
+const fn unix_path_max(linux: bool) -> usize {
+    if linux { 108 } else { 104 }
+}
 
 /// `%C` expands to a hex SHA-1 of the connection parameters.
 const EXPANDED_C: usize = 40;
@@ -103,7 +108,9 @@ pub struct ConnectError {
 }
 
 pub fn local_socket_path(session: &str) -> anyhow::Result<PathBuf> {
-    let base = dirs::config_dir()
+    // herdr keeps its socket under `~/.config/herdr` on macOS as on Linux,
+    // not in `~/Library/Application Support`, which `dirs` would pick there.
+    let base = crate::config::config_home()
         .ok_or_else(|| anyhow::anyhow!("no config dir"))?
         .join("herdr");
     Ok(if session == "default" {
@@ -739,6 +746,7 @@ mod tests {
     fn socket_paths_and_bridge_command() {
         let p = local_socket_path("default").unwrap();
         assert!(p.ends_with("herdr/herdr.sock"), "{}", p.display());
+        assert!(!p.to_string_lossy().contains("Library"), "{}", p.display());
         let p = local_socket_path("agents").unwrap();
         assert!(p.ends_with("herdr/sessions/agents/herdr.sock"));
         assert_eq!(
@@ -1146,6 +1154,10 @@ mod tests {
         assert_eq!(expanded_len(Path::new("/a/b")), 4);
         assert_eq!(expanded_len(Path::new("%%")), 1);
         assert_eq!(expanded_len(Path::new("/a-%C")), 3 + EXPANDED_C);
+        assert_eq!(unix_path_max(true), 108);
+        assert_eq!(unix_path_max(false), 104);
+        let expected = if cfg!(target_os = "linux") { 108 } else { 104 };
+        assert_eq!(UNIX_PATH_MAX, expected);
         // The guard's boundary: exactly `UNIX_PATH_MAX` staged bytes is fine.
         let fits = "x".repeat(UNIX_PATH_MAX - CONTROL_PATH_STAGING - 1);
         assert!(control_path_fits(Path::new(&fits)));

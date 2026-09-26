@@ -328,6 +328,13 @@ fn main() {
         Ok(p) => p,
         Err(err) => fail("config_error", &err.to_string()),
     };
+    if let Some(legacy) = pastor::config::legacy_macos_dir() {
+        match pastor::config::migrate_legacy_dir(&legacy, &paths) {
+            Ok(Some(note)) => eprintln!("{note}"),
+            Ok(None) => {}
+            Err(err) => fail("config_error", &format!("{err:#}")),
+        }
+    }
     pastor::ipc::set_caller_task(pastor::ipc::task_from_env());
     if let Some(task) = pastor::ipc::caller_task()
         && changes_fleet(&command)

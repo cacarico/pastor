@@ -20,19 +20,17 @@ impl Paths {
     pub fn from_env() -> anyhow::Result<Paths> {
         let config_dir = match std::env::var_os("PASTOR_CONFIG_DIR") {
             Some(v) => PathBuf::from(v),
-            None => dirs::config_dir().context("no config dir")?.join("pastor"),
+            None => config_home().context("no config dir")?.join("pastor"),
         };
         let state_dir = match std::env::var_os("PASTOR_STATE_DIR") {
             Some(v) => PathBuf::from(v),
-            None => dirs::state_dir()
-                .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
+            None => xdg_home("XDG_STATE_HOME", ".local/state")
                 .context("no state dir")?
                 .join("pastor"),
         };
         let data_dir = match std::env::var_os("PASTOR_DATA_DIR") {
             Some(v) => PathBuf::from(v),
-            None => dirs::data_dir()
-                .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
+            None => xdg_home("XDG_DATA_HOME", ".local/share")
                 .context("no data dir")?
                 .join("pastor"),
         };
@@ -152,6 +150,112 @@ impl Paths {
     pub fn runs_dir(&self, job: &str) -> PathBuf {
         self.state_dir.join("runs").join(job)
     }
+}
+
+/// `~/.config`, or `$XDG_CONFIG_HOME`: where pastor's config, herdr's socket
+/// and the systemd user units live.
+pub fn config_home() -> Option<PathBuf> {
+    xdg_home("XDG_CONFIG_HOME", ".config")
+}
+
+/// The XDG base directory `var` names, on every platform. On macOS `dirs`
+/// answers `~/Library/Application Support` instead, but herdr keeps its socket
+/// under `~/.config` there too, and one layout on every machine is simpler to
+/// document and to reach over ssh.
+fn xdg_home(var: &str, fallback: &str) -> Option<PathBuf> {
+    xdg_dir(std::env::var_os(var), dirs::home_dir(), fallback)
+}
+
+/// The XDG rule: the variable when it holds an absolute path, else
+/// `<home>/<fallback>`. A relative or empty value is ignored, as the spec says.
+fn xdg_dir(
+    value: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+    fallback: &str,
+) -> Option<PathBuf> {
+    value
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| h.join(fallback)))
+}
+
+/// Where pastor kept its config and connector checkouts on macOS before it
+/// followed the XDG layout there: `~/Library/Application Support/pastor`.
+/// `None` off macOS, and when an override says where the files are, because
+/// then nothing was ever read from the old place.
+pub fn legacy_macos_dir() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos")
+        || std::env::var_os("PASTOR_CONFIG_DIR").is_some()
+        || std::env::var_os("PASTOR_DATA_DIR").is_some()
+    {
+        return None;
+    }
+    dirs::home_dir().map(|h| h.join("Library/Application Support/pastor"))
+}
+
+/// Move a config left at `legacy` into `paths`, once. The old macOS layout had
+/// config and data in one directory, and still used the old name for
+/// connectors, so `plugins/` held both the checkouts and each connector's
+/// `.env`: the checkouts go to `connectors/` in the data dir and the `.env`
+/// files to `<config>/connectors/<id>/`. Nothing happens when there is no
+/// legacy directory or the new config dir already exists (never merge two
+/// configs). Returns the note to show the user when something moved.
+pub fn migrate_legacy_dir(legacy: &Path, paths: &Paths) -> anyhow::Result<Option<String>> {
+    let is_dir = std::fs::symlink_metadata(legacy).is_ok_and(|m| m.is_dir());
+    if !is_dir || std::fs::symlink_metadata(&paths.config_dir).is_ok() {
+        return Ok(None);
+    }
+    if let Some(parent) = paths.config_dir.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::rename(legacy, &paths.config_dir).with_context(|| {
+        format!(
+            "move {} to {}",
+            legacy.display(),
+            paths.config_dir.display()
+        )
+    })?;
+    let mut note = format!(
+        "note: moved the pastor config from {} to {}",
+        legacy.display(),
+        paths.config_dir.display()
+    );
+    let old_plugins = paths.config_dir.join("plugins");
+    let connectors = paths.connectors_dir();
+    let is_real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    if is_real_dir(&old_plugins) && std::fs::symlink_metadata(&connectors).is_err() {
+        create_private_dir(&paths.data_dir)?;
+        std::fs::rename(&old_plugins, &connectors).with_context(|| {
+            format!(
+                "move {} to {}",
+                old_plugins.display(),
+                connectors.display()
+            )
+        })?;
+        let mut ids: Vec<_> = std::fs::read_dir(&connectors)
+            .with_context(|| format!("read {}", connectors.display()))?
+            .filter_map(Result::ok)
+            // A `connector link` symlink points into the user's own checkout,
+            // whose `.env` is theirs to move.
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.file_name())
+            .collect();
+        ids.sort();
+        for id in ids {
+            let from = connectors.join(&id).join(".env");
+            if !std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file()) {
+                continue;
+            }
+            let to = paths.connector_env_file(&id.to_string_lossy());
+            if let Some(dir) = to.parent() {
+                create_private_dir(dir)?;
+            }
+            std::fs::rename(&from, &to)
+                .with_context(|| format!("move {} to {}", from.display(), to.display()))?;
+        }
+        note.push_str(&format!(", and its connectors to {}", connectors.display()));
+    }
+    Ok(Some(note))
 }
 
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
@@ -1242,6 +1346,114 @@ mod tests {
         std::fs::write(&path, "request_timeout = \"0s\"\n").unwrap();
         let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("request_timeout"), "{err}");
+    }
+
+    #[test]
+    fn xdg_dirs_take_an_absolute_variable_or_fall_back_to_home() {
+        let home = Some(PathBuf::from("/h"));
+        assert_eq!(
+            xdg_dir(Some("/x/cfg".into()), home.clone(), ".config"),
+            Some(PathBuf::from("/x/cfg"))
+        );
+        // Relative or empty values are ignored, per the XDG spec.
+        for bad in ["", "rel/cfg"] {
+            assert_eq!(
+                xdg_dir(Some(bad.into()), home.clone(), ".config"),
+                Some(PathBuf::from("/h/.config"))
+            );
+        }
+        assert_eq!(
+            xdg_dir(None, home, ".local/state"),
+            Some(PathBuf::from("/h/.local/state"))
+        );
+        assert_eq!(xdg_dir(None, None, ".config"), None);
+    }
+
+    #[test]
+    fn default_paths_follow_xdg_not_application_support() {
+        // What `from_env` builds with no overrides: on macOS this used to be
+        // `~/Library/Application Support/pastor` for config and data.
+        let home = dirs::home_dir().unwrap();
+        let config = config_home().unwrap();
+        assert!(!config.to_string_lossy().contains("Library"));
+        if std::env::var_os("XDG_CONFIG_HOME").is_none() {
+            assert_eq!(config, home.join(".config"));
+        }
+        if !cfg!(target_os = "macos") {
+            assert_eq!(legacy_macos_dir(), None);
+        }
+    }
+
+    fn legacy_layout(tmp: &Path) -> (PathBuf, Paths) {
+        let legacy = tmp.join("Library/Application Support/pastor");
+        std::fs::create_dir_all(legacy.join("jobs")).unwrap();
+        std::fs::write(legacy.join("flock.toml"), "# flock\n").unwrap();
+        std::fs::write(legacy.join("jobs/nightly.toml"), "# job\n").unwrap();
+        std::fs::create_dir_all(legacy.join("plugins/github")).unwrap();
+        std::fs::write(legacy.join("plugins/github/pastor-connector.toml"), "# m\n").unwrap();
+        std::fs::write(legacy.join("plugins/github/.env"), "TOKEN=x\n").unwrap();
+        let paths = Paths::new(tmp.join(".config/pastor"), tmp.join(".local/state/pastor"))
+            .with_data_dir(tmp.join(".local/share/pastor"));
+        (legacy, paths)
+    }
+
+    #[test]
+    fn a_legacy_macos_config_moves_once_with_a_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (legacy, paths) = legacy_layout(tmp.path());
+
+        let note = migrate_legacy_dir(&legacy, &paths).unwrap().unwrap();
+        assert!(note.contains(&legacy.display().to_string()), "{note}");
+        assert!(
+            note.contains(&paths.config_dir.display().to_string()),
+            "{note}"
+        );
+        assert!(!legacy.exists());
+        assert!(paths.flock_file().is_file());
+        assert!(paths.jobs_dir().join("nightly.toml").is_file());
+        // Checkouts go to the data dir, secrets stay with the config.
+        assert!(
+            paths
+                .connectors_dir()
+                .join("github/pastor-connector.toml")
+                .is_file()
+        );
+        assert!(!paths.connectors_dir().join("github/.env").exists());
+        assert_eq!(
+            std::fs::read_to_string(paths.connector_env_file("github")).unwrap(),
+            "TOKEN=x\n"
+        );
+        assert!(
+            !paths
+                .config_dir
+                .join("plugins/github/pastor-connector.toml")
+                .exists()
+        );
+
+        // A second run has nothing to move.
+        assert_eq!(migrate_legacy_dir(&legacy, &paths).unwrap(), None);
+    }
+
+    #[test]
+    fn a_legacy_config_is_left_alone_when_the_new_one_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (legacy, paths) = legacy_layout(tmp.path());
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+
+        assert_eq!(migrate_legacy_dir(&legacy, &paths).unwrap(), None);
+        assert!(legacy.join("flock.toml").is_file());
+        assert!(!paths.flock_file().exists());
+    }
+
+    #[test]
+    fn no_legacy_dir_means_no_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        assert_eq!(
+            migrate_legacy_dir(&tmp.path().join("missing"), &paths).unwrap(),
+            None
+        );
+        assert!(!paths.config_dir.exists());
     }
 
     #[test]
