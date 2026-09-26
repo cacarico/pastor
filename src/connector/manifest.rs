@@ -306,13 +306,31 @@ impl std::fmt::Display for Version {
     }
 }
 
+/// This build's version, for `min_pastor_version`. A prerelease
+/// (`0.5.0-rc.1`) counts as the release it leads to, so connectors that need
+/// 0.5.0 can be tried on its release candidates.
 pub fn pastor_version() -> Version {
-    Version::parse(env!("CARGO_PKG_VERSION")).expect("the crate version is major.minor.patch")
+    release_part(env!("CARGO_PKG_VERSION"))
+}
+
+fn release_part(v: &str) -> Version {
+    let release = v.split_once('-').map_or(v, |(r, _)| r);
+    Version::parse(release).expect("the crate version starts with major.minor.patch")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prerelease_counts_as_the_release_it_leads_to() {
+        assert_eq!(release_part("0.5.0-rc.1"), Version(0, 5, 0));
+        assert_eq!(release_part("0.5.0"), Version(0, 5, 0));
+        assert!(
+            Version::parse("0.5.0-rc.1").is_err(),
+            "manifests still take plain versions"
+        );
+    }
     use serde_json::json;
 
     const SPEC_EXAMPLE: &str = r#"
