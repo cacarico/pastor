@@ -532,10 +532,15 @@ fn changes_fleet(command: &Command) -> bool {
                 // herdr's agent terminal types into any task's pane.
                 | TaskCmd::Attach { .. }
         ),
-        Command::Machine { cmd } => !matches!(cmd, MachineCmd::List { .. }),
-        Command::Flock { cmd } => !matches!(cmd, FlockCmd::List { .. }),
+        // Reading the fleet is fine: list and describe change nothing.
+        Command::Machine { cmd } => {
+            !matches!(cmd, MachineCmd::List { .. } | MachineCmd::Describe { .. })
+        }
+        Command::Flock { cmd } => !matches!(cmd, FlockCmd::List { .. } | FlockCmd::Describe { .. }),
         Command::Tick(_) => true,
-        Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. }),
+        Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. } | JobCmd::Describe { .. }),
+        // pastor.toml holds agents_change_fleet itself.
+        Command::Config { .. } => true,
         // Install, link, uninstall and unlink edit the catalog and reload the
         // head's jobs, restarting its stream connectors.
         Command::Connector { cmd } => {

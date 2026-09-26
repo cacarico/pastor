@@ -2655,7 +2655,11 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
         std::fs::read_to_string(config.join("flock.toml")).unwrap(),
         before
     );
+    // pastor.toml holds agents_change_fleet, so editing it is refused too.
+    assert_eq!(error_code(&run(&["config", "edit"])), "agent_refused");
     ok(run(&["flock", "list"]));
+    ok(run(&["flock", "describe", "default"]));
+    ok(run(&["machine", "describe", "pi-1"]));
     ok(run(&["connector", "list"]));
 
     std::fs::write(config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();

@@ -182,7 +182,7 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - Do not ask questions. Nobody is watching; a permission prompt or a question leaves the task `blocked` until a human happens to attach. If something is missing, say so in your report and stop.
 - Print `DONE` as your last line when finished, then go idle.
 - Do not close your pane or exit to clean up. That is the user's job.
-- Do not run, send to, attach to, retry, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks or jobs, or run `pastor serve`, `pastor setup` or `pastor open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. Reading (`task list`, `show`, `read`) is fine.
+- Do not run, send to, attach to, retry, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. Reading (`task list`, `show`, `read`, and `describe` for jobs, machines and flocks) is fine.
 
 ## When something goes wrong
 

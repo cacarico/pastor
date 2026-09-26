@@ -960,10 +960,11 @@ So:
   that changes the fleet: `task run`, `send`, `attach` (herdr's agent terminal
   types into any task's pane), `retry`, `close` and `prune`, `tick`
   (`--dry-run` too), `job run` and `job reload`, `connector install`, `link`,
-  `uninstall` and `unlink`, edits of machines, flocks and jobs, `serve`
-  and `setup` (a head started from the pane would dispatch with nothing to
-  refuse), and `open` (herdr's full UI drives every pane) (`agent_refused`). A dry tick and a reload count because both apply
-  `pastor.toml` and `flock.toml` first. Reads still work.
+  `uninstall` and `unlink`, edits of machines, flocks, jobs and `pastor.toml`
+  (`config edit`), `serve` and `setup` (a head started from the pane would
+  dispatch with nothing to refuse), and `open` (herdr's full UI drives every
+  pane) (`agent_refused`). A dry tick and a reload count because both apply
+  `pastor.toml` and `flock.toml` first. Reads still work, `describe` included.
   `agents_change_fleet = true` in `pastor.toml` turns this off. It stops an
   agent acting on its own, not a determined one: it runs as the same user and
   can unset the variable.
