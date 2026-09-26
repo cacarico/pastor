@@ -1773,7 +1773,8 @@ impl Actor {
     /// Another agent at work in the checkout task `task_id` would remove,
     /// named (or its pane, when it has no name): one in `workspace` (the
     /// task's own on the checkout) or in any workspace showing `checkout`,
-    /// or the agent of another open task on this machine whose checkout or
+    /// or the agent of another open task on this machine (or a failed one
+    /// that names an agent, which may still be running) whose checkout or
     /// `--repo` is `checkout`, wherever its pane is. `pane` is the task's own.
     /// With no checkout recorded, the path is the one herdr reports for
     /// `workspace`.
@@ -1809,7 +1810,7 @@ impl Actor {
                     })
                     .map(|w| w.workspace_id.as_str()),
             );
-            for t in self.store.tasks_on_machine(&self.name)? {
+            for t in self.store.tasks_with_agents_on_machine(&self.name)? {
                 if t.id == task_id {
                     continue;
                 }
@@ -4333,6 +4334,41 @@ mod tests {
             if !auto || place == Place::Pastor {
                 assert_eq!(fake.workspaces(), workspaces, "{what}");
             }
+        }
+    }
+
+    /// A dispatch can fail after its agent started, and that agent keeps
+    /// working: reconcile calls it an orphan, but it may still be in another
+    /// task's checkout, from a pane of the shared workspace where no
+    /// workspace of the checkout lists it. Its failed row still names it, so
+    /// `--remove-worktree` refuses and names it, whatever the place of the
+    /// task with the worktree.
+    #[tokio::test]
+    async fn a_failed_task_s_agent_still_in_the_checkout_keeps_it() {
+        for place in [Place::Pastor, Place::Own] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let t = h
+                .dispatch(placed_task(&store, place.clone(), true).id)
+                .await
+                .unwrap();
+            let checkout = t.spec.checkout.clone().unwrap();
+            let mut fix = placed_task(&store, Place::Pastor, false);
+            fix.spec.repo = Some(checkout.path.clone());
+            store.update_task(&mut fix).unwrap();
+            let fix = h.dispatch(fix.id).await.unwrap();
+            let mut fix = store.get_task(fix.id).unwrap().unwrap();
+            fix.state = TaskState::Failed;
+            store.update_task(&mut fix).unwrap();
+
+            let err = h.close(t.id, true).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("another agent in it, t-2"),
+                "{place:?}: {err:#}"
+            );
+            assert!(calls(&fake, "worktree.remove").is_empty(), "{place:?}");
+            assert_eq!(fake.worktree_list("/r").await.unwrap().len(), 1);
         }
     }
 

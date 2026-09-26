@@ -605,6 +605,24 @@ impl Store {
         })
     }
 
+    /// `tasks_on_machine`, plus the failed tasks there that name an agent:
+    /// a dispatch can fail after its agent started, and that agent may still
+    /// be at work (an orphan to reconcile). For finding who works in a
+    /// checkout, where a live agent counts whatever its row says.
+    pub fn tasks_with_agents_on_machine(&self, machine: &str) -> anyhow::Result<Vec<Task>> {
+        let mut states = PANE_OWNING_STATES.to_vec();
+        states.push(TaskState::Failed);
+        let tasks = self.list_tasks(&TaskFilter {
+            machine: Some(machine.into()),
+            states: Some(states),
+            ..Default::default()
+        })?;
+        Ok(tasks
+            .into_iter()
+            .filter(|t| t.state != TaskState::Failed || t.agent_name.is_some())
+            .collect())
+    }
+
     pub fn queued_tasks(&self) -> anyhow::Result<Vec<Task>> {
         let mut v = self.list_tasks(&TaskFilter {
             states: Some(vec![TaskState::Queued]),

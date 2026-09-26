@@ -298,7 +298,8 @@ worktree task's checkout, `task close --remove-worktree` refuses and names
 it before closing or opening anything, and auto-close closes the task's pane
 but keeps the checkout, with a note on the task. pastor looks for such an
 agent in the task's own workspace, in any workspace showing the checkout,
-and among the other open tasks on the machine whose checkout or `--repo` is
+and among the other open tasks on the machine (and the failed ones that
+name an agent, which may still be running) whose checkout or `--repo` is
 that path, wherever their pane is: a fix round placed in `pastor` works in
 the checkout from a pane of the shared workspace, which no workspace of the
 checkout lists. An agent pastor did not start that works there from a
