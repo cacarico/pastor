@@ -134,6 +134,10 @@ pub struct Pong {
 pub struct Created {
     pub workspace: WorkspaceRef,
     pub root_pane: PaneRef,
+    /// `worktree.open` only: the workspace was already showing the checkout,
+    /// so it is someone else's and not the caller's to close.
+    #[serde(default)]
+    pub already_open: bool,
 }
 
 /// `pane.split`'s reply: `{"type": "pane_info", "pane": {...}}`.

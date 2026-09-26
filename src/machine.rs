@@ -1611,7 +1611,11 @@ impl Actor {
             match self.open_checkout(t, &name).await? {
                 Some(created) => {
                     workspace = Some(created.workspace.workspace_id);
-                    reopened = Some(created.root_pane.pane_id);
+                    // One already showing the checkout is not pastor's to
+                    // close again when the checkout stays.
+                    if !created.already_open {
+                        reopened = Some(created.root_pane.pane_id);
+                    }
                 }
                 // The checkout is gone already: nothing left to remove.
                 None => worktree_gone = true,
@@ -1619,18 +1623,21 @@ impl Actor {
         }
         // Under `place = "repo"` a task whose `--repo` is this checkout (a
         // fix round) joins this workspace, and `worktree.remove` would take
-        // its agent and its checkout with it. The checkout stays while
-        // another agent works there.
+        // its agent and its checkout with it; so would a workspace someone
+        // already had open on a shared task's checkout, which is what
+        // `worktree.open` answers then. The checkout stays while another
+        // agent works there. A workspace `worktree.open` just made is not in
+        // `agents`, listed before it existed.
         if remove_worktree
             && !keep_worktree
             && !worktree_gone
-            && reopened.is_none()
             && let Some(ws) = workspace.as_deref()
             && let Some(other) = agents
                 .iter()
                 .find(|a| a.workspace_id == ws && a.pane_id != pane)
         {
             let who = other.name.clone().unwrap_or_else(|| other.pane_id.clone());
+            self.close_reopened(reopened.as_deref()).await;
             if by != CloseBy::AutoClose {
                 anyhow::bail!(
                     "the worktree of {name} has another agent in it, {who}; close that first"
@@ -1639,7 +1646,7 @@ impl Actor {
             let t = row.as_ref().expect("auto-close has a row");
             note = Some(worktree_kept_note(t, &name, &format!("{who} works in it")));
             keep_worktree = true;
-            close_pane = true;
+            close_pane = shared.is_none();
         }
         if remove_worktree && !keep_worktree && !worktree_gone {
             let ws = workspace.with_context(|| format!("task {name} recorded no workspace"))?;
@@ -3989,6 +3996,72 @@ mod tests {
         assert_eq!(removed.workspace_id, None);
         assert!(fake.worktree_list("/r").await.unwrap().is_empty());
         assert_eq!(fake.workspaces(), vec![pastor]);
+    }
+
+    /// A worktree task in a shared workspace whose checkout someone else has
+    /// open, with an agent in it: `worktree.open` answers that workspace, and
+    /// removing it would take the other agent. `--remove-worktree` refuses,
+    /// auto-close keeps the checkout with a note, and the other workspace
+    /// keeps every pane it had.
+    #[tokio::test]
+    async fn a_shared_task_worktree_another_agent_has_open_stays() {
+        for auto in [false, true] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = spawn_with_settings(
+                &fake,
+                &store,
+                if auto {
+                    auto_close_settings()
+                } else {
+                    settings()
+                },
+            );
+            wait_for("connected", || {
+                h.snapshot().channel == ChannelState::Connected
+            })
+            .await;
+            let t = h
+                .dispatch(placed_task(&store, Place::Pastor, true).id)
+                .await
+                .unwrap();
+            let pastor = t.workspace_id.clone().unwrap();
+            let checkout = t.spec.checkout.clone().unwrap();
+            let other = fake
+                .worktree_open("/r", &checkout.branch, "mine")
+                .await
+                .unwrap();
+            let ws = other.workspace.workspace_id.clone();
+            fake.agent_start("mine", "claude", &other.root_pane.pane_id, &[])
+                .await
+                .unwrap();
+            let before = fake.panes(&ws);
+
+            if auto {
+                fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+                wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+                let row = store.get_task(t.id).unwrap().unwrap();
+                assert!(
+                    row.error.as_deref().unwrap().contains("mine works in it"),
+                    "{row:?}"
+                );
+            } else {
+                let err = h.close(t.id, true).await.unwrap_err();
+                assert!(
+                    format!("{err:#}").contains("another agent in it, mine"),
+                    "{err:#}"
+                );
+            }
+            assert!(calls(&fake, "worktree.remove").is_empty(), "auto {auto}");
+            assert_eq!(fake.panes(&ws), before, "auto {auto}");
+            assert!(fake.workspaces().contains(&pastor));
+            assert_eq!(fake.worktree_list("/r").await.unwrap().len(), 1);
+            assert!(
+                fake.agents()
+                    .iter()
+                    .any(|a| a.name.as_deref() == Some("mine"))
+            );
+        }
     }
 
     /// A dirty checkout is refused as for any worktree task, and the

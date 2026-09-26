@@ -278,11 +278,14 @@ the checkout is closed once the agent's pane is split off the shared one.
 Removing that worktree (`--remove-worktree`, or auto-close of a clean one)
 closes the task's pane, has herdr open a workspace on the checkout
 (`worktree.open`) and removes that; when herdr refuses (uncommitted changes),
-the workspace it opened is closed again and the checkout stays.
+the workspace it opened is closed again and the checkout stays. When a
+workspace already shows the checkout, herdr answers that one, and pastor
+leaves it open whatever happens.
 
 Since a fix round joins the workspace of the worktree it works in, removing
-that worktree would end the fix round too. While another agent is in a
-worktree task's workspace, `task close --remove-worktree` refuses and names
+that worktree would end the fix round too. While another agent is in the
+workspace that shows a worktree task's checkout (its own, or one someone
+opened on it), `task close --remove-worktree` refuses and names
 it, and auto-close closes the task's pane but keeps the checkout, with a note
 on the task.
 
