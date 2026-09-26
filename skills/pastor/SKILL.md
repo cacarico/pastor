@@ -92,11 +92,12 @@ pastor closes a done task's pane after `close_done_after` (`pastor.toml`, defaul
 pastor task retry t-4                      # queues a copy of a failed or stale task, new id, retry_of t-4
 pastor task retry t-4 --place own          # the same, with the copy's pane placed elsewhere
 pastor task close t-4                      # closes the pane if there is one, marks the task closed
+pastor task done t-4                       # marks a task with a pane done; its pane closes after close_done_after
 pastor task close t-4 --remove-worktree    # removes the worktree too; refused if it has uncommitted changes
 pastor task prune --done --older-than 3d   # deletes finished rows; --failed and --closed add those states
 ```
 
-`retry` re-dispatches the task's job, item, prompt and dispatch settings as a new task; the old agent may still be running under its own id. Retrying a failed worktree task reuses its branch and, if still on disk, its checkout. `close` also closes an orphaned agent, a `t-N` pane with no open task. `prune` never deletes a row whose worktree may still be on disk; it names the ones it keeps, and `task close t-N --remove-worktree` clears them so the next prune takes them. A pruned task's item stays seen, so a job never queues it again.
+`retry` re-dispatches the task's job, item, prompt and dispatch settings as a new task; the old agent may still be running under its own id. Retrying a failed worktree task reuses its branch and, if still on disk, its checkout. `close` also closes an orphaned agent, a `t-N` pane with no open task. `done` is how an agent ends its own task (with no task given it ends `PASTOR_TASK`'s): the task is `done` at once and stays so while the agent finishes its turn, and auto-close takes its pane once the agent is idle; `task send` to it makes it run again. `prune` never deletes a row whose worktree may still be on disk; it names the ones it keeps, and `task close t-N --remove-worktree` clears them so the next prune takes them. A pruned task's item stays seen, so a job never queues it again.
 
 ## Answering a blocked task
 
@@ -182,9 +183,9 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - Work only in the directory you started in: your worktree and branch. Never touch other worktrees, branches or panes.
 - Commit and push exactly as the prompt says, and write the report it asks for.
 - Do not ask questions. Nobody is watching; a permission prompt or a question leaves the task `blocked` until a human happens to attach. If something is missing, say so in your report and stop.
-- Print `DONE` as your last line when finished, then go idle.
-- Do not close your pane or exit to clean up. That is the user's job.
-- Do not run, send to, attach to, retry, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. Reading (`task list`, `show`, `read`, and `describe` for jobs, machines and flocks) is fine.
+- When finished, run `pastor task done` (it ends your own task, from `PASTOR_TASK`), print `DONE` as your last line, then go idle. pastor marks the task `done` at once and closes your pane after `close_done_after`, freeing the machine's slot.
+- Do not close your pane or exit to clean up; `pastor task done` is how you say you are finished.
+- Do not run, send to, attach to, retry, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `show`, `read`, and `describe` for jobs, machines and flocks) is fine.
 
 ## When something goes wrong
 

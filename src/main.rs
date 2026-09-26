@@ -233,6 +233,8 @@ enum TaskCmd {
     Prune(pastor::task_cli::PruneArgs),
     /// Type text or press keys in a live task's agent, to answer what it is waiting on
     Send(pastor::task_cli::SendArgs),
+    /// Mark a task done, its pane to close after close_done_after; an agent may end its own
+    Done(pastor::task_cli::DoneArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -343,6 +345,7 @@ fn main() {
     pastor::ipc::set_caller_task(pastor::ipc::task_from_env());
     if let Some(task) = pastor::ipc::caller_task()
         && changes_fleet(&command)
+        && !ends_own_task(&command, &task)
         && !agents_change_fleet(&paths)
     {
         fail("agent_refused", &pastor::daemon::agent_refusal(&task));
@@ -559,6 +562,7 @@ fn changes_fleet(command: &Command) -> bool {
                 | TaskCmd::Close(_)
                 | TaskCmd::Prune(_)
                 | TaskCmd::Send(_)
+                | TaskCmd::Done(_)
                 // herdr's agent terminal types into any task's pane.
                 | TaskCmd::Attach { .. }
         ),
@@ -583,6 +587,12 @@ fn changes_fleet(command: &Command) -> bool {
         Command::Open { .. } => true,
         _ => false,
     }
+}
+
+/// Whether `command` is `task done` for `task`, the task the caller runs
+/// in: the one change an agent may make without `agents_change_fleet`.
+fn ends_own_task(command: &Command, task: &str) -> bool {
+    matches!(command, Command::Task { cmd: TaskCmd::Done(a) } if a.ends(task))
 }
 
 /// `agents_change_fleet` in pastor.toml. A file that does not load counts
@@ -1089,6 +1099,7 @@ async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
         TaskCmd::Close(a) => pastor::task_cli::close(paths, a).await?,
         TaskCmd::Prune(a) => pastor::task_cli::prune(paths, a, head).await?,
         TaskCmd::Send(a) => pastor::task_cli::send(paths, a).await?,
+        TaskCmd::Done(a) => pastor::task_cli::done(paths, a).await?,
     }
     Ok(())
 }

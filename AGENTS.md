@@ -159,7 +159,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks (schema 3: retry_of), seen keys, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 7), seen keys, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
@@ -179,10 +179,12 @@ skills/spec/                      plan-for-the-flock skill, its plan format and 
 tests always set them to temp dirs (`Paths::new` puts the data dir under the
 state dir).
 
-In the code: `task retry|close|prune` are `src/task_cli.rs` (CLI), the
-`TaskRetry|TaskClose|TaskPrune` arms in `Daemon::handle`,
-`Store::{insert_retry, close_task, prune}` and `MachineCommand::Close` in
-the actor; auto-close of done tasks after `close_done_after` is
+In the code: `task retry|close|prune|done` are `src/task_cli.rs` (CLI), the
+`TaskRetry|TaskClose|TaskPrune|TaskDone` arms in `Daemon::handle`,
+`Store::{insert_retry, close_task, prune}` and `MachineCommand::{Close, End}`
+in the actor (`Task::ended` keeps an ended task done, and lets auto-close
+skip its sequence checks; the fleet guard lets an agent through only for its
+own task, `IpcRequest::ends_own_task`); auto-close of done tasks after `close_done_after` is
 `Actor::auto_close_done`, run after each connected reconcile through the same
 `run_close` (`CloseBy::AutoClose`); orphan detection is
 `machine::orphan_agents`, used by reconcile and by the head-less probe in

@@ -189,6 +189,16 @@ check runs with each reconcile, while the machine is connected. An agent
 that herdr shows working or blocked again
 at that moment is left alone, and its task goes back to running or blocked.
 
+An agent says it is finished with `pastor task done` from its own pane (the
+task defaults to `PASTOR_TASK`; a human may name any task, `pastor task done
+t-3`). The task goes `done` at once, however herdr reads the agent, and stays
+done while the agent finishes the turn it said so in: a trailing question or
+a turn still at work no longer keeps it `blocked` or `running`, and the
+completion sequence check does not hold its close. Auto-close then closes its
+pane once the agent is idle and `close_done_after` has passed, which frees the
+machine's slot. `pastor task send` to such a task gives it more to do, and it
+runs again as any done task does. `task show --json` prints `"ended": true`.
+
 `pastor task send t-3 "yes, go on"` types into the pane of a live task
 (starting, running, blocked, or done with its pane still open) and presses
 Enter; `--no-enter` leaves Enter out, and each `--key K` presses one named
@@ -697,6 +707,7 @@ pastor task list --all               # finished tasks too
 pastor task read t-1                 # recent pane output, without attaching
 pastor task retry t-4                # a failed or stale task again, as a new task
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
+pastor task done t-1                 # mark it done; its pane closes after close_done_after
 pastor task prune --done --closed --older-than 7d
 pastor task attach t-1               # lands in the agent's pane; ctrl+b q detaches
 pastor open pi-3                     # the full herdr UI on that machine
@@ -1141,7 +1152,8 @@ So:
   (`config edit`), `serve` and `setup` (a head started from the pane would
   dispatch with nothing to refuse), and `open` (herdr's full UI drives every
   pane) (`agent_refused`). A dry tick and a reload count because both apply
-  `pastor.toml` and `flock.toml` first. Reads still work, `describe` included.
+  `pastor.toml` and `flock.toml` first. `task done` is refused too, save for
+  the pane's own task: an agent may end its own task, and nobody else's. Reads still work, `describe` included.
   `agents_change_fleet = true` in `pastor.toml` turns this off. It stops an
   agent acting on its own, not a determined one: it runs as the same user and
   can unset the variable.
@@ -1220,7 +1232,7 @@ two pastor edits of one file never interleave.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, defaults, agents (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks (schema 6, with retry_of, flock, trust_sent and activity_seen), seen keys, job state, trusted repos
+~/.local/state/pastor/pastor.db   tasks (schema 7, with retry_of, flock, trust_sent, activity_seen and ended), seen keys, job state, trusted repos
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host

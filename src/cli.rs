@@ -634,6 +634,7 @@ mod tests {
             last_completion_seq: None,
             prompt_pending: false,
             activity_seen: false,
+            ended: false,
             retry_of: None,
             created_at: now,
             started_at: Some(now),

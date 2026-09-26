@@ -35,6 +35,24 @@ pub struct CloseArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct DoneArgs {
+    /// The task to end (default: the task this pane runs, from PASTOR_TASK)
+    pub task: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl DoneArgs {
+    /// Whether this ends `own`, the task the caller runs in: no task given,
+    /// or that one.
+    pub fn ends(&self, own: &str) -> bool {
+        self.task
+            .as_deref()
+            .is_none_or(|t| parse_task_id(t).is_some_and(|id| parse_task_id(own) == Some(id)))
+    }
+}
+
+#[derive(Args, Debug)]
 #[command(group(ArgGroup::new("send_input").required(true).multiple(true)))]
 pub struct SendArgs {
     /// A live task (starting, running or blocked), like t-12
@@ -149,6 +167,27 @@ pub async fn close(paths: &Paths, a: CloseArgs) -> anyhow::Result<()> {
             println!("{msg}");
             Ok(())
         }
+        other => Err(unexpected(other)),
+    }
+}
+
+/// `pastor task done [t-N]`: the task given, or the one this pane runs.
+pub async fn done(paths: &Paths, a: DoneArgs) -> anyhow::Result<()> {
+    let task = match a.task.clone().or_else(crate::ipc::caller_task) {
+        Some(t) => t,
+        None => {
+            return Err(CliError::err(
+                "usage_error",
+                format!(
+                    "name a task (t-12), or run this from a task's pane, where {} names it",
+                    crate::ipc::TASK_ENV
+                ),
+            ));
+        }
+    };
+    let id = task_id(&task)?;
+    match ask(paths, IpcRequest::TaskDone { id }).await? {
+        IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }
 }

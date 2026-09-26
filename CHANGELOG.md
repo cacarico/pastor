@@ -7,6 +7,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `pastor task done` lets an agent end its own task from its pane (the task
+  defaults to `PASTOR_TASK`), the one change the fleet guard allows an agent;
+  another task's is refused with `agent_refused`. The task is `done` at once
+  and stays so while the agent finishes its turn, and auto-close takes its
+  pane after `close_done_after`, freeing the machine's slot. A human may end
+  any task with a pane. The store goes to schema 7 (`tasks.ended`).
+
 - `place` decides where a task's agent gets its pane: `--place` on `task run`
   and `task retry`, `place` in a job's `[dispatch]` or under `[defaults]` in
   `pastor.toml`. The default, `repo`, keeps an agent under the repo it works

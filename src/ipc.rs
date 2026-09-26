@@ -111,6 +111,13 @@ pub enum IpcRequest {
         id: i64,
         input: crate::machine::SendInput,
     },
+    /// The task's agent says it is finished: mark the task done so its pane
+    /// closes after `close_done_after`. The one change an agent may make
+    /// without `agents_change_fleet`, and only to its own task
+    /// (`ends_own_task`). Answers `Task`.
+    TaskDone {
+        id: i64,
+    },
     /// Delete rows in `states` that finished more than `older_than_secs`
     /// ago. Answers `Pruned`.
     TaskPrune {
@@ -140,8 +147,16 @@ impl IpcRequest {
             | IpcRequest::TaskRetry { .. }
             | IpcRequest::TaskClose { .. }
             | IpcRequest::TaskSend { .. }
+            | IpcRequest::TaskDone { .. }
             | IpcRequest::TaskPrune { .. } => true,
         }
+    }
+
+    /// Whether the request only ends `task`, the task the caller runs in
+    /// (`TASK_ENV`): an agent may say it is finished, but not for anyone
+    /// else.
+    pub fn ends_own_task(&self, task: &str) -> bool {
+        matches!(self, IpcRequest::TaskDone { id } if crate::task::parse_task_id(task) == Some(*id))
     }
 }
 
@@ -464,6 +479,7 @@ mod tests {
             last_completion_seq: None,
             prompt_pending: false,
             activity_seen: false,
+            ended: false,
             retry_of: None,
             created_at: now,
             started_at: None,

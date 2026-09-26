@@ -2674,6 +2674,40 @@ fn an_agent_pastor_started_is_refused_a_task_run() {
     assert_eq!(tasks, serde_json::json!([]), "nothing was queued");
 }
 
+/// An agent may end its own task, `pastor task done` from its pane, and
+/// nobody else's; outside a task's pane the command needs a task.
+#[test]
+fn an_agent_may_end_its_own_task_only() {
+    let env = start();
+    for _ in 0..2 {
+        env.json(&["task", "run", "go on", "--repo", "/tmp", "--json"]);
+    }
+    let as_agent = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("PASTOR_TASK", "t-1")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        error_code(&as_agent(&["task", "done", "t-2"])),
+        "agent_refused"
+    );
+    let ended: serde_json::Value =
+        serde_json::from_str(&ok(as_agent(&["task", "done", "--json"]))).unwrap();
+    assert_eq!(ended["id"], 1, "{ended}");
+    assert_eq!(ended["state"], "done", "{ended}");
+    assert_eq!(ended["ended"], true, "{ended}");
+    ok(as_agent(&["task", "done", "t-1"]));
+    let other = env.json(&["task", "show", "t-2", "--json"]);
+    assert!(other.get("ended").is_none(), "{other}");
+    env.fails_with(&["task", "done"], "usage_error");
+    // A human may end any task.
+    assert_eq!(env.json(&["task", "done", "t-2", "--json"])["ended"], true);
+}
+
 /// Machine, flock and job edits need no head, so the CLI refuses them
 /// itself, and leaves flock.toml as it was; `agents_change_fleet = true`
 /// turns that off.

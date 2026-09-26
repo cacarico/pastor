@@ -261,6 +261,13 @@ pub enum MachineCommand {
         input: SendInput,
         reply: oneshot::Sender<anyhow::Result<Task>>,
     },
+    /// `pastor task done`: the agent says it is finished. Marks the task
+    /// `done` and `ended`, so it stays done while the agent finishes its
+    /// turn and auto-close takes its pane after `close_done_after`.
+    End {
+        task_id: i64,
+        reply: oneshot::Sender<anyhow::Result<Task>>,
+    },
 }
 
 /// What `pastor task send` types into a task's pane: `text` first, then
@@ -307,8 +314,9 @@ impl SendInput {
     }
 }
 
-/// `Send` refused before it typed anything, for a reason the CLI reports
-/// under its own code (`task_not_live`, ...).
+/// `Send` refused before it typed anything, or `End` before it wrote
+/// anything, for a reason the CLI reports under its own code
+/// (`task_not_live`, ...).
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct SendRefused {
@@ -462,6 +470,12 @@ impl MachineHandle {
             reply,
         };
         self.request(cmd, rx).await
+    }
+
+    pub async fn end(&self, task_id: i64) -> anyhow::Result<Task> {
+        let (reply, rx) = oneshot::channel();
+        self.request(MachineCommand::End { task_id, reply }, rx)
+            .await
     }
 
     /// Send `cmd` and wait for its reply, or fail with `ActorStopped` once
@@ -973,6 +987,7 @@ impl Actor {
                     Some(MachineCommand::Read { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Close { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Send { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::End { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                 },
             }
         }
@@ -1229,6 +1244,10 @@ impl Actor {
                     CommandOutcome::Nothing
                 }
             }
+            MachineCommand::End { task_id, reply } => {
+                let _ = reply.send(self.end_task(task_id));
+                CommandOutcome::Nothing
+            }
             MachineCommand::Read {
                 task_id,
                 lines,
@@ -1373,6 +1392,60 @@ impl Actor {
         (Ok(task), false)
     }
 
+    /// `MachineCommand::End`: the row alone, no herdr request. A task with a
+    /// pane on this machine (starting, running, blocked, stale or done)
+    /// becomes `done` and `ended`; its pane stays for `close_done_after`, as
+    /// any done task's does, so the agent can finish the turn it said so in.
+    fn end_task(&mut self, task_id: i64) -> anyhow::Result<Task> {
+        let Some(task) = self.store.get_task(task_id)? else {
+            let err = SendRefused {
+                code: "task_not_found",
+                message: format!("t-{task_id} not found"),
+            };
+            return Err(err.into());
+        };
+        let live = |t: &Task| t.state.occupies_pane() && t.machine.as_deref() == Some(&self.name);
+        if !live(&task) {
+            let err = SendRefused {
+                code: "task_not_live",
+                message: format!(
+                    "{} is {}; only a task with a pane on {} can end",
+                    task.display_id(),
+                    task.state,
+                    self.name
+                ),
+            };
+            return Err(err.into());
+        }
+        let was_done = task.state == TaskState::Done;
+        let written = write_task(&self.store, task, |t| {
+            if !live(t) || t.ended {
+                return false;
+            }
+            if t.state != TaskState::Done {
+                t.state = TaskState::Done;
+                t.finished_at = Some(Utc::now());
+                t.activity_seen = false;
+                t.prompt_pending = false;
+                // Advice about a block the task has left.
+                t.error = None;
+            }
+            t.ended = true;
+            true
+        })?;
+        let Some(t) = written else {
+            return self
+                .store
+                .get_task(task_id)?
+                .ok_or_else(|| anyhow::anyhow!("t-{task_id} not found"));
+        };
+        self.idle_agents.remove(&t.id);
+        if !was_done {
+            self.emit("task.done", Some(t.id));
+        }
+        Ok(t)
+    }
+
     /// A done task that was just given more to do runs again. The baseline
     /// stays at the idle it was done at and `activity_seen` stays clear, as
     /// `apply` left them, so the agent's next turn is what marks it done.
@@ -1386,6 +1459,8 @@ impl Actor {
             }
             t.state = TaskState::Running;
             t.finished_at = None;
+            // The agent said it was finished; it has more to do now.
+            t.ended = false;
             true
         })?;
         let Some(t) = written else {
@@ -1520,10 +1595,12 @@ impl Actor {
         // `completion_seq`) past the row's baseline means exactly that.
         // Closing now would destroy that unsettled completion; leave the row
         // for reconcile's settle window to catch up on instead.
+        // An ended task needs neither check: its agent said it is finished,
+        // and the turn it said so in moved the sequence on its own.
         if by == CloseBy::AutoClose
             && let Some((pane, _)) = &target
             && let Some(agent) = agents.iter().find(|a| &a.pane_id == pane)
-            && let Some(t) = &row
+            && let Some(t) = row.as_ref().filter(|t| !t.ended)
         {
             // Reading a missing baseline as 0 would make every such row look
             // moved, forever: reconcile writes no baseline for a row that is
@@ -5393,6 +5470,102 @@ mod tests {
         assert!(calls(&fake, "worktree.remove").is_empty());
         assert!(fake.agents().is_empty());
         wait_for("live drops", || h.snapshot().live == 0).await;
+    }
+
+    /// An agent that ends its task mid-turn (`pastor task done`): the task
+    /// is done at once and stays so while the agent works on, and auto-close
+    /// frees its pane once the agent is idle, although that turn moved the
+    /// sequence past the baseline.
+    #[tokio::test]
+    async fn an_ended_task_is_closed_once_its_agent_is_idle() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("activity seen", || {
+            store.get_task(t.id).unwrap().unwrap().activity_seen
+        })
+        .await;
+        let ended = h.end(t.id).await.unwrap();
+        assert_eq!(ended.state, TaskState::Done);
+        assert!(ended.ended);
+        assert_eq!(count(&mut events, "task.done", t.id).len(), 1);
+        // Ending again changes nothing and says nothing.
+        assert!(h.end(t.id).await.unwrap().ended);
+        let before = lists(&fake);
+        wait_for("a few reconciles", || lists(&fake) >= before + 4).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Done, "still at work");
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert_eq!(h.snapshot().live, 1, "the slot is held while it works");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        assert_eq!(
+            calls(&fake, "pane.close"),
+            vec![serde_json::json!({"pane_id": pane})]
+        );
+        assert!(count(&mut events, "task.done", t.id).is_empty());
+        wait_for("live drops", || h.snapshot().live == 0).await;
+    }
+
+    /// Typing into an ended task gives it more to do: it runs again, and no
+    /// longer counts as ended.
+    #[tokio::test]
+    async fn sending_to_an_ended_task_reopens_it() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        h.end(t.id).await.unwrap();
+        let sent = h
+            .send(
+                t.id,
+                SendInput {
+                    text: Some("one more thing".into()),
+                    enter: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.state, TaskState::Running);
+        assert!(!sent.ended);
+        assert!(!store.get_task(t.id).unwrap().unwrap().ended);
+    }
+
+    /// Only a task with a pane on this machine can end.
+    #[tokio::test]
+    async fn a_task_with_no_pane_cannot_end() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let queued = new_task(&store);
+        let err = h.end(queued.id).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<SendRefused>().map(|r| r.code),
+            Some("task_not_live"),
+            "{err:#}"
+        );
+        assert_eq!(state_of(&store, queued.id), TaskState::Queued);
+        let err = h.end(999).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<SendRefused>().map(|r| r.code),
+            Some("task_not_found"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]

@@ -283,6 +283,13 @@ pub struct Task {
     /// settles idle. Left out of the JSON the CLI prints.
     #[serde(skip)]
     pub activity_seen: bool,
+    /// The agent said it is finished (`pastor task done` from its own pane).
+    /// The task is `Done` and stays so while the agent finishes its last
+    /// turn: a `working` or `blocked` sighting no longer reopens it, and
+    /// auto-close takes it once the agent is idle after `close_done_after`.
+    /// Cleared when someone types into the pane (`pastor task send`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ended: bool,
     /// The task this one retries (`pastor task retry`). A retry is a new row
     /// with a new id, because the old agent `t-<id>` may still be alive.
     #[serde(default)]
@@ -440,6 +447,10 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
             state_change_seq,
             completion_seq,
         } => match status {
+            // The agent said it is finished (`pastor task done`), usually
+            // mid-turn: the rest of that turn is not new work, and whatever
+            // it shows next leaves the task done until auto-close takes it.
+            _ if task.state == Done && task.ended => return None,
             // Stale is sticky: a working/blocked observation after a timeout must not
             // flip the task back to running or blocked, or it would oscillate with the
             // next timeout check. Only a real completion (below) or a pane event moves
@@ -555,6 +566,7 @@ mod tests {
             last_completion_seq,
             prompt_pending: false,
             activity_seen: false,
+            ended: false,
             retry_of: None,
             created_at: now,
             started_at: Some(now),
@@ -562,6 +574,43 @@ mod tests {
             updated_at: now,
             flock: None,
         }
+    }
+
+    /// A task its agent ended (`pastor task done`) stays done whatever the
+    /// agent shows next, until its pane goes.
+    #[test]
+    fn an_ended_task_stays_done() {
+        let ended = Task {
+            ended: true,
+            ..task(TaskState::Done, Some(5))
+        };
+        for status in [
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+            AgentStatus::Idle,
+            AgentStatus::Unknown,
+        ] {
+            let seen = Observed::Status {
+                status,
+                state_change_seq: Some(9),
+                completion_seq: None,
+            };
+            assert_eq!(next_state(&ended, &seen), None, "{status:?}");
+        }
+        assert_eq!(
+            next_state(&ended, &Observed::PaneClosed),
+            Some(TaskState::Closed)
+        );
+        // Not ended, the same `working` reopens it.
+        let seen = Observed::Status {
+            status: AgentStatus::Working,
+            state_change_seq: Some(9),
+            completion_seq: None,
+        };
+        assert_eq!(
+            next_state(&task(TaskState::Done, Some(5)), &seen),
+            Some(TaskState::Running)
+        );
     }
 
     /// A task pastor has seen `working` or `blocked` since its prompt.

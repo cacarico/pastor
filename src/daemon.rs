@@ -846,7 +846,7 @@ impl Fleet {
 /// the fleet. The CLI says the same for a change it makes on its own.
 pub fn agent_refusal(task: &str) -> String {
     format!(
-        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, serve or set up a head, open herdr's UI); set agents_change_fleet = true in pastor.toml to allow it"
+        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, serve or set up a head, open herdr's UI; `pastor task done` may end only its own task); set agents_change_fleet = true in pastor.toml to allow it"
     )
 }
 
@@ -1146,10 +1146,11 @@ impl Daemon {
 
     /// `handle`, for a caller that says it runs in a task's pane
     /// (`ipc::TASK_ENV`): unless `agents_change_fleet` is on, such a caller
-    /// may read but not change the fleet.
+    /// may read but not change the fleet, save to end its own task.
     pub async fn handle_from(&self, req: IpcRequest, from_task: Option<&str>) -> IpcResponse {
         if let Some(task) = from_task
             && req.changes_fleet()
+            && !req.ends_own_task(task)
             && !self.fleet.agents_change_fleet()
         {
             return IpcResponse::error("agent_refused", agent_refusal(task));
@@ -1310,6 +1311,7 @@ impl Daemon {
                 remove_worktree,
             } => self.close(id, remove_worktree).await,
             IpcRequest::TaskSend { id, input } => self.send(id, input).await,
+            IpcRequest::TaskDone { id } => self.end(id).await,
             IpcRequest::TaskPrune {
                 states,
                 older_than_secs,
@@ -1388,6 +1390,39 @@ impl Daemon {
             Err(err) => match err.downcast_ref::<SendRefused>() {
                 Some(r) => IpcResponse::error(r.code, r),
                 None => stopped_or(err, "send_failed"),
+            },
+        }
+    }
+
+    /// `TaskDone`: through the actor of the task's machine, which checks the
+    /// row again and marks it done and ended. A task on no machine, or one
+    /// whose machine has left the flock, has no pane to end.
+    async fn end(&self, id: i64) -> IpcResponse {
+        let task = match self.store.get_task(id) {
+            Ok(Some(t)) => t,
+            Ok(None) => return IpcResponse::error("task_not_found", format!("t-{id}")),
+            Err(err) => return IpcResponse::error("store_error", err),
+        };
+        let handle = task
+            .machine
+            .as_deref()
+            .filter(|_| task.state.occupies_pane())
+            .and_then(|m| self.fleet.get(m).filter(|_| self.fleet.in_flock(m)));
+        let Some(handle) = handle else {
+            return IpcResponse::error(
+                "task_not_live",
+                format!(
+                    "{} is {} with no pane to end",
+                    task.display_id(),
+                    task.state
+                ),
+            );
+        };
+        match handle.end(id).await {
+            Ok(t) => IpcResponse::Task(t),
+            Err(err) => match err.downcast_ref::<SendRefused>() {
+                Some(r) => IpcResponse::error(r.code, r),
+                None => stopped_or(err, "done_failed"),
             },
         }
     }
@@ -2882,9 +2917,14 @@ mod tests {
     /// One raw line to the head's socket, as a client in task `t-9`'s pane
     /// sends it, and the reply.
     async fn ask_from_task(socket: &std::path::Path, req: &IpcRequest) -> IpcResponse {
+        ask_as(socket, req, "t-9").await
+    }
+
+    /// `ask_from_task`, from the pane of `task`.
+    async fn ask_as(socket: &std::path::Path, req: &IpcRequest, task: &str) -> IpcResponse {
         let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
         let (r, mut w) = stream.into_split();
-        let line = crate::ipc::request_line(req, Some("t-9")).unwrap();
+        let line = crate::ipc::request_line(req, Some(task)).unwrap();
         w.write_all(line.as_bytes()).await.unwrap();
         let mut reply = String::new();
         BufReader::new(r).read_line(&mut reply).await.unwrap();
@@ -2941,6 +2981,66 @@ mod tests {
             ask_from_task(&socket, &list).await,
             IpcResponse::Tasks(_)
         ));
+    }
+
+    /// The one change an agent may make on its own: ending its own task,
+    /// which leaves it done and ended. Another task's is refused.
+    #[tokio::test]
+    async fn an_agent_may_end_its_own_task_and_nobody_else_s() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let IpcResponse::Task(mine) = d.handle(run_hi()).await else {
+            panic!("run failed")
+        };
+        let IpcResponse::Task(theirs) = d.handle(run_hi()).await else {
+            panic!("run failed")
+        };
+        let store = d.store.clone();
+        let socket = serving(d).await;
+        let own = mine.display_id();
+        let resp = ask_as(&socket, &IpcRequest::TaskDone { id: theirs.id }, &own).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "agent_refused"),
+            "{resp:?}"
+        );
+        assert!(!store.get_task(theirs.id).unwrap().unwrap().ended);
+        let resp = ask_as(&socket, &IpcRequest::TaskDone { id: mine.id }, &own).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.state, TaskState::Done);
+        assert!(t.ended);
+        assert!(t.finished_at.is_some());
+        let row = store.get_task(mine.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Done);
+        assert!(row.ended);
+        assert_eq!(
+            store.get_task(theirs.id).unwrap().unwrap().state,
+            theirs.state
+        );
+    }
+
+    /// A task with no pane has nothing to end.
+    #[tokio::test]
+    async fn ending_a_task_with_no_pane_is_refused() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let resp = d.handle(IpcRequest::TaskDone { id: 42 }).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "task_not_found"),
+            "{resp:?}"
+        );
+        let IpcResponse::Task(t) = d.handle(run_hi()).await else {
+            panic!("run failed")
+        };
+        d.handle(IpcRequest::TaskClose {
+            id: t.id,
+            remove_worktree: false,
+        })
+        .await;
+        let resp = d.handle(IpcRequest::TaskDone { id: t.id }).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "task_not_live"),
+            "{resp:?}"
+        );
     }
 
     /// The refusal names every operation it covers, so its advice holds for
