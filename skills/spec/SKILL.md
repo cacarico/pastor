@@ -43,7 +43,7 @@ Never run `pastor task run` from this skill. Planning has no side effects on the
 
 ## Model per task
 
-pastor passes the model to Claude with `--agent-arg --model --agent-arg <alias>`. Name it on every task; do not rely on defaults.
+pastor passes the model to Claude with `--agent-arg --model --agent-arg <alias>`. Name it on every task; do not rely on defaults. The aliases below are the ones `claude --help` documents for `--model` (`fable`, `opus`, `sonnet`), each naming the latest model of its family. If the Claude Code on the flock is older and rejects an alias, use the full model id instead, such as `claude-fable-5-1`.
 
 | Task shape | Model | Why |
 |---|---|---|
