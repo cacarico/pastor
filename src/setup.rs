@@ -144,19 +144,38 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
 /// (less what `unit_path` drops, which is named on stderr), plus, for pastor,
 /// the dirs this shell resolves.
 fn exec_and_env(unit: Unit, paths: &Paths) -> anyhow::Result<(PathBuf, Vec<(String, String)>)> {
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    let exec = match unit {
-        Unit::Pastor => std::env::current_exe().context("locate the pastor binary")?,
-        Unit::Herdr => which("herdr", &path_var)
-            .context("herdr is not on PATH; install it or add its directory to PATH")?,
-    };
-    let (path_var, dropped) = unit_path(&path_var);
+    exec_and_env_from(unit, paths, &std::env::var("PATH").unwrap_or_default())
+}
+
+/// `exec_and_env` for a given shell PATH. herdr is resolved from the PATH the
+/// unit keeps, so a binary found only in a dropped entry is never written
+/// into ExecStart.
+fn exec_and_env_from(
+    unit: Unit,
+    paths: &Paths,
+    shell_path: &str,
+) -> anyhow::Result<(PathBuf, Vec<(String, String)>)> {
+    let (path_var, dropped) = unit_path(shell_path);
     if !dropped.is_empty() {
         eprintln!(
             "left out of the service's PATH (empty, relative or world-writable): {}",
             dropped.join(", ")
         );
     }
+    let exec = match unit {
+        Unit::Pastor => std::env::current_exe().context("locate the pastor binary")?,
+        Unit::Herdr => match (which("herdr", &path_var), which("herdr", shell_path)) {
+            (Some(exec), _) => exec,
+            (None, Some(unsafe_exec)) => anyhow::bail!(
+                "herdr is only at {}, in a directory left out of the service's PATH; \
+                 install it somewhere only you can write to",
+                unsafe_exec.display()
+            ),
+            (None, None) => {
+                anyhow::bail!("herdr is not on PATH; install it or add its directory to PATH")
+            }
+        },
+    };
     let mut env = vec![("PATH".to_string(), path_var)];
     if unit == Unit::Pastor {
         env.extend(dir_env(paths));
@@ -986,6 +1005,31 @@ mod tests {
                 open.display().to_string(),
             ]
         );
+    }
+
+    /// herdr is looked up in the PATH the unit keeps, not the shell's: one
+    /// found only in a world-writable dir would otherwise be written into
+    /// ExecStart as is, and anyone could replace it.
+    #[test]
+    fn herdr_resolves_only_from_the_kept_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let (good, open) = (tmp.path().join("good"), tmp.path().join("open"));
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        chmod(&good, 0o755);
+        chmod(&open, 0o777);
+        std::fs::write(open.join("herdr"), "").unwrap();
+        chmod(&open.join("herdr"), 0o755);
+        let var = format!("{}:{}", open.display(), good.display());
+        let err = exec_and_env_from(Unit::Herdr, &paths, &var).unwrap_err();
+        assert!(err.to_string().contains("left out"), "{err:#}");
+
+        std::fs::write(good.join("herdr"), "").unwrap();
+        chmod(&good.join("herdr"), 0o755);
+        let (exec, env) = exec_and_env_from(Unit::Herdr, &paths, &var).unwrap();
+        assert_eq!(exec, good.join("herdr"));
+        assert_eq!(env, vec![("PATH".to_string(), good.display().to_string())]);
     }
 
     #[test]

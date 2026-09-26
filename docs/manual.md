@@ -766,7 +766,8 @@ shell's `PATH` into the unit, so `ssh`, `herdr` and the agents resolve under
 systemd the way they do in a terminal; re-run it after moving a binary.
 Entries anyone could plant a binary in are left out and named on stderr: an
 empty or relative entry (`.`, `node_modules/.bin`) and a world-writable
-directory. A value with a line break is refused, since it would start a new
+directory. `herdr` is looked up in the `PATH` the unit keeps, and setup fails
+if it is only in an entry left out. A value with a line break is refused, since it would start a new
 directive, and a `$` in the binary's path is written `$$`, since systemd
 expands it in `ExecStart`.
 `pastor.service` also gets the config, state and data dirs this run resolved,
