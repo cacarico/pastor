@@ -2748,6 +2748,13 @@ fn spec_example_prompts_rebase_before_the_ledger_and_retry_the_push() {
             at("rejected as not a fast-forward, do steps 1 and 3 once more");
             at("keep both sides' lines");
             at("PUSH FAILED");
+            at(&format!("git push origin HEAD:pastor/{name}"));
+            assert_eq!(
+                p.trim_end().lines().last(),
+                Some("Print DONE as your last line."),
+                "{} must end by printing DONE",
+                file.display()
+            );
             checked += 1;
         }
     }
