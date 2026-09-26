@@ -85,7 +85,7 @@ demo: build ## record the README gifs with vhs against a demo head
 	mkdir -p docs/demo/local/jobs
 	cp -n docs/demo/flock.example.toml docs/demo/local/flock.toml
 	cp docs/demo/jobs.example/morning.toml docs/demo/local/jobs/morning.toml
-	cp docs/demo/jobs.example/issues.toml docs/demo/local/jobs/issues.toml
+	rm -f docs/demo/local/jobs/issues.toml
 	rm -rf docs/demo/local/state docs/demo/local/data
 	@set -e; \
 	export PASTOR_CONFIG_DIR=$(CURDIR)/docs/demo/local PASTOR_STATE_DIR=$(CURDIR)/docs/demo/local/state \

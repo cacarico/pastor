@@ -12,6 +12,14 @@ Set Padding 16
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 35ms
 
+# vhs starts fish without the user's config, so load pastor's completions,
+# and add the job that uses the connector, off camera.
+Hide
+Type "pastor completions fish | source; cp docs/demo/jobs.example/issues.toml docs/demo/local/jobs/; clear"
+Enter
+Sleep 1s
+Show
+
 Type "pastor connector install cacarico/pastor-connectors/github-issues --yes"
 Enter
 Sleep 6s
@@ -19,8 +27,9 @@ Sleep 6s
 Type "clear"
 Enter
 Type "pastor connector describe "
+Sleep 500ms
 Tab
-Sleep 1s
+Sleep 1.5s
 Enter
 Sleep 5s
 

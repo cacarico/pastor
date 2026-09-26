@@ -24,6 +24,6 @@ Type "pastor task list"
 Enter
 Sleep 3s
 
-Type "pastor task read t-1"
+Type "pastor task read t-1 | head -n 16"
 Enter
 Sleep 6s
