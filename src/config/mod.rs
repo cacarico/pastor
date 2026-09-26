@@ -662,9 +662,11 @@ const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
 /// accept that; saved trust presses them only while this is on screen.
 const CLAUDE_TRUST_MARKER: &str = "Yes, I trust this folder";
 
-/// Does `screen` (a pane's text) show `marker`? Case and whitespace are
-/// ignored, since a narrow pane wraps the line and a redraw may space it
-/// differently.
+/// Does the prompt at the bottom of `screen` (a pane's text, scrollback
+/// included) show `marker`? Only `bottom_prompt` is searched, so a trust
+/// prompt answered earlier and still in scrollback does not count for the
+/// dialog below it. Case and whitespace are ignored, since a narrow pane
+/// wraps the line and a redraw may space it differently.
 pub fn shows_trust_marker(screen: &str, marker: &str) -> bool {
     let squash = |s: &str| {
         s.chars()
@@ -673,7 +675,34 @@ pub fn shows_trust_marker(screen: &str, marker: &str) -> bool {
             .collect::<String>()
     };
     let marker = squash(marker);
-    !marker.is_empty() && squash(screen).contains(&marker)
+    !marker.is_empty() && squash(&bottom_prompt(screen)).contains(&marker)
+}
+
+/// The trailing lines of `screen` that make up the prompt at its bottom:
+/// those after the last output (a `●` or `⏺` message) and, when there is a
+/// menu, after the last option of any menu above the last one (a menu starts
+/// at an option numbered 1). The whole screen when neither is there.
+fn bottom_prompt(screen: &str) -> String {
+    let lines: Vec<&str> = screen.lines().collect();
+    let option = |line: &str| -> Option<u32> {
+        let t = line
+            .trim_start()
+            .trim_start_matches(['\u{276f}', '\u{203a}', '>'])
+            .trim_start();
+        let n = t.bytes().take_while(u8::is_ascii_digit).count();
+        match t[n..].chars().next() {
+            Some('.' | ')') if n > 0 => t[..n].parse().ok(),
+            _ => None,
+        }
+    };
+    let output = |line: &str| line.trim_start().starts_with(['\u{25cf}', '\u{23fa}']);
+    let mut start = lines.iter().rposition(|l| output(l)).map_or(0, |i| i + 1);
+    if let Some(menu) = lines.iter().rposition(|l| option(l) == Some(1))
+        && let Some(prev) = lines[..menu].iter().rposition(|l| option(l).is_some())
+    {
+        start = start.max(prev + 1);
+    }
+    lines[start.min(lines.len())..].join("\n")
 }
 
 /// Claude Code's own names for the allow and deny lists (`claude --help`).
@@ -1458,6 +1487,33 @@ mod tests {
         ));
         let bypass = "WARNING: Claude Code running in Bypass Permissions mode\n \u{276f} 1. No, exit\n   2. Yes, I accept\n";
         assert!(!shows_trust_marker(bypass, "Yes, I trust this folder"));
+    }
+
+    /// The read is scrollback, so a trust prompt already answered can still
+    /// be in it. Only the prompt at the bottom counts: the lines after the
+    /// last output, from the end of any menu before the last one.
+    #[test]
+    fn a_trust_marker_counts_only_in_the_prompt_at_the_bottom() {
+        let marker = "Yes, I trust this folder";
+        let trust = "Quick safety check: Is this a project you trust?\n\n\u{276f} 1. No, exit\n  2. Yes, I trust this folder\n\nEnter to confirm \u{b7} Esc to cancel\n";
+        let bypass = "WARNING: Claude Code running in Bypass Permissions mode\n\n\u{276f} 1. No, exit\n  2. Yes, I accept\n\nEnter to confirm \u{b7} Esc to cancel\n";
+        assert!(shows_trust_marker(trust, marker));
+        assert!(shows_trust_marker(
+            &format!("fake output\n\n{trust}"),
+            marker
+        ));
+        assert!(!shows_trust_marker(&format!("{trust}\n{bypass}"), marker));
+        assert!(!shows_trust_marker(
+            &format!("{trust}\n\u{25cf} Reading the repo\n"),
+            marker
+        ));
+        // A marker above its own menu, such as a question, still counts.
+        let codex = "Trust this directory?\n\n> 1. Yes\n  2. No\n";
+        assert!(shows_trust_marker(codex, "Trust this directory?"));
+        assert!(!shows_trust_marker(
+            &format!("{codex}\n{bypass}"),
+            "Trust this directory?"
+        ));
     }
 
     #[test]

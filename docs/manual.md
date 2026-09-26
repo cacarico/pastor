@@ -217,7 +217,10 @@ once per task, and emits `task.trusted`; a task still blocked after that is
 left for a human. The prompt is known by its `trust_marker` (Claude's is built
 in as its "Yes, I trust this folder" option), so a task blocked on another
 dialog the same keys would accept, such as Claude's bypass-permissions
-warning, is left for a human too. An agent with no marker (`trust_marker =
+warning, is left for a human too. The marker must be in the prompt at the
+bottom of the pane (after the last output, and after any menu above the last
+one), since the read includes scrollback where an earlier trust prompt can
+linger above a later dialog. An agent with no marker (`trust_marker =
 ""`, or one that is not Claude and sets none) gets the keys without the check. Either way the task's prompt goes in
 once, `settle` after the trust keys: Claude redraws for a moment after the
 dialog and loses what is typed then, though herdr takes it.

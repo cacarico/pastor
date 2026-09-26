@@ -5169,6 +5169,28 @@ mod tests {
         assert!(!store.trust_sent(t.id).unwrap());
     }
 
+    /// The pane read is scrollback: a trust prompt still in it above another
+    /// dialog is not the prompt on screen, and gets no keys.
+    #[tokio::test]
+    async fn saved_trust_ignores_a_trust_prompt_left_in_scrollback() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        fake.set_trust_screen(
+            "Quick safety check: Is this a project you trust?\n\n\u{276f} 1. No, exit\n  2. Yes, I trust this folder\n\n\
+             WARNING: Claude Code running in Bypass Permissions mode\n\u{276f} 1. No, exit\n  2. Yes, I accept\n",
+        );
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!calls(&fake, "agent.read").is_empty(), "the pane was read");
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert!(calls(&fake, "pane.send_keys").is_empty());
+        assert!(trusted_events(&mut events).is_empty());
+        assert!(!store.trust_sent(t.id).unwrap());
+    }
+
     #[tokio::test]
     async fn a_task_of_an_untrusted_repo_stays_blocked() {
         let fake = FakeHerdr::new();

@@ -38,7 +38,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   A notifier no longer receives the text of every other connector's items,
   nor another connector's cursors.
 - Saved trust reads the pane before pressing an agent's trust keys, and
-  presses them only while it shows the trust prompt's `trust_marker`, a new
+  presses them only while the prompt at the bottom of the pane, not its
+  scrollback, shows the trust prompt's `trust_marker`, a new
   `[agents.<name>]` setting; Claude's is built in as "Yes, I trust this
   folder". A task blocked on another dialog the same keys would accept, such
   as Claude's bypass-permissions warning, is left for a human.
