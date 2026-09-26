@@ -301,8 +301,9 @@ enum FlockCmd {
     },
     /// Remove a flock; refused while it has machines or queued tasks, or is the default
     Remove { name: String },
-    /// Make another flock the default; machines stay in their flocks
-    Default { name: String },
+    /// Print the default flock; with a name, make that one the default
+    /// (machines stay in their flocks)
+    Default { name: Option<String> },
     /// Open flock.toml in $VISUAL or $EDITOR; save it only once it is valid
     Edit,
     /// One flock in full: default or not, its agent, machines, live tasks
@@ -568,7 +569,7 @@ fn head_use(command: &Command) -> Option<bool> {
         }),
         Command::Flock { cmd } => Some(!matches!(
             cmd,
-            FlockCmd::List { .. } | FlockCmd::Describe { .. }
+            FlockCmd::List { .. } | FlockCmd::Describe { .. } | FlockCmd::Default { name: None }
         )),
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
         Command::Connector { cmd } => {
@@ -602,7 +603,10 @@ fn changes_fleet(command: &Command) -> bool {
         Command::Machine { cmd } => {
             !matches!(cmd, MachineCmd::List { .. } | MachineCmd::Describe { .. })
         }
-        Command::Flock { cmd } => !matches!(cmd, FlockCmd::List { .. } | FlockCmd::Describe { .. }),
+        Command::Flock { cmd } => !matches!(
+            cmd,
+            FlockCmd::List { .. } | FlockCmd::Describe { .. } | FlockCmd::Default { name: None }
+        ),
         Command::Tick(_) => true,
         Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. } | JobCmd::Describe { .. }),
         // pastor.toml holds agents_change_fleet itself.
@@ -1339,7 +1343,11 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
             edit(&|d| d.remove_flock(&name, &queued))?;
             format!("removed flock {name}")
         }
-        FlockCmd::Default { name } => {
+        FlockCmd::Default { name: None } => {
+            println!("{}", Flock::load(&path)?.default_flock());
+            return Ok(());
+        }
+        FlockCmd::Default { name: Some(name) } => {
             edit(&|d| d.set_default(&name))?;
             format!("{name} is the default flock; machines stay in their flocks")
         }

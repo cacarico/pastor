@@ -2163,6 +2163,36 @@ fn ok(out: std::process::Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// `flock default` with no name prints the default flock and edits nothing.
+#[test]
+fn flock_default_with_no_name_prints_the_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    // No flock.toml yet: the implicit flock.
+    assert_eq!(ok(run(&["flock", "default"])), "default\n");
+
+    let text = "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"work\"\n";
+    std::fs::write(config.join("flock.toml"), text).unwrap();
+    assert_eq!(ok(run(&["flock", "default"])), "home\n");
+    assert_eq!(
+        std::fs::read_to_string(config.join("flock.toml")).unwrap(),
+        text
+    );
+
+    ok(run(&["flock", "default", "work"]));
+    assert_eq!(ok(run(&["flock", "default"])), "work\n");
+}
+
 /// `flock` and `machine move` edit flock.toml in place: what they do not
 /// touch, comments included, stays as the user wrote it.
 #[test]

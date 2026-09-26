@@ -395,6 +395,7 @@ ports, keys and jump hosts in `~/.ssh/config` under a host alias instead.
 pastor flock list                       NAME, DEFAULT, MACHINES, AGENTS, QUEUED (--json)
 pastor flock add <name> [--default]
 pastor flock remove <name>              refused while it has machines or queued tasks, or is the default
+pastor flock default                    print the default flock
 pastor flock default <name>             new tasks and jobs go to <name>
 pastor machine add ... [--flock F]      default: the default flock
 pastor machine move <name> <flock>

@@ -153,6 +153,7 @@ pastor machine remove pi-3 --herdr
 pastor machine list        # connects to each machine now: ssh, herdr version, agents
 pastor flock list          # each flock: default, machines, live agents, queued tasks
 pastor flock add work [--default]
+pastor flock default       # print the default flock
 pastor flock default work  # new tasks and jobs go there; machines stay put
 pastor flock remove work   # refused while it has machines or queued tasks, or is the default
 pastor machine describe pi-3 --json   # one machine: channel, versions, its tasks, recent errors
