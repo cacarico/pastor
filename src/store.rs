@@ -1622,6 +1622,7 @@ mod tests {
         let checkout = Checkout {
             branch: "fix/x".into(),
             path: "/wt/fix-x".into(),
+            already_open: false,
         };
         let task = |worktree: bool, owned: bool, state| {
             let mut n = new_task("run");

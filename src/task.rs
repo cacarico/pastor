@@ -228,6 +228,12 @@ pub struct AgentSource {
 pub struct Checkout {
     pub branch: String,
     pub path: String,
+    /// herdr's `worktree.open` answered a workspace already showing the
+    /// checkout when dispatch reached it: the task joined a workspace pastor
+    /// did not make, and removing the checkout would close it. Missing from
+    /// rows written before it, which count as pastor's own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already_open: bool,
 }
 
 /// A checkout a retry may go back to, and the agent that owned it.
@@ -478,6 +484,21 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkout recorded before `already_open` existed is pastor's own,
+    /// and one that is pastor's own writes nothing new.
+    #[test]
+    fn a_checkout_without_already_open_is_pastor_s_own() {
+        let old: Checkout = serde_json::from_str(r#"{"branch":"b","path":"/p"}"#).unwrap();
+        assert!(!old.already_open);
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"branch":"b","path":"/p"}"#
+        );
+        let joined: Checkout =
+            serde_json::from_str(r#"{"branch":"b","path":"/p","already_open":true}"#).unwrap();
+        assert!(joined.already_open);
+    }
 
     /// A place reads and writes as the words `--place` and the TOML keys
     /// take, and a spec that says nothing is `repo`.

@@ -290,7 +290,11 @@ workspace already shows the checkout, herdr answers that one, and removing
 the checkout would close it: pastor did not open it, so the checkout stays
 and the task closes with a note to remove it with `git worktree remove`
 (its workspace is kept on the row, so `--remove-worktree` can try again
-once that workspace is gone).
+once that workspace is gone). Whatever the place, a task whose own dispatch found a
+workspace already showing its checkout (a retry placed `repo` or `own` that
+joined the failed task's workspace, or one someone opened) records that, and
+its checkout is kept the same way on `--remove-worktree` and auto-close:
+only the task's pane goes.
 
 Since a fix round joins the workspace of the worktree it works in, removing
 that worktree would end the fix round too. While another agent works in a

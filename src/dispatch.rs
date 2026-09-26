@@ -424,7 +424,8 @@ async fn reopenable<'a>(
 }
 
 /// The checkout herdr just made or reopened for this task, recorded so that
-/// a retry knows it is this task's own. Taken from `worktree.list`, the
+/// a retry knows it is this task's own, and whether its workspace was
+/// already open (so closing never removes it). Taken from `worktree.list`, the
 /// listing `reopenable` compares against, by the workspace showing it.
 async fn find_checkout(
     conn: &dyn Connector,
@@ -442,6 +443,7 @@ async fn find_checkout(
             Box::new(Checkout {
                 branch: w.branch.unwrap_or(branch),
                 path: w.path,
+                already_open: created.already_open,
             })
         }))
 }

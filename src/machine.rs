@@ -1624,6 +1624,23 @@ impl Actor {
                 close_pane = true;
             }
         }
+        // Dispatch found a workspace already showing the checkout
+        // (`Checkout::already_open`), whatever the task's place: a retry
+        // placed `repo` or `own` joins the failed task's workspace or one
+        // someone opened. pastor did not make it, and `worktree.remove`
+        // takes the checkout by closing it: the checkout stays, noted for
+        // removal by hand, and only the task's own pane goes.
+        if remove_worktree
+            && !keep_worktree
+            && let Some(t) = row
+                .as_ref()
+                .filter(|t| t.spec.checkout.as_ref().is_some_and(|c| c.already_open))
+        {
+            let why = "a workspace pastor did not open showed it when the task started";
+            note = Some(worktree_kept_note(t, &name, why));
+            keep_worktree = true;
+            close_pane = t.state != TaskState::Closed;
+        }
         // The task's pane goes first (not a closed row's: pastor closed that
         // one, and herdr may have handed its id out again), then the checkout
         // goes through a workspace `worktree.open` makes on it.
@@ -2742,6 +2759,7 @@ mod tests {
         t.spec.checkout = Some(Box::new(crate::task::Checkout {
             branch: "pastor/t-4".into(),
             path: "/w/t-4".into(),
+            already_open: false,
         }));
         let note = worktree_kept_note(&t, "t-9", "commits on no remote");
         assert!(note.contains("on branch pastor/t-4"), "{note}");
@@ -3740,7 +3758,14 @@ mod tests {
         let t = h.dispatch(again.id).await.unwrap();
         assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
         assert_eq!(calls(&fake, "worktree.create").len(), 1);
-        assert_eq!(t.spec.checkout, Some(checkout));
+        // The same checkout, reached through the workspace the first task
+        // left open on it.
+        let reached = t.spec.checkout.unwrap();
+        assert_eq!(
+            (reached.branch, reached.path),
+            (checkout.branch, checkout.path)
+        );
+        assert!(reached.already_open);
     }
 
     /// A task can fail before herdr made its worktree, here because another
@@ -3874,6 +3899,69 @@ mod tests {
             for pane in &before {
                 assert!(panes.contains(pane), "{place:?}: {pane} closed: {panes:?}");
             }
+        }
+    }
+
+    /// A retry placed in a workspace of its own can still join one: its
+    /// `worktree.open` answers the workspace already showing the checkout
+    /// (`already_open`), the failed task's or someone's. The row records
+    /// that, and removing the worktree would close that workspace with every
+    /// pane in it, so the checkout stays with a note to remove it by hand,
+    /// for `--remove-worktree` and auto-close alike; only the retry's own
+    /// pane goes.
+    #[tokio::test]
+    async fn a_worktree_whose_workspace_was_already_open_is_never_removed() {
+        for (place, auto) in [
+            (Place::Own, false),
+            (Place::Own, true),
+            (Place::Repo, false),
+            (Place::Repo, true),
+        ] {
+            let what = format!("{place:?}, auto {auto}");
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = spawn_with_settings(
+                &fake,
+                &store,
+                if auto {
+                    auto_close_settings()
+                } else {
+                    settings()
+                },
+            );
+            wait_for("connected", || {
+                h.snapshot().channel == ChannelState::Connected
+            })
+            .await;
+            let first = h
+                .dispatch(placed_task(&store, place.clone(), true).id)
+                .await
+                .unwrap();
+            fake.exit_pane(first.pane_id.as_deref().unwrap());
+            wait_for("failed", || state_of(&store, first.id) == TaskState::Failed).await;
+            let ws = first.workspace_id.clone().unwrap();
+            let before = fake.panes(&ws);
+
+            let retry = store.insert_retry(first.id).unwrap();
+            let t = h.dispatch(retry.id).await.unwrap();
+            assert_eq!(t.state, TaskState::Running, "{what}: {:?}", t.error);
+            assert_eq!(t.workspace_id.as_deref(), Some(ws.as_str()), "{what}");
+            assert!(t.spec.checkout.as_ref().unwrap().already_open, "{what}");
+
+            if auto {
+                fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+                wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+            } else {
+                let closed = h.close(t.id, true).await.unwrap();
+                assert_eq!(closed.state, TaskState::Closed, "{what}");
+            }
+            let row = store.get_task(t.id).unwrap().unwrap();
+            let note = row.error.as_deref().unwrap_or_default();
+            assert!(note.contains("worktree kept"), "{what}: {row:?}");
+            assert!(note.contains("git worktree remove"), "{what}: {row:?}");
+            assert!(calls(&fake, "worktree.remove").is_empty(), "{what}");
+            assert_eq!(fake.worktree_list("/r").await.unwrap().len(), 1, "{what}");
+            assert_eq!(fake.panes(&ws), before, "{what}");
         }
     }
 
