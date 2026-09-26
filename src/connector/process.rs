@@ -273,7 +273,8 @@ pub const STREAM_BACKOFF_BASE: Duration = Duration::from_secs(1);
 pub const STREAM_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// A stream that stayed up this long starts its backoff over.
 pub const STREAM_HEALTHY_AFTER: Duration = Duration::from_secs(60);
-/// Items held between drains; beyond it the oldest are dropped and logged.
+/// Items held between drains, the unacked batch included; beyond it the
+/// oldest are dropped and logged.
 pub const STREAM_BUFFER_MAX: usize = 10_000;
 /// Log lines held between drains; beyond it the oldest are dropped, counted
 /// in one note.
@@ -283,8 +284,8 @@ struct Buffer {
     items: std::collections::VecDeque<Item>,
     /// `item_bytes` of everything in `items`.
     items_bytes: usize,
-    /// The bound on the bytes of `items`, and of `pending` with them after a
-    /// drain; `ITEMS_BYTES_MAX` outside tests.
+    /// The bound on the bytes of `pending` and `items` together;
+    /// `ITEMS_BYTES_MAX` outside tests.
     bytes_max: usize,
     items_dropped: usize,
     /// The newest cursor since the last drain, handed to the scheduler.
@@ -299,7 +300,9 @@ struct Buffer {
     /// batch it went out in: the process will not emit it again, so it goes
     /// out again with every drain until it is persisted. Every drain carries
     /// all of it, so batch `n` held exactly the entries numbered `<= n`.
-    pending: Vec<(u64, Item)>,
+    pending: std::collections::VecDeque<(u64, Item)>,
+    /// `item_bytes` of everything in `pending`.
+    pending_bytes: usize,
     pending_cursor: Option<(u64, String)>,
     /// The number of the last drain.
     batch: u64,
@@ -317,7 +320,8 @@ impl Default for Buffer {
             logs: Default::default(),
             logs_dropped: 0,
             down: None,
-            pending: Vec::new(),
+            pending: Default::default(),
+            pending_bytes: 0,
             pending_cursor: None,
             batch: 0,
         }
@@ -328,14 +332,21 @@ impl Default for Buffer {
 /// both queues are bounded, items by count and by bytes, and overflow is one
 /// counter each, not a line per dropped entry.
 impl Buffer {
+    /// Queue `item`, then drop the oldest held, the unacked batch first,
+    /// until the unacked batch and the new items together fit the bound.
     fn push_item(&mut self, item: Item) {
         self.items_bytes += item_bytes(&item);
         self.items.push_back(item);
-        while self.items.len() > STREAM_BUFFER_MAX || self.items_bytes > self.bytes_max {
-            let Some(old) = self.items.pop_front() else {
+        while self.pending.len() + self.items.len() > STREAM_BUFFER_MAX
+            || self.pending_bytes + self.items_bytes > self.bytes_max
+        {
+            if let Some((_, old)) = self.pending.pop_front() {
+                self.pending_bytes -= item_bytes(&old);
+            } else if let Some(old) = self.items.pop_front() {
+                self.items_bytes -= item_bytes(&old);
+            } else {
                 break;
-            };
-            self.items_bytes -= item_bytes(&old);
+            }
             self.items_dropped += 1;
         }
     }
@@ -353,24 +364,15 @@ impl Buffer {
     fn drain(&mut self) -> RunOutput {
         self.batch += 1;
         let batch = self.batch;
-        let mut pending = std::mem::take(&mut self.pending);
-        pending.extend(self.items.drain(..).map(|i| (batch, i)));
-        self.items_bytes = 0;
-        let mut over = pending.len().saturating_sub(STREAM_BUFFER_MAX);
-        let mut bytes: usize = pending[over..].iter().map(|(_, i)| item_bytes(i)).sum();
-        while bytes > self.bytes_max && over < pending.len() {
-            bytes -= item_bytes(&pending[over].1);
-            over += 1;
-        }
-        if over > 0 {
-            pending.drain(..over);
-            self.items_dropped += over;
-        }
+        // `push_item` kept the two within the bound together, so moving the
+        // new items onto the batch drops nothing.
+        self.pending
+            .extend(self.items.drain(..).map(|i| (batch, i)));
+        self.pending_bytes += std::mem::take(&mut self.items_bytes);
         if let Some(c) = self.cursor.take() {
             self.pending_cursor = Some((batch, c));
         }
-        let items = pending.iter().map(|(_, i)| i.clone()).collect();
-        self.pending = pending;
+        let items = self.pending.iter().map(|(_, i)| i.clone()).collect();
         let cursor = self.pending_cursor.as_ref().map(|(_, c)| c.clone());
         let mut logs = Vec::with_capacity(self.logs.len() + 2);
         if self.logs_dropped > 0 {
@@ -399,6 +401,7 @@ impl Buffer {
     /// later drain added, since that run may still fail or be a dry run.
     fn ack(&mut self, batch: u64) {
         self.pending.retain(|(first, _)| *first > batch);
+        self.pending_bytes = self.pending.iter().map(|(_, i)| item_bytes(i)).sum();
         if self
             .pending_cursor
             .as_ref()
@@ -686,6 +689,36 @@ mod tests {
         b.ack(out.batch);
         b.push_item(big_item("huge", 20_000));
         assert!(b.drain().items.is_empty());
+    }
+
+    /// The unacked batch and what arrived since share one bound, enforced as
+    /// each item arrives: between two drains the buffer never holds more than
+    /// the bound, not the bound on top of a full pending batch.
+    #[test]
+    fn pending_and_new_items_share_the_bound_as_they_arrive() {
+        let mut b = Buffer {
+            bytes_max: 10_000,
+            ..Buffer::default()
+        };
+        for i in 0..3 {
+            b.push_item(big_item(&format!("k{i}"), 3_000));
+        }
+        b.drain();
+        b.push_item(big_item("k3", 3_000));
+        assert_eq!(b.pending.len() + b.items.len(), 3, "k0 goes at once");
+        let held: usize = b.pending.iter().map(|(_, i)| item_bytes(i)).sum();
+        assert!(held + b.items_bytes <= 10_000);
+
+        let mut b = Buffer::default();
+        for i in 0..STREAM_BUFFER_MAX {
+            b.push_item(Item::new(format!("k{i}"), serde_json::Map::new()));
+        }
+        b.drain();
+        b.push_item(Item::new("new", serde_json::Map::new()));
+        assert_eq!(b.pending.len() + b.items.len(), STREAM_BUFFER_MAX);
+        let out = b.drain();
+        assert_eq!(out.items.first().unwrap().key, "k1");
+        assert_eq!(out.items.last().unwrap().key, "new");
     }
 
     /// A poll run holds at most `items_max` items and `bytes_max` bytes of

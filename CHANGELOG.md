@@ -54,7 +54,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `connector install --ref` refuses a ref that starts with `-`.
 - A poll connector run that returns more than 10,000 items or 64 MiB of them
   fails instead of holding it all; a stream's buffer is bounded at 64 MiB as
-  well as 10,000 items.
+  well as 10,000 items, the unacked batch included, as each item arrives.
 - Every command pastor runs over ssh goes as `sh -c '<command>'`, so a fish
   or csh login shell on a machine no longer breaks the repo check. A machine's
   `session` may not contain a backslash or a control character.
