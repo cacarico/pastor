@@ -3,7 +3,7 @@
 # still called pastor.
 [package]
 name = "pastor-cli"
-version = "0.6.0-rc.1"
+version = "0.6.0"
 edition = "2024"
 # Let chains (stable since 1.88) are used throughout; raising this is a
 # minor bump, see CONTRIBUTING.md.

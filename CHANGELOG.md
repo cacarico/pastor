@@ -3,10 +3,15 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.6.0 - 2026-09-26
 
 ### Added
 
+- Tab completion offers real names in fish and bash: `pastor job describe
+  <TAB>` lists the job files, and flocks, machines, live tasks (with their
+  note) and installed connectors complete the same way. The scripts ask
+  `pastor __complete` at TAB time, which reads local files and the store and
+  never waits on the head.
 - `pastor connector describe <id> [--json]` shows one connector in full: its
   manifest, where it came from (source, ref, commit and install time for an
   installed one, the directory for a linked one and whether it still exists),
@@ -40,6 +45,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `task show` prints the place. A worktree another agent is working in (a
   fix round that joined its workspace) is not removed: auto-close keeps it
   with a note and `task close --remove-worktree` refuses.
+
+### Changed
+
+- Dependabot watches the crates and the GitHub Actions weekly, and a security
+  report goes through GitHub's private vulnerability reporting; the issue
+  template no longer offers a public fallback.
 
 ### Security
 
