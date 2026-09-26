@@ -280,6 +280,48 @@ fn completed_since_prompt(
     active && state_change_seq.is_some_and(|seq| seq > baseline)
 }
 
+/// What starts an agent's message in its pane: Claude draws `●` (`⏺` in
+/// older releases) in the first column, and indents the rest of the message
+/// by two spaces.
+const MESSAGE_MARKERS: [char; 2] = ['●', '⏺'];
+
+/// The question an agent's last message ends with, if it ends with one.
+/// herdr reports an agent that stopped to ask the same way as one that
+/// finished, idle, so the pane is the only place the difference shows.
+/// `pane` is the tail of the pane; the last message is the last block that
+/// starts with a message marker, and the question is its last paragraph
+/// when that ends in `?`. What Claude draws after it (turn summary, recap,
+/// input box, footer) starts in the first column, which ends the block, and
+/// tool output (`⎿`) is not the agent speaking. A pane with no marker (an
+/// agent that draws its messages some other way) never has a question.
+pub fn trailing_question(pane: &str) -> Option<String> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let start = lines.iter().rposition(|l| l.starts_with(MESSAGE_MARKERS))?;
+    let mut paragraphs: Vec<Vec<&str>> = vec![vec![]];
+    for (i, line) in lines[start..].iter().enumerate() {
+        let text = if i == 0 {
+            line.trim_start_matches(MESSAGE_MARKERS)
+        } else if line.trim().is_empty() {
+            if paragraphs.last().is_some_and(|p| !p.is_empty()) {
+                paragraphs.push(vec![]);
+            }
+            continue;
+        } else if let Some(rest) = line.strip_prefix("  ") {
+            rest
+        } else {
+            break;
+        };
+        let text = text.trim();
+        if !text.starts_with('⎿') {
+            paragraphs.last_mut().expect("never empty").push(text);
+        }
+    }
+    let last = paragraphs.iter().rev().find(|p| !p.is_empty())?.join(" ");
+    last.trim_end_matches(['*', '_', '`'])
+        .ends_with('?')
+        .then_some(last)
+}
+
 /// Pure transition. `None` means no change. The settle window for `Done` is the
 /// caller's job: it should confirm the agent is still idle after the window.
 pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
@@ -322,6 +364,14 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
             AgentStatus::Idle | AgentStatus::Done => {
                 if completed_since_prompt(task, *state_change_seq, *completion_seq) {
                     Done
+                } else if task.state == Blocked
+                    && task.last_completion_seq.is_some()
+                    && completion_seq.or(*state_change_seq) == task.last_completion_seq
+                {
+                    // Blocked on the question it ended its turn with (see
+                    // `trailing_question`): the agent still sits at the idle
+                    // the block was recorded at, so nobody has answered yet.
+                    return None;
                 } else if task.state == Blocked {
                     // The human answered the prompt; the agent is idle again but has not
                     // produced completed work since. Treat it as running until it does.
@@ -762,5 +812,68 @@ mod tests {
         assert_eq!(parse_task_id("x"), None);
         assert_eq!(Task::agent_name_for(7), "t-7");
         assert_eq!("blocked".parse::<TaskState>().unwrap(), TaskState::Blocked);
+    }
+
+    /// The tail of a Claude pane at the end of a turn, as herdr's
+    /// `recent_unwrapped` read gives it: the last message, the turn summary,
+    /// the recap, the input box and the footer (which has a `?` of its own).
+    fn claude_pane(message: &str) -> String {
+        format!(
+            "● Bash(make check)\n  ⎿  ok\n\n{message}\n\n✻ Baked for 6m 23s · done 11:54 PM\n\n\
+             ※ recap: Did the thing. Next: review\n  the diff. (disable recaps\n  in /config)\n\n\
+             ─────────────────────────\n❯\u{a0}\n─────────────────────────\n\
+             \u{a0} Ctx\u{a0}Used:\u{a0}14.0...\n\
+             \u{a0} ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n\
+             \u{20}                new task? /clear to save 140.6k tokens\n"
+        )
+    }
+
+    #[test]
+    fn a_last_message_that_asks_is_a_question() {
+        let pane = claude_pane(
+            "● The fix is in, but the old flag is still read\n  by the installer.\n\n  \
+             Should I remove it too, or keep it for\n  one more release?",
+        );
+        assert_eq!(
+            trailing_question(&pane).as_deref(),
+            Some("Should I remove it too, or keep it for one more release?")
+        );
+        // Markdown emphasis around the question and the older `⏺` marker.
+        let pane = claude_pane("⏺ **Which branch should I use?**");
+        assert_eq!(
+            trailing_question(&pane).as_deref(),
+            Some("**Which branch should I use?**")
+        );
+    }
+
+    #[test]
+    fn a_last_message_that_reports_is_not_a_question() {
+        let pane = claude_pane("● Is the build green? Yes: pushed the branch and stopped.");
+        assert_eq!(trailing_question(&pane), None);
+        // A question earlier in the message, then a report.
+        let pane = claude_pane("● Why did it fail?\n\n  The lock was held. Fixed and pushed.");
+        assert_eq!(trailing_question(&pane), None);
+        // A turn that ended on a tool call, and a pane with no message at all
+        // (another agent, or nothing on screen yet).
+        assert_eq!(trailing_question("● Bash(git push)\n  ⎿  done?\n"), None);
+        assert_eq!(trailing_question(&claude_pane("")), None);
+        assert_eq!(trailing_question("fake output\nready?\n"), None);
+    }
+
+    /// A task marked blocked on a question moves its baseline to the idle
+    /// it was found at; that same idle, seen again, changes nothing, while a
+    /// newer one (the agent answered and went back to work) runs again.
+    #[test]
+    fn a_blocked_task_stays_blocked_while_its_agent_sits_where_it_was() {
+        let t = task(TaskState::Blocked, Some(9));
+        assert_eq!(next_state(&t, &status(AgentStatus::Idle, Some(9))), None);
+        assert_eq!(
+            next_state(&t, &status(AgentStatus::Idle, Some(11))),
+            Some(TaskState::Running)
+        );
+        assert_eq!(
+            next_state(&t, &status(AgentStatus::Working, Some(10))),
+            Some(TaskState::Running)
+        );
     }
 }

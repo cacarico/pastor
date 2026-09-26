@@ -38,7 +38,13 @@ not forget work it saw before. An agent that went idle without pastor ever
 seeing it `working` or `blocked` (its whole working spell fell between two
 reconciles while the event was lost) stays `running` until its task goes
 `stale`: herdr's counter moves on `idle -> unknown -> idle` as well, so
-without the activity pastor cannot tell finished work from a flicker. An agent whose process exits while it sits idle
+without the activity pastor cannot tell finished work from a flicker. herdr
+shows an agent that stopped to ask something as idle too, so before it calls a
+task `done` pastor reads the last 100 lines of the pane: when the agent's last
+message (Claude's `●` block) ends in `?`, the task goes `blocked` instead, with
+`agent asked: <question>` as its error, and stays there until the agent moves
+again; answer it with `pastor task send`. Agents that draw their messages
+without that marker are never read as asking. An agent whose process exits while it sits idle
 between turns (someone typed `/exit` after the work) leaves its task `done`;
 one that exits while starting, blocked or working fails it with "agent process
 exited". Task state lives in SQLite under
@@ -550,7 +556,8 @@ A record, which is also what connector event hooks get on stdin:
 - `detail`: only on events that carry more, and absent otherwise. On
   `task.input`, `keys` (the key names pressed, Enter included), `text_len`
   (the length of any text) and `trust` (sent by `--trust`); on
-  `task.trusted`, `keys`.
+  `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
+  turn on a question, `question`.
 
 Fields may be added; none will be renamed or removed. Unreadable lines (a
 torn write, a hand edit) are skipped.

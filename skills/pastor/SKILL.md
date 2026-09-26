@@ -77,7 +77,7 @@ States:
 - `queued`: accepted, no machine has a free slot or the tag yet.
 - `starting`: pastor is creating the workspace and starting the agent.
 - `running`: the agent is working.
-- `blocked`: the agent is waiting on a permission prompt or question. Nobody answers it unless someone sends input (`pastor task send`) or attaches.
+- `blocked`: the agent is waiting on a permission prompt or question, or ended its turn on a question (the task's error reads `agent asked: ...`). Nobody answers it unless someone sends input (`pastor task send`) or attaches.
 - `done`: the agent went idle after pastor saw it work, and stayed idle for `settle` (10s by default). It means the agent stopped, not that the work is good; read the output.
 - `stale`: the timeout passed without `done`. The agent is left running.
 - `failed`: dispatch failed or the agent exited before it was done. `task show` has the error.

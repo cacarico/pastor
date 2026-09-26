@@ -42,6 +42,12 @@ down here because getting them wrong cost a day.
   an agent found working or blocked counts again, one found idle stays running
   until stale. Unreleased herdr adds `completion_seq` in the same sequence;
   pastor prefers it when present, with no activity needed.
+- herdr has no state for an agent that ended its turn on a question: it is
+  idle, exactly like one that finished. So before confirming `done`,
+  `confirm_pending_done` reads the pane (`agent.read`, 100 lines) and
+  `task::trailing_question` looks for a last `●` message ending in `?`; if so
+  the task goes `blocked` with its baseline moved to that idle, and
+  `next_state` keeps a blocked task at that same sequence where it is.
 - A herdr error reply is an API error with a code, never a dead connection.
   Only EOF before a reply, spawn failure or a non-zero exit with no reply are
   transport failures, and only those make a machine `lost`.

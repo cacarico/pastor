@@ -83,6 +83,8 @@ struct State {
     /// `agent.prompt` is accepted but the agent never acts on it: it stays idle
     /// and its `state_change_seq` does not move.
     ignore_prompts: bool,
+    /// pane id -> what `agent.read` shows of it (`set_pane_text`).
+    pane_text: HashMap<String, String>,
     /// How many of the next `agent.start` calls answer `agent_pane_busy`, as
     /// herdr does while a new pane's shell is still starting.
     pane_busy_for: u32,
@@ -349,6 +351,16 @@ impl FakeHerdr {
     /// working on it, as if the text never reached it.
     pub fn ignore_prompts(&self, yes: bool) {
         self.state.lock().unwrap().ignore_prompts = yes;
+    }
+
+    /// What `agent.read` answers for the agent in `pane_id` from now on,
+    /// instead of `fake output`.
+    pub fn set_pane_text(&self, pane_id: &str, text: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .pane_text
+            .insert(pane_id.into(), text.into());
     }
 
     /// Change an agent's status and publish `pane.agent_status_changed`, as
@@ -892,7 +904,16 @@ impl FakeHerdr {
                 }
                 Ok(json!({"type": "ok"}))
             }
-            "agent.read" => Ok(json!({"type": "pane_read", "read": {"text": "fake output\n"}})),
+            "agent.read" => {
+                let target = p["target"].as_str().unwrap_or("");
+                let text = s
+                    .agents
+                    .values()
+                    .find(|a| a.name.as_deref() == Some(target) || a.pane_id == target)
+                    .and_then(|a| s.pane_text.get(&a.pane_id))
+                    .map_or("fake output\n", String::as_str);
+                Ok(json!({"type": "pane_read", "read": {"text": text}}))
+            }
             // herdr 0.9.1: `pane.split {target_pane_id, direction, cwd, env}`
             // answers `pane_info` with the new pane, in the target's workspace.
             "pane.split" => {

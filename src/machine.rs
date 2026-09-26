@@ -2019,9 +2019,66 @@ impl Actor {
                     .insert(id, (Some(agent.state_change_seq), Instant::now()));
                 continue;
             }
-            self.apply(task, &observed_from(agent));
+            let observed = observed_from(agent);
+            if next_state(&task, &observed) == Some(TaskState::Done)
+                && let Some(question) = self.question_in_pane(&task).await
+            {
+                self.block_on_question(task, &observed, question);
+                continue;
+            }
+            self.apply(task, &observed);
         }
         Ok(())
+    }
+
+    /// The question the task's agent ended its turn with, read from the tail
+    /// of its pane (`task::trailing_question`). A pane that cannot be read
+    /// has no question: the task is done as it would have been without this
+    /// check, and a dead machine shows up on the next request anyway.
+    async fn question_in_pane(&self, task: &Task) -> Option<String> {
+        let target = task.agent_name.as_deref()?;
+        let timeout = self.settings.request_timeout;
+        match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
+            Ok(Ok(text)) => crate::task::trailing_question(&text),
+            Ok(Err(err)) => {
+                tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a question");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(machine = %self.name, task = %task.display_id(), "read pane for a question timed out");
+                None
+            }
+        }
+    }
+
+    /// Mark a task whose agent went idle on a question `blocked` instead of
+    /// `done`, so `task send` can answer it. The baseline moves to the idle it
+    /// was found at, as a completion would move it, so `next_state` holds the
+    /// task here until the agent moves again, and the answer's own work is
+    /// what finishes it next.
+    fn block_on_question(&mut self, mut task: Task, observed: &Observed, question: String) {
+        if let Observed::Status {
+            state_change_seq,
+            completion_seq,
+            ..
+        } = observed
+        {
+            task.last_completion_seq = completion_seq.or(*state_change_seq);
+        }
+        task.activity_seen = false;
+        task.state = TaskState::Blocked;
+        task.finished_at = None;
+        task.error = Some(format!("agent asked: {question}"));
+        if let Err(err) = self.store.update_task(&mut task) {
+            tracing::error!(%err, "update task");
+            return;
+        }
+        self.emit_with(
+            "task.blocked",
+            Some(task.id),
+            Some(serde_json::json!({ "question": question })),
+        );
+        self.refresh_live();
     }
 
     /// Remember whether the agent of task `id` is between turns; see
@@ -2785,6 +2842,67 @@ mod tests {
         wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
         wait_for("live 0", || h.snapshot().live == 0).await;
         let _ = h.read(t.id, 10).await.unwrap_err();
+    }
+
+    /// An agent that ends its turn on a question goes idle just like one that
+    /// finished: pastor reads the pane and marks the task blocked, with the
+    /// question as its error, and keeps it there until the agent moves. The
+    /// same agent answered, working and idle again with a plain report, is
+    /// done.
+    #[tokio::test]
+    async fn a_turn_that_ends_on_a_question_is_blocked_not_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(200);
+        let (h, mut events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(
+            &pane,
+            "● Two ways to do this.\n\n  Should I keep the old flag?\n\n✻ Baked for 1m\n\n❯\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            row.error.as_deref(),
+            Some("agent asked: Should I keep the old flag?")
+        );
+        assert_eq!(row.finished_at, None);
+        let ev = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if ev.kind != "task.running" {
+                break ev;
+            }
+        };
+        assert_eq!(ev.kind, "task.blocked");
+        assert_eq!(
+            ev.detail,
+            Some(serde_json::json!({"question": "Should I keep the old flag?"}))
+        );
+
+        // Idle events and reconciles at the same sequence leave it blocked.
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 4).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+
+        // `task send` answered it: the agent works, reports and goes idle.
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        assert_eq!(store.get_task(t.id).unwrap().unwrap().error, None);
+        fake.set_pane_text(&pane, "● Kept it. Pushed the branch.\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
     }
 
     /// herdr rejects a prompt to a blocked agent instead of queueing it, so
