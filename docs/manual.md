@@ -703,7 +703,8 @@ kept as `<label>.plist.bak`; a loaded agent keeps the old one until you
 On macOS pastor uses the same XDG layout as Linux (`~/.config/pastor`,
 `~/.local/state/pastor`, `~/.local/share/pastor`), next to herdr's own
 `~/.config/herdr`. A config left in `~/Library/Application Support/pastor` by
-an older pastor is moved there on the first run, with a note on stderr. That
+an older pastor is moved there on the first run, with a note on stderr,
+unless `PASTOR_CONFIG_DIR` or `XDG_CONFIG_HOME` points the config elsewhere. That
 pastor still said plugins: the checkouts it kept in `plugins/` go to
 `~/.local/share/pastor/connectors` and their `.env` files to
 `~/.config/pastor/connectors`. Rename each `pastor-plugin.toml` to

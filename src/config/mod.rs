@@ -181,16 +181,31 @@ fn xdg_dir(
 
 /// Where pastor kept its config and connector checkouts on macOS before it
 /// followed the XDG layout there: `~/Library/Application Support/pastor`.
-/// `None` off macOS, and when an override says where the files are, because
-/// then nothing was ever read from the old place.
+/// `None` off macOS, and when `PASTOR_CONFIG_DIR` or `XDG_CONFIG_HOME` moves
+/// the config dir: then the config is read from where the user said, not from
+/// the default the old one would move to. A data or state override alone
+/// leaves the config at its default, so the move still happens.
 pub fn legacy_macos_dir() -> Option<PathBuf> {
-    if !cfg!(target_os = "macos")
-        || std::env::var_os("PASTOR_CONFIG_DIR").is_some()
-        || std::env::var_os("PASTOR_DATA_DIR").is_some()
-    {
+    legacy_dir(
+        cfg!(target_os = "macos"),
+        std::env::var_os("PASTOR_CONFIG_DIR"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        dirs::home_dir(),
+    )
+}
+
+fn legacy_dir(
+    macos: bool,
+    config_override: Option<std::ffi::OsString>,
+    xdg_config: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    // The same rule `xdg_dir` applies: only an absolute value moves it.
+    let xdg_moves_config = xdg_config.is_some_and(|v| Path::new(&v).is_absolute());
+    if !macos || config_override.is_some() || xdg_moves_config {
         return None;
     }
-    dirs::home_dir().map(|h| h.join("Library/Application Support/pastor"))
+    home.map(|h| h.join("Library/Application Support/pastor"))
 }
 
 /// Marks a legacy move that has not finished: written into the legacy dir
@@ -1418,6 +1433,21 @@ mod tests {
         if !cfg!(target_os = "macos") {
             assert_eq!(legacy_macos_dir(), None);
         }
+    }
+
+    #[test]
+    fn only_a_config_override_skips_the_legacy_move() {
+        let home = || Some(PathBuf::from("/Users/u"));
+        let legacy = Some(PathBuf::from("/Users/u/Library/Application Support/pastor"));
+        assert_eq!(legacy_dir(true, None, None, home()), legacy);
+        // A data or state override does not move the config, so it is not
+        // passed here and the move still happens.
+        assert_eq!(legacy_dir(false, None, None, home()), None);
+        assert_eq!(legacy_dir(true, Some("/c".into()), None, home()), None);
+        assert_eq!(legacy_dir(true, None, Some("/xdg".into()), home()), None);
+        // A relative XDG_CONFIG_HOME is ignored, so the config stays put.
+        assert_eq!(legacy_dir(true, None, Some("rel".into()), home()), legacy);
+        assert_eq!(legacy_dir(true, None, None, None), None);
     }
 
     fn legacy_layout(tmp: &Path) -> (PathBuf, Paths) {
