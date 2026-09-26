@@ -122,6 +122,10 @@ struct State {
     trust_redraw: Duration,
     /// pane id -> when its trust question was answered.
     trust_answered: HashMap<String, Instant>,
+    /// How many of the next `pane.list` calls find their workspace gone
+    /// (see `vanish_on_pane_list`), and whether it closes for real.
+    pane_list_gone: u32,
+    pane_list_closes: bool,
 }
 
 /// herdr 0.9.1 derives `agent_status` from a detected state (idle, working,
@@ -242,6 +246,14 @@ impl FakeHerdr {
     /// t-50 on the real fleet, 2026-09-25).
     pub fn set_pane_busy_for(&self, n: u32) {
         self.state.lock().unwrap().pane_busy_for = n;
+    }
+    /// The next `n` `pane.list` calls answer `workspace_not_found`, as when
+    /// the workspace closes between `workspace.list` and them. With `close`
+    /// it really closes, label and all; without, it is back for the next.
+    pub fn vanish_on_pane_list(&self, n: u32, close: bool) {
+        let mut s = self.state.lock().unwrap();
+        s.pane_list_gone = n;
+        s.pane_list_closes = close;
     }
     /// The next request for `method` gets no reply; the connection just stops
     /// answering, as if the herdr process wedged. Lets tests exercise a client-side
@@ -808,6 +820,18 @@ impl FakeHerdr {
             // workspace's panes, `workspace_not_found` for one it lacks.
             "pane.list" => {
                 let ws = p["workspace_id"].as_str().unwrap_or("");
+                if s.pane_list_gone > 0 {
+                    s.pane_list_gone -= 1;
+                    if s.pane_list_closes {
+                        s.workspaces.remove(ws);
+                        s.panes.remove(ws);
+                        s.labels.remove(ws);
+                    }
+                    return Err((
+                        "workspace_not_found".into(),
+                        format!("workspace {ws} not found"),
+                    ));
+                }
                 let Some(panes) = s.panes.get(ws) else {
                     return Err((
                         "workspace_not_found".into(),

@@ -268,6 +268,10 @@ retry`, to move a retry), `place = "..."` in a job's `[dispatch]`, `place` under
 - `pane:<workspace>`: a pane in the workspace with that label. A machine with
   no such workspace fails the task before anything is made.
 
+A `pastor` or `pane:<workspace>` workspace that closes while pastor places the
+task is looked up once more; still gone, the task fails (`pastor` is made
+again instead), and it never lands in a workspace of its own.
+
 A pane in a workspace the task did not make is still the task's own: the
 task records that pane and that workspace, and `task close` and auto-close
 close only the pane, never the workspace or its other panes (herdr still

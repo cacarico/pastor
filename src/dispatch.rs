@@ -272,6 +272,8 @@ const PASTOR_WORKSPACE: &str = "pastor";
 /// - `pastor`: the machine's workspace labelled `pastor`, made on first use.
 /// - `pane:<label>`: the workspace with that label; refused when there is
 ///   none, before anything is made.
+///
+/// Only `repo` ever answers `None` for a workspace that closes midway.
 async fn host_workspace(
     conn: &dyn Connector,
     spec: &DispatchSpec,
@@ -283,54 +285,71 @@ async fn host_workspace(
             .find(|w| w.label.as_deref() == Some(label))
             .map(|w| w.workspace_id.clone())
     };
-    let workspace = match &spec.place {
-        Place::Own => return Ok(None),
-        Place::Repo => {
-            let Some(repo) = repo.filter(|_| !spec.worktree) else {
-                return Ok(None);
-            };
-            let showing = conn.workspace_list().await?.into_iter().find(|w| {
-                w.worktree
-                    .as_ref()
-                    .is_some_and(|c| same_dir(&c.checkout_path, repo))
-            });
-            match showing {
-                Some(w) => w.workspace_id,
-                None => return Ok(None),
+    // A workspace can close between `workspace.list` and `pane.list`. Only
+    // `repo` may then fall back to a workspace of the task's own; a named
+    // one is looked up once more (`pastor` is made again if it is gone),
+    // and still gone fails the task rather than put it somewhere else.
+    for _ in 0..2 {
+        let workspace = match &spec.place {
+            Place::Own => return Ok(None),
+            Place::Repo => {
+                let Some(repo) = repo.filter(|_| !spec.worktree) else {
+                    return Ok(None);
+                };
+                let showing = conn.workspace_list().await?.into_iter().find(|w| {
+                    w.worktree
+                        .as_ref()
+                        .is_some_and(|c| same_dir(&c.checkout_path, repo))
+                });
+                match showing {
+                    Some(w) => w.workspace_id,
+                    None => return Ok(None),
+                }
             }
+            Place::Pastor => match labelled(PASTOR_WORKSPACE, &conn.workspace_list().await?) {
+                Some(ws) => ws,
+                None => {
+                    let created = conn
+                        .workspace_create(None, PASTOR_WORKSPACE, &Default::default())
+                        .await?;
+                    return Ok(Some(Host {
+                        workspace_id: created.workspace.workspace_id,
+                        pane_id: created.root_pane.pane_id,
+                    }));
+                }
+            },
+            Place::Pane(label) => match labelled(label, &conn.workspace_list().await?) {
+                Some(ws) => ws,
+                None => {
+                    return Err(DispatchError::Task(format!(
+                        "place pane:{label}: no workspace named {label} on {}",
+                        machine.unwrap_or("this machine")
+                    )));
+                }
+            },
+        };
+        // A workspace always has a pane while it is open.
+        match conn.pane_list(&workspace).await {
+            Ok(panes) => {
+                if let Some(p) = panes.into_iter().next() {
+                    return Ok(Some(Host {
+                        workspace_id: workspace,
+                        pane_id: p.pane_id,
+                    }));
+                }
+            }
+            Err(err) if err.code() == Some("workspace_not_found") => {}
+            Err(err) => return Err(err.into()),
         }
-        Place::Pastor => match labelled(PASTOR_WORKSPACE, &conn.workspace_list().await?) {
-            Some(ws) => ws,
-            None => {
-                let created = conn
-                    .workspace_create(None, PASTOR_WORKSPACE, &Default::default())
-                    .await?;
-                return Ok(Some(Host {
-                    workspace_id: created.workspace.workspace_id,
-                    pane_id: created.root_pane.pane_id,
-                }));
-            }
-        },
-        Place::Pane(label) => match labelled(label, &conn.workspace_list().await?) {
-            Some(ws) => ws,
-            None => {
-                return Err(DispatchError::Task(format!(
-                    "place pane:{label}: no workspace named {label} on {}",
-                    machine.unwrap_or("this machine")
-                )));
-            }
-        },
-    };
-    // A workspace always has a pane while it is open; one that closed
-    // since the listing is a workspace of the task's own, as if none showed.
-    match conn.pane_list(&workspace).await {
-        Ok(panes) => Ok(panes.into_iter().next().map(|p| Host {
-            workspace_id: workspace,
-            pane_id: p.pane_id,
-        })),
-        Err(err) if err.code() == Some("workspace_not_found") => Ok(None),
-        Err(err) => Err(err.into()),
+        if spec.place == Place::Repo {
+            return Ok(None);
+        }
     }
+    Err(DispatchError::Task(format!(
+        "place {}: its workspace closed while pastor placed the task on {}",
+        spec.place,
+        machine.unwrap_or("this machine")
+    )))
 }
 
 /// Do two paths name the same directory? herdr reports a checkout's path
@@ -1634,6 +1653,52 @@ mod tests {
                 err.to_string().contains("no workspace named play on pi-1"),
                 "{err}"
             );
+            let made = methods(&fake);
+            assert!(
+                !made
+                    .iter()
+                    .any(|m| m.ends_with(".create") || m == "pane.split"),
+                "{made:?}"
+            );
+        }
+    }
+
+    /// A named workspace that closes between `workspace.list` and
+    /// `pane.list` is looked up once more, and never swapped for a
+    /// workspace of the task's own: a blip passes, a workspace gone for
+    /// good or still gone the second time fails the task.
+    #[tokio::test]
+    async fn place_pane_never_falls_back_to_a_workspace_of_its_own() {
+        // A blip: the second look finds it.
+        let fake = FakeHerdr::new();
+        let ws = fake.open_user_workspace("work", None);
+        fake.vanish_on_pane_list(1, false);
+        let mut t = task(DispatchSpec {
+            place: Place::Pane("work".into()),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        assert_eq!(t.workspace_id.as_deref(), Some(ws.as_str()));
+
+        for (n, close, why) in [
+            (1, true, "no workspace named work"),
+            (2, false, "closed while"),
+        ] {
+            let fake = FakeHerdr::new();
+            fake.open_user_workspace("work", None);
+            fake.vanish_on_pane_list(n, close);
+            let mut t = task(DispatchSpec {
+                place: Place::Pane("work".into()),
+                ..spec()
+            });
+            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+                .await
+                .unwrap_err();
+            assert!(!err.is_transport());
+            assert_eq!(t.state, TaskState::Failed);
+            assert!(err.to_string().contains(why), "{err}");
             let made = methods(&fake);
             assert!(
                 !made
