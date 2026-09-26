@@ -185,15 +185,65 @@ fn save(
         crate::config::create_private_dir(parent)?;
     }
     let mode = std::fs::metadata(real).map_or(0o600, |m| m.permissions().mode() & 0o7777);
-    let mut tmp = real.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-        .with_context(|| format!("chmod {}", tmp.display()))?;
-    std::fs::rename(&tmp, real).with_context(|| format!("rename to {}", real.display()))?;
+    let tmp = write_temp(real, text, mode)?;
+    if let Err(e) =
+        std::fs::rename(&tmp, real).with_context(|| format!("rename to {}", real.display()))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     let _ = std::fs::remove_file(copy);
     Ok(Outcome::Saved)
+}
+
+/// `text` in a new file beside `real`, with `mode`, ready to be renamed
+/// over it. The name is unique and the file is created exclusively without
+/// following a symlink, so nothing planted at a temp name can redirect the
+/// write or the chmod. Hidden and not `*.toml`, so no loader picks it up.
+/// Removed again if anything fails.
+fn write_temp(real: &Path, text: &str, mode: u32) -> anyhow::Result<PathBuf> {
+    let dir = real
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = real
+        .file_name()
+        .map_or_else(|| "edit".into(), |n| n.to_string_lossy().into_owned());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    for attempt in 0..16 {
+        let tmp = dir.join(format!(
+            ".{name}.{}-{stamp}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let mut f = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("create {}", tmp.display())),
+        };
+        let written = f
+            .write_all(text.as_bytes())
+            .and_then(|()| f.set_permissions(std::fs::Permissions::from_mode(mode)))
+            .and_then(|()| f.sync_all());
+        if let Err(e) = written {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("write {}", tmp.display()));
+        }
+        return Ok(tmp);
+    }
+    Err(anyhow::anyhow!(
+        "no free temp name for {} in {}",
+        name,
+        dir.display()
+    ))
 }
 
 /// `text` with the error on top, as comments pastor takes off again.

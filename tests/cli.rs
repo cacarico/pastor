@@ -3214,3 +3214,32 @@ fn edit_leaves_an_existing_parent_dir_mode_alone() {
     let mode = std::fs::metadata(&o2.config).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
 }
+
+/// Copilot 4109415047: the file is written through a fresh temp file made
+/// with exclusive creation, so a symlink planted at a predictable temp name
+/// cannot redirect the write, or the chmod after it, to another file.
+#[test]
+fn edit_never_writes_through_a_planted_temp_symlink() {
+    use std::os::unix::fs::PermissionsExt;
+    let o = offline();
+    let job = o.config.join("jobs/nightly.toml");
+    let victim = o.tmp.path().join("victim");
+    std::fs::write(&victim, "untouched\n").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let planted = o.config.join("jobs/nightly.toml.tmp");
+    std::os::unix::fs::symlink(&victim, &planted).unwrap();
+    let edited = NIGHTLY.replace("1h", "6h");
+    ok(o.edit(&o.editor(&[&edited]), &["job", "edit", "nightly"], ""));
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), edited);
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched\n");
+    let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o644);
+    // No temp file of pastor's is left beside the job.
+    let mut left: Vec<_> = std::fs::read_dir(o.config.join("jobs"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| !n.ends_with(".lock"))
+        .collect();
+    left.sort();
+    assert_eq!(left, ["nightly.toml", "nightly.toml.tmp"]);
+}
