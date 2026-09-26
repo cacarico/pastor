@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.5.0 - 2026-09-26
 
 ### Added
 
@@ -176,6 +176,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- An agent that ends its turn on a question is marked `blocked` with the
+  question as its error, not `done` with nothing pushed; `pastor task send`
+  answers it. A pane read lost to a dropped connection keeps the task pending
+  instead of settling it.
+- Auto-close keeps a worktree whose commits are on no remote, closes the pane
+  and notes the branch on the task, as it does for uncommitted changes.
+- After a trust answer (`pastor task send --trust` or the head's own), the
+  task's prompt is held for `settle` before it is sent. Claude redraws its
+  prompt box then, and a prompt sent into that window was lost, leaving the
+  agent at an empty input.
+- `pastor machine list` refreshes a machine's pastor version while it stays
+  connected, so an upgrade shows without restarting the head.
+- The first `flock add --default` on a file without `[[flock]]` entries moves
+  the machines that name no flock into the new flock, instead of writing them
+  into an explicit `default` flock. Machines stay while tasks are queued in
+  the implicit flock, and the output names those tasks.
+- Connector commands (`install`, `link`, `uninstall`, `unlink`) reuse the
+  CLI's head check instead of probing the head a second time.
+- A prerelease build (`0.5.0-rc.1`) no longer panics on its own version: it
+  compares as the release it leads to for `min_pastor_version`.
 - A `local = true` machine on macOS finds herdr's socket under
   `~/.config/herdr`, where herdr puts it.
 - The ssh ControlPath length check uses macOS's 104-byte socket path limit

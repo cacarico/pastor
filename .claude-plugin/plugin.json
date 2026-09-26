@@ -1,6 +1,6 @@
 {
   "name": "pastor",
-  "version": "0.5.0-rc.1",
+  "version": "0.5.0",
   "description": "Skills for driving pastor, a daemon that runs coding agents on a fleet of machines through herdr.",
   "homepage": "https://github.com/cacarico/pastor",
   "repository": "https://github.com/cacarico/pastor",
