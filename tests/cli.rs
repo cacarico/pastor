@@ -775,6 +775,7 @@ fn setup_systemd_yes_installs_without_a_prompt() {
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
     let xdg = tmp.path().join("xdg");
+    let data = tmp.path().join("data");
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let calls = tmp.path().join("systemctl.log");
@@ -803,6 +804,8 @@ fn setup_systemd_yes_installs_without_a_prompt() {
             .args(["setup", "systemd", flag])
             .env("PATH", &path)
             .env("XDG_CONFIG_HOME", &xdg)
+            .env("XDG_DATA_HOME", &data)
+            .env_remove("PASTOR_DATA_DIR")
             .env("PASTOR_CONFIG_DIR", &config)
             .env("PASTOR_STATE_DIR", &state)
             .stdin(Stdio::null())
@@ -819,6 +822,19 @@ fn setup_systemd_yes_installs_without_a_prompt() {
             xdg.join("systemd/user/pastor.service").exists(),
             "{flag} should install the unit"
         );
+        // A head started at login must use the dirs this run used, including
+        // a data dir that came from XDG_DATA_HOME rather than an override.
+        let unit = std::fs::read_to_string(xdg.join("systemd/user/pastor.service")).unwrap();
+        for (var, dir) in [
+            ("PASTOR_CONFIG_DIR", config.clone()),
+            ("PASTOR_STATE_DIR", state.clone()),
+            ("PASTOR_DATA_DIR", data.join("pastor")),
+        ] {
+            assert!(
+                unit.contains(&format!("{var}={}", dir.display())),
+                "{flag} unit lacks {var}:\n{unit}"
+            );
+        }
         let calls = std::fs::read_to_string(&calls).unwrap();
         assert!(calls.contains("--user daemon-reload"), "{calls}");
         assert!(

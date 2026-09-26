@@ -173,6 +173,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `~/.config/herdr`, where herdr puts it.
 - The ssh ControlPath length check uses macOS's 104-byte socket path limit
   there, not Linux's 108, so a long state dir no longer breaks multiplexing.
+- `pastor setup systemd` and `pastor setup launchd` write the effective
+  config, state and data dirs into the pastor service as absolute
+  `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR`, so a head
+  started at login uses the dirs the setup run used, not only when an override
+  was set.
 
 ## 0.4.0 - 2026-09-25
 

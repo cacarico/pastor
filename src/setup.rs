@@ -139,7 +139,7 @@ pub fn cli(paths: &Paths, cmd: SetupCmd) -> anyhow::Result<()> {
 }
 
 /// The binary a unit runs and the environment it gets: the PATH of this shell,
-/// plus, for pastor, any dir override the shell runs with.
+/// plus, for pastor, the dirs this shell resolves.
 fn exec_and_env(unit: Unit, paths: &Paths) -> anyhow::Result<(PathBuf, Vec<(String, String)>)> {
     let path_var = std::env::var("PATH").unwrap_or_default();
     let exec = match unit {
@@ -149,19 +149,27 @@ fn exec_and_env(unit: Unit, paths: &Paths) -> anyhow::Result<(PathBuf, Vec<(Stri
     };
     let mut env = vec![("PATH".to_string(), path_var)];
     if unit == Unit::Pastor {
-        // An override the shell runs with has to reach the daemon too, or the
-        // service would serve a different config and store than the CLI reads.
-        for (var, dir) in [
-            ("PASTOR_CONFIG_DIR", &paths.config_dir),
-            ("PASTOR_STATE_DIR", &paths.state_dir),
-        ] {
-            if std::env::var_os(var).is_some() {
-                let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.clone());
-                env.push((var.to_string(), dir.to_string_lossy().into_owned()));
-            }
-        }
+        env.extend(dir_env(paths));
     }
     Ok((exec, env))
+}
+
+/// The config, state and data dirs as absolute `PASTOR_*_DIR` values. A
+/// service does not see this shell's overrides or XDG variables, so without
+/// them the daemon could serve a different config, store and connector set than
+/// the CLI reads.
+fn dir_env(paths: &Paths) -> Vec<(String, String)> {
+    [
+        ("PASTOR_CONFIG_DIR", &paths.config_dir),
+        ("PASTOR_STATE_DIR", &paths.state_dir),
+        ("PASTOR_DATA_DIR", &paths.data_dir),
+    ]
+    .into_iter()
+    .map(|(var, dir)| {
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.clone());
+        (var.to_string(), dir.to_string_lossy().into_owned())
+    })
+    .collect()
 }
 
 fn ask(plan: &Plan, yes: bool) -> anyhow::Result<()> {
@@ -854,6 +862,27 @@ mod tests {
             ]
         );
         assert!(text.contains("Restart=always\n"));
+    }
+
+    /// The service gets every effective dir, absolute, whether it came from an
+    /// override, an XDG variable or the default, so a head started at login
+    /// uses the same config, state and data as the shell that ran setup.
+    #[test]
+    fn dir_env_names_all_three_dirs_absolute() {
+        let paths = Paths::new("rel/config", "/abs/state").with_data_dir("/abs/data");
+        let env = dir_env(&paths);
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            env,
+            [
+                (
+                    "PASTOR_CONFIG_DIR".to_string(),
+                    cwd.join("rel/config").to_string_lossy().into_owned()
+                ),
+                ("PASTOR_STATE_DIR".to_string(), "/abs/state".to_string()),
+                ("PASTOR_DATA_DIR".to_string(), "/abs/data".to_string()),
+            ]
+        );
     }
 
     #[test]

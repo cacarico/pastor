@@ -669,7 +669,11 @@ stops one for good, since systemd does not restart after an explicit stop.
 Setup points `ExecStart`
 at the binary it finds (the running pastor, or `herdr` on PATH) and copies your
 shell's `PATH` into the unit, so `ssh`, `herdr` and the agents resolve under
-systemd the way they do in a terminal; re-run it after moving a binary. A unit
+systemd the way they do in a terminal; re-run it after moving a binary.
+`pastor.service` also gets the config, state and data dirs this run resolved,
+as absolute `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR`, so
+the head uses the same dirs as the shell that set it up, whether they came from
+an override, an XDG variable or the default. A unit
 that differs from what setup would write is kept as `<unit>.service.bak`, and a
 running service is not restarted, since restarting herdr stops its agents: run
 `systemctl --user restart pastor` (or `herdr`) yourself.
@@ -685,7 +689,8 @@ socket and connector `.env` files to 0600, and says what it changed.
 same ask-first prompt. It writes `contrib/launchd/pastor.plist` to
 `~/Library/LaunchAgents/pastor.serve.plist` (label `pastor.serve`; with
 `--herdr`, `pastor.herdr` from `contrib/launchd/herdr.plist`), pointing
-ProgramArguments at the binary it finds and copying your shell's `PATH` into
+ProgramArguments at the binary it finds and copying your shell's `PATH` (and,
+for pastor, the three absolute `PASTOR_*_DIR` values) into
 EnvironmentVariables. Output goes to `~/Library/Logs/<label>.log`. The actions
 run in your `gui/<uid>` domain: `--enable` is `launchctl enable`, `--start`
 is `launchctl bootstrap` (or `kickstart` when the agent is already loaded),
