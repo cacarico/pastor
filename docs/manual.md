@@ -286,8 +286,11 @@ Removing that worktree (`--remove-worktree`, or auto-close of a clean one)
 closes the task's pane, has herdr open a workspace on the checkout
 (`worktree.open`) and removes that; when herdr refuses (uncommitted changes),
 the workspace it opened is closed again and the checkout stays. When a
-workspace already shows the checkout, herdr answers that one, and pastor
-leaves it open whatever happens.
+workspace already shows the checkout, herdr answers that one, and removing
+the checkout would close it: pastor did not open it, so the checkout stays
+and the task closes with a note to remove it with `git worktree remove`
+(its workspace is kept on the row, so `--remove-worktree` can try again
+once that workspace is gone).
 
 Since a fix round joins the workspace of the worktree it works in, removing
 that worktree would end the fix round too. While another agent is in the

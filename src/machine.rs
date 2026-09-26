@@ -1609,10 +1609,25 @@ impl Actor {
             }
             close_pane = false;
             match self.open_checkout(t, &name).await? {
+                // One already showing the checkout is someone else's, and
+                // `worktree.remove` takes the checkout by closing it: the
+                // checkout stays, noted for removal by hand, as a dirty one.
+                // With an agent in it, the check below says who.
+                Some(created)
+                    if created.already_open
+                        && !agents
+                            .iter()
+                            .any(|a| a.workspace_id == created.workspace.workspace_id) =>
+                {
+                    let why = format!(
+                        "workspace {} shows it and pastor did not open it",
+                        created.workspace.workspace_id
+                    );
+                    note = Some(worktree_kept_note(t, &name, &why));
+                    keep_worktree = true;
+                }
                 Some(created) => {
                     workspace = Some(created.workspace.workspace_id);
-                    // One already showing the checkout is not pastor's to
-                    // close again when the checkout stays.
                     if !created.already_open {
                         reopened = Some(created.root_pane.pane_id);
                     }
@@ -1624,9 +1639,8 @@ impl Actor {
         // Under `place = "repo"` a task whose `--repo` is this checkout (a
         // fix round) joins this workspace, and `worktree.remove` would take
         // its agent and its checkout with it; so would a workspace someone
-        // already had open on a shared task's checkout, which is what
-        // `worktree.open` answers then. The checkout stays while another
-        // agent works there. A workspace `worktree.open` just made is not in
+        // opened on a shared task's checkout, with an agent in it. The
+        // checkout stays while another agent works there. A workspace `worktree.open` just made is not in
         // `agents`, listed before it existed.
         if remove_worktree
             && !keep_worktree
@@ -1725,6 +1739,12 @@ impl Actor {
                     t.workspace_id = None;
                 }
                 self.finish_auto_close(t, note)
+            }
+            // Kept, not removed: the row keeps its workspace, so another
+            // `--remove-worktree` tries again once the checkout is free.
+            Some(t) if remove_worktree && keep_worktree => {
+                let note = note.expect("a kept worktree has a note");
+                self.finish_close_with_note(t, note)
             }
             Some(mut t) if remove_worktree => {
                 t.workspace_id = None;
@@ -4105,6 +4125,67 @@ mod tests {
                 fake.agents()
                     .iter()
                     .any(|a| a.name.as_deref() == Some("mine"))
+            );
+        }
+    }
+
+    /// A worktree task in a shared workspace whose checkout someone has open
+    /// with nobody at work in it: `worktree.open` answers that workspace with
+    /// `already_open`, and `worktree.remove` would close it. pastor did not
+    /// open it, so the checkout stays with a note to remove it by hand, for
+    /// `--remove-worktree` and auto-close alike, and the workspace keeps every
+    /// pane it had.
+    #[tokio::test]
+    async fn a_shared_task_worktree_already_open_elsewhere_is_never_removed() {
+        for auto in [false, true] {
+            let fake = FakeHerdr::new();
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = spawn_with_settings(
+                &fake,
+                &store,
+                if auto {
+                    auto_close_settings()
+                } else {
+                    settings()
+                },
+            );
+            wait_for("connected", || {
+                h.snapshot().channel == ChannelState::Connected
+            })
+            .await;
+            let t = h
+                .dispatch(placed_task(&store, Place::Pastor, true).id)
+                .await
+                .unwrap();
+            let checkout = t.spec.checkout.clone().unwrap();
+            let ws = fake
+                .worktree_open("/r", &checkout.branch, "mine")
+                .await
+                .unwrap()
+                .workspace
+                .workspace_id;
+            let before = fake.panes(&ws);
+
+            if auto {
+                fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+                wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+            } else {
+                let closed = h.close(t.id, true).await.unwrap();
+                assert_eq!(closed.state, TaskState::Closed);
+            }
+            let row = store.get_task(t.id).unwrap().unwrap();
+            let note = row.error.as_deref().unwrap_or_default();
+            assert!(note.contains("worktree kept"), "auto {auto}: {row:?}");
+            assert!(note.contains("git worktree remove"), "auto {auto}: {row:?}");
+            assert!(calls(&fake, "worktree.remove").is_empty(), "auto {auto}");
+            assert_eq!(fake.panes(&ws), before, "auto {auto}");
+            assert_eq!(fake.worktree_list("/r").await.unwrap().len(), 1);
+            assert!(
+                !fake
+                    .agents()
+                    .iter()
+                    .any(|a| a.pane_id == t.pane_id.clone().unwrap()),
+                "auto {auto}: the task's own pane goes"
             );
         }
     }
