@@ -214,7 +214,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_sub
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from systemd" -s y -l yes -d 'Skip the confirmation prompt; needed when stdin is not a terminal (a script, a task, `ssh host pastor setup systemd`)'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from systemd" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from launchd" -l herdr -d 'Install pastor.herdr (the herdr server) instead, for a flock machine'
-complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from launchd" -l enable -d 'Enable the agent at login'
+complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from launchd" -l enable -d 'Enable the agent at login; one not loaded yet is loaded, which starts it'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from launchd" -l start -d 'Start the agent now'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from launchd" -l now -d 'With --enable, start the agent now too'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and __fish_seen_subcommand_from launchd" -l stop -d 'Stop the agent now'

@@ -97,6 +97,12 @@ impl std::fmt::Display for Report {
             }
         }
         writeln!(f, "ran launchd action: {} {label}", self.action)?;
+        if self.action == Action::Enable && !self.was_loaded {
+            writeln!(
+                f,
+                "{label} was not loaded, so enabling loaded it, which starts it: launchd cannot register an agent without loading it"
+            )?;
+        }
         writeln!(f, "logs go to {}", self.log_path.display())?;
         writeln!(
             f,
@@ -140,7 +146,12 @@ impl Install {
             }
         };
         let calls: Vec<Vec<&str>> = match self.action {
-            Action::Enable => vec![vec!["enable", &target]],
+            // launchd has no way to register an agent without loading it,
+            // and loading one with RunAtLoad starts it; an agent that is not
+            // loaded would otherwise wait for the next login. Enable first:
+            // a disabled agent cannot be bootstrapped.
+            Action::Enable if was_loaded => vec![vec!["enable", &target]],
+            Action::Enable => vec![vec!["enable", &target], vec!["bootstrap", &domain, &plist]],
             Action::Start => start(was_loaded),
             Action::EnableStart | Action::EnableNow => {
                 let mut calls = vec![vec!["enable", target.as_str()]];
@@ -420,14 +431,39 @@ mod tests {
         );
     }
 
+    /// launchd cannot register an agent without loading it, and loading one
+    /// with RunAtLoad starts it, so --enable on an unloaded agent clears any
+    /// disable and then bootstraps it: the help and the manual say so.
     #[test]
-    fn enable_alone_does_not_start() {
+    fn enable_loads_an_unloaded_agent() {
         let e = env();
         let runner = launchd(false);
-        e.install(Unit::Pastor, Action::Enable)
+        let report = e
+            .install(Unit::Pastor, Action::Enable)
+            .run(&runner, &e.paths)
+            .unwrap();
+        let plist = e.tmp.path().join("LaunchAgents/pastor.serve.plist");
+        assert_eq!(
+            actions(&runner),
+            [
+                "launchctl enable gui/501/pastor.serve".to_string(),
+                format!("launchctl bootstrap gui/501 {}", plist.display()),
+            ]
+        );
+        let shown = report.to_string();
+        assert!(shown.contains("loaded it, which starts it"), "{shown}");
+    }
+
+    #[test]
+    fn enable_on_a_loaded_agent_does_not_restart_it() {
+        let e = env();
+        let runner = launchd(true);
+        let report = e
+            .install(Unit::Pastor, Action::Enable)
             .run(&runner, &e.paths)
             .unwrap();
         assert_eq!(actions(&runner), ["launchctl enable gui/501/pastor.serve"]);
+        assert!(!report.to_string().contains("which starts it"));
     }
 
     #[test]
@@ -519,7 +555,16 @@ mod tests {
             text.contains("<string>/opt/homebrew/bin/herdr</string>\n\t\t<string>server</string>")
         );
         assert!(text.contains("<string>pastor.herdr</string>"));
-        assert_eq!(actions(&runner), ["launchctl enable gui/501/pastor.herdr"]);
+        assert_eq!(
+            actions(&runner),
+            [
+                "launchctl enable gui/501/pastor.herdr".to_string(),
+                format!(
+                    "launchctl bootstrap gui/501 {}",
+                    report.plist_path.display()
+                ),
+            ]
+        );
         assert!(!e.paths.config_dir.exists());
         assert!(!e.paths.state_dir.exists());
     }

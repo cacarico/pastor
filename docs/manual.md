@@ -692,7 +692,10 @@ same ask-first prompt. It writes `contrib/launchd/pastor.plist` to
 ProgramArguments at the binary it finds and copying your shell's `PATH` (and,
 for pastor, the three absolute `PASTOR_*_DIR` values) into
 EnvironmentVariables. Output goes to `~/Library/Logs/<label>.log`. The actions
-run in your `gui/<uid>` domain: `--enable` is `launchctl enable`, `--start`
+run in your `gui/<uid>` domain: `--enable` is `launchctl enable`, and on an
+agent that is not loaded yet also `launchctl bootstrap`, which starts it:
+unlike `systemctl enable`, launchd has no way to register an agent without
+loading it, and `RunAtLoad` starts it as it loads. `--start`
 is `launchctl bootstrap` (or `kickstart` when the agent is already loaded),
 `--stop` is `launchctl bootout`, and no flag means enable and start. Both
 agents have `RunAtLoad` and `KeepAlive`, so they come back after a crash and

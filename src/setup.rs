@@ -52,14 +52,16 @@ pub enum SetupCmd {
     /// The agent goes to ~/Library/LaunchAgents. With no action flag it is
     /// installed, enabled and loaded, which starts it. --enable, --start,
     /// --enable --start, --enable --now and --stop choose a different action
-    /// instead: --enable clears a launchctl disable so it loads at login,
-    /// --start loads it (or kickstarts it when already loaded), --stop
-    /// unloads it until the next login.
+    /// instead: --enable clears a launchctl disable so it loads at login, and
+    /// also loads an agent that is not loaded yet, which starts it (launchd
+    /// cannot register an agent without loading it); --start loads it (or
+    /// kickstarts it when already loaded), --stop unloads it until the next
+    /// login.
     Launchd {
         /// Install pastor.herdr (the herdr server) instead, for a flock machine
         #[arg(long)]
         herdr: bool,
-        /// Enable the agent at login
+        /// Enable the agent at login; one not loaded yet is loaded, which starts it
         #[arg(long)]
         enable: bool,
         /// Start the agent now
