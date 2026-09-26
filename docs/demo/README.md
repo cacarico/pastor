@@ -14,7 +14,7 @@ make demo
 `make demo` starts a head whose config, state and data directories all sit
 under `docs/demo/local/`, so your own config, task history and connectors are
 never read, run or shown; it clears the demo state first so ids start at
-`t-1`, records every tape, and stops the head. `docs/demo/local/` is ignored
+`t-1`, records every tape, closes the tasks it started (so their agents don't hold a name the next run needs), and stops the head. `docs/demo/local/` is ignored
 by git. Needs `vhs`, `ttyd`, `ffmpeg` and `fish` (the tapes' shell) on the
 recording machine, and the repo the tapes name (a checkout of pastor at
 `~/ghq/github.com/cacarico/pastor`, one the agent there already trusts:
