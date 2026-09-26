@@ -63,6 +63,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l branch -d 'Branch for the worktree (needs --worktree; a plain workspace has no branch)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l tag -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l timeout -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l place -d 'Where the agent\'s pane goes: repo (under the repo it works on), own (its own workspace), pastor (the `pastor` workspace) or pane:<workspace> (default: `[defaults] place`, else repo)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l worktree -d 'A git worktree per task, branched from --repo (so it needs --repo)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l json
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -s h -l help -d 'Print help'
@@ -81,6 +82,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from read" -l lines -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from read" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from attach" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from retry" -l place -d 'Where the new task\'s pane goes instead of the old one\'s: repo, own, pastor or pane:<workspace>' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from retry" -l json
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from retry" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -l remove-worktree -d 'Remove the task\'s worktree too (refused if it has uncommitted changes)'

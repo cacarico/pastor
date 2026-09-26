@@ -757,7 +757,11 @@ impl Fleet {
     /// counts queued ones, and a copy in a removed flock would wait forever.
     /// A row that is missing or not retryable is left for `insert_retry` to
     /// name.
-    pub async fn queue_retry(&self, id: i64) -> Result<Task, QueueError<RetryError>> {
+    pub async fn queue_retry(
+        &self,
+        id: i64,
+        place: Option<&crate::task::Place>,
+    ) -> Result<Task, QueueError<RetryError>> {
         let _pass = self.dispatch_lock.lock().await;
         if let Ok(Some(t)) = self.store.get_task(id)
             && t.state.is_retryable()
@@ -780,7 +784,9 @@ impl Fleet {
                 .launch_args(&t.spec)
                 .map_err(QueueError::Agent)?;
         }
-        self.store.insert_retry(id).map_err(QueueError::Store)
+        self.store
+            .insert_retry_placed(id, place)
+            .map_err(QueueError::Store)
     }
 
     /// Try to place every queued task, oldest first. Serialised: a pass sees the
@@ -1298,7 +1304,7 @@ impl Daemon {
                 Ok(Err(reason)) => IpcResponse::error("job_not_found", reason),
                 Err(err) => IpcResponse::error("scheduler_error", err),
             },
-            IpcRequest::TaskRetry { id } => self.retry(id).await,
+            IpcRequest::TaskRetry { id, place } => self.retry(id, place).await,
             IpcRequest::TaskClose {
                 id,
                 remove_worktree,
@@ -1389,11 +1395,11 @@ impl Daemon {
     /// `TaskRetry`: a new queued row copying `id` (see `Store::insert_retry`),
     /// dispatched at once like a `Run`. Answers the new row as it stands after
     /// the dispatch pass.
-    async fn retry(&self, id: i64) -> IpcResponse {
+    async fn retry(&self, id: i64, place: Option<crate::task::Place>) -> IpcResponse {
         // The store checks the state and copies in one statement; its error
         // says which check failed, so a row pruned by a concurrent request is
         // `task_not_found` and a storage failure is `store_error`.
-        let task = match self.fleet.queue_retry(id).await {
+        let task = match self.fleet.queue_retry(id, place.as_ref()).await {
             Ok(t) => t,
             Err(QueueError::UnknownMachine(m)) => {
                 return IpcResponse::error(
@@ -1638,6 +1644,7 @@ mod tests {
             checkout: None,
             reopen: None,
             agent_source: None,
+            place: Default::default(),
         }
     }
 
@@ -2578,7 +2585,13 @@ mod tests {
             .await;
         assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
         assert_eq!(
-            error_code(d.handle(IpcRequest::TaskRetry { id: t.id }).await),
+            error_code(
+                d.handle(IpcRequest::TaskRetry {
+                    id: t.id,
+                    place: None
+                })
+                .await
+            ),
             "unknown_flock"
         );
         assert!(
@@ -2805,7 +2818,13 @@ mod tests {
         failed.spec.machine = Some("b".into());
         d.store.update_task(&mut failed).unwrap();
         assert_eq!(
-            error_code(d.handle(IpcRequest::TaskRetry { id: failed.id }).await),
+            error_code(
+                d.handle(IpcRequest::TaskRetry {
+                    id: failed.id,
+                    place: None
+                })
+                .await
+            ),
             "unknown_machine"
         );
         assert!(
@@ -2817,7 +2836,13 @@ mod tests {
         running.spec.machine = Some("b".into());
         d.store.update_task(&mut running).unwrap();
         assert_eq!(
-            error_code(d.handle(IpcRequest::TaskRetry { id: running.id }).await),
+            error_code(
+                d.handle(IpcRequest::TaskRetry {
+                    id: running.id,
+                    place: None
+                })
+                .await
+            ),
             "not_retryable"
         );
     }
@@ -3420,7 +3445,12 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let failed = insert(&d, TaskState::Failed);
         let mut events = d.subscribe();
-        let resp = d.handle(IpcRequest::TaskRetry { id: failed.id }).await;
+        let resp = d
+            .handle(IpcRequest::TaskRetry {
+                id: failed.id,
+                place: None,
+            })
+            .await;
         let IpcResponse::Task(t) = resp else {
             panic!("{resp:?}")
         };
@@ -3431,11 +3461,23 @@ mod tests {
         assert_eq!((ev.kind.as_str(), ev.task_id), ("task.queued", Some(t.id)));
 
         assert_eq!(
-            error_code(d.handle(IpcRequest::TaskRetry { id: t.id }).await),
+            error_code(
+                d.handle(IpcRequest::TaskRetry {
+                    id: t.id,
+                    place: None
+                })
+                .await
+            ),
             "not_retryable"
         );
         assert_eq!(
-            error_code(d.handle(IpcRequest::TaskRetry { id: 99 }).await),
+            error_code(
+                d.handle(IpcRequest::TaskRetry {
+                    id: 99,
+                    place: None
+                })
+                .await
+            ),
             "task_not_found"
         );
     }
@@ -3449,7 +3491,13 @@ mod tests {
             "CREATE TRIGGER no_insert BEFORE INSERT ON tasks BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
         );
         assert_eq!(
-            error_code(d.handle(IpcRequest::TaskRetry { id: failed.id }).await),
+            error_code(
+                d.handle(IpcRequest::TaskRetry {
+                    id: failed.id,
+                    place: None
+                })
+                .await
+            ),
             "store_error"
         );
     }

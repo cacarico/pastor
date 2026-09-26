@@ -127,6 +127,88 @@ pub struct DispatchSpec {
     /// predates it: that task keeps the agent it was queued with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_source: Option<Box<AgentSource>>,
+    /// Where on its machine's herdr the agent's pane goes (`Place`). Left out
+    /// of the JSON when it is the default, so a spec from before it reads as
+    /// `repo`.
+    #[serde(default, skip_serializing_if = "Place::is_repo")]
+    pub place: Place,
+}
+
+/// Where dispatch puts a task's pane: `--place`, a job's `[dispatch] place`
+/// or `[defaults] place`. Written as `repo`, `own`, `pastor` or
+/// `pane:<workspace>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Place {
+    /// Under the repo it works on: a worktree task in its own worktree
+    /// workspace (herdr shows it under the repo's), a task whose repo a
+    /// workspace already shows in a new pane there, anything else in its
+    /// own workspace.
+    #[default]
+    Repo,
+    /// Always a new workspace named after the task.
+    Own,
+    /// A pane in the machine's one workspace named `pastor`, made on first
+    /// use. A worktree is still made on disk.
+    Pastor,
+    /// A pane in the herdr workspace with this label; refused if the machine
+    /// has none.
+    Pane(String),
+}
+
+impl Place {
+    pub fn is_repo(&self) -> bool {
+        *self == Place::Repo
+    }
+
+    /// Does the pane go into a workspace the task did not make, whatever
+    /// the machine shows? A worktree task placed so has no workspace of its
+    /// own on its checkout.
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Place::Pastor | Place::Pane(_))
+    }
+}
+
+impl std::str::FromStr for Place {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "repo" => Ok(Place::Repo),
+            "own" => Ok(Place::Own),
+            "pastor" => Ok(Place::Pastor),
+            _ => match s.strip_prefix("pane:") {
+                Some(ws) if !ws.trim().is_empty() => Ok(Place::Pane(ws.to_string())),
+                Some(_) => Err("place pane: needs a workspace, like pane:work".into()),
+                None => Err(format!(
+                    "unknown place {s}; use repo, own, pastor or pane:<workspace>"
+                )),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Place::Repo => f.write_str("repo"),
+            Place::Own => f.write_str("own"),
+            Place::Pastor => f.write_str("pastor"),
+            Place::Pane(ws) => write!(f, "pane:{ws}"),
+        }
+    }
+}
+
+impl TryFrom<String> for Place {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        s.parse()
+    }
+}
+
+impl From<Place> for String {
+    fn from(p: Place) -> String {
+        p.to_string()
+    }
 }
 
 /// See `DispatchSpec::agent_source`. The labels read like `machine own`,
@@ -397,6 +479,29 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
 mod tests {
     use super::*;
 
+    /// A place reads and writes as the words `--place` and the TOML keys
+    /// take, and a spec that says nothing is `repo`.
+    #[test]
+    fn place_round_trips_as_its_word() {
+        for word in ["repo", "own", "pastor", "pane:work", "pane:my ws"] {
+            let place: Place = word.parse().unwrap();
+            assert_eq!(place.to_string(), word);
+            let json = serde_json::to_value(&place).unwrap();
+            assert_eq!(json, serde_json::json!(word));
+            assert_eq!(serde_json::from_value::<Place>(json).unwrap(), place);
+        }
+        assert!(Place::Pastor.is_shared() && Place::Pane("w".into()).is_shared());
+        assert!(!Place::Repo.is_shared() && !Place::Own.is_shared());
+        for bad in ["", "pane:", "pane: ", "mine", "Repo"] {
+            assert!(bad.parse::<Place>().is_err(), "{bad}");
+        }
+        let old: DispatchSpec =
+            serde_json::from_value(serde_json::json!({"agent": "claude"})).unwrap();
+        assert_eq!(old.place, Place::Repo);
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("place"), "the default is left out: {text}");
+    }
+
     pub fn task(state: TaskState, last_completion_seq: Option<u64>) -> Task {
         let now = Utc::now();
         Task {
@@ -418,6 +523,7 @@ mod tests {
                 checkout: None,
                 reopen: None,
                 agent_source: None,
+                place: Default::default(),
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),

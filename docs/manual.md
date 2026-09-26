@@ -244,6 +244,48 @@ the socket and does not answer (`head_unresponsive`): that head may still be
 writing tasks. Retry and close need it.
 `task run --worktree` needs `--repo`.
 
+### Where a task's pane goes
+
+`place` decides where on its machine's herdr a task's agent gets its pane.
+It is set like every dispatch setting: `--place` on `task run` (and on `task
+retry`, to move a retry), `place = "..."` in a job's `[dispatch]`, `place` under
+`[defaults]` in `pastor.toml`; `task show` prints it.
+
+- `repo` (the default) keeps an agent under the repo it works on. A
+  `--worktree` task gets a new worktree, which herdr shows under the repo's
+  workspace. A task whose `--repo` a workspace already shows, such as a fix
+  round started in a pull request's worktree, gets a new pane in that
+  workspace. herdr reports a workspace's directory only when it is a git
+  checkout, and pastor compares it with the expanded `--repo`, trailing `/`
+  ignored, without resolving symlinks. With no such workspace, or no repo, the
+  task gets a workspace of its own named `t-N`, as before.
+- `own`: always a workspace of its own named `t-N` (for a worktree, the one
+  herdr opens on the new checkout), whatever already shows the repo.
+- `pastor`: a pane in the machine's one workspace labelled `pastor`, made on
+  first use in the home directory. The first workspace with that label is
+  the one used, so a checkout of a repo named `pastor` that herdr labelled
+  after its folder is taken too.
+- `pane:<workspace>`: a pane in the workspace with that label. A machine with
+  no such workspace fails the task before anything is made.
+
+A pane in a workspace the task did not make is still the task's own: the
+task records that pane and that workspace, and `task close` and auto-close
+close only the pane, never the workspace or its other panes (herdr still
+closes a workspace whose last pane closes, so one left with only the task's
+pane goes with it). A worktree task placed in `pastor` or `pane:<workspace>`
+still gets its worktree on disk and works in it; the workspace herdr opened on
+the checkout is closed once the agent's pane is split off the shared one.
+Removing that worktree (`--remove-worktree`, or auto-close of a clean one)
+closes the task's pane, has herdr open a workspace on the checkout
+(`worktree.open`) and removes that; when herdr refuses (uncommitted changes),
+the workspace it opened is closed again and the checkout stays.
+
+Since a fix round joins the workspace of the worktree it works in, removing
+that worktree would end the fix round too. While another agent is in a
+worktree task's workspace, `task close --remove-worktree` refuses and names
+it, and auto-close closes the task's pane but keeps the checkout, with a note
+on the task.
+
 An agent named like a task (`t-N`) that no open task owns is an orphan: a
 dispatch that failed after the agent started, a daemon killed mid-dispatch, a
 failed task whose agent never exited, a pruned row. Orphans still hold a pane,
@@ -627,7 +669,8 @@ paths.
 `pastor task run` takes the prompt as its argument or, instead, `--prompt-file
 PATH`, and `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
 `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
-`--timeout` and `--json`. `--agent-arg` hands one argument to the agent,
+`--timeout`, `--place` (see [Where a task's pane goes](#where-a-tasks-pane-goes))
+and `--json`. `--agent-arg` hands one argument to the agent,
 through herdr's `agent.start`; repeat it for more, in order. It always takes the
 next word as its value, even one that starts with a dash, so
 `--agent-arg --model --agent-arg claude-opus-5-5` and
@@ -1130,6 +1173,7 @@ allow = []                   # tool patterns the agent may use unasked, e.g. ["B
 deny = []                    # tool patterns it must never use; wins over allow
 max_tasks_per_run = 5
 timeout = "2h"
+place = "repo"               # where a task's pane goes: repo, own, pastor or pane:<workspace>
 [agents.claude]              # one table per agent that needs one
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }

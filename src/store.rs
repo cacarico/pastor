@@ -401,24 +401,39 @@ impl Store {
     /// dispatch whether to go back to it. A stale task's agent is still at
     /// work, so its retry carries nothing.
     pub fn insert_retry(&self, of: i64) -> Result<Task, RetryError> {
+        self.insert_retry_placed(of, None)
+    }
+
+    /// `insert_retry`, with the copy's `place` replaced when one is given
+    /// (`task retry --place`).
+    pub fn insert_retry_placed(
+        &self,
+        of: i64,
+        place: Option<&crate::task::Place>,
+    ) -> Result<Task, RetryError> {
         let now = Utc::now().to_rfc3339();
+        let patch = match place {
+            Some(p) => serde_json::json!({ "place": p }),
+            None => serde_json::json!({}),
+        }
+        .to_string();
         let conn = self.conn.lock().unwrap();
         // Check and copy in one statement, so a task closed, pruned or
         // finished by another writer in between is not retried.
         let n = conn.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, state, retry_of, created_at, updated_at)
              SELECT job, item, prompt,
-                    CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
+                    json_patch(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
                          THEN json_remove(spec, '$.checkout', '$.reopen')
                          WHEN state = 'failed' AND json_extract(spec, '$.checkout') IS NOT NULL
                          THEN json_set(json_remove(spec, '$.branch', '$.checkout'), '$.reopen',
                                        json_object('branch', json_extract(spec, '$.checkout.branch'),
                                                    'path', json_extract(spec, '$.checkout.path'),
                                                    'agent', COALESCE(agent_name, 't-' || id)))
-                         ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
+                         ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END, ?3),
                     flock, 'queued', id, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
-            params![of, now],
+            params![of, now, patch],
         )?;
         if n == 0 {
             let state: Option<String> = conn
@@ -915,6 +930,7 @@ mod tests {
             checkout: None,
             reopen: None,
             agent_source: None,
+            place: Default::default(),
         }
     }
 
@@ -1546,6 +1562,34 @@ mod tests {
         set_state(&s, t.id, TaskState::Failed);
         let r = s.insert_retry(t.id).unwrap();
         assert_eq!(r.flock.as_deref(), Some("work"));
+    }
+
+    /// `task retry --place` replaces where the copy's pane goes and keeps
+    /// everything else; without it the copy keeps the original's place.
+    #[test]
+    fn a_retry_can_change_its_place() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task(NewTask {
+                spec: DispatchSpec {
+                    place: crate::task::Place::Pastor,
+                    ..spec()
+                },
+                ..new_task("run")
+            })
+            .unwrap();
+        set_state(&s, t.id, TaskState::Failed);
+        let same = s.insert_retry(t.id).unwrap();
+        assert_eq!(same.spec.place, crate::task::Place::Pastor);
+        let moved = s
+            .insert_retry_placed(t.id, Some(&crate::task::Place::Pane("work".into())))
+            .unwrap();
+        assert_eq!(moved.spec.place, crate::task::Place::Pane("work".into()));
+        assert_eq!(moved.spec.repo, t.spec.repo);
+        let home = s
+            .insert_retry_placed(t.id, Some(&crate::task::Place::Repo))
+            .unwrap();
+        assert_eq!(home.spec.place, crate::task::Place::Repo);
     }
 
     /// A retry of a failed worktree task that owns a checkout (dispatch

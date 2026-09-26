@@ -2635,12 +2635,16 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__retry)
-            opts="-h --json --help"
+            opts="-h --place --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --place)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -2649,7 +2653,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__run)
-            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --worktree --branch --tag --timeout --json --help"
+            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --worktree --branch --tag --timeout --place --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2688,6 +2692,10 @@ _pastor() {
                     return 0
                     ;;
                 --timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --place)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

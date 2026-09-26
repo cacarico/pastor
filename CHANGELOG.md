@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- `place` decides where a task's agent gets its pane: `--place` on `task run`
+  and `task retry`, `place` in a job's `[dispatch]` or under `[defaults]` in
+  `pastor.toml`. The default, `repo`, keeps an agent under the repo it works
+  on: a task whose `--repo` a herdr workspace already shows, such as a fix
+  round in a pull request's worktree, now gets a new pane in that workspace
+  instead of a new top-level workspace. `own` always makes a workspace `t-N`,
+  as before; `pastor` puts every task in one `pastor` workspace per machine,
+  made on first use; `pane:<workspace>` puts it in the workspace with that
+  label and fails the task if the machine has none. Closing a task closes only
+  its own pane, never a workspace it joined, and a worktree task placed in a
+  shared workspace still gets, and on removal loses, its worktree on disk.
+  `task show` prints the place. A worktree another agent is working in (a
+  fix round that joined its workspace) is not removed: auto-close keeps it
+  with a note and `task close --remove-worktree` refuses.
+
 ## 0.5.0 - 2026-09-26
 
 ### Added

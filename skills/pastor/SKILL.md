@@ -53,6 +53,7 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 - `--machine M` pins the task. `--tag T` (repeatable) instead restricts it to machines that carry every given tag in `flock.toml`; it is a filter, not a label on the task. With neither, any machine of the task's flock with a free slot takes it.
 - `--repo` is a path on the machine that runs the agent. Quote a leading `~` so your shell does not expand it. pastor checks that it is a directory on that machine before it creates anything (`test -d` over ssh); a missing repo fails the task with `repo <path> does not exist on <machine>`. A `command` machine cannot be checked.
 - `--worktree` makes a git worktree of `--repo` for the task, on `--branch` or `pastor/t-N`. It needs `--repo` and the repo cloned on that machine.
+- `--place` says where the agent's pane goes on the machine's herdr. `repo` (the default): a worktree task in its new worktree, a task whose `--repo` a workspace already shows (a fix round in a pull request's worktree) in a new pane there, anything else in its own workspace `t-N`. `own`: always its own workspace. `pastor`: a pane in the machine's `pastor` workspace, made on first use. `pane:<workspace>`: a pane in the workspace with that label, refused if the machine has none. A job sets it with `place` in `[dispatch]`, `pastor.toml` with `place` under `[defaults]`. Closing a task closes only its own pane, never a workspace it joined.
 - `--agent-arg` passes one argument to the agent and always takes the next word, dashes included. Repeat it, in order.
 - Without `--agent` and `--agent-arg`, the task takes the `agent` and `agent_args` of the machine it runs on from `flock.toml`, then its flock's, then `[defaults]` in `pastor.toml`, then `claude`. Args follow the agent they were written for: a flock's args for codex never reach a task run with `--agent claude`. `pastor task show t-N` prints what the task resolved to and where each came from; an unpinned task settles its agent again when it is placed on a machine.
 - An agent name can be a definition in `pastor.toml`: `[agents.claude-personal]` with `kind = "claude"` and `env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }` runs Claude on another account. `--agent claude-personal` (or a flock's `agent`) picks it; herdr starts the `kind`, with the env set on the task's pane, and Claude's trust keys and tool flags follow the kind.
@@ -89,6 +90,7 @@ pastor closes a done task's pane after `close_done_after` (`pastor.toml`, defaul
 
 ```bash
 pastor task retry t-4                      # queues a copy of a failed or stale task, new id, retry_of t-4
+pastor task retry t-4 --place own          # the same, with the copy's pane placed elsewhere
 pastor task close t-4                      # closes the pane if there is one, marks the task closed
 pastor task close t-4 --remove-worktree    # removes the worktree too; refused if it has uncommitted changes
 pastor task prune --done --older-than 3d   # deletes finished rows; --failed and --closed add those states
@@ -122,7 +124,7 @@ tags = ["arm"]
 prompt = "It is {{ item.key }}. Run the suite and fix what broke. Task {{ task.id }}."
 ```
 
-`[dispatch]` takes the same things as `pastor task run`, plus tool lists: `agent`, `agent_args`, `allow`, `deny`, `repo`, `worktree`, `branch`, `tags`, `flock`, `machine`, `timeout`, plus `max_tasks_per_run` and the `prompt` template.
+`[dispatch]` takes the same things as `pastor task run`, plus tool lists: `agent`, `agent_args`, `allow`, `deny`, `repo`, `worktree`, `branch`, `tags`, `flock`, `machine`, `timeout`, `place`, plus `max_tasks_per_run` and the `prompt` template.
 
 ```bash
 pastor job list            # schedule, enabled, last and next run, errors

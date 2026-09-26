@@ -179,6 +179,7 @@ pub fn task_detail(t: &Task) -> String {
         ("allow", list(&t.spec.allow)),
         ("deny", list(&t.spec.deny)),
         ("repo", repo),
+        ("place", t.spec.place.to_string()),
         ("tags", tags),
         ("timeout", format!("{}s", t.spec.timeout_secs)),
         ("pane", opt(&t.pane_id)),
@@ -776,6 +777,7 @@ mod tests {
             checkout: None,
             reopen: None,
             agent_source: None,
+            place: Default::default(),
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -833,6 +835,7 @@ mod tests {
             checkout: None,
             reopen: None,
             agent_source: None,
+            place: Default::default(),
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -917,6 +920,7 @@ mod tests {
             checkout: None,
             reopen: None,
             agent_source: None,
+            place: Default::default(),
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);

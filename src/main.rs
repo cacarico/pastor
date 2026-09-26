@@ -11,7 +11,7 @@ use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{Head, HeadPing, IpcRequest, IpcResponse, request};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
-use pastor::task::{DispatchSpec, Task, TaskState, parse_task_id};
+use pastor::task::{DispatchSpec, Place, Task, TaskState, parse_task_id};
 
 /// The agent skill, built into the binary so an agent on any machine with
 /// pastor installed can read the guide that matches this exact CLI.
@@ -170,6 +170,11 @@ struct RunArgs {
     tags: Vec<String>,
     #[arg(long)]
     timeout: Option<String>,
+    /// Where the agent's pane goes: repo (under the repo it works on), own
+    /// (its own workspace), pastor (the `pastor` workspace) or
+    /// pane:<workspace> (default: `[defaults] place`, else repo)
+    #[arg(long, value_name = "PLACE")]
+    place: Option<Place>,
     #[arg(long)]
     json: bool,
 }
@@ -675,6 +680,10 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
         checkout: None,
         reopen: None,
         agent_source: None,
+        place: a
+            .place
+            .clone()
+            .unwrap_or_else(|| config.defaults.place.clone()),
     })
 }
 

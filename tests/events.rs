@@ -42,6 +42,7 @@ fn task(id: i64) -> Task {
                 checkout: None,
                 reopen: None,
                 agent_source: None,
+                place: Default::default(),
             },
             flock: "default".into(),
         })
@@ -254,6 +255,7 @@ async fn the_daemon_writes_the_events_log() {
                 checkout: None,
                 reopen: None,
                 agent_source: None,
+                place: Default::default(),
             },
             flock: None,
             agent: None,

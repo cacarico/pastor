@@ -1589,7 +1589,59 @@ impl Actor {
                 close_pane = true;
             }
         }
-        if remove_worktree && !keep_worktree {
+        // A worktree task placed in a workspace it did not make (`pastor`,
+        // `pane:<label>`) records that workspace, which is never removed:
+        // its checkout has no workspace until herdr opens one on it. The
+        // task's pane goes first (not a closed row's: pastor closed that one,
+        // and herdr may have handed its id out again), then the checkout goes
+        // through the workspace `worktree.open` gives.
+        let mut workspace = workspace;
+        let mut reopened = None;
+        let shared = row
+            .as_ref()
+            .filter(|t| t.spec.worktree && t.spec.place.is_shared());
+        if remove_worktree
+            && !keep_worktree
+            && let Some(t) = shared
+        {
+            if t.state != TaskState::Closed {
+                self.close_pane_of(&pane, &name).await?;
+            }
+            close_pane = false;
+            match self.open_checkout(t, &name).await? {
+                Some(created) => {
+                    workspace = Some(created.workspace.workspace_id);
+                    reopened = Some(created.root_pane.pane_id);
+                }
+                // The checkout is gone already: nothing left to remove.
+                None => worktree_gone = true,
+            }
+        }
+        // Under `place = "repo"` a task whose `--repo` is this checkout (a
+        // fix round) joins this workspace, and `worktree.remove` would take
+        // its agent and its checkout with it. The checkout stays while
+        // another agent works there.
+        if remove_worktree
+            && !keep_worktree
+            && !worktree_gone
+            && reopened.is_none()
+            && let Some(ws) = workspace.as_deref()
+            && let Some(other) = agents
+                .iter()
+                .find(|a| a.workspace_id == ws && a.pane_id != pane)
+        {
+            let who = other.name.clone().unwrap_or_else(|| other.pane_id.clone());
+            if by != CloseBy::AutoClose {
+                anyhow::bail!(
+                    "the worktree of {name} has another agent in it, {who}; close that first"
+                );
+            }
+            let t = row.as_ref().expect("auto-close has a row");
+            note = Some(worktree_kept_note(t, &name, &format!("{who} works in it")));
+            keep_worktree = true;
+            close_pane = true;
+        }
+        if remove_worktree && !keep_worktree && !worktree_gone {
             let ws = workspace.with_context(|| format!("task {name} recorded no workspace"))?;
             // Closes the workspace, pane and agent with it: closing the pane
             // first would close the workspace and leave no id to remove by.
@@ -1635,15 +1687,17 @@ impl Actor {
                 // code: a protocol or decoding error is not herdr saying no,
                 // so it falls to the branch below and is retried whole.
                 Err(err) if by == CloseBy::AutoClose && err.code().is_some() => {
+                    self.close_reopened(reopened.as_deref()).await;
                     let t = row.as_ref().expect("auto-close has a row");
                     let why = match err.code() {
                         Some("dirty_worktree_requires_force") => "uncommitted changes".to_string(),
                         _ => format!("herdr refused to remove it: {err}"),
                     };
                     note = Some(worktree_kept_note(t, &name, &why));
-                    close_pane = true;
+                    close_pane = shared.is_none();
                 }
                 Err(err) => {
+                    self.close_reopened(reopened.as_deref()).await;
                     return Err(
                         anyhow::Error::from(err).context(format!("remove the worktree of {name}"))
                     );
@@ -1651,19 +1705,7 @@ impl Actor {
             }
         }
         if close_pane {
-            match tokio::time::timeout(timeout, self.connector.pane_close(&pane))
-                .await
-                .map_err(|_| TimedOut("pane.close", timeout))?
-            {
-                Ok(()) => {}
-                // Already gone is what closing wanted.
-                Err(err) if err.code() == Some("pane_not_found") => {}
-                Err(err) => {
-                    return Err(
-                        anyhow::Error::from(err).context(format!("close the pane of {name}"))
-                    );
-                }
-            }
+            self.close_pane_of(&pane, &name).await?;
         }
         self.forget_orphan(&pane);
         self.pending_done.remove(&task_id);
@@ -1691,6 +1733,64 @@ impl Actor {
                 }
                 .into())
             }
+        }
+    }
+
+    /// `pane.close` of task `name`'s pane; one already gone is what closing
+    /// wanted.
+    async fn close_pane_of(&self, pane: &str, name: &str) -> anyhow::Result<()> {
+        let timeout = self.settings.request_timeout;
+        match tokio::time::timeout(timeout, self.connector.pane_close(pane))
+            .await
+            .map_err(|_| TimedOut("pane.close", timeout))?
+        {
+            Ok(()) => Ok(()),
+            Err(err) if err.code() == Some("pane_not_found") => Ok(()),
+            Err(err) => Err(anyhow::Error::from(err).context(format!("close the pane of {name}"))),
+        }
+    }
+
+    /// A workspace showing the checkout of worktree task `t`, which dispatch
+    /// placed in a workspace it did not make, so that `worktree.remove` can
+    /// take it. `None` when herdr has no such checkout any more.
+    async fn open_checkout(
+        &self,
+        t: &Task,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::herdr::Created>> {
+        let (Some(checkout), Some(repo)) = (t.spec.checkout.as_deref(), t.spec.repo.as_deref())
+        else {
+            anyhow::bail!(manual_worktree_cleanup(&t.display_id()));
+        };
+        let timeout = self.settings.request_timeout;
+        let repo = crate::dispatch::expand_home(&*self.connector, "repo", repo, Some(&self.name))
+            .await
+            .map_err(|err| match err {
+                crate::dispatch::DispatchError::Call(err) => anyhow::Error::from(err),
+                other => anyhow::Error::from(other),
+            })?;
+        let opened = tokio::time::timeout(
+            timeout,
+            self.connector.worktree_open(&repo, &checkout.branch, name),
+        )
+        .await
+        .map_err(|_| TimedOut("worktree.open", timeout))?;
+        match opened {
+            Ok(created) => Ok(Some(created)),
+            Err(err) if err.code() == Some("worktree_not_found") => Ok(None),
+            Err(err) => Err(anyhow::Error::from(err)
+                .context(format!("open the worktree of {name} to remove it"))),
+        }
+    }
+
+    /// Close the workspace `open_checkout` opened when its checkout stays:
+    /// it was only a way to reach it. Best effort; a failure leaves a
+    /// workspace on the checkout, which is where it was before the task.
+    async fn close_reopened(&self, root: Option<&str>) {
+        if let Some(root) = root
+            && let Err(err) = self.close_pane_of(root, "a reopened worktree").await
+        {
+            tracing::debug!(machine = %self.name, %err, "could not close a reopened worktree");
         }
     }
 
@@ -2555,7 +2655,7 @@ mod tests {
     use crate::herdr::fake::PaneInput;
     use crate::herdr::{AgentStatus, ConnectError, ConnectFuture, Connection};
     use crate::store::NewTask;
-    use crate::task::DispatchSpec;
+    use crate::task::{DispatchSpec, Place};
 
     fn settings() -> MachineSettings {
         MachineSettings {
@@ -2615,6 +2715,7 @@ mod tests {
             checkout: None,
             reopen: None,
             agent_source: None,
+            place: Default::default(),
         }
     }
 
@@ -3763,6 +3864,175 @@ mod tests {
             "an API error is not an outage"
         );
         assert_eq!(fake.agents().len(), 1);
+    }
+
+    fn placed_task(store: &Store, place: Place, worktree: bool) -> Task {
+        store
+            .insert_task(NewTask {
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    repo: Some("/r".into()),
+                    worktree,
+                    place,
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// A task placed as a pane in a workspace it did not make: closing it
+    /// closes its pane and nothing else, whatever the place.
+    #[tokio::test]
+    async fn close_leaves_a_workspace_the_task_did_not_make() {
+        for (place, worktree) in [
+            (Place::Repo, false),
+            (Place::Pane("work".into()), false),
+            (Place::Pastor, false),
+            (Place::Pastor, true),
+        ] {
+            let fake = FakeHerdr::new();
+            fake.open_user_workspace("work", Some("/r"));
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let (h, _events) = connected(&fake, &store).await;
+            let t = h
+                .dispatch(placed_task(&store, place.clone(), worktree).id)
+                .await
+                .unwrap();
+            let ws = t.workspace_id.clone().unwrap();
+            let before = fake.panes(&ws);
+            assert_eq!(before.len(), 2, "{place}: {before:?}");
+            let closed = h.close(t.id, false).await.unwrap();
+            assert_eq!(closed.state, TaskState::Closed);
+            assert_eq!(
+                fake.panes(&ws),
+                vec![before[0].clone()],
+                "{place}: only the task's pane goes"
+            );
+            assert!(calls(&fake, "worktree.remove").is_empty());
+        }
+    }
+
+    /// A fix round started with `--repo` on a worktree task's checkout joins
+    /// that task's workspace. Removing the worktree would end the fix
+    /// round: auto-close keeps it with a note, `--remove-worktree` refuses,
+    /// and either way only the first task's pane closes.
+    #[tokio::test]
+    async fn a_worktree_another_agent_works_in_stays() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let first = h.dispatch(worktree_task(&store).id).await.unwrap();
+        let checkout = first.spec.checkout.clone().unwrap();
+        let mut fix = new_task(&store);
+        fix.spec.repo = Some(checkout.path.clone());
+        store.update_task(&mut fix).unwrap();
+        let fix = h.dispatch(fix.id).await.unwrap();
+        let ws = first.workspace_id.clone().unwrap();
+        assert_eq!(fix.workspace_id.as_deref(), Some(ws.as_str()));
+
+        let err = h.close(first.id, true).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("another agent in it, t-2"),
+            "{err:#}"
+        );
+
+        fake.set_status(first.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+        wait_for("closed", || state_of(&store, first.id) == TaskState::Closed).await;
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        assert_eq!(fake.panes(&ws), vec![fix.pane_id.clone().unwrap()]);
+        let row = store.get_task(first.id).unwrap().unwrap();
+        assert!(
+            row.error.as_deref().unwrap().contains("t-2 works in it"),
+            "{row:?}"
+        );
+        assert_eq!(row.workspace_id.as_deref(), Some(ws.as_str()));
+    }
+
+    /// A worktree task in a shared workspace has no workspace on its
+    /// checkout: `--remove-worktree` closes its pane, has herdr open the
+    /// checkout and removes that, never the shared workspace.
+    #[tokio::test]
+    async fn remove_worktree_of_a_task_in_a_shared_workspace() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h
+            .dispatch(placed_task(&store, Place::Pastor, true).id)
+            .await
+            .unwrap();
+        let pastor = t.workspace_id.clone().unwrap();
+        let closed = h.close(t.id, true).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(closed.workspace_id, None);
+        let removed = calls(&fake, "worktree.remove");
+        assert_eq!(removed.len(), 1);
+        assert_ne!(removed[0]["workspace_id"], pastor.as_str());
+        assert!(fake.worktree_list("/r").await.unwrap().is_empty());
+        assert_eq!(fake.workspaces(), vec![pastor.clone()]);
+        assert_eq!(fake.panes(&pastor), vec![format!("{pastor}:p1")]);
+
+        // A plain close first, then the removal: the same, from the row.
+        let t = h
+            .dispatch(placed_task(&store, Place::Pastor, true).id)
+            .await
+            .unwrap();
+        h.close(t.id, false).await.unwrap();
+        assert_eq!(fake.worktree_list("/r").await.unwrap().len(), 1);
+        let removed = h.close(t.id, true).await.unwrap();
+        assert_eq!(removed.workspace_id, None);
+        assert!(fake.worktree_list("/r").await.unwrap().is_empty());
+        assert_eq!(fake.workspaces(), vec![pastor]);
+    }
+
+    /// A dirty checkout is refused as for any worktree task, and the
+    /// workspace herdr opened to reach it goes again.
+    #[tokio::test]
+    async fn remove_worktree_in_a_shared_workspace_refuses_a_dirty_checkout() {
+        let fake = FakeHerdr::new();
+        fake.dirty_worktrees(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h
+            .dispatch(placed_task(&store, Place::Pastor, true).id)
+            .await
+            .unwrap();
+        let pastor = t.workspace_id.clone().unwrap();
+        let err = h.close(t.id, true).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("dirty_worktree_requires_force"),
+            "{err:#}"
+        );
+        assert_eq!(fake.workspaces(), vec![pastor]);
+        assert_eq!(fake.worktree_list("/r").await.unwrap().len(), 1);
+    }
+
+    /// Auto-close removes a clean checkout of a task in `pastor` as it does
+    /// for any worktree task, and leaves the `pastor` workspace.
+    #[tokio::test]
+    async fn auto_close_removes_the_worktree_of_a_task_in_a_shared_workspace() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = run_to_done(&h, &fake, &store, placed_task(&store, Place::Pastor, true)).await;
+        let pastor = t.workspace_id.clone().unwrap();
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        assert!(fake.worktree_list("/r").await.unwrap().is_empty());
+        assert_eq!(fake.workspaces(), vec![pastor.clone()]);
+        assert_eq!(fake.panes(&pastor), vec![format!("{pastor}:p1")]);
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.workspace_id, None);
+        assert!(row.error.is_none(), "{:?}", row.error);
     }
 
     #[tokio::test]

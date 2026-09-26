@@ -357,6 +357,10 @@ pub struct Defaults {
     pub deny: Vec<String>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
+    /// Where a task's pane goes when its run flags and job say nothing
+    /// (`task::Place`).
+    #[serde(skip_serializing_if = "crate::task::Place::is_repo")]
+    pub place: crate::task::Place,
 }
 
 /// What `pastor task run` flags or a job file's `[dispatch]` say about the
@@ -519,6 +523,7 @@ impl Default for Defaults {
             deny: vec![],
             max_tasks_per_run: 5,
             timeout: "2h".into(),
+            place: crate::task::Place::Repo,
         }
     }
 }
@@ -1036,6 +1041,7 @@ mod tests {
             checkout: None,
             reopen: None,
             agent_source: None,
+            place: Default::default(),
         }
     }
 

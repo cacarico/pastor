@@ -15,6 +15,10 @@ use crate::task::{Task, TaskState, parse_task_id};
 pub struct RetryArgs {
     /// A failed or stale task, like t-12
     pub task: String,
+    /// Where the new task's pane goes instead of the old one's: repo, own,
+    /// pastor or pane:<workspace>
+    #[arg(long, value_name = "PLACE")]
+    pub place: Option<crate::task::Place>,
     #[arg(long)]
     pub json: bool,
 }
@@ -120,7 +124,8 @@ fn unexpected(resp: IpcResponse) -> anyhow::Error {
 /// `pastor task retry t-N`: a new task copying t-N, dispatched now.
 pub async fn retry(paths: &Paths, a: RetryArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
-    match ask(paths, IpcRequest::TaskRetry { id }).await? {
+    let req = IpcRequest::TaskRetry { id, place: a.place };
+    match ask(paths, req).await? {
         IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }

@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::config::{AgentChoice, Defaults, check_tools, parse_duration};
 use crate::connector::Catalog;
 use crate::schedule::Schedule;
-use crate::task::DispatchSpec;
+use crate::task::{DispatchSpec, Place};
 use crate::template;
 
 fn default_true() -> bool {
@@ -60,6 +60,8 @@ pub struct DispatchTable {
     /// default flock.
     pub flock: Option<String>,
     pub timeout: Option<String>,
+    /// Where the job's tasks' panes go; `None` takes `[defaults] place`.
+    pub place: Option<Place>,
     pub max_tasks_per_run: Option<u32>,
     pub backfill: Option<String>,
     pub prompt: String,
@@ -202,6 +204,7 @@ impl Job {
                 checkout: None,
                 reopen: None,
                 agent_source: None,
+                place: d.place.unwrap_or_else(|| defaults.place.clone()),
             },
         })
     }
@@ -559,6 +562,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             deny: vec![],
             max_tasks_per_run: 2,
             timeout: "30m".into(),
+            place: Default::default(),
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");
@@ -567,6 +571,30 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         assert!(job.enabled, "enabled defaults to true");
         assert!(!job.spec.worktree);
         assert_eq!(job.connector_config, serde_json::json!({}));
+        assert_eq!(job.spec.place, Place::Repo);
+    }
+
+    /// `[dispatch] place` wins over `[defaults] place`, which fills in for a
+    /// job that says nothing; a place that is none of the four is refused.
+    #[test]
+    fn place_comes_from_the_job_then_the_defaults() {
+        let text = |extra: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        let d = Defaults {
+            place: Place::Pastor,
+            ..defaults()
+        };
+        let job = Job::parse(&text(""), "j", &d, &Builtins).unwrap();
+        assert_eq!(job.spec.place, Place::Pastor);
+        let job = Job::parse(&text("place = \"pane:work\"\n"), "j", &d, &Builtins).unwrap();
+        assert_eq!(job.spec.place, Place::Pane("work".into()));
+        let job = Job::parse(&text("place = \"own\"\n"), "j", &defaults(), &Builtins).unwrap();
+        assert_eq!(job.spec.place, Place::Own);
+        let err = Job::parse(&text("place = \"elsewhere\"\n"), "j", &d, &Builtins).unwrap_err();
+        assert!(err.contains("unknown place elsewhere"), "{err}");
     }
 
     #[test]

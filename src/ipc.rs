@@ -86,6 +86,11 @@ pub enum IpcRequest {
     /// Answers `Task` (the new row).
     TaskRetry {
         id: i64,
+        /// Where the copy's pane goes instead of the original's
+        /// (`task retry --place`). Left out when not given, so an older head
+        /// still reads the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        place: Option<crate::task::Place>,
     },
     /// Close the task's pane (or, with `remove_worktree`, its worktree) and
     /// mark it closed. Answers `Task`, or `Text` for an orphaned agent with no
@@ -442,6 +447,7 @@ mod tests {
                 checkout: None,
                 reopen: None,
                 agent_source: None,
+                place: Default::default(),
             },
             machine: None,
             workspace_id: None,
@@ -536,7 +542,11 @@ mod tests {
     #[test]
     fn task_lifecycle_requests_round_trip() {
         for req in [
-            IpcRequest::TaskRetry { id: 4 },
+            IpcRequest::TaskRetry { id: 4, place: None },
+            IpcRequest::TaskRetry {
+                id: 4,
+                place: Some(crate::task::Place::Pane("work".into())),
+            },
             IpcRequest::TaskClose {
                 id: 4,
                 remove_worktree: true,
@@ -588,7 +598,7 @@ mod tests {
                 id: 1,
                 input: crate::machine::SendInput::default(),
             },
-            IpcRequest::TaskRetry { id: 1 },
+            IpcRequest::TaskRetry { id: 1, place: None },
             IpcRequest::TaskClose {
                 id: 1,
                 remove_worktree: false,

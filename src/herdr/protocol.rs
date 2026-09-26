@@ -172,6 +172,34 @@ pub struct WorktreeList {
     pub worktrees: Vec<WorktreeInfo>,
 }
 
+/// One workspace in `workspace.list`'s reply (herdr 0.9.1). Only what
+/// pastor reads is decoded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Set when the workspace's directory is a git checkout; herdr reports
+    /// no directory for any other workspace.
+    #[serde(default)]
+    pub worktree: Option<WorkspaceCheckout>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceCheckout {
+    pub checkout_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceList {
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneList {
+    pub panes: Vec<PaneRef>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentList {
     pub agents: Vec<AgentInfo>,

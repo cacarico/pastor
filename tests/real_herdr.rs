@@ -21,6 +21,8 @@
 //! (its only pane), which also checks the method `pastor task close` uses. A
 //! `worktree.remove` on that plain workspace checks the other one exists and
 //! answers `not_linked_worktree` for a workspace that is not a worktree.
+//! `workspace.list` and `pane.list`, which `place` finds its workspace with,
+//! are checked on that workspace too.
 
 use pastor::MIN_HERDR_PROTOCOL;
 use pastor::herdr::{ConnectorExt, Endpoint};
@@ -72,6 +74,33 @@ async fn talks_to_a_real_herdr_session() {
         .agent_list()
         .await
         .expect("list agents after creating a workspace");
+
+    // `place`: dispatch finds a workspace by its label or its checkout in
+    // `workspace.list`, then a pane to split in `pane.list`.
+    let listed = endpoint
+        .workspace_list()
+        .await
+        .expect("list workspaces on the real herdr");
+    assert!(
+        listed
+            .iter()
+            .any(|w| w.workspace_id == created.workspace.workspace_id
+                && w.label.as_deref() == Some(label.as_str())),
+        "the new workspace is listed under its label"
+    );
+    let panes = endpoint
+        .pane_list(&created.workspace.workspace_id)
+        .await
+        .expect("list the new workspace's panes");
+    assert_eq!(
+        panes.first().map(|p| p.pane_id.as_str()),
+        Some(created.root_pane.pane_id.as_str())
+    );
+    let err = endpoint
+        .pane_list("pastor-no-such-workspace")
+        .await
+        .expect_err("an unknown workspace");
+    assert_eq!(err.code(), Some("workspace_not_found"), "{err}");
 
     let err = endpoint
         .worktree_remove(&created.workspace.workspace_id, false)

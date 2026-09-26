@@ -11,7 +11,8 @@ use tokio::io::{
 use super::transport::{ConnectError, Connector};
 use super::{
     AgentInfo, AgentList, AgentResult, Created, Event, HerdrError, Incoming, PaneInfoResult,
-    PaneRead, PaneRef, Pong, Request, Response, WorktreeInfo, WorktreeList, WorktreeRemoved,
+    PaneList, PaneRead, PaneRef, Pong, Request, Response, WorkspaceInfo, WorkspaceList,
+    WorktreeInfo, WorktreeList, WorktreeRemoved,
 };
 
 pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
@@ -433,6 +434,27 @@ pub trait ConnectorExt: Connector {
             .call_as::<AgentList>("agent.list", serde_json::json!({}))
             .await?
             .agents)
+    }
+
+    /// `workspace.list` (herdr 0.9.1): every open workspace, with the
+    /// checkout it shows when its directory is a git one.
+    async fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, CallError> {
+        Ok(self
+            .call_as::<WorkspaceList>("workspace.list", serde_json::json!({}))
+            .await?
+            .workspaces)
+    }
+
+    /// `pane.list {workspace_id}` (herdr 0.9.1): the workspace's panes;
+    /// `workspace_not_found` for one it does not have.
+    async fn pane_list(&self, workspace_id: &str) -> Result<Vec<PaneRef>, CallError> {
+        Ok(self
+            .call_as::<PaneList>(
+                "pane.list",
+                serde_json::json!({"workspace_id": workspace_id}),
+            )
+            .await?
+            .panes)
     }
 
     /// `env` sets variables for the root pane's shell, and so for an agent

@@ -7,7 +7,7 @@ use crate::config::Agents;
 use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
 };
-use crate::task::{Checkout, DispatchSpec, Reopen, Task, TaskState};
+use crate::task::{Checkout, DispatchSpec, Place, Reopen, Task, TaskState};
 
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
 const READY_POLL: Duration = Duration::from_millis(500);
@@ -171,41 +171,76 @@ async fn dispatch_steps(
     if let Some(dir) = repo.as_deref() {
         check_repo_exists(conn, dir, task.machine.as_deref()).await?;
     }
-    let (created, branch) = if spec.worktree {
-        let repo = repo
-            .as_deref()
-            .ok_or_else(|| HerdrError::Protocol("worktree = true needs repo".into()))?;
-        let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
-        (created, Some(branch))
-    } else {
-        (
-            conn.workspace_create(repo.as_deref(), name, &env).await?,
-            None,
-        )
+    if spec.worktree && repo.is_none() {
+        return Err(HerdrError::Protocol("worktree = true needs repo".into()).into());
+    }
+    let host = host_workspace(conn, &spec, repo.as_deref(), task.machine.as_deref()).await?;
+    let pane_id = match (host, repo.as_deref()) {
+        // A pane of the task's own in a workspace someone else has: only
+        // that pane is recorded, so closing the task closes only it.
+        (Some(host), _) => {
+            // A worktree is still made on disk, and the agent works in it;
+            // only the workspace herdr opens on it goes, with its one pane.
+            let mut worktree_pane = None;
+            if spec.worktree
+                && let Some(repo) = repo.as_deref()
+            {
+                let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
+                task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
+                worktree_pane = Some(created.root_pane.pane_id);
+            }
+            let cwd = match worktree_pane {
+                Some(_) => task.spec.checkout.as_ref().map(|c| c.path.clone()),
+                None => repo.clone(),
+            };
+            let pane = conn.pane_split(&host.pane_id, cwd.as_deref(), &env).await?;
+            task.workspace_id = Some(host.workspace_id);
+            task.pane_id = Some(pane.pane_id.clone());
+            if let Some(root) = worktree_pane {
+                conn.pane_close(&root).await?;
+            }
+            pane.pane_id
+        }
+        (None, Some(repo)) if spec.worktree => {
+            let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
+            task.workspace_id = Some(created.workspace.workspace_id.clone());
+            task.pane_id = Some(created.root_pane.pane_id.clone());
+            task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
+            // `worktree.create` and `worktree.open` take no env, and every
+            // agent has one (`TASK_ENV`), so the agent gets a pane split off
+            // the worktree's with it, and the pane without it goes: a task
+            // keeps one pane, whose close ends the workspace.
+            let root = created.root_pane.pane_id;
+            let cwd = task.spec.checkout.as_ref().map(|c| c.path.clone());
+            let pane = conn.pane_split(&root, cwd.as_deref(), &env).await?;
+            task.pane_id = Some(pane.pane_id.clone());
+            conn.pane_close(&root).await?;
+            pane.pane_id
+        }
+        (None, repo) => {
+            let created = conn.workspace_create(repo, name, &env).await?;
+            task.workspace_id = Some(created.workspace.workspace_id.clone());
+            task.pane_id = Some(created.root_pane.pane_id.clone());
+            created.root_pane.pane_id
+        }
     };
-    task.workspace_id = Some(created.workspace.workspace_id.clone());
-    task.pane_id = Some(created.root_pane.pane_id.clone());
-    if let (Some(repo), Some(branch)) = (repo.as_deref(), branch) {
-        task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
-    }
-    let mut pane_id = created.root_pane.pane_id.clone();
-    if spec.worktree {
-        // `worktree.create` and `worktree.open` take no env, and every agent
-        // has one (`TASK_ENV`), so the agent gets a pane split off the
-        // worktree's with it, and the pane without
-        // it goes: a task keeps one pane, whose close ends the workspace.
-        let cwd = task.spec.checkout.as_ref().map(|c| c.path.clone());
-        let pane = conn.pane_split(&pane_id, cwd.as_deref(), &env).await?;
-        task.pane_id = Some(pane.pane_id.clone());
-        conn.pane_close(&pane_id).await?;
-        pane_id = pane.pane_id;
-    }
+    finish_dispatch(conn, task, name, &launch, &pane_id, ready_timeout).await
+}
 
+/// Start the agent in its pane, wait for it to come up and prompt it.
+async fn finish_dispatch(
+    conn: &dyn Connector,
+    task: &mut Task,
+    name: &str,
+    launch: &crate::config::Launch,
+    pane_id: &str,
+    ready_timeout: Duration,
+) -> Result<DispatchOutcome, DispatchError> {
     // herdr's `agent.start` returns as soon as it has launched the agent in the
     // pane; it never reports `agent_not_ready` (its errors are about the name,
     // the kind and the pane). Readiness shows up afterwards, in `agent.list` and
     // in whether `agent.prompt` is accepted.
-    start_agent(conn, name, &launch.kind, &launch.args, &pane_id).await?;
+    start_agent(conn, name, &launch.kind, &launch.args, pane_id).await?;
 
     let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
@@ -216,6 +251,96 @@ async fn dispatch_steps(
         task.activity_seen = agent.agent_status.is_activity();
     }
     Ok(outcome)
+}
+
+/// A workspace the task's pane joins rather than one it makes, and the pane
+/// to split it off.
+struct Host {
+    workspace_id: String,
+    pane_id: String,
+}
+
+/// The label of the workspace `place = "pastor"` shares.
+const PASTOR_WORKSPACE: &str = "pastor";
+
+/// Where `spec.place` puts the task's pane, when that is a workspace the
+/// task does not make: `None` means a workspace (or worktree) of its own.
+///
+/// - `repo`: the workspace already showing a task's repo, for a task
+///   without a worktree; herdr reports a workspace's directory only when it
+///   is a git checkout, compared without trailing slashes.
+/// - `pastor`: the machine's workspace labelled `pastor`, made on first use.
+/// - `pane:<label>`: the workspace with that label; refused when there is
+///   none, before anything is made.
+async fn host_workspace(
+    conn: &dyn Connector,
+    spec: &DispatchSpec,
+    repo: Option<&str>,
+    machine: Option<&str>,
+) -> Result<Option<Host>, DispatchError> {
+    let labelled = |label: &str, list: &[crate::herdr::WorkspaceInfo]| {
+        list.iter()
+            .find(|w| w.label.as_deref() == Some(label))
+            .map(|w| w.workspace_id.clone())
+    };
+    let workspace = match &spec.place {
+        Place::Own => return Ok(None),
+        Place::Repo => {
+            let Some(repo) = repo.filter(|_| !spec.worktree) else {
+                return Ok(None);
+            };
+            let showing = conn.workspace_list().await?.into_iter().find(|w| {
+                w.worktree
+                    .as_ref()
+                    .is_some_and(|c| same_dir(&c.checkout_path, repo))
+            });
+            match showing {
+                Some(w) => w.workspace_id,
+                None => return Ok(None),
+            }
+        }
+        Place::Pastor => match labelled(PASTOR_WORKSPACE, &conn.workspace_list().await?) {
+            Some(ws) => ws,
+            None => {
+                let created = conn
+                    .workspace_create(None, PASTOR_WORKSPACE, &Default::default())
+                    .await?;
+                return Ok(Some(Host {
+                    workspace_id: created.workspace.workspace_id,
+                    pane_id: created.root_pane.pane_id,
+                }));
+            }
+        },
+        Place::Pane(label) => match labelled(label, &conn.workspace_list().await?) {
+            Some(ws) => ws,
+            None => {
+                return Err(DispatchError::Task(format!(
+                    "place pane:{label}: no workspace named {label} on {}",
+                    machine.unwrap_or("this machine")
+                )));
+            }
+        },
+    };
+    // A workspace always has a pane while it is open; one that closed
+    // since the listing is a workspace of the task's own, as if none showed.
+    match conn.pane_list(&workspace).await {
+        Ok(panes) => Ok(panes.into_iter().next().map(|p| Host {
+            workspace_id: workspace,
+            pane_id: p.pane_id,
+        })),
+        Err(err) if err.code() == Some("workspace_not_found") => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Do two paths name the same directory? herdr reports a checkout's path
+/// without a trailing slash; a `--repo` may carry one.
+fn same_dir(a: &str, b: &str) -> bool {
+    let trim = |p: &str| {
+        let t = p.trim_end_matches('/');
+        if t.is_empty() { "/" } else { t }.to_string()
+    };
+    trim(a) == trim(b)
 }
 
 /// The workspace of a worktree task, and the branch it is on: the checkout
@@ -345,7 +470,7 @@ async fn start_agent(
 /// `cwd` that does not exist silently opens the pane somewhere else. Job files
 /// and `pastor task run --repo` both use `~` to mean the home on that machine, so
 /// pastor resolves it there before asking herdr.
-async fn expand_home(
+pub(crate) async fn expand_home(
     conn: &dyn Connector,
     what: &str,
     repo: &str,
@@ -534,6 +659,7 @@ mod tests {
             checkout: None,
             reopen: None,
             agent_source: None,
+            place: Default::default(),
         }
     }
 
@@ -1288,5 +1414,233 @@ mod tests {
         );
         assert_eq!(t.state, TaskState::Failed);
         assert!(fake.requests().is_empty());
+    }
+    fn methods(fake: &FakeHerdr) -> Vec<String> {
+        fake.requests().into_iter().map(|r| r.method).collect()
+    }
+
+    /// A fix round in a PR's worktree: `--repo` is a checkout a workspace
+    /// already shows, so the agent gets a pane there, not a workspace of its
+    /// own. The pane is the task's; the workspace stays the user's.
+    #[tokio::test]
+    async fn place_repo_puts_a_task_in_the_workspace_showing_its_repo() {
+        for repo in ["/srv/app", "/srv/app/"] {
+            let fake = FakeHerdr::new();
+            fake.open_user_workspace("other", Some("/srv/other"));
+            let ws = fake.open_user_workspace("app", Some("/srv/app"));
+            let mut t = task(DispatchSpec {
+                repo: Some(repo.into()),
+                ..spec()
+            });
+            dispatch(&fake, &mut t, &Agents::default(), READY)
+                .await
+                .unwrap();
+            assert_eq!(t.state, TaskState::Running, "{repo}");
+            assert_eq!(t.workspace_id.as_deref(), Some(ws.as_str()), "{repo}");
+            let pane = t.pane_id.clone().unwrap();
+            assert_eq!(fake.panes(&ws), vec![format!("{ws}:p1"), pane.clone()]);
+            assert!(!methods(&fake).iter().any(|m| m.ends_with(".create")));
+            let split = fake
+                .requests()
+                .into_iter()
+                .find(|r| r.method == "pane.split")
+                .unwrap();
+            assert_eq!(split.params["target_pane_id"], format!("{ws}:p1"));
+            assert_eq!(split.params["cwd"], repo);
+            assert_eq!(fake.pane_env(&pane)["PASTOR_TASK"], "t-7");
+        }
+    }
+
+    /// Nothing shows the repo, or there is no repo: a workspace of its own,
+    /// as before.
+    #[tokio::test]
+    async fn place_repo_makes_a_workspace_when_none_shows_the_repo() {
+        for repo in [Some("/srv/app"), None] {
+            let fake = FakeHerdr::new();
+            fake.open_user_workspace("other", Some("/srv/other"));
+            let mut t = task(DispatchSpec {
+                repo: repo.map(str::to_string),
+                ..spec()
+            });
+            dispatch(&fake, &mut t, &Agents::default(), READY)
+                .await
+                .unwrap();
+            let create = fake
+                .requests()
+                .into_iter()
+                .find(|r| r.method == "workspace.create")
+                .unwrap();
+            assert_eq!(create.params["label"], "t-7");
+            assert_eq!(t.workspace_id.as_deref(), Some("w2"), "{repo:?}");
+            assert!(!methods(&fake).contains(&"pane.split".to_string()));
+        }
+    }
+
+    /// A worktree task gets a new worktree, which herdr already shows
+    /// under the repo's workspace, even with the repo open in one.
+    #[tokio::test]
+    async fn place_repo_keeps_a_worktree_task_in_its_worktree() {
+        let fake = FakeHerdr::new();
+        let ws = fake.open_user_workspace("app", Some("/srv/app"));
+        let mut t = task(DispatchSpec {
+            worktree: true,
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        assert!(methods(&fake).contains(&"worktree.create".to_string()));
+        assert_ne!(t.workspace_id.as_deref(), Some(ws.as_str()));
+        assert_eq!(fake.panes(&ws), vec![format!("{ws}:p1")]);
+        assert!(t.spec.checkout.is_some());
+    }
+
+    /// `own`: a workspace named after the task, whatever already shows the
+    /// repo.
+    #[tokio::test]
+    async fn place_own_always_makes_a_workspace() {
+        let fake = FakeHerdr::new();
+        let ws = fake.open_user_workspace("app", Some("/srv/app"));
+        let mut t = task(DispatchSpec {
+            place: Place::Own,
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        assert_ne!(t.workspace_id.as_deref(), Some(ws.as_str()));
+        assert_eq!(fake.panes(&ws), vec![format!("{ws}:p1")]);
+        assert!(!methods(&fake).contains(&"workspace.list".to_string()));
+        let create = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "workspace.create")
+            .unwrap();
+        assert_eq!(create.params["label"], "t-7");
+    }
+
+    /// `pastor`: the first task makes the machine's `pastor` workspace, the
+    /// next one joins it. Each gets its own pane; the workspace's first pane
+    /// stays, so no task's close ends it.
+    #[tokio::test]
+    async fn place_pastor_shares_one_workspace_made_on_first_use() {
+        let fake = FakeHerdr::new();
+        let mut one = task(DispatchSpec {
+            place: Place::Pastor,
+            ..spec()
+        });
+        dispatch(&fake, &mut one, &Agents::default(), READY)
+            .await
+            .unwrap();
+        let ws = one.workspace_id.clone().unwrap();
+        let mut two = task(DispatchSpec {
+            place: Place::Pastor,
+            repo: None,
+            ..spec()
+        });
+        two.id = 8;
+        dispatch(&fake, &mut two, &Agents::default(), READY)
+            .await
+            .unwrap();
+        assert_eq!(two.workspace_id.as_deref(), Some(ws.as_str()));
+        let creates: Vec<_> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "workspace.create")
+            .collect();
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0].params["label"], "pastor");
+        assert_eq!(creates[0].params["cwd"], serde_json::Value::Null);
+        assert_eq!(
+            fake.panes(&ws),
+            vec![
+                format!("{ws}:p1"),
+                one.pane_id.clone().unwrap(),
+                two.pane_id.clone().unwrap()
+            ]
+        );
+        assert_eq!(
+            fake.pane_env(one.pane_id.as_deref().unwrap())["PASTOR_TASK"],
+            "t-7"
+        );
+        assert_eq!(
+            fake.pane_env(two.pane_id.as_deref().unwrap())["PASTOR_TASK"],
+            "t-8"
+        );
+    }
+
+    /// A worktree task placed in `pastor` still gets its worktree on disk,
+    /// recorded as its checkout; the workspace herdr opened on it goes, and
+    /// the agent works in the checkout from a pane in `pastor`.
+    #[tokio::test]
+    async fn place_pastor_still_makes_the_worktree() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            place: Place::Pastor,
+            worktree: true,
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        let checkout = t.spec.checkout.clone().expect("checkout recorded");
+        assert_eq!(checkout.branch, "pastor/t-7");
+        let ws = t.workspace_id.clone().unwrap();
+        assert_eq!(
+            fake.workspaces(),
+            vec![ws.clone()],
+            "the worktree's workspace is closed"
+        );
+        let split = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "pane.split")
+            .unwrap();
+        assert_eq!(split.params["cwd"], checkout.path.as_str());
+        assert!(fake.panes(&ws).contains(t.pane_id.as_ref().unwrap()));
+        assert_eq!(fake.worktree_list("/srv/app").await.unwrap().len(), 1);
+    }
+
+    /// `pane:<workspace>`: a pane in that workspace, or refused before
+    /// anything is made when the machine has none by that name.
+    #[tokio::test]
+    async fn place_pane_uses_the_named_workspace_or_refuses() {
+        let fake = FakeHerdr::new();
+        let ws = fake.open_user_workspace("work", None);
+        let mut t = task(DispatchSpec {
+            place: Place::Pane("work".into()),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        assert_eq!(t.workspace_id.as_deref(), Some(ws.as_str()));
+        assert_eq!(fake.panes(&ws).len(), 2);
+
+        for worktree in [false, true] {
+            let fake = FakeHerdr::new();
+            fake.open_user_workspace("work", None);
+            let mut t = task(DispatchSpec {
+                place: Place::Pane("play".into()),
+                worktree,
+                ..spec()
+            });
+            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+                .await
+                .unwrap_err();
+            assert!(!err.is_transport());
+            assert_eq!(t.state, TaskState::Failed);
+            assert!(
+                err.to_string().contains("no workspace named play on pi-1"),
+                "{err}"
+            );
+            let made = methods(&fake);
+            assert!(
+                !made
+                    .iter()
+                    .any(|m| m.ends_with(".create") || m == "pane.split"),
+                "{made:?}"
+            );
+        }
     }
 }

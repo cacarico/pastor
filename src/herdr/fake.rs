@@ -35,12 +35,20 @@ struct State {
     /// Open workspace -> its open panes, in order. `pane.split` adds one;
     /// `pane.close` of the last closes the workspace, as in herdr.
     panes: HashMap<String, Vec<String>>,
+    /// Workspace id -> its label, as `workspace.list` reports it. Ids are
+    /// never reused, so a closed workspace's entry is harmless.
+    labels: HashMap<String, String>,
+    /// Workspace id -> the directory `workspace.list` reports as its
+    /// checkout: the `cwd` it was created with, or its worktree's path. The
+    /// fake treats every directory as a git checkout.
+    dirs: HashMap<String, String>,
     /// The `env` each pane was created with (`workspace.create`, `pane.split`).
     pane_env: HashMap<String, Value>,
     /// Worktree workspaces whose checkout has changes, so `worktree.remove`
     /// needs `force`.
     dirty: HashSet<String>,
-    /// Every new worktree starts dirty (see `dirty_worktrees`).
+    /// Every new worktree, and every workspace opened on one, starts dirty
+    /// (see `dirty_worktrees`).
     all_dirty: bool,
     /// Worktree checkouts on disk, as (repo cwd, branch) -> path. They outlive
     /// their workspace, as git worktrees do: only `worktree.remove` deletes one.
@@ -257,6 +265,24 @@ impl FakeHerdr {
     /// Every worktree created from now on is dirty.
     pub fn dirty_worktrees(&self, yes: bool) {
         self.state.lock().unwrap().all_dirty = yes;
+    }
+    /// Open a workspace the way someone at the machine would, with a label
+    /// and a directory, as `workspace.create` does. Answers its id.
+    pub fn open_user_workspace(&self, label: &str, dir: Option<&str>) -> String {
+        let mut s = self.state.lock().unwrap();
+        s.next_ws += 1;
+        let ws = format!("w{}", s.next_ws);
+        Self::open_workspace(&mut s, &ws, false);
+        s.labels.insert(ws.clone(), label.into());
+        if let Some(dir) = dir {
+            s.dirs.insert(ws.clone(), dir.into());
+        }
+        ws
+    }
+    /// The open panes of workspace `ws`, in order; empty once it is closed.
+    pub fn panes(&self, ws: &str) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        s.panes.get(ws).cloned().unwrap_or_default()
     }
     /// Open workspace ids, sorted.
     pub fn workspaces(&self) -> Vec<String> {
@@ -649,6 +675,17 @@ impl FakeHerdr {
                 }
                 s.next_ws += 1;
                 let ws = format!("w{}", s.next_ws);
+                let dir = if req.method == "worktree.create" {
+                    s.checkouts.get(&checkout).cloned()
+                } else {
+                    p["cwd"].as_str().map(str::to_string)
+                };
+                if let Some(dir) = dir {
+                    s.dirs.insert(ws.clone(), dir);
+                }
+                if let Some(label) = p["label"].as_str() {
+                    s.labels.insert(ws.clone(), label.to_string());
+                }
                 let pane = format!("{ws}:p1");
                 let is_worktree = req.method == "worktree.create";
                 Self::open_workspace(&mut s, &ws, is_worktree);
@@ -722,6 +759,13 @@ impl FakeHerdr {
                         let ws = format!("w{}", s.next_ws);
                         Self::open_workspace(&mut s, &ws, true);
                         s.workspace_checkout.insert(ws.clone(), checkout.clone());
+                        s.dirs.insert(ws.clone(), path.clone());
+                        if s.all_dirty {
+                            s.dirty.insert(ws.clone());
+                        }
+                        if let Some(label) = p["label"].as_str() {
+                            s.labels.insert(ws.clone(), label.to_string());
+                        }
                         ws
                     }
                 };
@@ -739,6 +783,42 @@ impl FakeHerdr {
                     "root_pane": {"pane_id": root, "workspace_id": ws},
                     "worktree": {"path": path, "branch": checkout.1}}),
                 )
+            }
+            // herdr 0.9.1: `workspace.list` answers every open workspace;
+            // one whose directory is a git checkout carries `worktree` with
+            // its `checkout_path`.
+            "workspace.list" => {
+                let mut ids: Vec<&String> = s.workspaces.keys().collect();
+                ids.sort_by_key(|ws| ws[1..].parse::<u32>().unwrap_or(0));
+                let workspaces: Vec<Value> = ids
+                    .into_iter()
+                    .map(|ws| {
+                        let mut w = json!({"workspace_id": ws, "label": s.labels.get(ws),
+                            "pane_count": s.panes.get(ws).map_or(0, Vec::len)});
+                        if let Some(dir) = s.dirs.get(ws) {
+                            w["worktree"] = json!({"checkout_path": dir,
+                                "is_linked_worktree": s.workspaces[ws]});
+                        }
+                        w
+                    })
+                    .collect();
+                Ok(json!({"type": "workspace_list", "workspaces": workspaces}))
+            }
+            // herdr 0.9.1: `pane.list {workspace_id}` answers that
+            // workspace's panes, `workspace_not_found` for one it lacks.
+            "pane.list" => {
+                let ws = p["workspace_id"].as_str().unwrap_or("");
+                let Some(panes) = s.panes.get(ws) else {
+                    return Err((
+                        "workspace_not_found".into(),
+                        format!("workspace {ws} not found"),
+                    ));
+                };
+                let panes: Vec<Value> = panes
+                    .iter()
+                    .map(|p| json!({"pane_id": p, "workspace_id": ws}))
+                    .collect();
+                Ok(json!({"type": "pane_list", "panes": panes}))
             }
             "agent.start" => {
                 let pane_id = p["pane_id"].as_str().unwrap_or("").to_string();

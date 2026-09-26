@@ -1605,6 +1605,7 @@ mod tests {
                 checkout: None,
                 reopen: None,
                 agent_source: None,
+                place: Default::default(),
             },
             agent: Default::default(),
             flock: None,
