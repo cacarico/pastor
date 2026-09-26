@@ -13,8 +13,9 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// The head's IPC protocol, answered in `Pong`. Bumped when a request gains a
 /// field an older head would silently ignore (serde skips unknown fields), so
 /// the CLI can refuse to send it there. A head that answers no protocol is 0.
-/// 1: flocks (`Run::flock`, `TaskFilter::flock`).
-pub const IPC_PROTOCOL: u32 = 2;
+/// 1: flocks (`Run::flock`, `TaskFilter::flock`). 2: flock agents and tool
+/// lists. 3: `TaskRetry::place`.
+pub const IPC_PROTOCOL: u32 = 3;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -34,6 +35,10 @@ pub const FLOCK_PROTOCOL: u32 = 1;
 /// passes the tool allow and deny lists on. An older one would start the
 /// agent without the deny list, and say nothing.
 pub const AGENT_PROTOCOL: u32 = 2;
+
+/// The first protocol whose head honours `TaskRetry::place`. An older one
+/// would retry the task with its original place, and say it succeeded.
+pub const PLACE_PROTOCOL: u32 = 3;
 
 // One request is read per connection and dropped once answered, so the
 // size of the largest variant (`Run`) costs nothing worth a box.
@@ -88,7 +93,8 @@ pub enum IpcRequest {
         id: i64,
         /// Where the copy's pane goes instead of the original's
         /// (`task retry --place`). Left out when not given, so an older head
-        /// still reads the request.
+        /// still reads the request; given, the CLI sends it only to a head
+        /// of `PLACE_PROTOCOL` or later.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         place: Option<crate::task::Place>,
     },

@@ -251,7 +251,10 @@ writing tasks. Retry and close need it.
 `place` decides where on its machine's herdr a task's agent gets its pane.
 It is set like every dispatch setting: `--place` on `task run` (and on `task
 retry`, to move a retry), `place = "..."` in a job's `[dispatch]`, `place` under
-`[defaults]` in `pastor.toml`; `task show` prints it.
+`[defaults]` in `pastor.toml`; `task show` prints it. A head from before
+`task retry --place` would retry the task where it was, so `task retry
+--place` refuses one (`head_too_old`): restart `pastor serve` after an
+upgrade.
 
 - `repo` (the default) keeps an agent under the repo it works on. A
   `--worktree` task gets a new worktree, which herdr shows under the repo's

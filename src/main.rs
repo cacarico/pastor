@@ -356,6 +356,7 @@ fn main() {
                     &paths,
                     flocky || flocks_declared(&paths),
                     needs_agent_protocol(&command),
+                    needs_place_protocol(&command),
                 )
                 .await?
             }
@@ -461,7 +462,16 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 /// `agents` is for a command that can queue a task (`needs_agent_protocol`): a
 /// head before `AGENT_PROTOCOL` would drop the task's tool lists, so it is
 /// refused too.
-async fn probe_head(paths: &Paths, flocks: bool, agents: bool) -> anyhow::Result<Head> {
+///
+/// `place` is for `task retry --place` (`needs_place_protocol`): a head
+/// before `PLACE_PROTOCOL` would retry the task where it was and answer
+/// success, so it is refused.
+async fn probe_head(
+    paths: &Paths,
+    flocks: bool,
+    agents: bool,
+    place: bool,
+) -> anyhow::Result<Head> {
     let socket = paths.socket_file();
     match pastor::ipc::ping_head(&socket).await {
         HeadPing::NotRunning => Ok(Head::Absent),
@@ -472,6 +482,14 @@ async fn probe_head(paths: &Paths, flocks: bool, agents: bool) -> anyhow::Result
                 socket.display()
             ),
         )),
+        HeadPing::Pong { version, protocol } if place && protocol < pastor::ipc::PLACE_PROTOCOL => {
+            Err(pastor::cli::CliError::err(
+                "head_too_old",
+                format!(
+                    "the running pastor serve ({version}) predates `task retry --place` and would retry the task where it was; restart it"
+                ),
+            ))
+        }
         HeadPing::Pong { version, protocol }
             if agents && protocol < pastor::ipc::AGENT_PROTOCOL =>
         {
@@ -584,6 +602,17 @@ fn needs_agent_protocol(command: &Command) -> bool {
         Command::Job { cmd } => matches!(cmd, JobCmd::Run { .. }),
         _ => false,
     }
+}
+
+/// Whether `command` sends a request only a head of `PLACE_PROTOCOL` or later
+/// honours: `task retry --place`.
+fn needs_place_protocol(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Task {
+            cmd: TaskCmd::Retry(a)
+        } if a.place.is_some()
+    )
 }
 
 /// Whether flock.toml declares named flocks, so a command with no `--flock`
@@ -1930,7 +1959,7 @@ mod tests {
                 w.write_all(out.as_bytes()).await.unwrap();
             }
         });
-        let err = probe_head(&paths, false, true).await.unwrap_err();
+        let err = probe_head(&paths, false, true, false).await.unwrap_err();
         let err = err.downcast::<pastor::cli::CliError>().unwrap();
         assert_eq!(err.code, "head_too_old");
         assert!(
@@ -1938,7 +1967,10 @@ mod tests {
             "{}",
             err.message
         );
-        assert_eq!(probe_head(&paths, true, false).await.unwrap(), Head::Live);
+        assert_eq!(
+            probe_head(&paths, true, false, false).await.unwrap(),
+            Head::Live
+        );
 
         let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
         assert!(needs_agent_protocol(&parse(&[
@@ -1960,6 +1992,54 @@ mod tests {
         ])));
         assert!(!needs_agent_protocol(&parse(&["pastor", "job", "list"])));
         assert!(!needs_agent_protocol(&parse(&["pastor", "job", "reload"])));
+    }
+
+    /// A head from before `PLACE_PROTOCOL` reads `task retry --place`
+    /// without the place (serde skips the unknown field) and retries the
+    /// task where it was, answering success. The CLI refuses to send it
+    /// there; a retry without `--place` still goes.
+    #[tokio::test]
+    async fn retry_with_a_place_refuses_a_head_before_it() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.into_split();
+                let mut line = String::new();
+                tokio::io::BufReader::new(r)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let pong = IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol: pastor::ipc::AGENT_PROTOCOL,
+                };
+                let mut out = serde_json::to_string(&pong).unwrap();
+                out.push('\n');
+                w.write_all(out.as_bytes()).await.unwrap();
+            }
+        });
+        let err = probe_head(&paths, false, true, true).await.unwrap_err();
+        let err = err.downcast::<pastor::cli::CliError>().unwrap();
+        assert_eq!(err.code, "head_too_old");
+        assert!(err.message.contains("--place"), "{}", err.message);
+        assert_eq!(
+            probe_head(&paths, false, true, false).await.unwrap(),
+            Head::Live
+        );
+
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        assert!(needs_place_protocol(&parse(&[
+            "pastor", "task", "retry", "t-1", "--place", "pastor"
+        ])));
+        assert!(!needs_place_protocol(&parse(&[
+            "pastor", "task", "retry", "t-1"
+        ])));
+        assert!(!needs_place_protocol(&parse(&["pastor", "task", "list"])));
     }
 
     #[test]
