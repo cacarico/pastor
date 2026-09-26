@@ -26,8 +26,8 @@ So every task in the plan must:
 
 Follow these in order. Create a todo for each.
 
-1. **Design.** If the user has no approved spec, run `superpowers:brainstorming` unchanged, approval gate included. Add nothing until the design is approved. This is the only step where you ask the user things; ask here what the tasks cannot.
-2. **Read the fleet.** `pastor machine list --json` and `pastor flock list --json`: flocks, tags, `max_agents`, which machines are `connected` or `polling`. With no head, the probe answer is enough. Never start `pastor serve` or install services. Ask the user for the repo path on the target machines (`--repo` is a path there, not here) and the command that checks the repo (`make check`, `cargo test`, ...), unless the repo says.
+1. **Design.** If the user has no approved spec, run `superpowers:brainstorming` unchanged, approval gate included. Add nothing until the design is approved. This is the only step where you ask the user things; ask here what the tasks cannot, including the repo path on the target machines (`--repo` is a path there, not here) and the command that checks the repo (`make check`, `cargo test`, ...), unless the repo says.
+2. **Read the fleet.** `pastor machine list --json` and `pastor flock list --json`: flocks, tags, `max_agents`, which machines are `connected` or `polling`. With no head, the probe answer is enough. Never start `pastor serve` or install services.
 3. **Name the plan.** `<name>` is short kebab case. The plan branch is `pastor/<name>`. Files, all on that branch:
    - `docs/superpowers/plans/YYYY-MM-DD-<name>.md`: the plan
    - `docs/superpowers/plans/YYYY-MM-DD-<name>.ledger.md`: the ledger
