@@ -917,7 +917,10 @@ it does not hold the cursor back, since a retry cannot fix it. A non-zero exit, 
 process group is killed) or a program that will not start fails the run: its
 items and cursor are discarded, `job.failed` is emitted, the job backs off,
 and the error names the run log. What the connector writes to stderr goes to
-that log.
+that log. So does a run that returns more than 10,000 items, or more than
+64 MiB of them: pastor keeps no more items past that point and fails the run
+once the connector exits, so a connector with more to hand over should page
+with its cursor.
 
 A stream connector gets the same handshake once, when it is started, and
 answers in the same lines at any time; it owns its own sockets and pastor
@@ -925,7 +928,10 @@ proxies nothing. If it exits it is started again with backoff (1s doubling to
 5 minutes; a run that stayed up a minute starts it over). Pastor hands the
 restarted process, in its handshake, the newest cursor the connector emitted
 before it exited, whether or not a job run has saved it yet, or the job's
-saved cursor if it has emitted none since the daemon started. How a job run takes a stream's output is
+saved cursor if it has emitted none since the daemon started. Between job
+runs pastor holds up to 10,000 of a stream's items and 64 MiB of them, the
+batch handed out but not yet saved included, and 1,000 of its log lines; past
+that the oldest are dropped, with one warning in the next run's log. How a job run takes a stream's output is
 under "Using a connector in a job".
 
 ### Secrets and the `.env` file

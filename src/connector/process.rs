@@ -65,19 +65,80 @@ pub fn parse_line(line: &str) -> Option<Line> {
     })
 }
 
+/// Items one poll run may return, and the bytes they may take together.
+/// Lines are already capped at 256 KiB each, but not their number, so a
+/// faulty connector, or a faithful one passing on a huge upstream answer,
+/// could otherwise fill the daemon's memory until its timeout.
+pub const POLL_ITEMS_MAX: usize = 10_000;
+/// See `POLL_ITEMS_MAX`; also the bound on what a stream holds.
+pub const ITEMS_BYTES_MAX: usize = 64 << 20;
+
+/// About what an item takes in memory: its key and its fields as JSON.
+fn item_bytes(item: &Item) -> usize {
+    item.key.len() + serde_json::to_string(&item.fields).map_or(0, |s| s.len())
+}
+
 /// A poll connector's collected output, line by line.
-#[derive(Default)]
 struct Collected {
     out: RunOutput,
     n: usize,
+    items_max: usize,
+    bytes_max: usize,
+    /// Bytes of the items kept so far (`item_bytes`).
+    bytes: usize,
+    /// Items that came past a bound and were not kept.
+    over: usize,
+}
+
+impl Default for Collected {
+    fn default() -> Self {
+        Collected {
+            out: RunOutput::default(),
+            n: 0,
+            items_max: POLL_ITEMS_MAX,
+            bytes_max: ITEMS_BYTES_MAX,
+            bytes: 0,
+            over: 0,
+        }
+    }
 }
 
 impl Collected {
+    /// Why the run must fail because it returned too much, if it did.
+    /// Failing keeps its items and cursor from being half-applied: the kept
+    /// items are only the first ones, and the cursor points past the rest.
+    fn overflow(&self) -> Option<String> {
+        (self.over > 0).then(|| {
+            format!(
+                "returned more than {} items or {} bytes of them in one run ({} over, not kept); \
+                 a connector with more to hand over should page with its cursor",
+                self.items_max, self.bytes_max, self.over
+            )
+        })
+    }
+
     fn take(&mut self, raw: &str, log: &SharedLog) {
         self.n += 1;
         match parse_line(raw) {
             None => {}
-            Some(Line::Item(item)) => self.out.items.push(item),
+            Some(Line::Item(item)) => {
+                let size = item_bytes(&item);
+                if self.over > 0
+                    || self.out.items.len() >= self.items_max
+                    || self.bytes + size > self.bytes_max
+                {
+                    if self.over == 0 {
+                        lock(log).line(&format!(
+                            "[pastor: stdout line {}: past {} items or {} bytes; keeping no more items]",
+                            self.n, self.items_max, self.bytes_max
+                        ));
+                    }
+                    self.over += 1;
+                } else {
+                    self.bytes += size;
+                    self.out.items.push(item);
+                }
+            }
             Some(Line::Cursor(c)) => self.out.cursor = Some(c),
             // Log records reach the scheduler's log and `connector run`, so they
             // get the same redaction as stderr.
@@ -192,7 +253,9 @@ impl ItemSource for PollSource {
             let (inv, log) = self.runner.prepare(&input, timeout)?;
             let mut got = Collected::default();
             let done = exec::run(inv, log.clone(), |l| got.take(l, &log)).await;
-            if done.exit.success() {
+            if let Some(why) = got.overflow() {
+                Err(format!("{why} (log: {})", lock(&log).path().display()))
+            } else if done.exit.success() {
                 Ok(got.out)
             } else {
                 Err(format!(
@@ -216,9 +279,13 @@ pub const STREAM_BUFFER_MAX: usize = 10_000;
 /// in one note.
 pub const STREAM_LOG_MAX: usize = 1000;
 
-#[derive(Default)]
 struct Buffer {
     items: std::collections::VecDeque<Item>,
+    /// `item_bytes` of everything in `items`.
+    items_bytes: usize,
+    /// The bound on the bytes of `items`, and of `pending` with them after a
+    /// drain; `ITEMS_BYTES_MAX` outside tests.
+    bytes_max: usize,
     items_dropped: usize,
     /// The newest cursor since the last drain, handed to the scheduler.
     cursor: Option<String>,
@@ -238,16 +305,39 @@ struct Buffer {
     batch: u64,
 }
 
+impl Default for Buffer {
+    fn default() -> Self {
+        Buffer {
+            items: Default::default(),
+            items_bytes: 0,
+            bytes_max: ITEMS_BYTES_MAX,
+            items_dropped: 0,
+            cursor: None,
+            latest_cursor: None,
+            logs: Default::default(),
+            logs_dropped: 0,
+            down: None,
+            pending: Vec::new(),
+            pending_cursor: None,
+            batch: 0,
+        }
+    }
+}
+
 /// A stream can run for days between two drains of an infrequent job, so
-/// both queues are bounded and overflow is one counter each, not a line per
-/// dropped entry.
+/// both queues are bounded, items by count and by bytes, and overflow is one
+/// counter each, not a line per dropped entry.
 impl Buffer {
     fn push_item(&mut self, item: Item) {
-        if self.items.len() >= STREAM_BUFFER_MAX {
-            self.items.pop_front();
+        self.items_bytes += item_bytes(&item);
+        self.items.push_back(item);
+        while self.items.len() > STREAM_BUFFER_MAX || self.items_bytes > self.bytes_max {
+            let Some(old) = self.items.pop_front() else {
+                break;
+            };
+            self.items_bytes -= item_bytes(&old);
             self.items_dropped += 1;
         }
-        self.items.push_back(item);
     }
 
     fn push_log(&mut self, line: String) {
@@ -265,8 +355,14 @@ impl Buffer {
         let batch = self.batch;
         let mut pending = std::mem::take(&mut self.pending);
         pending.extend(self.items.drain(..).map(|i| (batch, i)));
-        if pending.len() > STREAM_BUFFER_MAX {
-            let over = pending.len() - STREAM_BUFFER_MAX;
+        self.items_bytes = 0;
+        let mut over = pending.len().saturating_sub(STREAM_BUFFER_MAX);
+        let mut bytes: usize = pending[over..].iter().map(|(_, i)| item_bytes(i)).sum();
+        while bytes > self.bytes_max && over < pending.len() {
+            bytes -= item_bytes(&pending[over].1);
+            over += 1;
+        }
+        if over > 0 {
             pending.drain(..over);
             self.items_dropped += over;
         }
@@ -285,7 +381,8 @@ impl Buffer {
         }
         if self.items_dropped > 0 {
             logs.push(format!(
-                "warn: stream buffer full ({STREAM_BUFFER_MAX}); dropped the {} oldest items",
+                "warn: stream buffer full ({STREAM_BUFFER_MAX} items or {} bytes); dropped the {} oldest items",
+                self.bytes_max,
                 std::mem::take(&mut self.items_dropped)
             ));
         }
@@ -540,7 +637,7 @@ mod tests {
         );
         assert_eq!(
             out.logs[1],
-            "warn: stream buffer full (10000); dropped the 3 oldest items"
+            "warn: stream buffer full (10000 items or 67108864 bytes); dropped the 3 oldest items"
         );
         assert_eq!(out.logs[2], "info: line 5", "the newest logs are kept");
         assert_eq!(
@@ -550,6 +647,89 @@ mod tests {
         // The counters start over after a drain.
         b.push_log("info: again".into());
         assert_eq!(b.drain().logs, vec!["info: again"]);
+    }
+
+    fn big_item(key: &str, bytes: usize) -> Item {
+        let mut fields = serde_json::Map::new();
+        fields.insert("body".into(), "x".repeat(bytes).into());
+        Item::new(key, fields)
+    }
+
+    /// Items are held by size as well as by count: a stream of large items
+    /// drops the oldest once the buffer, pending batch included, passes its
+    /// byte bound.
+    #[test]
+    fn the_stream_buffer_caps_the_bytes_it_holds() {
+        let mut b = Buffer {
+            bytes_max: 10_000,
+            ..Buffer::default()
+        };
+        for i in 0..3 {
+            b.push_item(big_item(&format!("k{i}"), 3_000));
+        }
+        let first = b.drain();
+        assert_eq!(first.items.len(), 3, "under the bound");
+        // Unacked, the batch still counts: two more push the oldest out.
+        b.push_item(big_item("k3", 3_000));
+        b.push_item(big_item("k4", 3_000));
+        let out = b.drain();
+        let keys: Vec<&str> = out.items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["k2", "k3", "k4"]);
+        assert!(
+            out.logs
+                .iter()
+                .any(|l| l.contains("dropped the 2 oldest items")),
+            "{:?}",
+            out.logs
+        );
+        // One item over the whole bound is dropped on its own.
+        b.ack(out.batch);
+        b.push_item(big_item("huge", 20_000));
+        assert!(b.drain().items.is_empty());
+    }
+
+    /// A poll run holds at most `items_max` items and `bytes_max` bytes of
+    /// them. Past that it keeps nothing more and the run fails, so neither
+    /// its items nor its cursor are half-applied.
+    #[test]
+    fn a_poll_run_past_its_bounds_keeps_no_more_and_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = RunLog::create(tmp.path(), crate::connector::env::Redactor::new([], &[]))
+            .unwrap()
+            .shared();
+        let line = |k: &str, n: usize| {
+            format!(
+                r#"{{"type":"item","key":"{k}","body":"{}"}}"#,
+                "x".repeat(n)
+            )
+        };
+        let mut got = Collected {
+            items_max: 3,
+            bytes_max: 1_000_000,
+            ..Collected::default()
+        };
+        for i in 0..5 {
+            got.take(&line(&format!("k{i}"), 10), &log);
+        }
+        assert_eq!(got.out.items.len(), 3);
+        assert_eq!(got.over, 2);
+        let err = got.overflow().unwrap();
+        assert!(err.contains("more than 3 items"), "{err}");
+
+        let mut got = Collected {
+            items_max: 100,
+            bytes_max: 1_000,
+            ..Collected::default()
+        };
+        for i in 0..5 {
+            got.take(&line(&format!("k{i}"), 400), &log);
+        }
+        assert_eq!(got.out.items.len(), 2);
+        assert!(got.overflow().unwrap().contains("1000 bytes"));
+
+        let mut ok = Collected::default();
+        ok.take(&line("k", 10), &log);
+        assert_eq!(ok.overflow(), None);
     }
 
     #[test]
