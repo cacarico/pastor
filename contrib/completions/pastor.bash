@@ -280,6 +280,9 @@ _pastor() {
             pastor__subcmd__help__subcmd__task,close)
                 cmd="pastor__subcmd__help__subcmd__task__subcmd__close"
                 ;;
+            pastor__subcmd__help__subcmd__task,describe)
+                cmd="pastor__subcmd__help__subcmd__task__subcmd__describe"
+                ;;
             pastor__subcmd__help__subcmd__task,list)
                 cmd="pastor__subcmd__help__subcmd__task__subcmd__list"
                 ;;
@@ -1571,7 +1574,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help__subcmd__task)
-            opts="run list show read attach retry close prune send"
+            opts="run list show read attach retry close prune send describe"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1599,6 +1602,20 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help__subcmd__task__subcmd__close)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__task__subcmd__describe)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

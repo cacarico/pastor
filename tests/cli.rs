@@ -3143,3 +3143,37 @@ fn describe_a_machine_and_its_flock_with_a_head() {
     assert_eq!(f["machines"], serde_json::json!(["fake"]));
     assert!(f["agents"].is_u64(), "a head knows the live agents: {f}");
 }
+
+/// clap leaves a visible alias out of the `help` subtree, so `pastor help
+/// task describe` would not complete; the completion tree adds it back.
+#[test]
+fn completions_offer_aliases_under_help() {
+    let gen_ = |shell: &str| {
+        let out = pastor().args(["completions", shell]).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let bash = gen_("bash");
+    assert!(
+        bash.contains("pastor__subcmd__help__subcmd__task,describe)"),
+        "bash help task has no describe case"
+    );
+    let help_task = bash
+        .split("pastor__subcmd__help__subcmd__task)")
+        .nth(1)
+        .and_then(|s| s.lines().find(|l| l.trim_start().starts_with("opts=")))
+        .expect("bash help task opts");
+    assert!(
+        help_task
+            .split_whitespace()
+            .any(|w| w.trim_matches('"') == "describe"),
+        "bash help task opts: {help_task}"
+    );
+    let fish = gen_("fish");
+    assert!(
+        fish.lines().any(|l| l
+            .contains("__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task")
+            && l.contains("-a \"describe\"")),
+        "fish help task has no describe"
+    );
+}

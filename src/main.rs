@@ -382,7 +382,38 @@ fn main() {
 /// The command tree `pastor completions` describes: the real one, since there
 /// are no hidden subcommands left to strip out.
 fn completion_tree() -> clap::Command {
-    <Cli as clap::CommandFactory>::command().version(env!("CARGO_PKG_VERSION"))
+    let mut cmd = <Cli as clap::CommandFactory>::command().version(env!("CARGO_PKG_VERSION"));
+    // clap builds the `help` subtree from subcommand names only, so a
+    // visible alias (`task describe`) completes directly but not after
+    // `pastor help task`. Build first, then give each help node its aliases.
+    cmd.build();
+    let real = cmd.clone();
+    cmd.mut_subcommand("help", |help| help_aliases(help, &real))
+}
+
+/// `help`, a node of the built help subtree, with an entry added for each
+/// visible alias of the matching node `real` of the command tree.
+fn help_aliases(help: clap::Command, real: &clap::Command) -> clap::Command {
+    let base = help.get_bin_name().unwrap_or("pastor").to_string();
+    let mut extra = Vec::new();
+    for sub in real.get_subcommands() {
+        for alias in sub.get_visible_aliases() {
+            // clap names want `'static`; this runs once, for a completion script.
+            let name: &'static str = Box::leak(alias.to_owned().into_boxed_str());
+            let mut c = clap::Command::new(name)
+                .bin_name(format!("{base} {name}"))
+                .disable_help_flag(true);
+            if let Some(about) = sub.get_about() {
+                c = c.about(about.clone());
+            }
+            extra.push(c);
+        }
+    }
+    help.mut_subcommands(|node| match real.find_subcommand(node.get_name()) {
+        Some(r) if node.get_name() != "help" => help_aliases(node, r),
+        _ => node,
+    })
+    .subcommands(extra)
 }
 
 fn fail(code: &str, message: &str) -> ! {
