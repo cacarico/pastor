@@ -76,29 +76,7 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
     tasks
         .iter()
         .map(|t| {
-            let note = t
-                .error
-                .clone()
-                .or_else(|| {
-                    t.item
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .map(|title| one_line(title).chars().take(60).collect())
-                })
-                .unwrap_or_else(|| {
-                    t.prompt
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(60)
-                        .collect()
-                });
-            let note = one_line(&note);
-            let note = match t.retry_of {
-                Some(of) => format!("retry of t-{of}: {note}"),
-                None => note,
-            };
+            let note = task_note(t);
             vec![
                 t.display_id(),
                 t.state.to_string(),
@@ -111,6 +89,34 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
             ]
         })
         .collect()
+}
+
+/// The NOTE column of `task list`, one escaped line: the error, else the
+/// item's title, else the prompt's first line. Shell completion shows it too.
+pub fn task_note(t: &Task) -> String {
+    let note = t
+        .error
+        .clone()
+        .or_else(|| {
+            t.item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|title| one_line(title).chars().take(60).collect())
+        })
+        .unwrap_or_else(|| {
+            t.prompt
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect()
+        });
+    let note = one_line(&note);
+    match t.retry_of {
+        Some(of) => format!("retry of t-{of}: {note}"),
+        None => note,
+    }
 }
 
 /// Errors carry raw stderr, newlines included; a human line (an events

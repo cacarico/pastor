@@ -324,3 +324,11 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from connector" -f -a "run" -d 'Run a connector\'s command once for a job and print its items; creates no tasks and saves no cursor'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "list" -d 'Every saved trust: machine, repo, and when it was saved'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "remove" -d 'Forget a saved trust; the repo\'s next task asks again'
+
+# Names (jobs, flocks, machines, tasks, connectors) come from pastor itself.
+function __fish_pastor_names
+    set -g __fish_pastor_names (pastor __complete fish -- (commandline -opc)[2..] (commandline -ct) 2>/dev/null)
+end
+
+complete -c pastor -n __fish_pastor_names -k -f -a '(printf "%s\n" $__fish_pastor_names)'
+complete -c pastor -n __fish_pastor_names -l flock -l job -l machine -l task -r -k -f -a '(printf "%s\n" $__fish_pastor_names)'

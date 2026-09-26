@@ -3467,3 +3467,183 @@ fn edit_saves_under_a_lock_and_rechecks_after_waiting() {
     assert_eq!(last_error(&out).0, "edit_conflict");
     assert_eq!(std::fs::read_to_string(&job).unwrap(), theirs);
 }
+
+/// `pastor __complete <shell> -- <words>` prints the names the word being
+/// typed (the last one) can take, from files alone: no head is running here.
+fn complete(config: &std::path::Path, state: &std::path::Path, words: &[&str]) -> (bool, String) {
+    let out = pastor()
+        .args(["__complete", "fish", "--"])
+        .args(words)
+        .env("PASTOR_CONFIG_DIR", config)
+        .env("PASTOR_STATE_DIR", state)
+        .env("PASTOR_DATA_DIR", state.join("data"))
+        .output()
+        .unwrap();
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), String::from_utf8(out.stdout).unwrap())
+}
+
+/// A config with two jobs, two flocks, two machines and one connector.
+fn completion_config() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(config.join("jobs")).unwrap();
+    let job =
+        "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p {{ task.id }}\"\n";
+    std::fs::write(config.join("jobs/nightly.toml"), job).unwrap();
+    std::fs::write(config.join("jobs/triage.toml"), job).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"lab\"\n\n\
+         [[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\nflock = \"home\"\n\n\
+         [[machine]]\nname = \"pi-2\"\nssh = \"user@pi-2\"\nflock = \"lab\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(state.join("data/connectors/github-issues")).unwrap();
+    (tmp, config, state)
+}
+
+#[test]
+fn complete_offers_job_names() {
+    let (_tmp, config, state) = completion_config();
+    for words in [
+        &["job", "describe", ""][..],
+        &["job", "run", "tr"],
+        &["tick", "--job", ""],
+        &["connector", "run", "github-issues", "--job", ""],
+        &["task", "list", "--json", "--job=n"],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(ok, "{words:?}");
+        assert_eq!(out, "nightly\ntriage\n", "{words:?}");
+    }
+    // A slot that takes no name is not completed from pastor's names, and
+    // neither is a name that has already been given.
+    for words in [
+        &["job", ""][..],
+        &["job", "describe", "--"],
+        &["job", "describe", "nightly", ""],
+        &["task", "read", "t-1", "--lines", ""],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(!ok, "{words:?}: {out}");
+        assert!(out.is_empty(), "{words:?}: {out}");
+    }
+}
+
+#[test]
+fn complete_offers_flock_names() {
+    let (_tmp, config, state) = completion_config();
+    for words in [
+        &["flock", "describe", ""][..],
+        &["flock", "default", ""],
+        &["machine", "move", "pi-1", ""],
+        &["task", "run", "fix it", "--flock", ""],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(ok, "{words:?}");
+        assert_eq!(out, "home\tdefault\nlab\n", "{words:?}");
+    }
+    // A new flock's name is the user's to choose.
+    let (ok, _) = complete(&config, &state, &["flock", "add", ""]);
+    assert!(!ok);
+}
+
+#[test]
+fn complete_offers_machine_names() {
+    let (_tmp, config, state) = completion_config();
+    for words in [
+        &["machine", "describe", ""][..],
+        &["machine", "move", ""],
+        &["open", ""],
+        &["task", "list", "--machine", ""],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(ok, "{words:?}");
+        assert_eq!(out, "pi-1\thome\npi-2\tlab\n", "{words:?}");
+    }
+    let (ok, _) = complete(&config, &state, &["machine", "add", ""]);
+    assert!(!ok);
+}
+
+#[test]
+fn complete_offers_connector_ids() {
+    let (_tmp, config, state) = completion_config();
+    for words in [
+        &["connector", "uninstall", ""][..],
+        &["connector", "unlink", ""],
+        &["connector", "run", ""],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(ok, "{words:?}");
+        assert_eq!(out, "github-issues\n", "{words:?}");
+    }
+}
+
+#[test]
+fn complete_offers_task_ids_with_their_note() {
+    let (_tmp, config, state) = completion_config();
+    // No store yet: nothing to offer, and no store is created by asking.
+    let (ok, out) = complete(&config, &state, &["task", "read", ""]);
+    assert!(ok);
+    assert!(out.is_empty(), "{out}");
+    assert!(!state.join("pastor.db").exists());
+    let out = pastor()
+        .args(["tick", "--job", "nightly"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .env("PASTOR_DATA_DIR", state.join("data"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for words in [
+        &["task", "read", ""][..],
+        &["task", "describe", ""],
+        &["task", "done", ""],
+        &["events", "--task", ""],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(ok, "{words:?}");
+        // The clock item's title is the note, as in `task list`.
+        assert!(out.starts_with("t-1\tclock "), "{words:?}: {out}");
+        assert_eq!(out.lines().count(), 1, "{words:?}: {out}");
+    }
+}
+
+/// The installed scripts ask `pastor __complete` at TAB time; fish needs a
+/// separate entry for the options, since after `--flock` it consults only
+/// that option's own entries.
+#[test]
+fn completion_scripts_ask_pastor_for_names() {
+    let fish = pastor().args(["completions", "fish"]).output().unwrap();
+    let fish = String::from_utf8(fish.stdout).unwrap();
+    assert!(fish.contains("pastor __complete fish --"), "{fish}");
+    let opts = fish
+        .lines()
+        .find(|l| l.contains("-n __fish_pastor_names -l "))
+        .unwrap_or_else(|| panic!("no option entry:\n{fish}"));
+    for long in ["flock", "machine", "job", "task"] {
+        assert!(opts.contains(&format!("-l {long} ")), "{opts}");
+    }
+    assert!(
+        !fish.contains("-a \"__complete\""),
+        "the hidden command is offered"
+    );
+    let bash = pastor().args(["completions", "bash"]).output().unwrap();
+    let bash = String::from_utf8(bash.stdout).unwrap();
+    assert!(bash.contains("pastor __complete bash --"), "{bash}");
+    assert!(bash.contains("complete -F _pastor_names"), "{bash}");
+    assert!(
+        !bash.contains("pastor,__complete)"),
+        "bash knows __complete"
+    );
+}

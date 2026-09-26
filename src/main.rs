@@ -11,7 +11,7 @@ use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{Head, HeadPing, IpcRequest, IpcResponse, request};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
-use pastor::task::{DispatchSpec, Place, Task, TaskState, parse_task_id};
+use pastor::task::{DispatchSpec, LIVE_STATES, Place, Task, TaskState, parse_task_id};
 
 /// The agent skill, built into the binary so an agent on any machine with
 /// pastor installed can read the guide that matches this exact CLI.
@@ -321,6 +321,14 @@ fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+    // `pastor __complete <shell> -- <words>` is what the completion scripts
+    // ask at TAB time. It is not in the clap tree, which would put it in the
+    // very scripts it serves, and it runs before the legacy migration, the
+    // fleet guard and the runtime: it only reads, and quietly.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("__complete") {
+        complete(&args[2..]);
+    }
     let cli = Cli::parse();
     if cli.skill {
         print!("{SKILL}");
@@ -379,6 +387,11 @@ fn main() {
             Command::Completions { shell } => {
                 let mut cmd = completion_tree();
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
+                match shell {
+                    clap_complete::Shell::Fish => print!("{}", pastor::complete::fish_hook(&cmd)),
+                    clap_complete::Shell::Bash => print!("{}", pastor::complete::BASH_HOOK),
+                    _ => {}
+                }
                 Ok(())
             }
             Command::Events(args) => pastor::events::cli(&paths, args).await,
@@ -395,8 +408,27 @@ fn main() {
     }
 }
 
+/// `pastor __complete <shell> -- <words>`: the names for the last of
+/// `words`, and exit 0; exit 1 with nothing printed when that word takes no
+/// name (or the call is malformed), so the script falls back to its static
+/// completions. fish gets a description after a tab.
+fn complete(args: &[String]) -> ! {
+    use pastor::complete;
+    let (Some(shell), Some("--")) = (args.first(), args.get(1).map(String::as_str)) else {
+        std::process::exit(1)
+    };
+    let Some(kind) = complete::slot(&completion_tree(), &args[2..]) else {
+        std::process::exit(1)
+    };
+    if let Ok(paths) = Paths::from_env() {
+        let names = complete::names(&paths, kind);
+        print!("{}", complete::render(&names, shell == "fish"));
+    }
+    std::process::exit(0)
+}
+
 /// The command tree `pastor completions` describes: the real one, since there
-/// are no hidden subcommands left to strip out.
+/// are no hidden subcommands left to strip out (`__complete` is not in it).
 fn completion_tree() -> clap::Command {
     let mut cmd = <Cli as clap::CommandFactory>::command().version(env!("CARGO_PKG_VERSION"));
     // clap builds the `help` subtree from subcommand names only, so a
@@ -944,16 +976,6 @@ async fn machine_list(
     }
     Ok(())
 }
-
-/// The states a task can be in while it still needs pastor or a human:
-/// what `pastor task list` shows by default. Done, failed, stale and closed tasks
-/// are finished; they appear only with `--all` (or `--done` for done ones).
-const LIVE_STATES: [TaskState; 4] = [
-    TaskState::Queued,
-    TaskState::Starting,
-    TaskState::Running,
-    TaskState::Blocked,
-];
 
 /// The states `pastor task list` selects, `None` meaning all of them. `--blocked`
 /// and `--done` are single-state views, `--all` is everything, and no flag is

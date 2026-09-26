@@ -2964,3 +2964,20 @@ if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERS
 else
     complete -F _pastor -o bashdefault -o default pastor
 fi
+
+# Names (jobs, flocks, machines, tasks, connectors) come from pastor itself.
+_pastor_names() {
+    local cur="${COMP_WORDS[COMP_CWORD]}" names
+    if names=$(pastor __complete bash -- "${COMP_WORDS[@]:1:COMP_CWORD-1}" "${cur}" 2>/dev/null); then
+        [[ ${cur} == "=" ]] && cur=""
+        COMPREPLY=( $(compgen -W "${names}" -- "${cur}") )
+        return 0
+    fi
+    _pastor "$@"
+}
+
+if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+    complete -F _pastor_names -o nosort -o bashdefault -o default pastor
+else
+    complete -F _pastor_names -o bashdefault -o default pastor
+fi

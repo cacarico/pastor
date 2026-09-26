@@ -154,6 +154,31 @@ impl Store {
         Self::init(conn)
     }
 
+    /// The store for a reader that must never write or wait long: shell
+    /// completion. A missing file stays missing, nothing is migrated, and a
+    /// store of another schema is an error rather than something to read.
+    pub fn open_read_only(path: &Path) -> anyhow::Result<Store> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_millis(200))?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            version.parse::<i64>().ok() == Some(SCHEMA_VERSION),
+            "schema {version}, not {SCHEMA_VERSION}"
+        );
+        Ok(Store {
+            conn: Mutex::new(conn),
+        })
+    }
+
     pub fn open_in_memory() -> anyhow::Result<Store> {
         Self::init(Connection::open_in_memory()?)
     }

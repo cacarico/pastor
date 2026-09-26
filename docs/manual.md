@@ -1315,6 +1315,18 @@ deny_flag = "--disallowedTools"  # the flag before each deny pattern
 command definitions, so it always matches the installed binary. Ready-made
 copies for bash and fish live in `contrib/completions/`.
 
+In bash and fish the script also offers the names a command takes: job names
+after `job describe`, `--job` and the like, flock and machine names after
+`--flock`, `--machine` and the flock and machine commands, task ids after the
+task commands, and connector ids after `connector uninstall|unlink|run`. A
+static script cannot know them, so at TAB it runs `pastor __complete <shell>
+-- <words>`, which reads the job files, `flock.toml`, the connectors
+directory and the task store directly, never the head, and prints nothing
+when it cannot read them. Task ids come live ones first, newest first, and
+fish shows each task's note beside it. Other shells get the static script
+only. `--opt=<TAB>` works in fish; bash splits it at the `=`, which pastor
+handles too.
+
 `make install` writes both files after installing the binary, honouring
 `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME`. If you installed with plain `cargo
 install`, or want completions for another shell such as zsh, run:

@@ -28,6 +28,16 @@ pub const PANE_OWNING_STATES: [TaskState; 5] = [
     TaskState::Stale,
 ];
 
+/// The states a task can be in while it still needs pastor or a human:
+/// what `pastor task list` shows by default. Done, failed, stale and closed tasks
+/// are finished; they appear only with `--all` (or `--done` for done ones).
+pub const LIVE_STATES: [TaskState; 4] = [
+    TaskState::Queued,
+    TaskState::Starting,
+    TaskState::Running,
+    TaskState::Blocked,
+];
+
 impl TaskState {
     pub fn occupies_pane(&self) -> bool {
         matches!(
