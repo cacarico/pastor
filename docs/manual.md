@@ -1021,9 +1021,9 @@ does not exist yet (`flock.toml`, `pastor.toml`) starts empty; a job must
 exist. When the editor exits the copy is checked the way the head loads the
 file: a job against `pastor.toml`'s `[defaults]` and the connectors installed
 here, `flock.toml` and `pastor.toml` by their own rules. A valid edit replaces
-the file atomically (a temp file beside it, then a rename, keeping its mode)
-and a running head reloads it at once. A symlink is edited at its target and
-stays a symlink.
+the file atomically (a new hidden temp file beside it, then a rename, keeping
+its mode) and a running head reloads it at once. A symlink is edited at its
+target and stays a symlink; the directory it points into keeps its mode.
 
 An invalid edit prints the error and asks `reopen the editor to fix it?
 [Y/n]`. Yes reopens the copy with the error on top as `# pastor:` comments,
@@ -1032,7 +1032,9 @@ unchanged gives up: the file is left as it was, and the error
 (`invalid_edit`) names where the edit is kept. A copy saved as it was means
 no changes and writes nothing; an editor that exits non-zero writes nothing
 (`editor_failed`); a file that changed on disk while the editor was open is
-not overwritten (`edit_conflict`).
+not overwritten (`edit_conflict`). That check and the rename run together
+under an advisory lock on `.<file>.lock` beside the file, left in place, so
+two pastor edits of one file never interleave.
 
 ## Files
 

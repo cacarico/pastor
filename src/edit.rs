@@ -158,7 +158,10 @@ fn run_editor(editor: &str, file: &Path) -> anyhow::Result<()> {
 
 /// Replace the file with `text`: a temp file beside the real one, then a
 /// rename, so a reader sees the old file or the new one and never half of
-/// it. Refused when the file changed while the editor was open.
+/// it. Refused when the file changed while the editor was open. The check
+/// runs right before the rename, both under an advisory lock on
+/// `.<file>.lock` beside it, so two pastor edits never interleave; a writer
+/// that does not take the lock can still slip in between the two.
 fn save(
     target: &Path,
     real: &Path,
@@ -166,34 +169,70 @@ fn save(
     text: &str,
     copy: &Path,
 ) -> anyhow::Result<Outcome> {
-    if read_or_empty(real)? != original {
-        return Err(CliError::err(
+    let (dir, name) = beside(real);
+    // Only a missing parent is made, private. An existing one keeps its
+    // mode: through a symlink it may be a dotfiles dir that is not ours.
+    if std::fs::symlink_metadata(dir).is_err() {
+        crate::config::create_private_dir(dir)?;
+    }
+    let _lock = lock(&dir.join(format!(".{name}.lock")))?;
+    let mode = std::fs::metadata(real).map_or(0o600, |m| m.permissions().mode() & 0o7777);
+    let tmp = write_temp(real, text, mode)?;
+    let replaced = if read_or_empty(real)? != original {
+        Err(CliError::err(
             "edit_conflict",
             format!(
                 "{} changed while it was being edited; it was left as it is now and the edit is kept in {}",
                 target.display(),
                 copy.display()
             ),
-        ));
-    }
-    // Only a missing parent is made, private. An existing one keeps its
-    // mode: through a symlink it may be a dotfiles dir that is not ours.
-    if let Some(parent) = real.parent()
-        && !parent.as_os_str().is_empty()
-        && std::fs::symlink_metadata(parent).is_err()
-    {
-        crate::config::create_private_dir(parent)?;
-    }
-    let mode = std::fs::metadata(real).map_or(0o600, |m| m.permissions().mode() & 0o7777);
-    let tmp = write_temp(real, text, mode)?;
-    if let Err(e) =
+        ))
+    } else {
         std::fs::rename(&tmp, real).with_context(|| format!("rename to {}", real.display()))
-    {
+    };
+    if let Err(e) = replaced {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     let _ = std::fs::remove_file(copy);
     Ok(Outcome::Saved)
+}
+
+/// The directory `real` is in, and its file name.
+fn beside(real: &Path) -> (&Path, String) {
+    let dir = real
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = real
+        .file_name()
+        .map_or_else(|| "edit".into(), |n| n.to_string_lossy().into_owned());
+    (dir, name)
+}
+
+/// An exclusive `flock` on `path`, created if missing, held until the file
+/// is dropped. The lock file is left in place: removing it would let a
+/// waiter lock a file nobody else sees any more.
+fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    loop {
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(f);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e).with_context(|| format!("lock {}", path.display()));
+        }
+    }
 }
 
 /// `text` in a new file beside `real`, with `mode`, ready to be renamed
@@ -202,13 +241,7 @@ fn save(
 /// write or the chmod. Hidden and not `*.toml`, so no loader picks it up.
 /// Removed again if anything fails.
 fn write_temp(real: &Path, text: &str, mode: u32) -> anyhow::Result<PathBuf> {
-    let dir = real
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let name = real
-        .file_name()
-        .map_or_else(|| "edit".into(), |n| n.to_string_lossy().into_owned());
+    let (dir, name) = beside(real);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());

@@ -2842,12 +2842,13 @@ fn edit_saves_a_valid_edit_of_each_file() {
     assert!(text.contains("saved"), "{text}");
     assert_eq!(o.seen(0), NIGHTLY, "the editor starts from the file");
     assert_eq!(std::fs::read_to_string(&job).unwrap(), edited);
-    // The temp copy is gone once the edit is saved.
-    let tmp_left: Vec<_> = std::fs::read_dir(o.config.join("jobs"))
+    // The temp copy is gone once the edit is saved; the lock file stays.
+    let mut tmp_left: Vec<_> = std::fs::read_dir(o.config.join("jobs"))
         .unwrap()
-        .map(|e| e.unwrap().file_name())
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
-    assert_eq!(tmp_left, [std::ffi::OsString::from("nightly.toml")]);
+    tmp_left.sort();
+    assert_eq!(tmp_left, [".nightly.toml.lock", "nightly.toml"]);
 
     // flock.toml and pastor.toml need not exist yet.
     let flock = "[[flock]]\nname = \"work\"\ndefault = true\n\n[[machine]]\nname = \"pi-1\"\nlocal = true\n";
@@ -3242,4 +3243,71 @@ fn edit_never_writes_through_a_planted_temp_symlink() {
         .collect();
     left.sort();
     assert_eq!(left, ["nightly.toml", "nightly.toml.tmp"]);
+}
+
+/// Copilot 4109347317: the conflict check and the rename happen together
+/// under an advisory lock on a file beside the target, so a pastor edit
+/// that saves while another holds the lock waits, then checks the file as
+/// it is after the other one's write.
+#[test]
+fn edit_saves_under_a_lock_and_rechecks_after_waiting() {
+    use std::os::unix::io::AsRawFd;
+    let hold = |o: &Offline| {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(o.config.join("jobs/.nightly.toml.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) }, 0);
+        f
+    };
+    let spawn = |o: &Offline, edited: &str| {
+        pastor()
+            .args(["job", "edit", "nightly"])
+            .env("PASTOR_CONFIG_DIR", &o.config)
+            .env("PASTOR_STATE_DIR", &o.state)
+            .env_remove("VISUAL")
+            .env("EDITOR", o.editor(&[edited]))
+            .env("TMPDIR", o.tmp.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let wait_for_editor = |o: &Offline| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while o.runs() == 0 {
+            assert!(std::time::Instant::now() < deadline, "editor never ran");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    };
+
+    // Held, then released untouched: the edit waits, then saves.
+    let o = offline();
+    let job = o.config.join("jobs/nightly.toml");
+    let edited = NIGHTLY.replace("1h", "7h");
+    let lock = hold(&o);
+    let mut child = spawn(&o, &edited);
+    wait_for_editor(&o);
+    assert!(child.try_wait().unwrap().is_none(), "the edit did not wait");
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), NIGHTLY);
+    drop(lock);
+    ok(child.wait_with_output().unwrap());
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), edited);
+
+    // Changed while the edit waited: the check sees it and refuses.
+    let o = offline();
+    let job = o.config.join("jobs/nightly.toml");
+    let lock = hold(&o);
+    let child = spawn(&o, &NIGHTLY.replace("1h", "8h"));
+    wait_for_editor(&o);
+    let theirs = NIGHTLY.replace("1h", "9h");
+    std::fs::write(&job, &theirs).unwrap();
+    drop(lock);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(last_error(&out).0, "edit_conflict");
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), theirs);
 }
