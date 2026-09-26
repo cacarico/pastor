@@ -33,7 +33,7 @@ spend time deciding what to do, not typing it. The longer story is in
 - **Flocks.** Named groups of machines, such as work and personal ones on
   different accounts. A task only runs inside its own flock.
 - **Connectors.** Commands that turn outside sources into work (the built-in
-  `clock`, or [GitHub issues](https://github.com/cacarico/pastor-plugins)),
+  `clock`, or [GitHub issues](https://github.com/cacarico/pastor-connectors)),
   and event hooks that run when a task finishes or blocks.
 - **Task states you can trust.** herdr reports what the agent is doing, and
   pastor tells a finished agent from one that is waiting, stuck or gone.
