@@ -1,0 +1,26 @@
+# Version updates for the crates in Cargo.lock and the actions the workflows
+# use. Security updates and malware alerts are switched on in the
+# repository's settings and need nothing here. Minor and patch bumps come as
+# one grouped pull request per ecosystem a week, so CI runs once for them;
+# a major bump gets its own pull request, since it may break.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions:
+        update-types: [minor, patch]

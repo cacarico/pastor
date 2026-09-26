@@ -80,6 +80,10 @@ down here because getting them wrong cost a day.
   the weekly sweep runs. Nothing from the fleet goes into a commit: no
   addresses, hostnames, user names, tokens or home paths; examples use
   placeholders such as `user@pi-1`.
+- Dependabot (`.github/dependabot.yml`) opens weekly version updates for
+  cargo and GitHub Actions, minor and patch grouped into one pull request per
+  ecosystem, plus security updates; malware alerts and private vulnerability
+  reporting are repository settings. Its pull requests pass CI like any other.
 - Nothing in the suite talks to a real herdr. `make smoke SESSION=s` runs the
   opt-in test against one on the same host; do it on a fleet machine before
   trusting a change to the transport or dispatch.

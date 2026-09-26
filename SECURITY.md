@@ -40,10 +40,12 @@ than the model above says.
 
 ## Reporting a vulnerability
 
-Please do not publish exploit details in a public issue. If GitHub private
-vulnerability reporting is enabled for this repository, use it. Otherwise, open
-a minimal public issue asking for a private security contact and include no
-secrets, tokens, hostnames, exploit payloads, or sensitive logs.
+Please do not publish exploit details in a public issue. Report it privately
+through GitHub's private vulnerability reporting instead: the "Report a
+vulnerability" button under the repository's Security tab
+(<https://github.com/cacarico/pastor/security/advisories/new>). Only the
+maintainers see the report, and the fix can be discussed and prepared in a
+private advisory before it is published.
 
 A useful report includes:
 
@@ -64,6 +66,13 @@ A useful report includes:
   from git history.
 
 ## Dependency and license risk
+
+Dependabot watches the crates in `Cargo.lock` and the GitHub Actions the
+workflows use (`.github/dependabot.yml`): it opens security updates as soon as
+an advisory lands, and version updates weekly, grouping minor and patch bumps
+into one pull request per ecosystem. Its pull requests go through CI like any
+other. Its malware alerts flag a dependency version that has been reported as
+malicious.
 
 New dependencies should be justified in the pull request. Reviewers should
 consider maintenance status, transitive dependencies, license compatibility, and
