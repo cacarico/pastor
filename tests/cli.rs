@@ -3177,3 +3177,14 @@ fn completions_offer_aliases_under_help() {
         "fish help task has no describe"
     );
 }
+
+/// Copilot 4109347330: only a reopened copy carries pastor's error block, so
+/// a leading `# pastor:` comment of the user's own survives the first pass.
+#[test]
+fn edit_keeps_a_leading_pastor_comment_of_the_users_own() {
+    let o = offline();
+    let job = o.config.join("jobs/nightly.toml");
+    let edited = format!("# pastor: keep this\n{NIGHTLY}");
+    ok(o.edit(&o.editor(&[&edited]), &["job", "edit", "nightly"], ""));
+    assert_eq!(std::fs::read_to_string(&job).unwrap(), edited);
+}

@@ -52,9 +52,15 @@ pub fn edit(
             let _ = std::fs::remove_file(&copy);
             return Err(e);
         }
-        let text = strip_marks(
-            &std::fs::read_to_string(&copy).with_context(|| format!("read {}", copy.display()))?,
-        );
+        let raw =
+            std::fs::read_to_string(&copy).with_context(|| format!("read {}", copy.display()))?;
+        // Only a reopened copy carries the error block; on the first pass a
+        // leading `# pastor:` line is the user's own and stays.
+        let text = if last_rejected.is_some() {
+            strip_marks(&raw)
+        } else {
+            raw
+        };
         if text == original {
             let _ = std::fs::remove_file(&copy);
             return Ok(Outcome::Unchanged);
