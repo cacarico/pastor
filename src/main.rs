@@ -1082,7 +1082,7 @@ async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
             else {
                 unreachable!()
             };
-            print!("{text}");
+            print!("{}", pastor::cli::printable(&text));
         }
         TaskCmd::Attach { task } => attach(paths, &task).await?,
         TaskCmd::Retry(a) => pastor::task_cli::retry(paths, a).await?,

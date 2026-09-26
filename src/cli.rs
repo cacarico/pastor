@@ -83,7 +83,7 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
                     t.item
                         .get("title")
                         .and_then(|v| v.as_str())
-                        .map(str::to_string)
+                        .map(|title| one_line(title).chars().take(60).collect())
                 })
                 .unwrap_or_else(|| {
                     t.prompt
@@ -94,6 +94,7 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
                         .take(60)
                         .collect()
                 });
+            let note = one_line(&note);
             let note = match t.retry_of {
                 Some(of) => format!("retry of t-{of}: {note}"),
                 None => note,
@@ -116,8 +117,38 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
 /// record, a `task show` field) must stay one line. The escapes keep what was
 /// there visible, as JSON does, rather than folding it into spaces that read
 /// like the original text.
+///
+/// Every other control character is escaped too, as `printable` does.
 pub fn one_line(s: &str) -> String {
-    s.replace('\r', "\\r").replace('\n', "\\n")
+    escape_controls(s, false)
+}
+
+/// Text that came from outside pastor (an item, a pane, a connector
+/// manifest), made safe to print on the user's terminal: newlines and tabs
+/// stay, `\r` shows as `\r`, and every other C0 or C1 control character
+/// and DEL shows as `\xNN` or `\u{NN}`. Printed raw, an ESC could set the
+/// clipboard (OSC 52), draw a fake link, retitle the terminal or erase the
+/// line before it. `--json` output stays raw; JSON escapes these itself.
+pub fn printable(s: &str) -> String {
+    escape_controls(s, true)
+}
+
+fn escape_controls(s: &str, keep_lines: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\t' if keep_lines => out.push(c),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x80 && c.is_control() => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// `pastor task show`: every field a human asks about one task, one per line,
@@ -188,15 +219,17 @@ pub fn task_detail(t: &Task) -> String {
         ("finished", when(t.finished_at)),
     ];
     if let Some(e) = &t.error {
-        fields.push(("error", one_line(e)));
+        fields.push(("error", e.clone()));
     }
+    // Branch, repo and the prompt can come from an item; every field is
+    // escaped the same way so none of them reaches the terminal raw.
     let mut out: Vec<String> = fields
         .into_iter()
-        .map(|(k, v)| format!("{:<12}{v}", format!("{k}:")))
+        .map(|(k, v)| format!("{:<12}{}", format!("{k}:"), one_line(&v)))
         .collect();
     out.push("prompt:".into());
     out.extend(
-        t.prompt
+        printable(&t.prompt)
             .lines()
             .map(|l| format!("  {l}").trim_end().to_string()),
     );
@@ -929,6 +962,79 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains('\r'), "{out:?}");
+    }
+
+    /// Text from items, panes and manifests reaches the user's terminal, so
+    /// no control character goes through raw: an ESC could set the
+    /// clipboard (OSC 52), draw a fake link or erase what came before.
+    #[test]
+    fn printable_and_one_line_escape_every_control_character() {
+        let s = "a\x1b]52;c;aGk=\x07b\u{9b}2Jc\x7fd\te\r\nf";
+        assert_eq!(
+            printable(s),
+            "a\\x1b]52;c;aGk=\\x07b\\u{9b}2Jc\\x7fd\te\\r\nf"
+        );
+        assert_eq!(
+            one_line(s),
+            "a\\x1b]52;c;aGk=\\x07b\\u{9b}2Jc\\x7fd\\te\\r\\nf"
+        );
+        assert_eq!(printable("plain é ✓\n"), "plain é ✓\n");
+    }
+
+    #[test]
+    fn task_rows_escape_and_cap_an_item_title() {
+        let mut t = task_with(crate::task::DispatchSpec {
+            agent: "claude".into(),
+            agent_args: vec![],
+            allow: vec![],
+            deny: vec![],
+            repo: None,
+            worktree: false,
+            branch: None,
+            machine: None,
+            tags: vec![],
+            timeout_secs: 60,
+            checkout: None,
+            reopen: None,
+            agent_source: None,
+            place: Default::default(),
+        });
+        t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
+        let note = task_rows(std::slice::from_ref(&t))[0]
+            .last()
+            .unwrap()
+            .clone();
+        assert!(note.starts_with("x\\n t-9  done\\x1b[2Kyy"), "{note}");
+        assert!(!note.chars().any(char::is_control), "{note:?}");
+        assert_eq!(note.chars().count(), 60, "{note}");
+    }
+
+    #[test]
+    fn task_detail_escapes_item_text_in_the_prompt_and_fields() {
+        let mut t = task_with(crate::task::DispatchSpec {
+            agent: "claude".into(),
+            agent_args: vec!["--x\x1b[2J".into()],
+            allow: vec![],
+            deny: vec![],
+            repo: Some("~/work".into()),
+            worktree: true,
+            branch: Some("pastor/a\x1bb".into()),
+            machine: None,
+            tags: vec![],
+            timeout_secs: 60,
+            checkout: None,
+            reopen: None,
+            agent_source: None,
+            place: Default::default(),
+        });
+        t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
+        let out = task_detail(&t);
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out:?}");
+        assert!(out.contains("branch pastor/a\\x1bb"), "{out}");
+        assert!(
+            out.ends_with("prompt:\n  look at\\x1b]8;;http://x\\x07this\\r\n  and stop"),
+            "{out}"
+        );
     }
 
     #[test]

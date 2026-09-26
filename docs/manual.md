@@ -155,7 +155,11 @@ Finished ones (done, failed, stale, closed) appear with `--all`, and an empty
 default list says so on stderr. `--blocked` and `--done` narrow to just that
 state, `--job`, `--flock` and `--machine` narrow whichever set is shown, and
 `--json` prints the same selection. FLOCK is the flock the task targets. `pastor task read t-1` fetches recent output from the
-task's pane over the machine channel. `pastor open pi-3` execs the full herdr
+task's pane over the machine channel. Text that came from an item or a pane is
+printed with its control characters escaped (`\x1b`, `\r`, ...), so none of
+it can move the cursor, retitle the terminal or set the clipboard: the NOTE
+column of `task list` (an item's title, cut to 60 characters), every field and
+the prompt of `task show`, and `task read`. `--json` prints it raw. `pastor open pi-3` execs the full herdr
 UI against a flock machine (`herdr --remote` for an SSH one, `herdr` directly
 for a local one) instead of showing pastor's own view; herdr refuses to start
 inside one of its own panes, so run it from a plain terminal. pastor's flock and
