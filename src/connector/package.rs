@@ -157,16 +157,20 @@ impl Connector {
     /// The environment every command of this connector gets, connector command or hook:
     /// its `.env`, then `PASTOR_CONNECTOR_ID`, `PASTOR_JOB` (when there is a
     /// job), `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and
-    /// `PASTOR_CONNECTOR_STATE_DIR`, the job's scratch dir (`@<id>` without a
-    /// job), created 0700. Plus the redactor for what the command prints.
+    /// `PASTOR_CONNECTOR_STATE_DIR`, the job's scratch dir, created 0700. The
+    /// job's scratch belongs to the connector the job uses: without a job, or
+    /// for a hook hearing about a job it does not `own`, the dir is the
+    /// connector's own `@<id>`. Plus the redactor for what the command prints.
     pub fn command_env(
         &self,
         paths: &Paths,
         job: Option<&str>,
+        owns_job: bool,
     ) -> anyhow::Result<(Vec<(String, String)>, Redactor)> {
         let dotenv = self.env(paths)?;
         let redactor = self.redactor(&dotenv);
         let scope = job
+            .filter(|_| owns_job)
             .map(str::to_string)
             .unwrap_or_else(|| format!("@{}", self.id));
         let state_dir = paths.connector_state_dir(&scope);
@@ -432,7 +436,7 @@ mod tests {
                 err.contains("TOKEN") && err.contains("line break"),
                 "{value}: {err}"
             );
-            assert!(p.command_env(&paths, None).is_err());
+            assert!(p.command_env(&paths, None, false).is_err());
         }
         std::fs::write(&env_file, "TOKEN=xoxb-9999\nNOTE=\"a\\nb\"\n").unwrap();
         let env = p.env(&paths).unwrap();

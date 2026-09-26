@@ -1016,8 +1016,8 @@ command inherits:
 - `PASTOR_STATE_DIR`, and with it `pastor.sock` and the ssh ControlMaster
   sockets, which is control of the fleet (see [Trust model](#trust-model)).
 
-A hook without `only_own = true` also receives every task's item and prompt
-on stdin, whichever plugin the job uses. Start `pastor serve` from an
+A hook without `only_own = true` also hears about every other job's tasks,
+though without their item or prompt (see [Event hooks](#event-hooks)). Start `pastor serve` from an
 environment that holds only what its plugins and ssh need, and install only
 plugins you would run by hand.
 
@@ -1032,6 +1032,13 @@ for an event about no job, such as `machine.lost`). With `only_own = true` it
 only hears about tasks and jobs that use this connector, found by
 reading `connector.use` in the job's file; one-off `pastor task run` tasks
 belong to no connector, and an event about no job passes.
+
+A hook that hears about a task whose job another connector owns (or a one-off
+task, which no connector owns) gets the task with `item` set to `null` and
+`prompt` empty: those hold the text of the other connector's items, which a
+notifier has no need to see. Its `PASTOR_CONNECTOR_STATE_DIR` is then its own
+`@<id>` scratch dir, not the job's, which belongs to the job's connector;
+`PASTOR_JOB` still names the job.
 
 ```toml
 [[events]]

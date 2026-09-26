@@ -52,6 +52,20 @@ pub fn wants(paths: &Paths, connector: &Connector, hook: &Hook, rec: &EventRecor
     }
 }
 
+/// `rec` as a hook of a connector that does not own its job sees it: the task
+/// without its item (`null`) and prompt (empty). Those carry the text of
+/// another connector's items, private messages or issues, which a notifier
+/// has no need to send off the host; the task's id, state, job and machine
+/// stay.
+fn without_task_content(rec: &EventRecord) -> EventRecord {
+    let mut rec = rec.clone();
+    if let Some(task) = rec.task.as_mut() {
+        task.item = serde_json::Value::Null;
+        task.prompt.clear();
+    }
+    rec
+}
+
 /// Run one hook for one record. Its output (stdout and stderr, redacted)
 /// goes to a run log under `runs/@<connector id>/`, apart from the job's
 /// connector logs so hooks never prune those.
@@ -61,9 +75,12 @@ pub async fn run_hook(paths: &Paths, connector: &Connector, hook: &Hook, rec: &E
         .clone()
         .or_else(|| rec.task.as_ref().map(|t| t.job.clone()));
     let job = job.filter(|j| crate::config::job::check_name(j).is_ok());
+    let owns_job = job
+        .as_deref()
+        .is_some_and(|j| job_connector(paths, j).as_deref() == Some(connector.id.as_str()));
     let on = hook.on.join(",");
     let prepared = connector
-        .command_env(paths, job.as_deref())
+        .command_env(paths, job.as_deref(), owns_job)
         .and_then(|(env, redactor)| {
             let log = RunLog::create(&paths.runs_dir(&format!("@{}", connector.id)), redactor)?;
             Ok((env, log.shared()))
@@ -75,7 +92,12 @@ pub async fn run_hook(paths: &Paths, connector: &Connector, hook: &Hook, rec: &E
             return;
         }
     };
-    let mut stdin = serde_json::to_vec(rec).expect("an EventRecord serializes");
+    let mut stdin = if owns_job {
+        serde_json::to_vec(rec)
+    } else {
+        serde_json::to_vec(&without_task_content(rec))
+    }
+    .expect("an EventRecord serializes");
     stdin.push(b'\n');
     let inv = Invocation {
         argv: hook.command.clone(),
@@ -507,6 +529,8 @@ mod tests {
         assert_eq!(got["type"], "task.done");
         assert_eq!(got["task"]["id"], rec.task.as_ref().unwrap().id);
         assert_eq!(got["job"], "support");
+        assert_eq!(got["task"]["item"], rec.task.as_ref().unwrap().item);
+        assert_eq!(got["task"]["prompt"], "p");
         let env_line = std::fs::read_to_string(e.out.join("env")).unwrap();
         let dir = std::fs::canonicalize(e.paths.connectors_dir().join("slack")).unwrap();
         assert_eq!(
@@ -521,6 +545,37 @@ mod tests {
         assert!(text.contains("stdout: token [redacted:TOKEN]"), "{text}");
         assert!(text.contains("err [redacted:TOKEN]"), "{text}");
         assert!(!text.contains("sekrit"), "{text}");
+    }
+
+    /// A hook hearing about a task of a job another connector owns gets the
+    /// record without the task's item and prompt, and its own `@<id>`
+    /// scratch dir rather than the job's, which belongs to the owner.
+    #[tokio::test]
+    async fn a_hook_of_another_connector_gets_no_item_prompt_or_scratch_dir() {
+        let e = env();
+        e.connector(
+            "notify",
+            false,
+            &[(
+                "\"task.done\"",
+                false,
+                "5s",
+                "cat > \"$OUT/stdin.tmp\"; echo \"$PASTOR_JOB $(basename \"$PASTOR_CONNECTOR_STATE_DIR\")\" > \"$OUT/env\"; mv \"$OUT/stdin.tmp\" \"$OUT/stdin\"",
+            )],
+        );
+        e.connector("slack", true, &[]);
+        e.job("support", "slack");
+        let mut d = Dispatcher::new(e.paths.clone());
+        let rec = e.task_record("task.done", "support");
+        assert!(!rec.task.as_ref().unwrap().prompt.is_empty());
+        d.deliver(rec.clone());
+        let got: serde_json::Value = serde_json::from_str(&e.wait_for("stdin").await).unwrap();
+        assert_eq!(got["task"]["id"], rec.task.as_ref().unwrap().id);
+        assert_eq!(got["task"]["item"], serde_json::Value::Null);
+        assert_eq!(got["task"]["prompt"], "");
+        assert_eq!(got["job"], "support");
+        let env_line = std::fs::read_to_string(e.out.join("env")).unwrap();
+        assert_eq!(env_line.trim(), "support @notify");
     }
 
     /// Two hooks of one connector run one after the other; another connector's

@@ -121,7 +121,7 @@ impl Runner {
             })?;
         let (env, redactor) = self
             .connector
-            .command_env(&self.paths, self.job.as_deref())
+            .command_env(&self.paths, self.job.as_deref(), true)
             .map_err(|e| format!("{e:#}"))?;
         let log = RunLog::create(&self.paths.runs_dir(&self.log_dir_name()), redactor)
             .map_err(|e| format!("run log: {e:#}"))?;

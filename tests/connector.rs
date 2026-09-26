@@ -829,7 +829,8 @@ fn records(path: &Path) -> Vec<serde_json::Value> {
 /// The whole path: connectors linked while the daemon runs (link reloads it), a
 /// job on the connector ticked through the daemon, its tasks
 /// dispatched and done, and each connector's hooks hearing about it: `echo`
-/// only about its own job's tasks, `notify` about every task.
+/// only about its own job's tasks, `notify` about every task, without their
+/// item or prompt and in its own scratch dir.
 #[test]
 fn a_daemon_runs_connector_jobs_and_hooks_hear_their_events() {
     let s = serve();
@@ -850,7 +851,8 @@ fn a_daemon_runs_connector_jobs_and_hooks_hear_their_events() {
     assert_eq!(runs[0]["created"].as_array().unwrap().len(), 2, "{out}");
 
     let echo = cli.dir("s/connectors/support/hook-records.jsonl");
-    let notify = cli.dir("s/connectors/support/notify.jsonl");
+    // notify does not own the job, so it writes to its own scratch.
+    let notify = cli.dir("s/connectors/@notify/notify.jsonl");
     wait(60, "both tasks are done and every hook heard it", || {
         records(&echo)
             .iter()
@@ -873,18 +875,29 @@ fn a_daemon_runs_connector_jobs_and_hooks_hear_their_events() {
     let done = got.iter().find(|r| r["type"] == "task.done").unwrap();
     assert_eq!(done["task"]["state"], "done");
     assert_eq!(done["task"]["machine"], "fake");
+    assert!(
+        done["task"]["prompt"]
+            .as_str()
+            .unwrap()
+            .starts_with("look at")
+    );
+    for r in records(&notify) {
+        assert_eq!(r["job"], "support");
+        assert_eq!(r["task"]["item"], serde_json::Value::Null, "{r}");
+        assert_eq!(r["task"]["prompt"], "", "{r}");
+    }
+    assert!(!cli.dir("s/connectors/support/notify.jsonl").exists());
 
     // A one-off task is nobody's: notify hears of it, echo (only_own) not.
     cli.ok(&["task", "run", "one-off", "--repo", "/tmp"]);
     // `task run` is not a job, so the hook gets no PASTOR_JOB and its own scratch.
-    let notify_run = cli.dir("s/connectors/@notify/notify.jsonl");
     wait(60, "notify hears the one-off task end", || {
-        !records(&notify_run).is_empty()
+        records(&notify).len() == 3
     });
     std::thread::sleep(Duration::from_millis(300));
     assert!(!cli.dir("s/connectors/@echo/hook-records.jsonl").exists());
     assert_eq!(records(&echo).len(), 4, "echo heard nothing more");
-    assert_eq!(records(&notify_run)[0]["task"]["job"], "run");
+    assert_eq!(records(&notify)[2]["task"]["job"], "run");
 }
 
 /// A head that answers the first ping, then stops answering pings (a busy
