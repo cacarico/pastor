@@ -2467,7 +2467,24 @@ fn task_send_types_into_a_live_task_and_refuses_a_finished_one() {
     let out = env.cmd(&["task", "send", "t-1", "--key", "Enter", "--no-enter"]);
     assert_eq!(out.status.code(), Some(2));
 
+    // A done task whose pane is still open takes input and runs again.
     env.wait_done("t-1");
+    let out = env.cmd(&["task", "send", "t-1", "commit and push"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let t = env.json(&["task", "show", "t-1", "--json"]);
+    assert_eq!(t["state"], "running", "{t}");
+
+    // A closed one does not.
+    let out = env.cmd(&["task", "close", "t-1"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = env.cmd(&["task", "send", "t-1", "more"]);
     assert_eq!(out.status.code(), Some(1));
     let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();

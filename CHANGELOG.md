@@ -7,6 +7,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `pastor task send` types into a done task whose pane is still open, and
+  the task goes back to running. An agent marked done with its work
+  unfinished can be told to finish in the same pane, with its context, instead
+  of a new task in its worktree. A closed task, or one with no pane, is still
+  `task_not_live`.
+
 - Agents pastor starts may no longer change the fleet. Every agent's pane gets
   `PASTOR_TASK=t-N`, and a command from it that runs, sends to, attaches to,
   retries, closes or prunes tasks, ticks (dry runs too), runs or reloads jobs,

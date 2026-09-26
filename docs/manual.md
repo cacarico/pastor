@@ -178,12 +178,17 @@ that herdr shows working or blocked again
 at that moment is left alone, and its task goes back to running or blocked.
 
 `pastor task send t-3 "yes, go on"` types into the pane of a live task
-(starting, running or blocked) and presses Enter; `--no-enter` leaves Enter
-out, and each `--key K` presses one named key after the text, in order
-(`--key esc`, `--key Down --key Enter`; herdr's key names). It goes through
-the head to the task's machine; anything else answers `task_not_live`. Each
-send is a `task.input` event recording the key names and the length of the
-text, never the text, which may be a secret.
+(starting, running, blocked, or done with its pane still open) and presses
+Enter; `--no-enter` leaves Enter out, and each `--key K` presses one named
+key after the text, in order (`--key esc`, `--key Down --key Enter`; herdr's
+key names). It goes through the head to the task's machine; anything else
+answers `task_not_live`. Each send is a `task.input` event recording the key
+names and the length of the text, never the text, which may be a secret.
+
+A done task that is sent input goes back to running (`task.running`), so an
+agent marked done with its work unfinished can be told to finish in the same
+pane, context and all. Its next turn marks it done again; the idle it was
+done at does not.
 
 An agent started in a folder it has not seen stops at its folder-trust
 prompt, and a worktree is always a new folder. `pastor task send t-3

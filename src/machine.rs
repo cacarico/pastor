@@ -576,18 +576,20 @@ struct Actor {
 }
 
 /// The pane of `task` if it is live on `machine`: starting with a pane
-/// already, running or blocked. Anything else has no agent to type into.
+/// already, running, blocked, or done with its pane still open (an agent
+/// marked done too early can be told to finish). Anything else has no agent
+/// to type into.
 fn live_pane(task: &Task, machine: &str) -> Result<String, SendRefused> {
     let live = matches!(
         task.state,
-        TaskState::Starting | TaskState::Running | TaskState::Blocked
+        TaskState::Starting | TaskState::Running | TaskState::Blocked | TaskState::Done
     );
     match (&task.pane_id, task.machine.as_deref()) {
         (Some(pane), Some(m)) if live && m == machine => Ok(pane.clone()),
         _ => Err(SendRefused {
             code: "task_not_live",
             message: format!(
-                "{} is {}; only a starting, running or blocked task with a pane takes input",
+                "{} is {}; only a starting, running, blocked or done task with a pane takes input",
                 task.display_id(),
                 task.state
             ),
@@ -1332,6 +1334,9 @@ impl Actor {
             Err(_) => return (Err(TimedOut("pane input", timeout).into()), true),
         }
         self.emit_with("task.input", Some(task.id), Some(detail));
+        if task.state == TaskState::Done {
+            return (self.reopen(task), false);
+        }
         if input.trust {
             self.trust_answered.insert(task.id, Instant::now());
             // The prompt is answered: saved trust must not answer it again.
@@ -1345,6 +1350,32 @@ impl Actor {
             }
         }
         (Ok(task), false)
+    }
+
+    /// A done task that was just given more to do runs again. The baseline
+    /// stays at the idle it was done at and `activity_seen` stays clear, as
+    /// `apply` left them, so the agent's next turn is what marks it done.
+    /// A row that moved on meanwhile (closed, or picked up by an event) is
+    /// left as it is.
+    fn reopen(&mut self, task: Task) -> anyhow::Result<Task> {
+        let id = task.id;
+        let written = write_task(&self.store, task, |t| {
+            if t.state != TaskState::Done {
+                return false;
+            }
+            t.state = TaskState::Running;
+            t.finished_at = None;
+            true
+        })?;
+        let Some(t) = written else {
+            return self
+                .store
+                .get_task(id)?
+                .ok_or_else(|| anyhow::anyhow!("t-{id} not found"));
+        };
+        self.emit("task.running", Some(t.id));
+        self.refresh_live();
+        Ok(t)
     }
 
     /// `MachineCommand::Close`. herdr first, the row second: a herdr refusal
@@ -4310,6 +4341,86 @@ mod tests {
         );
         assert!(calls(&fake, "pane.send_keys").is_empty());
         assert!(input_events(&mut events).is_empty());
+    }
+
+    /// A task marked done with its work unfinished can be told to finish:
+    /// the input goes into its still-open pane and the task runs again. The
+    /// baseline stays at the idle it was done at, so only the agent's next
+    /// turn marks it done again.
+    #[tokio::test]
+    async fn send_to_a_done_task_types_into_its_pane_and_runs_it_again() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = run_to_done(&h, &fake, &store, new_task(&store)).await;
+        let pane = t.pane_id.clone().unwrap();
+        while events.try_recv().is_ok() {}
+        let sent = h
+            .send(
+                t.id,
+                SendInput {
+                    text: Some("commit and push".into()),
+                    enter: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.state, TaskState::Running);
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Running);
+        assert_eq!(row.finished_at, None);
+        assert_eq!(
+            fake.pane_input(&pane),
+            [
+                crate::herdr::fake::PaneInput::Text("commit and push".into()),
+                crate::herdr::fake::PaneInput::Keys(vec!["Enter".into()]),
+            ]
+        );
+        let mut kinds = vec![];
+        while let Ok(ev) = events.try_recv() {
+            kinds.push(ev.kind);
+        }
+        assert!(kinds.contains(&"task.running".to_string()), "{kinds:?}");
+        // Still idle at the old completion: running, not done again.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        // Its new turn finishes it.
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || {
+            store.get_task(t.id).unwrap().unwrap().activity_seen
+        })
+        .await;
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done again", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// A done row with no pane has nothing to type into.
+    #[tokio::test]
+    async fn send_refuses_a_done_task_with_no_pane() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let mut t = new_task(&store);
+        t.state = TaskState::Done;
+        t.machine = Some("m".into());
+        store.update_task(&mut t).unwrap();
+        let err = h
+            .send(
+                t.id,
+                SendInput {
+                    text: Some("commit".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<SendRefused>().map(|r| r.code),
+            Some("task_not_live"),
+            "{err:#}"
+        );
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
     }
 
     fn auto_close_settings() -> MachineSettings {
