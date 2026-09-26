@@ -24,6 +24,7 @@
 - Repo on the machines: `~/work/pastor`
 - Check: `make check`
 - Order: series. Start task N+1 only when the ledger has `Task N: complete`.
+- Dispatch: do not push the plan branch while a task may push it. Record `Task N: ran as t-M on <machine>` after the task's own ledger line, before starting the next.
 - Before merging: drop `docs/superpowers/plans/2026-09-26-nested-herdr*` from the branch; this repo keeps its plans on the `docs` branch.
 
 ---

@@ -20,7 +20,7 @@ So every task in the plan must:
 
 - say where the agent is and how to get the latest work (fetch and reset to the plan branch),
 - carry everything the agent needs to decide, with no "ask the user",
-- end by committing, writing its ledger line, pushing the plan branch, and printing `DONE`.
+- end by committing, then fetching and rebasing onto the plan branch, writing its ledger line, pushing the plan branch (once more after a rebase if the push is rejected), and printing `DONE`.
 
 ## Checklist
 
@@ -37,7 +37,7 @@ Follow these in order. Create a todo for each.
 6. **Write one prompt file per task** from the template in [plan-format.md](plan-format.md). The Dispatch command runs it with `pastor task run --prompt-file`, so quotes, backticks and `$` need no escaping.
 7. **Self-review.** Everything writing-plans checks, plus the unattended checks below. Fix what fails before going on.
 8. **Commit and push the plan branch**: plan, empty ledger (header only) and prompt files, one commit, `git push origin HEAD:pastor/<name>`. Do not push the default branch.
-9. **Hand off.** Show the user the plan path, the branch, and the first task's Dispatch command. Stop. The user reviews the plan and starts the first task; each next task starts only once the ledger on the plan branch says the one before is `complete`.
+9. **Hand off.** Show the user the plan path, the branch, and the first task's Dispatch command. Stop. The user reviews the plan and starts the first task; each next task starts only once the ledger on the plan branch says the one before is `complete`. Tell the user not to push the plan branch while a task may still push it: the `ran as t-M` ledger line goes in between tasks.
 
 Never run `pastor task run` from this skill. Planning has no side effects on the fleet.
 
@@ -66,7 +66,7 @@ Read each prompt file as a stranger who has nothing else. Every answer must be y
 - Can the agent finish without asking anything? No "confirm with the user", no "if unsure, ask".
 - Does it say what to do when something is missing: write `Task N: blocked: <why>` in the ledger, commit, push, stop?
 - Does it name the check to run and forbid committing while it fails?
-- Does it end with the ledger line, `git push origin HEAD:pastor/<name>`, and `DONE` as the last line?
+- Does it fetch and rebase onto `origin/pastor/<name>` right before the ledger commit, push with `git push origin HEAD:pastor/<name>`, retry once on a rejected push, keep both sides of a ledger conflict, and end with `DONE` as the last line?
 - Does it forbid touching the default branch, other branches and other worktrees?
 
 And for the plan as a whole:
