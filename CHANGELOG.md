@@ -11,7 +11,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `PASTOR_TASK=t-N`, and a command from it that runs, sends to, attaches to,
   retries, closes or prunes tasks, ticks (dry runs too), runs or reloads jobs,
   installs, links, uninstalls or unlinks plugins, edits machines, flocks or
-  jobs, or starts or sets up a head fails with `agent_refused`; reads still work. The head refuses such a
+  jobs, starts or sets up a head, or opens herdr's UI fails with `agent_refused`; reads still work. The head refuses such a
   request, and the CLI refuses the edits it makes on its own.
   `agents_change_fleet = true` in `pastor.toml` allows them again. A worktree
   task's agent now always runs in a pane split off the worktree's, since the

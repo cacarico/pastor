@@ -294,6 +294,7 @@ fn main() {
         Ok(p) => p,
         Err(err) => fail("config_error", &err.to_string()),
     };
+    pastor::ipc::set_caller_task(pastor::ipc::task_from_env());
     if let Some(task) = pastor::ipc::caller_task()
         && changes_fleet(&command)
         && !agents_change_fleet(&paths)
@@ -469,6 +470,8 @@ fn changes_fleet(command: &Command) -> bool {
         // A head started from an agent's pane schedules and dispatches with
         // no request to refuse; setup installs one that starts on login.
         Command::Serve | Command::Setup { .. } => true,
+        // herdr's full UI drives every pane and agent on the machine.
+        Command::Open { .. } => true,
         _ => false,
     }
 }

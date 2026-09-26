@@ -158,10 +158,25 @@ pub fn parse_request_line(line: &str) -> serde_json::Result<(IpcRequest, Option<
     Ok((serde_json::from_value(v)?, from_task))
 }
 
-/// The task this process runs in, from `TASK_ENV`: `None` outside a pane
-/// pastor started, or when the variable is empty.
-pub fn caller_task() -> Option<String> {
+static CALLER_TASK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The task `TASK_ENV` names: `None` outside a pane pastor started, or when
+/// the variable is empty.
+pub fn task_from_env() -> Option<String> {
     std::env::var(TASK_ENV).ok().filter(|t| !t.is_empty())
+}
+
+/// Sets the task this process's requests carry. Only the `pastor` binary
+/// calls it, from `task_from_env`: the library never reads the variable
+/// itself, so tests run from an agent's pane don't send the mark and get
+/// their own requests refused.
+pub fn set_caller_task(task: Option<String>) {
+    let _ = CALLER_TASK.set(task);
+}
+
+/// The task this process's requests carry, as `set_caller_task` left it.
+pub fn caller_task() -> Option<String> {
+    CALLER_TASK.get().cloned().flatten()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

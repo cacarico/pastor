@@ -839,7 +839,7 @@ impl Fleet {
 /// the fleet. The CLI says the same for a change it makes on its own.
 pub fn agent_refusal(task: &str) -> String {
     format!(
-        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink plugins, edit machines, flocks or jobs, serve or set up a head); set agents_change_fleet = true in pastor.toml to allow it"
+        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink plugins, edit machines, flocks or jobs, serve or set up a head, open herdr's UI); set agents_change_fleet = true in pastor.toml to allow it"
     )
 }
 
@@ -2880,6 +2880,7 @@ mod tests {
             "flocks",
             "serve",
             "set up",
+            "open",
             "jobs",
         ] {
             assert!(message.contains(op), "{op}: {message}");

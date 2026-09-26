@@ -2646,6 +2646,8 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
         // refuse.
         &["serve"],
         &["setup", "systemd"],
+        // herdr's full UI drives every pane on the machine.
+        &["open", "pi-1"],
     ] {
         assert_eq!(error_code(&run(args)), "agent_refused", "{args:?}");
     }
