@@ -9,10 +9,10 @@ labels: security
 If this report could expose a vulnerability, secret, private host, credential,
 or user data, please do not include those details in a public issue.
 
-Use GitHub's private vulnerability reporting if it is enabled for this
-repository. If it is not available, open a minimal public issue asking for a
-private contact path, without exploit details, logs, hostnames, tokens, or
-personal data.
+Report it privately instead, through GitHub's private vulnerability
+reporting: the "Report a vulnerability" button under the repository's
+Security tab (<https://github.com/cacarico/pastor/security/advisories/new>).
+Only the maintainers see it. See `SECURITY.md` for what a useful report holds.
 
 ## Safe public summary
 
