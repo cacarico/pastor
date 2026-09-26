@@ -327,19 +327,53 @@ pub fn migrate_legacy_dir(legacy: &Path, paths: &Paths) -> anyhow::Result<Option
     Ok(Some(note))
 }
 
+/// Create `dir` (and its parents) with mode 0700, or bring an existing one to
+/// 0700. The dir must be the user's own: one another uid owns, or reached
+/// through a symlink another uid owns, is refused rather than used, since a
+/// state dir under a shared path such as /tmp could otherwise be planted by
+/// someone else and receive the ssh and IPC sockets. A symlink the user owns
+/// (a config dir kept in dotfiles) is followed.
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    // Called on every ssh connect, so the common case — it is already there and
-    // already private — costs one stat instead of a create plus a chmod.
-    if let Ok(md) = std::fs::metadata(dir)
-        && md.is_dir()
-        && md.permissions().mode() & 0o777 == 0o700
-    {
-        return Ok(());
+    create_private_dir_as(dir, unsafe { libc::geteuid() })
+}
+
+fn create_private_dir_as(dir: &Path, euid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let owned = |md: &std::fs::Metadata, what: &str| {
+        if md.uid() == euid {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "{}: {what} is owned by uid {}, not {euid}; refusing to use it",
+                dir.display(),
+                md.uid()
+            ))
+        }
+    };
+    let link = match std::fs::symlink_metadata(dir) {
+        Ok(md) => md,
+        // Missing, or a parent is in the way: creating says which.
+        Err(_) => {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+            std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?
+        }
+    };
+    let md = if link.file_type().is_symlink() {
+        owned(&link, "the symlink")?;
+        std::fs::metadata(dir).with_context(|| format!("follow {}", dir.display()))?
+    } else {
+        link
+    };
+    if !md.is_dir() {
+        anyhow::bail!("{}: not a directory", dir.display());
     }
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod {}", dir.display()))?;
+    owned(&md, "the directory")?;
+    // Called on every ssh connect, so the common case — it is already there and
+    // already private — costs the stats above instead of a chmod too.
+    if md.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod {}", dir.display()))?;
+    }
     Ok(())
 }
 
@@ -925,6 +959,61 @@ mod tests {
             p.ssh_control_path("../../etc/x"),
             tmp.path().join("s/ssh/.._.._etc_x-%C"),
             "a machine name must not escape the ssh directory"
+        );
+    }
+
+    /// A private dir someone else owns, or reaches through a link someone else
+    /// owns, is refused and left as it was: in a shared place such as /tmp
+    /// another user can plant either before pastor first runs.
+    #[test]
+    fn create_private_dir_refuses_a_dir_or_link_another_user_owns() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let theirs = tmp.path().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let other = std::fs::metadata(&theirs).unwrap().uid() + 1;
+        let err = create_private_dir_as(&theirs, other).unwrap_err();
+        assert!(err.to_string().contains("owned by uid"), "{err:#}");
+        let mode = std::fs::metadata(&theirs).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "a refused dir keeps its mode");
+        // The fast path too: an already private dir is still checked.
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(create_private_dir_as(&theirs, other).is_err());
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&theirs, &link).unwrap();
+        assert!(create_private_dir_as(&link, other).is_err());
+    }
+
+    /// A symlinked dir (a config dir kept in dotfiles, say) still works when
+    /// the link and what it points at are the user's own.
+    #[test]
+    fn create_private_dir_accepts_an_own_symlinked_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        create_private_dir(&link).unwrap();
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn create_private_dir_refuses_a_file_or_a_dangling_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let err = create_private_dir(&file).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err:#}");
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &dangling).unwrap();
+        assert!(create_private_dir(&dangling).is_err());
+        assert!(
+            !tmp.path().join("nowhere").exists(),
+            "a link is never followed to create its target"
         );
     }
 
