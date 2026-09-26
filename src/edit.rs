@@ -176,7 +176,12 @@ fn save(
             ),
         ));
     }
-    if let Some(parent) = real.parent() {
+    // Only a missing parent is made, private. An existing one keeps its
+    // mode: through a symlink it may be a dotfiles dir that is not ours.
+    if let Some(parent) = real.parent()
+        && !parent.as_os_str().is_empty()
+        && std::fs::symlink_metadata(parent).is_err()
+    {
         crate::config::create_private_dir(parent)?;
     }
     let mode = std::fs::metadata(real).map_or(0o600, |m| m.permissions().mode() & 0o7777);

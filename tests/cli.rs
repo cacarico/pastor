@@ -3188,3 +3188,29 @@ fn edit_keeps_a_leading_pastor_comment_of_the_users_own() {
     ok(o.edit(&o.editor(&[&edited]), &["job", "edit", "nightly"], ""));
     assert_eq!(std::fs::read_to_string(&job).unwrap(), edited);
 }
+
+/// Copilot 4109415065: saving through a symlink must not chmod the
+/// directory the link points into; only a missing parent is created, 0700.
+#[test]
+fn edit_leaves_an_existing_parent_dir_mode_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let o = offline();
+    let dotfiles = o.tmp.path().join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    std::fs::set_permissions(&dotfiles, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let real = dotfiles.join("nightly.toml");
+    let link = o.config.join("jobs/nightly.toml");
+    std::fs::rename(&link, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let edited = NIGHTLY.replace("1h", "5h");
+    ok(o.edit(&o.editor(&[&edited]), &["job", "edit", "nightly"], ""));
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), edited);
+    let mode = std::fs::metadata(&dotfiles).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+
+    let o2 = offline();
+    std::fs::remove_dir_all(&o2.config).unwrap();
+    ok(o2.edit(&o2.editor(&["tick = \"5s\"\n"]), &["config", "edit"], ""));
+    let mode = std::fs::metadata(&o2.config).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
