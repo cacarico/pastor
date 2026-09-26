@@ -394,7 +394,9 @@ async fn open_worktree(
 /// dispatch recorded) only while it is on disk at the same path, on the same
 /// branch, that task's agent is gone and no agent is listed in the
 /// workspace showing the checkout: the failed task's work is there, and
-/// nobody else is at work in it. Anything else is `None` and gets a new
+/// nobody else is at work in it. The machine actor has already dropped
+/// `reopen` when a task's agent works in the checkout from a workspace not
+/// showing it (`Actor::keep_occupied_checkout`). Anything else is `None` and gets a new
 /// branch and worktree, since the checkout may now be another task's, the
 /// old agent may still be editing it, or an earlier retry of the same task
 /// may have reopened it.

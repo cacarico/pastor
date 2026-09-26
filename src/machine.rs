@@ -1996,6 +1996,34 @@ impl Actor {
     /// error, not a herdr error code): the caller must then treat the machine as
     /// lost and reconnect, not just resubscribe. The task's own outcome
     /// (including `Failed`, as `dispatch()` records it) is left to the store.
+    /// A retry reopens its checkout (`dispatch::reopenable`) only while
+    /// nobody works in it, and herdr lists an agent only in the workspace
+    /// the agent's pane is in: a fix round placed in `pastor` works in the
+    /// checkout from a pane of the shared workspace. So the agents are
+    /// looked for by the checkout's path first, as removing it does
+    /// (`checkout_occupant`); one there, or a look that fails, drops
+    /// `reopen`, and the retry gets a new branch and worktree.
+    async fn keep_occupied_checkout(&self, task: &mut Task) {
+        let Some(path) = task.spec.reopen.as_ref().map(|r| r.path.clone()) else {
+            return;
+        };
+        let timeout = self.settings.request_timeout;
+        let look = async {
+            let agents = self.connector.agent_list().await?;
+            self.checkout_occupant(&agents, task.id, "", Some(&path), None)
+                .await
+        };
+        let who = match tokio::time::timeout(timeout, look).await {
+            Ok(Ok(who)) => who,
+            Ok(Err(err)) => Some(format!("unknown ({err:#})")),
+            Err(_) => Some(format!("unknown (no answer in {timeout:?})")),
+        };
+        if let Some(who) = who {
+            tracing::info!(machine = %self.name, task = %task.display_id(), %path, %who, "not reopening a checkout in use");
+            task.spec.reopen = None;
+        }
+    }
+
     async fn run_dispatch(&mut self, task_id: i64) -> (anyhow::Result<Task>, bool) {
         // The claim is the `Queued -> Starting` transition done as a conditional
         // UPDATE: a task another pass already took, or that finished meanwhile,
@@ -2015,6 +2043,7 @@ impl Actor {
             }
             Err(e) => return (Err(e), false),
         };
+        self.keep_occupied_checkout(&mut task).await;
         let timeout = self.settings.request_timeout;
         let outcome = match tokio::time::timeout(
             timeout,
@@ -3963,6 +3992,40 @@ mod tests {
             assert_eq!(fake.worktree_list("/r").await.unwrap().len(), 1, "{what}");
             assert_eq!(fake.panes(&ws), before, "{what}");
         }
+    }
+
+    /// A failed worktree task placed in `pastor` leaves no workspace on its
+    /// checkout, yet a fix round placed there too may still work in it from
+    /// a pane of the shared workspace. A retry must not reopen a checkout
+    /// someone works in: it looks for agents by the checkout's path, as
+    /// removing it does, and gets a new branch and worktree instead.
+    #[tokio::test]
+    async fn a_retry_never_reopens_a_checkout_another_agent_works_in() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let first = h
+            .dispatch(placed_task(&store, Place::Pastor, true).id)
+            .await
+            .unwrap();
+        let checkout = first.spec.checkout.clone().unwrap();
+        let mut fix = placed_task(&store, Place::Pastor, false);
+        fix.spec.repo = Some(checkout.path.clone());
+        store.update_task(&mut fix).unwrap();
+        let fix = h.dispatch(fix.id).await.unwrap();
+        assert_eq!(fix.state, TaskState::Running, "{:?}", fix.error);
+        fake.exit_pane(first.pane_id.as_deref().unwrap());
+        wait_for("failed", || state_of(&store, first.id) == TaskState::Failed).await;
+
+        let retry = store.insert_retry(first.id).unwrap();
+        assert!(retry.spec.reopen.is_some());
+        let t = h.dispatch(retry.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+        assert!(calls(&fake, "worktree.open").is_empty());
+        let created = calls(&fake, "worktree.create");
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[1]["branch"], format!("pastor/t-{}", retry.id));
+        assert_ne!(t.spec.checkout.unwrap().path, checkout.path);
     }
 
     /// A retry whose old checkout was removed meanwhile gets a new one.
