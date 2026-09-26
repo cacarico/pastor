@@ -1459,7 +1459,12 @@ impl Actor {
             }
             t.state = TaskState::Running;
             t.finished_at = None;
-            // The agent said it was finished; it has more to do now.
+            // The agent said it was finished; it has more to do now. An
+            // ended task may have seen work after `task done` (the rest of
+            // that turn), which must not count toward finishing the new one.
+            if t.ended {
+                t.activity_seen = false;
+            }
             t.ended = false;
             true
         })?;
@@ -5519,13 +5524,24 @@ mod tests {
     async fn sending_to_an_ended_task_reopens_it() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let (h, _events) = spawn(&fake, &store);
+        let settle = Duration::from_millis(150);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
         wait_for("connected", || {
             h.snapshot().channel == ChannelState::Connected
         })
         .await;
         let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
         h.end(t.id).await.unwrap();
+        // The rest of the turn after `task done`: work, then idle.
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("activity recorded", || {
+            store.get_task(t.id).unwrap().unwrap().activity_seen
+        })
+        .await;
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 3).await;
         let sent = h
             .send(
                 t.id,
@@ -5540,6 +5556,15 @@ mod tests {
         assert_eq!(sent.state, TaskState::Running);
         assert!(!sent.ended);
         assert!(!store.get_task(t.id).unwrap().unwrap().ended);
+        // An idle report before the agent picks the input up must not count
+        // the ended turn's work as the new turn's: the task keeps running.
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 4).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        // The new turn's own work finishes it.
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
     }
 
     /// Only a task with a pane on this machine can end.
