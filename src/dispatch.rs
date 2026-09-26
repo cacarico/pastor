@@ -360,7 +360,7 @@ async fn host_workspace(
 
 /// Do two paths name the same directory? herdr reports a checkout's path
 /// without a trailing slash; a `--repo` may carry one.
-fn same_dir(a: &str, b: &str) -> bool {
+pub(crate) fn same_dir(a: &str, b: &str) -> bool {
     let trim = |p: &str| {
         let t = p.trim_end_matches('/');
         if t.is_empty() { "/" } else { t }.to_string()

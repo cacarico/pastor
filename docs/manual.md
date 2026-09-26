@@ -293,11 +293,17 @@ and the task closes with a note to remove it with `git worktree remove`
 once that workspace is gone).
 
 Since a fix round joins the workspace of the worktree it works in, removing
-that worktree would end the fix round too. While another agent is in the
-workspace that shows a worktree task's checkout (its own, or one someone
-opened on it), `task close --remove-worktree` refuses and names
-it, and auto-close closes the task's pane but keeps the checkout, with a note
-on the task.
+that worktree would end the fix round too. While another agent works in a
+worktree task's checkout, `task close --remove-worktree` refuses and names
+it before closing or opening anything, and auto-close closes the task's pane
+but keeps the checkout, with a note on the task. pastor looks for such an
+agent in the task's own workspace, in any workspace showing the checkout,
+and among the other open tasks on the machine whose checkout or `--repo` is
+that path, wherever their pane is: a fix round placed in `pastor` works in
+the checkout from a pane of the shared workspace, which no workspace of the
+checkout lists. An agent pastor did not start that works there from a
+workspace not showing the checkout is not seen (herdr reports no directory
+per agent).
 
 An agent named like a task (`t-N`) that no open task owns is an orphan: a
 dispatch that failed after the agent started, a daemon killed mid-dispatch, a
