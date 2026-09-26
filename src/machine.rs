@@ -86,12 +86,16 @@ fn manual_worktree_cleanup(display_id: &str) -> String {
     )
 }
 
-/// The note on a task whose worktree auto-close kept, and why.
+/// The note on a task whose worktree auto-close kept, and why. The branch is
+/// the one the checkout was recorded on: a retry reopens an older checkout
+/// and drops `spec.branch`, so the requested one may not be where the work is.
 fn worktree_kept_note(t: &Task, name: &str, why: &str) -> String {
     let branch = t
         .spec
-        .branch
-        .clone()
+        .checkout
+        .as_ref()
+        .map(|c| c.branch.clone())
+        .or_else(|| t.spec.branch.clone())
         .unwrap_or_else(|| format!("pastor/{name}"));
     format!(
         "worktree kept: {why} on branch {branch}{}; remove the checkout with `git worktree remove` once it is saved",
@@ -2531,6 +2535,21 @@ fn observed_from(agent: &AgentInfo) -> Observed {
 
 #[cfg(test)]
 mod tests {
+    /// A retry drops `spec.branch` and reopens the checkout of the task it
+    /// retries; the note must name that checkout's branch, where the work is.
+    #[test]
+    fn a_kept_worktree_note_names_the_checkout_branch() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = new_task(&store);
+        t.spec.branch = None;
+        t.spec.checkout = Some(Box::new(crate::task::Checkout {
+            branch: "pastor/t-4".into(),
+            path: "/w/t-4".into(),
+        }));
+        let note = worktree_kept_note(&t, "t-9", "commits on no remote");
+        assert!(note.contains("on branch pastor/t-4"), "{note}");
+    }
+
     use super::*;
     use crate::herdr::fake::FakeHerdr;
     use crate::herdr::fake::PaneInput;
