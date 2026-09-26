@@ -22,6 +22,43 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fix round that joined its workspace) is not removed: auto-close keeps it
   with a note and `task close --remove-worktree` refuses.
 
+### Security
+
+- `create_private_dir`, which makes the config, state and data dirs, refuses a
+  directory owned by another user, or a symlink owned by another user, instead
+  of using it. With `PASTOR_STATE_DIR` under a shared path such as `/tmp`,
+  someone else could otherwise plant the dir that receives the ssh and IPC
+  sockets. A symlink of the user's own is still followed.
+- A hook hearing about a task of a job another connector owns, or of a
+  one-off task, gets the task with `item` null and `prompt` empty, and its own
+  `@<id>` scratch dir as `PASTOR_CONNECTOR_STATE_DIR` rather than the job's.
+  A notifier no longer receives the text of every other connector's items,
+  nor another connector's cursors.
+- Saved trust reads the pane before pressing an agent's trust keys, and
+  presses them only while it shows the trust prompt's `trust_marker`, a new
+  `[agents.<name>]` setting; Claude's is built in as "Yes, I trust this
+  folder". A task blocked on another dialog the same keys would accept, such
+  as Claude's bypass-permissions warning, is left for a human.
+- Item and pane text printed for a human has its control characters escaped:
+  the NOTE column of `task list` (an item title, now cut to 60 characters),
+  every field and the prompt of `task show`, and `task read`. `one_line`
+  escapes every C0 and C1 control, not only CR and LF. `--json` is unchanged.
+- The confirmation `connector install` shows escapes the manifest's strings,
+  shell-quotes its commands and marks the hooks that hear about every job.
+  `connector link` shows the same, and warns when the directory or its
+  manifest is group- or world-writable or owned by another user.
+  `connector install --ref` refuses a ref that starts with `-`.
+- A poll connector run that returns more than 10,000 items or 64 MiB of them
+  fails instead of holding it all; a stream's buffer is bounded at 64 MiB as
+  well as 10,000 items.
+- Every command pastor runs over ssh goes as `sh -c '<command>'`, so a fish
+  or csh login shell on a machine no longer breaks the repo check. A machine's
+  `session` may not contain a backslash or a control character.
+- `pastor.service` runs with `NoNewPrivileges`, `UMask=0077`,
+  `LockPersonality` and `RestrictRealtime`. `pastor setup systemd` leaves
+  empty, relative and world-writable entries out of the unit's `PATH`, refuses
+  a value with a line break and writes `$` in `ExecStart` as `$$`.
+
 ## 0.5.0 - 2026-09-26
 
 ### Added
