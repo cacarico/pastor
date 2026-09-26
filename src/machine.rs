@@ -2020,9 +2020,21 @@ impl Actor {
                 continue;
             }
             let observed = observed_from(agent);
-            if next_state(&task, &observed) == Some(TaskState::Done)
-                && let Some(question) = self.question_in_pane(&task).await
-            {
+            let question = if next_state(&task, &observed) == Some(TaskState::Done) {
+                match self.question_in_pane(&task).await {
+                    Ok(q) => q,
+                    Err(err) => {
+                        // Not done yet: the pane could not be read because the
+                        // machine is out of reach. Keep the task pending for the
+                        // next settle check and let the caller reconnect.
+                        self.pending_done.insert(id, (seen_seq, Instant::now()));
+                        return Err(err);
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(question) = question {
                 self.block_on_question(task, &observed, question);
                 continue;
             }
@@ -2032,22 +2044,23 @@ impl Actor {
     }
 
     /// The question the task's agent ended its turn with, read from the tail
-    /// of its pane (`task::trailing_question`). A pane that cannot be read
-    /// has no question: the task is done as it would have been without this
-    /// check, and a dead machine shows up on the next request anyway.
-    async fn question_in_pane(&self, task: &Task) -> Option<String> {
-        let target = task.agent_name.as_deref()?;
+    /// of its pane (`task::trailing_question`). A pane herdr cannot read has
+    /// no question, so the task is done as it would have been without this
+    /// check. A lost connection or a read that never answers is an outage
+    /// (`is_outage`): the task is not settled on it, and the caller reconnects.
+    async fn question_in_pane(&self, task: &Task) -> anyhow::Result<Option<String>> {
+        let Some(target) = task.agent_name.as_deref() else {
+            return Ok(None);
+        };
         let timeout = self.settings.request_timeout;
         match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
-            Ok(Ok(text)) => crate::task::trailing_question(&text),
+            Ok(Ok(text)) => Ok(crate::task::trailing_question(&text)),
+            Ok(Err(err)) if err.is_transport() => Err(err.into()),
             Ok(Err(err)) => {
                 tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a question");
-                None
+                Ok(None)
             }
-            Err(_) => {
-                tracing::warn!(machine = %self.name, task = %task.display_id(), "read pane for a question timed out");
-                None
-            }
+            Err(_) => Err(TimedOut("agent.read", timeout).into()),
         }
     }
 
@@ -2903,6 +2916,34 @@ mod tests {
         fake.set_pane_text(&pane, "● Kept it. Pushed the branch.\n\n❯\n");
         fake.set_status(&pane, AgentStatus::Idle);
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// A pane read that never answers is an outage, not an empty pane: the
+    /// task must not be settled `done` on it. The actor reconnects, the task
+    /// stays pending, and the next settle check reads the question.
+    #[tokio::test]
+    async fn a_pane_read_that_hangs_does_not_settle_a_question_as_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(200);
+        let settings = MachineSettings {
+            request_timeout: Duration::from_millis(300),
+            ..settings_with_settle(settle)
+        };
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● Should I keep the old flag?\n\n❯\n");
+        fake.hang_method("agent.read");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
     }
 
     /// herdr rejects a prompt to a blocked agent instead of queueing it, so
