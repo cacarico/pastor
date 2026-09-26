@@ -120,6 +120,9 @@ struct State {
     /// Claude loses input typed while it replaces the dialog with its prompt
     /// box. herdr already reports it idle and ready by then. Zero by default.
     trust_redraw: Duration,
+    /// What `agent.read` shows for an agent still at its trust question
+    /// (see `set_trust_screen`); Claude's folder-trust dialog by default.
+    trust_screen: String,
     /// pane id -> when its trust question was answered.
     trust_answered: HashMap<String, Instant>,
     /// How many of the next `pane.list` calls find their workspace gone
@@ -170,6 +173,9 @@ pub struct FakeHerdr {
     /// See `wedge_connects`.
     wedge: Arc<(Mutex<Wedge>, Condvar)>,
 }
+
+/// Claude Code's folder-trust dialog as a pane shows it (2.1).
+const CLAUDE_TRUST_SCREEN: &str = "Accessing workspace:\n\n/r\n\nQuick safety check: Is this a project you created or one you trust?\n\n\u{276f} 1. No, exit\n  2. Yes, I trust this folder\n\nEnter to confirm \u{b7} Esc to cancel\n";
 
 #[derive(Default)]
 struct Wedge {
@@ -384,6 +390,12 @@ impl FakeHerdr {
     /// turns it off.
     pub fn set_trust_prompt(&self, keys: Option<Vec<String>>) {
         self.state.lock().unwrap().trust_prompt = keys;
+    }
+
+    /// What `agent.read` answers for an agent still at its trust question,
+    /// instead of Claude's folder-trust dialog.
+    pub fn set_trust_screen(&self, text: &str) {
+        self.state.lock().unwrap().trust_screen = text.into();
     }
 
     /// Prompts sent within `d` of the trust answer are accepted and lost (see
@@ -1017,12 +1029,22 @@ impl FakeHerdr {
             }
             "agent.read" => {
                 let target = p["target"].as_str().unwrap_or("");
-                let text = s
+                let found = s
                     .agents
                     .values()
-                    .find(|a| a.name.as_deref() == Some(target) || a.pane_id == target)
-                    .and_then(|a| s.pane_text.get(&a.pane_id))
-                    .map_or("fake output\n", String::as_str);
+                    .find(|a| a.name.as_deref() == Some(target) || a.pane_id == target);
+                // Still at its trust question: blocked, never answered.
+                let at_trust = found.is_some_and(|a| {
+                    s.trust_prompt.is_some()
+                        && a.agent_status == AgentStatus::Blocked
+                        && !s.trust_answered.contains_key(&a.pane_id)
+                });
+                let text = match found.and_then(|a| s.pane_text.get(&a.pane_id)) {
+                    Some(text) => text.as_str(),
+                    None if at_trust && s.trust_screen.is_empty() => CLAUDE_TRUST_SCREEN,
+                    None if at_trust => s.trust_screen.as_str(),
+                    None => "fake output\n",
+                };
                 Ok(json!({"type": "pane_read", "read": {"text": text}}))
             }
             // herdr 0.9.1: `pane.split {target_pane_id, direction, cwd, env}`

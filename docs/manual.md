@@ -207,9 +207,14 @@ repo counts. It answers only a task blocked on its startup prompt; any other
 task answers `not_at_trust_prompt`, and nothing is sent or saved. An agent
 without trust keys answers `no_trust_keys`, and a task
 without `--repo` gets the keys but nothing is saved. From then on, when a task
-of a saved repo is blocked during startup on that machine, the head presses
-the trust keys itself, once per task, and emits `task.trusted`; a task still
-blocked after that is left for a human. Either way the task's prompt goes in
+of a saved repo is blocked during startup on that machine, the head reads its
+pane and, if it shows the agent's trust prompt, presses the trust keys itself,
+once per task, and emits `task.trusted`; a task still blocked after that is
+left for a human. The prompt is known by its `trust_marker` (Claude's is built
+in as its "Yes, I trust this folder" option), so a task blocked on another
+dialog the same keys would accept, such as Claude's bypass-permissions
+warning, is left for a human too. An agent with no marker (`trust_marker =
+""`, or one that is not Claude and sets none) gets the keys without the check. Either way the task's prompt goes in
 once, `settle` after the trust keys: Claude redraws for a moment after the
 dialog and loses what is typed then, though herdr takes it.
 `pastor trust list [--json]` shows
@@ -1222,6 +1227,7 @@ place = "repo"               # where a task's pane goes: repo, own, pastor or pa
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
 trust_keys = ["Down", "Enter"]   # accept its folder-trust prompt; [] for none
+trust_marker = "Yes, I trust this folder"  # saved trust presses them only while the pane shows this
 allow_flag = "--allowedTools"    # the flag before each allow pattern
 deny_flag = "--disallowedTools"  # the flag before each deny pattern
 ```

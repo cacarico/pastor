@@ -582,6 +582,12 @@ pub struct AgentDef {
     /// an empty list means the agent has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_keys: Option<Vec<String>>,
+    /// Text the agent's folder-trust prompt shows, and no other dialog does.
+    /// Saved trust presses the trust keys only while the pane shows it.
+    /// Unset keeps the built-in (Claude's); empty means none, and then saved
+    /// trust presses the keys without reading the pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_marker: Option<String>,
     /// The flag that hands the agent one pattern of an `allow` list, put
     /// before each pattern. Unset keeps the built-in (`--allowedTools` for
     /// claude); an agent with none refuses tasks that carry an allow list.
@@ -606,9 +612,28 @@ pub struct Launch {
     pub env: std::collections::BTreeMap<String, String>,
 }
 
-/// Claude's folder-trust dialog opens on "No, exit"; Down moves to "Yes,
-/// proceed" and Enter takes it.
+/// Claude's folder-trust dialog opens on "No, exit"; Down moves to "Yes, I
+/// trust this folder" and Enter takes it.
 const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
+
+/// Text only Claude's folder-trust dialog shows. Its bypass-permissions
+/// warning also opens on "No, exit" with a yes below, so the same keys would
+/// accept that; saved trust presses them only while this is on screen.
+const CLAUDE_TRUST_MARKER: &str = "Yes, I trust this folder";
+
+/// Does `screen` (a pane's text) show `marker`? Case and whitespace are
+/// ignored, since a narrow pane wraps the line and a redraw may space it
+/// differently.
+pub fn shows_trust_marker(screen: &str, marker: &str) -> bool {
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let marker = squash(marker);
+    !marker.is_empty() && squash(screen).contains(&marker)
+}
 
 /// Claude Code's own names for the allow and deny lists (`claude --help`).
 /// Both take several patterns and may repeat, so one flag per pattern works.
@@ -633,6 +658,18 @@ impl Agents {
             None => return None,
         };
         (!keys.is_empty()).then_some(keys)
+    }
+
+    /// What the pane must show before saved trust presses `agent`'s trust
+    /// keys: its own `trust_marker`, else the built-in of its kind (only
+    /// `claude` has one). `None` when it has none.
+    pub fn trust_marker(&self, agent: &str) -> Option<String> {
+        let marker = match self.0.get(agent).and_then(|d| d.trust_marker.clone()) {
+            Some(marker) => marker,
+            None if self.kind(agent) == "claude" => CLAUDE_TRUST_MARKER.to_string(),
+            None => return None,
+        };
+        (!marker.trim().is_empty()).then_some(marker)
     }
 
     /// The flags that carry `agent`'s allow and deny lists: its own, else the
@@ -1287,6 +1324,49 @@ mod tests {
         std::fs::write(&path, "[agents.claude]\ntrust_keys = [\"Down\", \"\"]\n").unwrap();
         let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
         assert!(err.contains("agents.claude.trust_keys"), "{err}");
+    }
+
+    /// Saved trust presses the keys only when the pane shows the trust
+    /// dialog: Claude's is known by its "Yes, I trust this folder" option,
+    /// another agent's by the `trust_marker` it sets.
+    #[test]
+    fn claude_has_a_built_in_trust_marker_and_agents_can_set_their_own() {
+        let cfg = PastorConfig::default();
+        assert_eq!(
+            cfg.agents.trust_marker("claude").as_deref(),
+            Some("Yes, I trust this folder")
+        );
+        assert_eq!(cfg.agents.trust_marker("codex"), None);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.codex]\ntrust_keys = [\"Enter\"]\ntrust_marker = \"Trust this directory?\"\n[agents.claude]\ntrust_marker = \"\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.agents.trust_marker("codex").as_deref(),
+            Some("Trust this directory?")
+        );
+        assert_eq!(
+            cfg.agents.trust_marker("claude"),
+            None,
+            "empty turns it off"
+        );
+    }
+
+    #[test]
+    fn a_trust_marker_matches_across_spacing_and_case() {
+        let screen =
+            "Quick safety check: ...\n \u{276f} 1. No, exit\n   2.  Yes, I trust\n this folder\n";
+        assert!(shows_trust_marker(screen, "Yes, I trust this folder"));
+        assert!(shows_trust_marker(
+            "YES, I TRUST THIS FOLDER",
+            "Yes, I trust this folder"
+        ));
+        let bypass = "WARNING: Claude Code running in Bypass Permissions mode\n \u{276f} 1. No, exit\n   2. Yes, I accept\n";
+        assert!(!shows_trust_marker(bypass, "Yes, I trust this folder"));
     }
 
     #[test]

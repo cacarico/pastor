@@ -2672,7 +2672,10 @@ impl Actor {
     /// Answer the folder-trust prompt of every task blocked during startup
     /// (`Blocked` with its prompt still pending) whose (machine, repo) is
     /// saved as trusted: send its agent's trust keys once and emit
-    /// `task.trusted`. `claim_trust_sent`, after herdr accepted the keys,
+    /// `task.trusted`. When the agent has a `trust_marker` (Claude's is
+    /// built in), the pane is read first and the keys go only while it
+    /// shows the marker; a task blocked on any other dialog is left alone,
+    /// and is looked at again next reconcile. `claim_trust_sent`, after herdr accepted the keys,
     /// makes it once per task, across restarts, whether or not the keys
     /// answered the prompt: a task still blocked afterwards is left for a
     /// human. A send that fails claims nothing, so a later reconcile tries
@@ -2696,6 +2699,18 @@ impl Actor {
                 continue;
             }
             let timeout = self.settings.request_timeout;
+            // The keys answer whatever dialog is up, so they go only while the
+            // pane shows the trust prompt; anything else waits for a human.
+            if let Some(marker) = self.settings.agents.trust_marker(&task.spec.agent) {
+                let target = task.agent_name.as_deref().unwrap_or(pane);
+                let screen = tokio::time::timeout(timeout, self.connector.agent_read(target, 100))
+                    .await
+                    .map_err(|_| TimedOut("agent.read", timeout))??;
+                if !crate::config::shows_trust_marker(&screen, &marker) {
+                    tracing::debug!(machine = %self.name, task = %task.display_id(), "blocked, but not on the trust prompt; left for a human");
+                    continue;
+                }
+            }
             tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
                 .await
                 .map_err(|_| TimedOut("pane.send_keys", timeout))??;
@@ -5128,6 +5143,30 @@ mod tests {
             [PaneInput::Keys(vec!["Down".into(), "Enter".into()])]
         );
         assert_eq!(trusted_events(&mut events).len(), 1);
+    }
+
+    /// Saved trust reads the pane before it presses anything: a task of a
+    /// trusted repo blocked on some other dialog, one the same keys would
+    /// accept (Claude's bypass-permissions warning opens on "No, exit" too),
+    /// is left blocked for a human.
+    #[tokio::test]
+    async fn saved_trust_leaves_a_dialog_that_is_not_the_trust_prompt_alone() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        fake.set_trust_screen(
+            "WARNING: Claude Code running in Bypass Permissions mode\n\u{276f} 1. No, exit\n  2. Yes, I accept\n",
+        );
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.trust_repo("m", "/r").unwrap();
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(worktree_task(&store).id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!calls(&fake, "agent.read").is_empty(), "the pane was read");
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert!(calls(&fake, "pane.send_keys").is_empty());
+        assert!(trusted_events(&mut events).is_empty());
+        // Not claimed: once the real dialog shows, it is answered.
+        assert!(!store.trust_sent(t.id).unwrap());
     }
 
     #[tokio::test]
