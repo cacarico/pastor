@@ -45,8 +45,8 @@ someone else's cloud. The longer story is in [the blog post](https://cacari.co/p
   the schedule and the history.
 - **Machines** take the tasks. The head can be one of them. Others are
   reached over ssh, and each runs herdr.
-- **A task** is one agent, one prompt, in a repo or in a fresh git worktree of
-  it, so agents never step on each other.
+- **A task** is one agent, one prompt, in a repo or, with `--worktree`, in a
+  fresh git worktree of it, so two agents never edit the same checkout.
 - **A job** is a schedule plus a **connector** that finds work, and a prompt
   template that turns each piece of work into a task.
 - **A flock** is a named group of machines, for example `work` and
@@ -73,7 +73,11 @@ You also need:
 
 - [herdr](https://herdr.dev) 0.9 or newer on every machine, with its server running;
 - ssh from the head to the other machines, without a passphrase prompt;
+- git on the head, for `pastor connector install`;
 - the agents themselves (`claude`, `opencode`, ...), installed as usual on each machine.
+
+Each connector says what else it needs: `github-issues`, for example, uses an
+authenticated `gh`, `jq` and `sh` on the head.
 
 ## Quick start
 
@@ -153,6 +157,7 @@ label = "pastor"
 
 [dispatch]
 repo = "~/work/widgets"
+backfill = "30d"   # on the first run, also take issues from the last 30 days
 worktree = true
 branch = "pastor/issue-{{ item.key }}"
 prompt = """
@@ -165,7 +170,7 @@ Work test first, commit, and push the branch.
 ```
 
 Each piece of work has a stable key, so pastor never starts the same issue
-twice. Connectors in [pastor-connectors](https://github.com/cacarico/pastor-connectors):
+twice. Without `backfill`, the first run only sees issues updated from then on. Connectors in [pastor-connectors](https://github.com/cacarico/pastor-connectors):
 
 | Connector | Turns into tasks |
 |---|---|
@@ -187,10 +192,10 @@ notification. Writing one takes a manifest and a script in any language. See
 | follow tasks | `pastor task list`, `pastor task describe t-3`, `pastor events --follow` |
 | talk to an agent | `pastor task read t-3`, `pastor task send t-3 "..."`, `pastor task attach t-3` |
 | end a task | `pastor task close t-3` (an agent can run `pastor task done` itself) |
-| manage jobs | `pastor job list`, `job describe NAME`, `job run NAME`, `job edit NAME` |
-| manage flocks | `pastor flock list`, `flock describe NAME`, `flock edit` |
+| manage jobs | `pastor job list`, `pastor job describe NAME`, `pastor job run NAME`, `pastor job edit NAME` |
+| manage flocks | `pastor flock list`, `pastor flock describe NAME`, `pastor flock edit` |
 | change settings | `pastor config edit` |
-| use connectors | `pastor connector list`, `connector describe ID`, `connector install OWNER/REPO/DIR` |
+| use connectors | `pastor connector list`, `pastor connector describe ID`, `pastor connector install OWNER/REPO/DIR` |
 
 Every list and describe takes `--json`. `make install` also installs fish
 and bash completions that complete real names: `pastor job describe <TAB>`
@@ -234,9 +239,10 @@ machine names.
 ## Safety
 
 - **Agents can't take over the fleet.** Every agent pastor starts is marked.
-  From its terminal it can read (`task list`, `describe`), but it can't
-  start or stop tasks, edit machines, jobs or settings, or start its own
-  head, unless you allow it with `agents_change_fleet = true`.
+  From its terminal it can read (`task list`, `describe`) and end its own
+  task with `pastor task done`, but it can't start tasks, stop other tasks,
+  edit machines, jobs or settings, or start its own head, unless you allow it
+  with `agents_change_fleet = true`.
 - **Agents keep their permission prompts.** pastor passes the allow and deny
   lists you set for each flock. Turning the prompts off is your decision, and
   [the manual](docs/manual.md#trust-model) says when not to.

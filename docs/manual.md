@@ -1090,23 +1090,23 @@ leading `-` or control characters; such an item is skipped and reported.
 
 ### What a connector inherits
 
-A plugin is code you run as the head's user, not a sandboxed extension. Each
+A connector is code you run as the head's user, not a sandboxed extension. Each
 command inherits:
 
 - the whole environment of the `pastor serve` or `pastor` process that runs
   it, not just its `.env`: `SSH_AUTH_SOCK`, API tokens and cloud credentials
-  exported there reach every plugin. Only the secrets a manifest declares are
-  redacted from logs, so a plugin that prints its environment writes the rest
+  exported there reach every connector. Only the secrets a manifest declares are
+  redacted from logs, so a connector that prints its environment writes the rest
   to its run log in clear text;
-- the head user's files, including every other plugin's `.env`, so keeping
+- the head user's files, including every other connector's `.env`, so keeping
   secrets in separate `.env` files organises them but does not isolate them;
 - `PASTOR_STATE_DIR`, and with it `pastor.sock` and the ssh ControlMaster
   sockets, which is control of the fleet (see [Trust model](#trust-model)).
 
 A hook without `only_own = true` also hears about every other job's tasks,
 though without their item or prompt (see [Event hooks](#event-hooks)). Start `pastor serve` from an
-environment that holds only what its plugins and ssh need, and install only
-plugins you would run by hand.
+environment that holds only what its connectors and ssh need, and install only
+connectors you would run by hand.
 
 ### Event hooks
 
