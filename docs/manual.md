@@ -1071,7 +1071,7 @@ ln -s ~/ghq/github.com/cacarico/pastor/skills/pastor .claude/skills/pastor     #
 
 An agent that pastor dispatched runs on a flock machine, where this checkout
 may not exist; if pastor is installed there, it can run `pastor --skill`.
-A unit test checks that every command and flag the skills name exists, so a
+A unit test checks that every command and flag named by a skill exists, so a
 CLI change that breaks one fails `make check`.
 
 `skills/spec/SKILL.md` plans work for the flock. It starts from the
