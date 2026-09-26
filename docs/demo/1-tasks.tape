@@ -24,6 +24,9 @@ Type "pastor task list"
 Enter
 Sleep 3s
 
-Type "pastor task read t-1 | head -n 16"
+Type "clear"
 Enter
-Sleep 6s
+# The pane ends with the agent's own input box and status lines: stop at it.
+Type "pastor task read t-1 | sed '/^─/q'"
+Enter
+Sleep 7s
