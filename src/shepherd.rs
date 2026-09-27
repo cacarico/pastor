@@ -263,6 +263,7 @@ mod tests {
             at: chrono::Utc::now(),
             kind: "task.done".into(),
             task: None,
+            model: None,
             job: None,
             machine: None,
             detail: None,
