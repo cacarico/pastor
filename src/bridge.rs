@@ -19,14 +19,14 @@ pub async fn run(
     mut input: impl AsyncBufRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
-        if input.read_line(&mut line).await? == 0 {
+        if input.read_until(b'\n', &mut line).await? == 0 {
             return Ok(());
         }
         // A blank line holds no request; sending it would only draw an error.
-        if line.trim().is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         let reply = match relay_line(socket, &line).await {
@@ -42,7 +42,7 @@ pub async fn run(
                 return Err(CliError::err(code, message));
             }
         };
-        output.write_all(reply.as_bytes()).await?;
+        output.write_all(&reply).await?;
         output.flush().await?;
     }
 }
