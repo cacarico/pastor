@@ -1044,13 +1044,13 @@ impl PastorConfig {
         ] {
             check_tools(key, list).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         }
-        // It ends up as an ssh destination on another machine; a space in it
-        // would split into two arguments there.
+        // It ends up as an ssh destination in an agent's pane, the same way a
+        // machine's own `ssh` does; reject what that validation rejects.
         if let Some(head) = &cfg.head_address
-            && (head.is_empty() || head.chars().any(char::is_whitespace))
+            && let Some(problem) = flock::ssh_target_problem(head)
         {
             anyhow::bail!(
-                "{}: head_address must be an ssh destination, not empty and with no whitespace",
+                "{}: head_address must be an ssh destination: {problem}",
                 path.display()
             );
         }
@@ -1198,7 +1198,13 @@ mod tests {
         assert_eq!(PastorConfig::default().head_address, None);
         let cfg = PastorConfig::parse(path, "head_address = \"user@head.example\"").unwrap();
         assert_eq!(cfg.head_address.as_deref(), Some("user@head.example"));
-        for bad in ["\"\"", "\"  \"", "\"user@head example\"", "\"head\\n\""] {
+        for bad in [
+            "\"\"",
+            "\"  \"",
+            "\"user@head example\"",
+            "\"head\\n\"",
+            "\"-oProxyCommand=evil\"",
+        ] {
             let err = PastorConfig::parse(path, &format!("head_address = {bad}")).unwrap_err();
             assert!(err.to_string().contains("head_address"), "{bad}: {err}");
         }
