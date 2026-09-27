@@ -633,6 +633,7 @@ mod tests {
                 tags: vec![],
                 orphans: vec![],
                 flock: None,
+                shutting_down: false,
             })),
             task: None,
         }

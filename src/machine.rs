@@ -170,6 +170,13 @@ pub struct MachineStatus {
     /// from an actor, and from a head that predates flocks.
     #[serde(default)]
     pub flock: Option<String>,
+    /// The actor was stopped by a reload that took this machine out of the
+    /// flock, but it has not ended yet (`Fleet::statuses` fills it in). A
+    /// caller that grants access by flock membership must treat this machine
+    /// as removed, not as still in `flock`. `false` from an actor, and from
+    /// a head that predates the field.
+    #[serde(default)]
+    pub shutting_down: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -536,6 +543,7 @@ pub fn spawn_machine(
         tags: tags.clone(),
         orphans: vec![],
         flock: None,
+        shutting_down: false,
     }));
     let actor = Actor {
         name: name.clone(),

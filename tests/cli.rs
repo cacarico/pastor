@@ -566,7 +566,7 @@ fn authorized_key_prints_the_locked_line() {
     };
     let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_pastor")).unwrap();
     let want = format!(
-        "command=\"{} bridge --agent --machine pi-1\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza user@pi-1\n",
+        "command=\"{} bridge --agent --machine pi-1\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza user@pi-1\n",
         exe.display()
     );
     let out = run(

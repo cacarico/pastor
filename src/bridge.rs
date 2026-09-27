@@ -164,13 +164,18 @@ fn op_name(req: &IpcRequest) -> String {
 }
 
 /// `machine`'s flock, as the head reports it: never read from local files,
-/// which the head may not share. `None` when the head has no such machine.
+/// which the head may not share. `None` when the head has no such machine,
+/// or when a reload has already taken it out of the flock and is only
+/// waiting for its actor to stop (`shutting_down`): its reported flock is a
+/// fallback for display, not proof it still belongs there, and this key was
+/// scoped to the machine, not to whichever flock a stale record falls into.
 async fn machine_flock(socket: &Path, machine: &str) -> anyhow::Result<Option<String>> {
     let reply = ask(socket, &IpcRequest::FlockList, None).await?;
     Ok(match serde_json::from_slice::<IpcResponse>(&reply) {
         Ok(IpcResponse::Machines(ms)) => ms
             .into_iter()
             .find(|m| m.name == machine)
+            .filter(|m| !m.shutting_down)
             .and_then(|m| m.flock),
         _ => None,
     })
@@ -201,8 +206,17 @@ pub fn authorized_key_line(pastor: &Path, machine: &str, key: &str) -> anyhow::R
             format!("{pastor} cannot go in an authorized_keys command unquoted"),
         ));
     }
+    if machine.is_empty()
+        || machine.contains(['"', '\\'])
+        || machine.chars().any(char::is_whitespace)
+    {
+        return Err(CliError::err(
+            "invalid_machine",
+            format!("{machine} cannot go in an authorized_keys command unquoted"),
+        ));
+    }
     Ok(format!(
-        "command=\"{pastor} bridge --agent --machine {machine}\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding {key}"
+        "command=\"{pastor} bridge --agent --machine {machine}\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding {key}"
     ))
 }
 
@@ -232,10 +246,18 @@ mod tests {
     }
 
     fn machine_json(name: &str, flock: &str) -> serde_json::Value {
+        shutting_down_machine_json(name, flock, false)
+    }
+
+    fn shutting_down_machine_json(
+        name: &str,
+        flock: &str,
+        shutting_down: bool,
+    ) -> serde_json::Value {
         serde_json::json!({
             "name": name, "endpoint": "", "channel": "connected", "herdr_version": null,
             "protocol": null, "error": null, "live": 0, "max_agents": 2, "tags": [],
-            "flock": flock,
+            "flock": flock, "shutting_down": shutting_down,
         })
     }
 
@@ -260,6 +282,7 @@ mod tests {
                     }
                     "flock_list" => serde_json::json!({"kind": "machines", "data": [
                         machine_json("pi-1", "home"), machine_json("pi-2", "work"),
+                        shutting_down_machine_json("pi-3", "home", true),
                     ]}),
                     "list" => serde_json::json!({"kind": "tasks", "data": tasks}),
                     "task_show" if (1..=2).contains(&id) => {
@@ -413,6 +436,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_machine_shutting_down_gets_no_flock_from_a_stale_key() {
+        let head = fake_head();
+        let line = request_line(
+            &IpcRequest::List {
+                filter: TaskFilter::default(),
+            },
+            None,
+        )
+        .unwrap();
+        let reply = answer_agent(&head.socket, "pi-3", line.as_bytes())
+            .await
+            .unwrap();
+        let resp: IpcResponse = serde_json::from_slice(&reply).unwrap();
+        assert!(refused(&resp), "{resp:?}");
+    }
+
+    #[tokio::test]
     async fn the_bridge_names_the_task_a_request_comes_from() {
         let head = fake_head();
         head.ask(&IpcRequest::TaskDone { id: 1 }, Some("t-2")).await;
@@ -465,7 +505,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            "command=\"/opt/pastor/bin/pastor bridge --agent --machine pi-1\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza key@pi-1"
+            "command=\"/opt/pastor/bin/pastor bridge --agent --machine pi-1\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza key@pi-1"
         );
         for bad in ["", "ssh-ed25519", "ssh-ed25519 A\nssh-rsa B"] {
             assert!(
@@ -474,5 +514,15 @@ mod tests {
             );
         }
         assert!(authorized_key_line(Path::new("/a b/pastor"), "pi-1", "ssh-ed25519 A").is_err());
+    }
+
+    #[test]
+    fn the_authorized_key_line_rejects_a_machine_name_it_cannot_quote() {
+        for bad in ["", "pi 1", "pi\"1", "pi\\1", "pi\n1"] {
+            assert!(
+                authorized_key_line(Path::new("/opt/pastor"), bad, "ssh-ed25519 A").is_err(),
+                "{bad:?}"
+            );
+        }
     }
 }

@@ -284,15 +284,21 @@ impl Fleet {
             .collect()
     }
 
-    /// Every machine's status with the flock it is in (see `flock_of`), in
-    /// flock order: what `machine list` and `machine.*` events report.
+    /// Every machine's status with the flock it is in (see `flock_of`) and
+    /// whether it is `shutting_down`, in flock order: what `machine list`
+    /// and `machine.*` events report, and what a caller granting access by
+    /// flock membership (`bridge::machine_flock`) must check before trusting
+    /// the flock it reports for a machine no longer in `wanted`.
     pub fn statuses(&self) -> Vec<crate::machine::MachineStatus> {
         let wanted = self.flock();
-        self.machines()
+        self.members
+            .read()
+            .unwrap()
             .iter()
-            .map(|h| crate::machine::MachineStatus {
-                flock: Some(flock_of(&wanted, &h.name)),
-                ..h.snapshot()
+            .map(|m| crate::machine::MachineStatus {
+                flock: Some(flock_of(&wanted, &m.handle.name)),
+                shutting_down: m.shutting_down,
+                ..m.handle.snapshot()
             })
             .collect()
     }
