@@ -140,7 +140,7 @@ impl Collected {
                 }
             }
             Some(Line::Cursor(c)) => self.out.cursor = Some(c),
-            // Log records reach the scheduler's log and `connector run`, so they
+            // Log records reach the scheduler's log and `connector try`, so they
             // get the same redaction as stderr.
             Some(Line::Log(l)) => self.out.logs.push(lock(log).redact(&l)),
             Some(Line::Bad(why)) => {

@@ -530,7 +530,7 @@ mod tests {
     /// under internal tagging (serde_json refuses to merge a `kind` field into a
     /// sequence or a string), which the adjacently-tagged `content = "data"`
     /// representation fixes for every shape uniformly. `Task(Task)` is included
-    /// too: it's what `run` and `task show` actually return over the wire.
+    /// too: it's what `run` and `task describe` actually return over the wire.
     #[test]
     fn every_response_variant_round_trips_through_json() {
         let responses = vec![

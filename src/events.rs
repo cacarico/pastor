@@ -417,10 +417,10 @@ pub struct EventsArgs {
     /// with the daemon down)
     #[arg(long)]
     pub follow: bool,
-    /// Only events about this task (t-N or N)
+    /// Only events about this task, like t-12 or 12
     #[arg(long)]
     pub task: Option<String>,
-    /// One JSON record per line, the same shape hooks get on stdin
+    /// Print one JSON record per line, the same shape hooks get on stdin
     #[arg(long)]
     pub json: bool,
 }
@@ -430,7 +430,7 @@ pub async fn cli(paths: &Paths, args: EventsArgs) -> anyhow::Result<()> {
     let task = args
         .task
         .as_deref()
-        .map(|t| parse_task_id(t).ok_or_else(|| anyhow::anyhow!("not a task id: {t}")))
+        .map(|t| parse_task_id(t).ok_or_else(|| anyhow::anyhow!(crate::task::bad_task_id(t))))
         .transpose()?;
     let json = args.json;
     let print = move |r: &EventRecord| -> bool {

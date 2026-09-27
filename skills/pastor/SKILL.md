@@ -21,7 +21,7 @@ pastor events --help
 pastor setup --help
 ```
 
-Most read commands take `--json` (`pastor task list`, `pastor task show`, `pastor machine list`, `pastor job list`, `pastor events`, and every `describe`). Use it, and read task ids, machines and states from the output instead of predicting them.
+Most read commands take `--json` (`pastor task list`, `pastor task describe`, `pastor machine list`, `pastor job list`, `pastor events`, and every `describe`). Use it, and read task ids, machines and states from the output instead of predicting them.
 
 Runtime errors are one JSON object on stderr, `{"code": ..., "message": ...}`, with exit 1. A malformed command line is clap usage text with exit 2.
 
@@ -55,7 +55,7 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 - `--worktree` makes a git worktree of `--repo` for the task, on `--branch` or `pastor/t-N`. It needs `--repo` and the repo cloned on that machine.
 - `--place` says where the agent's pane goes on the machine's herdr. `repo` (the default): a worktree task in its new worktree, a task whose `--repo` a workspace already shows (a fix round in a pull request's worktree) in a new pane there, anything else in its own workspace `t-N`. `own`: always its own workspace. `pastor`: a pane in the machine's `pastor` workspace, made on first use. `pane:<workspace>`: a pane in the workspace with that label, refused if the machine has none. A job sets it with `place` in `[dispatch]`, `pastor.toml` with `place` under `[defaults]`. Closing a task closes only its own pane, never a workspace it joined.
 - `--agent-arg` passes one argument to the agent and always takes the next word, dashes included. Repeat it, in order.
-- Without `--agent` and `--agent-arg`, the task takes the `agent` and `agent_args` of the machine it runs on from `flock.toml`, then its flock's, then `[defaults]` in `pastor.toml`, then `claude`. Args follow the agent they were written for: a flock's args for codex never reach a task run with `--agent claude`. `pastor task show t-N` prints what the task resolved to and where each came from; an unpinned task settles its agent again when it is placed on a machine.
+- Without `--agent` and `--agent-arg`, the task takes the `agent` and `agent_args` of the machine it runs on from `flock.toml`, then its flock's, then `[defaults]` in `pastor.toml`, then `claude`. Args follow the agent they were written for: a flock's args for codex never reach a task run with `--agent claude`. `pastor task describe t-N` prints what the task resolved to and where each came from; an unpinned task settles its agent again when it is placed on a machine.
 - An agent name can be a definition in `pastor.toml`: `[agents.claude-personal]` with `kind = "claude"` and `env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }` runs Claude on another account. `--agent claude-personal` (or a flock's `agent`) picks it; herdr starts the `kind`, with the env set on the task's pane, and Claude's trust keys and tool flags follow the kind.
 - Tool permissions: the agent keeps its own permission mode. `allow` and `deny` lists of tool patterns (`"Bash(git:*)"`) in `[defaults]`, a `[[flock]]` entry or a job's `[dispatch]` add up, and deny wins over allow; pastor passes them as the agent's own flags (`--allowedTools`, `--disallowedTools` for Claude). An agent with no such flags refuses tasks that carry a list (`agent_tools_unsupported`). Never add `--dangerously-skip-permissions` or similar to `--agent-arg` on your own: a prompt-injected agent would then act as the machine's user with nothing to stop it. Leave that decision to the user.
 - `--timeout` bounds the task; past it the task goes `stale`.
@@ -66,7 +66,7 @@ pastor sends the prompt as is, and the agent knows nothing else. Write it so the
 Then watch it:
 
 ```bash
-pastor task show t-12 --json   # one task, with its error and agent args
+pastor task describe t-12 --json   # one task, with its error and agent args
 pastor task read t-12          # recent pane output; --lines N for more
 pastor events --task t-12      # what happened to it, and when
 ```
@@ -81,7 +81,7 @@ States:
 - `blocked`: the agent is waiting on a permission prompt or question, or ended its turn on a question (the task's error reads `agent asked: ...`). Nobody answers it unless someone sends input (`pastor task send`) or attaches.
 - `done`: the agent went idle after pastor saw it work, and stayed idle for `settle` (10s by default). It means the agent stopped, not that the work is good; read the output.
 - `stale`: the timeout passed without `done`. The agent is left running.
-- `failed`: dispatch failed or the agent exited before it was done. `task show` has the error.
+- `failed`: dispatch failed or the agent exited before it was done. `task describe` has the error.
 - `closed`: finished for good, by pastor after the grace period or by `task close`. Usually the pane is gone, but a task that never reached a machine, or whose machine left the flock, is closed as a row only: no pane was closed and its worktree may still be on disk.
 
 pastor closes a done task's pane after `close_done_after` (`pastor.toml`, default `15m`; `never` disables it): a worktree pastor created is removed if it is clean (no uncommitted changes and no commits on no remote), kept with a note on the task if it is not, and the task then shows as `closed`. Failed, stale and blocked tasks are never closed on their own; use `pastor task retry` or `pastor task close`. The check runs on each reconcile while the machine is connected; an agent herdr shows working or blocked again at that moment is left alone, and its task goes back to `running` or `blocked`.
@@ -160,8 +160,6 @@ pastor machine describe pi-3 --json   # one machine: channel, versions, its task
 pastor flock describe work --json     # one flock: default, agent, machines, live tasks
 ```
 
-`pastor task describe t-12` is `pastor task show t-12`.
-
 `pastor job edit hourly`, `pastor flock edit` and `pastor config edit` open the file in `$VISUAL` or `$EDITOR` and save it only once it is valid, reloading a running head. They are for a human at a terminal: an agent without one would wait on the editor, so edit the file directly and run `pastor job reload`, or use the commands above.
 
 These commands edit `flock.toml` in place, keeping its comments.
@@ -187,7 +185,7 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - Do not ask questions. Nobody is watching; a permission prompt or a question leaves the task `blocked` until a human happens to attach. If something is missing, say so in your report and stop.
 - When finished, run `pastor task done` (it ends your own task, from `PASTOR_TASK`), print `DONE` as your last line, then go idle. pastor marks the task `done` at once and closes your pane after `close_done_after`, freeing the machine's slot.
 - Do not close your pane or exit to clean up; `pastor task done` is how you say you are finished.
-- Do not run, send to, attach to, retry, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `show`, `read`, and `describe` for jobs, machines, flocks and connectors) is fine.
+- Do not run, send to, attach to, retry, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor machine open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `read`, and `describe` for tasks, jobs, machines, flocks and connectors) is fine.
 
 ## When something goes wrong
 

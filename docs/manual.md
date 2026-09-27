@@ -72,7 +72,7 @@ throughout. A head that holds the socket but does not answer the ping within
 2 seconds stops the command (`head_unresponsive`) before it does anything:
 it may be busy mid-request, and working as if no head ran would let `tick`
 start a second scheduler next to it, or an edit or a prune go offline behind
-it. `task list` and `task show`
+it. `task list` and `task describe`
 read from `pastor serve` when it's running and fall back to the SQLite store
 when it's not (`task list` says so on stderr); `task attach` always reads the store
 directly, since it only needs the task's machine and agent name to hand off
@@ -81,7 +81,7 @@ to `ssh`/`herdr`.
 `pastor machine list` opens with a line about the head, then lists the
 machines:
 
-```
+```text
 pastor 0.4.0 on desk (herdr 0.9.1), 2 machines, desk is the head of the flock
 
 NAME  HOST       FLOCK     CHANNEL    HERDR  PASTOR  AGENTS  ORPHANS  TAGS  ERROR
@@ -163,7 +163,7 @@ task's pane over the machine channel. Text that came from an item or a pane is
 printed with its control characters escaped (`\x1b`, `\r`, ...), so none of
 it can move the cursor, retitle the terminal or set the clipboard: the NOTE
 column of `task list` (an item's title, cut to 60 characters), every field and
-the prompt of `task show`, and `task read`. `--json` prints it raw. `pastor open pi-3` execs the full herdr
+the prompt of `task describe`, and `task read`. `--json` prints it raw. `pastor machine open pi-3` execs the full herdr
 UI against a flock machine (`herdr --remote` for an SSH one, `herdr` directly
 for a local one) instead of showing pastor's own view; herdr refuses to start
 inside one of its own panes, so run it from a plain terminal. pastor's flock and
@@ -197,7 +197,7 @@ a turn still at work no longer keeps it `blocked` or `running`, and the
 completion sequence check does not hold its close. Auto-close then closes its
 pane once the agent is idle and `close_done_after` has passed, which frees the
 machine's slot. `pastor task send` to such a task gives it more to do, and it
-runs again as any done task does. `task show --json` prints `"ended": true`.
+runs again as any done task does. `task describe --json` prints `"ended": true`.
 
 `pastor task send t-3 "yes, go on"` types into the pane of a live task
 (starting, running, blocked, or done with its pane still open) and presses
@@ -277,7 +277,7 @@ writing tasks. Retry and close need it.
 `place` decides where on its machine's herdr a task's agent gets its pane.
 It is set like every dispatch setting: `--place` on `task run` (and on `task
 retry`, to move a retry), `place = "..."` in a job's `[dispatch]`, `place` under
-`[defaults]` in `pastor.toml`; `task show` prints it. A head from before
+`[defaults]` in `pastor.toml`; `task describe` prints it. A head from before
 `task retry --place` would retry the task where it was, so `task retry
 --place` refuses one (`head_too_old`): restart `pastor serve` after an
 upgrade.
@@ -486,7 +486,7 @@ flock = "personal"          # no agent: the flock's, then [defaults]: claude
 A task that is not pinned to a machine does not know its machine until it is
 dispatched, so the head settles its agent again when it places it, from the
 files as they stand then; a task pinned with `--machine` (or a job's
-`machine`) has its machine's agent from the start. `pastor task show` prints
+`machine`) has its machine's agent from the start. `pastor task describe` prints
 the agent and args a task resolved to and where each came from, such as
 `claude-personal (from machine laptop)` or `--model claude-sonnet-5 (from
 flock work)`; before dispatch it shows what the task would run without a
@@ -551,7 +551,7 @@ deny_flag = "--deny-tool"
 
 A task whose agent has no flag for a list it carries is refused rather than
 started without it (`agent_tools_unsupported` from `pastor task run` and
-`pastor task retry`; a job records the error for that item). `pastor task show`
+`pastor task retry`; a job records the error for that item). `pastor task describe`
 prints a task's `allow` and `deny`. Since a head from before these lists would
 start the agent without them, every command that can make it queue a task
 (`pastor task run`, `pastor task retry`, `pastor tick` without `--dry-run`,
@@ -593,7 +593,7 @@ agent = "claude-personal"
 
 `pastor task run --agent claude-personal` or `agent = "claude-personal"` in
 a job does the same for one task. herdr starts a `claude` (the `kind`; without
-one, the name itself), and `task show` and `task list` keep the name
+one, the name itself), and `task describe` and `task list` keep the name
 `claude-personal`. Built-in settings follow the kind, not the name: the
 definition gets Claude's trust keys and its `--allowedTools` and
 `--disallowedTools` flags unless it sets `trust_keys`, `allow_flag` or
@@ -649,7 +649,7 @@ A record, which is also what connector event hooks get on stdin:
 - `type`: `task.queued|running|blocked|done|stale|failed|closed`,
   `task.input` (`pastor task send`), `task.trusted` (the head answered a
   trust prompt), `job.failed`, `machine.connected`, `machine.lost`.
-- `task`: the full task row (the same object as `pastor task show --json`) at
+- `task`: the full task row (the same object as `pastor task describe --json`) at
   that moment, on `task.*` events; `null` otherwise or if the row is gone.
   `task.flock` is the task's flock, so a hook can route work and personal
   notifications apart.
@@ -711,7 +711,7 @@ pastor task close t-1 --remove-worktree   # close its pane and remove its worktr
 pastor task done t-1                 # mark it done; its pane closes after close_done_after
 pastor task prune --done --closed --older-than 7d
 pastor task attach t-1               # lands in the agent's pane; ctrl+b q detaches
-pastor open pi-3                     # the full herdr UI on that machine
+pastor machine open pi-3             # the full herdr UI on that machine
 pastor events --follow               # task, job and machine events as they happen
 ```
 
@@ -738,7 +738,7 @@ job file's `agent_args` does the same for its tasks. When neither says
 anything, the machine's `agent_args` apply, then the flock's, then
 `[defaults] agent_args` in pastor.toml (see [A flock's or a machine's
 agent](#a-flocks-or-a-machines-agent)); a job file that sets `agent_args = []`
-opts out of all three. `pastor task show t-1` prints the agent and
+opts out of all three. `pastor task describe t-1` prints the agent and
 args a task was started with.
 
 `--prompt-file` reads the prompt from a file on the machine that runs the CLI,
@@ -952,7 +952,7 @@ The connector answers in JSON lines on stdout, one object per line with a
 - `cursor` carries a string `value` for the connector to be handed back next
   time. The last one in a run wins.
 - `log` carries a `message` and an optional `level` (`info` by default). Pastor
-  logs it, and `connector run` prints it.
+  logs it, and `connector try` prints it.
 - A blank line is ignored. Any other line (not JSON, not an object, an item
   without a key, an unknown `type`) is skipped, noted in the run log, and the
   rest of the output is used.
@@ -1014,7 +1014,7 @@ pastor connector install owner/repo/connectors/slack     # owner/repo[/subdir], 
 pastor connector link ~/src/my-connector                 # use a working copy in place
 pastor connector list [--json]                           # version, mode, hooks, missing secrets
 pastor connector describe slack [--json]                 # one connector in full, and the jobs that use it
-pastor connector run slack --job support --since 1h      # run its command once, print its items
+pastor connector try slack --job support --since 1h      # run its command once, print its items
 pastor connector uninstall slack                         # or unlink, for a linked one
 ```
 
@@ -1194,7 +1194,7 @@ So:
   (`--dry-run` too), `job run` and `job reload`, `connector install`, `link`,
   `uninstall` and `unlink`, edits of machines, flocks, jobs and `pastor.toml`
   (`config edit`), `serve` and `setup` (a head started from the pane would
-  dispatch with nothing to refuse), and `open` (herdr's full UI drives every
+  dispatch with nothing to refuse), and `machine open` (herdr's full UI drives every
   pane) (`agent_refused`). A dry tick and a reload count because both apply
   `pastor.toml` and `flock.toml` first. `task done` is refused too, save for
   the pane's own task: an agent may end its own task, and nobody else's. Reads still work, `describe` included.
@@ -1232,12 +1232,17 @@ environment; [Plugins](#plugins) lists what they inherit.
 In the terminal pastor reads like kubectl: `list` shows many things, `describe`
 one in full, `edit` its file.
 
-```
+Taking things away has three verbs, each with one meaning. `remove` takes one
+thing you name (`machine remove`, `flock remove`, `trust remove`). `uninstall`
+and `unlink` undo `connector install` and `connector link`. `prune` removes
+many at once, chosen by state and age (`task prune`).
+
+```text
 pastor job describe <name>       schedule, connector and its config, dispatch, last runs and errors, next run, recent tasks and job events
 pastor machine describe <name>   host, flock, session, channel, herdr, protocol and pastor versions, agents, orphans, tags, its tasks, recent errors
 pastor flock describe <name>     default or not, its agent, agent args, allow and deny, machines, live agents, queued and running tasks
 pastor connector describe <id>   manifest, origin, commands, config, secrets set or missing, jobs using it, status
-pastor task describe <id>        the same as `pastor task show`
+pastor task describe <id>        state, machine, agent and where it came from, prompt, error
 pastor job edit <name>           ~/.config/pastor/jobs/<name>.toml
 pastor flock edit                ~/.config/pastor/flock.toml
 pastor config edit               ~/.config/pastor/pastor.toml
@@ -1330,7 +1335,7 @@ copies for bash and fish live in `contrib/completions/`.
 In bash and fish the script also offers the names a command takes: job names
 after `job describe`, `--job` and the like, flock and machine names after
 `--flock`, `--machine` and the flock and machine commands, task ids after the
-task commands, and connector ids after `connector uninstall|unlink|run`. A
+task commands, and connector ids after `connector uninstall|unlink|try`. A
 static script cannot know them, so at TAB it runs `pastor __complete <shell>
 -- <words>`, which reads the job files, `flock.toml`, the connectors
 directory and the task store directly, never the head, and prints nothing

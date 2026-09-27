@@ -91,8 +91,10 @@ down here because getting them wrong cost a day.
 - Commit messages: conventional prefix, plain subject, a body that explains
   the why. No `Co-Authored-By` or other trailers.
 - `skills/pastor/SKILL.md` is built into the binary. Change it with the CLI:
-  a unit test fails when any Markdown file under `skills/` names a command
-  or flag that does not exist, or a SKILL.md's frontmatter is off. The other
+  a unit test fails when any Markdown file under `skills/`, `README.md` or
+  `docs/manual.md` names a command or flag that does not exist (fences
+  tagged `text`, `toml` or `json` are skipped), or a SKILL.md's frontmatter
+  is off. Another fails when a command or argument has no help. The other
   skills (`skills/spec/`) are not built in; they install with the repo as the
   Claude Code plugin `pastor` (`.claude-plugin/plugin.json`, whose version
   follows `Cargo.toml`). `tests/cli.rs` runs the spec skill's example plan's
@@ -135,7 +137,7 @@ Still open as of the last review; none of them blocks normal use.
   back insert of the newest task; ids appear in agent names, branch names
   (`pastor/t-<n>`) and `seen.task_id`. `task prune` never deletes the newest
   row for this reason. The real fix is a table rebuild in a later schema.
-- `pastor open` should detect a nested herdr and say so instead of herdr
+- `pastor machine open` should detect a nested herdr and say so instead of herdr
   refusing to start.
 - The whole dispatch pass runs under the dispatch lock, so slow agent
   readiness delays `job list`, `tick`, `job reload` and `task run` too. Move

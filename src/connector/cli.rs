@@ -22,6 +22,7 @@ use crate::ipc::Head;
 pub enum ConnectorCmd {
     /// Install a connector from GitHub: owner/repo, or owner/repo/subdir
     Install {
+        /// owner/repo, or owner/repo/subdir, on GitHub
         source: String,
         /// Branch, tag or commit to check out
         #[arg(long = "ref")]
@@ -31,25 +32,38 @@ pub enum ConnectorCmd {
         yes: bool,
     },
     /// Use a connector from a local directory, in place (for developing one)
-    Link { path: PathBuf },
+    Link {
+        /// The connector's directory, with its pastor-connector.toml
+        path: PathBuf,
+    },
     /// Remove an installed connector (its .env and state are kept)
-    Uninstall { id: String },
+    Uninstall {
+        /// The connector's id, as `connector list` shows it
+        id: String,
+    },
     /// Remove a linked connector; the directory itself is left alone
-    Unlink { id: String },
+    Unlink {
+        /// The connector's id, as `connector list` shows it
+        id: String,
+    },
     /// List connectors: version, connector, hooks, missing secrets
     List {
+        /// Print as a JSON array
         #[arg(long)]
         json: bool,
     },
     /// One connector in full: manifest, origin, commands, config, secrets, jobs
     Describe {
+        /// The connector's id, as `connector list` shows it
         id: String,
+        /// Print as a JSON object
         #[arg(long)]
         json: bool,
     },
-    /// Run a connector's command once for a job and print its items; creates
-    /// no tasks and saves no cursor
-    Run {
+    /// Try a connector: run its command once for a job and print its items;
+    /// creates no tasks and saves no cursor
+    Try {
+        /// The connector's id, as `connector list` shows it
         id: String,
         /// The job whose [connector] config to use; need not exist yet
         #[arg(long)]
@@ -132,7 +146,7 @@ pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result
             }
             Ok(())
         }
-        ConnectorCmd::Run { id, job, since } => run_once(paths, &id, &job, since.as_deref()).await,
+        ConnectorCmd::Try { id, job, since } => run_once(paths, &id, &job, since.as_deref()).await,
     }
 }
 
@@ -463,7 +477,7 @@ pub fn table(rows: &[ConnectorRow]) -> String {
     )
 }
 
-/// `connector run`: the job's config if its file exists (and names this connector),
+/// `connector try`: the job's config if its file exists (and names this connector),
 /// `{}` otherwise; no cursor; nothing written but the run log. Items go to
 /// stdout as JSON lines, everything else to stderr.
 async fn run_once(

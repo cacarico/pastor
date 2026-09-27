@@ -11,6 +11,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the default flock, and `pastor flock default set <name>` makes another flock
   the default. The old `pastor flock default <name>` is gone. `show` reads
   flock.toml only and never asks the head.
+- The CLI uses one verb per action, and the old names are gone with no
+  alias: `pastor task show` is `pastor task describe`, like the other
+  nouns' `describe`; `pastor connector run` is `pastor connector try`, since
+  it creates no tasks; `pastor open <machine>` is `pastor machine open
+  <name>`. Every command and argument has a line of help, each `--json`
+  says the shape it prints, `machine add` refuses more than one of an ssh
+  target, `--local` and `--command`, and a bad task id says both forms,
+  `t-12` and `12`.
 
 ## 0.6.0 - 2026-09-26
 

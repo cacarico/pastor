@@ -12,11 +12,17 @@ use crate::store::Store;
 pub enum TrustCmd {
     /// Every saved trust: machine, repo, and when it was saved
     List {
+        /// Print as a JSON array
         #[arg(long)]
         json: bool,
     },
     /// Forget a saved trust; the repo's next task asks again
-    Remove { machine: String, repo: String },
+    Remove {
+        /// The machine, as flock.toml names it
+        machine: String,
+        /// The repo's path on that machine, as `trust list` shows it
+        repo: String,
+    },
 }
 
 pub fn run(paths: &Paths, cmd: TrustCmd) -> anyhow::Result<()> {
