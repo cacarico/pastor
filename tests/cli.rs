@@ -4536,7 +4536,7 @@ fn a_named_model_reaches_herdr_and_bad_ones_are_refused() {
     assert_eq!(task["model"], "sonnet", "{task}");
     let start = env.agent_start_params("t-1");
     assert_eq!(
-        start["args"],
+        without_session(&start["args"]),
         serde_json::json!(["--model", "claude-sonnet-5", "-v"]),
         "{start}"
     );
