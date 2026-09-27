@@ -302,6 +302,42 @@ pub async fn request_with_timeout(
     }
 }
 
+/// One request line as a client wrote it, passed to the head unread, and the
+/// reply line as the head wrote it, newline included: `pastor bridge`'s round
+/// trip. Bytes in, bytes out: a request need not be UTF-8 (the head decides
+/// what is a valid request, not this relay), so this reads and writes bytes
+/// rather than a `str`. The same bound and failures as `request`.
+pub async fn relay_line(socket: &Path, line: &[u8]) -> Result<Vec<u8>, RequestError> {
+    let exchange = async {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(RequestError::Connect)?;
+        let (r, mut w) = stream.into_split();
+        let io = async {
+            w.write_all(line).await?;
+            if !line.ends_with(b"\n") {
+                w.write_all(b"\n").await?;
+            }
+            w.flush().await?;
+            let mut reply = Vec::new();
+            BufReader::new(r).read_until(b'\n', &mut reply).await?;
+            anyhow::ensure!(
+                reply.iter().any(|b| !b.is_ascii_whitespace()),
+                "daemon closed the connection without a reply"
+            );
+            if !reply.ends_with(b"\n") {
+                reply.push(b'\n');
+            }
+            Ok(reply)
+        };
+        io.await.map_err(RequestError::Exchange)
+    };
+    match tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err(RequestError::Timeout(DEFAULT_REQUEST_TIMEOUT)),
+    }
+}
+
 async fn round_trip(
     stream: tokio::net::UnixStream,
     req: &IpcRequest,

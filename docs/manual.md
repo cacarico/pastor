@@ -1142,6 +1142,17 @@ connector's hooks fall that far behind, the oldest waiting events are dropped
 and logged. A hook that fails or times out is logged and not retried. Its output goes to `~/.local/state/pastor/runs/@<id>/`, redacted
 like connector logs.
 
+## The bridge
+
+`pastor bridge` lets a CLI on another machine reach this machine's head over
+ssh (`ssh <head> pastor bridge`), so the head never opens a network port. It
+reads request lines on stdin, passes each to `pastor.sock` unchanged, and
+writes each reply line to stdout until stdin closes. It never starts a head
+or reads `flock.toml`; with no head running it writes one `no_head` error
+line and exits non-zero. It checks nothing itself: the head refuses what it
+would refuse from a local CLI, so ssh access to the head's user is access to
+the fleet.
+
 ## Trust model
 
 pastor gives an agent what the head's user has on each machine. It reaches a
