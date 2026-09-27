@@ -61,7 +61,20 @@ pub struct TrustedRepo {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The last lines read from a finishing task's pane, by task id; in
+    /// memory only (see `note_pane_tail`).
+    pane_tails: Mutex<PaneTails>,
 }
+
+/// Tails kept at once. Only a task's finish command asks for one, so most are
+/// never taken; the oldest go first.
+const PANE_TAILS_MAX: usize = 64;
+
+/// Lines of a pane kept as a task's tail.
+const PANE_TAIL_LINES: usize = 40;
+
+#[derive(Default)]
+struct PaneTails(std::collections::VecDeque<(i64, String)>);
 
 /// `update_task` found the row changed since this copy was read. The caller holds
 /// stale data; reload and decide again rather than overwrite.
@@ -185,6 +198,7 @@ impl Store {
         );
         Ok(Store {
             conn: Mutex::new(conn),
+            pane_tails: Mutex::default(),
         })
     }
 
@@ -337,6 +351,7 @@ impl Store {
         tx.commit()?;
         Ok(Store {
             conn: Mutex::new(conn),
+            pane_tails: Mutex::default(),
         })
     }
 
@@ -350,6 +365,29 @@ impl Store {
         let id = conn.last_insert_rowid();
         drop(conn);
         self.get_task(id)?.context("task vanished after insert")
+    }
+
+    /// Remember the last lines of `text`, what pastor read from `task_id`'s
+    /// pane when it judged the task done, for the finish command of its
+    /// connector (`take_pane_tail`). Kept in memory, not the database: it is
+    /// pane text, it is only useful for the minute between the read and the
+    /// finish, and a restart in between just leaves the command with none.
+    pub fn note_pane_tail(&self, task_id: i64, text: &str) {
+        let lines: Vec<&str> = text.trim_end().lines().collect();
+        let tail = lines[lines.len().saturating_sub(PANE_TAIL_LINES)..].join("\n");
+        let mut tails = self.pane_tails.lock().unwrap_or_else(|p| p.into_inner());
+        tails.0.retain(|(id, _)| *id != task_id);
+        if tails.0.len() >= PANE_TAILS_MAX {
+            tails.0.pop_front();
+        }
+        tails.0.push_back((task_id, tail));
+    }
+
+    /// The tail `note_pane_tail` kept for `task_id`, once.
+    pub fn take_pane_tail(&self, task_id: i64) -> Option<String> {
+        let mut tails = self.pane_tails.lock().unwrap_or_else(|p| p.into_inner());
+        let at = tails.0.iter().position(|(id, _)| *id == task_id)?;
+        tails.0.remove(at).map(|(_, t)| t)
     }
 
     /// The next event sequence number: one more than the last one given,
@@ -1001,6 +1039,36 @@ fn row_to_job_state(row: &Row<'_>) -> rusqlite::Result<JobState> {
 mod tests {
     use super::*;
     use crate::task::{Checkout, Reopen};
+
+    #[test]
+    fn a_pane_tail_is_the_last_lines_and_taken_once() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.take_pane_tail(1), None);
+        let text: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        s.note_pane_tail(1, &text);
+        let tail = s.take_pane_tail(1).unwrap();
+        assert_eq!(tail.lines().count(), PANE_TAIL_LINES);
+        assert!(
+            tail.starts_with("line 61\n") && tail.ends_with("line 100"),
+            "{tail}"
+        );
+        assert_eq!(s.take_pane_tail(1), None, "taken once");
+        s.note_pane_tail(2, "a");
+        s.note_pane_tail(2, "b");
+        assert_eq!(s.take_pane_tail(2).as_deref(), Some("b"), "the newest read");
+    }
+
+    #[test]
+    fn pane_tails_are_bounded_and_the_oldest_go() {
+        let s = Store::open_in_memory().unwrap();
+        for id in 0..(PANE_TAILS_MAX as i64 + 5) {
+            s.note_pane_tail(id, "x");
+        }
+        assert_eq!(s.take_pane_tail(0), None);
+        assert_eq!(s.take_pane_tail(4), None);
+        assert!(s.take_pane_tail(5).is_some());
+        assert!(s.take_pane_tail(PANE_TAILS_MAX as i64 + 4).is_some());
+    }
 
     fn spec() -> DispatchSpec {
         DispatchSpec {

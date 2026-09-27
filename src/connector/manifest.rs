@@ -34,6 +34,7 @@ struct ManifestFile {
     secrets: BTreeMap<String, SecretDecl>,
     #[serde(default)]
     events: Vec<HookFile>,
+    finish: Option<FinishFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +54,13 @@ struct HookFile {
     on: Vec<String>,
     #[serde(default)]
     only_own: bool,
+    command: Vec<String>,
+    timeout: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinishFile {
     command: Vec<String>,
     timeout: Option<String>,
 }
@@ -106,6 +114,8 @@ pub struct Manifest {
     pub connector: Option<ConnectorSpec>,
     pub secrets: BTreeMap<String, SecretDecl>,
     pub events: Vec<Hook>,
+    /// Run once when a task of one of this connector's jobs ends.
+    pub finish: Option<Finish>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +131,12 @@ pub struct ConnectorSpec {
 pub struct Hook {
     pub on: Vec<String>,
     pub only_own: bool,
+    pub command: Vec<String>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finish {
     pub command: Vec<String>,
     pub timeout: Duration,
 }
@@ -196,6 +212,22 @@ impl Manifest {
                 command: h.command,
             });
         }
+        let finish = file
+            .finish
+            .map(|f| -> Result<Finish, String> {
+                check_command("finish.command", &f.command)?;
+                Ok(Finish {
+                    timeout: timeout_or_default("finish.timeout", f.timeout.as_deref())?,
+                    command: f.command,
+                })
+            })
+            .transpose()?;
+        if finish.is_some() && connector.is_none() {
+            return Err(
+                "finish: needs a [connector]; only a connector's own jobs have tasks to finish"
+                    .into(),
+            );
+        }
         if connector.is_none() && events.is_empty() {
             return Err("a connector must provide a [connector], [[events]] hooks, or both".into());
         }
@@ -212,6 +244,7 @@ impl Manifest {
             connector,
             secrets: file.secrets,
             events,
+            finish,
         })
     }
 
@@ -511,6 +544,63 @@ command = ["bash", "dm-me.sh"]
                     "id = \"ok\"\nversion = \"0.1.0\"\nmin_pastor_version = \"99.0.0\"\nfuture_key = 1\n{conn}"
                 ),
                 "needs pastor 99.0.0",
+            ),
+        ] {
+            let err = Manifest::parse(&text).unwrap_err();
+            assert!(err.contains(needle), "{needle}: {err}\n{text}");
+        }
+    }
+
+    #[test]
+    fn finish_is_optional_and_defaults_its_timeout() {
+        let head = "id = \"f\"\nversion = \"1.0.0\"\n[connector]\ncommand = [\"x\"]\n";
+        assert!(Manifest::parse(head).unwrap().finish.is_none());
+        let m = Manifest::parse(&format!(
+            "{head}[finish]\ncommand = [\"sh\", \"done.sh\"]\n"
+        ))
+        .unwrap();
+        let f = m.finish.unwrap();
+        assert_eq!(f.command, vec!["sh", "done.sh"]);
+        assert_eq!(f.timeout, DEFAULT_TIMEOUT);
+        let m = Manifest::parse(&format!(
+            "{head}[finish]\ncommand = [\"x\"]\ntimeout = \"5s\"\n"
+        ))
+        .unwrap();
+        assert_eq!(m.finish.unwrap().timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rejects_bad_finish_tables() {
+        let head = "id = \"f\"\nversion = \"1.0.0\"\n";
+        let conn = "[connector]\ncommand = [\"x\"]\n";
+        for (text, needle) in [
+            (
+                format!("{head}{conn}[finish]\ncommand = []\n"),
+                "finish.command",
+            ),
+            (
+                format!("{head}{conn}[finish]\ncommand = [\"\"]\n"),
+                "finish.command",
+            ),
+            (
+                format!("{head}{conn}[finish]\ncommand = [\"x\"]\ntimeout = \"0s\"\n"),
+                "finish.timeout",
+            ),
+            (
+                format!("{head}{conn}[finish]\ncommand = [\"x\"]\ntimeout = \"soon\"\n"),
+                "finish.timeout",
+            ),
+            (
+                format!("{head}{conn}[finish]\ncommand = [\"x\"]\non = 1\n"),
+                "on",
+            ),
+            // Only a connector command makes jobs, so a finish command
+            // without one could never run.
+            (
+                format!(
+                    "{head}[[events]]\non = [\"task.done\"]\ncommand = [\"x\"]\n[finish]\ncommand = [\"x\"]\n"
+                ),
+                "finish: needs a [connector]",
             ),
         ] {
             let err = Manifest::parse(&text).unwrap_err();

@@ -2443,7 +2443,15 @@ impl Actor {
         };
         let timeout = self.settings.request_timeout;
         match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
-            Ok(Ok(text)) => Ok(crate::task::trailing_question(&text)),
+            Ok(Ok(text)) => {
+                // Kept only when the task really is done: a tail left by a
+                // question would reach a later failed task's finish command.
+                let question = crate::task::trailing_question(&text);
+                if question.is_none() {
+                    self.store.note_pane_tail(task.id, &text);
+                }
+                Ok(question)
+            }
             Ok(Err(err)) if err.is_transport() => Err(err.into()),
             Ok(Err(err)) => {
                 tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a question");
@@ -3337,6 +3345,32 @@ mod tests {
         fake.set_pane_text(&pane, "● Kept it. Pushed the branch.\n\n❯\n");
         fake.set_status(&pane, AgentStatus::Idle);
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// The pane text read to settle a task as done is kept as its tail, for
+    /// its connector's finish command (`Store::take_pane_tail`).
+    #[tokio::test]
+    async fn a_done_task_leaves_the_end_of_its_pane_for_the_finish_command() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(100)),
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● Opened https://example.org/pr/7\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        let tail = store.take_pane_tail(t.id).expect("a tail was kept");
+        assert!(tail.contains("Opened https://example.org/pr/7"), "{tail}");
     }
 
     /// A pane read that never answers is an outage, not an empty pane: the

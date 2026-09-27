@@ -5,6 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- A connector can declare a `[finish]` command in its manifest (`command`,
+  and a `timeout` that defaults like a hook's). The head runs it once, with the
+  connector's env and secrets, when a task of one of its jobs reaches `done`
+  or `failed`, so the connector can act where the work came from. Stdin is
+  the task row with its item, the final state, the job, the branch and
+  `last_output`, the last lines read from the agent's pane. A failure or
+  timeout is logged, emitted as `connector.finish_failed` and never changes
+  the task. `connector describe` shows the command.
+
 ### Changed
 
 - `pastor flock default` is split in two: `pastor flock default show` prints

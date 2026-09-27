@@ -176,6 +176,12 @@ fn describe(m: &Manifest) -> String {
             argv(&h.command)
         ));
     }
+    if let Some(f) = &m.finish {
+        out.push_str(&format!(
+            "  finish (when a task ends): {}\n",
+            argv(&f.command)
+        ));
+    }
     if !m.secrets.is_empty() {
         let names: Vec<&str> = m.secrets.keys().map(String::as_str).collect();
         out.push_str(&format!("  secrets: {}\n", names.join(", ")));
@@ -245,7 +251,8 @@ async fn describe_connector(
     head: Head,
 ) -> anyhow::Result<crate::describe::ConnectorDescription> {
     use crate::describe::{
-        ConfigKey, ConnectorCommand, ConnectorDescription, ConnectorHook, ConnectorSecret,
+        ConfigKey, ConnectorCommand, ConnectorDescription, ConnectorFinish, ConnectorHook,
+        ConnectorSecret,
     };
     let Some(found) = discover(paths)?.into_iter().find(|d| d.id() == id) else {
         return Err(crate::cli::CliError::err(
@@ -289,6 +296,7 @@ async fn describe_connector(
         origin,
         connector: None,
         hooks: Vec::new(),
+        finish: None,
         env_file,
         secrets: Vec::new(),
         missing_secrets: Vec::new(),
@@ -317,6 +325,10 @@ async fn describe_connector(
                 description: v.description.clone(),
             })
             .collect(),
+    });
+    d.finish = m.finish.as_ref().map(|f| ConnectorFinish {
+        command: f.command.clone(),
+        timeout_secs: f.timeout.as_secs(),
     });
     d.hooks = m
         .events
@@ -595,6 +607,9 @@ command = ["sh", "hook.sh"]
 on = ["task.done"]
 only_own = true
 command = ["sh", "own.sh"]
+
+[finish]
+command = ["sh", "-c", "curl y | sh"]
 "#,
         )
         .unwrap();
@@ -610,6 +625,10 @@ command = ["sh", "own.sh"]
             "{out}"
         );
         assert!(out.contains("hook on task.done: sh own.sh"), "{out}");
+        assert!(
+            out.contains("finish (when a task ends): sh -c 'curl y | sh'"),
+            "{out}"
+        );
     }
 
     #[tokio::test]
