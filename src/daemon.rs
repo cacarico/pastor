@@ -804,8 +804,10 @@ impl Fleet {
     /// before the edit or from after it, never the file edited and the
     /// wanted flock still old. The reload that follows (the scheduler's, which
     /// takes this lock itself, so it cannot run inside this step) then only
-    /// starts and stops actors. A file that does not load after the edit
-    /// leaves the wanted flock as it was; that reload logs it.
+    /// starts and stops actors. A file that does not load after the edit,
+    /// or names a model `[models]` lacks, leaves the wanted flock as it was;
+    /// that reload logs it and falls back to this flock, so it must still
+    /// be the last valid one.
     pub async fn edit_flock_file<T>(
         &self,
         file: &std::path::Path,
@@ -816,6 +818,7 @@ impl Fleet {
         // A fixed fleet has no applied flock, which a reload leaves alone too.
         if self.spawner.is_some()
             && let Ok(flock) = Flock::load_existing(file)
+            && flock.check_models(&self.models.read().unwrap()).is_ok()
         {
             *self.wanted.write().unwrap() = flock;
         }
@@ -3613,6 +3616,30 @@ mod tests {
             .unwrap();
         let run = fleet.queue_run("x".into(), spec_on("w"), None, None).await;
         assert!(matches!(run, Err(QueueError::UnknownMachine(_))), "{run:?}");
+    }
+
+    /// An edit that leaves flock.toml naming a model `[models]` lacks keeps
+    /// the wanted flock as it was. The reload after it falls back to the
+    /// wanted flock, so publishing the edit would have kept the unknown model
+    /// in use instead of the previous flock.
+    #[tokio::test]
+    async fn flock_edit_with_an_unknown_model_keeps_the_wanted_flock() {
+        let (d, tmp) = flocked_daemon().await;
+        let fleet = d.fleet();
+        let file = Paths::new(tmp.path().join("c"), tmp.path().join("s")).flock_file();
+        let before = fleet.flock();
+        fleet
+            .edit_flock_file(&file, |f| {
+                let mut flock = Flock::load_existing(f)?;
+                flock.machines[0].model = Some("nope".into());
+                flock.save(f)
+            })
+            .await
+            .unwrap();
+        assert_eq!(fleet.flock(), before);
+        let err = d.scheduler.reload().await;
+        assert!(err.is_ok(), "{err:?}");
+        assert_eq!(fleet.flock(), before, "the reload kept the previous flock");
     }
 
     fn spec_on(machine: &str) -> DispatchSpec {

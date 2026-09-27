@@ -946,17 +946,24 @@ fn needs_file_protocol(command: &Command) -> bool {
 }
 
 /// The protocol `command` needs of the head, and what an older head would
-/// do with it, for `probe_head`'s refusal.
+/// do with it, for `probe_head`'s refusal. Checked from the newest protocol
+/// down, so a command that needs two gets the higher: `task retry --place`
+/// needs `PLACE_PROTOCOL` for the flag and `MODEL_PROTOCOL` as a queueing
+/// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_place_protocol(command) {
+    if needs_agent_protocol(command) {
+        Some((
+            pastor::ipc::MODEL_PROTOCOL,
+            if needs_place_protocol(command) {
+                "predates named models and `task retry --place`, and would retry the task where it was, without them"
+            } else {
+                "predates named models (or flock agents and tool allow and deny lists), and would start the agent without them"
+            },
+        ))
+    } else if needs_place_protocol(command) {
         Some((
             pastor::ipc::PLACE_PROTOCOL,
             "predates `task retry --place` and would retry the task where it was",
-        ))
-    } else if needs_agent_protocol(command) {
-        Some((
-            pastor::ipc::MODEL_PROTOCOL,
-            "predates named models (or flock agents and tool allow and deny lists), and would start the agent without them",
         ))
     } else if needs_file_protocol(command) {
         Some((
@@ -2416,6 +2423,9 @@ mod tests {
         let place = protocol_need(&parse(&[
             "pastor", "task", "retry", "t-1", "--place", "pastor",
         ]));
+        // --place needs less than any queueing command: the retry asks for
+        // `MODEL_PROTOCOL`, and the refusal still names the flag.
+        assert_eq!(place.map(|n| n.0), Some(pastor::ipc::MODEL_PROTOCOL));
         let err = probe_head(&paths, false, false, place).await.unwrap_err();
         let err = err.downcast::<pastor::cli::CliError>().unwrap();
         assert_eq!(err.code, "head_too_old");
