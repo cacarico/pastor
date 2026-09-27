@@ -23,7 +23,7 @@
     <a data-key="1" href="{{ "/" | relURL }}"{{ if .IsHome }} class="on"{{ end }}><k>1</k> about</a>
     <a data-key="2" href="{{ "docs/" | relURL }}"{{ if $docs }} class="on"{{ end }}><k>2</k> docs</a>
     <a data-key="3" href="{{ "docs/install/" | relURL }}"><k>3</k> install</a>
-    <a data-key="4" href="{{ site.Params.repo }}"><k>4</k> source</a>
+    <a data-key="4" data-confirm href="{{ site.Params.repo }}" target="_blank" rel="noopener"><k>4</k> source</a>
   </nav>
 
   {{ block "main" . }}{{ end }}
@@ -32,5 +32,18 @@
     {{ block "status" . }}{{ end }}
   </footer>
 </div>
+
+{{- /* Asked before a link marked data-confirm leaves the site. keys.js
+       opens it; without scripts those links just work as links. */}}
+<dialog class="confirm" id="confirm" aria-labelledby="confirm-title">
+  <form method="dialog" class="pane focus">
+    <h2 class="t" id="confirm-title">leave pastor?</h2>
+    <p>Open <b id="confirm-dest"></b> in a new tab?</p>
+    <p class="choices">
+      <button value="yes" autofocus><k>y</k> yes, go</button>
+      <button value="no"><k>n</k> no, stay</button>
+    </p>
+  </form>
+</dialog>
 </body>
 </html>

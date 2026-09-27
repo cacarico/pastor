@@ -122,3 +122,13 @@ h2:hover .anchor, h3:hover .anchor, h4:hover .anchor, .anchor:focus { opacity: 1
   .meta { display: none; }
   .status .right { display: none; }
 }
+
+/* the leave-the-site prompt: a pane floating over a dimmed screen */
+.confirm { padding: 0; border: 0; background: transparent; color: var(--ink); width: min(56ch, calc(100vw - 32px)); overflow: visible; }
+.confirm::backdrop { background: rgb(0 0 0 / .6); }
+.confirm .pane { background: var(--bg); padding: 18px 16px 14px; margin-top: .8em; }
+.confirm b { color: var(--link); font-weight: 400; overflow-wrap: anywhere; }
+.choices { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-top: 14px !important; }
+.choices button { font: inherit; color: var(--ink); background: var(--sel); border: 1px solid var(--line); border-radius: 4px; padding: 2px 12px; cursor: pointer; }
+.choices button:hover, .choices button:focus-visible { border-color: var(--accent); outline: none; }
+.choices k { color: var(--accent); }
