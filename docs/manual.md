@@ -655,7 +655,8 @@ A record, which is also what connector event hooks get on stdin:
 - `at`: when the daemon received the event, RFC 3339 UTC.
 - `type`: `task.queued|running|blocked|done|stale|failed|closed`,
   `task.input` (`pastor task send`), `task.trusted` (the head answered a
-  trust prompt), `job.failed`, `machine.connected`, `machine.lost`.
+  trust prompt), `job.failed`, `connector.finish_failed` (a connector's
+  `[finish]` command failed), `machine.connected`, `machine.lost`.
 - `task`: the full task row (the same object as `pastor task describe --json`) at
   that moment, on `task.*` events; `null` otherwise or if the row is gone.
   `task.flock` is the task's flock, so a hook can route work and personal
@@ -671,7 +672,8 @@ A record, which is also what connector event hooks get on stdin:
   `task.input`, `keys` (the key names pressed, Enter included), `text_len`
   (the length of any text) and `trust` (sent by `--trust`); on
   `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
-  turn on a question, `question`.
+  turn on a question, `question`; on `connector.finish_failed`, `connector`
+  (its id) and `reason` (why: the exit status and stderr tail, or a timeout).
 
 Fields may be added; none will be renamed or removed. Unreadable lines (a
 torn write, a hand edit) are skipped.
@@ -905,6 +907,10 @@ on = ["task.done", "task.blocked", "task.failed"]
 only_own = true                      # false by default
 command = ["bash", "report.sh"]
 timeout = "60s"                      # the default
+
+[finish]                             # optional: runs when a task of its jobs ends
+command = ["bash", "close-issue.sh"]
+timeout = "60s"                      # the default
 ```
 
 The manifest is checked when pastor discovers the connector, and a key it does
@@ -912,7 +918,8 @@ not know is an error. A connector needs a `[connector]`, at least one `[[events]
 hook, or both. Each `command` is an argv array with a program in its first
 place; a relative program with a slash (`./poll`) means the connector's own file.
 An `on` entry is an event type like `task.done`, and timeouts may not be
-zero. The id `clock` belongs to the built-in connector. A connector that fails
+zero. `[finish]` needs a `[connector]`: only a connector's own jobs have tasks
+to finish. The id `clock` belongs to the built-in connector. A connector that fails
 any of this, or asks for a newer pastor than the one running, is listed by
 `connector list` as invalid with the reason, and a job that uses it is invalid
 too.
@@ -1011,14 +1018,14 @@ sets these files to 0600.
 
 Only what the manifest declares under `[secrets]` is treated as secret. What
 a run writes to stderr lands in `~/.local/state/pastor/runs/<job>/<ts>.log`
-(a hook's stdout goes to its log too); in those logs, in the connector's `log`
+(a hook's or finish command's stdout goes to its log too); in those logs, in the connector's `log`
 records and in the reason a failed run reports, the value of every declared
 secret is replaced by `[redacted:NAME]` (a value shorter than four characters
 is left alone, since hiding it would mangle the log and protect nothing). Redaction works line by line, so a
 declared secret may not contain a line break (a double-quoted `\n`): pastor
 refuses such a `.env` and names the variable. Each log is cut at 256 KiB, and
 each run directory keeps its newest 20: `runs/<job>/` for a job's connector
-runs, and `runs/@<id>/` for all of a connector's hook runs together. A stdout or stderr line longer than 256 KiB is
+runs, and `runs/@<id>/` for all of a connector's hook and finish runs together. A stdout or stderr line longer than 256 KiB is
 cut there and the rest of it dropped.
 
 ### Connector commands
@@ -1053,7 +1060,7 @@ it is invalid.
 `describe` shows one connector in full: its manifest (name, description,
 version, `min_pastor_version`, authors, homepage, repository, license); how it
 got here; its connector command's mode, argv and timeout and each hook's
-events, `only_own` and argv; its config keys, required ones marked; its
+events, `only_own` and argv; its `[finish]` command and timeout; its config keys, required ones marked; its
 secrets, each `set` or `missing` in the `.env` (names only, never values);
 the jobs whose `[connector] use` names it, with their last run and result as
 `job list` has them (from the head when one runs); and its status, `ok`, the
@@ -1155,6 +1162,47 @@ after another, in event order, from a queue that holds 256 events; when a
 connector's hooks fall that far behind, the oldest waiting events are dropped
 and logged. A hook that fails or times out is logged and not retried. Its output goes to `~/.local/state/pastor/runs/@<id>/`, redacted
 like connector logs.
+
+### The finish command
+
+A connector only brings work in; `[finish]` lets it act when the work is done,
+to close the loop where the item came from (comment on the issue, say). When a
+task of a job that uses the connector reaches `done` or `failed`, the head runs
+`command` once, with the connector's environment (the job's scratch dir as
+`PASTOR_CONNECTOR_STATE_DIR`, `PASTOR_JOB`, the `.env` and its secrets), as an
+event hook runs. It is queued with the connector's hooks, so one connector
+never races itself, and its output goes to the same `runs/@<id>/` log,
+redacted.
+
+Stdin is one JSON object on one line:
+
+```json
+{
+  "task": { "id": 7, "job": "support", "item": {"key": "k1", "title": "..."}, "state": "done", "...": "the whole task row" },
+  "state": "done",
+  "job": "support",
+  "branch": "fix/issue-12",
+  "last_output": "...the last lines of the agent's pane..."
+}
+```
+
+- `task` is the task row, as in `pastor task describe --json`, with its `item`
+  and prompt.
+- `state` is `done` or `failed`, the state the task ended in.
+- `branch` is the branch of the task's worktree, or the job's `branch` when
+  it names one; `null` when the task has neither.
+- `last_output` is up to the last 40 lines pastor read from the agent's pane
+  when it judged the task done (pastor reads the pane then to see whether the
+  agent ended on a question). It is `""` when pastor read none, as for a task
+  that failed, and after a restart of the head.
+
+It runs once per task, the first time pastor sees it `done` or `failed`. A task
+that goes on to `closed`, or that is reopened and ends again, does not run it
+again. The list of tasks already run is in memory, so it is lost when the head
+restarts. A failure never changes the task: an exit status other than 0, a
+timeout, or a command that could not start is logged and sent as a
+`connector.finish_failed` event (`detail.connector` and `detail.reason`), and
+not retried.
 
 ## The bridge
 

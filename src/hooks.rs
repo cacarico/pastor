@@ -5,18 +5,27 @@
 //! connector never races itself. A failed or timed-out hook is logged and never
 //! retried. Hooks get each record from the events log task once it is in the
 //! log, with the same sequence number; they never write the events log.
+//!
+//! A connector's `[finish]` command rides the same queue: the first time a
+//! task of one of its jobs is seen `done` or `failed`, it runs once with a
+//! JSON object about the task on stdin (`finish_input`). It never changes the
+//! task; a failure or timeout is logged and announced as
+//! `connector.finish_failed`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::config::Paths;
 use crate::connector::exec::{self, Invocation, RunLog};
-use crate::connector::manifest::Hook;
+use crate::connector::manifest::{Finish, Hook};
 use crate::connector::{Connector, Discovered, discover};
 use crate::events::EventRecord;
+use crate::machine::PastorEvent;
+use crate::store::Store;
+use crate::task::Task;
 
 /// The connector a job file names, read without validating the rest of the
 /// file: ownership only needs `connector.use`. `None` for a one-off task's
@@ -64,45 +73,47 @@ fn without_task_content(rec: &EventRecord) -> EventRecord {
     rec
 }
 
-/// Run one hook for one record. Its output (stdout and stderr, redacted)
-/// goes to a run log under `runs/@<connector id>/`, apart from the job's
-/// connector logs so hooks never prune those.
-pub async fn run_hook(paths: &Paths, connector: &Connector, hook: &Hook, rec: &EventRecord) {
-    let job = rec
-        .job
-        .clone()
-        .or_else(|| rec.task.as_ref().map(|t| t.job.clone()));
-    let job = job.filter(|j| crate::config::job::check_name(j).is_ok());
-    let owns_job = job
-        .as_deref()
-        .is_some_and(|j| job_connector(paths, j).as_deref() == Some(connector.id.as_str()));
-    let on = hook.on.join(",");
-    let prepared = connector
-        .command_env(paths, job.as_deref(), owns_job)
-        .and_then(|(env, redactor)| {
-            let log = RunLog::create(&paths.runs_dir(&format!("@{}", connector.id)), redactor)?;
-            Ok((env, log.shared()))
-        });
-    let (env, log) = match prepared {
-        Ok(p) => p,
-        Err(err) => {
-            tracing::warn!(connector = %connector.id, event = %rec.kind, hook = %on, err = %format!("{err:#}"), "hook not run");
-            return;
-        }
-    };
-    let mut stdin = if owns_job {
-        serde_json::to_vec(rec)
-    } else {
-        serde_json::to_vec(&without_task_content(rec))
+/// What one run of a connector's command left behind.
+struct Ran {
+    done: exec::Finished,
+    log: std::path::PathBuf,
+}
+
+/// What one connector command runs and hears.
+struct Spec<'a> {
+    argv: &'a [String],
+    timeout: std::time::Duration,
+    stdin: Vec<u8>,
+    /// A first line for the run log; none when empty.
+    heading: String,
+}
+
+/// Run `spec` as `connector`: in its directory, with its env (the job's
+/// scratch dir when `owns_job`, else its own `@<id>` one). Its
+/// output (stdout and stderr, redacted) goes to a run log under
+/// `runs/@<connector id>/`, apart from the job's connector logs so these runs
+/// never prune those. `Err` when the env or the log could not be made and
+/// nothing ran.
+async fn run_command(
+    paths: &Paths,
+    connector: &Connector,
+    job: Option<&str>,
+    owns_job: bool,
+    spec: Spec<'_>,
+) -> anyhow::Result<Ran> {
+    let (env, redactor) = connector.command_env(paths, job, owns_job)?;
+    let log = RunLog::create(&paths.runs_dir(&format!("@{}", connector.id)), redactor)?.shared();
+    if !spec.heading.is_empty() {
+        log.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .line(&spec.heading);
     }
-    .expect("an EventRecord serializes");
-    stdin.push(b'\n');
     let inv = Invocation {
-        argv: hook.command.clone(),
+        argv: spec.argv.to_vec(),
         cwd: connector.dir.clone(),
         env,
-        stdin,
-        timeout: Some(hook.timeout),
+        stdin: spec.stdin,
+        timeout: Some(spec.timeout),
     };
     let out_log = log.clone();
     let done = exec::run(inv, log.clone(), |line| {
@@ -117,21 +128,154 @@ pub async fn run_hook(paths: &Paths, connector: &Connector, hook: &Hook, rec: &E
         .unwrap_or_else(|p| p.into_inner())
         .path()
         .to_path_buf();
-    if done.exit.success() {
+    Ok(Ran { done, log: path })
+}
+
+/// Run one hook for one record.
+pub async fn run_hook(paths: &Paths, connector: &Connector, hook: &Hook, rec: &EventRecord) {
+    let job = rec
+        .job
+        .clone()
+        .or_else(|| rec.task.as_ref().map(|t| t.job.clone()));
+    let job = job.filter(|j| crate::config::job::check_name(j).is_ok());
+    let owns_job = job
+        .as_deref()
+        .is_some_and(|j| job_connector(paths, j).as_deref() == Some(connector.id.as_str()));
+    let on = hook.on.join(",");
+    let mut stdin = if owns_job {
+        serde_json::to_vec(rec)
+    } else {
+        serde_json::to_vec(&without_task_content(rec))
+    }
+    .expect("an EventRecord serializes");
+    stdin.push(b'\n');
+    let ran = run_command(
+        paths,
+        connector,
+        job.as_deref(),
+        owns_job,
+        Spec {
+            argv: &hook.command,
+            timeout: hook.timeout,
+            stdin,
+            heading: String::new(),
+        },
+    )
+    .await;
+    let ran = match ran {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(connector = %connector.id, event = %rec.kind, hook = %on, err = %format!("{err:#}"), "hook not run");
+            return;
+        }
+    };
+    if ran.done.exit.success() {
         tracing::debug!(connector = %connector.id, event = %rec.kind, hook = %on, "hook ran");
     } else {
         // `reason` carries the stderr tail, already redacted by the run log.
         tracing::warn!(
             connector = %connector.id, event = %rec.kind, hook = %on,
-            reason = %done.reason(), log = %path.display(),
+            reason = %ran.done.reason(), log = %ran.log.display(),
             "hook failed; not retried"
         );
+    }
+}
+
+/// A task's end, as its connector's finish command hears it on stdin: the
+/// task row (its `item` too), `state` (`done` or `failed`), the job, the
+/// branch its agent worked on (`null` when it had none), and `last_output`,
+/// the last lines pastor read from the agent's pane, empty when it read none.
+fn finish_input(task: &Task, state: &str, last_output: &str) -> Vec<u8> {
+    let branch = task
+        .spec
+        .checkout
+        .as_ref()
+        .map(|c| c.branch.as_str())
+        .or(task.spec.branch.as_deref());
+    let mut v = serde_json::to_vec(&serde_json::json!({
+        "task": task,
+        "state": state,
+        "job": task.job,
+        "branch": branch,
+        "last_output": last_output,
+    }))
+    .expect("a task-end object serializes");
+    v.push(b'\n');
+    v
+}
+
+/// What a finish command needs beyond its manifest entry.
+struct FinishJob {
+    finish: Finish,
+    task: Task,
+    state: &'static str,
+    last_output: String,
+}
+
+/// Run a connector's finish command for a task that ended. A failure of any
+/// kind is logged and sent on `events` as `connector.finish_failed`; the task
+/// is never touched.
+async fn run_finish(
+    paths: &Paths,
+    connector: &Connector,
+    f: &FinishJob,
+    events: Option<&broadcast::Sender<PastorEvent>>,
+) {
+    let task = &f.task;
+    let heading = format!(
+        "finish {} ({}, job {})",
+        task.display_id(),
+        f.state,
+        task.job
+    );
+    let ran = run_command(
+        paths,
+        connector,
+        Some(&task.job),
+        true,
+        Spec {
+            argv: &f.finish.command,
+            timeout: f.finish.timeout,
+            stdin: finish_input(task, f.state, &f.last_output),
+            heading,
+        },
+    )
+    .await;
+    let reason = match ran {
+        Ok(r) if r.done.exit.success() => {
+            tracing::debug!(connector = %connector.id, task = %task.display_id(), "finish ran");
+            return;
+        }
+        Ok(r) => {
+            let reason = r.done.reason();
+            tracing::warn!(
+                connector = %connector.id, task = %task.display_id(),
+                reason = %reason, log = %r.log.display(),
+                "finish failed; not retried"
+            );
+            reason
+        }
+        Err(err) => {
+            let reason = format!("not run: {err:#}");
+            tracing::warn!(connector = %connector.id, task = %task.display_id(), %reason, "finish not run");
+            reason
+        }
+    };
+    if let Some(events) = events {
+        let _ = events.send(PastorEvent {
+            kind: "connector.finish_failed".into(),
+            task_id: Some(task.id),
+            machine: None,
+            job: Some(task.job.clone()),
+            detail: Some(serde_json::json!({"connector": connector.id, "reason": reason})),
+        });
     }
 }
 
 struct Work {
     connector: Arc<Connector>,
     hooks: Vec<Hook>,
+    finish: Option<FinishJob>,
     rec: Arc<EventRecord>,
 }
 
@@ -218,6 +362,40 @@ pub struct Dispatcher {
     paths: Paths,
     queue_max: usize,
     workers: HashMap<String, (Arc<Queue>, JoinHandle<()>)>,
+    /// Where a finishing task's pane tail waits (`Store::note_pane_tail`).
+    store: Option<Arc<Store>>,
+    /// Where `connector.finish_failed` goes. Held weakly: the events log
+    /// task ends when every sender is gone, and it feeds this dispatcher.
+    events: Option<broadcast::WeakSender<PastorEvent>>,
+    /// Tasks whose finish command has been queued, so it runs once per task.
+    finished: Finished,
+}
+
+/// Task ids whose finish command was queued. Bounded like the queues: past
+/// `FINISHED_MAX` the oldest are forgotten, and a task that old ending again
+/// would be the only one to run twice.
+#[derive(Default)]
+struct Finished {
+    order: VecDeque<i64>,
+    seen: std::collections::HashSet<i64>,
+}
+
+const FINISHED_MAX: usize = 4096;
+
+impl Finished {
+    /// `true` the first time `id` is offered.
+    fn first(&mut self, id: i64) -> bool {
+        if !self.seen.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        if self.order.len() > FINISHED_MAX
+            && let Some(old) = self.order.pop_front()
+        {
+            self.seen.remove(&old);
+        }
+        true
+    }
 }
 
 impl Dispatcher {
@@ -230,7 +408,51 @@ impl Dispatcher {
             paths,
             queue_max: queue_max.max(1),
             workers: HashMap::new(),
+            store: None,
+            events: None,
+            finished: Finished::default(),
         }
+    }
+
+    /// Give finish commands the pane text the store kept for their task.
+    pub fn with_store(mut self, store: Arc<Store>) -> Dispatcher {
+        self.store = Some(store);
+        self
+    }
+
+    /// Announce a failed finish command on `events`.
+    pub fn with_events(mut self, events: broadcast::WeakSender<PastorEvent>) -> Dispatcher {
+        self.events = Some(events);
+        self
+    }
+
+    /// The finish command `connector` should run for `rec`: only for a task
+    /// that reached `done` or `failed` in a job this connector owns, and only
+    /// the first time. `closed` and every other event runs nothing.
+    fn finish_for(&mut self, connector: &Connector, rec: &EventRecord) -> Option<FinishJob> {
+        let state = match rec.kind.as_str() {
+            "task.done" => "done",
+            "task.failed" => "failed",
+            _ => return None,
+        };
+        let finish = connector.manifest.finish.as_ref()?;
+        let task = rec.task.as_ref()?;
+        if job_connector(&self.paths, &task.job).as_deref() != Some(connector.id.as_str())
+            || !self.finished.first(task.id)
+        {
+            return None;
+        }
+        let last_output = self
+            .store
+            .as_ref()
+            .and_then(|s| s.take_pane_tail(task.id))
+            .unwrap_or_default();
+        Some(FinishJob {
+            finish: finish.clone(),
+            task: task.clone(),
+            state,
+            last_output,
+        })
     }
 
     pub fn deliver(&mut self, rec: EventRecord) {
@@ -254,7 +476,8 @@ impl Dispatcher {
                 .filter(|h| wants(&self.paths, &connector, h, &rec))
                 .cloned()
                 .collect();
-            if hooks.is_empty() {
+            let finish = self.finish_for(&connector, &rec);
+            if hooks.is_empty() && finish.is_none() {
                 continue;
             }
             let (queue, worker) = self.workers.entry(connector.id.clone()).or_insert_with(|| {
@@ -264,17 +487,18 @@ impl Dispatcher {
                     state: Mutex::default(),
                     ready: Notify::new(),
                 });
-                let w = spawn_worker(self.paths.clone(), q.clone());
+                let w = spawn_worker(self.paths.clone(), q.clone(), self.events.clone());
                 (q, w)
             });
             // A worker only ends by panicking; a fresh one takes over the
             // same queue.
             if worker.is_finished() {
-                *worker = spawn_worker(self.paths.clone(), queue.clone());
+                *worker = spawn_worker(self.paths.clone(), queue.clone(), self.events.clone());
             }
             queue.push(Work {
                 connector: connector.clone(),
                 hooks,
+                finish,
                 rec: rec.clone(),
             });
         }
@@ -291,12 +515,21 @@ impl Drop for Dispatcher {
     }
 }
 
-/// One connector's worker: its hooks, one after another, in event order.
-fn spawn_worker(paths: Paths, queue: Arc<Queue>) -> JoinHandle<()> {
+/// One connector's worker: its hooks, then its finish command, one after
+/// another, in event order.
+fn spawn_worker(
+    paths: Paths,
+    queue: Arc<Queue>,
+    events: Option<broadcast::WeakSender<PastorEvent>>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(w) = queue.next().await {
             for hook in &w.hooks {
                 run_hook(&paths, &w.connector, hook, &w.rec).await;
+            }
+            if let Some(f) = &w.finish {
+                let events = events.as_ref().and_then(|e| e.upgrade());
+                run_finish(&paths, &w.connector, f, events.as_ref()).await;
             }
         }
     })
@@ -307,10 +540,17 @@ fn spawn_worker(paths: Paths, queue: Arc<Queue>) -> JoinHandle<()> {
 /// order. `rx` is bounded (`events::HOOK_QUEUE_CAPACITY`): the log task
 /// drops a record rather than block if this loop ever falls behind, which in
 /// practice it does not, since `Dispatcher::deliver` below only queues. Ends
-/// when the log task drops its sender; queued hooks still run.
-pub fn spawn(paths: Paths, mut rx: mpsc::Receiver<EventRecord>) -> JoinHandle<()> {
+/// when the log task drops its sender; queued hooks still run. `events` is
+/// where `connector.finish_failed` goes, and `store` holds the pane text a
+/// finish command gets.
+pub fn spawn(
+    paths: Paths,
+    store: Arc<Store>,
+    events: broadcast::WeakSender<PastorEvent>,
+    mut rx: mpsc::Receiver<EventRecord>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut dispatcher = Dispatcher::new(paths);
+        let mut dispatcher = Dispatcher::new(paths).with_store(store).with_events(events);
         while let Some(rec) = rx.recv().await {
             dispatcher.deliver(rec);
         }
@@ -321,16 +561,18 @@ pub fn spawn(paths: Paths, mut rx: mpsc::Receiver<EventRecord>) -> JoinHandle<()
 mod tests {
     use super::*;
     use crate::connector::manifest::MANIFEST_FILE;
+    use crate::machine::PastorEvent;
     use crate::store::Store;
     use crate::task::DispatchSpec;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+    use tokio::sync::broadcast;
 
     struct Env {
         _tmp: tempfile::TempDir,
         paths: Paths,
         out: PathBuf,
-        store: Store,
+        store: Arc<Store>,
     }
 
     fn env() -> Env {
@@ -341,7 +583,7 @@ mod tests {
         Env {
             paths,
             out,
-            store: Store::open_in_memory().unwrap(),
+            store: Arc::new(Store::open_in_memory().unwrap()),
             _tmp: tmp,
         }
     }
@@ -372,6 +614,18 @@ mod tests {
             .unwrap();
         }
 
+        /// Adds a `[finish]` table to an installed connector's manifest.
+        fn finish(&self, id: &str, timeout: &str, script: &str) {
+            let dir = self.paths.connectors_dir().join(id);
+            std::fs::write(dir.join("finish.sh"), script).unwrap();
+            let file = dir.join(MANIFEST_FILE);
+            let mut m = std::fs::read_to_string(&file).unwrap();
+            m.push_str(&format!(
+                "[finish]\ncommand = [\"sh\", \"finish.sh\"]\ntimeout = \"{timeout}\"\n"
+            ));
+            std::fs::write(file, m).unwrap();
+        }
+
         fn job(&self, name: &str, connector: &str) {
             std::fs::create_dir_all(self.paths.jobs_dir()).unwrap();
             std::fs::write(
@@ -382,12 +636,14 @@ mod tests {
         }
 
         fn task_record(&self, kind: &str, job: &str) -> EventRecord {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let t = self
                 .store
                 .insert_job_task(
                     job,
                     "default",
-                    &serde_json::json!({"key": format!("k-{kind}")}),
+                    &serde_json::json!({"key": format!("k-{kind}-{n}"), "title": "an item"}),
                     |_| Ok(("p".into(), spec())),
                 )
                 .unwrap();
@@ -679,13 +935,245 @@ mod tests {
         );
     }
 
+    const FINISH_SCRIPT: &str = "cat >> \"$OUT/finish.tmp\"; echo \"$PASTOR_CONNECTOR_ID $PASTOR_JOB $TOKEN\" >> \"$OUT/finish-env\"; echo \"said $TOKEN\"; mv \"$OUT/finish.tmp\" \"$OUT/finish\"";
+
+    fn dispatcher(
+        e: &Env,
+    ) -> (
+        Dispatcher,
+        broadcast::Sender<PastorEvent>,
+        broadcast::Receiver<PastorEvent>,
+    ) {
+        let (tx, rx) = broadcast::channel(16);
+        let d = Dispatcher::new(e.paths.clone())
+            .with_store(e.store.clone())
+            .with_events(tx.downgrade());
+        (d, tx, rx)
+    }
+
+    /// A finished task runs its connector's `[finish]` command once, with the
+    /// connector's env, and the task-end object on stdin.
+    #[tokio::test]
+    async fn a_finishing_task_runs_the_finish_command_with_the_task_end_object() {
+        let e = env();
+        e.connector("gh", true, &[]);
+        e.finish("gh", "5s", FINISH_SCRIPT);
+        e.job("support", "gh");
+        let (mut d, _tx, _rx) = dispatcher(&e);
+        let mut rec = e.task_record("task.done", "support");
+        let task = rec.task.as_mut().unwrap();
+        task.spec.checkout = Some(Box::new(crate::task::Checkout {
+            branch: "fix/it".into(),
+            path: "/w".into(),
+            already_open: false,
+        }));
+        e.store
+            .note_pane_tail(task.id, "did the thing\nPR: https://example.org/pr/1\n");
+        let id = task.id;
+        let item = task.item.clone();
+        d.deliver(rec);
+        let got: serde_json::Value = serde_json::from_str(&e.wait_for("finish").await).unwrap();
+        assert_eq!(got["state"], "done");
+        assert_eq!(got["job"], "support");
+        assert_eq!(got["task"]["id"], id);
+        assert_eq!(got["task"]["item"], item);
+        assert_eq!(got["branch"], "fix/it");
+        assert_eq!(
+            got["last_output"],
+            "did the thing\nPR: https://example.org/pr/1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(e.out.join("finish-env"))
+                .unwrap()
+                .trim(),
+            "gh support sekrit-gh-token"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let logs = std::fs::read_dir(e.paths.runs_dir("@gh")).unwrap();
+        let text: String = logs
+            .map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap())
+            .collect();
+        assert!(text.contains("stdout: said [redacted:TOKEN]"), "{text}");
+        assert!(!text.contains("sekrit"), "{text}");
+    }
+
+    /// No pane text and no branch: `last_output` is empty, `branch` null. A
+    /// failed task runs the command too.
+    #[tokio::test]
+    async fn a_failed_task_runs_it_too_with_no_output_and_no_branch() {
+        let e = env();
+        e.connector("gh", true, &[]);
+        e.finish("gh", "5s", FINISH_SCRIPT);
+        e.job("support", "gh");
+        let (mut d, _tx, _rx) = dispatcher(&e);
+        d.deliver(e.task_record("task.failed", "support"));
+        let got: serde_json::Value = serde_json::from_str(&e.wait_for("finish").await).unwrap();
+        assert_eq!(got["state"], "failed");
+        assert_eq!(got["last_output"], "");
+        assert_eq!(got["branch"], serde_json::Value::Null);
+    }
+
+    /// Once per task: the same task reaching done again, or failed after
+    /// done, or being closed, does not run it again. Another task does.
+    #[tokio::test]
+    async fn a_task_finishes_once_and_closed_runs_nothing() {
+        let e = env();
+        e.connector("gh", true, &[]);
+        e.finish("gh", "5s", "echo x >> \"$OUT/runs\"");
+        e.job("support", "gh");
+        let (mut d, _tx, _rx) = dispatcher(&e);
+        let done = e.task_record("task.done", "support");
+        let mut again = done.clone();
+        again.kind = "task.failed".into();
+        let mut closed = done.clone();
+        closed.kind = "task.closed".into();
+        d.deliver(done.clone());
+        d.deliver(closed);
+        d.deliver(done);
+        d.deliver(again);
+        e.wait_for("runs").await;
+        d.deliver(e.task_record("task.done", "support"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(e.out.join("runs"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < 2
+        {
+            assert!(Instant::now() < deadline, "the second task never ran it");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read_to_string(e.out.join("runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "one run per task"
+        );
+    }
+
+    /// Only the connector that owns the job runs its finish command; a
+    /// one-off task and another connector's job run nobody's.
+    #[tokio::test]
+    async fn only_the_owning_connector_finishes_a_task() {
+        let e = env();
+        e.connector("gh", true, &[]);
+        e.finish("gh", "5s", "echo gh >> \"$OUT/runs\"");
+        e.connector("other", true, &[]);
+        e.finish("other", "5s", "echo other >> \"$OUT/runs\"");
+        e.job("support", "other");
+        e.job("mine", "gh");
+        let (mut d, _tx, _rx) = dispatcher(&e);
+        d.deliver(e.task_record("task.done", "support"));
+        d.deliver(e.task_record("task.done", "run"));
+        d.deliver(e.task_record("task.done", "mine"));
+        e.wait_for("runs").await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let runs = std::fs::read_to_string(e.out.join("runs")).unwrap();
+        let mut runs: Vec<&str> = runs.lines().collect();
+        runs.sort();
+        assert_eq!(runs, ["gh", "other"]);
+    }
+
+    /// A timeout is logged and announced as `connector.finish_failed`, and the
+    /// connector's queue moves on; the task row is not touched.
+    #[tokio::test]
+    async fn a_finish_timeout_is_logged_and_emits_finish_failed() {
+        let e = env();
+        e.connector(
+            "gh",
+            true,
+            &[("\"task.queued\"", true, "5s", "echo hooked > \"$OUT/hook\"")],
+        );
+        e.finish("gh", "1s", "echo slow; sleep 30");
+        e.job("support", "gh");
+        let (mut d, _tx, mut rx) = dispatcher(&e);
+        let rec = e.task_record("task.done", "support");
+        let id = rec.task.as_ref().unwrap().id;
+        d.deliver(rec);
+        d.deliver(e.task_record("task.queued", "support"));
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("finish_failed within the bound")
+            .unwrap();
+        assert_eq!(ev.kind, "connector.finish_failed");
+        assert_eq!(ev.task_id, Some(id));
+        assert_eq!(ev.job.as_deref(), Some("support"));
+        let detail = ev.detail.unwrap();
+        assert_eq!(detail["connector"], "gh");
+        assert!(
+            detail["reason"].as_str().unwrap().contains("timed out"),
+            "{detail}"
+        );
+        assert_eq!(
+            e.wait_for("hook").await.trim(),
+            "hooked",
+            "the queue went on"
+        );
+        let logs = std::fs::read_dir(e.paths.runs_dir("@gh")).unwrap();
+        let text: String = logs
+            .map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap())
+            .collect();
+        assert!(text.contains("stdout: slow"), "{text}");
+        assert_eq!(
+            e.store.get_task(id).unwrap().unwrap().state,
+            crate::task::TaskState::Queued,
+            "the task is as it was"
+        );
+    }
+
+    /// A command that exits non-zero is a failure too, with its stderr in the
+    /// reason.
+    #[tokio::test]
+    async fn a_failing_finish_command_emits_finish_failed_with_its_stderr() {
+        let e = env();
+        e.connector("gh", true, &[]);
+        e.finish("gh", "5s", "echo boom >&2; exit 3");
+        e.job("support", "gh");
+        let (mut d, _tx, mut rx) = dispatcher(&e);
+        d.deliver(e.task_record("task.failed", "support"));
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.kind, "connector.finish_failed");
+        assert!(
+            ev.detail.unwrap()["reason"]
+                .as_str()
+                .unwrap()
+                .contains("boom")
+        );
+    }
+
+    /// A connector with hooks or a command but no `[finish]` behaves as it
+    /// did: its hook runs, nothing else does, and no event comes.
+    #[tokio::test]
+    async fn a_connector_without_finish_is_unchanged() {
+        let e = env();
+        e.connector(
+            "gh",
+            true,
+            &[("\"task.done\"", true, "5s", "echo hooked > \"$OUT/hook\"")],
+        );
+        e.job("support", "gh");
+        let (mut d, _tx, mut rx) = dispatcher(&e);
+        d.deliver(e.task_record("task.done", "support"));
+        assert_eq!(e.wait_for("hook").await.trim(), "hooked");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            std::fs::read_dir(&e.out).unwrap().count(),
+            1,
+            "only the hook wrote"
+        );
+    }
+
     /// Hooks get the record the events log task built and wrote: the same
     /// sequence number as the log line.
     #[tokio::test]
     async fn spawn_runs_hooks_on_the_logged_record() {
-        use crate::machine::PastorEvent;
-        use tokio::sync::broadcast;
-
         let e = env();
         e.connector(
             "a",
@@ -710,12 +1198,12 @@ mod tests {
         let log = crate::events::spawn_log(
             log_path.clone(),
             crate::events::DEFAULT_MAX_BYTES,
-            store,
+            store.clone(),
             None,
             rx,
             Some(fwd),
         );
-        let h = spawn(e.paths.clone(), hooks_rx);
+        let h = spawn(e.paths.clone(), store.clone(), tx.downgrade(), hooks_rx);
         for kind in ["task.queued", "task.done"] {
             tx.send(PastorEvent {
                 detail: None,

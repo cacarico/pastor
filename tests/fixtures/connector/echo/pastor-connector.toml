@@ -27,3 +27,8 @@ description = "Printed to stderr so redaction can be checked"
 on = ["task.queued", "task.done"]
 only_own = true
 command = ["sh", "hook.sh"]
+
+# Runs once when a task of one of its jobs is done or failed.
+[finish]
+command = ["sh", "finish.sh"]
+timeout = "10s"

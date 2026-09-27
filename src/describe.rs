@@ -94,6 +94,8 @@ pub struct ConnectorDescription {
     pub origin: Origin,
     pub connector: Option<ConnectorCommand>,
     pub hooks: Vec<ConnectorHook>,
+    /// Run when a task of one of its jobs is done or failed.
+    pub finish: Option<ConnectorFinish>,
     pub env_file: String,
     /// Declared secrets and whether the `.env` sets them; never their values.
     pub secrets: Vec<ConnectorSecret>,
@@ -121,6 +123,12 @@ pub struct ConfigKey {
 pub struct ConnectorHook {
     pub on: Vec<String>,
     pub only_own: bool,
+    pub command: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorFinish {
     pub command: Vec<String>,
     pub timeout_secs: u64,
 }
@@ -440,6 +448,12 @@ pub fn connector_text(c: &ConnectorDescription) -> String {
         })
         .collect();
     section(&mut out, "hooks", hooks);
+    let finish = c
+        .finish
+        .iter()
+        .map(|f| format!("{} [timeout {}s]", argv(&f.command), f.timeout_secs))
+        .collect();
+    section(&mut out, "finish", finish);
     let secrets = c
         .secrets
         .iter()

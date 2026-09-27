@@ -982,7 +982,7 @@ impl Daemon {
             log_rx,
             Some(to_hooks),
         );
-        crate::hooks::spawn(paths.clone(), hooks_rx);
+        crate::hooks::spawn(paths.clone(), store.clone(), events.downgrade(), hooks_rx);
         let scheduler = Scheduler::new(
             paths.clone(),
             &config,
