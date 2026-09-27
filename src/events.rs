@@ -31,6 +31,15 @@ use crate::task::{Task, parse_task_id};
 /// generation is kept, so the log never takes more than twice this.
 pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Capacity of the bounded channel `spawn_log` feeds to `hooks::spawn`.
+/// `hooks::spawn`'s loop only queues onto `Dispatcher::deliver`, which is
+/// synchronous and itself bounds each connector's queue, so in practice this
+/// drains instantly; it exists for the same reason the old `broadcast::
+/// channel(1024)` hooks read from did, as a backstop against a stuck
+/// connector. `spawn_log` uses `try_send` and drops a record for hooks (never
+/// for `events.jsonl`) rather than block or grow without bound.
+pub const HOOK_QUEUE_CAPACITY: usize = 1024;
+
 /// How often `--follow` looks for new lines.
 const FOLLOW_POLL: Duration = Duration::from_millis(250);
 
@@ -209,6 +218,12 @@ impl LogWriter {
 /// sequence number. A write that fails is logged and the record still goes
 /// on; the task ends when the broadcast channel closes.
 ///
+/// `forward` is bounded (`HOOK_QUEUE_CAPACITY`): a `try_send` that finds it
+/// full drops that record for hooks, with a warning, rather than block this
+/// task or grow the queue without bound; the record is still in
+/// `events.jsonl`. Once `try_send` reports the receiver closed, `forward` is
+/// cleared so later records stop paying for the check.
+///
 /// The fleet is held weakly: it owns the machine actors' command senders, the
 /// actors own event senders, and this task only ends when every event sender
 /// is gone. A strong reference would keep all of them alive after the daemon
@@ -220,7 +235,7 @@ pub fn spawn_log(
     store: Arc<Store>,
     fleet: Option<Weak<dyn MachineLookup>>,
     mut rx: broadcast::Receiver<PastorEvent>,
-    forward: Option<mpsc::UnboundedSender<EventRecord>>,
+    mut forward: Option<mpsc::Sender<EventRecord>>,
 ) -> JoinHandle<()> {
     let writer = LogWriter::new(path, max_bytes);
     tokio::spawn(async move {
@@ -234,8 +249,20 @@ pub fn spawn_log(
                         tracing::error!(%err, "events log: write failed");
                     }
                     if let Some(tx) = &forward {
-                        // The hook runner gone is not the log's problem.
-                        let _ = tx.send(rec);
+                        match tx.try_send(rec) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(rec)) => {
+                                tracing::warn!(
+                                    seq = rec.seq,
+                                    kind = %rec.kind,
+                                    "events log: hooks queue full; dropping record for hooks"
+                                );
+                            }
+                            // The hook runner gone is not the log's problem.
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                forward = None;
+                            }
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -894,6 +921,37 @@ mod tests {
             ChannelState::Connected
         );
         drop(fleet);
+    }
+
+    /// A hooks queue that never drains (no `hooks::spawn` reading it, as when
+    /// a connector hook is stuck) must not block the log task or panic it:
+    /// `try_send` drops the record for hooks and the write to `events.jsonl`
+    /// still goes through.
+    #[tokio::test]
+    async fn a_full_hooks_queue_is_dropped_without_blocking_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (store, t) = store_with_task("triage");
+        let store = Arc::new(store);
+        let (tx, rx) = broadcast::channel(16);
+        let (fwd, mut hooks_rx) = mpsc::channel(1);
+        // Fill the one slot up front, so the log task's own send finds it full.
+        fwd.try_send(record("task.queued", Some(&t))).unwrap();
+        let log = spawn_log(path.clone(), DEFAULT_MAX_BYTES, store, None, rx, Some(fwd));
+        tx.send(ev("task.done", Some(t.id), None, None)).unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), log)
+            .await
+            .unwrap()
+            .unwrap();
+        // The write to events.jsonl happened regardless of the full queue.
+        let recs = read(&path, None).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].kind, "task.done");
+        // Only the pre-filled record made it to the hooks side; the log
+        // task's own record was dropped for hooks, not queued or blocked on.
+        assert_eq!(hooks_rx.try_recv().unwrap().kind, "task.queued");
+        assert!(hooks_rx.try_recv().is_err());
     }
 
     /// The log task must not keep the fleet alive: the fleet holds the machine

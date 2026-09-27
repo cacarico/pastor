@@ -304,8 +304,11 @@ fn spawn_worker(paths: Paths, queue: Arc<Queue>) -> JoinHandle<()> {
 
 /// The daemon's hook runner: every record the events log task built
 /// (`events::spawn_log`), numbered and already in the log, delivered in
-/// order. Ends when the log task drops its sender; queued hooks still run.
-pub fn spawn(paths: Paths, mut rx: mpsc::UnboundedReceiver<EventRecord>) -> JoinHandle<()> {
+/// order. `rx` is bounded (`events::HOOK_QUEUE_CAPACITY`): the log task
+/// drops a record rather than block if this loop ever falls behind, which in
+/// practice it does not, since `Dispatcher::deliver` below only queues. Ends
+/// when the log task drops its sender; queued hooks still run.
+pub fn spawn(paths: Paths, mut rx: mpsc::Receiver<EventRecord>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut dispatcher = Dispatcher::new(paths);
         while let Some(rec) = rx.recv().await {
@@ -701,7 +704,7 @@ mod tests {
             })
             .unwrap();
         let (tx, rx) = broadcast::channel(8);
-        let (fwd, hooks_rx) = mpsc::unbounded_channel();
+        let (fwd, hooks_rx) = mpsc::channel(crate::events::HOOK_QUEUE_CAPACITY);
         let log_path = e.paths.events_file();
         std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
         let log = crate::events::spawn_log(

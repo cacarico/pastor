@@ -973,7 +973,7 @@ impl Daemon {
         // Connector event hooks get each record from the log task once it is
         // written, so they see the same sequence number.
         let lookup: Arc<dyn crate::events::MachineLookup> = fleet.clone();
-        let (to_hooks, hooks_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (to_hooks, hooks_rx) = tokio::sync::mpsc::channel(crate::events::HOOK_QUEUE_CAPACITY);
         crate::events::spawn_log(
             paths.events_file(),
             crate::events::DEFAULT_MAX_BYTES,
