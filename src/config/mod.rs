@@ -71,6 +71,12 @@ impl Paths {
     pub fn db_file(&self) -> PathBuf {
         self.state_dir.join("pastor.db")
     }
+    /// A headless serve's own database: its jobs' state and seen keys, and
+    /// how far it has read the head's events. Never `db_file`, which is a
+    /// head's task store.
+    pub fn shepherd_db_file(&self) -> PathBuf {
+        self.state_dir.join("shepherd.db")
+    }
     pub fn socket_file(&self) -> PathBuf {
         self.state_dir.join("pastor.sock")
     }

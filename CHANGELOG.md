@@ -50,8 +50,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `head_unreachable`, `no_head` or `head_too_old` unless `--force`. With a
   remote head, `task` commands (but `attach`), `machine list`, `tick` and
   `job list|run|reload` go to it; other commands that would act on local
-  files fail with `remote_head_unsupported`, and `pastor serve` refuses to
-  start.
+  files fail with `remote_head_unsupported`.
 - `pastor bridge --agent --machine <name>` is a bridge locked to one
   machine's agents: it passes on `ping`, a task list cut to the machine's
   flock, and `describe`, `read` and `done` for a task placed on that
@@ -67,6 +66,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with `PASTOR_HEAD=<head_address>` in their pane, which `pastor head`
   above already routes their CLI commands through. Agents on the head's
   machine get none.
+- With a head set, `pastor serve` runs headless instead of refusing: it runs
+  this machine's jobs and connector hooks and nothing else. Each item a job
+  finds goes to the head as a new `JobTask` request (IPC protocol 9), which
+  renders, queues and dispatches it as that job's task; the head's events
+  come back each tick for the hooks here. It keeps job state, seen keys and
+  its event cursor in `shepherd.db`, and answers `ping` (role `shepherd`),
+  `tick` and `job list|run|reload` on the local socket, `shepherd_unsupported`
+  to the rest. An unreachable head is a `shepherd_needs_head` warning in its
+  log, asked again each tick. It refuses to start beside a head
+  (`head_running`), and a head refuses to start beside it
+  (`shepherd_running`). `pastor setup systemd` installs it the same way.
 
 ### Changed
 

@@ -18,6 +18,7 @@ pub mod reopen;
 pub mod schedule;
 pub mod scheduler;
 pub mod setup;
+pub mod shepherd;
 pub mod store;
 pub mod task;
 pub mod task_cli;

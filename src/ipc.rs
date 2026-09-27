@@ -17,9 +17,9 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// lists. 3: `TaskRetry::place`. 4: `EventsSince`. 5: flock and machine
 /// edits (`FLEET_EDIT_PROTOCOL`). 6: `FileGet`, `FilePut`, `JobDescribe`,
 /// `JobSetEnabled`. 7: `JobSubmit`. 8: named models (`AgentChoice::model`).
-/// 9: `TrustList`, `TrustAdd`, `TrustRemove`, `FlockDescribe` and
-/// `MachineDescribe`.
-pub const IPC_PROTOCOL: u32 = 9;
+/// 9: `JobTask`, and `Pong::role`. 10: `TrustList`, `TrustAdd`,
+/// `TrustRemove`, `FlockDescribe` and `MachineDescribe`.
+pub const IPC_PROTOCOL: u32 = 10;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -59,11 +59,19 @@ pub const FLEET_EDIT_PROTOCOL: u32 = 5;
 /// The first protocol whose head takes `FileGet`, `FilePut`, `JobDescribe`
 /// and `JobSetEnabled`. An older one refuses them as unknown requests.
 pub const FILE_PROTOCOL: u32 = 6;
+/// The first protocol whose head takes `JobTask`, what a headless serve
+/// sends for each item its jobs find. An older one refuses it as unknown.
+pub const SHEPHERD_PROTOCOL: u32 = 9;
+
+/// `Pong::role` of a headless `pastor serve`: it runs this machine's jobs
+/// and hooks against a head elsewhere, and is not a head itself.
+pub const SHEPHERD_ROLE: &str = "shepherd";
+
 /// The first protocol whose head answers `TrustList`, `TrustAdd`,
 /// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. An older one reads
 /// them as an unknown request and answers `invalid_request`, so the CLI
 /// refuses it with `head_too_old` first.
-pub const HEAD_READS_PROTOCOL: u32 = 9;
+pub const HEAD_READS_PROTOCOL: u32 = 10;
 
 /// The first protocol whose head knows `JobSubmit`. An older one refuses the
 /// request as unreadable; `check_protocol` says why before it is sent.
@@ -241,6 +249,20 @@ pub enum IpcRequest {
         prompt: String,
         items: Vec<serde_json::Value>,
     },
+    /// One item a headless serve's job found, queued as that job's task on
+    /// the head. `prompt` and `spec` are the job's unrendered templates: the
+    /// head renders them with the id it gives the task, and resolves the
+    /// agent from `agent` and `flock` as it would for its own job. Answers
+    /// `Task`.
+    JobTask {
+        job: String,
+        #[serde(default)]
+        flock: Option<String>,
+        agent: AgentChoice,
+        prompt: String,
+        spec: DispatchSpec,
+        item: serde_json::Value,
+    },
     /// Every saved folder trust. Answers `Trusted`.
     TrustList,
     /// Save `repo` on `machine` as trusted. Answers `Text`.
@@ -301,6 +323,7 @@ impl IpcRequest {
             | IpcRequest::FilePut { .. }
             | IpcRequest::JobSetEnabled { .. }
             | IpcRequest::JobSubmit { .. }
+            | IpcRequest::JobTask { .. }
             | IpcRequest::TrustAdd { .. }
             | IpcRequest::TrustRemove { .. } => true,
         }
@@ -375,6 +398,9 @@ pub enum IpcResponse {
         /// `IPC_PROTOCOL` of the head; missing from a head older than it.
         #[serde(default)]
         protocol: u32,
+        /// `SHEPHERD_ROLE` from a headless serve; absent from a head.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
     },
     Task(Task),
     Tasks(Vec<Task>),
@@ -616,7 +642,11 @@ pub fn connect_error_means_no_daemon(err: &std::io::Error) -> bool {
 pub enum HeadPing {
     NotRunning,
     Unresponsive,
-    Pong { version: String, protocol: u32 },
+    Pong {
+        version: String,
+        protocol: u32,
+        role: Option<String>,
+    },
 }
 
 pub async fn ping_head(socket: &Path) -> HeadPing {
@@ -626,7 +656,15 @@ pub async fn ping_head(socket: &Path) -> HeadPing {
         Err(_) => return HeadPing::Unresponsive,
     };
     match tokio::time::timeout(PING_TIMEOUT, round_trip(stream, &IpcRequest::Ping)).await {
-        Ok(Ok(IpcResponse::Pong { version, protocol })) => HeadPing::Pong { version, protocol },
+        Ok(Ok(IpcResponse::Pong {
+            version,
+            protocol,
+            role,
+        })) => HeadPing::Pong {
+            version,
+            protocol,
+            role,
+        },
         _ => HeadPing::Unresponsive,
     }
 }
@@ -764,6 +802,7 @@ mod tests {
             IpcResponse::Pong {
                 version: "1".into(),
                 protocol: IPC_PROTOCOL,
+                role: Some(SHEPHERD_ROLE.into()),
             },
             IpcResponse::Task(minimal_task()),
             IpcResponse::Tasks(vec![minimal_task()]),
