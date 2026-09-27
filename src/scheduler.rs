@@ -389,6 +389,11 @@ pub async fn run_job(
                 });
                 report.created.push(t.display_id());
             }
+            // Queued by another request first, or, for a headless serve,
+            // by the head on a try whose reply was lost.
+            Err(_) if store.is_seen(&job.name, &item.key).unwrap_or(false) => {
+                report.skipped_seen += 1;
+            }
             Err(e) => {
                 tracing::error!(job = %job.name, key = %item.key, %e, "create task");
                 problems.push(format!("{}: {e:#}", item.key));
@@ -1903,6 +1908,34 @@ mod tests {
         let report = run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
         assert_eq!(report.created, vec!["t-3"]);
         assert_eq!(got.lock().unwrap().len(), 4);
+    }
+
+    /// A head that answers `already_seen` queued the key on a try whose
+    /// reply was lost: the key is seen here and the cursor moves on.
+    #[tokio::test]
+    async fn a_headless_run_counts_a_key_the_head_already_queued_as_seen() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let forward: crate::daemon::JobTaskForward = Arc::new(|_| {
+            Box::pin(async {
+                Err(crate::cli::CliError::err(
+                    crate::ipc::ALREADY_SEEN,
+                    "its task is gone",
+                ))
+            })
+        });
+        let fleet = Fleet::headless(store.clone(), forward);
+        let src = Scripted::with_keys(&["k1"]);
+        *src.cursor.lock().unwrap() = Some("c1".into());
+        let (tx, _rx) = events();
+        let report = run_job(&fleet, &job("j"), &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
+        assert_eq!(report.skipped_seen, 1);
+        assert!(report.created.is_empty() && report.error.is_none());
+        assert_eq!(store.seen_task("j", "k1").unwrap(), Some(None));
+        assert_eq!(
+            store.job_state("j").unwrap().unwrap().cursor.as_deref(),
+            Some("c1")
+        );
     }
 
     #[tokio::test]

@@ -1346,7 +1346,7 @@ way pastor reaches a machine: ssh, never a network port.
 ```bash
 pastor head set user@pi-1                                # checks the head, then saves it
 pastor head set user@pi-1 --pastor '~/.local/bin/pastor' # pastor is not on its PATH over ssh
-pastor head set user@pi-1 --force                        # save it even if it does not answer
+pastor head set user@pi-1 --force                        # save it even if it does not answer or is too old
 pastor head show [--json]                                # head: user@pi-1 (remote), or head: this machine
 pastor head unset                                        # back to this machine's head
 ```
@@ -1413,6 +1413,10 @@ store, and never reads `flock.toml`.
   the flock, resolves the agent as for its own jobs and queues and dispatches
   the task under the job's name. A head that refuses the item, or does not
   answer, fails the run and holds the job's cursor, as a failed insert does.
+- A key the head has queued for that job before is answered with that task
+  again, so a run whose reply was lost marks the key seen on the next try.
+  Once the head has pruned the task the answer is `already_seen`, and the
+  key is marked seen all the same.
 - Every tick it reads the head's events past its cursor (`EventsSince`) and
   hands them to this machine's hooks in order. The first time it reaches the
   head it skips the head's history and starts from there.
@@ -1430,7 +1434,8 @@ store, and never reads `flock.toml`.
   (`head_running`), and a head, or a second headless serve, refuses to start
   while it holds it (`shepherd_running`). A CLI with no head set that finds
   a shepherd on the socket, and `head set` pointed at a machine running one,
-  fail with `shepherd_running` too.
+  fail with `shepherd_running` too; `--force` does not save a shepherd as
+  the head.
 
 `pastor setup systemd` (or `launchd`) installs it the same way: the unit
 runs `pastor serve`, which reads the head from `client.toml`. The head

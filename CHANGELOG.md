@@ -69,14 +69,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - With a head set, `pastor serve` runs headless instead of refusing: it runs
   this machine's jobs and connector hooks and nothing else. Each item a job
   finds goes to the head as a new `JobTask` request (IPC protocol 9), which
-  renders, queues and dispatches it as that job's task; the head's events
+  renders, queues and dispatches it as that job's task, and answers a key
+  it queued before with that task again (`already_seen` once it is
+  pruned), so a lost reply does not hold the job's cursor; the head's events
   come back each tick for the hooks here. It keeps job state, seen keys and
   its event cursor in `shepherd.db`, and answers `ping` (role `shepherd`),
   `tick` and `job list|run|reload` on the local socket, `shepherd_unsupported`
   to the rest. An unreachable head is a `shepherd_needs_head` warning in its
   log, asked again each tick. It refuses to start beside a head
   (`head_running`), and a head refuses to start beside it
-  (`shepherd_running`). `pastor setup systemd` installs it the same way.
+  (`shepherd_running`), as does `head set` pointed at it, even with
+  `--force`. `pastor setup systemd` installs it the same way.
 
 ### Changed
 

@@ -339,7 +339,9 @@ pub async fn run(paths: &Paths, cmd: HeadCmd, active: Option<&RemoteHead>) -> an
                     save(&file, Some(&setting))?;
                     println!("head: {} (remote, pastor {version})", setting.ssh);
                 }
-                Err(err) if force => {
+                // --force is for a head that is down or old, never for a
+                // machine that answered as a headless serve.
+                Err(err) if force && !is_shepherd(&err) => {
                     save(&file, Some(&setting))?;
                     let why = err
                         .downcast_ref::<CliError>()
@@ -380,6 +382,11 @@ pub async fn run(paths: &Paths, cmd: HeadCmd, active: Option<&RemoteHead>) -> an
         }
     }
     Ok(())
+}
+
+fn is_shepherd(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CliError>()
+        .is_some_and(|e| e.code == "shepherd_running")
 }
 
 /// One ping through the bridge: the head's version, or why not.

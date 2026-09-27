@@ -4275,13 +4275,19 @@ struct Client {
 }
 
 fn client(head: Option<&Env>) -> Client {
+    client_to(head.map(|e| (e.config.as_path(), e.state.as_path())))
+}
+
+/// `client`, whose `head-up` is the machine with these config and state
+/// dirs.
+fn client_to(head: Option<(&std::path::Path, &std::path::Path)>) -> Client {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let empty = tmp.path().join("empty");
     let (up_config, up_state) = match head {
-        Some(e) => (e.config.clone(), e.state.clone()),
+        Some((config, state)) => (config.to_path_buf(), state.to_path_buf()),
         None => (empty.clone(), empty.clone()),
     };
     let script = format!(
@@ -4756,6 +4762,19 @@ fn a_headless_serve_runs_its_jobs_through_the_head() {
     assert_eq!(run["data"]["code"], "job_not_found", "{run}");
     let list = c.local(r#"{"op":"list","filter":{}}"#);
     assert_eq!(list["data"]["code"], "shepherd_unsupported", "{list}");
+
+    // `head set` at this machine is refused, --force or not: it answers,
+    // and is not a head.
+    let other = client_to(Some((&c.config, &c.state)));
+    assert_eq!(
+        error_code(&other.head_set("head-up", &[])),
+        "shepherd_running"
+    );
+    assert_eq!(
+        error_code(&other.head_set("head-up", &["--force"])),
+        "shepherd_running"
+    );
+    assert!(!other.config.join("client.toml").exists());
 
     // A second serve, headless or head, refuses the socket.
     assert_eq!(error_code(&c.cmd(&["serve"])), "shepherd_running");

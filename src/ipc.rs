@@ -67,6 +67,11 @@ pub const SHEPHERD_PROTOCOL: u32 = 9;
 /// and hooks against a head elsewhere, and is not a head itself.
 pub const SHEPHERD_ROLE: &str = "shepherd";
 
+/// The error code a head answers a `JobTask` with when it queued that
+/// job's key before and the task row is gone; a live row is answered
+/// again instead.
+pub const ALREADY_SEEN: &str = "already_seen";
+
 /// The first protocol whose head answers `TrustList`, `TrustAdd`,
 /// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. An older one reads
 /// them as an unknown request and answers `invalid_request`, so the CLI

@@ -837,8 +837,22 @@ impl Fleet {
             spec: job.spec.clone(),
             item: item.clone(),
         })
-        .await?;
-        self.store.mark_seen(&job.name, &key, task.id)?;
+        .await;
+        // The head answers a key it has seen with the task it queued then,
+        // or `already_seen` once that row is pruned: either way the key is
+        // done, and the run counts it seen rather than hold its cursor.
+        let task = match task {
+            Err(err)
+                if err
+                    .downcast_ref::<crate::cli::CliError>()
+                    .is_some_and(|e| e.code == crate::ipc::ALREADY_SEEN) =>
+            {
+                self.store.mark_seen(&job.name, &key, None)?;
+                return Err(err);
+            }
+            other => other?,
+        };
+        self.store.mark_seen(&job.name, &key, Some(task.id))?;
         Ok(task)
     }
 
@@ -2016,6 +2030,13 @@ impl Daemon {
         if let Err(why) = crate::scheduler::check_item_paths(&job, &item) {
             return IpcResponse::error("item_rejected", why);
         }
+        let key = item
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if let Some(resp) = self.seen_job_task(&job.name, key) {
+            return resp;
+        }
         // As for `Run`: the agent resolves against the config as it reads now.
         if let Err(err) = self.scheduler.sync_config().await {
             tracing::warn!(%err, "config not re-read before a job task");
@@ -2028,7 +2049,12 @@ impl Daemon {
             .await
         {
             Ok(t) => t,
-            Err(err) => return IpcResponse::error("job_task_refused", format!("{err:#}")),
+            // Another request queued the key first.
+            Err(err) => {
+                return self
+                    .seen_job_task(&job.name, key)
+                    .unwrap_or_else(|| IpcResponse::error("job_task_refused", format!("{err:#}")));
+            }
         };
         tracing::info!(job = %job.name, task = %task.display_id(), "task queued for a headless serve");
         let _ = self.events.send(PastorEvent {
@@ -2044,6 +2070,30 @@ impl Daemon {
             Ok(None) => IpcResponse::error("task_not_found", task.id),
             Err(err) => IpcResponse::error("store_error", err),
         }
+    }
+
+    /// The answer to a `JobTask` whose key this head has seen: the task it
+    /// queued then, so a serve that lost the first reply can mark the key
+    /// seen and move its cursor. `already_seen` when that row is gone.
+    /// `None` for an unseen key.
+    fn seen_job_task(&self, job: &str, key: &str) -> Option<IpcResponse> {
+        let id = match self.store.seen_task(job, key) {
+            Ok(Some(id)) => id,
+            Ok(None) => return None,
+            Err(err) => return Some(IpcResponse::error("store_error", err)),
+        };
+        let gone = || {
+            IpcResponse::error(
+                crate::ipc::ALREADY_SEEN,
+                format!("job {job} queued item {key} already, and its task is gone"),
+            )
+        };
+        let Some(id) = id else { return Some(gone()) };
+        Some(match self.store.get_task(id) {
+            Ok(Some(t)) => IpcResponse::Task(t),
+            Ok(None) => gone(),
+            Err(err) => IpcResponse::error("store_error", err),
+        })
     }
 
     async fn retry(&self, id: i64, place: Option<crate::task::Place>) -> IpcResponse {
@@ -4771,8 +4821,8 @@ mod tests {
 
     /// `JobTask`, from a headless serve: rendered with this head's id,
     /// queued as that job's task and dispatched, its key seen here too; an
-    /// item seen already, or one that would climb out of its branch, is
-    /// refused.
+    /// item seen already answers its task again, or `already_seen` once
+    /// that is gone; one that would climb out of its branch is refused.
     #[tokio::test]
     async fn a_job_task_is_rendered_queued_and_dispatched_here() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
@@ -4795,9 +4845,19 @@ mod tests {
         assert_eq!(t.prompt, format!("sweep k1 for sweep as t-{}", t.id));
         assert_eq!(t.state, TaskState::Running);
         assert!(d.store().is_seen("sweep", "k1").unwrap());
+        // A resubmitted key, as after a lost reply, gets the same task back.
+        let IpcResponse::Task(again) = d.handle(req("k1", None)).await else {
+            panic!()
+        };
+        assert_eq!(again.id, t.id);
         assert_eq!(
-            error_code(d.handle(req("k1", None)).await),
-            "job_task_refused"
+            d.store().list_tasks(&TaskFilter::default()).unwrap().len(),
+            1
+        );
+        d.store().mark_seen("sweep", "gone", None).unwrap();
+        assert_eq!(
+            error_code(d.handle(req("gone", None)).await),
+            crate::ipc::ALREADY_SEEN
         );
         assert_eq!(
             error_code(d.handle(req("..", Some("b/{{ item.key }}"))).await),
