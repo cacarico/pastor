@@ -1,7 +1,8 @@
 //! The events log: every `PastorEvent` the daemon broadcasts, stamped and
 //! expanded into an `EventRecord` and appended to `events.jsonl` under the
 //! state dir. `pastor events` reads the file, not the daemon, so it works with
-//! the daemon down; `--follow` tails it.
+//! the daemon down; `--follow` tails it. With a remote head it pages through
+//! `IpcRequest::EventsSince` instead (`page_remote`).
 //!
 //! The JSON of `EventRecord` is also what connector event hooks get on stdin, so
 //! it is a connector-facing format: fields are only ever added, never renamed.
@@ -508,10 +509,65 @@ pub async fn follow(
     }
 }
 
+/// How many records `pastor events` asks a remote head for at a time.
+pub const REMOTE_PAGE: u32 = 500;
+
+/// How often `--follow` asks a remote head for new records.
+const REMOTE_POLL: Duration = Duration::from_secs(1);
+
+/// `pastor events` against a remote head: every record from the start of the
+/// head's log, a page of `limit` at a time through `fetch` (an
+/// `EventsSince` from the cursor it is given), and with `follow` a new ask
+/// every `poll` once a page comes back short, until `on` returns false.
+/// A page with `gap` set gets one line through `warn`, and the cursor moves
+/// to just before the page's oldest record, so the same loss is not reported
+/// again on the next poll.
+pub async fn page_remote<F, Fut>(
+    limit: u32,
+    follow: bool,
+    poll: Duration,
+    mut fetch: F,
+    mut on: impl FnMut(&EventRecord) -> bool,
+    mut warn: impl FnMut(&str),
+) -> anyhow::Result<()>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<EventsPage>>,
+{
+    let mut after = 0u64;
+    loop {
+        let page = fetch(after).await?;
+        if page.gap
+            && let Some(oldest) = page.oldest
+        {
+            warn(&format!(
+                "pastor: events {} to {} were rotated out of the head's log before they were read",
+                after + 1,
+                oldest - 1
+            ));
+            after = after.max(oldest - 1);
+        }
+        let full = page.events.len() >= limit as usize;
+        for r in &page.events {
+            if !on(r) {
+                return Ok(());
+            }
+            after = after.max(r.seq);
+        }
+        if full {
+            continue;
+        }
+        if !follow {
+            return Ok(());
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub struct EventsArgs {
-    /// Keep printing new events as they are written (reads the file; works
-    /// with the daemon down)
+    /// Keep printing new events as they are written (reads the file, and
+    /// works with the daemon down; with a remote head, asks it every second)
     #[arg(long)]
     pub follow: bool,
     /// Only events about this task, like t-12 or 12
@@ -539,6 +595,34 @@ pub async fn cli(paths: &Paths, args: EventsArgs) -> anyhow::Result<()> {
         // A closed stdout (`pastor events | head`) ends the command quietly.
         writeln!(std::io::stdout(), "{line}").is_ok()
     };
+    if crate::ipc::remote_head().is_some() {
+        let fetch = |after| {
+            let req = crate::ipc::IpcRequest::EventsSince {
+                after,
+                limit: REMOTE_PAGE,
+                task,
+            };
+            async move {
+                let resp = crate::ipc::request_head(paths, &req)
+                    .await
+                    .map_err(|e| crate::head::failure(&e))?;
+                match resp {
+                    crate::ipc::IpcResponse::Events(page) => Ok(page),
+                    crate::ipc::IpcResponse::Error { code, message } => {
+                        Err(crate::cli::CliError::err(&code, message))
+                    }
+                    other => Err(crate::cli::CliError::err(
+                        "internal",
+                        format!("unexpected daemon reply: {other:?}"),
+                    )),
+                }
+            }
+        };
+        return page_remote(REMOTE_PAGE, args.follow, REMOTE_POLL, fetch, print, |w| {
+            eprintln!("{w}")
+        })
+        .await;
+    }
     let path = paths.events_file();
     if args.follow {
         follow(&path, task, print).await
@@ -1225,5 +1309,96 @@ mod tests {
         // A cursor right before the oldest record lost nothing.
         let page = since(&path, oldest - 1, 100, None).unwrap();
         assert!(!page.gap);
+    }
+
+    /// A scripted head for `page_remote`: answers `EventsSince` from `log`
+    /// as `since` would, and records every cursor it was asked for.
+    struct ScriptedHead {
+        log: Vec<EventRecord>,
+        asked: Vec<u64>,
+    }
+
+    impl ScriptedHead {
+        fn page(&mut self, after: u64, limit: u32, task: Option<i64>) -> EventsPage {
+            self.asked.push(after);
+            let oldest = self.log.iter().map(|r| r.seq).filter(|&s| s > 0).min();
+            EventsPage {
+                gap: oldest.is_some_and(|o| o > after + 1),
+                oldest,
+                events: self
+                    .log
+                    .iter()
+                    .filter(|r| r.seq > after && matches(r, task))
+                    .take(limit as usize)
+                    .cloned()
+                    .collect(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn page_remote_reads_every_page_then_stops() {
+        let head = std::sync::Mutex::new(ScriptedHead {
+            log: (1..=5).map(|s| numbered(s, "job.fired", None)).collect(),
+            asked: vec![],
+        });
+        let (mut seen, mut warnings) = (vec![], vec![]);
+        page_remote(
+            2,
+            false,
+            Duration::ZERO,
+            |after| {
+                let page = head.lock().unwrap().page(after, 2, None);
+                async move { Ok(page) }
+            },
+            |r| {
+                seen.push(r.seq);
+                true
+            },
+            |w| warnings.push(w.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen, [1, 2, 3, 4, 5]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Two full pages, then a short one ends it.
+        assert_eq!(head.lock().unwrap().asked, [0, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn page_remote_follows_and_warns_once_per_gap() {
+        let head = std::sync::Mutex::new(ScriptedHead {
+            log: (4..=5).map(|s| numbered(s, "job.fired", None)).collect(),
+            asked: vec![],
+        });
+        let (mut seen, mut warnings) = (vec![], vec![]);
+        page_remote(
+            10,
+            true,
+            Duration::ZERO,
+            |after| {
+                let mut h = head.lock().unwrap();
+                let page = h.page(after, 10, None);
+                // While the follower waits, the log rotates past its cursor
+                // (5): 6 and 7 are lost, 8 and 9 are left.
+                if after == 5 && h.asked.len() == 3 {
+                    h.log = (8..=9).map(|s| numbered(s, "job.fired", None)).collect();
+                }
+                async move { Ok(page) }
+            },
+            |r| {
+                seen.push(r.seq);
+                r.seq < 9
+            },
+            |w| warnings.push(w.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen, [4, 5, 8, 9]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("1 to 3"), "{warnings:?}");
+        assert!(warnings[1].contains("6 to 7"), "{warnings:?}");
+        // The cursor moved past each gap, so no poll reported it again.
+        assert_eq!(head.lock().unwrap().asked, [0, 5, 5, 5]);
     }
 }

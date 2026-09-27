@@ -4427,6 +4427,75 @@ fn a_remote_head_answers_what_the_local_one_would() {
     assert!(!c.state.join("pastor.db").exists());
 }
 
+/// With a head set, `pastor events` pages through the head's log with
+/// `EventsSince` and prints what the head's own `pastor events` prints, with
+/// `--json` and `--task` too; `--follow` asks again every second and prints
+/// what the head logs after it started.
+#[test]
+fn events_from_a_remote_head_match_the_local_log() {
+    use std::io::BufRead;
+    let env = start();
+    let c = client(Some(&env));
+    ok(c.head_set("head-up", &[]));
+    ok(c.cmd(&["task", "run", "one", "--repo", "/tmp"]));
+    env.wait_done("t-1");
+
+    for args in [
+        &["events"][..],
+        &["events", "--json"],
+        &["events", "--task", "t-1"],
+        &["events", "--task", "t-9", "--json"],
+    ] {
+        // The head may log a machine event between the two reads; compare
+        // the lines both saw.
+        let local = ok(env.cmd(args));
+        let remote = ok(c.cmd(args));
+        assert!(!remote.is_empty() || args.contains(&"t-9"), "{args:?}");
+        assert!(
+            remote.starts_with(&local) || local.starts_with(&remote),
+            "{args:?}\nremote:\n{remote}\nlocal:\n{local}"
+        );
+    }
+    assert!(ok(c.cmd(&["events", "--task", "t-1"])).contains("task.done"));
+    assert_eq!(
+        error_code(&c.cmd(&["events", "--task", "x"])),
+        error_code(&env.cmd(&["events", "--task", "x"]))
+    );
+    assert!(!c.state.join("events.jsonl").exists());
+
+    let mut follow = pastor()
+        .args(["events", "--follow", "--task", "t-2", "--json"])
+        .env("PASTOR_CONFIG_DIR", &c.config)
+        .env("PASTOR_STATE_DIR", &c.state)
+        .env("PATH", &c.path)
+        .env_remove("PASTOR_HEAD")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(follow.stdout.take().unwrap()).lines();
+    ok(c.cmd(&["task", "run", "two", "--repo", "/tmp"]));
+    let mut kinds = vec![];
+    while !kinds.iter().any(|k| k == "task.done") {
+        let line = lines.next().expect("follow ended").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["task"]["id"], 2, "{v}");
+        kinds.push(v["type"].as_str().unwrap().to_string());
+    }
+    follow.kill().unwrap();
+    follow.wait().unwrap();
+    assert_eq!(kinds[0], "task.queued", "{kinds:?}");
+    let local: Vec<String> = ok(env.cmd(&["events", "--task", "t-2", "--json"]))
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kinds, local[..kinds.len()]);
+}
+
 /// A command not moved behind the head yet would act on this machine's
 /// files; it is refused instead, and `serve` would be a second head. The
 /// commands that are local on purpose still run.
@@ -4438,7 +4507,6 @@ fn a_remote_head_refuses_what_would_act_on_local_files() {
         &["machine", "add", "pi-1", "--local"][..],
         &["flock", "list"],
         &["job", "enable", "x"],
-        &["events"],
         &["config", "edit"],
     ] {
         let out = c.cmd(args);

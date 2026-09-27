@@ -718,6 +718,17 @@ one task's records, `--json` prints the records as stored, and `--follow`
 keeps printing as new ones are written. It reads the file, not the daemon, so
 it works with `pastor serve` down.
 
+With a remote head set (see [A head on another machine](#a-head-on-another-machine)
+below), `pastor events` asks the head instead, through `events_since`: it pages
+from the start of the head's log, 500 records at a time, and with `--follow`
+asks again every second. `--task` and `--json` work as they do here, and the
+output is the same, except that lines written before pastor numbered records
+are not shown. When records the command had not read yet were rotated out of
+the head's log (`gap: true`), it prints one line to stderr naming the missing
+numbers and carries on from the oldest record left; a first read of a log
+that has rotated says so too. It needs a head speaking protocol 4 or newer
+(`head_too_old` otherwise).
+
 A record, which is also what connector event hooks get on stdin:
 
 ```json
@@ -1386,7 +1397,7 @@ It needs:
 it never falls back to this machine's files.
 
 These commands go to a remote head: `task run|list|show|read|retry|close|prune|send|done`,
-`machine list`, `tick`, `job list|run|reload`. `machine list`'s first line
+`machine list`, `tick`, `job list|run|reload`, `events`. `machine list`'s first line
 names the head by its ssh destination and shows its herdr as `-`. `task run`
 fills what its flags leave out from the built-in defaults, not from the
 head's `[defaults]` (the head still resolves the agent with its own).

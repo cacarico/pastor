@@ -517,6 +517,9 @@ fn main() {
         // remote head, commands that stay here on purpose do not ask it.
         let head_use = match remote_route(&command) {
             RemoteRoute::Here if remote.is_some() => None,
+            // Here `events` reads the log file, head or no head; a remote
+            // head is asked for it, so it must be up and new enough.
+            _ if remote.is_some() && matches!(command, Command::Events(_)) => Some(false),
             _ => head_use(&command),
         };
         let head = match head_use {
@@ -829,6 +832,7 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Machine {
             cmd: MachineCmd::List { .. },
         }
+        | Command::Events(_)
         | Command::Tick(_)
         | Command::Job {
             cmd: JobCmd::List { .. } | JobCmd::Run { .. } | JobCmd::Reload,
@@ -1017,6 +1021,11 @@ fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
         Some((
             pastor::ipc::HEAD_READS_PROTOCOL,
             "predates this request through the head",
+        ))
+    } else if matches!(command, Command::Events(_)) {
+        Some((
+            pastor::ipc::EVENTS_PROTOCOL,
+            "predates reading the events log through the head",
         ))
     } else {
         None
