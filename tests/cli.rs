@@ -3944,3 +3944,165 @@ fn bridge_relays_invalid_utf8_bytes_to_the_head() {
     assert_eq!(v["kind"], "error", "{stdout}");
     assert_eq!(v["data"]["code"], "invalid_request", "{stdout}");
 }
+
+/// A second config dir that shares `env`'s state dir, so its socket reaches
+/// `env`'s head: a CLI on another machine, with its own (stale) copy of
+/// the nightly job. Anything it edits through the head lands in `env`'s
+/// config, never in its own.
+fn laptop(env: &Env) -> Offline {
+    let mut o = offline();
+    o.state = env.state.clone();
+    o
+}
+
+#[test]
+fn edit_with_a_head_changes_the_head_s_files() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let l = laptop(&env);
+    let head_job = env.config.join("jobs/nightly.toml");
+
+    let edited = format!("enabled = false\n{NIGHTLY}");
+    let text = ok(l.edit(&l.editor(&[&edited]), &["job", "edit", "nightly"], ""));
+    assert!(text.contains("saved"), "{text}");
+    assert!(text.contains("picked it up"), "{text}");
+    assert_eq!(l.seen(0), NIGHTLY, "the editor starts from the head's file");
+    assert_eq!(std::fs::read_to_string(&head_job).unwrap(), edited);
+    assert_eq!(
+        std::fs::read_to_string(l.config.join("jobs/nightly.toml")).unwrap(),
+        NIGHTLY,
+        "the local copy is not touched"
+    );
+    let jobs: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(env.cmd(&["job", "list", "--json"]))).unwrap();
+    assert_eq!(jobs[0]["enabled"], false);
+
+    // flock.toml and pastor.toml: the head's, which the laptop does not have.
+    let head_flock = std::fs::read_to_string(env.config.join("flock.toml")).unwrap();
+    let l2 = laptop(&env);
+    let flock = format!("{head_flock}# edited\n");
+    ok(l2.edit(&l2.editor(&[&flock]), &["flock", "edit"], ""));
+    assert_eq!(l2.seen(0), head_flock);
+    assert_eq!(
+        std::fs::read_to_string(env.config.join("flock.toml")).unwrap(),
+        flock
+    );
+    assert!(!l2.config.join("flock.toml").exists());
+    let head_config = std::fs::read_to_string(env.config.join("pastor.toml")).unwrap();
+    let l3 = laptop(&env);
+    let config = format!("{head_config}# edited\n");
+    ok(l3.edit(&l3.editor(&[&config]), &["config", "edit"], ""));
+    assert_eq!(
+        std::fs::read_to_string(env.config.join("pastor.toml")).unwrap(),
+        config
+    );
+    assert!(!l3.config.join("pastor.toml").exists());
+
+    // An unchanged file sends nothing and says so.
+    let text = ok(l3.edit("true", &["config", "edit"], ""));
+    assert!(text.contains("no changes"), "{text}");
+    // A job only the laptop has is not the head's.
+    std::fs::write(l3.config.join("jobs/mine.toml"), NIGHTLY).unwrap();
+    assert_eq!(
+        error_code(&l3.edit("true", &["job", "edit", "mine"], "")),
+        "job_not_found"
+    );
+}
+
+#[test]
+fn edit_with_a_head_refuses_an_invalid_or_stale_edit() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let head_job = env.config.join("jobs/nightly.toml");
+
+    // Invalid, not reopened: the head's error is shown, its file is untouched.
+    let l = laptop(&env);
+    let broken = NIGHTLY.replace("1h", "soon");
+    let out = l.edit(&l.editor(&[&broken]), &["job", "edit", "nightly"], "n\n");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(last_error(&out).0, "invalid_edit");
+    assert!(stderr.contains("soon"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&head_job).unwrap(), NIGHTLY);
+
+    // Invalid, then fixed in the reopened editor.
+    let l = laptop(&env);
+    let fixed = NIGHTLY.replace("1h", "4h");
+    ok(l.edit(
+        &l.editor(&[&broken, &fixed]),
+        &["job", "edit", "nightly"],
+        "y\n",
+    ));
+    assert_eq!(l.runs(), 2);
+    assert!(l.seen(1).starts_with("# pastor:"), "{}", l.seen(1));
+    assert_eq!(std::fs::read_to_string(&head_job).unwrap(), fixed);
+
+    // Changed on the head while the editor was open: a stale hash.
+    let l = laptop(&env);
+    let ed = l.tmp.path().join("race.sh");
+    std::fs::write(
+        &ed,
+        format!(
+            "#!/bin/sh\necho '# changed elsewhere' >> {}\necho '# mine' >> \"$1\"\n",
+            head_job.display()
+        ),
+    )
+    .unwrap();
+    let out = l.edit(
+        &format!("sh {}", ed.display()),
+        &["job", "edit", "nightly"],
+        "",
+    );
+    assert_eq!(last_error(&out).0, "edit_conflict");
+    let now = std::fs::read_to_string(&head_job).unwrap();
+    assert!(
+        now.ends_with("# changed elsewhere\n") && !now.contains("# mine"),
+        "{now}"
+    );
+}
+
+#[test]
+fn job_describe_enable_and_disable_go_through_a_head() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let l = laptop(&env);
+    // The laptop has no job file: only the head knows the job.
+    std::fs::remove_file(l.config.join("jobs/nightly.toml")).unwrap();
+    let j: serde_json::Value =
+        serde_json::from_str(&ok(l.cmd(&["job", "describe", "nightly", "--json"]))).unwrap();
+    assert_eq!(j["name"], "nightly");
+    assert_eq!(j["schedule"], "every 1h");
+    assert_eq!(j["connector"]["use"], "clock");
+    assert!(
+        j["file"]
+            .as_str()
+            .unwrap()
+            .starts_with(env.config.to_str().unwrap()),
+        "{j}"
+    );
+    let text = ok(l.cmd(&["job", "describe", "nightly"]));
+    assert!(text.contains("every 1h"), "{text}");
+    assert_eq!(
+        error_code(&l.cmd(&["job", "describe", "ghost"])),
+        "job_not_found"
+    );
+
+    let head_job = env.config.join("jobs/nightly.toml");
+    let text = ok(l.cmd(&["job", "disable", "nightly"]));
+    assert!(text.contains("disabled nightly"), "{text}");
+    assert!(
+        std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("enabled = false")
+    );
+    let jobs: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(env.cmd(&["job", "list", "--json"]))).unwrap();
+    assert_eq!(jobs[0]["enabled"], false);
+    ok(l.cmd(&["job", "enable", "nightly"]));
+    assert!(
+        std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("enabled = true")
+    );
+    assert!(!l.config.join("jobs/nightly.toml").exists());
+    assert_eq!(
+        error_code(&l.cmd(&["job", "enable", "ghost"])),
+        "job_not_found"
+    );
+}
