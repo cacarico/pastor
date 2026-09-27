@@ -5,7 +5,7 @@ use clap::{ArgGroup, Args};
 use crate::cli::{CliError, TASK_HEADER, request_failure, table, task_rows};
 use crate::config::{Paths, parse_duration};
 use crate::ipc::{
-    Head, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, request,
+    Head, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, request_head,
 };
 use crate::machine::SendInput;
 use crate::store::{PruneOutcome, Store};
@@ -110,16 +110,16 @@ fn task_id(s: &str) -> anyhow::Result<i64> {
 fn request_error(err: &RequestError) -> anyhow::Error {
     let (code, message) = request_failure(err);
     let code = match err {
-        RequestError::Connect(e) if connect_error_means_no_daemon(e) => "daemon_not_running",
+        RequestError::Connect(e) if connect_error_means_no_daemon(e) => "daemon_not_running".into(),
         _ => code,
     };
-    CliError::err(code, message)
+    CliError::err(&code, message)
 }
 
 /// One request to the daemon. Retry and close need it: one dispatches, the
 /// other talks to herdr on the task's machine.
 async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    let resp = request(&paths.socket_file(), &req)
+    let resp = request_head(paths, &req)
         .await
         .map_err(|e| request_error(&e))?;
     match resp {

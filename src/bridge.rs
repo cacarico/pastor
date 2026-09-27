@@ -39,7 +39,7 @@ pub async fn run(
             }
             Err(err) => {
                 let (code, message) = request_failure(&err);
-                return Err(CliError::err(code, message));
+                return Err(CliError::err(&code, message));
             }
         };
         output.write_all(&reply).await?;
