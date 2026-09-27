@@ -454,6 +454,88 @@ pub async fn run_job(
     report
 }
 
+/// What a `JobSubmit` did with its items; see `IpcResponse::JobSubmitted`.
+#[derive(Debug, Default)]
+pub struct Submitted {
+    pub tasks: Vec<crate::task::Task>,
+    pub skipped: Vec<String>,
+    pub refused: Vec<(String, String)>,
+}
+
+/// Queue a submitted job's items as `run_job` queues a run's: a key already
+/// seen (or repeated in `items`) is skipped, an item whose values fail
+/// `check_item_paths` is refused with the reason, and past
+/// `max_tasks_per_run` tasks the rest are refused with `max_tasks_per_run`.
+/// Each task is one transaction (`Store::insert_job_task`). Dispatch is the
+/// caller's.
+pub async fn submit_items(
+    fleet: &Fleet,
+    store: &Store,
+    events: &broadcast::Sender<PastorEvent>,
+    job: &Job,
+    items: &[Value],
+) -> Submitted {
+    let mut out = Submitted::default();
+    let mut in_request: HashSet<String> = HashSet::new();
+    for item in items {
+        let Some(key) = item.get("key").and_then(Value::as_str).map(str::to_string) else {
+            out.refused
+                .push((String::new(), "item has no string key".into()));
+            continue;
+        };
+        if key.is_empty() {
+            out.refused.push((key, "item has an empty key".into()));
+            continue;
+        }
+        if !in_request.insert(key.clone()) {
+            out.skipped.push(key);
+            continue;
+        }
+        match store.is_seen(&job.name, &key) {
+            Ok(true) => {
+                out.skipped.push(key);
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                out.refused.push((key, format!("seen-store: {e:#}")));
+                continue;
+            }
+        }
+        if let Err(why) = check_item_paths(job, item) {
+            out.refused.push((key, format!("rejected: {why}")));
+            continue;
+        }
+        if out.tasks.len() as u32 >= job.max_tasks_per_run {
+            out.refused.push((key, "max_tasks_per_run".into()));
+            continue;
+        }
+        match fleet
+            .queue_job_task(job, item, |id| render_task(job, item, id))
+            .await
+        {
+            Ok(t) => {
+                tracing::info!(job = %job.name, task = %t.display_id(), %key, "submitted task queued");
+                let _ = events.send(PastorEvent {
+                    detail: None,
+                    kind: "task.queued".into(),
+                    task_id: Some(t.id),
+                    machine: None,
+                    job: Some(t.job.clone()),
+                });
+                out.tasks.push(t);
+            }
+            // Another submitter queued the key first.
+            Err(_) if store.is_seen(&job.name, &key).unwrap_or(false) => out.skipped.push(key),
+            Err(e) => {
+                tracing::warn!(job = %job.name, %key, %e, "submitted item not queued");
+                out.refused.push((key, format!("{e:#}")));
+            }
+        }
+    }
+    out
+}
+
 /// What `pastor job list` shows for one job file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
@@ -535,6 +617,15 @@ pub enum SchedulerCommand {
     /// Apply `pastor.toml` and `flock.toml` if they changed on disk
     /// (`reload_config`), before a `task run` queues against them.
     SyncConfig { reply: oneshot::Sender<()> },
+    /// Build the job a `JobSubmit` names from its `[dispatch]`, with the job
+    /// files and `pastor.toml` as they stand now: `Err((code, message))` for
+    /// a name a job file has, or a table that does not validate.
+    Submitted {
+        name: String,
+        dispatch: Value,
+        prompt: String,
+        reply: oneshot::Sender<Result<Job, (String, String)>>,
+    },
 }
 
 #[derive(Clone)]
@@ -577,6 +668,20 @@ impl SchedulerHandle {
     }
     pub async fn job_list(&self) -> anyhow::Result<Vec<JobStatus>> {
         self.send(|reply| SchedulerCommand::JobList { reply }).await
+    }
+    pub async fn submitted(
+        &self,
+        name: String,
+        dispatch: Value,
+        prompt: String,
+    ) -> anyhow::Result<Result<Job, (String, String)>> {
+        self.send(|reply| SchedulerCommand::Submitted {
+            name,
+            dispatch,
+            prompt,
+            reply,
+        })
+        .await
     }
     pub async fn sync_config(&self) -> anyhow::Result<()> {
         self.send(|reply| SchedulerCommand::SyncConfig { reply })
@@ -788,6 +893,12 @@ impl Scheduler {
                             let _ = reply.send(());
                             retime(&mut tick, self.tick);
                         }
+                        SchedulerCommand::Submitted { name, dispatch, prompt, reply } => {
+                            self.reload_config(false).await;
+                            self.reload();
+                            let _ = reply.send(self.submitted(&name, &dispatch, &prompt));
+                            retime(&mut tick, self.tick);
+                        }
                         SchedulerCommand::JobList { reply } => {
                             self.reload();
                             self.reap().await;
@@ -797,6 +908,24 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// `SchedulerCommand::Submitted`. A job file of the name, valid or not,
+    /// owns it: its tasks and `seen` keys would mix with the submitter's.
+    fn submitted(
+        &self,
+        name: &str,
+        dispatch: &Value,
+        prompt: &str,
+    ) -> Result<Job, (String, String)> {
+        if self.entries.contains_key(name) {
+            return Err((
+                "job_name_taken".into(),
+                format!("the head has a job file named {name}"),
+            ));
+        }
+        Job::submitted(name, dispatch, prompt, &self.defaults)
+            .map_err(|e| ("invalid_dispatch".into(), e))
     }
 
     /// Re-read the jobs directory if any file was added, removed or touched.
