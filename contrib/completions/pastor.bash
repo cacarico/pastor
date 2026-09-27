@@ -298,6 +298,9 @@ _pastor() {
             pastor__subcmd__help__subcmd__machine,add)
                 cmd="pastor__subcmd__help__subcmd__machine__subcmd__add"
                 ;;
+            pastor__subcmd__help__subcmd__machine,authorized-key)
+                cmd="pastor__subcmd__help__subcmd__machine__subcmd__authorized__subcmd__key"
+                ;;
             pastor__subcmd__help__subcmd__machine,describe)
                 cmd="pastor__subcmd__help__subcmd__machine__subcmd__describe"
                 ;;
@@ -406,6 +409,9 @@ _pastor() {
             pastor__subcmd__machine,add)
                 cmd="pastor__subcmd__machine__subcmd__add"
                 ;;
+            pastor__subcmd__machine,authorized-key)
+                cmd="pastor__subcmd__machine__subcmd__authorized__subcmd__key"
+                ;;
             pastor__subcmd__machine,describe)
                 cmd="pastor__subcmd__machine__subcmd__describe"
                 ;;
@@ -426,6 +432,9 @@ _pastor() {
                 ;;
             pastor__subcmd__machine__subcmd__help,add)
                 cmd="pastor__subcmd__machine__subcmd__help__subcmd__add"
+                ;;
+            pastor__subcmd__machine__subcmd__help,authorized-key)
+                cmd="pastor__subcmd__machine__subcmd__help__subcmd__authorized__subcmd__key"
                 ;;
             pastor__subcmd__machine__subcmd__help,describe)
                 cmd="pastor__subcmd__machine__subcmd__help__subcmd__describe"
@@ -568,12 +577,16 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__bridge)
-            opts="-h --help"
+            opts="-h --agent --machine --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --machine)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -1704,7 +1717,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help__subcmd__machine)
-            opts="add remove move list describe open"
+            opts="add remove move list describe open authorized-key"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1718,6 +1731,20 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help__subcmd__machine__subcmd__add)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__machine__subcmd__authorized__subcmd__key)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -2306,7 +2333,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__machine)
-            opts="-h --help add remove move list describe open help"
+            opts="-h --help add remove move list describe open authorized-key help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2353,6 +2380,24 @@ _pastor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        pastor__subcmd__machine__subcmd__authorized__subcmd__key)
+            opts="-h --key --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         pastor__subcmd__machine__subcmd__describe)
             opts="-h --json --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -2368,7 +2413,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__machine__subcmd__help)
-            opts="add remove move list describe open help"
+            opts="add remove move list describe open authorized-key help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2382,6 +2427,20 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__machine__subcmd__help__subcmd__add)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__machine__subcmd__help__subcmd__authorized__subcmd__key)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

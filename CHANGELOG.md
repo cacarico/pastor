@@ -5,6 +5,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- `pastor bridge --agent --machine <name>` is a bridge locked to one
+  machine's agents: it passes on `ping`, a task list cut to the machine's
+  flock, and `describe`, `read` and `done` for a task placed on that
+  machine, sets the request's task itself, and answers anything else
+  `not_allowed_for_agent` without reaching the head.
+- `pastor machine authorized-key <name> --key <file|->` prints the
+  `authorized_keys` line that locks a machine's key to that bridge. It edits
+  no file. The manual's "Agents on other machines" has the steps.
+
 ### Changed
 
 - `pastor flock default` is split in two: `pastor flock default show` prints

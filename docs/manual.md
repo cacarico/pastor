@@ -1153,6 +1153,39 @@ line and exits non-zero. It checks nothing itself: the head refuses what it
 would refuse from a local CLI, so ssh access to the head's user is access to
 the fleet.
 
+### Agents on other machines
+
+An agent on another machine reaches the head the same way, but with a key
+that can do no more than an agent should: ping, list the tasks of its
+machine's flock, and `describe`, read or end (`task done`) the tasks placed on
+its machine. `pastor bridge --agent --machine <name>` is that locked bridge.
+It reads each request and passes on only those; anything else, a task on
+another machine included, it answers `not_allowed_for_agent` without asking
+the head. It learns a task's machine and a machine's flock from the head,
+never from local files, cuts a task list down to the flock, and names the
+task a request comes from itself, whatever the caller said.
+
+To set it up for machine `pi-1`:
+
+1. On `pi-1`, as the user its agents run as, make a key with no passphrase
+   (`ssh-keygen -t ed25519 -f ~/.ssh/pastor_head -N ""`) and copy
+   `~/.ssh/pastor_head.pub` to the head.
+2. On the head, print the line for that key:
+   `pastor machine authorized-key pi-1 --key pastor_head.pub` (or `--key -`
+   to read it on stdin). It refuses a machine that is not in `flock.toml`,
+   and edits no file.
+3. Append the line to the head user's `~/.ssh/authorized_keys`. It runs
+   `<this pastor> bridge --agent --machine pi-1` whatever command the client
+   asks for, with no terminal and no forwarding:
+
+   ```
+   command="/path/to/pastor bridge --agent --machine pi-1",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... user@pi-1
+   ```
+
+Give each machine its own key: the machine named in the line is the only one
+whose tasks that key reaches. A work flock's machine then cannot even list a
+personal flock's tasks.
+
 ## Trust model
 
 pastor gives an agent what the head's user has on each machine. It reaches a
