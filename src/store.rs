@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -41,6 +41,15 @@ const V5_TABLES: &str = "CREATE TABLE IF NOT EXISTS trusted_repos (
         trusted_at TEXT NOT NULL,
         PRIMARY KEY (machine, repo)
      );";
+
+/// Schema 8: the last sequence number given to an event record
+/// (`Store::next_event_seq`), one row, so numbers keep growing across head
+/// restarts.
+const V8_TABLES: &str = "CREATE TABLE IF NOT EXISTS event_seq (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        last INTEGER NOT NULL
+     );
+     INSERT OR IGNORE INTO event_seq (id, last) VALUES (1, 0);";
 
 /// One saved trust, as `pastor trust list` shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +260,7 @@ impl Store {
                 )?;
                 tx.execute_batch(V2_TABLES)?;
                 tx.execute_batch(V5_TABLES)?;
+                tx.execute_batch(V8_TABLES)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
@@ -261,6 +271,7 @@ impl Store {
             Some(v) if v == SCHEMA_VERSION => {
                 tx.execute_batch(V2_TABLES)?;
                 tx.execute_batch(V5_TABLES)?;
+                tx.execute_batch(V8_TABLES)?;
             }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
@@ -309,6 +320,11 @@ impl Store {
                 if v < 7 {
                     add_column(&tx, "ended", "ended INTEGER NOT NULL DEFAULT 0")?;
                 }
+                // Event sequence numbers (`next_event_seq`). Records already
+                // in the log have none and read as 0; the first new one is 1.
+                if v < 8 {
+                    tx.execute_batch(V8_TABLES)?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -334,6 +350,27 @@ impl Store {
         let id = conn.last_insert_rowid();
         drop(conn);
         self.get_task(id)?.context("task vanished after insert")
+    }
+
+    /// The next event sequence number: one more than the last one given,
+    /// saved before it is returned, so no number is given twice, across
+    /// restarts too. The first is 1.
+    pub fn next_event_seq(&self) -> anyhow::Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let seq: i64 = conn.query_row(
+            "UPDATE event_seq SET last = last + 1 WHERE id = 1 RETURNING last",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(seq as u64)
+    }
+
+    /// The last event sequence number given; 0 before the first.
+    pub fn last_event_seq(&self) -> anyhow::Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let seq: i64 =
+            conn.query_row("SELECT last FROM event_seq WHERE id = 1", [], |r| r.get(0))?;
+        Ok(seq as u64)
     }
 
     pub fn get_task(&self, id: i64) -> anyhow::Result<Option<Task>> {
@@ -1249,11 +1286,21 @@ mod tests {
             s.insert_task(new_task("run")).unwrap();
             s.execute_raw("DROP TABLE seen; DROP TABLE job_state;");
         }
-        assert_eq!(table_names(&path), vec!["meta", "tasks", "trusted_repos"]);
+        assert_eq!(
+            table_names(&path),
+            vec!["event_seq", "meta", "tasks", "trusted_repos"]
+        );
         let s = Store::open(&path).unwrap();
         assert_eq!(
             table_names(&path),
-            vec!["job_state", "meta", "seen", "tasks", "trusted_repos"]
+            vec![
+                "event_seq",
+                "job_state",
+                "meta",
+                "seen",
+                "tasks",
+                "trusted_repos"
+            ]
         );
         assert!(!s.is_seen("j", "k").unwrap());
         assert!(s.job_state("j").unwrap().is_none());
@@ -1286,7 +1333,14 @@ mod tests {
         drop(Store::open(&fresh).unwrap());
         assert_eq!(
             table_names(&fresh),
-            vec!["job_state", "meta", "seen", "tasks", "trusted_repos"]
+            vec![
+                "event_seq",
+                "job_state",
+                "meta",
+                "seen",
+                "tasks",
+                "trusted_repos"
+            ]
         );
     }
 
@@ -1819,6 +1873,35 @@ mod tests {
         assert!(s.get_task(1).unwrap().unwrap().ended);
     }
 
+    /// Event sequence numbers keep growing across a restart of the store,
+    /// and a v7 database, which has none, starts them at 1.
+    #[test]
+    fn event_seq_survives_a_reopen_and_a_v7_database_gains_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            assert_eq!(s.last_event_seq().unwrap(), 0);
+            assert_eq!(s.next_event_seq().unwrap(), 1);
+            assert_eq!(s.next_event_seq().unwrap(), 2);
+        }
+        {
+            let s = Store::open(&path).unwrap();
+            assert_eq!(s.last_event_seq().unwrap(), 2);
+            assert_eq!(s.next_event_seq().unwrap(), 3);
+            s.execute_raw(
+                "DROP TABLE event_seq;
+                 UPDATE meta SET value = '7' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(s.next_event_seq().unwrap(), 1);
+    }
+
     /// A v2 database predates `retry_of`; opening it adds the column empty.
     #[test]
     fn a_v2_database_gains_retry_of() {
@@ -1879,9 +1962,10 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN activity_seen;
                  ALTER TABLE tasks DROP COLUMN ended;
                  DROP TABLE trusted_repos;
+                 DROP TABLE event_seq;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '7' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '8' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -1911,9 +1995,11 @@ mod tests {
             "rolled back: {cols:?}"
         );
         drop(conn);
+        let tables = table_names(&path);
         assert!(
-            !table_names(&path).contains(&"trusted_repos".to_string()),
-            "rolled back"
+            !tables.contains(&"trusted_repos".to_string())
+                && !tables.contains(&"event_seq".to_string()),
+            "rolled back: {tables:?}"
         );
     }
 

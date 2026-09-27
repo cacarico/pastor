@@ -14,8 +14,8 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// field an older head would silently ignore (serde skips unknown fields), so
 /// the CLI can refuse to send it there. A head that answers no protocol is 0.
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`). 2: flock agents and tool
-/// lists. 3: `TaskRetry::place`.
-pub const IPC_PROTOCOL: u32 = 3;
+/// lists. 3: `TaskRetry::place`. 4: `EventsSince`.
+pub const IPC_PROTOCOL: u32 = 4;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -39,6 +39,10 @@ pub const AGENT_PROTOCOL: u32 = 2;
 /// The first protocol whose head honours `TaskRetry::place`. An older one
 /// would retry the task with its original place, and say it succeeded.
 pub const PLACE_PROTOCOL: u32 = 3;
+
+/// The first protocol whose head answers `EventsSince`. An older one fails
+/// to read the request and answers an error.
+pub const EVENTS_PROTOCOL: u32 = 4;
 
 // One request is read per connection and dropped once answered, so the
 // size of the largest variant (`Run`) costs nothing worth a box.
@@ -118,6 +122,16 @@ pub enum IpcRequest {
     TaskDone {
         id: i64,
     },
+    /// The events log records numbered after `after`, oldest first, at most
+    /// `limit`, only those about `task` if given, read from the log files.
+    /// Answers `Events`, whose `gap` says records after `after` were rotated
+    /// out of the log.
+    EventsSince {
+        after: u64,
+        limit: u32,
+        #[serde(default)]
+        task: Option<i64>,
+    },
     /// Delete rows in `states` that finished more than `older_than_secs`
     /// ago. Answers `Pruned`.
     TaskPrune {
@@ -138,7 +152,8 @@ impl IpcRequest {
             | IpcRequest::TaskShow { .. }
             | IpcRequest::TaskRead { .. }
             | IpcRequest::FlockList
-            | IpcRequest::JobList => false,
+            | IpcRequest::JobList
+            | IpcRequest::EventsSince { .. } => false,
             IpcRequest::Reload
             | IpcRequest::Tick { .. }
             | IpcRequest::Run { .. }
@@ -233,6 +248,7 @@ pub enum IpcResponse {
     Runs(Vec<JobRunReport>),
     Jobs(Vec<JobStatus>),
     Pruned(crate::store::PruneOutcome),
+    Events(crate::events::EventsPage),
 }
 
 impl IpcResponse {
@@ -613,6 +629,11 @@ mod tests {
                 states: vec![crate::task::TaskState::Done, crate::task::TaskState::Closed],
                 older_than_secs: 3 * 86400,
             },
+            IpcRequest::EventsSince {
+                after: 7,
+                limit: 50,
+                task: Some(3),
+            },
         ] {
             let json = serde_json::to_string(&req).unwrap();
             let back: IpcRequest = serde_json::from_str(&json).unwrap();
@@ -641,6 +662,11 @@ mod tests {
             IpcRequest::TaskRead { id: 1, lines: 5 },
             IpcRequest::FlockList,
             IpcRequest::JobList,
+            IpcRequest::EventsSince {
+                after: 0,
+                limit: 10,
+                task: None,
+            },
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");

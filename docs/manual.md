@@ -635,6 +635,7 @@ A record, which is also what connector event hooks get on stdin:
 
 ```json
 {
+  "seq": 812,
   "at": "2026-09-24T10:15:02.123Z",
   "type": "task.done",
   "task": {"id": 3, "job": "triage", "item": {"key": "...", "title": "..."},
@@ -645,6 +646,10 @@ A record, which is also what connector event hooks get on stdin:
 }
 ```
 
+- `seq`: the record's number, from 1. It only grows, never repeats, and
+  carries on across restarts of the head and rotations of the log (the last
+  one given is kept in the head's database). Lines written before pastor
+  numbered records read as 0.
 - `at`: when the daemon received the event, RFC 3339 UTC.
 - `type`: `task.queued|running|blocked|done|stale|failed|closed`,
   `task.input` (`pastor task send`), `task.trusted` (the head answered a
@@ -668,6 +673,13 @@ A record, which is also what connector event hooks get on stdin:
 
 Fields may be added; none will be renamed or removed. Unreadable lines (a
 torn write, a hand edit) are skipped.
+
+A client can read the log through the head by number: the IPC request
+`events_since` (`{"op":"events_since","after":N,"limit":L,"task":ID}`, head
+protocol 4 or newer) answers the records whose `seq` is past `N`, oldest
+first, at most `L`, only those about task `ID` if given, with `oldest`, the
+oldest number the two log files still hold, and `gap: true` when records after
+`N` were already rotated out of both. It is a read, so an agent may send it.
 
 Runtime errors print JSON on stderr with a stable `code` and exit 1; a
 malformed command line gets clap's plain usage text and exit 2.
@@ -1282,7 +1294,7 @@ two pastor edits of one file never interleave.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, defaults, agents (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks (schema 7, with retry_of, flock, trust_sent, activity_seen and ended), seen keys, job state, trusted repos
+~/.local/state/pastor/pastor.db   tasks (schema 8, with retry_of, flock, trust_sent, activity_seen and ended), seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
