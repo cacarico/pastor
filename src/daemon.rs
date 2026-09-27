@@ -1533,6 +1533,10 @@ impl Daemon {
         let out =
             crate::scheduler::submit_items(&self.fleet, &self.store, &self.events, &job, &items)
                 .await;
+        // The name is reserved from the moment the scheduler builds the
+        // `Job`, above, so a concurrent job-file reload or scheduled run
+        // cannot mix its tasks and `seen` keys with this job's until now.
+        self.scheduler.released(job.name.clone()).await;
         if !out.tasks.is_empty() {
             self.fleet.dispatch_queued().await;
         }

@@ -626,6 +626,9 @@ pub enum SchedulerCommand {
         prompt: String,
         reply: oneshot::Sender<Result<Job, (String, String)>>,
     },
+    /// The items `Submitted` reserved `name` for are queued now (or never
+    /// will be, on error); release the reservation.
+    Released { name: String },
 }
 
 #[derive(Clone)]
@@ -683,6 +686,11 @@ impl SchedulerHandle {
         })
         .await
     }
+    /// Release the name `submitted` reserved, once the caller is done
+    /// queueing its items (whatever the outcome).
+    pub async fn released(&self, name: String) {
+        let _ = self.tx.send(SchedulerCommand::Released { name }).await;
+    }
     pub async fn sync_config(&self) -> anyhow::Result<()> {
         self.send(|reply| SchedulerCommand::SyncConfig { reply })
             .await
@@ -712,6 +720,12 @@ pub struct Scheduler {
     /// host a stream connector.
     standalone: bool,
     entries: HashMap<String, Entry>,
+    /// Names `submitted` has handed out a `Job` for but whose items are not
+    /// queued yet: held taken so a concurrent job-file reload, `fire` or tick
+    /// cannot start a run of the same name and mix its tasks and `seen` keys
+    /// with the submitter's. Released once the caller queues them (or gives
+    /// up), by `Released`.
+    reserved: HashSet<String>,
     /// (file name, mtime, size) of every job file at the last load; `None`
     /// until the first.
     fingerprint: Option<Vec<(PathBuf, Option<SystemTime>, u64)>>,
@@ -761,6 +775,7 @@ impl Scheduler {
             resolve: None,
             standalone: false,
             entries: HashMap::new(),
+            reserved: HashSet::new(),
             fingerprint: None,
             in_flight: Vec::new(),
             last_turn: HashMap::new(),
@@ -899,6 +914,9 @@ impl Scheduler {
                             let _ = reply.send(self.submitted(&name, &dispatch, &prompt));
                             retime(&mut tick, self.tick);
                         }
+                        SchedulerCommand::Released { name } => {
+                            self.reserved.remove(&name);
+                        }
                         SchedulerCommand::JobList { reply } => {
                             self.reload();
                             self.reap().await;
@@ -913,19 +931,21 @@ impl Scheduler {
     /// `SchedulerCommand::Submitted`. A job file of the name, valid or not,
     /// owns it: its tasks and `seen` keys would mix with the submitter's.
     fn submitted(
-        &self,
+        &mut self,
         name: &str,
         dispatch: &Value,
         prompt: &str,
     ) -> Result<Job, (String, String)> {
-        if self.entries.contains_key(name) {
+        if self.entries.contains_key(name) || self.reserved.contains(name) {
             return Err((
                 "job_name_taken".into(),
                 format!("the head has a job file named {name}"),
             ));
         }
-        Job::submitted(name, dispatch, prompt, &self.defaults)
-            .map_err(|e| ("invalid_dispatch".into(), e))
+        let job = Job::submitted(name, dispatch, prompt, &self.defaults)
+            .map_err(|e| ("invalid_dispatch".into(), e))?;
+        self.reserved.insert(name.to_string());
+        Ok(job)
     }
 
     /// Re-read the jobs directory if any file was added, removed or touched.
@@ -1202,6 +1222,7 @@ impl Scheduler {
             .entries
             .values()
             .filter_map(|e| e.job.clone())
+            .filter(|j| !self.reserved.contains(&j.name))
             .filter(|j| matches!(self.due_of(j, states.get(&j.name), now), Due::Now))
             .collect();
         for job in due {
@@ -1221,6 +1242,11 @@ impl Scheduler {
     /// A fire while a run is going queues behind it (see `Turn`), so the
     /// second run starts from the state the first one saved.
     pub fn fire(&mut self, name: &str, now: DateTime<Utc>) -> Result<String, String> {
+        if self.reserved.contains(name) {
+            return Err(format!(
+                "{name:?} is a submitted job whose items are still queueing; try again shortly"
+            ));
+        }
         let job = self
             .entries
             .get(name)
@@ -1338,6 +1364,12 @@ impl Scheduler {
         for name in &names {
             let name = name.as_str();
             if only.is_some_and(|o| o != name) {
+                continue;
+            }
+            if self.reserved.contains(name) {
+                // A job file just landed under a name `submitted` reserved;
+                // its items are still queueing. Let this pass skip it rather
+                // than run it against the submitter's still-forming state.
                 continue;
             }
             let entry = &self.entries[name];
