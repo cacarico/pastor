@@ -277,7 +277,8 @@ enum TaskCmd {
         #[arg(long, default_value_t = 40)]
         lines: u32,
     },
-    /// Attach to a task's agent terminal (ctrl+b q detaches)
+    /// Attach to a task's agent terminal (ctrl+b q detaches); a closed Claude
+    /// task's session reopens in a new pane
     Attach {
         /// A task, like t-12 or 12
         task: String,
@@ -1113,6 +1114,7 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
             .place
             .clone()
             .unwrap_or_else(|| config.defaults.place.clone()),
+        session_id: None,
     })
 }
 
@@ -1864,19 +1866,45 @@ async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     let t = open_store(paths)?
         .get_task(id)?
         .unwrap_or_else(|| fail("task_not_found", task));
-    let (Some(machine), Some(agent)) = (t.machine.clone(), t.agent_name.clone()) else {
+    let (Some(machine), Some(mut agent)) = (t.machine.clone(), t.agent_name.clone()) else {
         fail("no_agent", &format!("{} has no agent yet", t.display_id()))
     };
-    if !t.state.occupies_pane() {
-        fail(
-            "no_agent",
-            &format!("{} is {}; nothing to attach to", t.display_id(), t.state),
-        );
-    }
     let f = Flock::load(&paths.flock_file())?;
     let m = f
         .get(&machine)
         .unwrap_or_else(|| fail("unknown_machine", &machine));
+    // Its pane is gone: a Claude task's own session opens again in a new
+    // pane, and the task stays as it is.
+    if !t.state.occupies_pane() {
+        let agents = PastorConfig::load(&paths.config_file())?.agents;
+        if let Some(why) = pastor::reopen::why_not(&t, &agents) {
+            fail(
+                "no_agent",
+                &format!(
+                    "{} is {}; nothing to attach to: {why}",
+                    t.display_id(),
+                    t.state
+                ),
+            );
+        }
+        if m.ssh.is_none() && !m.local {
+            fail(
+                "no_terminal",
+                "command machines have no terminal to attach to",
+            );
+        }
+        let ep = Endpoint::from_machine(m, paths);
+        agent = pastor::reopen::reopen(&ep, &t, &agents)
+            .await
+            .unwrap_or_else(|e| fail(e.code, &e.message));
+        if agent != Task::agent_name_for(t.id) {
+            eprintln!(
+                "{} is {}; its session is open again in {agent} on {machine}",
+                t.display_id(),
+                t.state
+            );
+        }
+    }
     let err = if let Some(target) = &m.ssh {
         std::process::Command::new("ssh")
             .args(["-t", "--", target])

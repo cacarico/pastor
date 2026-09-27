@@ -85,6 +85,10 @@ struct State {
     unpushed: HashSet<String>,
     /// What `Connector::pastor_version` reports.
     pastor_version: Option<String>,
+    /// Branches `Connector::restore_worktree` finds gone.
+    gone_branches: HashSet<String>,
+    /// Every `Connector::restore_worktree` call, as (repo, path, branch).
+    restored: Vec<(String, String, String)>,
     /// The started agent vanishes immediately, as it does when the agent binary
     /// is missing and the process exits the moment it is launched.
     exit_on_start: bool,
@@ -222,6 +226,19 @@ impl FakeHerdr {
             .unwrap()
             .missing_dirs
             .insert(path.to_string());
+    }
+    /// `Connector::restore_worktree` finds `branch` gone.
+    pub fn set_gone_branch(&self, branch: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .gone_branches
+            .insert(branch.to_string());
+    }
+    /// Every worktree `Connector::restore_worktree` was asked to put back,
+    /// as (repo, path, branch).
+    pub fn restored(&self) -> Vec<(String, String, String)> {
+        self.state.lock().unwrap().restored.clone()
     }
     /// The checkout at `path` has commits on no remote.
     pub fn set_unpushed(&self, path: &str) {
@@ -1166,6 +1183,23 @@ impl super::transport::Connector for FakeHerdr {
     fn unpushed_commits(&self, path: &str) -> super::transport::DirFuture<'_> {
         let unpushed = self.state.lock().unwrap().unpushed.contains(path);
         Box::pin(async move { Ok(Some(unpushed)) })
+    }
+    /// Records the call; unless the branch is gone, the path exists from
+    /// then on.
+    fn restore_worktree(
+        &self,
+        repo: &str,
+        path: &str,
+        branch: &str,
+    ) -> super::transport::DirFuture<'_> {
+        let mut st = self.state.lock().unwrap();
+        st.restored
+            .push((repo.to_string(), path.to_string(), branch.to_string()));
+        let added = !st.gone_branches.contains(branch);
+        if added {
+            st.missing_dirs.remove(path);
+        }
+        Box::pin(async move { Ok(Some(added)) })
     }
     fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
         let version = self.state.lock().unwrap().pastor_version.clone();

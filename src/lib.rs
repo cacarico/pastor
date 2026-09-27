@@ -14,6 +14,7 @@ pub mod herdr;
 pub mod hooks;
 pub mod ipc;
 pub mod machine;
+pub mod reopen;
 pub mod schedule;
 pub mod scheduler;
 pub mod setup;

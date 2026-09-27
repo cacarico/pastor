@@ -226,6 +226,7 @@ pub fn task_detail(t: &Task) -> String {
         ("tags", tags),
         ("timeout", format!("{}s", t.spec.timeout_secs)),
         ("pane", opt(&t.pane_id)),
+        ("session", opt(&t.spec.session_id)),
         ("created", when(Some(t.created_at))),
         ("started", when(t.started_at)),
         ("finished", when(t.finished_at)),
@@ -828,6 +829,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -887,6 +889,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -976,6 +979,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);
@@ -1020,6 +1024,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
         let note = task_rows(std::slice::from_ref(&t))[0]
@@ -1048,6 +1053,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
         let out = task_detail(&t);

@@ -275,6 +275,7 @@ impl Job {
                 reopen: None,
                 agent_source: None,
                 place: d.place.unwrap_or_else(|| defaults.place.clone()),
+                session_id: None,
             },
         })
     }

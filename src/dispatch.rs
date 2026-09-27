@@ -165,7 +165,17 @@ async fn dispatch_steps(
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
-    let launch = agents.launch(&spec).map_err(DispatchError::Task)?;
+    let mut launch = agents.launch(&spec).map_err(DispatchError::Task)?;
+    // A Claude agent starts on a session pastor names, so `task attach` can
+    // resume it once the pane is gone; last, after the tool flags.
+    task.spec.session_id = None;
+    if launch.kind == "claude"
+        && !crate::task::picks_session(&launch.args)
+        && let Some(id) = crate::task::new_session_id()
+    {
+        launch.args.extend(["--session-id".to_string(), id.clone()]);
+        task.spec.session_id = Some(id);
+    }
     let repo = match spec.repo.as_deref() {
         Some(repo) => Some(expand_home(conn, "repo", repo, task.machine.as_deref()).await?),
         None => None,
@@ -701,6 +711,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         }
     }
 
@@ -749,6 +760,18 @@ mod tests {
             err.to_string().contains("/home/fake/gone does not exist"),
             "{err}"
         );
+    }
+
+    /// `args` with the `--session-id` dispatch gave `t` after them.
+    fn with_session(t: &Task, args: Value) -> Value {
+        let mut args = args.as_array().unwrap().clone();
+        let id = t
+            .spec
+            .session_id
+            .clone()
+            .expect("a claude task records a session");
+        args.extend([Value::from("--session-id"), Value::from(id)]);
+        Value::Array(args)
     }
 
     fn task(spec: DispatchSpec) -> Task {
@@ -893,10 +916,94 @@ mod tests {
         assert_eq!(ws.params["label"], "t-7");
         let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
         assert_eq!(start.params["kind"], "claude");
-        assert_eq!(start.params["args"], serde_json::json!(["--model", "opus"]));
+        assert_eq!(
+            start.params["args"],
+            with_session(&t, serde_json::json!(["--model", "opus"]))
+        );
         let prompt = reqs.iter().find(|r| r.method == "agent.prompt").unwrap();
         assert_eq!(prompt.params["target"], "t-7");
         assert_eq!(prompt.params["text"], "line one\n\"two\" {{ three }}");
+    }
+
+    /// A claude task starts on a session of its own, `--session-id` after
+    /// every other arg, and the task records it so attach can resume it
+    /// once the pane is gone.
+    #[tokio::test]
+    async fn a_claude_task_starts_on_a_session_it_records() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            deny: vec!["WebFetch".into()],
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        let id = t.spec.session_id.clone().expect("a session id");
+        assert!(crate::task::is_session_id(&id), "{id}");
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!([
+                "--model",
+                "opus",
+                "--disallowedTools",
+                "WebFetch",
+                "--session-id",
+                id
+            ])
+        );
+        // Another task, another session.
+        let mut u = task(spec());
+        u.id = 8;
+        dispatch(&FakeHerdr::new(), &mut u, &Agents::default(), READY)
+            .await
+            .unwrap();
+        assert_ne!(u.spec.session_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// Agent args that already pick a session keep it, and pastor records
+    /// none; an agent of another kind gets no flag it would not know.
+    #[tokio::test]
+    async fn a_session_the_args_pick_or_another_kind_gets_no_session_id() {
+        for args in [
+            vec!["--session-id", "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["--session-id=0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["--resume", "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["-r", "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--resume", "x", "--fork-session"],
+        ] {
+            let fake = FakeHerdr::new();
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            let mut t = task(DispatchSpec {
+                agent_args: args.clone(),
+                ..spec()
+            });
+            // A stale id copied from somewhere else is dropped, too.
+            t.spec.session_id = Some("stale".into());
+            dispatch(&fake, &mut t, &Agents::default(), READY)
+                .await
+                .unwrap();
+            assert_eq!(t.spec.session_id, None, "{args:?}");
+            let reqs = fake.requests();
+            let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+            assert_eq!(start.params["args"], serde_json::json!(args));
+        }
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "codex".into(),
+            agent_args: vec![],
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.session_id, None);
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["args"], serde_json::json!([]));
     }
 
     /// The tool lists reach herdr as the agent's own flags, after its args.
@@ -915,14 +1022,17 @@ mod tests {
         let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
         assert_eq!(
             start.params["args"],
-            serde_json::json!([
-                "--model",
-                "opus",
-                "--allowedTools",
-                "Bash(git:*)",
-                "--disallowedTools",
-                "WebFetch"
-            ])
+            with_session(
+                &t,
+                serde_json::json!([
+                    "--model",
+                    "opus",
+                    "--allowedTools",
+                    "Bash(git:*)",
+                    "--disallowedTools",
+                    "WebFetch"
+                ])
+            )
         );
     }
 
@@ -993,7 +1103,10 @@ mod tests {
         assert_eq!(start.params["name"], "t-7");
         assert_eq!(
             start.params["args"],
-            serde_json::json!(["--model", "opus", "--disallowedTools", "WebFetch"])
+            with_session(
+                &t,
+                serde_json::json!(["--model", "opus", "--disallowedTools", "WebFetch"])
+            )
         );
         assert_eq!(fake.pane_env(t.pane_id.as_deref().unwrap()), want);
         assert!(!reqs.iter().any(|r| r.method == "pane.split"));
