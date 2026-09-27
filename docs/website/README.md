@@ -1,8 +1,9 @@
 # website
 
 The pastor website: a homepage and short docs pages, drawn like a small TUI
-(panes, tabs, a status bar). It is a Hugo site with no theme; the only script
-adds keys (1-4 tabs, j/k pages), and every key is also a plain link.
+(panes, tabs, a status bar). It is a Hugo site with no theme. The only
+script, `static/keys.js`, adds keys: 1-4 for tabs, and Vimium's j/k, h/l,
+d/u, gg/G to scroll. Every tab is also a plain link.
 
 - `layouts/home.html` is the homepage. Its commands mirror the README's
   Install and Quick start; keep them in step when those change.
