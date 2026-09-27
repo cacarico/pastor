@@ -37,11 +37,23 @@ pub struct MachineView {
 /// wins. Otherwise: healthy, has every required tag, below capacity, fewest
 /// live tasks. Ties keep flock order.
 pub fn pick_machine(machines: &[MachineView], flock: &str, spec: &DispatchSpec) -> Option<String> {
+    pick_machine_where(machines, flock, spec, &|_| true)
+}
+
+/// `pick_machine` among the machines `accepts` takes by name, as a machine
+/// of another flock is left out: one whose agent cannot run the task's model.
+pub fn pick_machine_where(
+    machines: &[MachineView],
+    flock: &str,
+    spec: &DispatchSpec,
+    accepts: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     let fits = |m: &MachineView| {
         m.flock == flock
             && m.healthy
             && (m.live as u64) < m.max_agents as u64
             && spec.tags.iter().all(|t| m.tags.contains(t))
+            && accepts(&m.name)
     };
     if let Some(pinned) = &spec.machine {
         return machines

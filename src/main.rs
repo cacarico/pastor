@@ -203,6 +203,11 @@ struct RunArgs {
     /// value, dashes and all.
     #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
     agent_args: Vec<String>,
+    /// Run this model, a name from `[models]` in pastor.toml; its args go
+    /// before the agent's (default: the machine's, else its flock's, else
+    /// `[defaults] model`, else none)
+    #[arg(long, value_name = "NAME")]
+    model: Option<String>,
     /// A git worktree per task, branched from --repo (so it needs --repo)
     #[arg(long, requires = "repo")]
     worktree: bool,
@@ -253,7 +258,7 @@ struct ListArgs {
 #[derive(Subcommand, Debug)]
 enum TaskCmd {
     /// Create a one-off task and dispatch it
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// List live tasks across the flock; --all adds finished ones
     List(ListArgs),
     /// One task in full: state, machine, agent, prompt, error
@@ -885,8 +890,8 @@ fn agents_change_fleet(paths: &Paths) -> bool {
     PastorConfig::load(&paths.config_file()).is_ok_and(|c| c.agents_change_fleet)
 }
 
-/// Whether `command` can make the head queue a task, whose agent the head
-/// resolves: it needs a head at `AGENT_PROTOCOL` or later. A tick or a job
+/// Whether `command` can make the head queue a task, whose agent and model
+/// the head resolves: it needs a head at `MODEL_PROTOCOL` or later. A tick or a job
 /// run queues through the head's own jobs, so they count too; a dry run
 /// writes nothing, and a reload only re-reads the job files.
 fn needs_agent_protocol(command: &Command) -> bool {
@@ -950,8 +955,8 @@ fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
         ))
     } else if needs_agent_protocol(command) {
         Some((
-            pastor::ipc::AGENT_PROTOCOL,
-            "predates flock agents and tool allow and deny lists, and would start the agent without them",
+            pastor::ipc::MODEL_PROTOCOL,
+            "predates named models (or flock agents and tool allow and deny lists), and would start the agent without them",
         ))
     } else if needs_file_protocol(command) {
         Some((
@@ -1001,6 +1006,14 @@ fn run_prompt(a: &RunArgs) -> anyhow::Result<String> {
 }
 
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
+    if let Some(m) = &a.model {
+        pastor::config::check_model_name(m).map_err(|e| {
+            CliError::err(
+                "unknown_model",
+                format!("{e}; --model takes a name from [models] in pastor.toml, not agent args"),
+            )
+        })?;
+    }
     let prompt = run_prompt(&a)?;
     // With a remote head, pastor.toml is the head's and not here: the built-in
     // defaults fill the spec, and the head resolves the agent again with its own.
@@ -1033,6 +1046,7 @@ fn agent_choice(a: &RunArgs) -> AgentChoice {
     AgentChoice {
         agent: a.agent.clone(),
         agent_args: (!a.agent_args.is_empty()).then(|| a.agent_args.clone()),
+        model: a.model.clone(),
         ..Default::default()
     }
 }
@@ -1072,7 +1086,7 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
 
 fn print_task(t: &Task, json: bool) {
     if json {
-        println!("{}", serde_json::to_string_pretty(t).unwrap());
+        println!("{}", serde_json::to_string_pretty(&t.to_json()).unwrap());
     } else {
         println!(
             "{}",
@@ -1356,7 +1370,10 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
         eprintln!("{hint}");
     }
     if a.json {
-        println!("{}", serde_json::to_string_pretty(&tasks)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&tasks.iter().map(Task::to_json).collect::<Vec<_>>())?
+        );
     } else if tasks.is_empty() {
         if hint.is_none() {
             println!("no tasks");
@@ -1414,7 +1431,7 @@ fn task_id(s: &str) -> i64 {
 
 async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
     match cmd {
-        TaskCmd::Run(args) => run(paths, args).await?,
+        TaskCmd::Run(args) => run(paths, *args).await?,
         TaskCmd::List(args) => list(paths, args, head).await?,
         TaskCmd::Describe { task, json } => {
             let id = task_id(&task);
@@ -1483,6 +1500,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 flock,
                 agent: None,
                 agent_args: None,
+                model: None,
             };
             // With a head the reload line comes with its answer, before the
             // herdr lines; without one it follows them.
@@ -2168,6 +2186,7 @@ async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> 
     let d = pastor::describe::MachineDescription {
         row,
         session: m.session.clone(),
+        model: m.model.clone(),
         tasks,
         recent_errors,
     };
@@ -2209,6 +2228,7 @@ async fn flock_describe(paths: &Paths, name: &str, json: bool, head: Head) -> an
         agent_args: entry.agent_args,
         allow: entry.allow,
         deny: entry.deny,
+        model: entry.model,
         machines: row.machines,
         agents: row.agents,
         tasks,
@@ -2245,7 +2265,7 @@ mod tests {
         match Cli::try_parse_from(full).unwrap().command.unwrap() {
             Command::Task {
                 cmd: TaskCmd::Run(a),
-            } => a,
+            } => *a,
             other => panic!("{other:?}"),
         }
     }
@@ -2366,7 +2386,7 @@ mod tests {
     /// A head from before `PLACE_PROTOCOL` reads `task retry --place`
     /// without the place (serde skips the unknown field) and retries the
     /// task where it was, answering success. The CLI refuses to send it
-    /// there; a retry without `--place` still goes.
+    /// there, and says so.
     #[tokio::test]
     async fn retry_with_a_place_refuses_a_head_before_it() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -2400,11 +2420,13 @@ mod tests {
         let err = err.downcast::<pastor::cli::CliError>().unwrap();
         assert_eq!(err.code, "head_too_old");
         assert!(err.message.contains("--place"), "{}", err.message);
+        // A retry without it is refused only for what every queueing
+        // command needs (`MODEL_PROTOCOL`), not for --place.
         let retry = protocol_need(&parse(&["pastor", "task", "retry", "t-1"]));
-        assert_eq!(
-            probe_head(&paths, false, false, retry).await.unwrap(),
-            Head::Live
-        );
+        assert_eq!(retry.map(|n| n.0), Some(pastor::ipc::MODEL_PROTOCOL));
+        let err = probe_head(&paths, false, false, retry).await.unwrap_err();
+        let err = err.downcast::<pastor::cli::CliError>().unwrap();
+        assert!(!err.message.contains("--place"), "{}", err.message);
 
         assert!(needs_place_protocol(&parse(&[
             "pastor", "task", "retry", "t-1", "--place", "pastor"

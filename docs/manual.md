@@ -380,6 +380,7 @@ default = true            # tasks and jobs that name no flock go here
 name = "work"
 agent = "claude"          # optional: the agent for this flock's tasks
 agent_args = ["--model", "claude-sonnet-5"]
+# model = "sonnet"        # optional: a [models] name, see Models below
 
 [[machine]]
 name = "desk"
@@ -632,6 +633,74 @@ already on the machine keep running there, and its connection stays up. A
 queued task pinned to a machine that has moved to another flock stays queued
 for its own flock, and the head logs a warning once.
 
+### Models
+
+`[models.<name>]` in pastor.toml names a model, so a task can pick it by name
+instead of repeating the agent's own flags. Each has a `kind`, the herdr agent
+kind whose agents can run it, and `args`, the argv that selects it (it may be
+`[]`); both are required. Names follow the job names' rules
+(`[a-z0-9][a-z0-9_.-]{0,63}`), and there are no built-in models. A bad entry
+fails the file's load.
+
+```toml
+# pastor.toml
+[models.sonnet]
+kind = "claude"
+args = ["--model", "claude-sonnet-5"]
+
+[models.opus]
+kind = "claude"
+args = ["--model", "claude-opus-5-5"]
+
+[defaults]
+model = "opus"
+```
+
+```toml
+# flock.toml: the personal flock runs sonnet unless a task says otherwise
+[[flock]]
+name = "personal"
+agent = "claude-personal"
+model = "sonnet"
+```
+
+A task settles its model like its agent, from the first of these that names
+one: `--model` on `pastor task run` (or `model` under a job's `[dispatch]`),
+`model` under the `[[machine]]` entry it runs on, `model` under its
+`[[flock]]` entry, `[defaults] model`; with none, it runs no model and nothing
+changes. `--model` takes a name only, never raw args.
+
+A job's `model` is a template, rendered for each item:
+`model = "{{ item.model }}"` runs the model the item names. It may use
+`item.*` and `job.name`. When it renders empty, the job says nothing and the
+lookup goes on to the machine, the flock and `[defaults]`.
+
+The model's `args` go first, then the task's `agent_args` settled as above,
+then the allow and deny flags, so permission flags in `agent_args` still
+apply. A task in the personal flock above starts as `claude --model
+claude-sonnet-5 ...` under the `claude-personal` definition.
+
+A model runs only on agents of its kind (the agent's `kind`, or its name
+without a definition). A task that asks for an agent of another kind with
+`--agent`, or is pinned to a machine whose agent is of another kind, is
+refused (`model_kind_mismatch`). A task that is not pinned is offered only to
+the machines of its flock whose agent has the model's kind; the others are
+skipped as machines of another flock are. If none has, it stays queued and
+`pastor task describe` says why in its `error`.
+
+A name `[models]` does not define is refused: `unknown_model` from `pastor
+task run` and `pastor task retry`, and the job records the error for that
+item. In flock.toml, a flock's or a machine's unknown `model` fails the load
+(the head keeps the previous flock on a reload).
+
+`pastor task describe` prints the model and where it came from, such as
+`model: sonnet (from flock personal)`; `task list` has a MODEL column and
+`--json` a `model` field; `flock describe` and `machine describe` show their
+own `model`; task events carry `model`. The store keeps the name, and a retry
+settles the model's args again from pastor.toml as it stands. Since a head
+from before models would start the agent without its model, every command
+that can make it queue a task refuses one (`head_too_old`).
+
 ## Events
 
 `pastor serve` appends every task, job and machine event to
@@ -716,6 +785,7 @@ pastor machine list                  # a line about the head, then each machine:
 pastor setup systemd                 # confirm, then install and enable --now; or `pastor serve &`
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
 pastor task run "Review the open PR" --agent-arg=--model --agent-arg=claude-opus-5-5
+pastor task run "Fix the typo in README" --model sonnet   # a [models] name from pastor.toml
 pastor task run "Triage the inbox" --flock work   # only work machines take it
 pastor task run --prompt-file ./prompt.md --repo '~/work/api'   # a long prompt, no shell quoting
 mkdir -p ~/.config/pastor/jobs
@@ -753,7 +823,7 @@ paths.
 
 `pastor task run` takes the prompt as its argument or, instead, `--prompt-file
 PATH`, and `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
-`--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
+`--model` (a name from `[models]`, see [Models](#models)), `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
 `--timeout`, `--place` (see [Where a task's pane goes](#where-a-tasks-pane-goes))
 and `--json`. `--agent-arg` hands one argument to the agent,
 through herdr's `agent.start`; repeat it for more, in order. It always takes the
@@ -1498,6 +1568,7 @@ deny = []                    # tool patterns it must never use; wins over allow
 max_tasks_per_run = 5
 timeout = "2h"
 place = "repo"               # where a task's pane goes: repo, own, pastor or pane:<workspace>
+# model = "sonnet"           # a [models] name for tasks that name none; unset: no model
 [agents.claude]              # one table per agent that needs one
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
@@ -1505,6 +1576,9 @@ trust_keys = ["Down", "Enter"]   # accept its folder-trust prompt; [] for none
 trust_marker = "Yes, I trust this folder"  # saved trust presses them only while the pane shows this
 allow_flag = "--allowedTools"    # the flag before each allow pattern
 deny_flag = "--disallowedTools"  # the flag before each deny pattern
+[models.sonnet]              # one table per model; none are built in
+kind = "claude"                  # the herdr agent kind that runs it (required)
+args = ["--model", "claude-sonnet-5"]  # put before agent_args (required, may be [])
 ```
 
 ## Shell completions
@@ -1516,7 +1590,8 @@ copies for bash and fish live in `contrib/completions/`.
 In bash and fish the script also offers the names a command takes: job names
 after `job describe`, `--job` and the like, flock and machine names after
 `--flock`, `--machine` and the flock and machine commands, task ids after the
-task commands, and connector ids after `connector uninstall|unlink|try`. A
+task commands, connector ids after `connector uninstall|unlink|try`, and
+the `[models]` names of pastor.toml after `--model`. A
 static script cannot know them, so at TAB it runs `pastor __complete <shell>
 -- <words>`, which reads the job files, `flock.toml`, the connectors
 directory and the task store directly, never the head, and prints nothing

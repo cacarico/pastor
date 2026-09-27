@@ -430,6 +430,10 @@ pub struct Defaults {
     pub allow: Vec<String>,
     /// Tool patterns every task's agent must never use; wins over `allow`.
     pub deny: Vec<String>,
+    /// The `[models]` entry tasks run when their run flags, job, machine and
+    /// flock name none. See `resolve_agent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
     /// Where a task's pane goes when its run flags and job say nothing
@@ -453,6 +457,9 @@ pub struct AgentChoice {
     /// Tool patterns added to the flock's and `[defaults]` deny lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// A `[models]` name, before the machine's, the flock's and `[defaults]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Where a task's agent, or its args, came from (`Defaults::resolve_agent_on`).
@@ -479,6 +486,10 @@ pub struct AgentPick {
     /// `None` when no layer's args were written for the agent: it runs
     /// with none.
     pub args_from: Option<Layer>,
+    /// The `[models]` name the task runs, and the layer that named it;
+    /// `None` when no layer names one. Its args are not in `agent_args`:
+    /// `Models::apply` puts them in front.
+    pub model: Option<(String, Layer)>,
 }
 
 impl AgentPick {
@@ -578,6 +589,14 @@ impl Defaults {
                     .map(|a| (Some(layer), a.clone()))
             })
             .unwrap_or_default();
+        let model = [
+            (Layer::Ask, ask.model.as_ref()),
+            (Layer::Machine, machine.and_then(|m| m.model.as_ref())),
+            (Layer::Flock, flock.and_then(|f| f.model.as_ref())),
+            (Layer::Defaults, self.model.as_ref()),
+        ]
+        .into_iter()
+        .find_map(|(layer, name)| Some((name?.clone(), layer)));
         AgentPick {
             agent,
             agent_args,
@@ -585,6 +604,7 @@ impl Defaults {
             deny,
             agent_from,
             args_from,
+            model,
         }
     }
 }
@@ -596,6 +616,7 @@ impl Default for Defaults {
             agent_args: vec![],
             allow: vec![],
             deny: vec![],
+            model: None,
             max_tasks_per_run: 5,
             timeout: "2h".into(),
             place: crate::task::Place::Repo,
@@ -798,6 +819,118 @@ impl Agents {
     }
 }
 
+/// One model under `[models.<name>]` in `pastor.toml`: the herdr agent kind
+/// it runs on and the args that pick it. A task names it with `model`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDef {
+    /// The herdr agent kind (`claude`, `codex`) whose agents can run it.
+    pub kind: String,
+    /// Put before the task's `agent_args` (`["--model", "claude-sonnet-5"]`).
+    pub args: Vec<String>,
+}
+
+/// `[models.<name>]`, by model name. No model is built in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Models(pub std::collections::BTreeMap<String, ModelDef>);
+
+/// Model names go in the store, in events and on the command line, so they
+/// keep to the job names' alphabet: `[a-z0-9][a-z0-9_.-]{0,63}`. That also
+/// keeps a raw agent arg such as `--model` from passing for one.
+pub fn check_model_name(name: &str) -> Result<(), String> {
+    let first_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let rest_ok = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c));
+    if first_ok && rest_ok && name.len() <= 64 {
+        Ok(())
+    } else {
+        Err(format!(
+            "model name {name:?} must match [a-z0-9][a-z0-9_.-]{{0,63}}"
+        ))
+    }
+}
+
+/// The code of a model whose kind is not the task's agent's.
+pub const MODEL_KIND_MISMATCH: &str = "model_kind_mismatch";
+
+/// Why a task's agent cannot run as resolved: a stable code for the CLI's
+/// error and a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRefusal {
+    /// `unknown_model`, `model_kind_mismatch` or `agent_tools_unsupported`.
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for AgentRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Models {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The names, sorted, for errors and shell completion.
+    pub fn names(&self) -> Vec<&str> {
+        self.0.keys().map(String::as_str).collect()
+    }
+
+    /// `name`'s definition, or `unknown_model`.
+    pub fn get(&self, name: &str) -> Result<&ModelDef, AgentRefusal> {
+        self.0.get(name).ok_or_else(|| AgentRefusal {
+            code: "unknown_model",
+            message: if self.0.is_empty() {
+                format!("model {name} is not in [models] in pastor.toml, which names none")
+            } else {
+                format!(
+                    "model {name} is not in [models] in pastor.toml; it has {}",
+                    self.names().join(", ")
+                )
+            },
+        })
+    }
+
+    /// `get`, for a check that only needs to know it is there.
+    pub fn check(&self, name: &str) -> Result<(), String> {
+        self.get(name).map(drop).map_err(|e| e.message)
+    }
+
+    /// Settle `pick`'s model into `spec`: the model's args before the
+    /// agent's own. Refused when the model is not defined or its kind is not
+    /// the one of the agent the task runs (`agents.kind`).
+    pub fn apply(
+        &self,
+        pick: &AgentPick,
+        agents: &Agents,
+        spec: &mut crate::task::DispatchSpec,
+    ) -> Result<(), AgentRefusal> {
+        let Some((name, _)) = &pick.model else {
+            return Ok(());
+        };
+        let def = self.get(name)?;
+        let kind = agents.kind(&pick.agent);
+        if def.kind != kind {
+            return Err(AgentRefusal {
+                code: MODEL_KIND_MISMATCH,
+                message: format!(
+                    "model {name} runs on {} agents, and agent {} is {kind}",
+                    def.kind, pick.agent
+                ),
+            });
+        }
+        spec.agent_args = def.args.iter().chain(&pick.agent_args).cloned().collect();
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PastorConfig {
@@ -823,6 +956,8 @@ pub struct PastorConfig {
     pub defaults: Defaults,
     #[serde(skip_serializing_if = "is_empty_agents")]
     pub agents: Agents,
+    #[serde(skip_serializing_if = "Models::is_empty")]
+    pub models: Models,
 }
 
 fn is_empty_agents(a: &Agents) -> bool {
@@ -841,6 +976,7 @@ impl Default for PastorConfig {
             agents_change_fleet: false,
             defaults: Defaults::default(),
             agents: Agents::default(),
+            models: Models::default(),
         }
     }
 }
@@ -934,6 +1070,18 @@ impl PastorConfig {
                     path.display()
                 );
             }
+        }
+        for (name, def) in &cfg.models.0 {
+            check_model_name(name)
+                .map_err(|e| anyhow::anyhow!("{}: models: {e}", path.display()))?;
+            if def.kind.trim().is_empty() {
+                anyhow::bail!("{}: models.{name}.kind must not be empty", path.display());
+            }
+        }
+        if let Some(m) = &cfg.defaults.model {
+            cfg.models
+                .check(m)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.model: {e}", path.display()))?;
         }
         if cfg.agent_ready_timeout_duration() >= cfg.request_timeout_duration() {
             anyhow::bail!(
@@ -1272,6 +1420,122 @@ mod tests {
         assert_eq!(p.deny, vec!["Bash(rm:*)"]);
     }
 
+    /// `[models.<name>]` needs a kind and args, a name in the job names'
+    /// alphabet, and nothing else; `[defaults] model` must name one.
+    #[test]
+    fn models_load_and_bad_ones_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nmodel = \"sonnet\"\n[models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n[models.plain]\nkind = \"codex\"\nargs = []\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            cfg.models.0["sonnet"].args,
+            vec!["--model", "claude-sonnet-5"]
+        );
+        assert!(cfg.models.0["plain"].args.is_empty());
+        for (text, says) in [
+            ("[models.sonnet]\nkind = \"claude\"\n", "args"),
+            ("[models.sonnet]\nargs = []\n", "kind"),
+            (
+                "[models.sonnet]\nkind = \" \"\nargs = []\n",
+                "models.sonnet.kind",
+            ),
+            (
+                "[models.Sonnet]\nkind = \"claude\"\nargs = []\n",
+                "must match",
+            ),
+            (
+                "[models.\"--model\"]\nkind = \"claude\"\nargs = []\n",
+                "must match",
+            ),
+            (
+                "[models.sonnet]\nkind = \"claude\"\nargs = []\nenv = {}\n",
+                "env",
+            ),
+            ("[defaults]\nmodel = \"haiku\"\n", "defaults.model"),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            assert!(err.contains(says), "{text}: {err}");
+        }
+    }
+
+    /// The model comes from the first of the ask, the machine, the flock
+    /// and `[defaults]` that names one, and its args go before the agent's.
+    #[test]
+    fn the_model_comes_from_the_first_layer_that_names_one() {
+        let d = Defaults {
+            model: Some("opus".into()),
+            agent_args: vec!["-v".into()],
+            ..Default::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "p".into(),
+            model: Some("sonnet".into()),
+            ..Default::default()
+        };
+        let machine: flock::MachineConfig =
+            toml::from_str("name = \"m\"\nlocal = true\nmodel = \"haiku\"\n").unwrap();
+        let ask = |model: Option<&str>| AgentChoice {
+            model: model.map(Into::into),
+            ..Default::default()
+        };
+        let model = |p: AgentPick| p.model.unwrap();
+        assert_eq!(
+            model(d.resolve_agent_on(&ask(Some("gpt")), Some(&machine), Some(&flock))),
+            ("gpt".into(), Layer::Ask)
+        );
+        assert_eq!(
+            model(d.resolve_agent_on(&ask(None), Some(&machine), Some(&flock))),
+            ("haiku".into(), Layer::Machine)
+        );
+        assert_eq!(
+            model(d.resolve_agent(&ask(None), Some(&flock))),
+            ("sonnet".into(), Layer::Flock)
+        );
+        assert_eq!(
+            model(d.resolve_agent(&ask(None), None)),
+            ("opus".into(), Layer::Defaults)
+        );
+        assert_eq!(
+            Defaults::default().resolve_agent(&ask(None), None).model,
+            None
+        );
+
+        let models: Models = toml::from_str(
+            "[opus]\nkind = \"claude\"\nargs = [\"--model\", \"claude-opus-5-5\"]\n",
+        )
+        .unwrap();
+        let agents = Agents::default();
+        let pick = d.resolve_agent(&ask(None), None);
+        let mut spec = spec_with("claude", &[], &[]);
+        pick.apply_to(&mut spec);
+        models.apply(&pick, &agents, &mut spec).unwrap();
+        assert_eq!(spec.agent_args, vec!["--model", "claude-opus-5-5", "-v"]);
+
+        let codex = AgentChoice {
+            agent: Some("codex".into()),
+            ..Default::default()
+        };
+        let err = models
+            .apply(&d.resolve_agent(&codex, None), &agents, &mut spec)
+            .unwrap_err();
+        assert_eq!(err.code, MODEL_KIND_MISMATCH);
+        let err = models
+            .apply(
+                &d.resolve_agent(&ask(Some("gpt")), None),
+                &agents,
+                &mut spec,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "unknown_model");
+    }
+
     fn spec_with(agent: &str, allow: &[&str], deny: &[&str]) -> crate::task::DispatchSpec {
         crate::task::DispatchSpec {
             agent: agent.into(),
@@ -1580,6 +1844,7 @@ mod tests {
             agent_args: Some(vec!["-v".into()]),
             allow: vec![],
             deny: vec![],
+            model: None,
         };
         assert_eq!(pick(&own, Some(&work)), ("aider".into(), "-v".into()));
         // Args follow the agent they were written for: the flock's are for
@@ -1589,6 +1854,7 @@ mod tests {
             agent_args: None,
             allow: vec![],
             deny: vec![],
+            model: None,
         };
         assert_eq!(
             pick(&claude, Some(&work)),
@@ -1599,6 +1865,7 @@ mod tests {
             agent_args: None,
             allow: vec![],
             deny: vec![],
+            model: None,
         };
         assert_eq!(
             pick(&codex, Some(&work)),

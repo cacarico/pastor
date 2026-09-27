@@ -665,6 +665,7 @@ mod tests {
                 job: Some(t.job.clone()),
                 task: Some(t),
                 machine: None,
+                model: None,
             }
         }
 
@@ -722,6 +723,7 @@ mod tests {
             task: None,
             job: None,
             machine: None,
+            model: None,
         }
     }
 

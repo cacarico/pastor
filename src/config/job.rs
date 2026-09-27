@@ -51,6 +51,9 @@ pub struct DispatchTable {
     pub allow: Vec<String>,
     /// Added to the flock's and `[defaults]` deny list.
     pub deny: Vec<String>,
+    /// A `[models]` name, or a template of one (`{{ item.model }}`) rendered
+    /// per item; rendered empty, the machine's, flock's or `[defaults]` model.
+    pub model: Option<String>,
     pub repo: Option<String>,
     pub worktree: bool,
     pub branch: Option<String>,
@@ -84,7 +87,8 @@ pub struct Job {
     /// flock's is only known when a task is queued, which re-resolves it
     /// from `agent` (`Fleet::queue_job_task`).
     pub spec: DispatchSpec,
-    /// What `[dispatch]` itself says about the agent.
+    /// What `[dispatch]` itself says about the agent. Its `model` is still a
+    /// template: `model_for` renders it for one item.
     pub agent: AgentChoice,
     /// `dispatch.flock`, checked against flock.toml at each run (see
     /// `Flock::task_flock`): the job file does not know the flocks.
@@ -175,6 +179,19 @@ impl Job {
         if d.worktree && d.repo.is_none() {
             return Err("dispatch.worktree = true needs dispatch.repo".into());
         }
+        if let Some(model) = &d.model {
+            for path in template::placeholders(model).map_err(|e| format!("dispatch.model: {e}"))? {
+                if !(path.starts_with("item.") || path == "job.name") {
+                    return Err(format!(
+                        "dispatch.model: unknown placeholder {{{{ {path} }}}}; use item.* or job.name"
+                    ));
+                }
+            }
+            if !model.contains("{{") {
+                crate::config::check_model_name(model)
+                    .map_err(|e| format!("dispatch.model: {e}"))?;
+            }
+        }
         for (field, text) in [
             ("prompt", Some(d.prompt.as_str())),
             ("branch", d.branch.as_deref()),
@@ -229,6 +246,7 @@ impl Job {
             agent_args: d.agent_args,
             allow: d.allow,
             deny: d.deny,
+            model: d.model,
         };
         let pick = defaults.resolve_agent(&agent, None);
         Ok(Job {
@@ -259,6 +277,27 @@ impl Job {
                 place: d.place.unwrap_or_else(|| defaults.place.clone()),
             },
         })
+    }
+
+    /// The job's `model` rendered for `item`: `None` when the job names
+    /// none, or its template renders empty, so the machine's, flock's or
+    /// `[defaults]` model applies. A rendered value that is not a model name
+    /// is refused; whether `[models]` has it is checked when the task is
+    /// queued.
+    pub fn model_for(&self, item: &Value) -> Result<Option<String>, String> {
+        let Some(model) = &self.agent.model else {
+            return Ok(None);
+        };
+        let ctx = serde_json::json!({"item": item, "job": {"name": self.name}});
+        let text = template::render(model, &ctx)
+            .map_err(|e| format!("dispatch.model: {e}"))?
+            .text;
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        crate::config::check_model_name(text).map_err(|e| format!("dispatch.model: {e}"))?;
+        Ok(Some(text.to_string()))
     }
 }
 
@@ -471,6 +510,44 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert!(job.prompt.contains("{{ item.author }}"));
     }
 
+    /// A job's `model` is a template rendered per item: empty means the job
+    /// names none, and what it renders must be a model name.
+    #[test]
+    fn a_jobs_model_renders_per_item() {
+        let job = |model: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nmodel = {model:?}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &defaults(),
+                &Builtins,
+            )
+        };
+        let j = job("{{ item.model }}").unwrap();
+        let item = |v: serde_json::Value| j.model_for(&v);
+        assert_eq!(
+            item(serde_json::json!({"model": "opus"}))
+                .unwrap()
+                .as_deref(),
+            Some("opus")
+        );
+        assert_eq!(item(serde_json::json!({})).unwrap(), None);
+        assert_eq!(item(serde_json::json!({"model": " "})).unwrap(), None);
+        let err = item(serde_json::json!({"model": "--model x"})).unwrap_err();
+        assert!(err.contains("dispatch.model"), "{err}");
+        assert_eq!(
+            job("sonnet")
+                .unwrap()
+                .model_for(&serde_json::json!({}))
+                .unwrap()
+                .as_deref(),
+            Some("sonnet")
+        );
+        assert!(job("{{ task.id }}").unwrap_err().contains("dispatch.model"));
+        assert!(job("Sonnet").unwrap_err().contains("dispatch.model"));
+    }
+
     /// `[defaults] agent_args` fills in for a job file that has no
     /// `agent_args` key; a key that is there, even `[]`, is the job's choice.
     #[test]
@@ -618,6 +695,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             max_tasks_per_run: 2,
             timeout: "30m".into(),
             place: Default::default(),
+            model: None,
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");

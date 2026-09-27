@@ -55,6 +55,10 @@ pub struct EventRecord {
     pub kind: String,
     /// The full task row at the time the record was built.
     pub task: Option<Task>,
+    /// The `[models]` name the task runs (`Task::model`); absent on a task
+    /// that runs none and on events with no task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub job: Option<String>,
     /// Set on `machine.*` events: the machine's status at that moment.
     pub machine: Option<MachineStatus>,
@@ -127,6 +131,7 @@ impl EventRecord {
             detail: ev.detail.clone(),
             at: Utc::now(),
             kind: ev.kind.clone(),
+            model: task.as_ref().and_then(|t| t.model().map(str::to_string)),
             task,
             job,
             machine,
@@ -716,6 +721,7 @@ mod tests {
             task: task.cloned(),
             job: task.map(|t| t.job.clone()),
             machine: None,
+            model: None,
         }
     }
 

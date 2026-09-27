@@ -16,8 +16,8 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`). 2: flock agents and tool
 /// lists. 3: `TaskRetry::place`. 4: `EventsSince`. 5: flock and machine
 /// edits (`FLEET_EDIT_PROTOCOL`). 6: `FileGet`, `FilePut`, `JobDescribe`,
-/// `JobSetEnabled`. 7: `JobSubmit`.
-pub const IPC_PROTOCOL: u32 = 7;
+/// `JobSetEnabled`. 7: `JobSubmit`. 8: named models (`AgentChoice::model`).
+pub const IPC_PROTOCOL: u32 = 8;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -57,6 +57,11 @@ pub const FILE_PROTOCOL: u32 = 6;
 /// The first protocol whose head knows `JobSubmit`. An older one refuses the
 /// request as unreadable; `check_protocol` says why before it is sent.
 pub const JOB_SUBMIT_PROTOCOL: u32 = 7;
+
+/// The first protocol whose head runs a task's named model (`--model`, a
+/// flock's or job's `model`). An older one would drop it and start the agent
+/// on its default model without a word.
+pub const MODEL_PROTOCOL: u32 = 8;
 
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.
@@ -737,6 +742,7 @@ mod tests {
                     job: Some("run".into()),
                     machine: None,
                     detail: None,
+                    model: None,
                 }],
                 gap: false,
                 oldest: Some(812),
@@ -913,6 +919,7 @@ mod tests {
                     flock: None,
                     agent: None,
                     agent_args: None,
+                    model: None,
                 },
             },
             IpcRequest::MachineRemove { name: "m".into() },

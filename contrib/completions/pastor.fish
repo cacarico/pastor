@@ -64,6 +64,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l machine -d 'Run it on this machine (a name from flock.toml) instead of any free one' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l agent -d 'The agent command to start, like claude or codex (default: the machine\'s, else its flock\'s, else `[defaults]`, else claude)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l agent-arg -d 'One argument for the agent; repeat it, in order, for more. Replaces the flock\'s and `[defaults]` agent_args. The next word is always the value, dashes and all' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l model -d 'Run this model, a name from `[models]` in pastor.toml; its args go before the agent\'s (default: the machine\'s, else its flock\'s, else `[defaults] model`, else none)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l branch -d 'Branch for the worktree (needs --worktree; a plain workspace has no branch)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l tag -d 'Only a machine with this tag takes the task; repeat for more, and it needs them all' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l timeout -d 'Mark the task stale once it has run this long (30m, 2h; default: `[defaults]` timeout)' -r
@@ -421,4 +422,4 @@ function __fish_pastor_names
 end
 
 complete -c pastor -n __fish_pastor_names -k -f -a '(printf "%s\n" $__fish_pastor_names)'
-complete -c pastor -n __fish_pastor_names -l flock -l job -l machine -l task -r -k -f -a '(printf "%s\n" $__fish_pastor_names)'
+complete -c pastor -n __fish_pastor_names -l flock -l job -l machine -l model -l task -r -k -f -a '(printf "%s\n" $__fish_pastor_names)'

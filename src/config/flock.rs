@@ -36,6 +36,10 @@ pub struct MachineConfig {
     /// Like `agent`, for the agent's args; `[]` means none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_args: Option<Vec<String>>,
+    /// The `[models]` name for tasks on this machine that name none, before
+    /// its flock's and `[defaults]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
@@ -64,6 +68,10 @@ pub struct FlockEntry {
     /// Tool patterns this flock's agents must not use, on top of `[defaults]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// The `[models]` name for this flock's tasks that name none, before
+    /// `[defaults] model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Why a task cannot have the flock it asked for (`Flock::task_flock`).
@@ -149,6 +157,9 @@ impl Flock {
             }
             crate::config::check_tools(&format!("flock {}: allow", f.name), &f.allow)?;
             crate::config::check_tools(&format!("flock {}: deny", f.name), &f.deny)?;
+            if let Some(m) = &f.model {
+                crate::config::check_model_name(m).map_err(|e| format!("flock {}: {e}", f.name))?;
+            }
         }
         if !self.flocks.is_empty() {
             let defaults: Vec<&str> = self
@@ -198,6 +209,10 @@ impl Flock {
                     m.name, m.session
                 ));
             }
+            if let Some(model) = &m.model {
+                crate::config::check_model_name(model)
+                    .map_err(|e| format!("machine {}: {e}", m.name))?;
+            }
             if m.max_agents == 0 {
                 return Err(format!("machine {}: max_agents must be at least 1", m.name));
             }
@@ -205,6 +220,22 @@ impl Flock {
                 && !self.has_flock(f)
             {
                 return Err(format!("machine {}: flock {f} is not declared", m.name));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a flock or machine `model` that `[models]` in pastor.toml
+    /// does not define. Apart from `validate` because the models live in the
+    /// other file; every caller that loads both runs it.
+    pub fn check_models(&self, models: &crate::config::Models) -> anyhow::Result<()> {
+        let flocks = self.flocks.iter().map(|f| ("flock", &f.name, &f.model));
+        let machines = self.machines.iter().map(|m| ("machine", &m.name, &m.model));
+        for (what, name, model) in flocks.chain(machines) {
+            if let Some(model) = model {
+                models
+                    .check(model)
+                    .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
             }
         }
         Ok(())
@@ -742,6 +773,7 @@ mod tests {
             flock: None,
             agent: None,
             agent_args: None,
+            model: None,
         }
     }
 
@@ -1281,6 +1313,40 @@ tags = ["fast"]
         std::fs::write(&path, "").unwrap();
         let f = Flock::load_existing(&path).unwrap();
         assert!(f.machines.is_empty());
+    }
+
+    /// A flock's or a machine's `model` must be a model name, and one that
+    /// pastor.toml's `[models]` defines.
+    #[test]
+    fn a_model_must_be_a_name_that_models_define() {
+        let flock = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"p\"\n"
+                ),
+            )
+        };
+        let err = format!("{:#}", flock("model = \"--model x\"").unwrap_err());
+        assert!(err.contains("flock p: model name"), "{err}");
+        let f = flock("model = \"sonnet\"").unwrap();
+        let models: crate::config::Models =
+            toml::from_str("[sonnet]\nkind = \"claude\"\nargs = []\n").unwrap();
+        f.check_models(&models).unwrap();
+        let err = f.check_models(&Default::default()).unwrap_err().to_string();
+        assert!(
+            err.contains("flock p: model sonnet is not in [models]"),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            Flock::parse(
+                Path::new("flock.toml"),
+                "[[machine]]\nname = \"m\"\nlocal = true\nmodel = \"A\"\n"
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("machine m: model name"), "{err}");
     }
 
     #[test]

@@ -4417,3 +4417,73 @@ fn head_set_refuses_a_head_that_does_not_answer() {
     assert_eq!(error_code(&c.cmd(&["task", "list"])), "no_head");
     assert_eq!(error_code(&c.cmd(&["task", "describe", "t-1"])), "no_head");
 }
+
+/// `--model` offers the `[models]` names, with their kind.
+#[test]
+fn complete_offers_model_names_after_model() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "[models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n\
+         [models.gpt]\nkind = \"codex\"\nargs = []\n",
+    )
+    .unwrap();
+    let (ok, out) = complete(&config, &state, &["task", "run", "--model", ""]);
+    assert!(ok);
+    assert_eq!(out, "gpt\tcodex\nsonnet\tclaude\n");
+}
+
+/// `--model sonnet` starts the agent with the model's args before its own,
+/// and describe, list and the JSON name it; a name `[models]` lacks, one of
+/// another kind than `--agent`, and raw args in `--model` are refused.
+#[test]
+fn a_named_model_reaches_herdr_and_bad_ones_are_refused() {
+    let env = start();
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [defaults]\nagent_args = [\"-v\"]\n\
+         [models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n",
+    )
+    .unwrap();
+    let out = env.cmd(&["task", "run", "hi", "--model", "sonnet", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["model"], "sonnet", "{task}");
+    let start = env.agent_start_params("t-1");
+    assert_eq!(
+        start["args"],
+        serde_json::json!(["--model", "claude-sonnet-5", "-v"]),
+        "{start}"
+    );
+    let out = env.cmd(&["task", "describe", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("model:      sonnet (from task run)\n"),
+        "{text}"
+    );
+    let out = env.cmd(&["task", "list", "--all"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines().next().unwrap().contains("AGENT   MODEL"),
+        "{text}"
+    );
+    assert!(text.contains("claude  sonnet"), "{text}");
+
+    for (args, code) in [
+        (&["--model", "haiku"][..], "unknown_model"),
+        (&["--model=--model claude-opus-5-5"], "unknown_model"),
+        (
+            &["--model", "sonnet", "--agent", "codex"],
+            "model_kind_mismatch",
+        ),
+    ] {
+        let out = env.cmd(&[&["task", "run", "x"][..], args].concat());
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(last_error(&out).0, code, "{args:?}");
+    }
+}

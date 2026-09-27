@@ -231,6 +231,13 @@ pub struct AgentSource {
     /// for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_args: Option<String>,
+    /// The `[models]` name the task runs, whose args lead `agent_args`;
+    /// `None` when no layer names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Where `model` came from, labelled like `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_from: Option<String>,
 }
 
 /// A worktree herdr made for a task: its branch and where it is on disk.
@@ -321,6 +328,21 @@ impl Task {
     }
     pub fn agent_name_for(id: i64) -> String {
         format!("t-{id}")
+    }
+    /// The `[models]` name the task runs, if it runs one.
+    pub fn model(&self) -> Option<&str> {
+        self.spec.agent_source.as_ref()?.model.as_deref()
+    }
+    /// The task as `--json` prints it: its row, with `model` beside it.
+    pub fn to_json(&self) -> Value {
+        let mut v = serde_json::to_value(self).unwrap_or(Value::Null);
+        if let Value::Object(o) = &mut v {
+            o.insert(
+                "model".into(),
+                self.model().map_or(Value::Null, Value::from),
+            );
+        }
+        v
     }
 }
 

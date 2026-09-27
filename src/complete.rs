@@ -23,6 +23,7 @@ pub enum Kind {
     Machine,
     Task,
     Connector,
+    Model,
 }
 
 /// The kind of name the argument `id` of the subcommand at `path` (canonical
@@ -35,6 +36,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         (_, "machine") => Some(Kind::Machine),
         (_, "task") => Some(Kind::Task),
         (_, "job") => Some(Kind::Job),
+        (_, "model") => Some(Kind::Model),
         (["connector", ..], "id") => Some(Kind::Connector),
         (["job", _], "name") => Some(Kind::Job),
         (["flock", _], "name") => Some(Kind::Flock),
@@ -162,6 +164,17 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
                 .collect()
         }
         Kind::Task => tasks(paths),
+        Kind::Model => {
+            let Ok(config) = crate::config::PastorConfig::load(&paths.config_file()) else {
+                return Vec::new();
+            };
+            config
+                .models
+                .0
+                .iter()
+                .map(|(name, m)| (name.clone(), Some(m.kind.clone())))
+                .collect()
+        }
     }
 }
 
