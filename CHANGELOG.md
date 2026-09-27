@@ -3,6 +3,15 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- `pastor flock default` is split in two: `pastor flock default show` prints
+  the default flock, and `pastor flock default set <name>` makes another flock
+  the default. The old `pastor flock default <name>` is gone. `show` reads
+  flock.toml only and never asks the head.
+
 ## 0.6.0 - 2026-09-26
 
 ### Added

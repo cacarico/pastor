@@ -1674,7 +1674,7 @@ fn flock_flags_refuse_a_head_from_before_flocks() {
     for args in [
         &["flock", "add", "work"][..],
         &["flock", "add", "work", "--default"],
-        &["flock", "default", "default"],
+        &["flock", "default", "set", "default"],
         &["flock", "remove", "default"],
         &["machine", "add", "pi-2", "--local"],
         &["machine", "move", "pi-1", "default"],
@@ -2163,9 +2163,9 @@ fn ok(out: std::process::Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// `flock default` with no name prints the default flock and edits nothing.
+/// `flock default show` prints the default flock and edits nothing.
 #[test]
-fn flock_default_with_no_name_prints_the_default() {
+fn flock_default_show_prints_the_default() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("c");
     let state = tmp.path().join("s");
@@ -2179,18 +2179,18 @@ fn flock_default_with_no_name_prints_the_default() {
             .unwrap()
     };
     // No flock.toml yet: the implicit flock.
-    assert_eq!(ok(run(&["flock", "default"])), "default\n");
+    assert_eq!(ok(run(&["flock", "default", "show"])), "default\n");
 
     let text = "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"work\"\n";
     std::fs::write(config.join("flock.toml"), text).unwrap();
-    assert_eq!(ok(run(&["flock", "default"])), "home\n");
+    assert_eq!(ok(run(&["flock", "default", "show"])), "home\n");
     assert_eq!(
         std::fs::read_to_string(config.join("flock.toml")).unwrap(),
         text
     );
 
-    ok(run(&["flock", "default", "work"]));
-    assert_eq!(ok(run(&["flock", "default"])), "work\n");
+    ok(run(&["flock", "default", "set", "work"]));
+    assert_eq!(ok(run(&["flock", "default", "show"])), "work\n");
 }
 
 /// `flock` and `machine move` edit flock.toml in place: what they do not
@@ -2290,9 +2290,9 @@ fn flock_commands_edit_the_file_and_keep_its_comments() {
     assert_eq!(list[1]["name"], "play");
     assert_eq!(list[1]["default"], true);
     assert_eq!(list[0]["machines"], serde_json::json!(["pi-1", "pi-3"]));
-    ok(run(&["flock", "default", "default"]));
+    ok(run(&["flock", "default", "set", "default"]));
     assert_eq!(
-        error_code(&run(&["flock", "default", "nope"])),
+        error_code(&run(&["flock", "default", "set", "nope"])),
         "unknown_flock"
     );
     assert!(file().contains("# desk"), "{}", file());
@@ -3571,7 +3571,7 @@ fn complete_offers_flock_names() {
     let (_tmp, config, state) = completion_config();
     for words in [
         &["flock", "describe", ""][..],
-        &["flock", "default", ""],
+        &["flock", "default", "set", ""],
         &["machine", "move", "pi-1", ""],
         &["task", "run", "fix it", "--flock", ""],
     ] {

@@ -38,6 +38,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         (["connector", ..], "id") => Some(Kind::Connector),
         (["job", _], "name") => Some(Kind::Job),
         (["flock", _], "name") => Some(Kind::Flock),
+        (["flock", "default", "set"], "name") => Some(Kind::Flock),
         (["machine", _], "name") => Some(Kind::Machine),
         _ => None,
     }

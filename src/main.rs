@@ -287,6 +287,14 @@ enum MachineCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum FlockDefaultCmd {
+    /// Print the default flock
+    Show,
+    /// Make another flock the default; machines stay in their flocks
+    Set { name: String },
+}
+
+#[derive(Subcommand, Debug)]
 enum FlockCmd {
     /// Every flock: default or not, its machines, live agents, queued tasks
     List {
@@ -301,9 +309,11 @@ enum FlockCmd {
     },
     /// Remove a flock; refused while it has machines or queued tasks, or is the default
     Remove { name: String },
-    /// Print the default flock; with a name, make that one the default
-    /// (machines stay in their flocks)
-    Default { name: Option<String> },
+    /// The flock that new tasks and jobs go to
+    Default {
+        #[command(subcommand)]
+        cmd: FlockDefaultCmd,
+    },
     /// Open flock.toml in $VISUAL or $EDITOR; save it only once it is valid
     Edit,
     /// One flock in full: default or not, its agent, machines, live tasks
@@ -567,10 +577,14 @@ fn head_use(command: &Command) -> Option<bool> {
             MachineCmd::Describe { .. } => false,
             _ => true,
         }),
-        Command::Flock { cmd } => Some(!matches!(
-            cmd,
-            FlockCmd::List { .. } | FlockCmd::Describe { .. } | FlockCmd::Default { name: None }
-        )),
+        Command::Flock { cmd } => match cmd {
+            // Reads flock.toml and nothing else: no head to ask.
+            FlockCmd::Default {
+                cmd: FlockDefaultCmd::Show,
+            } => None,
+            FlockCmd::List { .. } | FlockCmd::Describe { .. } => Some(false),
+            _ => Some(true),
+        },
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
         Command::Connector { cmd } => {
             (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Run { .. })).then_some(false)
@@ -605,7 +619,11 @@ fn changes_fleet(command: &Command) -> bool {
         }
         Command::Flock { cmd } => !matches!(
             cmd,
-            FlockCmd::List { .. } | FlockCmd::Describe { .. } | FlockCmd::Default { name: None }
+            FlockCmd::List { .. }
+                | FlockCmd::Describe { .. }
+                | FlockCmd::Default {
+                    cmd: FlockDefaultCmd::Show
+                }
         ),
         Command::Tick(_) => true,
         Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. } | JobCmd::Describe { .. }),
@@ -1343,11 +1361,15 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
             edit(&|d| d.remove_flock(&name, &queued))?;
             format!("removed flock {name}")
         }
-        FlockCmd::Default { name: None } => {
+        FlockCmd::Default {
+            cmd: FlockDefaultCmd::Show,
+        } => {
             println!("{}", Flock::load(&path)?.default_flock());
             return Ok(());
         }
-        FlockCmd::Default { name: Some(name) } => {
+        FlockCmd::Default {
+            cmd: FlockDefaultCmd::Set { name },
+        } => {
             edit(&|d| d.set_default(&name))?;
             format!("{name} is the default flock; machines stay in their flocks")
         }
