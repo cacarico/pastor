@@ -1330,7 +1330,77 @@ impl Daemon {
                     Err(err) => IpcResponse::error("store_error", err),
                 }
             }
+            IpcRequest::TrustList => match self.store.trusted_repos() {
+                Ok(list) => IpcResponse::Trusted(list),
+                Err(err) => IpcResponse::error("store_error", err),
+            },
+            IpcRequest::TrustAdd { machine, repo } => {
+                match self.store.trust_repo(&machine, &repo) {
+                    Ok(true) => IpcResponse::Text(format!("{repo} on {machine} is trusted")),
+                    Ok(false) => {
+                        IpcResponse::Text(format!("{repo} on {machine} was already trusted"))
+                    }
+                    Err(err) => IpcResponse::error("store_error", err),
+                }
+            }
+            IpcRequest::TrustRemove { machine, repo } => {
+                match self.store.untrust(&machine, &repo) {
+                    Ok(true) => {
+                        IpcResponse::Text(format!("{repo} on {machine} is no longer trusted"))
+                    }
+                    Ok(false) => IpcResponse::error(
+                        "not_trusted",
+                        format!("{repo} on {machine} is not trusted"),
+                    ),
+                    Err(err) => IpcResponse::error("store_error", err),
+                }
+            }
+            IpcRequest::FlockDescribe { name } => self.describe_flock(&name),
+            IpcRequest::MachineDescribe { name } => self.describe_machine(&name),
         }
+    }
+
+    /// `FlockDescribe`: from the flock last applied and the live agents,
+    /// not from flock.toml as it reads now.
+    fn describe_flock(&self, name: &str) -> IpcResponse {
+        let flock = self.fleet.flock();
+        if !flock.has_flock(name) {
+            return IpcResponse::error("unknown_flock", format!("no flock {name}"));
+        }
+        let tasks = match self.store.list_tasks(&crate::describe::flock_tasks(name)) {
+            Ok(ts) => ts,
+            Err(err) => return IpcResponse::error("store_error", err),
+        };
+        let statuses = self.fleet.statuses();
+        match crate::describe::flock_description(&flock, name, Some(&statuses), tasks) {
+            Some(d) => IpcResponse::FlockDescription(d),
+            None => IpcResponse::error("unknown_flock", format!("no flock {name}")),
+        }
+    }
+
+    /// `MachineDescribe`: one of the head's machines, as its actor sees it.
+    fn describe_machine(&self, name: &str) -> IpcResponse {
+        let unknown =
+            || IpcResponse::error("unknown_machine", format!("no machine {name} in the flock"));
+        let flock = self.fleet.flock();
+        let Some(m) = flock.get(name) else {
+            return unknown();
+        };
+        let Some(status) = self.fleet.statuses().into_iter().find(|s| s.name == name) else {
+            return unknown();
+        };
+        let tasks = match self.store.list_tasks(&crate::describe::machine_tasks(name)) {
+            Ok(ts) => ts,
+            Err(err) => return IpcResponse::error("store_error", err),
+        };
+        // A description is still worth sending without the log.
+        let events = crate::events::read(&self.paths.events_file(), None).unwrap_or_default();
+        IpcResponse::MachineDescription(crate::describe::MachineDescription {
+            row: crate::cli::MachineRow::from(&status),
+            session: m.session.clone(),
+            tasks,
+            recent_errors: crate::describe::machine_errors(events, name),
+        })
     }
 
     /// `TaskSend`: through the actor of the task's machine, which checks the
@@ -2048,6 +2118,88 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         (d, tmp)
+    }
+
+    #[tokio::test]
+    async fn trust_is_listed_added_and_removed_on_the_head() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let add = || IpcRequest::TrustAdd {
+            machine: "a".into(),
+            repo: "/r".into(),
+        };
+        let resp = d.handle(add()).await;
+        assert!(
+            matches!(&resp, IpcResponse::Text(t) if t == "/r on a is trusted"),
+            "{resp:?}"
+        );
+        let resp = d.handle(add()).await;
+        assert!(
+            matches!(&resp, IpcResponse::Text(t) if t.contains("already")),
+            "{resp:?}"
+        );
+        let IpcResponse::Trusted(list) = d.handle(IpcRequest::TrustList).await else {
+            panic!()
+        };
+        assert_eq!(list.len(), 1);
+        assert!(d.store.is_trusted("a", "/r").unwrap());
+        let remove = || IpcRequest::TrustRemove {
+            machine: "a".into(),
+            repo: "/r".into(),
+        };
+        assert!(matches!(d.handle(remove()).await, IpcResponse::Text(_)));
+        let resp = d.handle(remove()).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "not_trusted"),
+            "{resp:?}"
+        );
+        let IpcResponse::Trusted(list) = d.handle(IpcRequest::TrustList).await else {
+            panic!()
+        };
+        assert!(list.is_empty());
+    }
+
+    /// The head describes from the flock it applied, not from flock.toml as
+    /// it reads now: a file that does not load leaves the last one in use.
+    #[tokio::test]
+    async fn describe_answers_from_the_applied_flock() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        std::fs::write(d.paths.flock_file(), "not [[ toml").unwrap();
+        let resp = d
+            .handle(IpcRequest::MachineDescribe { name: "a".into() })
+            .await;
+        let IpcResponse::MachineDescription(m) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(m.row.name, "a");
+        assert_eq!(m.row.channel, "connected");
+        assert_eq!(m.row.live, Some(0));
+        let resp = d
+            .handle(IpcRequest::MachineDescribe { name: "b".into() })
+            .await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "unknown_machine"),
+            "{resp:?}"
+        );
+        let resp = d
+            .handle(IpcRequest::FlockDescribe {
+                name: "default".into(),
+            })
+            .await;
+        let IpcResponse::FlockDescription(f) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(f.default);
+        assert_eq!(f.machines, ["a"]);
+        assert_eq!(f.agents, Some(0));
+        let resp = d
+            .handle(IpcRequest::FlockDescribe {
+                name: "nope".into(),
+            })
+            .await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "unknown_flock"),
+            "{resp:?}"
+        );
     }
 
     #[tokio::test]

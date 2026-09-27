@@ -3,6 +3,24 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- `pastor trust add <machine> <repo>` saves a folder trust without a blocked
+  task.
+
+### Changed
+
+- With a head running, `pastor trust list|add|remove`, `pastor flock
+  describe` and `pastor machine describe` ask it (new requests, IPC protocol
+  4) instead of reading the local store and `flock.toml`, so a CLI on
+  another machine gets the head's answer. The two describes show the flock
+  the head last applied. A head from before this is refused with
+  `head_too_old`; with no head the commands work as before. `trust add` and
+  `trust remove` now count as changing the fleet, so an agent pastor started
+  is refused them unless `agents_change_fleet` is on.
+
 ## 0.6.0 - 2026-09-26
 
 ### Added

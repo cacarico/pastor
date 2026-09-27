@@ -14,8 +14,8 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// field an older head would silently ignore (serde skips unknown fields), so
 /// the CLI can refuse to send it there. A head that answers no protocol is 0.
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`). 2: flock agents and tool
-/// lists. 3: `TaskRetry::place`.
-pub const IPC_PROTOCOL: u32 = 3;
+/// lists. 3: `TaskRetry::place`. 4: the trust and describe requests.
+pub const IPC_PROTOCOL: u32 = 4;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -39,6 +39,12 @@ pub const AGENT_PROTOCOL: u32 = 2;
 /// The first protocol whose head honours `TaskRetry::place`. An older one
 /// would retry the task with its original place, and say it succeeded.
 pub const PLACE_PROTOCOL: u32 = 3;
+
+/// The first protocol whose head answers `TrustList`, `TrustAdd`,
+/// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. An older one reads
+/// them as an unknown request and answers `invalid_request`, so the CLI
+/// refuses it with `head_too_old` first.
+pub const HEAD_READS_PROTOCOL: u32 = 4;
 
 // One request is read per connection and dropped once answered, so the
 // size of the largest variant (`Run`) costs nothing worth a box.
@@ -124,6 +130,28 @@ pub enum IpcRequest {
         states: Vec<TaskState>,
         older_than_secs: u64,
     },
+    /// Every saved folder trust. Answers `Trusted`.
+    TrustList,
+    /// Save `repo` on `machine` as trusted. Answers `Text`.
+    TrustAdd {
+        machine: String,
+        repo: String,
+    },
+    /// Forget a saved trust. Answers `Text`, or `not_trusted`.
+    TrustRemove {
+        machine: String,
+        repo: String,
+    },
+    /// `flock describe`, from the flock the head last applied. Answers
+    /// `FlockDescription`.
+    FlockDescribe {
+        name: String,
+    },
+    /// `machine describe`, from the head's machines. Answers
+    /// `MachineDescription`.
+    MachineDescribe {
+        name: String,
+    },
 }
 
 impl IpcRequest {
@@ -138,7 +166,10 @@ impl IpcRequest {
             | IpcRequest::TaskShow { .. }
             | IpcRequest::TaskRead { .. }
             | IpcRequest::FlockList
-            | IpcRequest::JobList => false,
+            | IpcRequest::JobList
+            | IpcRequest::TrustList
+            | IpcRequest::FlockDescribe { .. }
+            | IpcRequest::MachineDescribe { .. } => false,
             IpcRequest::Reload
             | IpcRequest::Tick { .. }
             | IpcRequest::Run { .. }
@@ -148,7 +179,9 @@ impl IpcRequest {
             | IpcRequest::TaskClose { .. }
             | IpcRequest::TaskSend { .. }
             | IpcRequest::TaskDone { .. }
-            | IpcRequest::TaskPrune { .. } => true,
+            | IpcRequest::TaskPrune { .. }
+            | IpcRequest::TrustAdd { .. }
+            | IpcRequest::TrustRemove { .. } => true,
         }
     }
 
@@ -233,6 +266,9 @@ pub enum IpcResponse {
     Runs(Vec<JobRunReport>),
     Jobs(Vec<JobStatus>),
     Pruned(crate::store::PruneOutcome),
+    Trusted(Vec<crate::store::TrustedRepo>),
+    FlockDescription(crate::describe::FlockDescription),
+    MachineDescription(crate::describe::MachineDescription),
 }
 
 impl IpcResponse {
@@ -605,6 +641,9 @@ mod tests {
             IpcRequest::TaskRead { id: 1, lines: 5 },
             IpcRequest::FlockList,
             IpcRequest::JobList,
+            IpcRequest::TrustList,
+            IpcRequest::FlockDescribe { name: "f".into() },
+            IpcRequest::MachineDescribe { name: "m".into() },
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -640,6 +679,14 @@ mod tests {
             },
             IpcRequest::Reload,
             IpcRequest::JobRun { name: "j".into() },
+            IpcRequest::TrustAdd {
+                machine: "m".into(),
+                repo: "/r".into(),
+            },
+            IpcRequest::TrustRemove {
+                machine: "m".into(),
+                repo: "/r".into(),
+            },
         ];
         for req in changes {
             assert!(req.changes_fleet(), "{req:?}");

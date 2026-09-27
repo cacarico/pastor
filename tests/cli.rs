@@ -3299,6 +3299,68 @@ fn describe_a_machine_and_its_flock_with_a_head() {
     assert_eq!(f["default"], true);
     assert_eq!(f["machines"], serde_json::json!(["fake"]));
     assert!(f["agents"].is_u64(), "a head knows the live agents: {f}");
+
+    // A flock.toml that no longer loads leaves the head's flock in use, and
+    // the CLI describes that one, not the file.
+    std::fs::write(env.config.join("flock.toml"), "not [[ toml").unwrap();
+    let m: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["machine", "describe", "fake", "--json"]))).unwrap();
+    assert_eq!(m["channel"], "connected");
+    assert_eq!(m["tasks"][0]["id"], t["id"]);
+    let f: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["flock", "describe", "default", "--json"]))).unwrap();
+    assert_eq!(f["machines"], serde_json::json!(["fake"]));
+    assert_eq!(
+        error_code(&env.cmd(&["machine", "describe", "nope"])),
+        "unknown_machine"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["flock", "describe", "nope"])),
+        "unknown_flock"
+    );
+}
+
+/// With a head running, `trust` goes through it: the CLI works with the
+/// store out of its reach, as it is on another machine.
+#[test]
+fn trust_add_list_and_remove_go_through_the_head() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = start();
+    let db = env.state.join("pastor.db");
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let text = ok(env.cmd(&["trust", "add", "fake", "/tmp/app"]));
+    assert!(text.contains("/tmp/app on fake is trusted"), "{text}");
+    let list: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["trust", "list", "--json"]))).unwrap();
+    assert_eq!(list[0]["machine"], "fake", "{list}");
+    assert_eq!(list[0]["repo"], "/tmp/app", "{list}");
+    assert!(ok(env.cmd(&["trust", "list"])).contains("/tmp/app"));
+    ok(env.cmd(&["trust", "remove", "fake", "/tmp/app"]));
+    assert_eq!(
+        error_code(&env.cmd(&["trust", "remove", "fake", "/tmp/app"])),
+        "not_trusted"
+    );
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn trust_add_list_and_remove_without_a_head() {
+    let o = offline();
+    let text = ok(o.cmd(&["trust", "add", "pi-1", "/srv/app"]));
+    assert!(text.contains("/srv/app on pi-1 is trusted"), "{text}");
+    let text = ok(o.cmd(&["trust", "add", "pi-1", "/srv/app"]));
+    assert!(text.contains("already"), "{text}");
+    let list: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["trust", "list", "--json"]))).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list[0]["machine"], "pi-1");
+    assert!(list[0]["trusted_at"].is_string(), "{list}");
+    ok(o.cmd(&["trust", "remove", "pi-1", "/srv/app"]));
+    assert_eq!(
+        error_code(&o.cmd(&["trust", "remove", "pi-1", "/srv/app"])),
+        "not_trusted"
+    );
+    assert!(ok(o.cmd(&["trust", "list"])).contains("no trusted repos"));
 }
 
 /// clap leaves a visible alias out of the `help` subtree, so `pastor help
