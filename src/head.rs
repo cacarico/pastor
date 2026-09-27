@@ -60,7 +60,12 @@ pub struct RemoteHead {
     pub ssh: String,
     pub pastor: String,
     pub source: HeadSource,
-    /// The directory ssh's `ControlPath` lives in: the state dir.
+    /// ssh's `ControlPath` for this head, under the state dir. Built by
+    /// `Paths::ssh_control_path`, which escapes a `%` in the state dir so ssh
+    /// does not expand it as one of its own tokens.
+    control_path: PathBuf,
+    /// The directory the control socket lives in, created private before ssh
+    /// runs.
     control_dir: PathBuf,
 }
 
@@ -156,25 +161,32 @@ impl RemoteHead {
             ssh: ssh.to_string(),
             pastor: pastor.unwrap_or_else(|| DEFAULT_PASTOR.to_string()),
             source,
-            control_dir: paths.state_dir.clone(),
+            control_path: paths.ssh_control_path("head"),
+            control_dir: paths.ssh_dir(),
         }
     }
 
-    /// The ssh command line, after `ssh`. The last word goes to the remote
-    /// shell as is, so a `~` in pastor's path expands there.
+    /// The ssh command line, after `ssh`. `--` keeps `self.ssh` from ever being
+    /// read as an option (a `PASTOR_HEAD` or `client.toml` value starting with
+    /// `-`), and the remote command is quoted for the login shell that parses
+    /// it, the same way the machine transport does.
     pub fn ssh_args(&self) -> Vec<String> {
         let mut args = Vec::new();
         for opt in [
             "BatchMode=yes".to_string(),
             "ControlMaster=auto".to_string(),
             "ControlPersist=60s".to_string(),
-            format!("ControlPath={}", self.control_dir.join("ssh-%C").display()),
+            format!("ControlPath={}", self.control_path.display()),
         ] {
             args.push("-o".to_string());
             args.push(opt);
         }
+        args.push("--".to_string());
         args.push(self.ssh.clone());
-        args.push(format!("{} bridge", self.pastor));
+        args.push(crate::herdr::transport::posix_command(&format!(
+            "{} bridge",
+            self.pastor
+        )));
         args
     }
 
@@ -458,7 +470,7 @@ mod tests {
         let (_tmp, p) = paths();
         let h = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File);
         let args = h.ssh_args();
-        let control = format!("ControlPath={}", p.state_dir.join("ssh-%C").display());
+        let control = format!("ControlPath={}", p.ssh_control_path("head").display());
         for opt in [
             "BatchMode=yes",
             "ControlMaster=auto",
@@ -470,6 +482,18 @@ mod tests {
                 "{opt}: {args:?}"
             );
         }
-        assert_eq!(&args[args.len() - 2..], ["user@pi-1", "pastor bridge"]);
+        assert_eq!(
+            &args[args.len() - 3..],
+            ["--", "user@pi-1", "sh -c 'pastor bridge'"]
+        );
+    }
+
+    #[test]
+    fn ssh_args_never_reads_a_dash_prefixed_destination_as_an_option() {
+        let (_tmp, p) = paths();
+        let h = RemoteHead::new(&p, "-oProxyCommand=evil", None, HeadSource::File);
+        let args = h.ssh_args();
+        let dash_pos = args.iter().position(|a| a == "--").expect("has --");
+        assert_eq!(args[dash_pos + 1], "-oProxyCommand=evil");
     }
 }
