@@ -48,17 +48,36 @@ repository they work on.
 
 **Push with a deploy key, not your account's key.** Your account's ssh key
 can push to every repository you own. A deploy key belongs to one repository.
-On the machine, make a key, add it to `you/app` under Settings, then Deploy
-keys, with write access, and check it:
+On the machine, make a key under its own name, and add it to `you/app` under
+Settings, then Deploy keys, with write access:
 
 ```bash
-ssh user@pi-1 'ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C pi-1-app && cat ~/.ssh/id_ed25519.pub'
-ssh user@pi-1 'ssh -T git@github.com'    # "Hi you/app!" means a deploy key; "Hi you!" means your account
+ssh user@pi-1 'ssh-keygen -t ed25519 -N "" -f ~/.ssh/app_deploy -C pi-1-app && cat ~/.ssh/app_deploy.pub'
 ```
 
-GitHub refuses a key that is already on your account, so remove it there
-first. Your branch rules still apply to a deploy key: with a pull request
-required on `main`, agents can push branches but not `main`.
+Then make the clone use that key and no other. In the machine's
+`~/.ssh/config`:
+
+```text
+Host github-app
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/app_deploy
+  IdentitiesOnly yes
+```
+
+```bash
+ssh user@pi-1 'git -C ~/app remote set-url origin git@github-app:you/app.git'
+ssh user@pi-1 'ssh -T git@github-app'    # "Hi you/app!": the deploy key
+ssh user@pi-1 'ssh -T git@github.com'    # should fail; "Hi you!" means an account key is still there
+```
+
+`IdentitiesOnly` stops ssh from offering other keys, such as ones in an
+ssh-agent. An account key left on the machine still reaches every repository,
+so remove it from the machine and from your account. GitHub also refuses a
+deploy key that is already on your account. Your branch rules still apply to
+a deploy key: with a pull request required on `main`, agents can push
+branches but not `main`.
 
 **Give `gh` a fine-grained token for that repository alone.** A token from
 `gh auth login` reaches every repository. Make one under Settings, then
@@ -70,13 +89,16 @@ Developer settings, then Fine-grained tokens:
 - An expiry (90 days, say), and a calendar reminder to renew it.
 
 With Contents read-only, `gh` on that machine can open pull requests,
-comment, reply to and resolve review threads, and read CI, but it cannot
-merge: merging needs Contents write. Pushes still work, through the deploy
-key. Keep merging on the head, where you or your own review gate decide.
+comment, reply to and resolve review threads, and read Actions runs, but it
+cannot merge: merging needs Contents write. Pushes still work, through the
+deploy key. Keep merging on the head, where you or your own review gate
+decide. Fine-grained tokens have no Checks permission, so check runs from
+apps other than Actions may be out of its reach.
 
 ```bash
 ssh -t user@pi-1 'gh auth logout --hostname github.com; gh auth login --hostname github.com --with-token'
 ssh user@pi-1 'gh pr list --repo you/app --limit 1'     # works
+ssh user@pi-1 'gh run list --repo you/app --limit 1'    # works: CI through Actions
 ssh user@pi-1 'gh repo view you/other'                  # fails: out of reach
 ```
 
@@ -136,14 +158,19 @@ system asks before a command, the task sits `blocked` until someone answers.
 ## Fresh code for every task
 
 `--worktree` branches from the clone's local `HEAD`. Pull requests merged on
-GitHub don't move it, so a task can start from code days old. Start each
-task's prompt, or each job's prompt template, with:
+GitHub don't move it, so a task can start from code days old. For a
+`--worktree` task, whose worktree and branch are new and hold nothing yet,
+start the prompt, or the job's prompt template, with:
 
 ```text
 First run `git fetch origin` and `git reset --hard origin/main`.
 ```
 
-For a review, fetch and check out the pull request's branch the same way.
+Use your default branch's name in place of `main`. Never put this in a task
+without `--worktree`: it runs in your existing clone, and the reset throws
+away whatever is uncommitted there. Pull that clone yourself instead.
+
+For a review, fetch and check out the pull request's branch.
 
 ## Keep slots free
 
