@@ -2444,8 +2444,13 @@ impl Actor {
         let timeout = self.settings.request_timeout;
         match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
             Ok(Ok(text)) => {
-                self.store.note_pane_tail(task.id, &text);
-                Ok(crate::task::trailing_question(&text))
+                // Kept only when the task really is done: a tail left by a
+                // question would reach a later failed task's finish command.
+                let question = crate::task::trailing_question(&text);
+                if question.is_none() {
+                    self.store.note_pane_tail(task.id, &text);
+                }
+                Ok(question)
             }
             Ok(Err(err)) if err.is_transport() => Err(err.into()),
             Ok(Err(err)) => {

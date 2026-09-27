@@ -285,7 +285,8 @@ struct Work {
 pub const HOOK_QUEUE_MAX: usize = 256;
 
 /// One connector's pending records. Full, it drops the oldest: hooks are
-/// notifications, and the newest state matters more than a backlog.
+/// notifications, and the newest state matters more than a backlog. Work
+/// carrying a finish command is kept over plain notifications.
 struct Queue {
     connector: String,
     max: usize,
@@ -310,7 +311,16 @@ impl Queue {
     fn push(&self, work: Work) {
         let mut st = self.lock();
         if st.items.len() >= self.max {
-            st.items.pop_front();
+            // A finish command runs once per task and is marked as queued, so
+            // it is never the one evicted; only when it is the newcomer and
+            // the queue holds nothing else droppable does the queue grow.
+            match st.items.iter().position(|w| w.finish.is_none()) {
+                Some(at) => {
+                    st.items.remove(at);
+                }
+                None if work.finish.is_none() => return,
+                None => {}
+            }
             st.dropped += 1;
             if st.dropped == 1 {
                 tracing::warn!(

@@ -249,7 +249,17 @@ pub fn spawn_log(
                         tracing::error!(%err, "events log: write failed");
                     }
                     if let Some(tx) = &forward {
-                        match tx.try_send(rec) {
+                        // A finish command hangs on these two: wait for room
+                        // rather than lose them (the runner drains at once).
+                        let vital = matches!(rec.kind.as_str(), "task.done" | "task.failed");
+                        let sent = if vital {
+                            tx.send(rec)
+                                .await
+                                .map_err(|e| mpsc::error::TrySendError::Closed(e.0))
+                        } else {
+                            tx.try_send(rec)
+                        };
+                        match sent {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(rec)) => {
                                 tracing::warn!(
@@ -938,7 +948,7 @@ mod tests {
         // Fill the one slot up front, so the log task's own send finds it full.
         fwd.try_send(record("task.queued", Some(&t))).unwrap();
         let log = spawn_log(path.clone(), DEFAULT_MAX_BYTES, store, None, rx, Some(fwd));
-        tx.send(ev("task.done", Some(t.id), None, None)).unwrap();
+        tx.send(ev("task.blocked", Some(t.id), None, None)).unwrap();
         drop(tx);
         tokio::time::timeout(Duration::from_secs(5), log)
             .await
@@ -947,11 +957,39 @@ mod tests {
         // The write to events.jsonl happened regardless of the full queue.
         let recs = read(&path, None).unwrap();
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].kind, "task.done");
+        assert_eq!(recs[0].kind, "task.blocked");
         // Only the pre-filled record made it to the hooks side; the log
         // task's own record was dropped for hooks, not queued or blocked on.
         assert_eq!(hooks_rx.try_recv().unwrap().kind, "task.queued");
         assert!(hooks_rx.try_recv().is_err());
+    }
+
+    /// A record a finish command hangs on is not dropped for a full queue:
+    /// the log task waits for room and the record reaches the hooks side.
+    #[tokio::test]
+    async fn a_finishing_record_waits_for_room_in_the_hooks_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (store, t) = store_with_task("triage");
+        let (tx, rx) = broadcast::channel(16);
+        let (fwd, mut hooks_rx) = mpsc::channel(1);
+        fwd.try_send(record("task.queued", Some(&t))).unwrap();
+        let log = spawn_log(
+            path,
+            DEFAULT_MAX_BYTES,
+            Arc::new(store),
+            None,
+            rx,
+            Some(fwd),
+        );
+        tx.send(ev("task.done", Some(t.id), None, None)).unwrap();
+        drop(tx);
+        assert_eq!(hooks_rx.recv().await.unwrap().kind, "task.queued");
+        assert_eq!(hooks_rx.recv().await.unwrap().kind, "task.done");
+        tokio::time::timeout(Duration::from_secs(5), log)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     /// The log task must not keep the fleet alive: the fleet holds the machine
