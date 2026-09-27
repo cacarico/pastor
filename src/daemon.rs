@@ -1401,6 +1401,12 @@ impl Daemon {
                 Ok(Err(reason)) => IpcResponse::error("job_not_found", reason),
                 Err(err) => IpcResponse::error("scheduler_error", err),
             },
+            IpcRequest::JobSubmit {
+                job,
+                dispatch,
+                prompt,
+                items,
+            } => self.submit(job, dispatch, prompt, items).await,
             IpcRequest::TaskRetry { id, place } => self.retry(id, place).await,
             IpcRequest::TaskClose {
                 id,
@@ -1506,6 +1512,44 @@ impl Daemon {
         match self.scheduler.reload().await {
             Ok(_) => "the running pastor serve picked it up".into(),
             Err(err) => format!("the reload after it failed ({err}); run `pastor job reload`"),
+        }
+    }
+
+    /// `JobSubmit`: the scheduler builds the job, so the job files and
+    /// `[defaults]` it checks against are the ones it runs with; the items
+    /// are queued here, off its loop, and dispatched like a run's.
+    async fn submit(
+        &self,
+        name: String,
+        dispatch: serde_json::Value,
+        prompt: String,
+        items: Vec<serde_json::Value>,
+    ) -> IpcResponse {
+        let job = match self.scheduler.submitted(name, dispatch, prompt).await {
+            Ok(Ok(job)) => job,
+            Ok(Err((code, message))) => return IpcResponse::error(&code, message),
+            Err(err) => return IpcResponse::error("scheduler_error", err),
+        };
+        let out =
+            crate::scheduler::submit_items(&self.fleet, &self.store, &self.events, &job, &items)
+                .await;
+        // The name is reserved from the moment the scheduler builds the
+        // `Job`, above, so a concurrent job-file reload or scheduled run
+        // cannot mix its tasks and `seen` keys with this job's until now.
+        self.scheduler.released(job.name.clone()).await;
+        if !out.tasks.is_empty() {
+            self.fleet.dispatch_queued().await;
+        }
+        // As queued: dispatch may have moved them on since.
+        let tasks = out
+            .tasks
+            .into_iter()
+            .map(|t| self.store.get_task(t.id).ok().flatten().unwrap_or(t))
+            .collect();
+        IpcResponse::JobSubmitted {
+            tasks,
+            skipped: out.skipped,
+            refused: out.refused,
         }
     }
 
@@ -2224,6 +2268,127 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         (d, tmp)
+    }
+
+    /// `JobSubmit` queues another machine's items as this head's own job
+    /// would: rendered the same, deduplicated by `seen`, capped by
+    /// `max_tasks_per_run`, and refused for a name a job file owns or a
+    /// `[dispatch]` that does not validate.
+    #[tokio::test]
+    async fn job_submit_queues_items_like_a_local_job() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let dispatch = serde_json::json!({
+            "repo": "~/work/{{ item.repo }}",
+            "branch": "pastor/{{ item.key }}",
+            "max_tasks_per_run": 2,
+        });
+        let prompt = "{{ job.name }} {{ task.id }}: {{ item.title }}";
+        let submit = |job: &str, dispatch: &serde_json::Value, items: Vec<serde_json::Value>| {
+            IpcRequest::JobSubmit {
+                job: job.into(),
+                dispatch: dispatch.clone(),
+                prompt: prompt.into(),
+                items,
+            }
+        };
+        let item = |key: &str| serde_json::json!({"key": key, "repo": "r", "title": "fix it"});
+        let resp = d
+            .handle(submit(
+                "vault",
+                &dispatch,
+                vec![
+                    item("c1"),
+                    item("c1"),
+                    serde_json::json!({"key": "bad", "repo": "..", "title": "x"}),
+                    item("c2"),
+                    item("c3"),
+                ],
+            ))
+            .await;
+        let IpcResponse::JobSubmitted {
+            tasks,
+            skipped,
+            refused,
+        } = resp
+        else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(tasks.len(), 2, "{tasks:?}");
+        assert_eq!(skipped, vec!["c1"]);
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert_eq!(refused[0].0, "bad");
+        assert!(refused[0].1.contains("repo"), "{refused:?}");
+        assert_eq!(
+            refused[1],
+            ("c3".to_string(), "max_tasks_per_run".to_string())
+        );
+
+        // Rendered exactly as a job file with the same [dispatch] would be.
+        let file = format!(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nrepo = \"~/work/{{{{ item.repo }}}}\"\nbranch = \"pastor/{{{{ item.key }}}}\"\nprompt = \"{prompt}\"\n"
+        );
+        let local = crate::config::job::Job::parse(
+            &file,
+            "vault",
+            &test_config().defaults,
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let t = &tasks[0];
+        assert_eq!(t.job, "vault");
+        let (want_prompt, want_spec) =
+            crate::scheduler::render_task(&local, &item("c1"), t.id).unwrap();
+        assert_eq!(t.prompt, want_prompt);
+        assert_eq!(t.prompt, format!("vault t-{}: fix it", t.id));
+        assert_eq!(t.spec.repo, want_spec.repo);
+        assert_eq!(t.spec.branch.as_deref(), Some("pastor/c1"));
+        assert!(d.store.is_seen("vault", "c1").unwrap());
+
+        // A second submitter of the same job shares its seen keys.
+        let resp = d
+            .handle(submit("vault", &dispatch, vec![item("c1"), item("c3")]))
+            .await;
+        let IpcResponse::JobSubmitted {
+            tasks,
+            skipped,
+            refused,
+        } = resp
+        else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(skipped, vec!["c1"]);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].item["key"], "c3");
+
+        // A job file owns its name, even an invalid one.
+        let jobs = d.paths.jobs_dir();
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::write(jobs.join("mine.toml"), &file).unwrap();
+        std::fs::write(jobs.join("broken.toml"), "not toml [").unwrap();
+        for name in ["mine", "broken"] {
+            let resp = d.handle(submit(name, &dispatch, vec![item("x")])).await;
+            let IpcResponse::Error { code, .. } = resp else {
+                panic!("{resp:?}")
+            };
+            assert_eq!(code, "job_name_taken", "{name}");
+        }
+        assert!(!d.store.is_seen("mine", "x").unwrap());
+
+        // A [dispatch] the job file would refuse, with the job file's error.
+        let resp = d
+            .handle(submit(
+                "other",
+                &serde_json::json!({"worktree": true}),
+                vec![item("x")],
+            ))
+            .await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "invalid_dispatch");
+        assert_eq!(message, "dispatch.worktree = true needs dispatch.repo");
+        assert!(!d.store.is_seen("other", "x").unwrap());
     }
 
     #[tokio::test]
