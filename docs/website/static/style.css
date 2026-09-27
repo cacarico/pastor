@@ -6,7 +6,7 @@
   --bg: #15181c; --code: #1c2025; --ink: #d5d9de; --dim: #8a929c; --line: #343a42;
   --accent: #ff8a3d; --link: #8fb8de; --hot: #ffb27a;
   --ok: #6cc4a1; --warn: #f2c14e; --bad: #ef6b6b;
-  --sel: #262b32; --sel-ink: #eef1f4; --bar: #1c2025; --bar-ink: #c5cad0;
+  --sel: #262b32; --sel-ink: #eef1f4; --bar: #1c2025; --bar-ink: #c5cad0; --pick: #3a2a1f;
   --mono: ui-monospace, "JetBrains Mono", "IBM Plex Mono", Menlo, Consolas, monospace;
 }
 
@@ -130,5 +130,8 @@ h2:hover .anchor, h3:hover .anchor, h4:hover .anchor, .anchor:focus { opacity: 1
 .confirm b { color: var(--link); font-weight: 400; overflow-wrap: anywhere; }
 .choices { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-top: 14px !important; }
 .choices button { font: inherit; color: var(--ink); background: var(--sel); border: 1px solid var(--line); border-radius: 4px; padding: 2px 12px; cursor: pointer; }
-.choices button:hover, .choices button:focus-visible { border-color: var(--accent); outline: none; }
+.choices button:hover, .choices button:focus { border-color: var(--accent); color: var(--sel-ink); outline: none; }
+.choices button:focus { background: var(--pick); }
 .choices k { color: var(--accent); }
+.confirm .hint { margin: 10px 0 0; color: var(--dim); font-size: 13px; }
+.confirm .hint k { color: var(--accent); }

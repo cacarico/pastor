@@ -9,8 +9,8 @@ const dialog = document.getElementById('confirm');
 let pending = null;
 
 // A link marked data-confirm leaves the site, so it asks first, the way a
-// terminal asks before doing something you may not have meant: y or enter
-// goes, n or esc stays.
+// terminal asks before doing something you may not have meant: y goes, n or
+// esc stays, h/l pick a choice and enter takes it.
 document.addEventListener('click', (e) => {
   const link = e.target.closest('a[data-confirm]');
   if (!link || !dialog || e.ctrlKey || e.metaKey || e.shiftKey) return;
@@ -64,7 +64,16 @@ document.addEventListener('keydown', (e) => {
   if (dialog?.open) {
     if (e.key === 'y') dialog.close('yes');
     if (e.key === 'n') dialog.close('no');
-    return;  // esc and enter are the dialog's own
+    // h and l (or the arrows) move between the choices; enter takes the one
+    // with focus, esc stays. Both of those are the dialog's own.
+    const back = e.key === 'h' || e.key === 'ArrowLeft';
+    if (back || e.key === 'l' || e.key === 'ArrowRight') {
+      const choices = [...dialog.querySelectorAll('.choices button')];
+      const i = choices.indexOf(document.activeElement);
+      choices[(i + (back ? -1 : 1) + choices.length) % choices.length].focus();
+      e.preventDefault();
+    }
+    return;
   }
   const tab = document.querySelector(`.tabs [data-key="${e.key}"]`);
   if (tab) { tab.click(); return; }
