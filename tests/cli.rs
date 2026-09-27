@@ -3677,3 +3677,95 @@ fn completion_scripts_ask_pastor_for_names() {
         "bash knows __complete"
     );
 }
+
+/// `pastor bridge` carries each request line to the head's socket and each
+/// reply back, in order, one connection per line, and leaves the bytes alone.
+/// The fake head answers every connection with the line it got, numbered, so
+/// the test sees both the order and that nothing was rewritten.
+#[test]
+fn bridge_passes_each_line_to_the_head_and_its_reply_back() {
+    use std::io::{BufRead, BufReader, Write};
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&state).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(state.join("pastor.sock")).unwrap();
+    std::thread::spawn(move || {
+        for (n, stream) in listener.incoming().enumerate() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let reply = serde_json::json!({"kind": "text", "data": format!("{n}:{line}")});
+            writeln!(stream, "{reply}").unwrap();
+        }
+    });
+    let requests = "{\"op\":\"ping\"}\n{\"op\":\"task_show\",\"id\":7,\"from_task\":\"t-3\"}\n";
+    let mut child = pastor()
+        .arg("bridge")
+        .env("PASTOR_CONFIG_DIR", tmp.path().join("c"))
+        .env("PASTOR_STATE_DIR", &state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(requests.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let replies: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        replies,
+        vec![
+            serde_json::json!({"kind": "text", "data": "0:{\"op\":\"ping\"}\n"}),
+            serde_json::json!({"kind": "text", "data": "1:{\"op\":\"task_show\",\"id\":7,\"from_task\":\"t-3\"}\n"}),
+        ],
+        "{stdout}"
+    );
+    // The bridge is plumbing: it never reads or writes the config.
+    assert!(!tmp.path().join("c").exists());
+}
+
+/// With no head on the socket the bridge answers one `no_head` line on
+/// stdout, where the remote CLI reads, and exits non-zero. It never starts a
+/// head.
+#[test]
+fn bridge_without_a_head_answers_no_head() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("s");
+    let mut child = pastor()
+        .arg("bridge")
+        .env("PASTOR_CONFIG_DIR", tmp.path().join("c"))
+        .env("PASTOR_STATE_DIR", &state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"op\":\"ping\"}\n{\"op\":\"ping\"}\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["code"], "no_head", "{stdout}");
+    assert!(v["message"].is_string(), "{stdout}");
+    assert!(!state.join("pastor.sock").exists());
+}

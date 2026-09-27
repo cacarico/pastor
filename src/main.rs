@@ -91,6 +91,8 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::trust_cli::TrustCmd,
     },
+    /// Pass request lines from stdin to this machine's head; for a remote CLI over ssh
+    Bridge,
 }
 
 #[derive(Args, Debug)]
@@ -354,6 +356,11 @@ fn main() {
         Ok(p) => p,
         Err(err) => fail("config_error", &err.to_string()),
     };
+    // Plumbing, before the legacy migration and the fleet guard: it reads no
+    // config, and the head checks each request it carries.
+    if let Command::Bridge = command {
+        bridge(&paths);
+    }
     if let Some(legacy) = pastor::config::legacy_macos_dir() {
         match pastor::config::migrate_legacy_dir(&legacy, &paths) {
             Ok(Some(note)) => eprintln!("{note}"),
@@ -409,6 +416,7 @@ fn main() {
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd),
+            Command::Bridge => unreachable!("handled before the runtime"),
         }
     });
     if let Err(err) = result {
@@ -473,6 +481,26 @@ fn help_aliases(help: clap::Command, real: &clap::Command) -> clap::Command {
         _ => node,
     })
     .subcommands(extra)
+}
+
+/// `pastor bridge`. Its client reads replies on stdout, so a failure is
+/// written there too, as the one line where the reply would have been.
+fn bridge(paths: &Paths) -> ! {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let result = rt.block_on(pastor::bridge::run(
+        &paths.socket_file(),
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    ));
+    let Err(err) = result else {
+        std::process::exit(0)
+    };
+    let (code, message) = match err.downcast_ref::<CliError>() {
+        Some(e) => (e.code.clone(), e.message.clone()),
+        None => ("runtime_error".to_string(), format!("{err:#}")),
+    };
+    println!("{}", serde_json::json!({"code": code, "message": message}));
+    std::process::exit(1)
 }
 
 fn fail(code: &str, message: &str) -> ! {

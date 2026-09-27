@@ -16,6 +16,9 @@ _pastor() {
             ",$1")
                 cmd="pastor"
                 ;;
+            pastor,bridge)
+                cmd="pastor__subcmd__bridge"
+                ;;
             pastor,completions)
                 cmd="pastor__subcmd__completions"
                 ;;
@@ -183,6 +186,9 @@ _pastor() {
                 ;;
             pastor__subcmd__flock__subcmd__help__subcmd__default,show)
                 cmd="pastor__subcmd__flock__subcmd__help__subcmd__default__subcmd__show"
+                ;;
+            pastor__subcmd__help,bridge)
+                cmd="pastor__subcmd__help__subcmd__bridge"
                 ;;
             pastor__subcmd__help,completions)
                 cmd="pastor__subcmd__help__subcmd__completions"
@@ -551,8 +557,22 @@ _pastor() {
 
     case "${cmd}" in
         pastor)
-            opts="-h -V --skill --help --version serve task machine flock open tick job config completions events setup connector trust help"
+            opts="-h -V --skill --help --version serve task machine flock open tick job config completions events setup connector trust bridge help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__bridge)
+            opts="-h --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -1239,8 +1259,22 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help)
-            opts="serve task machine flock open tick job config completions events setup connector trust help"
+            opts="serve task machine flock open tick job config completions events setup connector trust bridge help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__bridge)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

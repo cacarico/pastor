@@ -302,6 +302,40 @@ pub async fn request_with_timeout(
     }
 }
 
+/// One request line as a client wrote it, passed to the head unread, and the
+/// reply line as the head wrote it, newline included: `pastor bridge`'s round
+/// trip. The same bound and failures as `request`.
+pub async fn relay_line(socket: &Path, line: &str) -> Result<String, RequestError> {
+    let exchange = async {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(RequestError::Connect)?;
+        let (r, mut w) = stream.into_split();
+        let io = async {
+            w.write_all(line.as_bytes()).await?;
+            if !line.ends_with('\n') {
+                w.write_all(b"\n").await?;
+            }
+            w.flush().await?;
+            let mut reply = String::new();
+            BufReader::new(r).read_line(&mut reply).await?;
+            anyhow::ensure!(
+                !reply.trim().is_empty(),
+                "daemon closed the connection without a reply"
+            );
+            if !reply.ends_with('\n') {
+                reply.push('\n');
+            }
+            Ok(reply)
+        };
+        io.await.map_err(RequestError::Exchange)
+    };
+    match tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err(RequestError::Timeout(DEFAULT_REQUEST_TIMEOUT)),
+    }
+}
+
 async fn round_trip(
     stream: tokio::net::UnixStream,
     req: &IpcRequest,
