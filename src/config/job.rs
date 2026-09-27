@@ -116,7 +116,59 @@ impl Job {
         let connector_config =
             serde_json::to_value(&file.connector.config).map_err(|e| e.to_string())?;
         catalog.check(&file.connector.use_, &connector_config)?;
-        let d = file.dispatch;
+        Job::from_dispatch(
+            name,
+            schedule,
+            file.enabled,
+            file.connector.use_,
+            connector_config,
+            file.dispatch,
+            defaults,
+        )
+    }
+
+    /// A job another machine runs and submits items for (`IpcRequest::
+    /// JobSubmit`): its `[dispatch]` table as JSON, with `prompt` beside it
+    /// (it wins over a `prompt` inside the table). Checked exactly as a job
+    /// file's `[dispatch]` is. It has no schedule or connector on the head:
+    /// those stay on the submitter, and nothing here reads them.
+    pub fn submitted(
+        name: &str,
+        dispatch: &Value,
+        prompt: &str,
+        defaults: &Defaults,
+    ) -> Result<Job, String> {
+        check_name(name)?;
+        let mut table = match dispatch {
+            Value::Object(m) => m.clone(),
+            Value::Null => serde_json::Map::new(),
+            _ => return Err("dispatch must be a table".into()),
+        };
+        table.insert("prompt".into(), Value::String(prompt.to_string()));
+        let d: DispatchTable =
+            serde_json::from_value(Value::Object(table)).map_err(|e| e.to_string())?;
+        Job::from_dispatch(
+            name.to_string(),
+            Schedule::Every(Duration::MAX),
+            true,
+            String::new(),
+            Value::Null,
+            d,
+            defaults,
+        )
+    }
+
+    /// The `[dispatch]` checks and defaults, shared by a job file and a
+    /// submitted job.
+    fn from_dispatch(
+        name: String,
+        schedule: Schedule,
+        enabled: bool,
+        connector: String,
+        connector_config: Value,
+        d: DispatchTable,
+        defaults: &Defaults,
+    ) -> Result<Job, String> {
         if d.prompt.trim().is_empty() {
             return Err("dispatch.prompt is required".into());
         }
@@ -182,8 +234,8 @@ impl Job {
         Ok(Job {
             name,
             schedule,
-            enabled: file.enabled,
-            connector: file.connector.use_,
+            enabled,
+            connector,
             connector_config,
             prompt: d.prompt,
             max_tasks_per_run,
@@ -670,6 +722,53 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         )
         .unwrap_err();
         assert!(err.contains("prompt is required"), "{err}");
+    }
+
+    /// A submitted job's `[dispatch]` is the job file's, checked the same
+    /// way: the same job, and the same error for the same mistake.
+    #[test]
+    fn a_submitted_dispatch_is_checked_like_a_job_file() {
+        let file = Job::parse(SPEC_EXAMPLE, "support-slack", &defaults(), &Builtins).unwrap();
+        let text: toml::Table = toml::from_str(SPEC_EXAMPLE).unwrap();
+        let mut dispatch = serde_json::to_value(&text["dispatch"]).unwrap();
+        let prompt = dispatch["prompt"].as_str().unwrap().to_string();
+        dispatch.as_object_mut().unwrap().remove("prompt");
+        let sub = Job::submitted("support-slack", &dispatch, &prompt, &defaults()).unwrap();
+        assert_eq!(sub.spec, file.spec);
+        assert_eq!(sub.agent, file.agent);
+        assert_eq!(sub.flock, file.flock);
+        assert_eq!(sub.prompt, file.prompt);
+        assert_eq!(sub.max_tasks_per_run, file.max_tasks_per_run);
+
+        let bad = |extra: &str| {
+            let file = format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            );
+            let file_err = Job::parse(&file, "ok", &defaults(), &Builtins).unwrap_err();
+            let table: toml::Table = toml::from_str(extra).unwrap();
+            let json = serde_json::to_value(&table).unwrap();
+            let err = Job::submitted("ok", &json, "p", &defaults()).unwrap_err();
+            (file_err, err)
+        };
+        for extra in [
+            "worktree = true\n",
+            "max_tasks_per_run = 0\n",
+            "branch = \"{{ item.key }}/x\"\n",
+            "timeout = \"soon\"\n",
+        ] {
+            let (file_err, err) = bad(extra);
+            assert_eq!(err, file_err, "{extra}");
+        }
+        let (file_err, err) = bad("colour = \"blue\"\n");
+        assert!(file_err.contains("unknown field `colour`"), "{file_err}");
+        assert!(err.contains("unknown field `colour`"), "{err}");
+
+        let err = Job::submitted("run", &Value::Null, "p", &defaults()).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+        let err = Job::submitted("ok", &Value::Null, " ", &defaults()).unwrap_err();
+        assert!(err.contains("prompt is required"), "{err}");
+        let err = Job::submitted("ok", &serde_json::json!([1]), "p", &defaults()).unwrap_err();
+        assert!(err.contains("must be a table"), "{err}");
     }
 
     #[test]

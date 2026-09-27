@@ -149,6 +149,18 @@ that names one that is not installed is `invalid`.
 A failed connector backs the job off, one minute doubling to an hour, and
 keeps its cursor.
 
+A job can also run on another machine and hand its items to the head, which
+keeps the `seen` keys so no item is queued twice. The IPC request
+`job_submit` carries the job's name, its `[dispatch]` table, its prompt and
+the items (each with its `key`); the head checks the table as it would a job
+file's (`invalid_dispatch` with the same error), and queues each item with the
+same rendering, path checks and `max_tasks_per_run` cap as its own jobs. It
+answers the tasks queued, the keys skipped as seen, and each refused item with
+its reason (`max_tasks_per_run` for those past the cap; they stay unseen). A
+name the head has a job file for is `job_name_taken`; submitters of one name
+share its seen keys. It needs a head of IPC protocol 4 (`head_too_old`
+otherwise). No command sends it yet.
+
 A machine whose requests answer but whose event subscription will not open is
 `polling`: it still takes tasks and is reconciled every `tick`. Two dispatch
 passes never run at once, and a task moves from `queued` to `starting` with a

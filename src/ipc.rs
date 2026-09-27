@@ -14,8 +14,8 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// field an older head would silently ignore (serde skips unknown fields), so
 /// the CLI can refuse to send it there. A head that answers no protocol is 0.
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`). 2: flock agents and tool
-/// lists. 3: `TaskRetry::place`.
-pub const IPC_PROTOCOL: u32 = 3;
+/// lists. 3: `TaskRetry::place`. 4: `JobSubmit`.
+pub const IPC_PROTOCOL: u32 = 4;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -39,6 +39,22 @@ pub const AGENT_PROTOCOL: u32 = 2;
 /// The first protocol whose head honours `TaskRetry::place`. An older one
 /// would retry the task with its original place, and say it succeeded.
 pub const PLACE_PROTOCOL: u32 = 3;
+
+/// The first protocol whose head knows `JobSubmit`. An older one refuses the
+/// request as unreadable; `check_protocol` says why before it is sent.
+pub const JOB_SUBMIT_PROTOCOL: u32 = 4;
+
+/// `head_too_old` unless the head (its version and protocol, from `Pong`)
+/// speaks at least `needed`; `what` names what the older head lacks.
+pub fn check_protocol(version: &str, protocol: u32, needed: u32, what: &str) -> anyhow::Result<()> {
+    if protocol >= needed {
+        return Ok(());
+    }
+    Err(crate::cli::CliError::err(
+        "head_too_old",
+        format!("the running pastor serve ({version}) predates {what}; restart it"),
+    ))
+}
 
 // One request is read per connection and dropped once answered, so the
 // size of the largest variant (`Run`) costs nothing worth a box.
@@ -124,6 +140,17 @@ pub enum IpcRequest {
         states: Vec<TaskState>,
         older_than_secs: u64,
     },
+    /// Items another machine's job found, to become tasks here: the head
+    /// keeps the `seen` keys, so no item is queued twice. `dispatch` is the
+    /// job file's `[dispatch]` table and `prompt` its template; each item is
+    /// an object with a string `key`. Refused with `job_name_taken` when the
+    /// head has a job file of that name. Answers `JobSubmitted`.
+    JobSubmit {
+        job: String,
+        dispatch: serde_json::Value,
+        prompt: String,
+        items: Vec<serde_json::Value>,
+    },
 }
 
 impl IpcRequest {
@@ -148,7 +175,8 @@ impl IpcRequest {
             | IpcRequest::TaskClose { .. }
             | IpcRequest::TaskSend { .. }
             | IpcRequest::TaskDone { .. }
-            | IpcRequest::TaskPrune { .. } => true,
+            | IpcRequest::TaskPrune { .. }
+            | IpcRequest::JobSubmit { .. } => true,
         }
     }
 
@@ -233,6 +261,13 @@ pub enum IpcResponse {
     Runs(Vec<JobRunReport>),
     Jobs(Vec<JobStatus>),
     Pruned(crate::store::PruneOutcome),
+    /// `JobSubmit`'s outcome: the tasks queued, the keys already seen (or
+    /// repeated in the request), and each item refused with its reason.
+    JobSubmitted {
+        tasks: Vec<Task>,
+        skipped: Vec<String>,
+        refused: Vec<(String, String)>,
+    },
 }
 
 impl IpcResponse {
@@ -548,6 +583,11 @@ mod tests {
                 pruned: 2,
                 kept_worktrees: vec![3],
             }),
+            IpcResponse::JobSubmitted {
+                tasks: vec![minimal_task()],
+                skipped: vec!["k1".into()],
+                refused: vec![("k2".into(), "max_tasks_per_run".into())],
+            },
             IpcResponse::error("some_code", "some message"),
         ];
         for resp in responses {
@@ -676,6 +716,12 @@ mod tests {
             },
             IpcRequest::Reload,
             IpcRequest::JobRun { name: "j".into() },
+            IpcRequest::JobSubmit {
+                job: "j".into(),
+                dispatch: serde_json::Value::Null,
+                prompt: "p".into(),
+                items: vec![],
+            },
         ];
         for req in changes {
             assert!(req.changes_fleet(), "{req:?}");
@@ -701,6 +747,26 @@ mod tests {
         let (_, from) = parse_request_line(line.trim()).unwrap();
         assert_eq!(from, None);
         assert!(parse_request_line("not json").is_err());
+    }
+
+    /// A client refuses to send `JobSubmit` to a head older than
+    /// `JOB_SUBMIT_PROTOCOL`, which would not read it.
+    #[test]
+    fn an_older_head_is_too_old_to_submit_to() {
+        let err = check_protocol("0.5.0", 3, JOB_SUBMIT_PROTOCOL, "job submit").unwrap_err();
+        let err = err.downcast_ref::<crate::cli::CliError>().unwrap();
+        assert_eq!(err.code, "head_too_old");
+        assert!(err.message.contains("0.5.0"), "{}", err.message);
+        assert!(check_protocol("0.6.0", IPC_PROTOCOL, JOB_SUBMIT_PROTOCOL, "job submit").is_ok());
+        let v = serde_json::to_value(IpcRequest::JobSubmit {
+            job: "j".into(),
+            dispatch: serde_json::json!({"repo": "r"}),
+            prompt: "p".into(),
+            items: vec![serde_json::json!({"key": "k"})],
+        })
+        .unwrap();
+        assert_eq!(v["op"], "job_submit");
+        assert_eq!(v["items"][0]["key"], "k");
     }
 
     #[tokio::test]
