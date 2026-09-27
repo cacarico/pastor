@@ -1541,7 +1541,7 @@ sends nothing. A head from before these requests is refused
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, defaults, agents (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, head_address, defaults, agents (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
@@ -1572,6 +1572,7 @@ request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "15m"     # a done task's pane closes after this; "never" keeps it
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
+# head_address = "user@head.example"  # unset by default; see below
 [defaults]                   # for run flags, job keys and flock keys that are left out
 agent = "claude"
 agent_args = []              # e.g. ["--model", "claude-opus-5-5"]
@@ -1592,6 +1593,13 @@ deny_flag = "--disallowedTools"  # the flag before each deny pattern
 kind = "claude"                  # the herdr agent kind that runs it (required)
 args = ["--model", "claude-sonnet-5"]  # put before agent_args (required, may be [])
 ```
+
+`head_address` is the ssh destination other machines reach the head by. When
+it is set, every agent pastor starts on a machine that is not the head's own
+(`local = true`) gets `PASTOR_HEAD=<head_address>` in its pane next to
+`PASTOR_TASK`, so it knows where to send `pastor task done`. An agent on the
+head's machine gets none: it uses the local socket. An `[agents]` env cannot
+override it. The value must not be empty or hold whitespace.
 
 ## Shell completions
 

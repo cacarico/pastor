@@ -51,6 +51,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   no file. The manual's "Agents on other machines" has the steps.
 - `pastor trust add <machine> <repo>` saves a folder trust without a blocked
   task.
+- `head_address` in `pastor.toml`: the ssh destination other machines reach
+  the head by. When set, agents on machines other than the head's own start
+  with `PASTOR_HEAD=<head_address>` in their pane, which `pastor head`
+  above already routes their CLI commands through. Agents on the head's
+  machine get none.
 
 ### Changed
 

@@ -953,6 +953,10 @@ pub struct PastorConfig {
     /// refuses it. A guard against an agent acting on its own; the agent runs
     /// as the same user, so it is not a security boundary.
     pub agents_change_fleet: bool,
+    /// The ssh destination other machines reach the head by. Agents on
+    /// machines other than the head's own get it as `ipc::HEAD_ENV`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_address: Option<String>,
     pub defaults: Defaults,
     #[serde(skip_serializing_if = "is_empty_agents")]
     pub agents: Agents,
@@ -974,6 +978,7 @@ impl Default for PastorConfig {
             agent_ready_timeout: "30s".into(),
             close_done_after: "15m".into(),
             agents_change_fleet: false,
+            head_address: None,
             defaults: Defaults::default(),
             agents: Agents::default(),
             models: Models::default(),
@@ -1038,6 +1043,16 @@ impl PastorConfig {
             ("defaults.deny", &cfg.defaults.deny),
         ] {
             check_tools(key, list).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        }
+        // It ends up as an ssh destination on another machine; a space in it
+        // would split into two arguments there.
+        if let Some(head) = &cfg.head_address
+            && (head.is_empty() || head.chars().any(char::is_whitespace))
+        {
+            anyhow::bail!(
+                "{}: head_address must be an ssh destination, not empty and with no whitespace",
+                path.display()
+            );
         }
         for (name, def) in &cfg.agents.0 {
             if def.kind.as_deref().is_some_and(|k| k.trim().is_empty()) {
@@ -1173,6 +1188,20 @@ mod tests {
         assert!(!PastorConfig::default().agents_change_fleet);
         let cfg: PastorConfig = toml::from_str("agents_change_fleet = true").unwrap();
         assert!(cfg.agents_change_fleet);
+    }
+
+    /// `head_address` is an ssh destination: optional, and when set a
+    /// non-empty word.
+    #[test]
+    fn head_address_is_an_ssh_destination() {
+        let path = Path::new("pastor.toml");
+        assert_eq!(PastorConfig::default().head_address, None);
+        let cfg = PastorConfig::parse(path, "head_address = \"user@head.example\"").unwrap();
+        assert_eq!(cfg.head_address.as_deref(), Some("user@head.example"));
+        for bad in ["\"\"", "\"  \"", "\"user@head example\"", "\"head\\n\""] {
+            let err = PastorConfig::parse(path, &format!("head_address = {bad}")).unwrap_err();
+            assert!(err.to_string().contains("head_address"), "{bad}: {err}");
+        }
     }
 
     use super::*;

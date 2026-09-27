@@ -208,6 +208,9 @@ pub struct MachineSettings {
     /// `[agents]` in `pastor.toml`: the keys that answer each agent's
     /// folder-trust prompt.
     pub agents: crate::config::Agents,
+    /// `head_address` in `pastor.toml`, for a machine other than the head's
+    /// own (`daemon::actor_settings`): its agents get it as `ipc::HEAD_ENV`.
+    pub head_address: Option<String>,
 }
 
 impl Default for MachineSettings {
@@ -223,6 +226,7 @@ impl Default for MachineSettings {
             close_done_after: Some(Duration::from_secs(15 * 60)),
             version_every: Duration::from_secs(10 * 60),
             agents: crate::config::Agents::default(),
+            head_address: None,
         }
     }
 }
@@ -2141,6 +2145,7 @@ impl Actor {
                 self.connector.as_ref(),
                 &mut task,
                 &self.settings.agents,
+                self.settings.head_address.as_deref(),
                 self.settings.agent_ready_timeout,
             ),
         )
@@ -2926,6 +2931,7 @@ mod tests {
             close_done_after: None,
             version_every: Duration::from_millis(200),
             agents: Default::default(),
+            head_address: None,
         }
     }
 
