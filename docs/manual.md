@@ -1276,6 +1276,16 @@ not overwritten (`edit_conflict`). That check and the rename run together
 under an advisory lock on `.<file>.lock` beside the file, left in place, so
 two pastor edits of one file never interleave.
 
+With a head running, `edit`, `job describe` and `job enable|disable` act on
+the head's files, not the caller's copies. The editor still runs here: the CLI
+fetches the head's file and a hash of it (`FileGet`), edits a temp copy, and
+sends the result back with that hash (`FilePut`). The head checks it with the
+same code as an edit with no head, against its own `[defaults]` and
+connectors, and refuses a stale hash (`edit_conflict`); an invalid edit comes
+back with the head's error and reopens the editor as above. An unchanged file
+sends nothing. A head from before these requests is refused
+(`head_too_old`): restart `pastor serve` after an upgrade.
+
 ## Files
 
 ```

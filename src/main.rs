@@ -5,8 +5,9 @@ use std::sync::Arc;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use pastor::cli::{CliError, request_failure};
 use pastor::config::flock::{DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig};
-use pastor::config::job::{check_name, job_path, set_enabled};
+use pastor::config::job::set_enabled;
 use pastor::config::{AgentChoice, PastorConfig, Paths, parse_duration};
+use pastor::edit::{ConfigFile, Outcome};
 use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{Head, HeadPing, IpcRequest, IpcResponse, request};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
@@ -449,8 +450,7 @@ fn main() {
                 probe_head(
                     &paths,
                     flocky || flocks_declared(&paths),
-                    needs_agent_protocol(&command),
-                    needs_place_protocol(&command),
+                    protocol_need(&command),
                 )
                 .await?
             }
@@ -542,6 +542,19 @@ fn fail(code: &str, message: &str) -> ! {
 }
 
 async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
+    match ask_or_refused(paths, req).await {
+        Err(err) => match err.downcast::<CliError>() {
+            Ok(e) => fail(&e.code, &e.message),
+            Err(err) => Err(err),
+        },
+        ok => ok,
+    }
+}
+
+/// `ask`, with the head's refusal handed back as a `CliError` rather than
+/// ending the command, for a caller that acts on it (an invalid edit
+/// reopens the editor). A request that never got an answer still ends it.
+async fn ask_or_refused(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
     let socket = paths.socket_file();
     let resp = match request(&socket, &req).await {
         Ok(resp) => resp,
@@ -550,8 +563,8 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
             fail(code, &message);
         }
     };
-    if let IpcResponse::Error { code, message } = &resp {
-        fail(code, message);
+    if let IpcResponse::Error { code, message } = resp {
+        return Err(CliError::err(&code, message));
     }
     Ok(resp)
 }
@@ -566,18 +579,12 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 /// (serde skips unknown fields) and reads flock.toml as one flock, so it
 /// would dispatch, list or reload across every flock.
 ///
-/// `agents` is for a command that can queue a task (`needs_agent_protocol`): a
-/// head before `AGENT_PROTOCOL` would drop the task's tool lists, so it is
-/// refused too.
-///
-/// `place` is for `task retry --place` (`needs_place_protocol`): a head
-/// before `PLACE_PROTOCOL` would retry the task where it was and answer
-/// success, so it is refused.
+/// `need` is the protocol the command needs of the head, with what an older
+/// head would do instead (`protocol_need`); such a head is refused too.
 async fn probe_head(
     paths: &Paths,
     flocks: bool,
-    agents: bool,
-    place: bool,
+    need: Option<(u32, &str)>,
 ) -> anyhow::Result<Head> {
     let socket = paths.socket_file();
     match pastor::ipc::ping_head(&socket).await {
@@ -589,22 +596,13 @@ async fn probe_head(
                 socket.display()
             ),
         )),
-        HeadPing::Pong { version, protocol } if place && protocol < pastor::ipc::PLACE_PROTOCOL => {
-            Err(pastor::cli::CliError::err(
-                "head_too_old",
-                format!(
-                    "the running pastor serve ({version}) predates `task retry --place` and would retry the task where it was; restart it"
-                ),
-            ))
-        }
         HeadPing::Pong { version, protocol }
-            if agents && protocol < pastor::ipc::AGENT_PROTOCOL =>
+            if let Some((needed, why)) = need
+                && protocol < needed =>
         {
             Err(pastor::cli::CliError::err(
                 "head_too_old",
-                format!(
-                    "the running pastor serve ({version}) predates flock agents and tool allow and deny lists, and would start the agent without them; restart it"
-                ),
+                format!("the running pastor serve ({version}) {why}; restart it"),
             ))
         }
         HeadPing::Pong { protocol, .. } if !flocks || protocol >= pastor::ipc::FLOCK_PROTOCOL => {
@@ -740,6 +738,46 @@ fn needs_place_protocol(command: &Command) -> bool {
             cmd: TaskCmd::Retry(a)
         } if a.place.is_some()
     )
+}
+
+/// Whether `command` sends a request only a head of `FILE_PROTOCOL` or later
+/// takes: the edits, and `job describe|enable|disable`.
+fn needs_file_protocol(command: &Command) -> bool {
+    match command {
+        Command::Flock { cmd } => matches!(cmd, FlockCmd::Edit),
+        Command::Job { cmd } => matches!(
+            cmd,
+            JobCmd::Edit { .. }
+                | JobCmd::Describe { .. }
+                | JobCmd::Enable { .. }
+                | JobCmd::Disable { .. }
+        ),
+        Command::Config { .. } => true,
+        _ => false,
+    }
+}
+
+/// The protocol `command` needs of the head, and what an older head would
+/// do with it, for `probe_head`'s refusal.
+fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
+    if needs_place_protocol(command) {
+        Some((
+            pastor::ipc::PLACE_PROTOCOL,
+            "predates `task retry --place` and would retry the task where it was",
+        ))
+    } else if needs_agent_protocol(command) {
+        Some((
+            pastor::ipc::AGENT_PROTOCOL,
+            "predates flock agents and tool allow and deny lists, and would start the agent without them",
+        ))
+    } else if needs_file_protocol(command) {
+        Some((
+            pastor::ipc::FILE_PROTOCOL,
+            "predates edits and job requests through the head, and would refuse them",
+        ))
+    } else {
+        None
+    }
 }
 
 /// Whether flock.toml declares named flocks, so a command with no `--flock`
@@ -1344,14 +1382,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
         FlockCmd::Describe { name, json } => {
             return flock_describe(paths, &name, json, head).await;
         }
-        FlockCmd::Edit => {
-            let check = |text: &str| {
-                Flock::parse(&path, text)
-                    .map(|_| ())
-                    .map_err(|e| format!("{e:#}"))
-            };
-            return edit_file(paths, &path, &check, head).await;
-        }
+        FlockCmd::Edit => return edit_file(paths, ConfigFile::Flock, head).await,
         FlockCmd::Add { name, default } => {
             // A first default flock would take the implicit flock's
             // machines, stranding the tasks queued there. As with `flock
@@ -1701,41 +1732,56 @@ async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
             println!("{msg}");
         }
         JobCmd::Reload => reload(paths).await?,
-        JobCmd::Edit { name } => job_edit(paths, &name, head).await?,
+        JobCmd::Edit { name } => edit_file(paths, ConfigFile::Job(name), head).await?,
         JobCmd::Describe { name, json } => job_describe(paths, &name, json, head).await?,
     }
     Ok(())
 }
 
-/// The job file `name` names, which must exist. The name is checked before
-/// it is joined under the jobs dir: `"../pastor"` would resolve outside it.
-fn existing_job_file(paths: &Paths, name: &str) -> std::path::PathBuf {
-    if let Err(e) = check_name(name) {
-        fail("job_not_found", &e);
-    }
-    let path = job_path(&paths.jobs_dir(), name);
-    if !path.exists() {
-        fail("job_not_found", &format!("no job file {}", path.display()));
-    }
-    path
-}
-
-/// Edit `path` in the user's editor, checked with `check`; a saved edit
-/// reloads a running head.
-async fn edit_file(
-    paths: &Paths,
-    path: &std::path::Path,
-    check: &dyn Fn(&str) -> Result<(), String>,
-    head: Head,
-) -> anyhow::Result<()> {
+/// Edit `file` in the user's editor, checked the way the head loads it.
+/// With a head the file is the head's: fetched with `FileGet`, edited here,
+/// sent back with `FilePut`, which checks it, writes it and reloads the
+/// head; an invalid edit comes back with the head's error and reopens the
+/// editor. With no head the file is the local one, through the same
+/// `edit::put`.
+async fn edit_file(paths: &Paths, file: ConfigFile, head: Head) -> anyhow::Result<()> {
     let editor = pastor::edit::editor();
-    match pastor::edit::edit(path, &editor, check, &mut |_| ask_reopen())? {
-        pastor::edit::Outcome::Unchanged => println!("no changes to {}", path.display()),
-        pastor::edit::Outcome::Saved => println!(
-            "saved {}; {}",
-            path.display(),
-            reload_running_head(paths, head).await
-        ),
+    if !head.is_live() {
+        let path = file.path(paths)?;
+        let check = file.checker(paths)?;
+        match pastor::edit::edit_here(&path, &editor, &check, &mut |_| ask_reopen()).await? {
+            Outcome::Unchanged => println!("no changes to {}", path.display()),
+            Outcome::Saved => println!("saved {}; start pastor serve to use it", path.display()),
+        }
+        return Ok(());
+    }
+    let IpcResponse::File(got) = ask(
+        paths,
+        IpcRequest::FileGet {
+            file: file.to_string(),
+        },
+    )
+    .await?
+    else {
+        unreachable!()
+    };
+    let label = std::path::PathBuf::from(&got.path);
+    let mut saved = String::new();
+    let put = async |text: &str| {
+        let req = IpcRequest::FilePut {
+            file: file.to_string(),
+            text: text.to_string(),
+            base_hash: got.hash.clone(),
+        };
+        let IpcResponse::Text(msg) = ask_or_refused(paths, req).await? else {
+            unreachable!()
+        };
+        saved = msg;
+        Ok(())
+    };
+    match pastor::edit::edit(&label, &got.text, &editor, put, &mut |_| ask_reopen()).await? {
+        Outcome::Unchanged => println!("no changes to {}", label.display()),
+        Outcome::Saved => println!("{saved}"),
     }
     Ok(())
 }
@@ -1759,30 +1805,8 @@ fn ask_reopen() -> bool {
     }
 }
 
-/// A job file is checked as the head loads it: against pastor.toml's
-/// `[defaults]` and the connectors installed here.
-async fn job_edit(paths: &Paths, name: &str, head: Head) -> anyhow::Result<()> {
-    let path = existing_job_file(paths, name);
-    let defaults = PastorConfig::load(&paths.config_file())?.defaults;
-    let catalog: Box<dyn pastor::connector::Catalog> =
-        match pastor::connector::ConnectorCatalog::load(paths) {
-            Ok(c) => Box::new(c),
-            Err(_) => Box::new(pastor::connector::Builtins),
-        };
-    let check = |text: &str| {
-        pastor::config::job::Job::parse(text, name, &defaults, catalog.as_ref()).map(|_| ())
-    };
-    edit_file(paths, &path, &check, head).await
-}
-
 async fn config_edit(paths: &Paths, head: Head) -> anyhow::Result<()> {
-    let path = paths.config_file();
-    let check = |text: &str| {
-        PastorConfig::parse(&path, text)
-            .map(|_| ())
-            .map_err(|e| format!("{e:#}"))
-    };
-    edit_file(paths, &path, &check, head).await
+    edit_file(paths, ConfigFile::Config, head).await
 }
 
 /// Tasks matching `filter`, from the head when one runs, else the store.
@@ -1821,65 +1845,26 @@ fn print_description<T: serde::Serialize>(
 }
 
 async fn job_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
-    let path = existing_job_file(paths, name);
-    let statuses = if head.is_live() {
-        let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::JobList).await? else {
+    let d = if head.is_live() {
+        let IpcResponse::Job(d) = ask(
+            paths,
+            IpcRequest::JobDescribe {
+                name: name.to_string(),
+            },
+        )
+        .await?
+        else {
             unreachable!()
         };
-        jobs
+        d
     } else {
+        // The file first, so a missing job says so before the scheduler
+        // loads anything.
+        ConfigFile::Job(name.to_string()).path(paths)?;
         let mut s = standalone(paths)?;
         s.reload();
-        s.statuses(chrono::Utc::now())
-    };
-    let Some(status) = statuses.into_iter().find(|j| j.name == name) else {
-        fail("job_not_found", &format!("the head has no job {name}"));
-    };
-    // The tables as written, so a file that does not parse still shows what
-    // it says as far as TOML goes.
-    let raw: Option<toml::Table> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| toml::from_str(&t).ok());
-    let table = |key: &str| {
-        raw.as_ref()
-            .and_then(|r| r.get(key))
-            .and_then(|v| serde_json::to_value(v).ok())
-    };
-    let state = open_store(paths)?.job_state(name)?.unwrap_or_default();
-    let tasks = tasks_matching(
-        paths,
-        head,
-        TaskFilter {
-            job: Some(name.to_string()),
-            ..Default::default()
-        },
-    )
-    .await?
-    .into_iter()
-    .take(pastor::describe::RECENT)
-    .collect();
-    let events = pastor::describe::recent_events(events_log(paths), |e| {
-        e.kind.starts_with("job.") && e.job.as_deref() == Some(name)
-    });
-    let d = pastor::describe::JobDescription {
-        name: name.to_string(),
-        file: path.display().to_string(),
-        schedule: status.schedule,
-        enabled: status.enabled,
-        error: status.error,
-        running: status.running,
-        flock: status.flock,
-        connector: table("connector"),
-        dispatch: table("dispatch"),
-        next_due: status.next_due,
-        last_run_at: status.last_run_at.or(state.last_run_at),
-        last_ok_at: state.last_ok_at,
-        last_result: status.last_result.or(state.last_result),
-        last_error: state.last_error,
-        failures: state.failures,
-        backoff_until: state.backoff_until,
-        tasks,
-        events,
+        let statuses = s.statuses(chrono::Utc::now());
+        pastor::describe::job(paths, name, statuses, &open_store(paths)?)?
     };
     print_description(&d, json, pastor::describe::job_text)
 }
@@ -1982,15 +1967,20 @@ async fn flock_describe(paths: &Paths, name: &str, json: bool, head: Head) -> an
 }
 
 async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow::Result<()> {
-    let path = existing_job_file(paths, name);
-    set_enabled(&path, enabled)?;
-    let verb = if enabled { "enabled" } else { "disabled" };
     if head.is_live() {
-        ask(paths, IpcRequest::Reload).await?;
-        println!("{verb} {name}");
-    } else {
-        println!("{verb} {name}; applies when pastor serve starts");
+        let req = IpcRequest::JobSetEnabled {
+            name: name.to_string(),
+            enabled,
+        };
+        let IpcResponse::Text(done) = ask(paths, req).await? else {
+            unreachable!()
+        };
+        println!("{done}");
+        return Ok(());
     }
+    set_enabled(&ConfigFile::Job(name.to_string()).path(paths)?, enabled)?;
+    let verb = if enabled { "enabled" } else { "disabled" };
+    println!("{verb} {name}; applies when pastor serve starts");
     Ok(())
 }
 
@@ -2087,7 +2077,9 @@ mod tests {
                 w.write_all(out.as_bytes()).await.unwrap();
             }
         });
-        let err = probe_head(&paths, false, true, false).await.unwrap_err();
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let run = protocol_need(&parse(&["pastor", "task", "run", "hi"]));
+        let err = probe_head(&paths, false, run).await.unwrap_err();
         let err = err.downcast::<pastor::cli::CliError>().unwrap();
         assert_eq!(err.code, "head_too_old");
         assert!(
@@ -2095,12 +2087,8 @@ mod tests {
             "{}",
             err.message
         );
-        assert_eq!(
-            probe_head(&paths, true, false, false).await.unwrap(),
-            Head::Live
-        );
+        assert_eq!(probe_head(&paths, true, None).await.unwrap(), Head::Live);
 
-        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
         assert!(needs_agent_protocol(&parse(&[
             "pastor", "task", "run", "hi"
         ])));
@@ -2151,16 +2139,17 @@ mod tests {
                 w.write_all(out.as_bytes()).await.unwrap();
             }
         });
-        let err = probe_head(&paths, false, true, true).await.unwrap_err();
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let place = protocol_need(&parse(&[
+            "pastor", "task", "retry", "t-1", "--place", "pastor",
+        ]));
+        let err = probe_head(&paths, false, place).await.unwrap_err();
         let err = err.downcast::<pastor::cli::CliError>().unwrap();
         assert_eq!(err.code, "head_too_old");
         assert!(err.message.contains("--place"), "{}", err.message);
-        assert_eq!(
-            probe_head(&paths, false, true, false).await.unwrap(),
-            Head::Live
-        );
+        let retry = protocol_need(&parse(&["pastor", "task", "retry", "t-1"]));
+        assert_eq!(probe_head(&paths, false, retry).await.unwrap(), Head::Live);
 
-        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
         assert!(needs_place_protocol(&parse(&[
             "pastor", "task", "retry", "t-1", "--place", "pastor"
         ])));
@@ -2168,6 +2157,65 @@ mod tests {
             "pastor", "task", "retry", "t-1"
         ])));
         assert!(!needs_place_protocol(&parse(&["pastor", "task", "list"])));
+    }
+
+    /// A head from before `FILE_PROTOCOL` does not know `FileGet`,
+    /// `FilePut`, `JobDescribe` or `JobSetEnabled`. The CLI refuses to go
+    /// on with it rather than edit the local copy behind its back; commands
+    /// that send none of them still work with it.
+    #[tokio::test]
+    async fn edits_and_job_requests_refuse_a_head_before_them() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.into_split();
+                let mut line = String::new();
+                tokio::io::BufReader::new(r)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let pong = IpcResponse::Pong {
+                    version: "0.6.0".into(),
+                    protocol: pastor::ipc::PLACE_PROTOCOL,
+                };
+                let mut out = serde_json::to_string(&pong).unwrap();
+                out.push('\n');
+                w.write_all(out.as_bytes()).await.unwrap();
+            }
+        });
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        for argv in [
+            &["pastor", "flock", "edit"][..],
+            &["pastor", "config", "edit"],
+            &["pastor", "job", "edit", "j"],
+            &["pastor", "job", "describe", "j"],
+            &["pastor", "job", "enable", "j"],
+            &["pastor", "job", "disable", "j"],
+        ] {
+            let need = protocol_need(&parse(argv));
+            assert_eq!(
+                need.map(|n| n.0),
+                Some(pastor::ipc::FILE_PROTOCOL),
+                "{argv:?}"
+            );
+            let err = probe_head(&paths, false, need).await.unwrap_err();
+            let err = err.downcast::<pastor::cli::CliError>().unwrap();
+            assert_eq!(err.code, "head_too_old", "{argv:?}");
+        }
+        for argv in [
+            &["pastor", "job", "list"][..],
+            &["pastor", "job", "reload"],
+            &["pastor", "flock", "list"],
+        ] {
+            let need = protocol_need(&parse(argv));
+            assert_eq!(need, None, "{argv:?}");
+            assert_eq!(probe_head(&paths, false, need).await.unwrap(), Head::Live);
+        }
     }
 
     #[test]

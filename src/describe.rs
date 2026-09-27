@@ -4,21 +4,25 @@
 //! and how they read.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::cli::CliError;
 use crate::cli::{
     JOB_HEADER, MachineRow, TASK_HEADER, age, in_, job_rows, one_line, table, task_rows,
 };
+use crate::config::Paths;
 use crate::connector::install::Origin;
+use crate::edit::ConfigFile;
 use crate::events::EventRecord;
 use crate::herdr::shell_quote;
 use crate::scheduler::JobStatus;
+use crate::store::{Store, TaskFilter};
 use crate::task::Task;
 
 /// How many recent tasks and events a description lists.
 pub const RECENT: usize = 10;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobDescription {
     pub name: String,
     pub file: String,
@@ -43,6 +47,68 @@ pub struct JobDescription {
     pub tasks: Vec<Task>,
     /// Its most recent `job.*` events, oldest first.
     pub events: Vec<EventRecord>,
+}
+
+/// `job describe` for `name`: how `statuses` (the head's, or a standalone
+/// scheduler's) report it, its tables as written in its file under `paths`,
+/// and its state, recent tasks and events from `store` and the events log.
+/// The head (`JobDescribe`) and the CLI with no head both build it here.
+pub fn job(
+    paths: &Paths,
+    name: &str,
+    statuses: Vec<JobStatus>,
+    store: &Store,
+) -> anyhow::Result<JobDescription> {
+    let path = ConfigFile::Job(name.to_string()).path(paths)?;
+    let Some(status) = statuses.into_iter().find(|j| j.name == name) else {
+        return Err(CliError::err(
+            "job_not_found",
+            format!("the head has no job {name}"),
+        ));
+    };
+    // The tables as written, so a file that does not parse still shows what
+    // it says as far as TOML goes.
+    let raw: Option<toml::Table> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok());
+    let table = |key: &str| {
+        raw.as_ref()
+            .and_then(|r| r.get(key))
+            .and_then(|v| serde_json::to_value(v).ok())
+    };
+    let state = store.job_state(name)?.unwrap_or_default();
+    let tasks = store
+        .list_tasks(&TaskFilter {
+            job: Some(name.to_string()),
+            ..Default::default()
+        })?
+        .into_iter()
+        .take(RECENT)
+        .collect();
+    let log = crate::events::read(&paths.events_file(), None).unwrap_or_default();
+    let events = recent_events(log, |e| {
+        e.kind.starts_with("job.") && e.job.as_deref() == Some(name)
+    });
+    Ok(JobDescription {
+        name: name.to_string(),
+        file: path.display().to_string(),
+        schedule: status.schedule,
+        enabled: status.enabled,
+        error: status.error,
+        running: status.running,
+        flock: status.flock,
+        connector: table("connector"),
+        dispatch: table("dispatch"),
+        next_due: status.next_due,
+        last_run_at: status.last_run_at.or(state.last_run_at),
+        last_ok_at: state.last_ok_at,
+        last_result: status.last_result.or(state.last_result),
+        last_error: state.last_error,
+        failures: state.failures,
+        backoff_until: state.backoff_until,
+        tasks,
+        events,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
