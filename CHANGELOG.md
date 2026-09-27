@@ -18,6 +18,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (MODEL, and `model` in `--json`), `flock describe`, `machine describe` and
   task events show it. The IPC protocol goes to 8, and every command that can
   make the head queue a task refuses an older head (`head_too_old`).
+- `docs/recommended-setup.md`: how to set up a fleet you'll keep. It covers
+  flocks per account, least-privilege credentials for agent machines (a
+  deploy key and a fine-grained token for one repository, so they can't
+  merge), permissions for unattended agents, fresh code for every task, and
+  `close_done_after` for short tasks. The docs test checks its commands too.
 - A connector can declare a `[finish]` command in its manifest (`command`,
   and a `timeout` that defaults like a hook's). The head runs it once, with the
   connector's env and secrets, when a task of one of its jobs reaches `done`

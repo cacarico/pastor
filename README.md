@@ -79,6 +79,10 @@ You also need:
 Each connector says what else it needs: `github-issues`, for example, uses an
 authenticated `gh`, `jq` and `sh` on the head.
 
+For a fleet you'll run for a while, [docs/recommended-setup.md](docs/recommended-setup.md)
+says how to put it together: flocks per account, least-privilege credentials
+for agent machines, permissions, and the settings that keep agents moving.
+
 ## Quick start
 
 Add the machines. The head can take tasks too:

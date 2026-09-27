@@ -775,6 +775,10 @@ ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
 
 ## Try it
 
+For a fleet you'll keep, see `docs/recommended-setup.md` first: which
+credentials each machine gets, and the settings that keep unattended agents
+moving.
+
 ```bash
 make install                         # pastor into ~/.cargo/bin
 pastor machine add pi-3 user@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
