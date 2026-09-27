@@ -2,7 +2,7 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use pastor::cli::{CliError, request_failure};
 use pastor::config::flock::{DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
@@ -11,7 +11,7 @@ use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{Head, HeadPing, IpcRequest, IpcResponse, request};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
-use pastor::task::{DispatchSpec, LIVE_STATES, Place, Task, TaskState, parse_task_id};
+use pastor::task::{DispatchSpec, LIVE_STATES, Place, Task, TaskState, bad_task_id, parse_task_id};
 
 /// The agent skill, built into the binary so an agent on any machine with
 /// pastor installed can read the guide that matches this exact CLI.
@@ -58,8 +58,6 @@ enum Command {
         #[command(subcommand)]
         cmd: FlockCmd,
     },
-    /// Open the full herdr UI on a machine
-    Open { machine: String },
     /// Run one scheduler pass now and report what it did
     Tick(TickArgs),
     /// Manage jobs (files in ~/.config/pastor/jobs/)
@@ -73,7 +71,10 @@ enum Command {
         cmd: ConfigCmd,
     },
     /// Print a shell completion script (fish, bash, zsh, ...) to stdout
-    Completions { shell: clap_complete::Shell },
+    Completions {
+        /// The shell to write the script for
+        shell: clap_complete::Shell,
+    },
     /// Show the events log (task, job and machine events)
     Events(pastor::events::EventsArgs),
     /// Install pastor or herdr as a user service (systemd, or launchd on macOS)
@@ -103,6 +104,7 @@ struct TickArgs {
     /// Only this job, and run it whether or not it is due
     #[arg(long)]
     job: Option<String>,
+    /// Print as a JSON array, one entry per job run
     #[arg(long)]
     json: bool,
 }
@@ -111,22 +113,37 @@ struct TickArgs {
 enum JobCmd {
     /// Every job file: schedule, enabled, last run, next run, last result
     List {
+        /// Print as a JSON array
         #[arg(long)]
         json: bool,
     },
     /// Enable a job file
-    Enable { name: String },
+    Enable {
+        /// The job: its file name without .toml
+        name: String,
+    },
     /// Disable a job file
-    Disable { name: String },
+    Disable {
+        /// The job: its file name without .toml
+        name: String,
+    },
     /// Fire a job now, ignoring its schedule, the overlap rule and `enabled`
-    Run { name: String },
-    /// Re-read the job files now instead of at the next tick
+    Run {
+        /// The job: its file name without .toml
+        name: String,
+    },
+    /// Re-read the job files, flock.toml and pastor.toml now instead of at the next tick
     Reload,
     /// Open a job file in $VISUAL or $EDITOR; save it only once it is valid
-    Edit { name: String },
+    Edit {
+        /// The job: its file name without .toml
+        name: String,
+    },
     /// One job in full: schedule, connector, dispatch, last runs, recent tasks
     Describe {
+        /// The job: its file name without .toml
         name: String,
+        /// Print as a JSON object
         #[arg(long)]
         json: bool,
     },
@@ -147,14 +164,19 @@ struct RunArgs {
     /// spares long prompts the shell's quoting
     #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
     prompt_file: Option<String>,
-    #[arg(long)]
+    /// The repo the agent works in: a path on the machine that runs the
+    /// task, not on this one
+    #[arg(long, value_name = "PATH")]
     repo: Option<String>,
     /// Only this flock's machines take the task (default: the flock of
     /// --machine, else the default flock)
     #[arg(long)]
     flock: Option<String>,
+    /// Run it on this machine (a name from flock.toml) instead of any free one
     #[arg(long)]
     machine: Option<String>,
+    /// The agent command to start, like claude or codex (default: the
+    /// machine's, else its flock's, else `[defaults]`, else claude)
     #[arg(long)]
     agent: Option<String>,
     /// One argument for the agent; repeat it, in order, for more. Replaces
@@ -168,8 +190,10 @@ struct RunArgs {
     /// Branch for the worktree (needs --worktree; a plain workspace has no branch)
     #[arg(long, requires = "worktree")]
     branch: Option<String>,
+    /// Only a machine with this tag takes the task; repeat for more, and it needs them all
     #[arg(long = "tag")]
     tags: Vec<String>,
+    /// Mark the task stale once it has run this long (30m, 2h; default: `[defaults]` timeout)
     #[arg(long)]
     timeout: Option<String>,
     /// Where the agent's pane goes: repo (under the repo it works on), own
@@ -177,6 +201,7 @@ struct RunArgs {
     /// pane:<workspace> (default: `[defaults] place`, else repo)
     #[arg(long, value_name = "PLACE")]
     place: Option<Place>,
+    /// Print as a JSON object
     #[arg(long)]
     json: bool,
 }
@@ -201,7 +226,7 @@ struct ListArgs {
     /// Every task, finished ones too (done, failed, stale, closed)
     #[arg(long, group = "list_filter")]
     all: bool,
-    /// Print full task records as JSON instead of a table
+    /// Print as a JSON array of full task records
     #[arg(long)]
     json: bool,
 }
@@ -212,21 +237,27 @@ enum TaskCmd {
     Run(RunArgs),
     /// List live tasks across the flock; --all adds finished ones
     List(ListArgs),
-    /// Show one task row
-    #[command(visible_alias = "describe")]
-    Show {
+    /// One task in full: state, machine, agent, prompt, error
+    Describe {
+        /// A task, like t-12 or 12
         task: String,
+        /// Print as a JSON object
         #[arg(long)]
         json: bool,
     },
     /// Read recent output from a task's pane
     Read {
+        /// A task, like t-12 or 12
         task: String,
+        /// How many lines from the bottom of the pane
         #[arg(long, default_value_t = 40)]
         lines: u32,
     },
     /// Attach to a task's agent terminal (ctrl+b q detaches)
-    Attach { task: String },
+    Attach {
+        /// A task, like t-12 or 12
+        task: String,
+    },
     /// Re-dispatch a failed or stale task as a new task (retry_of points back)
     Retry(pastor::task_cli::RetryArgs),
     /// Close a task's pane (and with --remove-worktree its worktree), or an orphaned agent
@@ -241,9 +272,14 @@ enum TaskCmd {
 
 #[derive(Subcommand, Debug)]
 enum MachineCmd {
+    /// Add a machine to flock.toml, reached over ssh, locally or by a command
+    #[command(group(ArgGroup::new("reach").args(["ssh", "local", "command"])))]
     Add {
+        /// The name pastor calls it by, in tasks, jobs and agent names
         name: String,
+        /// How ssh reaches it, like user@pi-1 (or an ssh config Host)
         ssh: Option<String>,
+        /// This machine itself, through herdr's local socket; no ssh
         #[arg(long)]
         local: bool,
         /// Developer option: the bridge command as one string, split on
@@ -251,10 +287,13 @@ enum MachineCmd {
         /// Words containing spaces go in flock.toml by hand.
         #[arg(long, value_name = "COMMAND")]
         command: Option<String>,
+        /// The herdr session on the machine that agents run in
         #[arg(long, default_value = "default")]
         session: String,
+        /// How many tasks it runs at once
         #[arg(long, default_value_t = 2)]
         max_agents: u32,
+        /// A label a task's --tag can ask for; repeat for more
         #[arg(long = "tag")]
         tags: Vec<String>,
         /// The flock it joins (default: the default flock)
@@ -264,27 +303,42 @@ enum MachineCmd {
         #[arg(long, conflicts_with_all = ["local", "command"])]
         herdr: bool,
     },
+    /// Remove a machine from flock.toml; tasks already on it keep their rows
     Remove {
+        /// The machine, as flock.toml names it
         name: String,
         /// Also remove herdr's saved machine with this label
         #[arg(long)]
         herdr: bool,
     },
     /// Put a machine in another flock; tasks already on it stay there
-    Move { name: String, flock: String },
+    Move {
+        /// The machine, as flock.toml names it
+        name: String,
+        /// The flock it moves to
+        flock: String,
+    },
     /// A line about the head, then each machine: host, flock, channel, herdr, agents
     List {
         /// Only the machines of this flock
         #[arg(long)]
         flock: Option<String>,
+        /// Print as a JSON object, {head, machines}: the head's row, then the machines
         #[arg(long)]
         json: bool,
     },
     /// One machine in full: host, flock, channel, versions, agents, recent errors
     Describe {
+        /// The machine, as flock.toml names it
         name: String,
+        /// Print as a JSON object
         #[arg(long)]
         json: bool,
+    },
+    /// Open the full herdr UI on a machine
+    Open {
+        /// The machine, as flock.toml names it
+        name: String,
     },
 }
 
@@ -293,24 +347,33 @@ enum FlockDefaultCmd {
     /// Print the default flock
     Show,
     /// Make another flock the default; machines stay in their flocks
-    Set { name: String },
+    Set {
+        /// The flock that becomes the default
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum FlockCmd {
     /// Every flock: default or not, its machines, live agents, queued tasks
     List {
+        /// Print as a JSON array
         #[arg(long)]
         json: bool,
     },
     /// Declare a flock; with --default, new tasks and jobs go to it
     Add {
+        /// The new flock's name
         name: String,
+        /// Make it the default flock too
         #[arg(long)]
         default: bool,
     },
     /// Remove a flock; refused while it has machines or queued tasks, or is the default
-    Remove { name: String },
+    Remove {
+        /// The flock
+        name: String,
+    },
     /// The flock that new tasks and jobs go to
     Default {
         #[command(subcommand)]
@@ -320,7 +383,9 @@ enum FlockCmd {
     Edit,
     /// One flock in full: default or not, its agent, machines, live tasks
     Describe {
+        /// The flock
         name: String,
+        /// Print as a JSON object
         #[arg(long)]
         json: bool,
     },
@@ -396,7 +461,6 @@ fn main() {
             Command::Task { cmd } => task(&paths, cmd, head).await,
             Command::Machine { cmd } => machine(&paths, cmd, head).await,
             Command::Flock { cmd } => flock(&paths, cmd, head).await,
-            Command::Open { machine } => open(&paths, &machine).await,
             Command::Tick(args) => tick(&paths, args, head).await,
             Command::Job { cmd } => job(&paths, cmd, head).await,
             Command::Config {
@@ -447,40 +511,9 @@ fn complete(args: &[String]) -> ! {
 }
 
 /// The command tree `pastor completions` describes: the real one, since there
-/// are no hidden subcommands left to strip out (`__complete` is not in it).
+/// are no hidden subcommands or aliases (`__complete` is not in it).
 fn completion_tree() -> clap::Command {
-    let mut cmd = <Cli as clap::CommandFactory>::command().version(env!("CARGO_PKG_VERSION"));
-    // clap builds the `help` subtree from subcommand names only, so a
-    // visible alias (`task describe`) completes directly but not after
-    // `pastor help task`. Build first, then give each help node its aliases.
-    cmd.build();
-    let real = cmd.clone();
-    cmd.mut_subcommand("help", |help| help_aliases(help, &real))
-}
-
-/// `help`, a node of the built help subtree, with an entry added for each
-/// visible alias of the matching node `real` of the command tree.
-fn help_aliases(help: clap::Command, real: &clap::Command) -> clap::Command {
-    let base = help.get_bin_name().unwrap_or("pastor").to_string();
-    let mut extra = Vec::new();
-    for sub in real.get_subcommands() {
-        for alias in sub.get_visible_aliases() {
-            // clap names want `'static`; this runs once, for a completion script.
-            let name: &'static str = Box::leak(alias.to_owned().into_boxed_str());
-            let mut c = clap::Command::new(name)
-                .bin_name(format!("{base} {name}"))
-                .disable_help_flag(true);
-            if let Some(about) = sub.get_about() {
-                c = c.about(about.clone());
-            }
-            extra.push(c);
-        }
-    }
-    help.mut_subcommands(|node| match real.find_subcommand(node.get_name()) {
-        Some(r) if node.get_name() != "help" => help_aliases(node, r),
-        _ => node,
-    })
-    .subcommands(extra)
+    <Cli as clap::CommandFactory>::command().version(env!("CARGO_PKG_VERSION"))
 }
 
 /// `pastor bridge`. Its client reads replies on stdout, so a failure is
@@ -600,11 +633,13 @@ fn head_use(command: &Command) -> Option<bool> {
             TaskCmd::Attach { .. } => None,
             _ => Some(false),
         },
-        Command::Machine { cmd } => Some(match cmd {
-            MachineCmd::List { flock, .. } => flock.is_some(),
-            MachineCmd::Describe { .. } => false,
-            _ => true,
-        }),
+        Command::Machine { cmd } => match cmd {
+            MachineCmd::List { flock, .. } => Some(flock.is_some()),
+            MachineCmd::Describe { .. } => Some(false),
+            // Open execs herdr on the machine; the head has no part in it.
+            MachineCmd::Open { .. } => None,
+            _ => Some(true),
+        },
         Command::Flock { cmd } => match cmd {
             // Reads flock.toml and nothing else: no head to ask.
             FlockCmd::Default {
@@ -615,7 +650,7 @@ fn head_use(command: &Command) -> Option<bool> {
         },
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
         Command::Connector { cmd } => {
-            (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Run { .. })).then_some(false)
+            (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Try { .. })).then_some(false)
         }
         _ => None,
     }
@@ -641,7 +676,8 @@ fn changes_fleet(command: &Command) -> bool {
                 // herdr's agent terminal types into any task's pane.
                 | TaskCmd::Attach { .. }
         ),
-        // Reading the fleet is fine: list and describe change nothing.
+        // Reading the fleet is fine: list and describe change nothing. Open
+        // counts: herdr's full UI drives every pane and agent on the machine.
         Command::Machine { cmd } => {
             !matches!(cmd, MachineCmd::List { .. } | MachineCmd::Describe { .. })
         }
@@ -661,13 +697,11 @@ fn changes_fleet(command: &Command) -> bool {
         // head's jobs, restarting its stream connectors.
         Command::Connector { cmd } => !matches!(
             cmd,
-            ConnectorCmd::List { .. } | ConnectorCmd::Describe { .. } | ConnectorCmd::Run { .. }
+            ConnectorCmd::List { .. } | ConnectorCmd::Describe { .. } | ConnectorCmd::Try { .. }
         ),
         // A head started from an agent's pane schedules and dispatches with
         // no request to refuse; setup installs one that starts on login.
         Command::Serve | Command::Setup { .. } => true,
-        // herdr's full UI drives every pane and agent on the machine.
-        Command::Open { .. } => true,
         _ => false,
     }
 }
@@ -1127,15 +1161,14 @@ fn open_store(paths: &Paths) -> anyhow::Result<Store> {
 }
 
 fn task_id(s: &str) -> i64 {
-    parse_task_id(s)
-        .unwrap_or_else(|| fail("usage_error", &format!("{s} is not a task id like t-12")))
+    parse_task_id(s).unwrap_or_else(|| fail("usage_error", &bad_task_id(s)))
 }
 
 async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
     match cmd {
         TaskCmd::Run(args) => run(paths, args).await?,
         TaskCmd::List(args) => list(paths, args, head).await?,
-        TaskCmd::Show { task, json } => {
+        TaskCmd::Describe { task, json } => {
             let id = task_id(&task);
             let t = if head.is_live() {
                 let IpcResponse::Task(t) = ask(paths, IpcRequest::TaskShow { id }).await? else {
@@ -1289,6 +1322,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             machine_list(paths, flock.as_deref(), json, head).await?
         }
         MachineCmd::Describe { name, json } => machine_describe(paths, &name, json, head).await?,
+        MachineCmd::Open { name } => open(paths, &name).await?,
     }
     Ok(())
 }
@@ -2535,7 +2569,7 @@ mod tests {
         for args in [
             vec!["pastor", "task", "run", "hi"],
             vec!["pastor", "task", "list", "--json"],
-            vec!["pastor", "task", "show", "t-1"],
+            vec!["pastor", "task", "describe", "t-1"],
             vec!["pastor", "task", "read", "t-1"],
             vec!["pastor", "task", "attach", "t-1"],
         ] {
@@ -2543,6 +2577,150 @@ mod tests {
                 panic!("{args:?}: {e}");
             }
         }
+    }
+
+    /// The old names are gone outright, with no alias left behind: one verb
+    /// per action across the nouns.
+    #[test]
+    fn renamed_commands_answer_only_to_their_new_names() {
+        for args in [
+            vec!["pastor", "task", "show", "t-1"],
+            vec!["pastor", "connector", "run", "c", "--job", "j"],
+            vec!["pastor", "open", "pi-1"],
+        ] {
+            let err = Cli::try_parse_from(&args).expect_err(&format!("{args:?} still parses"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "{args:?}: {err}"
+            );
+        }
+        for args in [
+            vec!["pastor", "task", "describe", "t-1"],
+            vec!["pastor", "connector", "try", "c", "--job", "j"],
+            vec!["pastor", "machine", "open", "pi-1"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(&args) {
+                panic!("{args:?}: {e}");
+            }
+        }
+        fn aliases(cmd: &clap::Command) -> Vec<String> {
+            let mut out: Vec<String> = cmd.get_all_aliases().map(str::to_string).collect();
+            for sub in cmd.get_subcommands() {
+                out.extend(aliases(sub));
+            }
+            out
+        }
+        use clap::CommandFactory;
+        assert_eq!(aliases(&Cli::command()), Vec::<String>::new());
+    }
+
+    /// `--help` is the first thing a user or an agent reads: every command
+    /// says what it does and every argument what it takes. `--json` says the
+    /// shape it prints, and a task argument the two ways to write one.
+    #[test]
+    fn every_command_and_argument_has_help() {
+        fn walk(cmd: &clap::Command, path: &str, missing: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id().as_str();
+                if matches!(id, "help" | "version") {
+                    continue;
+                }
+                let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+                if help.is_empty() {
+                    missing.push(format!("{path} {id}: no help"));
+                }
+                if id == "json"
+                    && ![
+                        "Print as a JSON array",
+                        "Print as a JSON object",
+                        "Print one JSON record per line",
+                    ]
+                    .iter()
+                    .any(|p| help.starts_with(p))
+                {
+                    missing.push(format!("{path} --json: {help:?} does not say the shape"));
+                }
+                if arg.is_positional()
+                    && id == "task"
+                    && !help.starts_with("A task, like t-12 or 12")
+                {
+                    missing.push(format!("{path} <task>: {help:?}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                let name = sub.get_name();
+                if name == "help" {
+                    continue;
+                }
+                let path = format!("{path} {name}");
+                if sub.get_about().is_none_or(|a| a.to_string().is_empty()) {
+                    missing.push(format!("{path}: no about"));
+                }
+                walk(sub, &path, missing);
+            }
+        }
+        use clap::CommandFactory;
+        let mut missing = Vec::new();
+        walk(&Cli::command(), "pastor", &mut missing);
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+    }
+
+    /// A machine is reached one way: over ssh, locally, or by a command.
+    #[test]
+    fn machine_add_takes_one_way_to_reach_the_machine() {
+        for args in [
+            vec!["pastor", "machine", "add", "x", "user@h", "--local"],
+            vec![
+                "pastor",
+                "machine",
+                "add",
+                "x",
+                "user@h",
+                "--command",
+                "fake",
+            ],
+            vec![
+                "pastor",
+                "machine",
+                "add",
+                "x",
+                "--local",
+                "--command",
+                "fake",
+            ],
+        ] {
+            let err = Cli::try_parse_from(&args).expect_err(&format!("{args:?} parses"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}: {err}"
+            );
+        }
+        for args in [
+            vec!["pastor", "machine", "add", "x", "user@h"],
+            vec!["pastor", "machine", "add", "x", "--local"],
+            vec!["pastor", "machine", "add", "x", "--command", "fake"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(&args) {
+                panic!("{args:?}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn job_reload_help_names_every_file_it_rereads() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let reload = root
+            .find_subcommand("job")
+            .and_then(|j| j.find_subcommand("reload"))
+            .unwrap();
+        let about = reload.get_about().unwrap().to_string();
+        assert!(
+            about.contains("flock.toml") && about.contains("pastor.toml"),
+            "{about}"
+        );
     }
 
     #[test]
@@ -2567,26 +2745,36 @@ mod tests {
         );
     }
 
-    /// Every `pastor ...` command a skill shows, in inline code or a code
-    /// block, must be a real command with real long flags, so the skills
+    /// Every `pastor ...` command a skill or the docs show, in inline code or
+    /// a code block, must be a real command with real long flags, so they
     /// cannot drift from the CLI. Words that are not commands end the walk
     /// (`t-12`, a quoted prompt); flags are checked on the command reached.
     /// Every Markdown file under `skills/` counts: the reference files and
     /// worked examples are read by agents as much as the SKILL.md itself.
+    /// README.md and docs/manual.md are read by people, and count too.
     #[test]
     fn skills_mention_only_real_commands_and_flags() {
         let mut files = Vec::new();
         markdown_files(&skills_dir(), &mut files);
         assert!(files.len() > 1, "found only {files:?}");
+        let repo = skills_dir().parent().unwrap().to_path_buf();
+        files.push(repo.join("README.md"));
+        files.push(repo.join("docs/manual.md"));
+        let mut wrong = Vec::new();
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
-            let checked = check_commands(&text);
-            if file.ends_with("pastor/SKILL.md") {
+            let (checked, errors) = check_commands(&text);
+            wrong.extend(errors.iter().map(|e| format!("{}: {e}", file.display())));
+            if file.ends_with("pastor/SKILL.md")
+                || file.ends_with("README.md")
+                || file.ends_with("manual.md")
+            {
                 assert!(checked > 20, "only {checked} commands found in {file:?}");
             }
         }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
         // The binary prints the copy it was built with; it is the same file.
-        assert!(check_commands(SKILL) > 20);
+        assert!(check_commands(SKILL).0 > 20);
     }
 
     /// Each skill is loaded by its frontmatter alone until it triggers, so a
@@ -2655,37 +2843,56 @@ mod tests {
         }
     }
 
-    /// Checks every `pastor` command in `text`; returns how many it saw.
-    fn check_commands(text: &str) -> usize {
+    /// Checks every `pastor` command in `text`; returns how many it saw and
+    /// what is wrong with them.
+    fn check_commands(text: &str) -> (usize, Vec<String>) {
         use clap::CommandFactory;
         let root = Cli::command();
         let mut checked = 0;
+        let mut errors = Vec::new();
         for code in code_spans(text) {
             for line in code.lines() {
                 let line = line.split(" # ").next().unwrap_or(line);
                 let words: Vec<&str> = line.split_whitespace().collect();
                 for (at, _) in words.iter().enumerate().filter(|(_, w)| **w == "pastor") {
-                    check_command(&root, &words[at + 1..], line);
+                    if let Err(e) = check_command(&root, &words[at + 1..]) {
+                        errors.push(format!("{line:?}: {e}"));
+                    }
                     checked += 1;
                 }
             }
         }
-        checked
+        (checked, errors)
     }
 
     /// Inline code spans and fenced blocks of a Markdown text, in order.
+    /// A fence tagged with a language that is not a shell (`toml`, `json`,
+    /// `text` for a diagram or sample output) holds no commands and is left
+    /// out. An inline span may wrap onto the next line of its paragraph.
     fn code_spans(text: &str) -> Vec<String> {
         let mut out = Vec::new();
-        let mut fence: Option<String> = None;
+        let mut fence: Option<(bool, String)> = None;
+        let mut para = String::new();
+        let inline = |para: &mut String, out: &mut Vec<String>| {
+            out.extend(para.split('`').skip(1).step_by(2).map(str::to_string));
+            para.clear();
+        };
         for line in text.lines() {
-            if line.starts_with("```") {
+            if fence.is_none() && (line.trim().is_empty() || line.starts_with("```")) {
+                inline(&mut para, &mut out);
+            }
+            if let Some(lang) = line.strip_prefix("```") {
                 match fence.take() {
-                    Some(block) => out.push(block),
-                    None => fence = Some(String::new()),
+                    Some((true, block)) => out.push(block),
+                    Some((false, _)) => {}
+                    None => {
+                        let shell = matches!(lang.trim(), "" | "sh" | "bash" | "fish" | "console");
+                        fence = Some((shell, String::new()));
+                    }
                 }
                 continue;
             }
-            if let Some(block) = fence.as_mut() {
+            if let Some((_, block)) = fence.as_mut() {
                 // A trailing backslash continues the command on the next line.
                 block.push_str(line.trim_end_matches('\\'));
                 if !line.ends_with('\\') {
@@ -2693,12 +2900,18 @@ mod tests {
                 }
                 continue;
             }
-            out.extend(line.split('`').skip(1).step_by(2).map(str::to_string));
+            para.push_str(line);
+            para.push(' ');
         }
+        inline(&mut para, &mut out);
         out
     }
 
-    fn check_command(root: &clap::Command, words: &[&str], line: &str) {
+    fn check_command(root: &clap::Command, words: &[&str]) -> Result<(), String> {
+        // What the completion scripts run at TAB; it is not in the clap tree.
+        if words.first() == Some(&"__complete") {
+            return Ok(());
+        }
         let mut cmd = root;
         let mut rest = words;
         while let Some(word) = rest.first() {
@@ -2708,10 +2921,10 @@ mod tests {
                     rest = &rest[1..];
                 }
                 None if cmd.has_subcommands() && !word.starts_with('-') => {
-                    panic!(
-                        "{line:?}: `{word}` is not a subcommand of `{}`",
+                    return Err(format!(
+                        "`{word}` is not a subcommand of `{}`",
                         cmd.get_name()
-                    )
+                    ));
                 }
                 None => break,
             }
@@ -2725,16 +2938,27 @@ mod tests {
                 Some((name, _)) => (name, true),
                 None => (flag, false),
             };
-            if name == "help" {
+            if name == "help" || name == "version" {
                 continue;
             }
             let arg = cmd
                 .get_arguments()
                 .find(|a| a.get_long() == Some(name))
-                .unwrap_or_else(|| panic!("{line:?}: `{}` has no --{name}", cmd.get_name()));
+                .ok_or_else(|| format!("`{}` has no --{name}", cmd.get_name()))?;
             if !inline && arg.get_action().takes_values() {
-                words.next();
+                // A quoted value runs to the word that closes the quote.
+                if let Some(value) = words.next()
+                    && let Some(q) = value.chars().next().filter(|c| matches!(c, '"' | '\''))
+                    && (value.len() == 1 || !value.ends_with(q))
+                {
+                    for w in words.by_ref() {
+                        if w.ends_with(q) {
+                            break;
+                        }
+                    }
+                }
             }
         }
+        Ok(())
     }
 }

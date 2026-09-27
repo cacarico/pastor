@@ -157,12 +157,12 @@ impl Env {
         }
     }
 
-    /// Polls `task show` until `task` is done, so later snapshots of it are
+    /// Polls `task describe` until `task` is done, so later snapshots of it are
     /// stable: the fake finishes agents on its own and the daemon reconciles.
     fn wait_done(&self, task: &str) {
         let deadline = Instant::now() + WAIT;
         loop {
-            let out = self.cmd(&["task", "show", task, "--json"]);
+            let out = self.cmd(&["task", "describe", task, "--json"]);
             let t: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
             if t["state"] == "done" {
                 return;
@@ -251,7 +251,7 @@ fn run_list_show_read_end_to_end() {
     assert_eq!(tasks[0]["agent_name"], "t-1");
     assert_eq!(tasks[0]["state"], "done");
 
-    let out = env.cmd(&["task", "show", "t-9"]);
+    let out = env.cmd(&["task", "describe", "t-9"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("task_not_found"));
 }
@@ -344,7 +344,7 @@ fn help_footer_points_agents_at_the_skill() {
 }
 
 /// `--agent-arg` reaches herdr's `agent.start` as `args`, in order, and shows
-/// in `task show` and `task list --json`; without it, the flock's
+/// in `task describe` and `task list --json`; without it, the flock's
 /// `agent_args` do, then `[defaults] agent_args`.
 #[test]
 fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
@@ -370,7 +370,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     assert_eq!(start["args"], want, "{start}");
     assert_eq!(start["kind"], "claude");
 
-    let out = env.cmd(&["task", "show", "t-1"]);
+    let out = env.cmd(&["task", "describe", "t-1"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         text.contains("agent args: --model claude-opus-5-5"),
@@ -401,7 +401,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     );
 
     // A flock's own agent_args come before `[defaults]`, its deny list
-    // reaches claude as --disallowedTools, and `task show` prints what the
+    // reaches claude as --disallowedTools, and `task describe` prints what the
     // task resolved to.
     let flock = env.config.join("flock.toml");
     // A third slot, so t-3 need not wait for the first two to settle.
@@ -433,7 +433,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
         ]),
         "{start}"
     );
-    let out = env.cmd(&["task", "show", "t-3"]);
+    let out = env.cmd(&["task", "describe", "t-3"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         text.contains("agent:      claude (from defaults)\n"),
@@ -477,7 +477,7 @@ fn an_agent_definition_reaches_herdr_as_its_kind_and_env() {
         serde_json::json!({"CLAUDE_CONFIG_DIR": "/srv/claude-personal", "PASTOR_TASK": "t-1"}),
         "{ws}"
     );
-    let out = env.cmd(&["task", "show", "t-1"]);
+    let out = env.cmd(&["task", "describe", "t-1"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         text.contains("agent:      claude-personal (from task run)\n"),
@@ -1712,7 +1712,7 @@ fn named_flocks_refuse_every_head_path_on_a_head_from_before_flocks() {
     for args in [
         &["task", "run", "hi"][..],
         &["task", "list"],
-        &["task", "show", "t-1"],
+        &["task", "describe", "t-1"],
         &["machine", "list"],
         &["flock", "list"],
         &["job", "list"],
@@ -1757,7 +1757,7 @@ fn an_unresponsive_head_is_a_hard_error_on_every_head_path() {
         &["task", "run", "hi"],
         &["task", "run", "hi", "--flock", "work"],
         &["task", "list"],
-        &["task", "show", "t-1"],
+        &["task", "describe", "t-1"],
         &["task", "prune", "--done", "--older-than", "3d"],
         &["machine", "list"],
         &["machine", "add", "pi-2", "--local"],
@@ -1908,7 +1908,7 @@ fn task_retry_close_and_prune_end_to_end() {
     let env = start();
     let t1 = env.json(&["task", "run", "first", "--json"]);
     assert_eq!(t1["state"], "running");
-    env.wait_for("t-1 done", &["task", "show", "t-1", "--json"], |t| {
+    env.wait_for("t-1 done", &["task", "describe", "t-1", "--json"], |t| {
         t.contains("\"done\"")
     });
     // Only failed or stale tasks retry.
@@ -1998,9 +1998,9 @@ fn task_retry_close_and_prune_end_to_end() {
         pruned["pruned"], 2,
         "t-3, the newest, stays so its id is not reused"
     );
-    env.fails_with(&["task", "show", "t-1"], "task_not_found");
+    env.fails_with(&["task", "describe", "t-1"], "task_not_found");
     assert_eq!(
-        env.json(&["task", "show", "t-3", "--json"])["state"],
+        env.json(&["task", "describe", "t-3", "--json"])["state"],
         "closed"
     );
     let out = env.cmd(&[
@@ -2398,8 +2398,8 @@ fn a_task_waits_for_its_flock_end_to_end() {
     let header: Vec<&str> = table.lines().next().unwrap().split_whitespace().collect();
     assert_eq!(header[..4], ["ID", "STATE", "MACHINE", "FLOCK"], "{table}");
     assert!(
-        ok(env.cmd(&["task", "show", &format!("t-{id}")])).contains("flock:      work"),
-        "task show names the flock"
+        ok(env.cmd(&["task", "describe", &format!("t-{id}")])).contains("flock:      work"),
+        "task describe names the flock"
     );
 
     ok(env.cmd(&["machine", "move", "fake", "work"]));
@@ -2407,7 +2407,7 @@ fn a_task_waits_for_its_flock_end_to_end() {
     loop {
         let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
             "task",
-            "show",
+            "describe",
             &format!("t-{id}"),
             "--json",
         ])))
@@ -2505,7 +2505,7 @@ fn task_send_types_into_a_live_task_and_refuses_a_finished_one() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let t = env.json(&["task", "show", "t-1", "--json"]);
+    let t = env.json(&["task", "describe", "t-1", "--json"]);
     assert_eq!(t["state"], "running", "{t}");
 
     // A closed one does not.
@@ -2521,11 +2521,11 @@ fn task_send_types_into_a_live_task_and_refuses_a_finished_one() {
     assert_eq!(err["code"], "task_not_live", "{err}");
 }
 
-/// Polls `task show` until `task` is in `state`.
+/// Polls `task describe` until `task` is in `state`.
 fn wait_state(env: &Env, task: &str, state: &str) -> serde_json::Value {
     let deadline = Instant::now() + WAIT;
     loop {
-        let out = env.cmd(&["task", "show", task, "--json"]);
+        let out = env.cmd(&["task", "describe", task, "--json"]);
         let t: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         if t["state"] == state {
             return t;
@@ -2731,7 +2731,7 @@ fn an_agent_may_end_its_own_task_only() {
     assert_eq!(ended["state"], "done", "{ended}");
     assert_eq!(ended["ended"], true, "{ended}");
     ok(as_agent(&["task", "done", "t-1"]));
-    let other = env.json(&["task", "show", "t-2", "--json"]);
+    let other = env.json(&["task", "describe", "t-2", "--json"]);
     assert!(other.get("ended").is_none(), "{other}");
     env.fails_with(&["task", "done"], "usage_error");
     // A human may end any task.
@@ -2778,7 +2778,7 @@ fn an_agent_pastor_started_may_not_edit_the_flock() {
         &["serve"],
         &["setup", "systemd"],
         // herdr's full UI drives every pane on the machine.
-        &["open", "pi-1"],
+        &["machine", "open", "pi-1"],
     ] {
         assert_eq!(error_code(&run(args)), "agent_refused", "{args:?}");
     }
@@ -3282,16 +3282,6 @@ fn describe_a_job_flock_and_task_without_a_head() {
         "unknown_flock"
     );
 
-    // `task describe` is `task show`, spelled the kubectl way.
-    assert_eq!(
-        ok(o.cmd(&["task", "describe", "t-1", "--json"])),
-        ok(o.cmd(&["task", "show", "t-1", "--json"]))
-    );
-    assert_eq!(
-        ok(o.cmd(&["task", "describe", "t-1"])),
-        ok(o.cmd(&["task", "show", "t-1"]))
-    );
-
     // Without a head a machine is probed directly; a local one with no
     // herdr server reads as down.
     let m: serde_json::Value =
@@ -3545,7 +3535,7 @@ fn complete_offers_job_names() {
         &["job", "describe", ""][..],
         &["job", "run", "tr"],
         &["tick", "--job", ""],
-        &["connector", "run", "github-issues", "--job", ""],
+        &["connector", "try", "github-issues", "--job", ""],
         &["task", "list", "--json", "--job=n"],
     ] {
         let (ok, out) = complete(&config, &state, words);
@@ -3590,7 +3580,7 @@ fn complete_offers_machine_names() {
     for words in [
         &["machine", "describe", ""][..],
         &["machine", "move", ""],
-        &["open", ""],
+        &["machine", "open", ""],
         &["task", "list", "--machine", ""],
     ] {
         let (ok, out) = complete(&config, &state, words);
@@ -3607,7 +3597,7 @@ fn complete_offers_connector_ids() {
     for words in [
         &["connector", "uninstall", ""][..],
         &["connector", "unlink", ""],
-        &["connector", "run", ""],
+        &["connector", "try", ""],
     ] {
         let (ok, out) = complete(&config, &state, words);
         assert!(ok, "{words:?}");

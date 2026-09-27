@@ -32,7 +32,7 @@ someone else's cloud. The longer story is in [the blog post](https://cacari.co/p
 
 ## How it works
 
-```
+```text
    you ──► pastor CLI ──►  head: pastor serve  ──ssh + herdr──►  machine ──► agent in a
              ▲             queue · schedule ·                    (a Pi,       terminal, in a
              │             history · events                       a server)   git worktree

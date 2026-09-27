@@ -1,12 +1,12 @@
-# pastor open refuses inside herdr: Implementation Plan
+# pastor machine open refuses inside herdr: Implementation Plan
 
 > **For agentic workers:** this plan runs on a pastor flock, one task at a time. Each task's prompt file is under `docs/superpowers/plans/2026-09-26-nested-herdr/`. Do only the task your prompt names.
 
-**Goal:** `pastor open <machine>` run inside a herdr pane fails at once with the code `nested_herdr` and a message that says to use a plain terminal, instead of exec'ing herdr and letting herdr refuse.
+**Goal:** `pastor machine open <machine>` run inside a herdr pane fails at once with the code `nested_herdr` and a message that says to use a plain terminal, instead of exec'ing herdr and letting herdr refuse.
 
 **Architecture:** herdr sets `HERDR_ENV=1` in every pane it starts. `open` in `src/main.rs` checks it first, before loading the flock, and calls the existing `fail` helper. No new dependency, no daemon change.
 
-**Spec:** the Known gaps list in `AGENTS.md`: "`pastor open` should detect a nested herdr and say so instead of herdr refusing to start."
+**Spec:** the Known gaps list in `AGENTS.md`: "`pastor machine open` should detect a nested herdr and say so instead of herdr refusing to start."
 
 **Global Constraints:**
 
@@ -29,7 +29,7 @@
 
 ---
 
-### Task 1: Refuse `pastor open` inside a herdr pane
+### Task 1: Refuse `pastor machine open` inside a herdr pane
 
 **Files:**
 
@@ -50,7 +50,7 @@ Append to `tests/cli.rs`:
 fn open_refuses_inside_a_herdr_pane() {
     let tmp = tempfile::tempdir().unwrap();
     let out = pastor()
-        .args(["open", "pi-3"])
+        .args(["machine", "open", "pi-3"])
         .env("PASTOR_CONFIG_DIR", tmp.path())
         .env("PASTOR_STATE_DIR", tmp.path())
         .env("HERDR_ENV", "1")
@@ -77,7 +77,7 @@ At the top of `async fn open` in `src/main.rs`, before `Flock::load`:
     if std::env::var_os("HERDR_ENV").is_some_and(|v| v == "1") {
         fail(
             "nested_herdr",
-            "this terminal is a herdr pane; run pastor open from a plain terminal",
+            "this terminal is a herdr pane; run pastor machine open from a plain terminal",
         );
     }
 ```
@@ -118,7 +118,7 @@ pastor task run --prompt-file docs/superpowers/plans/2026-09-26-nested-herdr/tas
 
 **Files:**
 
-- Modify: `docs/manual.md` (the paragraph on `pastor open` under "How it works")
+- Modify: `docs/manual.md` (the paragraph on `pastor machine open` under "How it works")
 - Modify: `AGENTS.md` (Known gaps)
 - Modify: `CHANGELOG.md` (Unreleased)
 
@@ -133,11 +133,11 @@ In `docs/manual.md`, replace "herdr refuses to start inside one of its own panes
 
 - [ ] **Step 2: Known gaps**
 
-In `AGENTS.md`, delete the Known gaps item that starts "`pastor open` should detect a nested herdr".
+In `AGENTS.md`, delete the Known gaps item that starts "`pastor machine open` should detect a nested herdr".
 
 - [ ] **Step 3: Changelog**
 
-Under `## Unreleased` in `CHANGELOG.md`, add a `### Fixed` section if there is none, with the item: "`pastor open` inside a herdr pane fails with `nested_herdr` instead of handing the terminal to a herdr that refuses to start."
+Under `## Unreleased` in `CHANGELOG.md`, add a `### Fixed` section if there is none, with the item: "`pastor machine open` inside a herdr pane fails with `nested_herdr` instead of handing the terminal to a herdr that refuses to start."
 
 - [ ] **Step 4: Check and commit**
 
@@ -146,7 +146,7 @@ Expected: pass.
 
 ```bash
 git add docs/manual.md AGENTS.md CHANGELOG.md
-git commit -m "docs: say that pastor open refuses inside herdr"
+git commit -m "docs: say that pastor machine open refuses inside herdr"
 ```
 
 with a body saying the known gap is closed.

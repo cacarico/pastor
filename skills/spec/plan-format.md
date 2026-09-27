@@ -88,4 +88,4 @@ Task 2: ran as t-15 on pi-3
 
 The agent writes `complete` and `blocked` lines, each after fetching and rebasing onto the plan branch, so a push that raced with another one is retried rather than lost.
 
-Whoever starts a task keeps the id from `--json` and does not push the plan branch while that task's agent may still push it. Once the task has written its line, or its pane is closed, they append `Task N: ran as t-M on <machine>` and push, before starting the next task. That way `pastor task show t-N` and `pastor events --task t-N` can be found from the branch alone. The next task to run is the first one with no `complete` line.
+Whoever starts a task keeps the id from `--json` and does not push the plan branch while that task's agent may still push it. Once the task has written its line, or its pane is closed, they append `Task N: ran as t-M on <machine>` and push, before starting the next task. That way `pastor task describe t-N` and `pastor events --task t-N` can be found from the branch alone. The next task to run is the first one with no `complete` line.

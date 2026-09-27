@@ -13,31 +13,35 @@ use crate::task::{Task, TaskState, parse_task_id};
 
 #[derive(Args, Debug)]
 pub struct RetryArgs {
-    /// A failed or stale task, like t-12
+    /// A task, like t-12 or 12: a failed or stale one
     pub task: String,
     /// Where the new task's pane goes instead of the old one's: repo, own,
     /// pastor or pane:<workspace>
     #[arg(long, value_name = "PLACE")]
     pub place: Option<crate::task::Place>,
+    /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct CloseArgs {
-    /// A task, or an orphaned agent named like one (t-12)
+    /// A task, like t-12 or 12, or an orphaned agent named like one
     pub task: String,
     /// Remove the task's worktree too (refused if it has uncommitted changes)
     #[arg(long)]
     pub remove_worktree: bool,
+    /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct DoneArgs {
-    /// The task to end (default: the task this pane runs, from PASTOR_TASK)
+    /// A task, like t-12 or 12: the one to end (default: the task this pane
+    /// runs, from PASTOR_TASK)
     pub task: Option<String>,
+    /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
 }
@@ -55,7 +59,7 @@ impl DoneArgs {
 #[derive(Args, Debug)]
 #[command(group(ArgGroup::new("send_input").required(true).multiple(true)))]
 pub struct SendArgs {
-    /// A live task (starting, running or blocked), like t-12
+    /// A task, like t-12 or 12: a live one (starting, running or blocked)
     pub task: String,
     /// Text to type into the agent, followed by Enter
     #[arg(group = "send_input")]
@@ -69,6 +73,7 @@ pub struct SendArgs {
     /// Accept the agent's folder-trust prompt with its trust keys, and trust the task's repo on its machine from now on
     #[arg(long, group = "send_input", conflicts_with_all = ["text", "keys", "no_enter"])]
     pub trust: bool,
+    /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
 }
@@ -88,13 +93,13 @@ pub struct PruneArgs {
     /// Only tasks that finished longer ago than this (30m, 12h, 3d)
     #[arg(long, value_name = "DURATION")]
     pub older_than: String,
+    /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
 }
 
 fn task_id(s: &str) -> anyhow::Result<i64> {
-    parse_task_id(s)
-        .ok_or_else(|| CliError::err("usage_error", format!("{s} is not a task id like t-12")))
+    parse_task_id(s).ok_or_else(|| CliError::err("usage_error", crate::task::bad_task_id(s)))
 }
 
 /// A request that got no reply, classified as `request_failure` does for

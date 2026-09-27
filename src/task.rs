@@ -328,6 +328,11 @@ pub fn parse_task_id(s: &str) -> Option<i64> {
     s.strip_prefix("t-").unwrap_or(s).parse().ok()
 }
 
+/// What to say when `s` is not something `parse_task_id` takes.
+pub fn bad_task_id(s: &str) -> String {
+    format!("{s} is not a task id; write it like t-12 or 12")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Observed {
     Status {
@@ -996,6 +1001,8 @@ mod tests {
         assert_eq!(parse_task_id("t-12"), Some(12));
         assert_eq!(parse_task_id("12"), Some(12));
         assert_eq!(parse_task_id("x"), None);
+        let msg = bad_task_id("x");
+        assert!(msg.contains("t-12") && msg.contains(" 12"), "{msg}");
         assert_eq!(Task::agent_name_for(7), "t-7");
         assert_eq!("blocked".parse::<TaskState>().unwrap(), TaskState::Blocked);
     }

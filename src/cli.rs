@@ -120,7 +120,7 @@ pub fn task_note(t: &Task) -> String {
 }
 
 /// Errors carry raw stderr, newlines included; a human line (an events
-/// record, a `task show` field) must stay one line. The escapes keep what was
+/// record, a `task describe` field) must stay one line. The escapes keep what was
 /// there visible, as JSON does, rather than folding it into spaces that read
 /// like the original text.
 ///
@@ -157,7 +157,7 @@ fn escape_controls(s: &str, keep_lines: bool) -> String {
     out
 }
 
-/// `pastor task show`: every field a human asks about one task, one per line,
+/// `pastor task describe`: every field a human asks about one task, one per line,
 /// then the prompt. The agent args are shell-quoted, so the line reads as the
 /// command herdr runs; each is followed by where it came from, when the task
 /// knows (`DispatchSpec::agent_source`).
@@ -903,7 +903,7 @@ mod tests {
         assert!(bare.contains("agent args: -"), "{bare}");
     }
 
-    /// `task show` says where the agent and its args came from, when the
+    /// `task describe` says where the agent and its args came from, when the
     /// task knows; a task with no args from any layer says so too.
     #[test]
     fn task_detail_prints_where_the_agent_came_from() {

@@ -464,7 +464,7 @@ fn install_resolves_a_symlinked_subdir_and_refuses_one_outside_the_repo() {
     let (out, _) = cli.ok(&["connector", "list", "--json"]);
     let rows: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(rows[0]["error"], serde_json::Value::Null, "{out}");
-    let (out, _) = cli.ok(&["connector", "run", "echo", "--job", "try"]);
+    let (out, _) = cli.ok(&["connector", "try", "echo", "--job", "try"]);
     assert_eq!(
         out.lines().count(),
         3,
@@ -556,7 +556,7 @@ fn install_list_and_uninstall_from_a_git_repo() {
     assert!(err.contains("git clone"), "{err}");
 }
 
-/// The stream fixture, copied with a 1s timeout so `connector run` collects for
+/// The stream fixture, copied with a 1s timeout so `connector try` collects for
 /// a second rather than the default minute, and linked.
 fn link_quick_stream(cli: &Cli) {
     let dir = cli.dir("dev/stream");
@@ -578,7 +578,7 @@ fn link_quick_stream(cli: &Cli) {
 fn connector_run_collects_a_stream_and_prints_each_item_once() {
     let cli = Cli::new();
     link_quick_stream(&cli);
-    let (out, err) = cli.ok(&["connector", "run", "stream", "--job", "try"]);
+    let (out, err) = cli.ok(&["connector", "try", "stream", "--job", "try"]);
     assert_eq!(out, "{\"key\":\"start-1\"}\n", "{err}");
     assert!(err.contains("collecting for 1s"), "{err}");
     assert!(err.contains("1 items, cursor cur-1"), "{err}");
@@ -623,7 +623,7 @@ fn a_standalone_tick_refuses_a_stream_job() {
 }
 
 #[test]
-fn link_run_and_unlink() {
+fn link_try_and_unlink() {
     let cli = Cli::new();
     let (out, _) = cli.ok(&["connector", "link", fixture("echo").to_str().unwrap()]);
     assert!(out.contains("linked echo 0.1.0"), "{out}");
@@ -631,7 +631,7 @@ fn link_run_and_unlink() {
     assert!(err.contains("is linked"), "{err}");
 
     // No job file: an empty config, items on stdout as JSON lines.
-    let (out, err) = cli.ok(&["connector", "run", "echo", "--job", "try"]);
+    let (out, err) = cli.ok(&["connector", "try", "echo", "--job", "try"]);
     let items: Vec<serde_json::Value> = out
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -652,7 +652,7 @@ fn link_run_and_unlink() {
     .unwrap();
     let (_, err) = cli.ok(&[
         "connector",
-        "run",
+        "try",
         "echo",
         "--job",
         "support",
@@ -666,25 +666,25 @@ fn link_run_and_unlink() {
         "every = \"5m\"\n[connector]\nuse = \"echo\"\n[dispatch]\nprompt = \"p\"\n",
     )
     .unwrap();
-    let err = cli.fails(&["connector", "run", "echo", "--job", "bare"]);
+    let err = cli.fails(&["connector", "try", "echo", "--job", "bare"]);
     assert!(err.contains("requires connector.channel"), "{err}");
 
     // A failing run is an error naming its log.
     let envf = cli.dir("c/connectors/echo/.env");
     std::fs::create_dir_all(envf.parent().unwrap()).unwrap();
     std::fs::write(&envf, "FIXTURE_MODE=fail\n").unwrap();
-    let err = cli.fails(&["connector", "run", "echo", "--job", "try"]);
+    let err = cli.fails(&["connector", "try", "echo", "--job", "try"]);
     assert!(err.contains("exit 4: failing on purpose"), "{err}");
 
     // The job name becomes paths under jobs/, runs/ and connectors/; one that
     // could walk out of them is refused before anything is touched.
     for bad in ["../x", "a/b", "Upper"] {
-        let err = cli.fails(&["connector", "run", "echo", "--job", bad]);
+        let err = cli.fails(&["connector", "try", "echo", "--job", bad]);
         assert!(err.contains("must match"), "{bad}: {err}");
     }
     assert!(!cli.dir("s/x").exists() && !cli.dir("s/runs/../x").exists());
     assert!(!cli.dir("x").exists());
-    let err = cli.fails(&["connector", "run", "nope", "--job", "try"]);
+    let err = cli.fails(&["connector", "try", "nope", "--job", "try"]);
     assert!(err.contains("not available"), "{err}");
     cli.ok(&["connector", "unlink", "echo"]);
     assert!(
