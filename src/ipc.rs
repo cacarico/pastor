@@ -564,6 +564,19 @@ mod tests {
                 pruned: 2,
                 kept_worktrees: vec![3],
             }),
+            IpcResponse::Events(crate::events::EventsPage {
+                events: vec![crate::events::EventRecord {
+                    seq: 812,
+                    at: chrono::Utc::now(),
+                    kind: "task.done".into(),
+                    task: Some(minimal_task()),
+                    job: Some("run".into()),
+                    machine: None,
+                    detail: None,
+                }],
+                gap: false,
+                oldest: Some(812),
+            }),
             IpcResponse::error("some_code", "some message"),
         ];
         for resp in responses {
