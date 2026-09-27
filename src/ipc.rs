@@ -14,8 +14,9 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// field an older head would silently ignore (serde skips unknown fields), so
 /// the CLI can refuse to send it there. A head that answers no protocol is 0.
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`). 2: flock agents and tool
-/// lists. 3: `TaskRetry::place`.
-pub const IPC_PROTOCOL: u32 = 3;
+/// lists. 3: `TaskRetry::place`. 4: flock and machine edits
+/// (`FLEET_EDIT_PROTOCOL`).
+pub const IPC_PROTOCOL: u32 = 4;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -39,6 +40,11 @@ pub const AGENT_PROTOCOL: u32 = 2;
 /// The first protocol whose head honours `TaskRetry::place`. An older one
 /// would retry the task with its original place, and say it succeeded.
 pub const PLACE_PROTOCOL: u32 = 3;
+
+/// The first protocol whose head edits flock.toml itself for `flock
+/// add|default` and `machine add|remove|move`. An older one does not know
+/// those requests.
+pub const FLEET_EDIT_PROTOCOL: u32 = 4;
 
 // One request is read per connection and dropped once answered, so the
 // size of the largest variant (`Run`) costs nothing worth a box.
@@ -74,6 +80,31 @@ pub enum IpcRequest {
     /// edit of flock.toml are one step against `Run`. Answers `Text`.
     FlockRemove {
         name: String,
+    },
+    /// `flock add`, done by the head so the queued-task check and the edit
+    /// are one step against `Run`, as for `FlockRemove`. Answers `Text`.
+    FlockAdd {
+        name: String,
+        default: bool,
+    },
+    /// `flock default`. Answers `Text`.
+    FlockSetDefault {
+        name: String,
+    },
+    /// `machine add`, the flock.toml part; `--herdr` stays with the CLI,
+    /// whose herdr it is. Answers `Text`.
+    MachineAdd {
+        machine: crate::config::flock::MachineConfig,
+    },
+    /// `machine remove`, the flock.toml part, as for `MachineAdd`. Answers
+    /// `Text`.
+    MachineRemove {
+        name: String,
+    },
+    /// `machine move`. Answers `Text`.
+    MachineMove {
+        name: String,
+        flock: String,
     },
     /// One scheduler pass now; `job` forces that job regardless of schedule.
     Tick {
@@ -143,6 +174,11 @@ impl IpcRequest {
             | IpcRequest::Tick { .. }
             | IpcRequest::Run { .. }
             | IpcRequest::FlockRemove { .. }
+            | IpcRequest::FlockAdd { .. }
+            | IpcRequest::FlockSetDefault { .. }
+            | IpcRequest::MachineAdd { .. }
+            | IpcRequest::MachineRemove { .. }
+            | IpcRequest::MachineMove { .. }
             | IpcRequest::JobRun { .. }
             | IpcRequest::TaskRetry { .. }
             | IpcRequest::TaskClose { .. }
@@ -630,6 +666,30 @@ mod tests {
                 older_than_secs: 0,
             },
             IpcRequest::FlockRemove { name: "f".into() },
+            IpcRequest::FlockAdd {
+                name: "f".into(),
+                default: false,
+            },
+            IpcRequest::FlockSetDefault { name: "f".into() },
+            IpcRequest::MachineAdd {
+                machine: crate::config::flock::MachineConfig {
+                    name: "m".into(),
+                    local: true,
+                    ssh: None,
+                    command: None,
+                    session: "default".into(),
+                    max_agents: 1,
+                    tags: vec![],
+                    flock: None,
+                    agent: None,
+                    agent_args: None,
+                },
+            },
+            IpcRequest::MachineRemove { name: "m".into() },
+            IpcRequest::MachineMove {
+                name: "m".into(),
+                flock: "f".into(),
+            },
             IpcRequest::Tick {
                 job: None,
                 dry_run: false,

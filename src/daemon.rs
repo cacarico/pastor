@@ -6,7 +6,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
-use crate::config::flock::{EditError, Flock, FlockDoc, MachineConfig, TaskFlockError};
+use crate::config::flock::{
+    DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig, TaskFlockError,
+};
 use crate::config::{AgentChoice, AgentPick, Agents, Defaults, Layer, PastorConfig, Paths};
 use crate::dispatch::{MachineView, pick_machine};
 use crate::herdr::{Connector, Endpoint};
@@ -459,8 +461,8 @@ impl Fleet {
         *self.wanted.write().unwrap() = flock;
     }
 
-    /// Hold the dispatch lock, as a dispatch pass does.
-    #[cfg(test)]
+    /// Hold the dispatch lock, as a dispatch pass does: for a test, and for
+    /// the head's own edits of flock.toml (`Daemon::edit_flock_file`).
     pub async fn hold_dispatch_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.dispatch_lock.lock().await
     }
@@ -1158,6 +1160,37 @@ impl Daemon {
         self.handle(req).await
     }
 
+    /// One `fleet_edit` edit of flock.toml for a CLI, then the reload that
+    /// applies it: what the CLI would do with no head, done here so the
+    /// head's file is the one changed. The edit runs under the dispatch lock,
+    /// so a `task run` sees the file before or after it, never half of it.
+    /// Answers `Text`: what the edit did, `sep`, and how the reload went.
+    async fn edit_flock_file(
+        &self,
+        sep: &str,
+        edit: impl FnOnce(&std::path::Path) -> anyhow::Result<String>,
+    ) -> IpcResponse {
+        let done = {
+            let _pass = self.fleet.hold_dispatch_lock().await;
+            edit(&self.paths.flock_file())
+        };
+        let done = match done {
+            Ok(done) => done,
+            Err(err) => {
+                return match err.downcast_ref::<EditError>() {
+                    Some(e) => IpcResponse::error(e.code(), e),
+                    None => IpcResponse::error("runtime_error", format!("{err:#}")),
+                };
+            }
+        };
+        match self.scheduler.reload().await {
+            Ok(_) => IpcResponse::Text(format!("{done}{sep}the running pastor serve picked it up")),
+            Err(err) => IpcResponse::Text(format!(
+                "{done}{sep}the reload after it failed ({err}); run `pastor job reload`"
+            )),
+        }
+    }
+
     pub async fn handle(&self, req: IpcRequest) -> IpcResponse {
         match req {
             IpcRequest::Ping => IpcResponse::Pong {
@@ -1287,6 +1320,40 @@ impl Daemon {
                         "removed flock {name}; the reload after it failed ({err}); run `pastor job reload`"
                     )),
                 }
+            }
+            IpcRequest::FlockAdd { name, default } => {
+                let store = &self.store;
+                self.edit_flock_file("; ", |file| {
+                    crate::fleet_edit::add_flock(file, &name, default, || {
+                        Ok(store
+                            .queued_tasks()?
+                            .iter()
+                            .filter(|t| t.flock.as_deref() == Some(DEFAULT_FLOCK))
+                            .map(|t| t.display_id())
+                            .collect())
+                    })
+                })
+                .await
+            }
+            IpcRequest::FlockSetDefault { name } => {
+                self.edit_flock_file("; ", |file| crate::fleet_edit::set_default(file, &name))
+                    .await
+            }
+            // The CLI prints its herdr lines after this one, so the reload
+            // gets a line of its own, as without a head.
+            IpcRequest::MachineAdd { machine } => {
+                self.edit_flock_file("\n", |file| crate::fleet_edit::add_machine(file, &machine))
+                    .await
+            }
+            IpcRequest::MachineRemove { name } => {
+                self.edit_flock_file("; ", |file| crate::fleet_edit::remove_machine(file, &name))
+                    .await
+            }
+            IpcRequest::MachineMove { name, flock } => {
+                self.edit_flock_file("; ", |file| {
+                    crate::fleet_edit::move_machine(file, &name, &flock)
+                })
+                .await
             }
             IpcRequest::Tick { job, dry_run } => match self.scheduler.tick(job, dry_run).await {
                 Ok(runs) => IpcResponse::Runs(runs),
@@ -2598,6 +2665,174 @@ mod tests {
             matches!(&resp, IpcResponse::Error { code, .. } if code == "flock_is_default"),
             "{resp:?}"
         );
+    }
+
+    /// The flock of `name` as the head's fleet reports it, `None` once it
+    /// is gone from the fleet.
+    fn fleet_flock_of(d: &Daemon, name: &str) -> Option<String> {
+        d.fleet()
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.flock)
+    }
+
+    /// `flock add`, `flock default`, `machine add|move|remove` go through the
+    /// head: it edits flock.toml with the CLI's own code, reloads, answers
+    /// `Text`, and its fleet matches the file afterwards.
+    #[tokio::test]
+    async fn fleet_edits_go_through_the_head() {
+        let (d, tmp) = daemon_with_flock(
+            home_and_work(),
+            &[
+                ("h", 2, FakeHerdr::new()),
+                ("w", 2, FakeHerdr::new()),
+                ("n", 2, FakeHerdr::new()),
+            ],
+        )
+        .await;
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let on_disk = || Flock::load(&paths.flock_file()).unwrap();
+        let text = |resp: IpcResponse| match resp {
+            IpcResponse::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+
+        let said = text(
+            d.handle(IpcRequest::FlockAdd {
+                name: "spare".into(),
+                default: false,
+            })
+            .await,
+        );
+        assert!(said.starts_with("added flock spare; "), "{said}");
+        assert!(said.contains("picked it up"), "{said}");
+        assert!(on_disk().has_flock("spare"));
+        assert!(d.fleet().flock().has_flock("spare"));
+
+        let said = text(
+            d.handle(IpcRequest::FlockSetDefault {
+                name: "work".into(),
+            })
+            .await,
+        );
+        assert!(said.starts_with("work is the default flock"), "{said}");
+        assert_eq!(on_disk().default_flock(), "work");
+        assert_eq!(d.fleet().flock().default_flock(), "work");
+
+        let said = text(
+            d.handle(IpcRequest::MachineAdd {
+                machine: MachineConfig {
+                    flock: Some("spare".into()),
+                    ..machine("n", 2)
+                },
+            })
+            .await,
+        );
+        assert!(said.starts_with("added n to flock spare in "), "{said}");
+        assert!(on_disk().get("n").is_some());
+        wait_until("n in the fleet", || {
+            fleet_flock_of(&d, "n").as_deref() == Some("spare")
+        })
+        .await;
+
+        let said = text(
+            d.handle(IpcRequest::MachineMove {
+                name: "h".into(),
+                flock: "spare".into(),
+            })
+            .await,
+        );
+        assert!(said.starts_with("moved h to flock spare"), "{said}");
+        assert_eq!(on_disk().machine_flock("h"), Some("spare"));
+        assert_eq!(fleet_flock_of(&d, "h").as_deref(), Some("spare"));
+
+        let said = text(
+            d.handle(IpcRequest::MachineRemove { name: "w".into() })
+                .await,
+        );
+        assert!(said.starts_with("removed w; "), "{said}");
+        assert!(on_disk().get("w").is_none());
+        wait_until("w out of the fleet", || fleet_flock_of(&d, "w").is_none()).await;
+
+        // A refused edit keeps its code and leaves the file alone.
+        let before = std::fs::read_to_string(paths.flock_file()).unwrap();
+        for (req, code) in [
+            (
+                IpcRequest::FlockAdd {
+                    name: "spare".into(),
+                    default: false,
+                },
+                "flock_exists",
+            ),
+            (
+                IpcRequest::FlockSetDefault {
+                    name: "nope".into(),
+                },
+                "unknown_flock",
+            ),
+            (
+                IpcRequest::MachineAdd {
+                    machine: machine("h", 2),
+                },
+                "machine_exists",
+            ),
+            (
+                IpcRequest::MachineMove {
+                    name: "h".into(),
+                    flock: "nope".into(),
+                },
+                "unknown_flock",
+            ),
+            (
+                IpcRequest::MachineRemove {
+                    name: "nope".into(),
+                },
+                "unknown_machine",
+            ),
+        ] {
+            assert_eq!(error_code(d.handle(req).await), code);
+        }
+        assert_eq!(std::fs::read_to_string(paths.flock_file()).unwrap(), before);
+    }
+
+    /// `flock add --default` on a file with only the implicit flock keeps its
+    /// machines there while the head has tasks queued in it.
+    #[tokio::test]
+    async fn flock_add_default_through_the_head_sees_queued_tasks() {
+        let (d, _tmp) = daemon_with_flock(
+            Flock {
+                flocks: vec![],
+                machines: vec![machine("a", 1)],
+            },
+            &[("a", 1, FakeHerdr::new())],
+        )
+        .await;
+        let t = d
+            .store
+            .insert_task(NewTask {
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "p".into(),
+                // Pinned to a machine the fleet lacks, so it stays queued.
+                spec: DispatchSpec {
+                    machine: Some("gone".into()),
+                    ..spec()
+                },
+                flock: crate::config::flock::DEFAULT_FLOCK.into(),
+            })
+            .unwrap();
+        let IpcResponse::Text(said) = d
+            .handle(IpcRequest::FlockAdd {
+                name: "work".into(),
+                default: true,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert!(said.contains(&t.display_id()), "{said}");
+        assert_eq!(fleet_flock_of(&d, "a").as_deref(), Some("default"));
     }
 
     /// A retry copies the flock of the task it retries. A failed task keeps
