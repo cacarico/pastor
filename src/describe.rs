@@ -116,6 +116,8 @@ pub struct MachineDescription {
     #[serde(flatten)]
     pub row: MachineRow,
     pub session: String,
+    /// The machine's own `model`; `None` falls through to its flock's.
+    pub model: Option<String>,
     /// The tasks whose agent holds a pane on it, newest first.
     pub tasks: Vec<Task>,
     /// Its recent `machine.*` events that carried an error, and its failed
@@ -132,6 +134,8 @@ pub struct FlockDescription {
     pub agent_args: Option<Vec<String>>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    /// The flock's own `model`; `None` falls through to `[defaults]`.
+    pub model: Option<String>,
     pub machines: Vec<String>,
     /// Live agents on its machines; known only from a running head.
     pub agents: Option<usize>,
@@ -373,6 +377,12 @@ pub fn machine_text(m: &MachineDescription) -> String {
         ("endpoint", r.endpoint.clone()),
         ("flock", r.flock.clone()),
         ("session", m.session.clone()),
+        (
+            "model",
+            m.model
+                .clone()
+                .unwrap_or_else(|| "- (from its flock)".into()),
+        ),
         ("channel", r.channel.clone()),
         ("herdr", dash(r.herdr_version.clone())),
         ("protocol", dash(r.protocol.map(|p| p.to_string()))),
@@ -409,6 +419,12 @@ pub fn flock_text(f: &FlockDescription) -> String {
         ),
         ("allow", words(&f.allow)),
         ("deny", words(&f.deny)),
+        (
+            "model",
+            f.model
+                .clone()
+                .unwrap_or_else(|| "- (from [defaults])".into()),
+        ),
         ("machines", dash(Some(f.machines.join(",")))),
         ("agents", dash(f.agents.map(|n| n.to_string()))),
     ]);
@@ -574,6 +590,7 @@ mod tests {
             agent_args: Some(vec!["--model".into(), "a b".into()]),
             allow: vec![],
             deny: vec!["Bash(rm:*)".into()],
+            model: Some("sonnet".into()),
             machines: vec!["pi-1".into(), "pi-2".into()],
             agents: None,
             tasks: vec![],
@@ -581,6 +598,7 @@ mod tests {
         let text = flock_text(&f);
         assert!(text.contains("agent:      - (from [defaults])"), "{text}");
         assert!(text.contains("--model 'a b'"), "{text}");
+        assert!(text.contains("model:      sonnet"), "{text}");
         assert!(text.contains("pi-1,pi-2"), "{text}");
         assert!(text.ends_with("tasks: none"), "{text}");
     }
@@ -595,6 +613,7 @@ mod tests {
             job: None,
             machine: None,
             detail: None,
+            model: None,
         };
         let all: Vec<EventRecord> = (0..15).map(|i| ev(&format!("job.{i}"))).collect();
         let kept = recent_events(all, |e| e.kind != "job.14");

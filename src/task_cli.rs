@@ -130,7 +130,7 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 
 fn print_task(t: &Task, json: bool) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(t)?);
+        println!("{}", serde_json::to_string_pretty(&t.to_json())?);
     } else {
         println!(
             "{}",

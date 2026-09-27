@@ -60,6 +60,7 @@ fn record(kind: &str, t: Option<&Task>, job: Option<&str>) -> EventRecord {
         task: t.cloned(),
         job: job.map(Into::into),
         machine: None,
+        model: None,
     }
 }
 
@@ -191,6 +192,7 @@ async fn the_daemon_writes_the_events_log() {
             flock: None,
             agent: None,
             agent_args: None,
+            model: None,
         }],
     };
     let fake: Arc<dyn Connector> = Arc::new(FakeHerdr::new());

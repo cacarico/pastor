@@ -844,6 +844,7 @@ impl Scheduler {
         store: Arc<Store>,
     ) -> anyhow::Result<Scheduler> {
         let flock = Flock::load(&paths.flock_file())?;
+        flock.check_models(&config.models)?;
         let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()).with_flock(flock));
         let (events, _) = broadcast::channel(1);
         Ok(Scheduler {
@@ -1077,7 +1078,9 @@ impl Scheduler {
                 tracing::error!(%err, "pastor.toml does not load; the previous version stays in use")
             }
         }
-        let flock = match Flock::load_existing(&files[1]) {
+        let flock = match Flock::load_existing(&files[1])
+            .and_then(|f| f.check_models(&self.config.models).map(|()| f))
+        {
             Ok(f) => f,
             Err(err) if is_not_found(&err) => {
                 tracing::warn!(

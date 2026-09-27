@@ -83,6 +83,7 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
                 t.machine.clone().unwrap_or_else(|| "-".into()),
                 t.flock.clone().unwrap_or_else(|| "-".into()),
                 t.spec.agent.clone(),
+                t.model().unwrap_or("-").to_string(),
                 t.job.clone(),
                 age(t.created_at),
                 note,
@@ -170,6 +171,10 @@ pub fn task_detail(t: &Task) -> String {
     let source = t.spec.agent_source.as_deref();
     let from = |label: Option<&String>| label.map(|l| format!(" (from {l})")).unwrap_or_default();
     let agent = format!("{}{}", t.spec.agent, from(source.map(|s| &s.agent)));
+    let model = match t.model() {
+        Some(m) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
+        None => "-".to_string(),
+    };
     let args = if t.spec.agent_args.is_empty() {
         "-".to_string()
     } else {
@@ -212,6 +217,7 @@ pub fn task_detail(t: &Task) -> String {
         ("flock", opt(&t.flock)),
         ("machine", opt(&t.machine)),
         ("agent", agent),
+        ("model", model),
         ("agent args", args),
         ("allow", list(&t.spec.allow)),
         ("deny", list(&t.spec.deny)),
@@ -292,8 +298,8 @@ pub fn mark_removed(rows: &mut [Vec<String>], tasks: &[Task], known: impl Fn(&st
     }
 }
 
-pub const TASK_HEADER: [&str; 8] = [
-    "ID", "STATE", "MACHINE", "FLOCK", "AGENT", "JOB", "AGE", "NOTE",
+pub const TASK_HEADER: [&str; 9] = [
+    "ID", "STATE", "MACHINE", "FLOCK", "AGENT", "MODEL", "JOB", "AGE", "NOTE",
 ];
 
 /// One flock in `pastor flock list`. `agents` is the live agents on its
@@ -846,6 +852,7 @@ mod tests {
                 flock: None,
                 agent: None,
                 agent_args: None,
+                model: None,
             }],
         };
         let mut rows = task_rows(&tasks);
@@ -918,6 +925,8 @@ mod tests {
                 ask: Default::default(),
                 agent: "machine own".into(),
                 agent_args: Some("flock personal".into()),
+                model: None,
+                model_from: None,
             })),
             ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
         };
@@ -936,6 +945,8 @@ mod tests {
                 ask: Default::default(),
                 agent: "defaults".into(),
                 agent_args: None,
+                model: None,
+                model_from: None,
             })),
             ..spec
         }));

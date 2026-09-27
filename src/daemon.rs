@@ -9,8 +9,11 @@ use tokio::sync::broadcast;
 use crate::config::flock::{
     DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig, TaskFlockError,
 };
-use crate::config::{AgentChoice, AgentPick, Agents, Defaults, Layer, PastorConfig, Paths};
-use crate::dispatch::{MachineView, pick_machine};
+use crate::config::{
+    AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer, MODEL_KIND_MISMATCH, Models,
+    PastorConfig, Paths,
+};
+use crate::dispatch::{MachineView, pick_machine, pick_machine_where};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
 use crate::machine::{
@@ -174,8 +177,10 @@ pub enum QueueError<E = anyhow::Error> {
     UnknownMachine(String),
     /// Names a flock that does not exist, or one its pinned machine is not in.
     Flock(TaskFlockError),
-    /// Its agent cannot be started as resolved (`Agents::launch_args`).
-    Agent(String),
+    /// Its agent cannot be started as resolved: a model `[models]` lacks
+    /// or of another kind (`Models::apply`), or a tool list it has no flag
+    /// for (`Agents::launch_args`).
+    Agent(AgentRefusal),
     /// The insert failed; for `queue_retry`, the `RetryError` that says why.
     Store(E),
 }
@@ -215,6 +220,8 @@ pub struct Fleet {
     /// `[agents]` as last applied: whether a queued task's agent can take
     /// its tool lists (`Agents::launch_args`).
     agents: RwLock<Agents>,
+    /// `[models]` as last applied: what a task's `model` names.
+    models: RwLock<Models>,
     /// `agents_change_fleet` as last applied: whether the head takes a
     /// fleet-changing request from an agent it started.
     agents_change_fleet: std::sync::atomic::AtomicBool,
@@ -240,6 +247,7 @@ impl Fleet {
             wanted: RwLock::default(),
             defaults: RwLock::default(),
             agents: RwLock::default(),
+            models: RwLock::default(),
             agents_change_fleet: Default::default(),
             store,
             spawner: None,
@@ -267,6 +275,7 @@ impl Fleet {
             wanted: RwLock::default(),
             defaults: RwLock::default(),
             agents: RwLock::default(),
+            models: RwLock::default(),
             agents_change_fleet: Default::default(),
             store,
             spawner: Some(Spawner { connect, events }),
@@ -325,6 +334,7 @@ impl Fleet {
     pub fn set_config(&self, config: &PastorConfig) {
         *self.defaults.write().unwrap() = config.defaults.clone();
         *self.agents.write().unwrap() = config.agents.clone();
+        *self.models.write().unwrap() = config.models.clone();
         self.agents_change_fleet.store(
             config.agents_change_fleet,
             std::sync::atomic::Ordering::Relaxed,
@@ -357,8 +367,11 @@ impl Fleet {
     }
 
     /// `resolve_agent` written into `spec`, with the ask and where the agent
-    /// and its args came from (`DispatchSpec::agent_source`). `asked_by`
-    /// names the ask: `task run` or `job <name>`.
+    /// and its args came from (`DispatchSpec::agent_source`), and its model's
+    /// args put in front (`Models::apply`). `asked_by` names the ask: `task
+    /// run` or `job <name>`. Refused when the model is not in `[models]` or
+    /// not of the agent's kind; `spec` then has the agent without the model's
+    /// args.
     fn settle(
         &self,
         spec: &mut crate::task::DispatchSpec,
@@ -366,7 +379,7 @@ impl Fleet {
         flock: &str,
         machine: Option<&str>,
         asked_by: &str,
-    ) {
+    ) -> Result<(), AgentRefusal> {
         let pick = self.resolve_agent(ask, flock, machine);
         pick.apply_to(spec);
         let label = |layer| match layer {
@@ -379,24 +392,43 @@ impl Fleet {
             ask: ask.clone(),
             agent: label(pick.agent_from),
             agent_args: pick.args_from.map(label),
+            model: pick.model.as_ref().map(|(name, _)| name.clone()),
+            model_from: pick.model.as_ref().map(|&(_, layer)| label(layer)),
         }));
+        self.models
+            .read()
+            .unwrap()
+            .apply(&pick, &self.agents.read().unwrap(), spec)
     }
 
     /// `settle` for a task being queued: on the machine it is pinned to,
     /// else with no machine yet, as dispatch settles it again on the one it
-    /// picks. Refused when the agent cannot be started as resolved (a tool
-    /// list it has no flag for) on any machine it may land on. Checked here
-    /// so the task is refused, not queued to fail at dispatch.
+    /// picks. Refused when the agent cannot be started as resolved on any
+    /// machine it may land on: a model `[models]` does not have, a tool list
+    /// the agent has no flag for, or, on the machine it is pinned to or with
+    /// an agent it asked for itself, a model of another kind. Checked here so
+    /// the task is refused, not queued to fail at dispatch. An unpinned task
+    /// whose model does not suit some machine's agent only skips that machine
+    /// (`dispatch_queued`), and waits when none suits.
     fn settle_agent(
         &self,
         spec: &mut crate::task::DispatchSpec,
         ask: &AgentChoice,
         flock: &str,
         asked_by: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), AgentRefusal> {
         let pinned = spec.machine.clone();
-        self.settle(spec, ask, flock, pinned.as_deref(), asked_by);
-        let mut landings = vec![spec.clone()];
+        // Unpinned, with the agent left to the machine, its kind is known
+        // only on the machine: a mismatch here is not the task's to fix.
+        let per_machine = |e: &AgentRefusal| {
+            e.code == MODEL_KIND_MISMATCH && pinned.is_none() && ask.agent.is_none()
+        };
+        let mut landings = Vec::new();
+        match self.settle(spec, ask, flock, pinned.as_deref(), asked_by) {
+            Ok(()) => landings.push(spec.clone()),
+            Err(e) if per_machine(&e) => {}
+            Err(e) => return Err(e),
+        }
         if pinned.is_none() {
             let wanted = self.flock();
             for m in wanted
@@ -405,14 +437,23 @@ impl Fleet {
                 .filter(|m| wanted.flock_of(m) == flock)
             {
                 let mut s = spec.clone();
-                self.settle(&mut s, ask, flock, Some(&m.name), asked_by);
-                landings.push(s);
+                match self.settle(&mut s, ask, flock, Some(&m.name), asked_by) {
+                    Ok(()) => landings.push(s),
+                    Err(e) if per_machine(&e) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         let agents = self.agents.read().unwrap();
-        landings
-            .iter()
-            .try_for_each(|s| agents.launch_args(s).map(drop))
+        landings.iter().try_for_each(|s| {
+            agents
+                .launch_args(s)
+                .map(drop)
+                .map_err(|message| AgentRefusal {
+                    code: "agent_tools_unsupported",
+                    message,
+                })
+        })
     }
 
     /// The store the fleet queues tasks in.
@@ -712,13 +753,12 @@ impl Fleet {
         let _pass = self.dispatch_lock.lock().await;
         let flock = self.job_task_flock(job)?;
         let mut settled = job.spec.clone();
-        self.settle_agent(
-            &mut settled,
-            &job.agent,
-            &flock,
-            &format!("job {}", job.name),
-        )
-        .map_err(anyhow::Error::msg)?;
+        let ask = AgentChoice {
+            model: job.model_for(item).map_err(anyhow::Error::msg)?,
+            ..job.agent.clone()
+        };
+        self.settle_agent(&mut settled, &ask, &flock, &format!("job {}", job.name))
+            .map_err(|e| anyhow::Error::msg(e.message))?;
         self.store.insert_job_task(&job.name, &flock, item, |id| {
             let (prompt, mut spec) = render(id)?;
             spec.agent = settled.agent;
@@ -764,8 +804,10 @@ impl Fleet {
     /// before the edit or from after it, never the file edited and the
     /// wanted flock still old. The reload that follows (the scheduler's, which
     /// takes this lock itself, so it cannot run inside this step) then only
-    /// starts and stops actors. A file that does not load after the edit
-    /// leaves the wanted flock as it was; that reload logs it.
+    /// starts and stops actors. A file that does not load after the edit,
+    /// or names a model `[models]` lacks, leaves the wanted flock as it was;
+    /// that reload logs it and falls back to this flock, so it must still
+    /// be the last valid one.
     pub async fn edit_flock_file<T>(
         &self,
         file: &std::path::Path,
@@ -776,6 +818,7 @@ impl Fleet {
         // A fixed fleet has no applied flock, which a reload leaves alone too.
         if self.spawner.is_some()
             && let Ok(flock) = Flock::load_existing(file)
+            && flock.check_models(&self.models.read().unwrap()).is_ok()
         {
             *self.wanted.write().unwrap() = flock;
         }
@@ -807,13 +850,34 @@ impl Fleet {
             {
                 return Err(QueueError::Flock(TaskFlockError::UnknownFlock(f.clone())));
             }
-            // The copy keeps the agent and tool lists as resolved, so only
-            // an `[agents]` edit since can make them unstartable.
-            self.agents
-                .read()
-                .unwrap()
-                .launch_args(&t.spec)
-                .map_err(QueueError::Agent)?;
+            // Dispatch settles the copy's agent again from what it asked
+            // for, so it is checked as a new task would be: a model since
+            // dropped from `[models]` refuses it here. A copy of a task from
+            // before that keeps its agent and tool lists as resolved, and
+            // only an `[agents]` edit since can make them unstartable.
+            match &t.spec.agent_source {
+                Some(source) => {
+                    let flock = t
+                        .flock
+                        .clone()
+                        .unwrap_or_else(|| self.flock().default_flock().to_string());
+                    let mut spec = t.spec.clone();
+                    self.settle_agent(&mut spec, &source.ask, &flock, &asked_by(&t))
+                        .map_err(QueueError::Agent)?;
+                }
+                None => {
+                    self.agents
+                        .read()
+                        .unwrap()
+                        .launch_args(&t.spec)
+                        .map_err(|message| {
+                            QueueError::Agent(AgentRefusal {
+                                code: "agent_tools_unsupported",
+                                message,
+                            })
+                        })?;
+                }
+            }
         }
         self.store
             .insert_retry_placed(id, place)
@@ -838,23 +902,55 @@ impl Fleet {
         let flock = self.flock();
         for task in queued {
             let target = task.flock.as_deref().unwrap_or(flock.default_flock());
-            let Some(name) = pick_machine(&self.views(), target, &task.spec) else {
+            let views = self.views();
+            // The agent can depend on the machine: a machine whose agent
+            // cannot run the task's model does not take it. A task from
+            // before `agent_source` keeps the agent it was queued with.
+            let settled_on = |machine: &str| {
+                let source = task.spec.agent_source.as_ref()?;
+                let mut spec = task.spec.clone();
+                let r = self.settle(
+                    &mut spec,
+                    &source.ask,
+                    target,
+                    Some(machine),
+                    &asked_by(&task),
+                );
+                Some(r.map(|()| spec))
+            };
+            let picked = pick_machine_where(&views, target, &task.spec, &|m| {
+                settled_on(m).is_none_or(|r| r.is_ok())
+            });
+            let Some(name) = picked else {
+                // Say why, when a machine would take it but for its model.
+                if let Some(m) = pick_machine(&views, target, &task.spec)
+                    && let Some(Err(err)) = settled_on(&m)
+                {
+                    let note = format!("{WAITING_FOR_MODEL}: {err}");
+                    if task.error.as_deref() != Some(note.as_str()) {
+                        let mut t = task.clone();
+                        t.error = Some(note);
+                        if let Err(err) = self.store.update_task(&mut t) {
+                            tracing::warn!(task = %task.display_id(), %err, "note why it waits");
+                        }
+                    }
+                }
                 continue;
             };
             let Some(handle) = self.get(&name) else {
                 continue;
             };
-            // The agent can depend on the machine, now known. A task from
-            // before `agent_source` keeps the agent it was queued with.
-            if let Some(source) = &task.spec.agent_source {
+            if let Some(Ok(spec)) = settled_on(&name) {
                 let mut on = task.clone();
-                let asked_by = if task.job == "run" {
-                    "task run".to_string()
-                } else {
-                    format!("job {}", task.job)
-                };
-                self.settle(&mut on.spec, &source.ask, target, Some(&name), &asked_by);
-                if on.spec != task.spec
+                on.spec = spec;
+                if on
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
+                {
+                    on.error = None;
+                }
+                if (on.spec != task.spec || on.error != task.error)
                     && let Err(err) = self.store.update_task(&mut on)
                 {
                     tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
@@ -870,6 +966,19 @@ impl Fleet {
                 }
             }
         }
+    }
+}
+
+/// How a queued task's error starts while no machine in its flock runs an
+/// agent its model suits; cleared once one takes it.
+const WAITING_FOR_MODEL: &str = "waiting for a machine";
+
+/// Who asked for `task`'s agent, as `AgentSource` labels it.
+fn asked_by(task: &Task) -> String {
+    if task.job == "run" {
+        "task run".to_string()
+    } else {
+        format!("job {}", task.job)
     }
 }
 
@@ -1276,7 +1385,7 @@ impl Daemon {
                         );
                     }
                     Err(QueueError::Agent(err)) => {
-                        return IpcResponse::error("agent_tools_unsupported", err);
+                        return IpcResponse::error(err.code, err.message);
                     }
                     Err(QueueError::Store(err)) => {
                         return IpcResponse::error("store_error", err);
@@ -1669,7 +1778,7 @@ impl Daemon {
                 );
             }
             Err(QueueError::Agent(err)) => {
-                return IpcResponse::error("agent_tools_unsupported", err);
+                return IpcResponse::error(err.code, err.message);
             }
             // A retry keeps the flock of the task it copies; nothing chooses one.
             Err(QueueError::Flock(err)) => {
@@ -1854,6 +1963,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     let on_disk = ConfigFingerprint::sample(&paths);
     let config = PastorConfig::load(&paths.config_file())?;
     let flock = Flock::load(&paths.flock_file())?;
+    flock.check_models(&config.models)?;
     anyhow::ensure!(
         !flock.machines.is_empty(),
         "flock is empty; add a machine with `pastor machine add`"
@@ -1887,6 +1997,7 @@ mod tests {
             flock: None,
             agent: None,
             agent_args: None,
+            model: None,
         }
     }
 
@@ -2623,6 +2734,7 @@ mod tests {
             agent_args: None,
             allow: vec![],
             deny: vec![],
+            model: None,
         });
         assert_eq!(
             queued(d.handle(run("work", own)).await),
@@ -2760,6 +2872,280 @@ mod tests {
         };
         assert_eq!(t.spec.agent, "claude-personal");
         assert_eq!(t.spec.deny, vec!["WebFetch"]);
+    }
+
+    /// pastor.toml with `sonnet` and `opus` for claude and `gpt` for codex,
+    /// and `claude-personal`, a claude.
+    fn models_config() -> PastorConfig {
+        let mut c = test_config();
+        c.agents.0.insert(
+            "claude-personal".into(),
+            crate::config::AgentDef {
+                kind: Some("claude".into()),
+                ..Default::default()
+            },
+        );
+        for (name, kind, arg) in [
+            ("sonnet", "claude", "claude-sonnet-5"),
+            ("opus", "claude", "claude-opus-5-5"),
+            ("gpt", "codex", "gpt-x"),
+        ] {
+            c.models.0.insert(
+                name.into(),
+                crate::config::ModelDef {
+                    kind: kind.into(),
+                    args: vec!["--model".into(), arg.into()],
+                },
+            );
+        }
+        c
+    }
+
+    /// A daemon over `machines` in the flock `personal`, which runs
+    /// `claude-personal` with `-v` and the model `flock_model`, and
+    /// `models_config` on disk: `task run` re-reads both files.
+    async fn models_daemon(
+        flock_model: Option<&str>,
+        machines: Vec<MachineConfig>,
+        fakes: &[(&str, u32, FakeHerdr)],
+    ) -> (Daemon, tempfile::TempDir) {
+        use crate::config::flock::FlockEntry;
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "personal".into(),
+                default: true,
+                agent: Some("claude-personal".into()),
+                agent_args: Some(vec!["-v".into()]),
+                ..Default::default()
+            }],
+            machines,
+        };
+        let (d, tmp) = daemon_with_flock(flock.clone(), fakes).await;
+        std::fs::write(
+            d.paths.config_file(),
+            toml::to_string(&models_config()).unwrap(),
+        )
+        .unwrap();
+        let mut flock = flock;
+        flock.flocks[0].model = flock_model.map(Into::into);
+        flock.save(&d.paths.flock_file()).unwrap();
+        (d, tmp)
+    }
+
+    fn run_model(model: Option<&str>, agent: Option<&str>, machine: Option<&str>) -> IpcRequest {
+        IpcRequest::Run {
+            prompt: "x".into(),
+            spec: DispatchSpec {
+                machine: machine.map(Into::into),
+                ..spec()
+            },
+            flock: None,
+            agent: Some(AgentChoice {
+                agent: agent.map(Into::into),
+                model: model.map(Into::into),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// `--model` puts the model's args before the agent's own, herdr starts
+    /// the agent with them, and the task keeps the name and where it came
+    /// from.
+    #[tokio::test]
+    async fn a_task_runs_the_model_it_names() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) =
+            models_daemon(None, vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
+        let resp = d.handle(run_model(Some("sonnet"), None, None)).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.spec.agent, "claude-personal");
+        assert_eq!(t.spec.agent_args, vec!["--model", "claude-sonnet-5", "-v"]);
+        assert_eq!(t.model(), Some("sonnet"));
+        let source = t.spec.agent_source.clone().unwrap();
+        assert_eq!(source.model_from.as_deref(), Some("task run"));
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "claude");
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!(["--model", "claude-sonnet-5", "-v"])
+        );
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("model:      sonnet (from task run)"),
+            "{text}"
+        );
+    }
+
+    /// A flock's model reaches its tasks that name none; `--model` wins.
+    #[tokio::test]
+    async fn a_flocks_model_runs_unless_the_task_names_one() {
+        let (d, _tmp) = models_daemon(
+            Some("sonnet"),
+            vec![machine("pi", 2)],
+            &[("pi", 2, FakeHerdr::new())],
+        )
+        .await;
+        let IpcResponse::Task(t) = d.handle(run_model(None, None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.model(), Some("sonnet"));
+        assert_eq!(
+            t.spec.agent_source.as_ref().unwrap().model_from.as_deref(),
+            Some("flock personal")
+        );
+        assert_eq!(t.spec.agent_args[..2], ["--model", "claude-sonnet-5"]);
+        let IpcResponse::Task(t) = d.handle(run_model(Some("opus"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.model(), Some("opus"));
+        assert_eq!(t.spec.agent_args[..2], ["--model", "claude-opus-5-5"]);
+    }
+
+    /// A name `[models]` lacks, and a model of another kind than the agent
+    /// the task asked for or the machine it is pinned to, are refused.
+    #[tokio::test]
+    async fn an_unknown_or_mismatched_model_is_refused() {
+        let cx = MachineConfig {
+            agent: Some("codex".into()),
+            ..machine("cx", 1)
+        };
+        let (d, _tmp) = models_daemon(
+            None,
+            vec![machine("pi", 1), cx],
+            &[("pi", 1, FakeHerdr::new()), ("cx", 1, FakeHerdr::new())],
+        )
+        .await;
+        let resp = d.handle(run_model(Some("haiku"), None, None)).await;
+        match resp {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "unknown_model", "{message}");
+                assert!(message.contains("gpt, opus, sonnet"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            error_code(
+                d.handle(run_model(Some("sonnet"), Some("codex"), None))
+                    .await
+            ),
+            "model_kind_mismatch"
+        );
+        assert_eq!(
+            error_code(d.handle(run_model(Some("sonnet"), None, Some("cx"))).await),
+            "model_kind_mismatch"
+        );
+        assert!(d.store.queued_tasks().unwrap().is_empty());
+    }
+
+    /// An unpinned task goes only to a machine whose agent has its model's
+    /// kind; with none, it waits, and says why.
+    #[tokio::test]
+    async fn a_model_skips_machines_of_another_kind() {
+        let cx = MachineConfig {
+            agent: Some("codex".into()),
+            ..machine("cx", 1)
+        };
+        let (d, _tmp) = models_daemon(
+            None,
+            vec![machine("pi", 1), cx],
+            &[("pi", 1, FakeHerdr::new()), ("cx", 1, FakeHerdr::new())],
+        )
+        .await;
+        let IpcResponse::Task(t) = d.handle(run_model(Some("gpt"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(
+            (t.machine.as_deref(), t.spec.agent.as_str()),
+            (Some("cx"), "codex")
+        );
+        assert_eq!(t.spec.agent_args, vec!["--model", "gpt-x"]);
+        // cx is full, and pi's agent is a claude.
+        let IpcResponse::Task(t) = d.handle(run_model(Some("gpt"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.unwrap_or_default();
+        assert!(err.starts_with("waiting for a machine"), "{err}");
+        assert!(err.contains("model gpt runs on codex agents"), "{err}");
+    }
+
+    /// A retry settles its model again, so one since dropped from
+    /// `[models]` is refused.
+    #[tokio::test]
+    async fn a_retry_of_a_dropped_model_is_unknown() {
+        let (d, _tmp) =
+            models_daemon(None, vec![machine("pi", 2)], &[("pi", 2, FakeHerdr::new())]).await;
+        let IpcResponse::Task(mut t) = d.handle(run_model(Some("sonnet"), None, None)).await else {
+            panic!()
+        };
+        t.state = TaskState::Failed;
+        t.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut t).unwrap();
+        let mut config = models_config();
+        config.models.0.remove("sonnet");
+        d.fleet().set_config(&config);
+        let retry = IpcRequest::TaskRetry {
+            id: t.id,
+            place: None,
+        };
+        assert_eq!(error_code(d.handle(retry.clone()).await), "unknown_model");
+        d.fleet().set_config(&models_config());
+        let IpcResponse::Task(copy) = d.handle(retry).await else {
+            panic!()
+        };
+        assert_eq!(copy.model(), Some("sonnet"));
+    }
+
+    /// A job's model is a template: the item's model when it has one, the
+    /// flock's when it renders empty, and an item error when `[models]`
+    /// lacks it.
+    #[tokio::test]
+    async fn a_jobs_model_comes_from_its_item() {
+        let (d, _tmp) = models_daemon(
+            Some("sonnet"),
+            vec![machine("pi", 4)],
+            &[("pi", 4, FakeHerdr::new())],
+        )
+        .await;
+        let config = models_config();
+        let _ = d.scheduler.sync_config().await;
+        let text = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nmodel = \"{{ item.model }}\"\nprompt = \"p\"\n";
+        let job = crate::config::job::Job::parse(
+            text,
+            "j",
+            &config.defaults,
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let queue = |item: serde_json::Value| {
+            let job = job.clone();
+            let fleet = d.fleet().clone();
+            async move {
+                fleet
+                    .queue_job_task(&job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                    .await
+            }
+        };
+        let t = queue(serde_json::json!({"key": "a", "model": "opus"}))
+            .await
+            .unwrap();
+        assert_eq!(t.model(), Some("opus"));
+        assert_eq!(
+            t.spec.agent_source.as_ref().unwrap().model_from.as_deref(),
+            Some("job j")
+        );
+        let t = queue(serde_json::json!({"key": "b"})).await.unwrap();
+        assert_eq!(t.model(), Some("sonnet"));
+        let err = queue(serde_json::json!({"key": "c", "model": "haiku"}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("model haiku is not in [models]"),
+            "{err:#}"
+        );
     }
 
     /// `personal` holds `own`, which runs `claude-personal`, and `plain`,
@@ -3230,6 +3616,30 @@ mod tests {
             .unwrap();
         let run = fleet.queue_run("x".into(), spec_on("w"), None, None).await;
         assert!(matches!(run, Err(QueueError::UnknownMachine(_))), "{run:?}");
+    }
+
+    /// An edit that leaves flock.toml naming a model `[models]` lacks keeps
+    /// the wanted flock as it was. The reload after it falls back to the
+    /// wanted flock, so publishing the edit would have kept the unknown model
+    /// in use instead of the previous flock.
+    #[tokio::test]
+    async fn flock_edit_with_an_unknown_model_keeps_the_wanted_flock() {
+        let (d, tmp) = flocked_daemon().await;
+        let fleet = d.fleet();
+        let file = Paths::new(tmp.path().join("c"), tmp.path().join("s")).flock_file();
+        let before = fleet.flock();
+        fleet
+            .edit_flock_file(&file, |f| {
+                let mut flock = Flock::load_existing(f)?;
+                flock.machines[0].model = Some("nope".into());
+                flock.save(f)
+            })
+            .await
+            .unwrap();
+        assert_eq!(fleet.flock(), before);
+        let err = d.scheduler.reload().await;
+        assert!(err.is_ok(), "{err:?}");
+        assert_eq!(fleet.flock(), before, "the reload kept the previous flock");
     }
 
     fn spec_on(machine: &str) -> DispatchSpec {

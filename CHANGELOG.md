@@ -7,6 +7,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Named models: `[models.<name>]` in pastor.toml, each with a herdr agent
+  `kind` and the `args` that select it. A task runs one with `pastor task run
+  --model <name>`, a job's `[dispatch] model` (a template, so
+  `"{{ item.model }}"` works), or the `model` of its machine, its flock or
+  `[defaults]`, in that order. The model's args go before `agent_args`. A
+  name `[models]` lacks is `unknown_model`; a model whose kind is not the
+  agent's is `model_kind_mismatch`, and an unpinned task only goes to
+  machines whose agent has the model's kind. `task describe`, `task list`
+  (MODEL, and `model` in `--json`), `flock describe`, `machine describe` and
+  task events show it. The IPC protocol goes to 8, and every command that can
+  make the head queue a task refuses an older head (`head_too_old`).
 - A connector can declare a `[finish]` command in its manifest (`command`,
   and a `timeout` that defaults like a hook's). The head runs it once, with the
   connector's env and secrets, when a task of one of its jobs reaches `done`
