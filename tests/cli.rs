@@ -1687,6 +1687,120 @@ fn flock_flags_refuse_a_head_from_before_flocks() {
     assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
 }
 
+/// A head at `socket` that speaks IPC protocol `protocol`: it answers ping
+/// with a pong, and every other request with the text `said by the head`. It
+/// records each request whole.
+fn text_head(
+    socket: &std::path::Path,
+    protocol: u32,
+) -> std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let reqs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = reqs.clone();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let reply = if req["op"] == "ping" {
+                serde_json::json!({"kind": "pong", "data": {"version": "test", "protocol": protocol}})
+            } else {
+                serde_json::json!({"kind": "text", "data": "said by the head"})
+            };
+            seen.lock().unwrap().push(req);
+            let _ = stream.write_all(format!("{reply}\n").as_bytes());
+        }
+    });
+    reqs
+}
+
+/// With a head running, `flock add|default` and `machine add|remove|move`
+/// send the edit to the head and print its answer: the CLI leaves its own
+/// flock.toml alone, since the head's is the one that counts. A head from
+/// before these requests is refused with `head_too_old` before anything is
+/// sent.
+#[test]
+fn flock_and_machine_edits_go_through_the_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let flock_file = config.join("flock.toml");
+    std::fs::write(&flock_file, NAMED_FLOCKS).unwrap();
+    let socket = state.join("pastor.sock");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let cases: [(&[&str], serde_json::Value); 6] = [
+        (
+            &["flock", "add", "spare"],
+            serde_json::json!({"op": "flock_add", "name": "spare", "default": false}),
+        ),
+        (
+            &["flock", "add", "spare", "--default"],
+            serde_json::json!({"op": "flock_add", "name": "spare", "default": true}),
+        ),
+        (
+            &["flock", "default", "set", "work"],
+            serde_json::json!({"op": "flock_set_default", "name": "work"}),
+        ),
+        (
+            &[
+                "machine", "add", "pi-2", "--local", "--flock", "work", "--tag", "gpu",
+            ],
+            serde_json::json!({"op": "machine_add", "machine": {
+                "name": "pi-2", "local": true, "session": "default", "max_agents": 2,
+                "tags": ["gpu"], "flock": "work"}}),
+        ),
+        (
+            &["machine", "remove", "pi-1"],
+            serde_json::json!({"op": "machine_remove", "name": "pi-1"}),
+        ),
+        (
+            &["machine", "move", "pi-1", "work"],
+            serde_json::json!({"op": "machine_move", "name": "pi-1", "flock": "work"}),
+        ),
+    ];
+
+    let reqs = text_head(&socket, pastor::ipc::FLEET_EDIT_PROTOCOL);
+    for (args, want) in &cases {
+        let out = run(args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "said by the head\n",
+            "{args:?}"
+        );
+        let sent = reqs.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(&sent, want, "{args:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), NAMED_FLOCKS);
+
+    std::fs::remove_file(&socket).unwrap();
+    let reqs = text_head(&socket, pastor::ipc::FLEET_EDIT_PROTOCOL - 1);
+    for (args, _) in &cases {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), NAMED_FLOCKS);
+    let reqs = reqs.lock().unwrap();
+    assert!(
+        reqs.iter().all(|r| r["op"] == "ping"),
+        "only pings: {reqs:?}"
+    );
+}
+
 /// Copilot 4106353474: once flock.toml declares named flocks, a command with
 /// no `--flock` still means "the default flock", which an old head would
 /// read as every machine. So every path that talks to or reloads the head

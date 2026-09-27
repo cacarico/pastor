@@ -7,6 +7,7 @@ use pastor::cli::{CliError, request_failure};
 use pastor::config::flock::{DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig};
 use pastor::config::job::{check_name, job_path, set_enabled};
 use pastor::config::{AgentChoice, PastorConfig, Paths, parse_duration};
+use pastor::fleet_edit;
 use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{Head, HeadPing, IpcRequest, IpcResponse, request};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
@@ -451,6 +452,7 @@ fn main() {
                     flocky || flocks_declared(&paths),
                     needs_agent_protocol(&command),
                     needs_place_protocol(&command),
+                    needs_fleet_edit_protocol(&command),
                 )
                 .await?
             }
@@ -573,11 +575,16 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 /// `place` is for `task retry --place` (`needs_place_protocol`): a head
 /// before `PLACE_PROTOCOL` would retry the task where it was and answer
 /// success, so it is refused.
+///
+/// `fleet_edit` is for a flock or machine edit the head makes itself
+/// (`needs_fleet_edit_protocol`): a head before `FLEET_EDIT_PROTOCOL` does
+/// not know the request, so it is refused before anything is sent.
 async fn probe_head(
     paths: &Paths,
     flocks: bool,
     agents: bool,
     place: bool,
+    fleet_edit: bool,
 ) -> anyhow::Result<Head> {
     let socket = paths.socket_file();
     match pastor::ipc::ping_head(&socket).await {
@@ -594,6 +601,16 @@ async fn probe_head(
                 "head_too_old",
                 format!(
                     "the running pastor serve ({version}) predates `task retry --place` and would retry the task where it was; restart it"
+                ),
+            ))
+        }
+        HeadPing::Pong { version, protocol }
+            if fleet_edit && protocol < pastor::ipc::FLEET_EDIT_PROTOCOL =>
+        {
+            Err(pastor::cli::CliError::err(
+                "head_too_old",
+                format!(
+                    "the running pastor serve ({version}) predates flock and machine edits through the head; restart it, or stop it to edit flock.toml without a head"
                 ),
             ))
         }
@@ -727,6 +744,20 @@ fn needs_agent_protocol(command: &Command) -> bool {
         Command::Task { cmd } => matches!(cmd, TaskCmd::Run(_) | TaskCmd::Retry { .. }),
         Command::Tick(a) => !a.dry_run,
         Command::Job { cmd } => matches!(cmd, JobCmd::Run { .. }),
+        _ => false,
+    }
+}
+
+/// Whether `command` is a flock.toml edit the head makes itself, which only
+/// a head of `FLEET_EDIT_PROTOCOL` or later knows. `flock remove` and `flock
+/// edit` are not: the first is older, the second edits here and reloads.
+fn needs_fleet_edit_protocol(command: &Command) -> bool {
+    match command {
+        Command::Flock { cmd } => matches!(cmd, FlockCmd::Add { .. } | FlockCmd::Default { .. }),
+        Command::Machine { cmd } => matches!(
+            cmd,
+            MachineCmd::Add { .. } | MachineCmd::Remove { .. } | MachineCmd::Move { .. }
+        ),
         _ => false,
     }
 }
@@ -1224,7 +1255,6 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             flock,
             herdr,
         } => {
-            let mut doc = FlockDoc::open(&path)?;
             let m = MachineConfig {
                 name: name.clone(),
                 local,
@@ -1237,16 +1267,22 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 agent: None,
                 agent_args: None,
             };
-            doc.add_machine(&m).map_err(edit_error)?;
-            doc.save(&path)?;
-            let f = doc.flock().map_err(anyhow::Error::msg)?;
-            println!(
-                "added {name} to flock {} in {}",
-                f.machine_flock(&name).unwrap_or_default(),
-                path.display()
-            );
-            let target = f.get(&name).and_then(|m| m.ssh.clone());
-            match (herdr, target) {
+            // With a head the reload line comes with its answer, before the
+            // herdr lines; without one it follows them.
+            let reload = if head.is_live() {
+                println!(
+                    "{}",
+                    ask_text(paths, IpcRequest::MachineAdd { machine: m.clone() }).await?
+                );
+                None
+            } else {
+                println!(
+                    "{}",
+                    fleet_edit::add_machine(&path, &m).map_err(edit_error)?
+                );
+                Some(reload_running_head(paths, head).await)
+            };
+            match (herdr, m.ssh.as_deref()) {
                 // The flock file is already written: a herdr failure below is
                 // reported, not rolled back, so the two lists never diverge
                 // silently in the other direction either.
@@ -1254,11 +1290,11 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                     herdr_cmd(&[
                         "machine",
                         "add",
-                        &target,
+                        target,
                         "--label",
                         &name,
                         "--remote-session",
-                        &f.get(&name).map(|m| m.session.clone()).unwrap_or_default(),
+                        &m.session,
                     ]);
                     println!("saved in herdr's sidebar as {name}");
                 }
@@ -1267,18 +1303,26 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 ),
                 _ => {}
             }
-            println!("{}", reload_running_head(paths, head).await);
+            if let Some(reload) = reload {
+                println!("{reload}");
+            }
         }
         MachineCmd::Remove { name, herdr } => {
-            let mut doc = FlockDoc::open(&path)?;
-            let target = doc
-                .flock()
-                .map_err(anyhow::Error::msg)?
-                .get(&name)
-                .and_then(|m| m.ssh.clone());
-            doc.remove_machine(&name).map_err(edit_error)?;
-            doc.save(&path)?;
-            println!("removed {name}; {}", reload_running_head(paths, head).await);
+            // Only for the herdr hint below, read before the machine goes. A
+            // head's file is this machine's file for now; a file that does
+            // not load gives no hint.
+            let target = Flock::load(&path)
+                .ok()
+                .and_then(|f| f.get(&name).and_then(|m| m.ssh.clone()));
+            if head.is_live() {
+                println!(
+                    "{}",
+                    ask_text(paths, IpcRequest::MachineRemove { name: name.clone() }).await?
+                );
+            } else {
+                let done = fleet_edit::remove_machine(&path, &name).map_err(edit_error)?;
+                println!("{done}; {}", reload_running_head(paths, head).await);
+            }
             if herdr {
                 // herdr removes by profile id; the label is all pastor knows.
                 let list = herdr_cmd(&["machine", "list"]);
@@ -1310,13 +1354,15 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             }
         }
         MachineCmd::Move { name, flock } => {
-            let mut doc = FlockDoc::open(&path)?;
-            doc.move_machine(&name, &flock).map_err(edit_error)?;
-            doc.save(&path)?;
-            println!(
-                "moved {name} to flock {flock}; tasks already on it stay; {}",
-                reload_running_head(paths, head).await
-            );
+            if head.is_live() {
+                println!(
+                    "{}",
+                    ask_text(paths, IpcRequest::MachineMove { name, flock }).await?
+                );
+            } else {
+                let done = fleet_edit::move_machine(&path, &name, &flock).map_err(edit_error)?;
+                println!("{done}; {}", reload_running_head(paths, head).await);
+            }
         }
         MachineCmd::List { flock, json } => {
             machine_list(paths, flock.as_deref(), json, head).await?
@@ -1327,9 +1373,22 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
     Ok(())
 }
 
-/// A refused flock.toml edit, with its stable code.
-fn edit_error(e: EditError) -> anyhow::Error {
-    pastor::cli::CliError::err(e.code(), e)
+/// A refused flock.toml edit, with its stable code; any other error as it
+/// is.
+fn edit_error(err: impl Into<anyhow::Error>) -> anyhow::Error {
+    let err = err.into();
+    match err.downcast_ref::<EditError>() {
+        Some(e) => pastor::cli::CliError::err(e.code(), e),
+        None => err,
+    }
+}
+
+/// `ask`, for a request the head answers with `Text`.
+async fn ask_text(paths: &Paths, req: IpcRequest) -> anyhow::Result<String> {
+    let IpcResponse::Text(text) = ask(paths, req).await? else {
+        unreachable!()
+    };
+    Ok(text)
 }
 
 async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
@@ -1353,44 +1412,28 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
             return edit_file(paths, &path, &check, head).await;
         }
         FlockCmd::Add { name, default } => {
-            // A first default flock would take the implicit flock's
-            // machines, stranding the tasks queued there. As with `flock
-            // remove` without a head, a task queued between this read and
-            // the save is not seen; `pastor task close` recovers it.
-            let queued: Vec<String> = if default && Flock::load(&path)?.flocks.is_empty() {
-                queued_tasks(paths, head)
-                    .await?
-                    .iter()
-                    .filter(|t| t.flock.as_deref() == Some(DEFAULT_FLOCK))
-                    .map(|t| t.display_id())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let mut doc = FlockDoc::open(&path)?;
-            let added = doc.add_flock(&name, default, &queued).map_err(edit_error)?;
-            doc.save(&path)?;
-            let mut done = if default {
-                format!("added flock {name}, now the default")
-            } else {
-                format!("added flock {name}")
-            };
-            if !added.machines.is_empty() {
-                let (noun, verb) = match added.machines.len() {
-                    1 => ("machine", "stays"),
-                    _ => ("machines", "stay"),
-                };
-                let machines = added.machines.join(", ");
-                if added.moved {
-                    done += &format!("; {noun} {machines} moved to it");
-                } else {
-                    done += &format!("; {noun} {machines} {verb} in flock {}", added.flock);
-                }
-                if !added.held_by.is_empty() {
-                    done += &format!(", which has queued tasks: {}", added.held_by.join(", "));
-                }
+            if head.is_live() {
+                println!(
+                    "{}",
+                    ask_text(paths, IpcRequest::FlockAdd { name, default }).await?
+                );
+                return Ok(());
             }
-            done
+            // As with `flock remove` without a head, a task queued between
+            // this read and the save is not seen; `pastor task close`
+            // recovers it.
+            let queued = || -> anyhow::Result<Vec<String>> {
+                Ok(open_store(paths)?
+                    .list_tasks(&TaskFilter {
+                        states: Some(vec![TaskState::Queued]),
+                        flock: Some(DEFAULT_FLOCK.into()),
+                        ..Default::default()
+                    })?
+                    .iter()
+                    .map(|t| t.display_id())
+                    .collect())
+            };
+            fleet_edit::add_flock(&path, &name, default, queued).map_err(edit_error)?
         }
         FlockCmd::Remove { name } => {
             // With a head, the head checks and edits under the lock `task
@@ -1432,8 +1475,14 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
         FlockCmd::Default {
             cmd: FlockDefaultCmd::Set { name },
         } => {
-            edit(&|d| d.set_default(&name))?;
-            format!("{name} is the default flock; machines stay in their flocks")
+            if head.is_live() {
+                println!(
+                    "{}",
+                    ask_text(paths, IpcRequest::FlockSetDefault { name }).await?
+                );
+                return Ok(());
+            }
+            fleet_edit::set_default(&path, &name).map_err(edit_error)?
         }
     };
     println!("{done}; {}", reload_running_head(paths, head).await);
@@ -2087,7 +2136,9 @@ mod tests {
                 w.write_all(out.as_bytes()).await.unwrap();
             }
         });
-        let err = probe_head(&paths, false, true, false).await.unwrap_err();
+        let err = probe_head(&paths, false, true, false, false)
+            .await
+            .unwrap_err();
         let err = err.downcast::<pastor::cli::CliError>().unwrap();
         assert_eq!(err.code, "head_too_old");
         assert!(
@@ -2096,7 +2147,7 @@ mod tests {
             err.message
         );
         assert_eq!(
-            probe_head(&paths, true, false, false).await.unwrap(),
+            probe_head(&paths, true, false, false, false).await.unwrap(),
             Head::Live
         );
 
@@ -2151,12 +2202,14 @@ mod tests {
                 w.write_all(out.as_bytes()).await.unwrap();
             }
         });
-        let err = probe_head(&paths, false, true, true).await.unwrap_err();
+        let err = probe_head(&paths, false, true, true, false)
+            .await
+            .unwrap_err();
         let err = err.downcast::<pastor::cli::CliError>().unwrap();
         assert_eq!(err.code, "head_too_old");
         assert!(err.message.contains("--place"), "{}", err.message);
         assert_eq!(
-            probe_head(&paths, false, true, false).await.unwrap(),
+            probe_head(&paths, false, true, false, false).await.unwrap(),
             Head::Live
         );
 
