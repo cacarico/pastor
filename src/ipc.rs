@@ -15,8 +15,9 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// the CLI can refuse to send it there. A head that answers no protocol is 0.
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`). 2: flock agents and tool
 /// lists. 3: `TaskRetry::place`. 4: `EventsSince`. 5: flock and machine
-/// edits (`FLEET_EDIT_PROTOCOL`).
-pub const IPC_PROTOCOL: u32 = 5;
+/// edits (`FLEET_EDIT_PROTOCOL`). 6: `FileGet`, `FilePut`, `JobDescribe`,
+/// `JobSetEnabled`.
+pub const IPC_PROTOCOL: u32 = 6;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -49,6 +50,9 @@ pub const EVENTS_PROTOCOL: u32 = 4;
 /// add|default` and `machine add|remove|move`. An older one does not know
 /// those requests.
 pub const FLEET_EDIT_PROTOCOL: u32 = 5;
+/// The first protocol whose head takes `FileGet`, `FilePut`, `JobDescribe`
+/// and `JobSetEnabled`. An older one refuses them as unknown requests.
+pub const FILE_PROTOCOL: u32 = 6;
 
 // One request is read per connection and dropped once answered, so the
 // size of the largest variant (`Run`) costs nothing worth a box.
@@ -169,6 +173,31 @@ pub enum IpcRequest {
         states: Vec<TaskState>,
         older_than_secs: u64,
     },
+    /// The text of one of the head's config files, `flock`, `config` or
+    /// `job:<name>` (`edit::ConfigFile`), with its hash. Answers `File`.
+    FileGet {
+        file: String,
+    },
+    /// Replace one of the head's config files with `text`, through
+    /// `edit::put`: refused `invalid_edit` when the head would not load it,
+    /// `edit_conflict` when the file's hash is no longer `base_hash`. A saved
+    /// file reloads the head. Answers `Text`.
+    FilePut {
+        file: String,
+        text: String,
+        base_hash: String,
+    },
+    /// What `job describe --json` prints, from the head's files. Answers
+    /// `Job`.
+    JobDescribe {
+        name: String,
+    },
+    /// `job enable|disable` on the head's job file, then a reload. Answers
+    /// `Text`.
+    JobSetEnabled {
+        name: String,
+        enabled: bool,
+    },
 }
 
 impl IpcRequest {
@@ -185,6 +214,7 @@ impl IpcRequest {
             | IpcRequest::FlockList
             | IpcRequest::JobList
             | IpcRequest::EventsSince { .. } => false,
+            IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
             | IpcRequest::Tick { .. }
             | IpcRequest::Run { .. }
@@ -199,7 +229,9 @@ impl IpcRequest {
             | IpcRequest::TaskClose { .. }
             | IpcRequest::TaskSend { .. }
             | IpcRequest::TaskDone { .. }
-            | IpcRequest::TaskPrune { .. } => true,
+            | IpcRequest::TaskPrune { .. }
+            | IpcRequest::FilePut { .. }
+            | IpcRequest::JobSetEnabled { .. } => true,
         }
     }
 
@@ -285,6 +317,19 @@ pub enum IpcResponse {
     Jobs(Vec<JobStatus>),
     Pruned(crate::store::PruneOutcome),
     Events(crate::events::EventsPage),
+    File(FileText),
+    Job(crate::describe::JobDescription),
+}
+
+/// One of the head's config files as `FileGet` found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileText {
+    /// Where it is on the head, for messages and the editor's temp copy.
+    pub path: String,
+    /// Empty for a missing flock.toml or pastor.toml.
+    pub text: String,
+    /// `edit::hash` of `text`, to send back as `FilePut::base_hash`.
+    pub hash: String,
 }
 
 impl IpcResponse {
@@ -613,6 +658,11 @@ mod tests {
                 gap: false,
                 oldest: Some(812),
             }),
+            IpcResponse::File(FileText {
+                path: "/c/flock.toml".into(),
+                text: "a = 1\n".into(),
+                hash: "00".into(),
+            }),
             IpcResponse::error("some_code", "some message"),
         ];
         for resp in responses {
@@ -632,6 +682,19 @@ mod tests {
             IpcRequest::Reload,
             IpcRequest::JobList,
             IpcRequest::JobRun { name: "j".into() },
+            IpcRequest::FileGet {
+                file: "job:j".into(),
+            },
+            IpcRequest::FilePut {
+                file: "config".into(),
+                text: "tick = \"5s\"\n".into(),
+                base_hash: "ab".into(),
+            },
+            IpcRequest::JobDescribe { name: "j".into() },
+            IpcRequest::JobSetEnabled {
+                name: "j".into(),
+                enabled: true,
+            },
         ] {
             let json = serde_json::to_string(&req).unwrap();
             let back: IpcRequest = serde_json::from_str(&json).unwrap();
@@ -716,6 +779,10 @@ mod tests {
                 limit: 10,
                 task: None,
             },
+            IpcRequest::FileGet {
+                file: "flock".into(),
+            },
+            IpcRequest::JobDescribe { name: "j".into() },
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -775,6 +842,15 @@ mod tests {
             },
             IpcRequest::Reload,
             IpcRequest::JobRun { name: "j".into() },
+            IpcRequest::FilePut {
+                file: "job:j".into(),
+                text: String::new(),
+                base_hash: String::new(),
+            },
+            IpcRequest::JobSetEnabled {
+                name: "j".into(),
+                enabled: false,
+            },
         ];
         for req in changes {
             assert!(req.changes_fleet(), "{req:?}");

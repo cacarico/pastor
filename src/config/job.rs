@@ -301,7 +301,17 @@ pub fn load_file(path: &Path, stem: &str, defaults: &Defaults, catalog: &dyn Cat
 /// one before the first table) and nothing else, so comments and layout the
 /// user wrote survive. The result must still parse or the file is left alone.
 pub fn set_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    // Resolve the real file first: `path` may be a symlink (e.g. into a
+    // dotfiles repo), and writing the temp file next to `path` then renaming
+    // over it would replace the link with a plain file. Writing beside, and
+    // renaming onto, the canonical target keeps the link and edits what it
+    // points to. The edit lock is held from the read to the rename so a
+    // `put` or another toggle cannot be overwritten with stale text.
+    let target =
+        std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    let _lock = crate::edit::lock_file(&target)?;
+    let text =
+        std::fs::read_to_string(&target).with_context(|| format!("read {}", target.display()))?;
     let line = format!("enabled = {enabled}");
     let mut out: Vec<String> = Vec::new();
     let mut replaced = false;
@@ -341,13 +351,6 @@ pub fn set_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
     // does not know yet), which is not what "leave a broken edit alone" means.
     toml::from_str::<toml::Value>(&new_text)
         .with_context(|| format!("{} would not parse after the edit", path.display()))?;
-    // Resolve the real file first: `path` may be a symlink (e.g. into a
-    // dotfiles repo), and writing the temp file next to `path` then renaming
-    // over it would replace the link with a plain file. Writing beside, and
-    // renaming onto, the canonical target keeps the link and edits what it
-    // points to.
-    let target =
-        std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
     let tmp = target.with_extension("toml.tmp");
     std::fs::write(&tmp, &new_text).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &target).with_context(|| format!("rename to {}", target.display()))?;

@@ -867,6 +867,15 @@ impl Fleet {
     }
 }
 
+/// An error from code the CLI shares with the head, as a reply: its
+/// `CliError` code when it has one, else `runtime_error`.
+fn cli_error(err: anyhow::Error) -> IpcResponse {
+    match err.downcast_ref::<crate::cli::CliError>() {
+        Some(e) => IpcResponse::error(&e.code, &e.message),
+        None => IpcResponse::error("runtime_error", format!("{err:#}")),
+    }
+}
+
 /// Why an agent pastor started, in task `task`, was refused a change to
 /// the fleet. The CLI says the same for a change it makes on its own.
 pub fn agent_refusal(task: &str) -> String {
@@ -1430,6 +1439,73 @@ impl Daemon {
                     Err(err) => IpcResponse::error("events_read_failed", err),
                 }
             }
+            IpcRequest::FileGet { file } => self.file_get(&file).unwrap_or_else(cli_error),
+            IpcRequest::FilePut {
+                file,
+                text,
+                base_hash,
+            } => match self.file_put(&file, &text, &base_hash) {
+                Ok(path) => IpcResponse::Text(format!(
+                    "saved {}; {}",
+                    path.display(),
+                    self.reload_after_edit().await
+                )),
+                Err(err) => cli_error(err),
+            },
+            IpcRequest::JobDescribe { name } => {
+                let statuses = match self.scheduler.job_list().await {
+                    Ok(jobs) => jobs,
+                    Err(err) => return IpcResponse::error("scheduler_error", err),
+                };
+                match crate::describe::job(&self.paths, &name, statuses, &self.store) {
+                    Ok(d) => IpcResponse::Job(d),
+                    Err(err) => cli_error(err),
+                }
+            }
+            IpcRequest::JobSetEnabled { name, enabled } => {
+                let set = crate::edit::ConfigFile::Job(name.clone())
+                    .path(&self.paths)
+                    .and_then(|path| crate::config::job::set_enabled(&path, enabled));
+                if let Err(err) = set {
+                    return cli_error(err);
+                }
+                let verb = if enabled { "enabled" } else { "disabled" };
+                match self.scheduler.reload().await {
+                    Ok(_) => IpcResponse::Text(format!("{verb} {name}")),
+                    Err(err) => IpcResponse::Text(format!(
+                        "{verb} {name}; the reload after it failed ({err}); run `pastor job reload`"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// `FileGet`: the head's own copy of the file, and its hash.
+    fn file_get(&self, file: &str) -> anyhow::Result<IpcResponse> {
+        let path = file.parse::<crate::edit::ConfigFile>()?.path(&self.paths)?;
+        let (text, hash) = crate::edit::get(&path)?;
+        Ok(IpcResponse::File(crate::ipc::FileText {
+            path: path.display().to_string(),
+            text,
+            hash,
+        }))
+    }
+
+    /// `FilePut`: checked and written by `edit::put`, as an edit with no
+    /// head is. Answers where it wrote.
+    fn file_put(&self, file: &str, text: &str, base_hash: &str) -> anyhow::Result<PathBuf> {
+        let file = file.parse::<crate::edit::ConfigFile>()?;
+        let path = file.path(&self.paths)?;
+        let check = file.checker(&self.paths)?;
+        crate::edit::put(&path, text, base_hash, &check)?;
+        Ok(path)
+    }
+
+    /// What a saved edit tells the user about the reload that follows it.
+    async fn reload_after_edit(&self) -> String {
+        match self.scheduler.reload().await {
+            Ok(_) => "the running pastor serve picked it up".into(),
+            Err(err) => format!("the reload after it failed ({err}); run `pastor job reload`"),
         }
     }
 
@@ -3634,6 +3710,68 @@ mod tests {
             fake.agents().len(),
             1,
             "one agent on a max_agents = 1 machine"
+        );
+    }
+
+    /// `FileGet` and `FilePut` act on the head's own files, named only as
+    /// `flock`, `config` or `job:<name>`, and write only a valid edit made
+    /// from the file as it is now.
+    #[tokio::test]
+    async fn file_requests_edit_the_heads_files() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        let job = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p {{ task.id }}\"\n";
+        let file = paths.jobs_dir().join("clock.toml");
+        std::fs::write(&file, job).unwrap();
+        let code = |r: IpcResponse| match r {
+            IpcResponse::Error { code, .. } => code,
+            other => panic!("{other:?}"),
+        };
+        for bad in ["/etc/passwd", "job:../pastor", "jobs"] {
+            let r = d.handle(IpcRequest::FileGet { file: bad.into() }).await;
+            assert!(
+                ["invalid_file", "job_not_found"].contains(&code(r).as_str()),
+                "{bad}"
+            );
+        }
+        let r = d
+            .handle(IpcRequest::FileGet {
+                file: "job:ghost".into(),
+            })
+            .await;
+        assert_eq!(code(r), "job_not_found");
+
+        let IpcResponse::File(got) = d
+            .handle(IpcRequest::FileGet {
+                file: "job:clock".into(),
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(got.text, job);
+        assert_eq!(got.hash, crate::edit::hash(job));
+        let put = |text: &str, base_hash: &str| IpcRequest::FilePut {
+            file: "job:clock".into(),
+            text: text.into(),
+            base_hash: base_hash.into(),
+        };
+        let r = d.handle(put(&job.replace("1h", "soon"), &got.hash)).await;
+        assert_eq!(code(r), "invalid_edit");
+        let r = d
+            .handle(put(&job.replace("1h", "2h"), &crate::edit::hash("old")))
+            .await;
+        assert_eq!(code(r), "edit_conflict");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), job);
+        let IpcResponse::Text(msg) = d.handle(put(&job.replace("1h", "2h"), &got.hash)).await
+        else {
+            panic!()
+        };
+        assert!(msg.starts_with("saved "), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            job.replace("1h", "2h")
         );
     }
 
