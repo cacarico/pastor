@@ -273,7 +273,7 @@ fn completions_offer_only_the_nested_spellings() {
         .lines()
         .find(|l| {
             l.trim_start()
-                .starts_with("opts=\"-h -V --skill --help --version")
+                .starts_with("opts=\"-h -V --skill --head --help --version")
         })
         .unwrap_or_else(|| panic!("no top-level opts line:\n{bash}"));
     assert!(fish.contains("-l skill"), "fish does not offer --skill");
@@ -3839,4 +3839,241 @@ fn bridge_relays_invalid_utf8_bytes_to_the_head() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["kind"], "error", "{stdout}");
     assert_eq!(v["data"]["code"], "invalid_request", "{stdout}");
+}
+
+/// A CLI with its own, empty config and state dirs, and a fake `ssh` first on
+/// its PATH. The fake ignores ssh's options, runs the remote command here and
+/// picks the head by destination: `head-up` is `head`'s state dir, `no-head`
+/// an empty one, `unreachable` fails as ssh does when it cannot connect.
+struct Client {
+    tmp: tempfile::TempDir,
+    config: std::path::PathBuf,
+    state: std::path::PathBuf,
+    path: std::ffi::OsString,
+}
+
+fn client(head: Option<&Env>) -> Client {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let empty = tmp.path().join("empty");
+    let (up_config, up_state) = match head {
+        Some(e) => (e.config.clone(), e.state.clone()),
+        None => (empty.clone(), empty.clone()),
+    };
+    let script = format!(
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+dest=$1; shift
+case "$dest" in
+  head-up) export PASTOR_CONFIG_DIR='{}' PASTOR_STATE_DIR='{}' ;;
+  no-head) export PASTOR_CONFIG_DIR='{e}' PASTOR_STATE_DIR='{e}' ;;
+  *) echo "ssh: connect to host $dest port 22: Connection refused" >&2; exit 255 ;;
+esac
+exec sh -c "$*"
+"#,
+        up_config.display(),
+        up_state.display(),
+        e = empty.display(),
+    );
+    let ssh = bin.join("ssh");
+    std::fs::write(&ssh, script).unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = std::ffi::OsString::from(&bin);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    Client {
+        config: tmp.path().join("c"),
+        state: tmp.path().join("s"),
+        tmp,
+        path,
+    }
+}
+
+impl Client {
+    fn cmd(&self, args: &[&str]) -> std::process::Output {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .env("PATH", &self.path)
+            .env_remove("PASTOR_HEAD")
+            .output()
+            .unwrap()
+    }
+
+    /// `head set <dest>` with pastor's path the test binary.
+    fn head_set(&self, dest: &str, extra: &[&str]) -> std::process::Output {
+        let mut args = vec![
+            "head",
+            "set",
+            dest,
+            "--pastor",
+            env!("CARGO_BIN_EXE_pastor"),
+        ];
+        args.extend_from_slice(extra);
+        self.cmd(&args)
+    }
+}
+
+/// With a head set, `task run`, `task list`, `task show` and `machine list`
+/// go to it over ssh and `pastor bridge`, and print and exit as they do on
+/// the head's own machine. Nothing reads or writes the CLI's own files but
+/// client.toml.
+#[test]
+fn a_remote_head_answers_what_the_local_one_would() {
+    let env = start();
+    let c = client(Some(&env));
+    let out = ok(c.head_set("head-up", &[]));
+    assert!(out.starts_with("head: head-up (remote, pastor "), "{out}");
+    assert_eq!(ok(c.cmd(&["head", "show"])), "head: head-up (remote)\n");
+    let v: serde_json::Value =
+        serde_json::from_str(&ok(c.cmd(&["head", "show", "--json"]))).unwrap();
+    assert_eq!(v["remote"], true);
+    assert_eq!(v["ssh"], "head-up");
+    assert_eq!(v["from"], "file");
+
+    let t: serde_json::Value = serde_json::from_str(&ok(
+        c.cmd(&["task", "run", "hello", "--repo", "/tmp", "--json"])
+    ))
+    .unwrap();
+    assert_eq!(t["machine"], "fake");
+    assert_eq!(t["agent_name"], "t-1");
+    env.wait_done("t-1");
+
+    for args in [
+        &["task", "list", "--all", "--json"][..],
+        &["task", "show", "t-1", "--json"],
+        &["task", "list"],
+    ] {
+        let (remote, local) = (c.cmd(args), env.cmd(args));
+        assert_eq!(remote.status.code(), local.status.code(), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&remote.stdout),
+            String::from_utf8_lossy(&local.stdout),
+            "{args:?}"
+        );
+    }
+    let (remote, local) = (
+        c.cmd(&["task", "show", "t-9"]),
+        env.cmd(&["task", "show", "t-9"]),
+    );
+    assert_eq!(error_code(&remote), "task_not_found");
+    assert_eq!(remote.stderr, local.stderr);
+
+    // The machines are the head's; the head's line names where it is.
+    let remote = ok(c.cmd(&["machine", "list"]));
+    let local = ok(env.cmd(&["machine", "list"]));
+    assert!(
+        remote.starts_with(&format!(
+            "pastor {} on head-up (herdr -), 1 machine",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{remote}"
+    );
+    let table = |s: &str| s.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert_eq!(table(&remote), table(&local));
+    let v: serde_json::Value =
+        serde_json::from_str(&ok(c.cmd(&["machine", "list", "--json"]))).unwrap();
+    assert_eq!(v["head"]["host"], "head-up");
+    assert_eq!(v["machines"][0]["name"], "fake");
+
+    // `--head` and PASTOR_HEAD name a head for one command, over the file.
+    let out = c.cmd(&["--head", "unreachable", "task", "list"]);
+    assert_eq!(error_code(&out), "head_unreachable");
+
+    let names: Vec<String> = std::fs::read_dir(&c.config)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["client.toml"], "nothing else written here");
+    assert!(!c.state.join("pastor.db").exists());
+}
+
+/// A command not moved behind the head yet would act on this machine's
+/// files; it is refused instead, and `serve` would be a second head. The
+/// commands that are local on purpose still run.
+#[test]
+fn a_remote_head_refuses_what_would_act_on_local_files() {
+    let c = client(None);
+    ok(c.head_set("unreachable", &["--force"]));
+    for args in [
+        &["machine", "add", "pi-1", "--local"][..],
+        &["flock", "list"],
+        &["job", "enable", "x"],
+        &["events"],
+        &["config", "edit"],
+    ] {
+        let out = c.cmd(args);
+        assert_eq!(error_code(&out), "remote_head_unsupported", "{args:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains(&args[..args.len().min(2)].join(" ")),
+            "{v}"
+        );
+    }
+    assert!(!c.config.join("flock.toml").exists());
+    assert_eq!(error_code(&c.cmd(&["serve"])), "remote_head_set");
+    ok(c.cmd(&["completions", "bash"]));
+    ok(c.cmd(&["connector", "list"]));
+
+    ok(c.cmd(&["head", "unset"]));
+    assert_eq!(ok(c.cmd(&["head", "show"])), "head: this machine\n");
+    let out = c.cmd(&["task", "list"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("pastor serve is not running"),
+        "back to the local head, and there is none"
+    );
+}
+
+/// `head set` pings through the bridge first: ssh that cannot connect is
+/// `head_unreachable` with ssh's own words, a machine with no head running is
+/// `no_head`, a pastor with no `bridge` is `head_too_old`. Nothing is saved
+/// unless `--force` says so.
+#[test]
+fn head_set_refuses_a_head_that_does_not_answer() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = client(None);
+    let out = c.head_set("unreachable", &[]);
+    assert_eq!(error_code(&out), "head_unreachable");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Connection refused"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!c.config.join("client.toml").exists());
+
+    assert_eq!(error_code(&c.head_set("no-head", &[])), "no_head");
+    assert_eq!(ok(c.cmd(&["head", "show"])), "head: this machine\n");
+
+    let old = c.tmp.path().join("old-pastor");
+    std::fs::write(
+        &old,
+        "#!/bin/sh\necho \"error: unrecognized subcommand '$1'\" >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = c.cmd(&["head", "set", "no-head", "--pastor", old.to_str().unwrap()]);
+    assert_eq!(error_code(&out), "head_too_old");
+
+    let out = c.head_set("no-head", &["--force"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("saved anyway"));
+    assert_eq!(ok(c.cmd(&["head", "show"])), "head: no-head (remote)\n");
+    let text = std::fs::read_to_string(c.config.join("client.toml")).unwrap();
+    assert!(text.contains("ssh = \"no-head\""), "{text}");
+    // A command then says the same, and never falls back to this machine.
+    assert_eq!(error_code(&c.cmd(&["task", "list"])), "no_head");
+    assert_eq!(error_code(&c.cmd(&["task", "show", "t-1"])), "no_head");
 }
