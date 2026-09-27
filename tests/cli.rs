@@ -530,6 +530,80 @@ fn machine_add_and_remove_edit_the_file() {
     assert!(!run(&["machine", "remove", "pi-3"]).status.success());
 }
 
+/// The line pastor prints for a machine's key names this very binary, and
+/// the machine must be in flock.toml. The key comes from a file or stdin.
+#[test]
+fn authorized_key_prints_the_locked_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\n",
+    )
+    .unwrap();
+    let key = tmp.path().join("id.pub");
+    std::fs::write(&key, "ssh-ed25519 AAAAC3Nza user@pi-1\n").unwrap();
+    let run = |args: &[&str], stdin: &str| {
+        let mut child = pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_pastor")).unwrap();
+    let want = format!(
+        "command=\"{} bridge --agent --machine pi-1\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza user@pi-1\n",
+        exe.display()
+    );
+    let out = run(
+        &[
+            "machine",
+            "authorized-key",
+            "pi-1",
+            "--key",
+            key.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+    let out = run(
+        &["machine", "authorized-key", "pi-1", "--key", "-"],
+        "ssh-ed25519 AAAAC3Nza user@pi-1\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+    let out = run(
+        &[
+            "machine",
+            "authorized-key",
+            "pi-9",
+            "--key",
+            key.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown_machine"));
+}
+
 /// Copilot 4102376166: a socket that accepts but never answers `Ping` is
 /// `Unresponsive` (a busy head), not the same as no daemon at all, so
 /// `machine add` must not send the "start pastor serve" advice. Copilot

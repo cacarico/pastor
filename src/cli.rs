@@ -668,6 +668,7 @@ mod tests {
             tags: vec!["fast".into(), "arm".into()],
             orphans: vec![],
             flock: None,
+            shutting_down: false,
         }
     }
 

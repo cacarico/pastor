@@ -97,12 +97,22 @@ enum Command {
         cmd: pastor::trust_cli::TrustCmd,
     },
     /// Pass request lines from stdin to this machine's head; for a remote CLI over ssh
-    Bridge,
+    Bridge(BridgeArgs),
     /// Which head this CLI uses: this machine's, or one on another machine over ssh
     Head {
         #[command(subcommand)]
         cmd: pastor::head::HeadCmd,
     },
+}
+
+#[derive(Args, Debug)]
+struct BridgeArgs {
+    /// Pass on only what an agent on --machine may ask: its machine's tasks
+    #[arg(long, requires = "machine")]
+    agent: bool,
+    /// The machine whose agents this bridge serves, as flock.toml names it
+    #[arg(long, requires = "agent")]
+    machine: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -349,6 +359,14 @@ enum MachineCmd {
         /// The machine, as flock.toml names it
         name: String,
     },
+    /// Print the authorized_keys line that lets a machine's agents reach this head
+    AuthorizedKey {
+        /// The machine, as flock.toml names it
+        name: String,
+        /// The public key of the machine's user: a .pub file, or - for stdin
+        #[arg(long, value_name = "FILE")]
+        key: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -442,8 +460,8 @@ fn main() {
     };
     // Plumbing, before the legacy migration and the fleet guard: it reads no
     // config, and the head checks each request it carries.
-    if let Command::Bridge = command {
-        bridge(&paths);
+    if let Command::Bridge(args) = &command {
+        bridge(&paths, args);
     }
     if let Some(legacy) = pastor::config::legacy_macos_dir() {
         match pastor::config::migrate_legacy_dir(&legacy, &paths) {
@@ -538,7 +556,7 @@ fn main() {
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd),
-            Command::Bridge => unreachable!("handled before the runtime"),
+            Command::Bridge(_) => unreachable!("handled before the runtime"),
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
         }
     });
@@ -577,13 +595,18 @@ fn completion_tree() -> clap::Command {
 
 /// `pastor bridge`. Its client reads replies on stdout, so a failure is
 /// written there too, as the one line where the reply would have been.
-fn bridge(paths: &Paths) -> ! {
+fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let result = rt.block_on(pastor::bridge::run(
-        &paths.socket_file(),
-        tokio::io::BufReader::new(tokio::io::stdin()),
-        tokio::io::stdout(),
-    ));
+    let socket = paths.socket_file();
+    let input = tokio::io::BufReader::new(tokio::io::stdin());
+    let result = rt.block_on(async {
+        match (args.agent, &args.machine) {
+            (true, Some(machine)) => {
+                pastor::bridge::run_agent(&socket, machine, input, tokio::io::stdout()).await
+            }
+            _ => pastor::bridge::run(&socket, input, tokio::io::stdout()).await,
+        }
+    });
     let Err(err) = result else {
         std::process::exit(0)
     };
@@ -727,6 +750,8 @@ fn head_use(command: &Command) -> Option<bool> {
             MachineCmd::Describe { .. } => Some(false),
             // Open execs herdr on the machine; the head has no part in it.
             MachineCmd::Open { .. } => None,
+            // Reads flock.toml and prints a line; it edits no file.
+            MachineCmd::AuthorizedKey { .. } => None,
             _ => Some(true),
         },
         Command::Flock { cmd } => match cmd {
@@ -776,7 +801,7 @@ fn remote_route(command: &Command) -> RemoteRoute {
         Command::Completions { .. }
         | Command::Setup { .. }
         | Command::Head { .. }
-        | Command::Bridge
+        | Command::Bridge(_)
         | Command::Connector { .. } => RemoteRoute::Here,
         Command::Serve => RemoteRoute::Serve,
         _ => RemoteRoute::Unsupported,
@@ -1561,6 +1586,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
         }
         MachineCmd::Describe { name, json } => machine_describe(paths, &name, json, head).await?,
         MachineCmd::Open { name } => open(paths, &name).await?,
+        MachineCmd::AuthorizedKey { name, key } => authorized_key(&path, &name, &key)?,
     }
     Ok(())
 }
@@ -1819,6 +1845,27 @@ async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
         )
     };
     Err(anyhow::anyhow!("exec failed: {err}"))
+}
+
+/// `pastor machine authorized-key`: prints the line, and never edits
+/// `authorized_keys` or any other file.
+fn authorized_key(flock: &std::path::Path, machine: &str, key: &str) -> anyhow::Result<()> {
+    if Flock::load(flock)?.get(machine).is_none() {
+        fail("unknown_machine", machine);
+    }
+    let key = if key == "-" {
+        std::io::read_to_string(std::io::stdin())?
+    } else {
+        std::fs::read_to_string(key).map_err(|e| {
+            pastor::cli::CliError::err("invalid_key", format!("cannot read {key}: {e}"))
+        })?
+    };
+    let pastor = std::env::current_exe()?;
+    println!(
+        "{}",
+        pastor::bridge::authorized_key_line(&pastor, machine, &key)?
+    );
+    Ok(())
 }
 
 async fn open(paths: &Paths, machine: &str) -> anyhow::Result<()> {
