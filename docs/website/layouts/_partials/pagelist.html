@@ -1,0 +1,15 @@
+{{- /* The docs pages in reading order, grouped by the `group` front matter
+       key. Weights keep groups together: start 1x, use 2x, run 3x,
+       reference 4x. The current page is marked. */ -}}
+{{- $current := . -}}
+<nav class="pane list" aria-label="docs pages">
+  <h2 class="t">pages</h2>
+  {{- $group := "" }}
+  {{- range (site.GetPage "/docs").Pages.ByWeight }}
+    {{- if ne .Params.group $group }}
+      {{- $group = .Params.group }}
+  <p class="grp">{{ $group }}</p>
+    {{- end }}
+  <a href="{{ .RelPermalink }}"{{ if eq . $current }} class="sel" aria-current="page"{{ end }}>{{ .Title }}</a>
+  {{- end }}
+</nav>

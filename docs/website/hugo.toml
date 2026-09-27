@@ -1,0 +1,45 @@
+# The pastor website: a homepage and short docs pages, one topic each, drawn
+# like a small TUI. docs/manual.md is mounted as the last docs page, so the
+# full reference stays one file in the repo, not a copy.
+
+baseURL = "/"
+relativeURLs = true
+title = "pastor"
+disableKinds = ["taxonomy", "term", "rss", "sitemap"]
+
+[params]
+repo = "https://github.com/cacarico/pastor"
+blog = "https://cacari.co/pastor/"
+
+[markup.tableOfContents]
+startLevel = 2
+endLevel = 3
+
+# The manual has no front matter; give it one here.
+[[cascade]]
+title = "manual"
+weight = 49
+[cascade.params]
+summary = "everything, on one long page"
+group = "reference"
+[cascade.target]
+path = "/docs/manual"
+
+# Mounting a component replaces its default, so content and static are
+# listed again.
+[[module.mounts]]
+source = "content"
+target = "content"
+
+[[module.mounts]]
+source = "../manual.md"
+target = "content/docs/manual.md"
+
+[[module.mounts]]
+source = "static"
+target = "static"
+
+# The version in the header comes from Cargo.toml, so it cannot go stale.
+[[module.mounts]]
+source = "../../Cargo.toml"
+target = "data/cargo.toml"

@@ -1,0 +1,12 @@
+{{- /* Links to other Markdown files in the repo (the manual's README link, for
+       one) are not site pages, so they go to GitHub. Page links and anchors
+       are left alone. The path is relative to docs/, where the manual is. */ -}}
+{{- $dest := .Destination -}}
+{{- $u := urls.Parse $dest -}}
+{{- if and (not $u.Scheme) (strings.HasSuffix $u.Path ".md") -}}
+  {{- $path := path.Clean (path.Join "docs" $u.Path) -}}
+  {{- $dest = printf "%s/blob/main/%s" site.Params.repo $path -}}
+  {{- with $u.Fragment }}{{ $dest = printf "%s#%s" $dest . }}{{ end -}}
+{{- end -}}
+<a href="{{ $dest | safeURL }}"{{ with .Title }} title="{{ . }}"{{ end }}>{{ .Text }}</a>
+{{- /* trim */ -}}

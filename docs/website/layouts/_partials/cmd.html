@@ -1,0 +1,26 @@
+{{- /* A shell block drawn as a terminal: a "$ " prompt on each command, comments
+       dimmed. No prompt on a line that continues the one before (a trailing
+       backslash) or on a heredoc body, since those are not new commands.
+       The prompt is user-select: none, so copying takes only the commands. */ -}}
+{{- $heredoc := "" -}}
+{{- $cont := false -}}
+<pre class="cmd"><code>
+{{- range $i, $l := split (strings.TrimRight "\n" .Inner) "\n" -}}
+  {{- if $i }}{{ "\n" }}{{ end -}}
+  {{- if $heredoc -}}
+    {{- $l -}}
+    {{- if eq (strings.TrimSpace $l) $heredoc }}{{ $heredoc = "" }}{{ end -}}
+  {{- else if hasPrefix (strings.TrimSpace $l) "#" -}}
+    <span class="c">{{ $l }}</span>
+  {{- else if eq (strings.TrimSpace $l) "" -}}
+  {{- else -}}
+    {{- $parts := split $l "  #" -}}
+    {{- if not $cont }}<span class="p">$ </span>{{ end -}}
+    {{- index $parts 0 -}}
+    {{- if gt (len $parts) 1 }}<span class="c">  #{{ delimit (after 1 $parts) "  #" }}</span>{{ end -}}
+    {{- with findRESubmatch `<<-?\s*'?"?([A-Za-z_]+)` $l 1 }}{{ $heredoc = index (index . 0) 1 }}{{ end -}}
+  {{- end -}}
+  {{- $cont = hasSuffix $l "\\" -}}
+{{- end -}}
+</code></pre>
+{{- /* trim */ -}}

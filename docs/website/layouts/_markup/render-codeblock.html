@@ -1,0 +1,4 @@
+{{- /* Every other fenced block (toml, json, text, none) as plain <pre>: no
+       syntax colours, like a terminal. sh and bash have their own hooks. */ -}}
+<pre><code{{ with .Type }} class="language-{{ . }}"{{ end }}>{{ strings.TrimRight "\n" .Inner }}</code></pre>
+{{- /* trim */ -}}

@@ -1,0 +1,32 @@
+{{ define "meta" }}docs · one topic per page<br>v{{ hugo.Data.cargo.package.version }}{{ end }}
+
+{{ define "main" }}
+<main class="grid docs">
+  {{ partial "pagelist.html" . }}
+
+  <article class="pane focus doc">
+    <h2 class="t">docs <span>how pastor works today</span></h2>
+    {{ .Content }}
+    <div class="index">
+      {{- $group := "" }}
+      {{- range .Pages.ByWeight }}
+        {{- if ne .Params.group $group }}
+          {{- if $group }}</dl></section>{{ end }}
+          {{- $group = .Params.group }}
+      <section><h2>{{ $group }}</h2><dl>
+        {{- end }}
+        <dt><a href="{{ .RelPermalink }}">{{ .Title }}</a></dt><dd>{{ .Params.summary }}</dd>
+      {{- end }}
+      {{- if $group }}</dl></section>{{ end }}
+    </div>
+  </article>
+</main>
+{{ end }}
+
+{{ define "status" }}
+    <span class="mode">DOCS</span>
+    <span><k>j</k>/<k>k</k> move</span>
+    <span><k>enter</k> open</span>
+    <span><k>1-4</k> switch</span>
+    <span class="right">index · {{ len .Pages }} pages</span>
+{{ end }}

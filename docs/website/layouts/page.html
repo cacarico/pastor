@@ -1,0 +1,34 @@
+{{ define "meta" }}docs · one topic per page<br>v{{ hugo.Data.cargo.package.version }}{{ end }}
+
+{{ define "main" }}
+<main class="grid docs">
+  {{ partial "pagelist.html" . }}
+
+  <article class="pane focus doc">
+    <h2 class="t">{{ .Title }} <span>{{ .Params.summary }}</span></h2>
+    {{- if eq .File.BaseFileName "manual" }}
+    <p>This is <a href="{{ site.Params.repo }}/blob/main/docs/manual.md">docs/manual.md</a> from the repo, as is: every command, state, file and setting in one place. The other pages are the short version.</p>
+    <details class="toc"><summary>contents</summary>{{ .TableOfContents }}</details>
+    {{- end }}
+    {{ .Content }}
+    {{- with .Params.manual }}
+    <p class="more">More in the <a href="{{ "docs/manual/" | relURL }}#{{ . }}">manual</a>.</p>
+    {{- end }}
+    <nav class="pager">
+      <span>{{ with .PrevInSection }}<a href="{{ .RelPermalink }}">← {{ .Title }}</a>{{ end }}</span>
+      <span>{{ with .NextInSection }}<a href="{{ .RelPermalink }}">{{ .Title }} →</a>{{ end }}</span>
+    </nav>
+  </article>
+</main>
+{{ end }}
+
+{{ define "status" }}
+  {{- $pages := (site.GetPage "/docs").Pages.ByWeight }}
+  {{- $n := 0 }}
+  {{- range $i, $p := $pages }}{{ if eq $p $ }}{{ $n = add $i 1 }}{{ end }}{{ end }}
+    <span class="mode">DOCS</span>
+    <span><k>j</k>/<k>k</k> move</span>
+    <span><k>enter</k> open</span>
+    <span><k>1-4</k> switch</span>
+    <span class="right">{{ .Params.group }} › {{ .Title }} · {{ $n }}/{{ len $pages }}</span>
+{{ end }}
