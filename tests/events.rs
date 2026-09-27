@@ -53,6 +53,7 @@ fn task(id: i64) -> Task {
 
 fn record(kind: &str, t: Option<&Task>, job: Option<&str>) -> EventRecord {
     EventRecord {
+        seq: 0,
         detail: None,
         at: Utc::now(),
         kind: kind.into(),
@@ -106,16 +107,14 @@ fn events_filters_by_task_and_prints_json() {
             .output()
             .unwrap(),
     );
-    let kinds: Vec<String> = out
+    let recs: Vec<serde_json::Value> = out
         .lines()
-        .map(|l| {
-            serde_json::from_str::<serde_json::Value>(l).unwrap()["type"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
+        .map(|l| serde_json::from_str(l).unwrap())
         .collect();
+    let kinds: Vec<&str> = recs.iter().map(|r| r["type"].as_str().unwrap()).collect();
     assert_eq!(kinds, ["task.queued", "task.done"]);
+    // `seq` is printed like any other field (0 here: written by hand).
+    assert!(recs.iter().all(|r| r["seq"] == 0), "{out}");
 }
 
 #[test]
@@ -272,5 +271,25 @@ async fn the_daemon_writes_the_events_log() {
     let running = wait_for("task.running").await;
     assert_eq!(running.task.unwrap().id, t.id);
     assert_eq!(running.job.as_deref(), Some("run"));
+    assert!(queued.seq >= 1 && running.seq > queued.seq);
+
+    // The head answers the records after a cursor, from the same log.
+    let resp = pastor::ipc::request(
+        &socket,
+        &IpcRequest::EventsSince {
+            after: queued.seq - 1,
+            limit: 1,
+            task: Some(t.id),
+        },
+    )
+    .await
+    .unwrap();
+    let IpcResponse::Events(page) = resp else {
+        panic!("{resp:?}")
+    };
+    assert!(!page.gap);
+    assert_eq!(page.events.len(), 1, "the limit");
+    assert_eq!(page.events[0].seq, queued.seq);
+    assert_eq!(page.events[0].kind, "task.queued");
     serve.abort();
 }

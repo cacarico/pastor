@@ -3,22 +3,20 @@
 //! same environment as the connector's command. Hooks of different connectors run
 //! concurrently; one connector's hooks run one at a time, in event order, so a
 //! connector never races itself. A failed or timed-out hook is logged and never
-//! retried. Hooks read the daemon's broadcast on their own; they never write
-//! the events log.
+//! retried. Hooks get each record from the events log task once it is in the
+//! log, with the same sequence number; they never write the events log.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::config::Paths;
 use crate::connector::exec::{self, Invocation, RunLog};
 use crate::connector::manifest::Hook;
 use crate::connector::{Connector, Discovered, discover};
-use crate::events::{EventRecord, MachineLookup};
-use crate::machine::PastorEvent;
-use crate::store::Store;
+use crate::events::EventRecord;
 
 /// The connector a job file names, read without validating the rest of the
 /// file: ownership only needs `connector.use`. `None` for a one-off task's
@@ -304,30 +302,17 @@ fn spawn_worker(paths: Paths, queue: Arc<Queue>) -> JoinHandle<()> {
     })
 }
 
-/// The daemon's hook runner: subscribe before any actor runs, build a record
-/// per event (as the events log does), deliver it. The fleet is held weakly
-/// for the same reason `events::spawn_log` does. Ends when the broadcast
-/// closes; queued hooks still run.
-pub fn spawn(
-    paths: Paths,
-    store: Arc<Store>,
-    fleet: Option<Weak<dyn MachineLookup>>,
-    mut rx: broadcast::Receiver<PastorEvent>,
-) -> JoinHandle<()> {
+/// The daemon's hook runner: every record the events log task built
+/// (`events::spawn_log`), numbered and already in the log, delivered in
+/// order. `rx` is bounded (`events::HOOK_QUEUE_CAPACITY`): the log task
+/// drops a record rather than block if this loop ever falls behind, which in
+/// practice it does not, since `Dispatcher::deliver` below only queues. Ends
+/// when the log task drops its sender; queued hooks still run.
+pub fn spawn(paths: Paths, mut rx: mpsc::Receiver<EventRecord>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut dispatcher = Dispatcher::new(paths);
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let lookup = fleet.as_ref().and_then(Weak::upgrade);
-                    let rec = EventRecord::build(&ev, &store, lookup.as_deref());
-                    dispatcher.deliver(rec);
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(n, "hooks lagged; their events were dropped")
-                }
-                Err(broadcast::error::RecvError::Closed) => return,
-            }
+        while let Some(rec) = rx.recv().await {
+            dispatcher.deliver(rec);
         }
     })
 }
@@ -336,6 +321,7 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::connector::manifest::MANIFEST_FILE;
+    use crate::store::Store;
     use crate::task::DispatchSpec;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -406,6 +392,7 @@ mod tests {
                 )
                 .unwrap();
             EventRecord {
+                seq: 0,
                 detail: None,
                 at: chrono::Utc::now(),
                 kind: kind.into(),
@@ -462,6 +449,7 @@ mod tests {
 
     fn machine_record(kind: &str) -> EventRecord {
         EventRecord {
+            seq: 0,
             detail: None,
             at: chrono::Utc::now(),
             kind: kind.into(),
@@ -691,8 +679,13 @@ mod tests {
         );
     }
 
+    /// Hooks get the record the events log task built and wrote: the same
+    /// sequence number as the log line.
     #[tokio::test]
-    async fn spawn_builds_records_from_the_broadcast() {
+    async fn spawn_runs_hooks_on_the_logged_record() {
+        use crate::machine::PastorEvent;
+        use tokio::sync::broadcast;
+
         let e = env();
         e.connector(
             "a",
@@ -711,22 +704,40 @@ mod tests {
             })
             .unwrap();
         let (tx, rx) = broadcast::channel(8);
-        let h = spawn(e.paths.clone(), store, None, rx);
-        tx.send(PastorEvent {
-            detail: None,
-            kind: "task.done".into(),
-            task_id: Some(rec.id),
-            machine: None,
-            job: None,
-        })
-        .unwrap();
+        let (fwd, hooks_rx) = mpsc::channel(crate::events::HOOK_QUEUE_CAPACITY);
+        let log_path = e.paths.events_file();
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        let log = crate::events::spawn_log(
+            log_path.clone(),
+            crate::events::DEFAULT_MAX_BYTES,
+            store,
+            None,
+            rx,
+            Some(fwd),
+        );
+        let h = spawn(e.paths.clone(), hooks_rx);
+        for kind in ["task.queued", "task.done"] {
+            tx.send(PastorEvent {
+                detail: None,
+                kind: kind.into(),
+                task_id: Some(rec.id),
+                machine: None,
+                job: None,
+            })
+            .unwrap();
+        }
         let got: serde_json::Value = serde_json::from_str(&e.wait_for("r").await).unwrap();
         assert_eq!(got["task"]["id"], rec.id);
         assert_eq!(got["job"], "run", "filled from the task row");
+        assert_eq!(got["seq"], 2);
+        let logged = crate::events::read(&log_path, None).unwrap();
+        assert_eq!(logged.last().unwrap().seq, 2);
         drop(tx);
-        tokio::time::timeout(Duration::from_secs(5), h)
-            .await
-            .unwrap()
-            .unwrap();
+        for h in [log, h] {
+            tokio::time::timeout(Duration::from_secs(5), h)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 }

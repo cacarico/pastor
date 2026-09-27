@@ -961,9 +961,6 @@ impl Daemon {
         // sees a task from before flocks without one.
         store.adopt_default_flock(flock.default_flock())?;
         let (events, log_rx) = broadcast::channel(1024);
-        // Connector event hooks read the broadcast on their own, subscribed here
-        // for the same reason as the log: before any actor can emit.
-        let hooks_rx = events.subscribe();
         let connect = connect.unwrap_or_else(|| endpoint_factory(paths.clone()));
         let fleet = Arc::new(Fleet::managed(store.clone(), events.clone(), connect));
         fleet.apply_flock(&flock, &machine_settings(&config)).await;
@@ -973,20 +970,19 @@ impl Daemon {
         // Subscribed in `start`, before any actor runs, so the log sees the
         // first events too. The log holds the fleet weakly (see `spawn_log`),
         // so dropping the daemon still winds the tasks down.
+        // Connector event hooks get each record from the log task once it is
+        // written, so they see the same sequence number.
         let lookup: Arc<dyn crate::events::MachineLookup> = fleet.clone();
+        let (to_hooks, hooks_rx) = tokio::sync::mpsc::channel(crate::events::HOOK_QUEUE_CAPACITY);
         crate::events::spawn_log(
             paths.events_file(),
             crate::events::DEFAULT_MAX_BYTES,
             store.clone(),
             Some(Arc::downgrade(&lookup)),
             log_rx,
+            Some(to_hooks),
         );
-        crate::hooks::spawn(
-            paths.clone(),
-            store.clone(),
-            Some(Arc::downgrade(&lookup)),
-            hooks_rx,
-        );
+        crate::hooks::spawn(paths.clone(), hooks_rx);
         let scheduler = Scheduler::new(
             paths.clone(),
             &config,
@@ -1328,6 +1324,19 @@ impl Daemon {
                 {
                     Ok(out) => IpcResponse::Pruned(out),
                     Err(err) => IpcResponse::error("store_error", err),
+                }
+            }
+            IpcRequest::EventsSince { after, limit, task } => {
+                // Up to two log generations of file reading: off the runtime.
+                let path = self.paths.events_file();
+                match tokio::task::spawn_blocking(move || {
+                    crate::events::since(&path, after, limit, task)
+                })
+                .await
+                {
+                    Ok(Ok(page)) => IpcResponse::Events(page),
+                    Ok(Err(err)) => IpcResponse::error("events_read_failed", err),
+                    Err(err) => IpcResponse::error("events_read_failed", err),
                 }
             }
         }

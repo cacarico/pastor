@@ -161,7 +161,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks (schema 7), seen keys, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 8), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine

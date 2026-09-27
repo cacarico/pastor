@@ -5,6 +5,10 @@
 //!
 //! The JSON of `EventRecord` is also what connector event hooks get on stdin, so
 //! it is a connector-facing format: fields are only ever added, never renamed.
+//!
+//! Every record the daemon builds carries `seq`, a number from the head's
+//! store that only grows, across restarts and rotations, so a client can ask
+//! for the records after the last one it saw (`since`, `IpcRequest::EventsSince`).
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -15,7 +19,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::config::Paths;
@@ -27,11 +31,24 @@ use crate::task::{Task, parse_task_id};
 /// generation is kept, so the log never takes more than twice this.
 pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Capacity of the bounded channel `spawn_log` feeds to `hooks::spawn`.
+/// `hooks::spawn`'s loop only queues onto `Dispatcher::deliver`, which is
+/// synchronous and itself bounds each connector's queue, so in practice this
+/// drains instantly; it exists for the same reason the old `broadcast::
+/// channel(1024)` hooks read from did, as a backstop against a stuck
+/// connector. `spawn_log` uses `try_send` and drops a record for hooks (never
+/// for `events.jsonl`) rather than block or grow without bound.
+pub const HOOK_QUEUE_CAPACITY: usize = 1024;
+
 /// How often `--follow` looks for new lines.
 const FOLLOW_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRecord {
+    /// The record's sequence number (`Store::next_event_seq`), from 1. A
+    /// line written before numbering reads as 0.
+    #[serde(default)]
+    pub seq: u64,
     pub at: DateTime<Utc>,
     /// `task.done`, `job.failed`, `machine.lost`, ...
     #[serde(rename = "type")]
@@ -72,10 +89,11 @@ impl MachineLookup for crate::daemon::Fleet {
 }
 
 impl EventRecord {
-    /// Stamp `ev` with the time of receipt and expand its ids into records: the
-    /// task row for task events, the machine status for `machine.*` events. A
-    /// row or machine that cannot be found leaves that field empty; the event
-    /// is still recorded.
+    /// Stamp `ev` with the next sequence number and the time of receipt, and
+    /// expand its ids into records: the task row for task events, the machine
+    /// status for `machine.*` events. A row or machine that cannot be found
+    /// leaves that field empty; the event is still recorded, and so is one
+    /// whose number cannot be taken, as 0.
     pub fn build(
         ev: &PastorEvent,
         store: &Store,
@@ -100,7 +118,12 @@ impl EventRecord {
         } else {
             None
         };
+        let seq = store.next_event_seq().unwrap_or_else(|err| {
+            tracing::error!(%err, kind = %ev.kind, "event record: cannot take a sequence number");
+            0
+        });
         EventRecord {
+            seq,
             detail: ev.detail.clone(),
             at: Utc::now(),
             kind: ev.kind.clone(),
@@ -190,8 +213,16 @@ impl LogWriter {
 }
 
 /// The daemon's log task: every event on `rx`, built into a record and
-/// appended to `path`. A write that fails is logged and the task carries on;
-/// it ends when the broadcast channel closes.
+/// appended to `path`, then passed to `forward` (the hook runner). It is the
+/// one place records are built, so the log and the hooks see the same
+/// sequence number. A write that fails is logged and the record still goes
+/// on; the task ends when the broadcast channel closes.
+///
+/// `forward` is bounded (`HOOK_QUEUE_CAPACITY`): a `try_send` that finds it
+/// full drops that record for hooks, with a warning, rather than block this
+/// task or grow the queue without bound; the record is still in
+/// `events.jsonl`. Once `try_send` reports the receiver closed, `forward` is
+/// cleared so later records stop paying for the check.
 ///
 /// The fleet is held weakly: it owns the machine actors' command senders, the
 /// actors own event senders, and this task only ends when every event sender
@@ -204,6 +235,7 @@ pub fn spawn_log(
     store: Arc<Store>,
     fleet: Option<Weak<dyn MachineLookup>>,
     mut rx: broadcast::Receiver<PastorEvent>,
+    mut forward: Option<mpsc::Sender<EventRecord>>,
 ) -> JoinHandle<()> {
     let writer = LogWriter::new(path, max_bytes);
     tokio::spawn(async move {
@@ -215,6 +247,22 @@ pub fn spawn_log(
                     let rec = EventRecord::build(&ev, &store, lookup.as_deref());
                     if let Err(err) = writer.append(&rec) {
                         tracing::error!(%err, "events log: write failed");
+                    }
+                    if let Some(tx) = &forward {
+                        match tx.try_send(rec) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(rec)) => {
+                                tracing::warn!(
+                                    seq = rec.seq,
+                                    kind = %rec.kind,
+                                    "events log: hooks queue full; dropping record for hooks"
+                                );
+                            }
+                            // The hook runner gone is not the log's problem.
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                forward = None;
+                            }
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -316,6 +364,40 @@ fn read_generations(
         read_file(new, task, &mut out)?;
     }
     Ok(out)
+}
+
+/// What `since` found: the records after the cursor, and whether some were
+/// lost to rotation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsPage {
+    /// Records with `seq` past the cursor, oldest first, at most the limit.
+    pub events: Vec<EventRecord>,
+    /// Records after the cursor were rotated out of both log files, so
+    /// `events` does not start right after it.
+    pub gap: bool,
+    /// The oldest sequence number still in the log; `None` when it holds no
+    /// numbered record.
+    pub oldest: Option<u64>,
+}
+
+/// The records numbered after `after`, oldest first, at most `limit`, only
+/// those about `task` if given. Lines from before numbering (seq 0) are never
+/// returned. `gap` is decided on the whole log, whatever `task` is: it is set
+/// when the oldest numbered record left is past `after + 1`.
+pub fn since(path: &Path, after: u64, limit: u32, task: Option<i64>) -> anyhow::Result<EventsPage> {
+    let all = read(path, None)?;
+    let oldest = all.iter().map(|r| r.seq).filter(|&s| s > 0).min();
+    let gap = oldest.is_some_and(|o| o > after.saturating_add(1));
+    let events = all
+        .into_iter()
+        .filter(|r| r.seq > after && matches(r, task))
+        .take(limit as usize)
+        .collect();
+    Ok(EventsPage {
+        events,
+        gap,
+        oldest,
+    })
 }
 
 /// An open log file being tailed, with the partial line read so far.
@@ -605,7 +687,8 @@ mod tests {
         let v = serde_json::to_value(&rec).unwrap();
         let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["at", "job", "machine", "task", "type"]);
+        assert_eq!(keys, ["at", "job", "machine", "seq", "task", "type"]);
+        assert_eq!(v["seq"], 1);
         assert_eq!(v["type"], "task.queued");
         assert_eq!(v["task"]["item"]["title"], "fix it");
         assert_eq!(v["task"]["state"], "queued");
@@ -615,6 +698,7 @@ mod tests {
 
     fn record(kind: &str, task: Option<&Task>) -> EventRecord {
         EventRecord {
+            seq: 0,
             detail: None,
             at: Utc::now(),
             kind: kind.into(),
@@ -819,6 +903,7 @@ mod tests {
             store,
             Some(Arc::downgrade(&fleet)),
             rx,
+            None,
         );
         tx.send(ev("task.queued", Some(t.id), None, None)).unwrap();
         tx.send(ev("machine.connected", None, Some("m"), None))
@@ -838,6 +923,37 @@ mod tests {
         drop(fleet);
     }
 
+    /// A hooks queue that never drains (no `hooks::spawn` reading it, as when
+    /// a connector hook is stuck) must not block the log task or panic it:
+    /// `try_send` drops the record for hooks and the write to `events.jsonl`
+    /// still goes through.
+    #[tokio::test]
+    async fn a_full_hooks_queue_is_dropped_without_blocking_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (store, t) = store_with_task("triage");
+        let store = Arc::new(store);
+        let (tx, rx) = broadcast::channel(16);
+        let (fwd, mut hooks_rx) = mpsc::channel(1);
+        // Fill the one slot up front, so the log task's own send finds it full.
+        fwd.try_send(record("task.queued", Some(&t))).unwrap();
+        let log = spawn_log(path.clone(), DEFAULT_MAX_BYTES, store, None, rx, Some(fwd));
+        tx.send(ev("task.done", Some(t.id), None, None)).unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), log)
+            .await
+            .unwrap()
+            .unwrap();
+        // The write to events.jsonl happened regardless of the full queue.
+        let recs = read(&path, None).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].kind, "task.done");
+        // Only the pre-filled record made it to the hooks side; the log
+        // task's own record was dropped for hooks, not queued or blocked on.
+        assert_eq!(hooks_rx.try_recv().unwrap().kind, "task.queued");
+        assert!(hooks_rx.try_recv().is_err());
+    }
+
     /// The log task must not keep the fleet alive: the fleet holds the machine
     /// actors' command senders and the actors hold event senders, so a strong
     /// reference here is a cycle that keeps a dropped daemon's tasks running.
@@ -855,6 +971,7 @@ mod tests {
             Arc::new(store),
             Some(weak.clone()),
             rx,
+            None,
         );
         drop(fleet);
         assert!(
@@ -930,5 +1047,137 @@ mod tests {
             .map(|r| r.kind)
             .collect();
         assert_eq!(kinds, ["task.running", "task.done", "task.closed"]);
+    }
+
+    /// Push `kinds` through a log task writing to `path` with `store`, and
+    /// wait for it to finish.
+    async fn log_events(path: &Path, max_bytes: u64, store: Arc<Store>, kinds: &[&str]) {
+        let (tx, rx) = broadcast::channel(16);
+        let log = spawn_log(path.to_path_buf(), max_bytes, store, None, rx, None);
+        for kind in kinds {
+            tx.send(ev(kind, None, None, Some("j"))).unwrap();
+        }
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), log)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Sequence numbers keep growing when the head restarts (a new store
+    /// handle on the same database, a new log task) and when the log
+    /// rotates; none is given twice.
+    #[tokio::test]
+    async fn seq_grows_across_a_restart_and_a_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let db = dir.path().join("pastor.db");
+        let line_len = serde_json::to_string(&record("job.failed", None))
+            .unwrap()
+            .len() as u64
+            + 40;
+        // Room for about two records per file.
+        let max = line_len * 2;
+        log_events(
+            &path,
+            max,
+            Arc::new(Store::open(&db).unwrap()),
+            &["job.failed", "job.failed", "job.failed"],
+        )
+        .await;
+        assert!(rotated(&path).exists(), "no rotation");
+        // The head restarts.
+        log_events(
+            &path,
+            max,
+            Arc::new(Store::open(&db).unwrap()),
+            &["job.failed", "job.failed"],
+        )
+        .await;
+        let seqs: Vec<u64> = read(&path, None).unwrap().iter().map(|r| r.seq).collect();
+        assert!(seqs.len() >= 2, "{seqs:?}");
+        assert_eq!(*seqs.last().unwrap(), 5, "{seqs:?}");
+        assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
+    }
+
+    /// A line written before records were numbered still reads, as seq 0.
+    #[test]
+    fn a_line_without_seq_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            "{\"at\":\"2026-01-01T00:00:00Z\",\"type\":\"job.failed\",\"task\":null,\"job\":\"j\",\"machine\":null}\n",
+        )
+        .unwrap();
+        let recs = read(&path, None).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].kind, "job.failed");
+        assert_eq!(recs[0].seq, 0);
+        // `since` never returns it: it has no number to be after.
+        let page = since(&path, 0, 10, None).unwrap();
+        assert!(page.events.is_empty());
+        assert_eq!(page.oldest, None);
+        assert!(!page.gap);
+    }
+
+    fn numbered(seq: u64, kind: &str, task: Option<&Task>) -> EventRecord {
+        EventRecord {
+            seq,
+            ..record(kind, task)
+        }
+    }
+
+    /// `since` returns what follows the cursor, oldest first, bounded by the
+    /// limit and filtered by task, and says when rotation lost records after
+    /// the cursor.
+    #[test]
+    fn since_reads_after_the_cursor_and_reports_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (_, t1) = store_with_task("j");
+        let mut t2 = t1.clone();
+        t2.id = t1.id + 1;
+        let line_len = serde_json::to_string(&numbered(10, "task.queued", Some(&t1)))
+            .unwrap()
+            .len() as u64
+            + 1;
+        let w = LogWriter::new(path.clone(), DEFAULT_MAX_BYTES);
+        // A line from before numbering, then numbered ones.
+        w.append(&record("task.queued", Some(&t1))).unwrap();
+        for (seq, t) in [(1, &t1), (2, &t2), (3, &t1), (4, &t2), (5, &t1)] {
+            w.append(&numbered(seq, "task.running", Some(t))).unwrap();
+        }
+        let seqs = |p: &EventsPage| p.events.iter().map(|r| r.seq).collect::<Vec<_>>();
+
+        let page = since(&path, 0, 100, None).unwrap();
+        assert_eq!(seqs(&page), [1, 2, 3, 4, 5]);
+        assert!(!page.gap);
+        assert_eq!(page.oldest, Some(1));
+        let page = since(&path, 2, 2, None).unwrap();
+        assert_eq!(seqs(&page), [3, 4], "oldest first, at most the limit");
+        let page = since(&path, 1, 100, Some(t1.id)).unwrap();
+        assert_eq!(seqs(&page), [3, 5]);
+        let page = since(&path, 5, 100, None).unwrap();
+        assert!(page.events.is_empty());
+        assert!(!page.gap);
+
+        // Two rotations push 1..=5 out of both files.
+        let w = LogWriter::new(path.clone(), line_len * 2 + 10);
+        for seq in 6..=10 {
+            w.append(&numbered(seq, "task.running", Some(&t2))).unwrap();
+        }
+        let page = since(&path, 3, 100, None).unwrap();
+        assert!(page.gap, "4 and 5 are gone");
+        let oldest = page.oldest.unwrap();
+        assert!(oldest > 5, "{oldest}");
+        assert_eq!(page.events.first().unwrap().seq, oldest);
+        assert_eq!(page.events.last().unwrap().seq, 10);
+        // The gap is about the log, not the filter: t1 has nothing left.
+        let page = since(&path, 3, 100, Some(t1.id)).unwrap();
+        assert!(page.gap && page.events.is_empty());
+        // A cursor right before the oldest record lost nothing.
+        let page = since(&path, oldest - 1, 100, None).unwrap();
+        assert!(!page.gap);
     }
 }
