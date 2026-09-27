@@ -1,18 +1,22 @@
 # pastor
 
-**Run coding agents on machines you own, and let them work while your laptop is closed.**
+**A personal control plane for running coding agents on machines I own.**
 
 [![CI](https://github.com/cacarico/pastor/actions/workflows/ci.yml/badge.svg)](https://github.com/cacarico/pastor/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/cacarico/pastor)](https://github.com/cacarico/pastor/releases)
 [![crates.io](https://img.shields.io/crates/v/pastor-cli)](https://crates.io/crates/pastor-cli)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-You give pastor work: a one-off task ("fix the flaky test"), or a job that
-finds work on a schedule, such as new GitHub issues or cards on a board.
-pastor picks a free machine, opens a terminal there, starts the agent
-(Claude Code, opencode, ...), sends the prompt and keeps track of it. When you
-come back, you read what it did, answer it if it asked something, or sit in
-its terminal and carry on.
+pastor is the piece I was missing in my own AI workflow. I give it work: a
+one-off task ("fix the flaky test"), or a job that finds work on a schedule,
+such as new GitHub issues or cards on a board. pastor picks a free machine,
+opens a terminal there, starts the agent (Claude Code, opencode, ...), sends
+the prompt and keeps track of it. When I come back, I read what it did, answer
+it if it asked something, or sit in its terminal and carry on.
+
+There are bigger and more general projects in this space. pastor is not trying
+to be one of them. It is a small tool I am building to improve how I use AI in
+my daily work, personal projects and learning.
 
 <p align="center">
   <img src="docs/demo/tasks.gif" alt="pastor machine list, task run, task list and task read in a terminal" width="800">
@@ -20,11 +24,18 @@ its terminal and carry on.
 
 ## Who it's for
 
-You run coding agents, you have one or more always-on machines (a home
-server, a Raspberry Pi, a spare laptop), and you'd rather decide *what* to do
-than babysit *where* and *how* it runs. pastor is the small layer that does
-the babysitting: it queues the work, spreads it over your machines, notices
-when an agent finished, got stuck or is waiting for you, and keeps a history.
+pastor is first for me: a developer who runs coding agents, has one or more
+always-on machines (a home server, a Raspberry Pi, a spare laptop), and would
+rather decide *what* to do than babysit *where* and *how* it runs.
+
+It may also fit you if your workflow looks similar. pastor is the small layer
+that does the babysitting: it queues the work, spreads it over your machines,
+notices when an agent finished, got stuck or is waiting for you, and keeps a
+history.
+
+It is young, opinionated and shaped by my day-to-day use, not a product with
+a stable contract. I try not to break existing setups, but compatibility is
+best effort, and things may change a lot while pastor finds its shape.
 
 It uses [herdr](https://herdr.dev) for the terminals, so every agent runs in a
 real terminal you can attach to, on a machine you control. Nothing runs in
@@ -281,11 +292,14 @@ every Raspberry Pi OS release.
 
 ## Contributing
 
-Issues and pull requests are welcome. `make check` runs formatting, clippy
-and the whole test suite against a fake herdr, so you don't need a fleet to
-work on pastor; `make help` lists the rest. Start with
-[CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Rules for AI
-contributors are in [docs/AI_GOVERNANCE.md](docs/AI_GOVERNANCE.md).
+Issues and pull requests are welcome, especially when they fit the direction
+above. pastor is still my personal workflow tool first, so I may decline good
+ideas that would pull it away from that shape.
+
+`make check` runs formatting, clippy and the whole test suite against a fake
+herdr, so you don't need a fleet to work on pastor; `make help` lists the rest.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Rules
+for AI contributors are in [docs/AI_GOVERNANCE.md](docs/AI_GOVERNANCE.md).
 
 ## License
 
