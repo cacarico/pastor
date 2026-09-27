@@ -395,7 +395,8 @@ ports, keys and jump hosts in `~/.ssh/config` under a host alias instead.
 pastor flock list                       NAME, DEFAULT, MACHINES, AGENTS, QUEUED (--json)
 pastor flock add <name> [--default]
 pastor flock remove <name>              refused while it has machines or queued tasks, or is the default
-pastor flock default <name>             new tasks and jobs go to <name>
+pastor flock default show               print the default flock
+pastor flock default set <name>         new tasks and jobs go to <name>
 pastor machine add ... [--flock F]      default: the default flock
 pastor machine move <name> <flock>
 pastor machine list [--flock F]
@@ -413,7 +414,7 @@ takes the implicit one's place instead, and the machines that name no flock
 move to it (`default` is still written down if a machine names it). While
 tasks are queued in the implicit flock the machines stay there, so those
 tasks keep somewhere to run, and the output names the tasks. `flock add` says
-which flock those machines are in afterwards. `flock default` writes the old
+which flock those machines are in afterwards. `flock default set` writes the old
 default flock onto every machine that named none, so changing where new work goes moves no machine.
 AGENTS in `flock list` needs a running head and is `-` without one.
 
