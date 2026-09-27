@@ -167,14 +167,17 @@ async fn dispatch_steps(
     // behind.
     let mut launch = agents.launch(&spec).map_err(DispatchError::Task)?;
     // A Claude agent starts on a session pastor names, so `task attach` can
-    // resume it once the pane is gone; last, after the tool flags.
+    // resume it once the pane is gone; last, after the tool flags. The task
+    // records it only once `agent.start` succeeds (`finish_dispatch`): a
+    // task that failed before then never had that conversation to resume.
     task.spec.session_id = None;
+    let mut session = None;
     if launch.kind == "claude"
         && !crate::task::picks_session(&launch.args)
         && let Some(id) = crate::task::new_session_id()
     {
         launch.args.extend(["--session-id".to_string(), id.clone()]);
-        task.spec.session_id = Some(id);
+        session = Some(id);
     }
     let repo = match spec.repo.as_deref() {
         Some(repo) => Some(expand_home(conn, "repo", repo, task.machine.as_deref()).await?),
@@ -252,7 +255,7 @@ async fn dispatch_steps(
             created.root_pane.pane_id
         }
     };
-    finish_dispatch(conn, task, name, &launch, &pane_id, ready_timeout).await
+    finish_dispatch(conn, task, name, &launch, session, &pane_id, ready_timeout).await
 }
 
 /// Start the agent in its pane, wait for it to come up and prompt it.
@@ -261,6 +264,7 @@ async fn finish_dispatch(
     task: &mut Task,
     name: &str,
     launch: &crate::config::Launch,
+    session: Option<String>,
     pane_id: &str,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
@@ -269,6 +273,7 @@ async fn finish_dispatch(
     // the kind and the pane). Readiness shows up afterwards, in `agent.list` and
     // in whether `agent.prompt` is accepted.
     start_agent(conn, name, &launch.kind, &launch.args, pane_id).await?;
+    task.spec.session_id = session;
 
     let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
@@ -740,6 +745,7 @@ mod tests {
                     .any(|r| r.method.ends_with(".create")),
                 "nothing was created"
             );
+            assert_eq!(t.spec.session_id, None, "no session to resume");
         }
     }
 
@@ -1444,6 +1450,17 @@ mod tests {
             "created workspace is recorded even on failure"
         );
         assert!(!fake.requests().iter().any(|r| r.method == "agent.prompt"));
+        // Claude never ran, so there is no session for attach to resume.
+        let start = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "agent.start");
+        assert!(
+            start.unwrap().params["args"]
+                .to_string()
+                .contains("--session-id")
+        );
+        assert_eq!(t.spec.session_id, None);
     }
 
     /// herdr answers `agent_pane_busy` while the new pane's shell is still
