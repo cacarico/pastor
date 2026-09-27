@@ -107,7 +107,7 @@ pastor task read t-12                       # see what it is asking first
 pastor task send t-12 "yes, go on"          # types the text, then Enter; --no-enter leaves Enter out
 pastor task send t-12 --key esc             # named keys, in order; repeat --key
 pastor task send t-12 --trust               # accept the folder-trust prompt, and trust that repo on that machine
-pastor trust list                           # saved (machine, repo) pairs; pastor trust remove <machine> <repo>
+pastor trust list                           # saved (machine, repo) pairs; pastor trust add|remove <machine> <repo>
 ```
 
 Only starting, running and blocked tasks take input, and done ones whose pane is still open (`task_not_live` otherwise); a done task sent input goes back to running, so `pastor task send t-12 "commit and push"` finishes work an agent left undone. Read the pane before you answer; never send what a human should decide. Once a repo is trusted on a machine, the head answers the trust prompt of its later tasks there by itself, once per task (`task.trusted`), worktrees included, and only while the pane shows that prompt; a task blocked on any other dialog is left for you. `--trust` answers only a task blocked on its startup prompt (`not_at_trust_prompt` otherwise) and needs `trust_keys` for the agent (Claude has them built in); `no_trust_keys` otherwise.

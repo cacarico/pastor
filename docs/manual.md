@@ -247,8 +247,12 @@ linger above a later dialog. An agent with no marker (`trust_marker =
 once, `settle` after the trust keys: Claude redraws for a moment after the
 dialog and loses what is typed then, though herdr takes it.
 `pastor trust list [--json]` shows
-the saved pairs and `pastor trust remove <machine> <repo>` forgets one; both
-work with `pastor serve` down.
+the saved pairs, `pastor trust add <machine> <repo>` saves one without a
+blocked task, and `pastor trust remove <machine> <repo>` forgets one. With
+`pastor serve` running they go through it, so the table is the head's; with
+it down they read and write the store directly. `add` and `remove` change the
+fleet: an agent pastor started is refused them unless `agents_change_fleet`
+is on.
 
 Everything else pastor closes only when asked; three commands do it, all
 with `--json`. `pastor task retry t-4` queues a new task
@@ -1490,7 +1494,11 @@ pastor config edit               ~/.config/pastor/pastor.toml
 
 Every `describe` takes `--json`. A description reads from the head when one
 runs and from the files and the store when not; a machine is then probed
-directly, as `machine list` does. The job's `connector` and `dispatch` are the
+directly, as `machine list` does. `machine describe` and `flock describe` are
+built by the head itself, from the flock it last applied rather than
+`flock.toml` as it reads now, so a machine the head has not picked up yet is
+`unknown_machine`. These and the `trust` commands need a head from this
+release or later (`head_too_old` otherwise). The job's `connector` and `dispatch` are the
 tables as written in its file. Recent events come from `events.jsonl`: a
 job's `job.*` events, and for a machine its `machine.*` events that carried
 an error and its `task.failed` ones, ten at most.

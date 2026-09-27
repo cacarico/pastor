@@ -560,7 +560,7 @@ fn main() {
             Command::Events(args) => pastor::events::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
-            Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd),
+            Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
         }
@@ -670,7 +670,13 @@ async fn ask_or_refused(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcRes
 /// not know the request, so it is refused before anything is sent.
 ///
 /// `need` is the protocol the command needs of the head, with what an older
-/// head would do instead (`protocol_need`); such a head is refused too.
+/// head would do instead (`protocol_need`); such a head is refused too. This
+/// covers `task retry --place` (`needs_place_protocol`), flock agents and
+/// tool lists (`needs_agent_protocol`), edits and job requests
+/// (`needs_file_protocol`), and reads the head used to answer locally
+/// (`needs_head_reads_protocol`, `HEAD_READS_PROTOCOL`): a head that
+/// predates one of these does not know the request, or would answer it in
+/// the old, less complete way, so it is refused rather than let through.
 async fn probe_head(
     paths: &Paths,
     flocks: bool,
@@ -768,6 +774,7 @@ fn head_use(command: &Command) -> Option<bool> {
             _ => Some(true),
         },
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
+        Command::Trust { .. } => Some(false),
         Command::Connector { cmd } => {
             (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Try { .. })).then_some(false)
         }
@@ -874,6 +881,7 @@ fn changes_fleet(command: &Command) -> bool {
         // A head started from an agent's pane schedules and dispatches with
         // no request to refuse; setup installs one that starts on login.
         Command::Serve | Command::Setup { .. } => true,
+        Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
         _ => false,
     }
 }
@@ -945,6 +953,18 @@ fn needs_file_protocol(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` asks the head a request only a head of
+/// `HEAD_READS_PROTOCOL` or later knows: the trust commands and `flock|machine
+/// describe`.
+fn needs_head_reads_protocol(command: &Command) -> bool {
+    match command {
+        Command::Trust { .. } => true,
+        Command::Flock { cmd } => matches!(cmd, FlockCmd::Describe { .. }),
+        Command::Machine { cmd } => matches!(cmd, MachineCmd::Describe { .. }),
+        _ => false,
+    }
+}
+
 /// The protocol `command` needs of the head, and what an older head would
 /// do with it, for `probe_head`'s refusal. Checked from the newest protocol
 /// down, so a command that needs two gets the higher: `task retry --place`
@@ -969,6 +989,11 @@ fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
         Some((
             pastor::ipc::FILE_PROTOCOL,
             "predates edits and job requests through the head, and would refuse them",
+        ))
+    } else if needs_head_reads_protocol(command) {
+        Some((
+            pastor::ipc::HEAD_READS_PROTOCOL,
+            "predates this request through the head",
         ))
     } else {
         None
@@ -2144,7 +2169,18 @@ async fn job_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyh
     print_description(&d, json, pastor::describe::job_text)
 }
 
+/// `machine describe`: the head's description when one runs, else one
+/// built from flock.toml, a probe and the store.
 async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
+    if head.is_live() {
+        let req = IpcRequest::MachineDescribe {
+            name: name.to_string(),
+        };
+        let IpcResponse::MachineDescription(d) = ask(paths, req).await? else {
+            unreachable!()
+        };
+        return print_description(&d, json, pastor::describe::machine_text);
+    }
     let f = Flock::load(&paths.flock_file())?;
     let Some(m) = f.get(name) else {
         fail(
@@ -2152,94 +2188,38 @@ async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> 
             &format!("no machine {name} in the flock"),
         );
     };
-    let live = if head.is_live() {
-        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
-            unreachable!()
-        };
-        ms.iter()
-            .find(|s| s.name == name)
-            .map(pastor::cli::MachineRow::from)
-    } else {
-        None
-    };
-    let row = match live {
-        Some(row) => row,
-        // No head, or one that has not picked the machine up yet.
-        None => {
-            paths.ensure()?;
-            let store = Store::open(&paths.db_file())?;
-            probe_machine(m, f.flock_of(m), paths, &store).await?
-        }
-    };
-    let tasks = tasks_matching(
-        paths,
-        head,
-        TaskFilter {
-            machine: Some(name.to_string()),
-            states: Some(pastor::task::PANE_OWNING_STATES.to_vec()),
-            ..Default::default()
-        },
-    )
-    .await?;
-    let recent_errors = pastor::describe::recent_events(events_log(paths), |e| {
-        let machine_error = e.kind.starts_with("machine.")
-            && e.machine
-                .as_ref()
-                .is_some_and(|s| s.name == name && s.error.is_some());
-        let failed_here = e.kind == "task.failed"
-            && e.task.as_ref().and_then(|t| t.machine.as_deref()) == Some(name);
-        machine_error || failed_here
-    });
+    paths.ensure()?;
+    let store = Store::open(&paths.db_file())?;
+    let row = probe_machine(m, f.flock_of(m), paths, &store).await?;
+    let tasks = store.list_tasks(&pastor::describe::machine_tasks(name))?;
     let d = pastor::describe::MachineDescription {
         row,
         session: m.session.clone(),
         model: m.model.clone(),
         tasks,
-        recent_errors,
+        recent_errors: pastor::describe::machine_errors(events_log(paths), name),
     };
     print_description(&d, json, pastor::describe::machine_text)
 }
 
+/// `flock describe`: the head's description when one runs, else one built
+/// from flock.toml and the store.
 async fn flock_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
+    if head.is_live() {
+        let req = IpcRequest::FlockDescribe {
+            name: name.to_string(),
+        };
+        let IpcResponse::FlockDescription(d) = ask(paths, req).await? else {
+            unreachable!()
+        };
+        return print_description(&d, json, pastor::describe::flock_text);
+    }
     let f = Flock::load(&paths.flock_file())?;
     if !f.has_flock(name) {
         fail("unknown_flock", &format!("no flock {name}"));
     }
-    let live = if head.is_live() {
-        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
-            unreachable!()
-        };
-        Some(ms)
-    } else {
-        None
-    };
-    let row = pastor::cli::flock_list(&f, live.as_deref(), &[])
-        .into_iter()
-        .find(|r| r.name == name)
-        .expect("has_flock");
-    let tasks = tasks_matching(
-        paths,
-        head,
-        TaskFilter {
-            flock: Some(name.to_string()),
-            states: Some(LIVE_STATES.to_vec()),
-            ..Default::default()
-        },
-    )
-    .await?;
-    let entry = f.entry(name).cloned().unwrap_or_default();
-    let d = pastor::describe::FlockDescription {
-        name: row.name,
-        default: row.default,
-        agent: entry.agent,
-        agent_args: entry.agent_args,
-        allow: entry.allow,
-        deny: entry.deny,
-        model: entry.model,
-        machines: row.machines,
-        agents: row.agents,
-        tasks,
-    };
+    let tasks = open_store(paths)?.list_tasks(&pastor::describe::flock_tasks(name))?;
+    let d = pastor::describe::flock_description(&f, name, None, tasks).expect("has_flock");
     print_description(&d, json, pastor::describe::flock_text)
 }
 
@@ -2507,6 +2487,71 @@ mod tests {
                 Head::Live
             );
         }
+    }
+
+    /// A head from before `HEAD_READS_PROTOCOL` does not know the trust
+    /// and describe requests. The CLI refuses it with `head_too_old` instead
+    /// of reading its own copy, which may not be the head's.
+    #[tokio::test]
+    async fn trust_and_describe_refuse_a_head_before_them() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.into_split();
+                let mut line = String::new();
+                tokio::io::BufReader::new(r)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let pong = IpcResponse::Pong {
+                    version: "0.6.0".into(),
+                    protocol: pastor::ipc::PLACE_PROTOCOL,
+                };
+                let mut out = serde_json::to_string(&pong).unwrap();
+                out.push('\n');
+                w.write_all(out.as_bytes()).await.unwrap();
+            }
+        });
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let reads = protocol_need(&parse(&["pastor", "trust", "list"]));
+        let err = probe_head(&paths, false, false, reads).await.unwrap_err();
+        let err = err.downcast::<pastor::cli::CliError>().unwrap();
+        assert_eq!(err.code, "head_too_old");
+        assert_eq!(
+            probe_head(&paths, false, false, None).await.unwrap(),
+            Head::Live
+        );
+
+        for argv in [
+            &["pastor", "trust", "list"][..],
+            &["pastor", "trust", "add", "m", "/r"][..],
+            &["pastor", "trust", "remove", "m", "/r"][..],
+            &["pastor", "flock", "describe", "f"][..],
+            &["pastor", "machine", "describe", "m"][..],
+        ] {
+            let cmd = parse(argv);
+            assert!(needs_head_reads_protocol(&cmd), "{argv:?}");
+            assert_eq!(head_use(&cmd), Some(false), "{argv:?}");
+        }
+        assert!(!needs_head_reads_protocol(&parse(&[
+            "pastor", "flock", "list"
+        ])));
+        assert!(!needs_head_reads_protocol(&parse(&[
+            "pastor", "job", "describe", "j"
+        ])));
+        // Only a trust change counts against an agent.
+        assert!(!changes_fleet(&parse(&["pastor", "trust", "list"])));
+        assert!(changes_fleet(&parse(&[
+            "pastor", "trust", "add", "m", "/r"
+        ])));
+        assert!(changes_fleet(&parse(&[
+            "pastor", "trust", "remove", "m", "/r"
+        ])));
     }
 
     #[test]

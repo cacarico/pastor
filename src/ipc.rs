@@ -17,7 +17,9 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// lists. 3: `TaskRetry::place`. 4: `EventsSince`. 5: flock and machine
 /// edits (`FLEET_EDIT_PROTOCOL`). 6: `FileGet`, `FilePut`, `JobDescribe`,
 /// `JobSetEnabled`. 7: `JobSubmit`. 8: named models (`AgentChoice::model`).
-pub const IPC_PROTOCOL: u32 = 8;
+/// 9: `TrustList`, `TrustAdd`, `TrustRemove`, `FlockDescribe` and
+/// `MachineDescribe`.
+pub const IPC_PROTOCOL: u32 = 9;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -53,6 +55,11 @@ pub const FLEET_EDIT_PROTOCOL: u32 = 5;
 /// The first protocol whose head takes `FileGet`, `FilePut`, `JobDescribe`
 /// and `JobSetEnabled`. An older one refuses them as unknown requests.
 pub const FILE_PROTOCOL: u32 = 6;
+/// The first protocol whose head answers `TrustList`, `TrustAdd`,
+/// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. An older one reads
+/// them as an unknown request and answers `invalid_request`, so the CLI
+/// refuses it with `head_too_old` first.
+pub const HEAD_READS_PROTOCOL: u32 = 9;
 
 /// The first protocol whose head knows `JobSubmit`. An older one refuses the
 /// request as unreadable; `check_protocol` says why before it is sent.
@@ -230,6 +237,28 @@ pub enum IpcRequest {
         prompt: String,
         items: Vec<serde_json::Value>,
     },
+    /// Every saved folder trust. Answers `Trusted`.
+    TrustList,
+    /// Save `repo` on `machine` as trusted. Answers `Text`.
+    TrustAdd {
+        machine: String,
+        repo: String,
+    },
+    /// Forget a saved trust. Answers `Text`, or `not_trusted`.
+    TrustRemove {
+        machine: String,
+        repo: String,
+    },
+    /// `flock describe`, from the flock the head last applied. Answers
+    /// `FlockDescription`.
+    FlockDescribe {
+        name: String,
+    },
+    /// `machine describe`, from the head's machines. Answers
+    /// `MachineDescription`.
+    MachineDescribe {
+        name: String,
+    },
 }
 
 impl IpcRequest {
@@ -245,7 +274,10 @@ impl IpcRequest {
             | IpcRequest::TaskRead { .. }
             | IpcRequest::FlockList
             | IpcRequest::JobList
-            | IpcRequest::EventsSince { .. } => false,
+            | IpcRequest::EventsSince { .. }
+            | IpcRequest::TrustList
+            | IpcRequest::FlockDescribe { .. }
+            | IpcRequest::MachineDescribe { .. } => false,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
             | IpcRequest::Tick { .. }
@@ -264,7 +296,9 @@ impl IpcRequest {
             | IpcRequest::TaskPrune { .. }
             | IpcRequest::FilePut { .. }
             | IpcRequest::JobSetEnabled { .. }
-            | IpcRequest::JobSubmit { .. } => true,
+            | IpcRequest::JobSubmit { .. }
+            | IpcRequest::TrustAdd { .. }
+            | IpcRequest::TrustRemove { .. } => true,
         }
     }
 
@@ -359,6 +393,9 @@ pub enum IpcResponse {
         skipped: Vec<String>,
         refused: Vec<(String, String)>,
     },
+    Trusted(Vec<crate::store::TrustedRepo>),
+    FlockDescription(crate::describe::FlockDescription),
+    MachineDescription(crate::describe::MachineDescription),
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -877,6 +914,9 @@ mod tests {
                 file: "flock".into(),
             },
             IpcRequest::JobDescribe { name: "j".into() },
+            IpcRequest::TrustList,
+            IpcRequest::FlockDescribe { name: "f".into() },
+            IpcRequest::MachineDescribe { name: "m".into() },
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -951,6 +991,14 @@ mod tests {
                 dispatch: serde_json::Value::Null,
                 prompt: "p".into(),
                 items: vec![],
+            },
+            IpcRequest::TrustAdd {
+                machine: "m".into(),
+                repo: "/r".into(),
+            },
+            IpcRequest::TrustRemove {
+                machine: "m".into(),
+                repo: "/r".into(),
             },
         ];
         for req in changes {
