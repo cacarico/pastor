@@ -1279,7 +1279,7 @@ two pastor edits of one file never interleave.
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, defaults, agents (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, head_address, defaults, agents (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.local/state/pastor/pastor.db   tasks (schema 7, with retry_of, flock, trust_sent, activity_seen and ended), seen keys, job state, trusted repos
@@ -1309,6 +1309,7 @@ request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "15m"     # a done task's pane closes after this; "never" keeps it
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
+# head_address = "user@head.example"  # unset by default; see below
 [defaults]                   # for run flags, job keys and flock keys that are left out
 agent = "claude"
 agent_args = []              # e.g. ["--model", "claude-opus-5-5"]
@@ -1325,6 +1326,13 @@ trust_marker = "Yes, I trust this folder"  # saved trust presses them only while
 allow_flag = "--allowedTools"    # the flag before each allow pattern
 deny_flag = "--disallowedTools"  # the flag before each deny pattern
 ```
+
+`head_address` is the ssh destination other machines reach the head by. When
+it is set, every agent pastor starts on a machine that is not the head's own
+(`local = true`) gets `PASTOR_HEAD=<head_address>` in its pane next to
+`PASTOR_TASK`, so it knows where to send `pastor task done`. An agent on the
+head's machine gets none: it uses the local socket. An `[agents]` env cannot
+override it. The value must not be empty or hold whitespace.
 
 ## Shell completions
 

@@ -5,6 +5,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- `head_address` in `pastor.toml`: the ssh destination other machines reach
+  the head by. When set, agents on machines other than the head's own start
+  with `PASTOR_HEAD=<head_address>` in their pane. Agents on the head's
+  machine get none.
+
 ### Changed
 
 - `pastor flock default` is split in two: `pastor flock default show` prints

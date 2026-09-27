@@ -41,6 +41,7 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         poll_every: config.tick_duration(),
         close_done_after: config.close_done_after_duration(),
         agents: config.agents.clone(),
+        head_address: config.head_address.clone(),
         ..Default::default()
     }
 }
@@ -137,6 +138,16 @@ fn actor_config(m: &MachineConfig) -> MachineConfig {
         agent: None,
         agent_args: None,
         ..m.clone()
+    }
+}
+
+/// `settings` as the actor for `m` runs them: an agent on the head's own
+/// machine (`local`) reaches the head through its socket, so it is not told
+/// the head's address.
+pub fn actor_settings(m: &MachineConfig, settings: &MachineSettings) -> MachineSettings {
+    MachineSettings {
+        head_address: settings.head_address.clone().filter(|_| !m.local),
+        ..settings.clone()
     }
 }
 
@@ -529,7 +540,7 @@ impl Fleet {
         }
         let mut plan: Vec<Step> = Vec::new();
         for m in &flock.machines {
-            let want = (actor_config(m), settings.clone());
+            let want = (actor_config(m), actor_settings(m, settings));
             plan.push(match old.iter().position(|o| o.handle.name == m.name) {
                 Some(i) if !old[i].shutting_down && old[i].spawned_from.as_ref() == Some(&want) => {
                     Step::Keep(old.remove(i))
@@ -606,6 +617,7 @@ impl Fleet {
     }
 
     fn spawn(&self, spawner: &Spawner, m: &MachineConfig, settings: &MachineSettings) -> Member {
+        let settings = &actor_settings(m, settings);
         let handle = spawn_machine(
             m.name.clone(),
             m.max_agents,
@@ -1852,6 +1864,51 @@ mod tests {
             TaskState::Running
         );
         assert_eq!(fleet.get("a").unwrap().snapshot().live, 1);
+    }
+
+    /// Through the fleet: a task on another machine starts with
+    /// `PASTOR_HEAD`, one on the head's own machine without it.
+    #[tokio::test]
+    async fn a_task_off_the_head_machine_is_told_where_the_head_is() {
+        let (here, there) = (FakeHerdr::new(), FakeHerdr::new());
+        let (fleet, store) = managed(&[("here", here.clone()), ("there", there.clone())]);
+        let mut flock = flock_of(&[("here", 1), ("there", 1)]);
+        flock.machines[0].local = true;
+        flock.machines[0].command = None;
+        let settings = MachineSettings {
+            head_address: Some("user@head.example".into()),
+            ..fast()
+        };
+        fleet.apply_flock(&flock, &settings).await;
+        healthy(&fleet, "here").await;
+        healthy(&fleet, "there").await;
+        let mut ids = vec![];
+        for _ in 0..2 {
+            let t = store
+                .insert_task(NewTask {
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                    flock: "default".into(),
+                })
+                .unwrap();
+            ids.push(t.id);
+        }
+        fleet.dispatch_queued().await;
+        for id in ids {
+            let t = store.get_task(id).unwrap().unwrap();
+            let fake = match t.machine.as_deref() {
+                Some("here") => &here,
+                Some("there") => &there,
+                other => panic!("t-{id} on {other:?}"),
+            };
+            let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+            match t.machine.as_deref() {
+                Some("there") => assert_eq!(env["PASTOR_HEAD"], "user@head.example"),
+                _ => assert!(env.get("PASTOR_HEAD").is_none(), "{env}"),
+            }
+        }
     }
 
     /// Copilot 4103070196: an old actor that does not end within the
@@ -3471,6 +3528,31 @@ mod tests {
             Some(vec!["Enter".into()])
         );
         assert_ne!(settings, machine_settings(&test_config()));
+    }
+
+    /// Agents on other machines are told where the head is; those on the
+    /// head's own machine use its socket, and with no `head_address` nobody
+    /// is told.
+    #[test]
+    fn only_agents_off_the_head_machine_get_the_head_address() {
+        let machine = |text: &str| -> MachineConfig {
+            toml::from_str(&format!("name = \"m\"\n{text}")).unwrap()
+        };
+        let local = machine("local = true");
+        let remote = machine("ssh = \"pi\"");
+        let config = PastorConfig {
+            head_address: Some("user@head.example".into()),
+            ..test_config()
+        };
+        let settings = machine_settings(&config);
+        assert_eq!(
+            actor_settings(&remote, &settings).head_address.as_deref(),
+            Some("user@head.example")
+        );
+        assert_eq!(actor_settings(&local, &settings).head_address, None);
+        let unset = machine_settings(&test_config());
+        assert_eq!(actor_settings(&remote, &unset).head_address, None);
+        assert_eq!(actor_settings(&local, &unset).head_address, None);
     }
 
     #[tokio::test]

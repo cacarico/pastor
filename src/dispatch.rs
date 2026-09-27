@@ -106,10 +106,13 @@ impl DispatchError {
 /// accepts; it must stay below the caller's per-request timeout, or a slow
 /// agent surfaces as a confusing "request timed out". `agents` turns the
 /// task's tool lists into the agent's own flags (`Agents::launch_args`).
+/// `head`, when given, is where the agent reaches the head from its machine
+/// (`ipc::HEAD_ENV`).
 pub async fn dispatch(
     conn: &dyn Connector,
     task: &mut Task,
     agents: &Agents,
+    head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     let name = Task::agent_name_for(task.id);
@@ -119,7 +122,7 @@ pub async fn dispatch(
     task.prompt_pending = false;
     task.activity_seen = false;
 
-    let result = dispatch_steps(conn, task, &name, agents, ready_timeout).await;
+    let result = dispatch_steps(conn, task, &name, agents, head, ready_timeout).await;
     match &result {
         Ok(DispatchOutcome::Running) => {
             task.state = TaskState::Running;
@@ -147,6 +150,7 @@ async fn dispatch_steps(
     task: &mut Task,
     name: &str,
     agents: &Agents,
+    head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
@@ -168,6 +172,11 @@ async fn dispatch_steps(
     // The mark the head refuses fleet changes by (`ipc::TASK_ENV`). Last,
     // so an `[agents]` env cannot clear it.
     env.insert(crate::ipc::TASK_ENV.into(), name.to_string());
+    // Where an agent off the head's machine reaches the head; the same
+    // reason puts it last.
+    if let Some(head) = head {
+        env.insert(crate::ipc::HEAD_ENV.into(), head.to_string());
+    }
     if let Some(dir) = repo.as_deref() {
         check_repo_exists(conn, dir, task.machine.as_deref()).await?;
     }
@@ -701,7 +710,7 @@ mod tests {
             let fake = FakeHerdr::new();
             fake.set_missing_dir("/srv/app");
             let mut t = task(DispatchSpec { worktree, ..spec() });
-            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap_err();
             assert!(!err.is_transport(), "the machine is fine: {err}");
@@ -730,7 +739,7 @@ mod tests {
             repo: Some("~/gone".into()),
             ..spec()
         });
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(
@@ -863,7 +872,7 @@ mod tests {
     async fn dispatch_sends_prompt_verbatim() {
         let fake = FakeHerdr::new();
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Running);
@@ -896,7 +905,7 @@ mod tests {
             deny: vec!["WebFetch".into()],
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         let reqs = fake.requests();
@@ -924,7 +933,7 @@ mod tests {
             deny: vec!["WebFetch".into()],
             ..spec()
         });
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("deny_flag"), "{err}");
@@ -964,7 +973,9 @@ mod tests {
             deny: vec!["WebFetch".into()],
             ..spec()
         });
-        dispatch(&fake, &mut t, &personal(), READY).await.unwrap();
+        dispatch(&fake, &mut t, &personal(), None, READY)
+            .await
+            .unwrap();
         let reqs = fake.requests();
         let ws = reqs
             .iter()
@@ -998,7 +1009,9 @@ mod tests {
             branch: Some("pastor/k1".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &personal(), READY).await.unwrap();
+        dispatch(&fake, &mut t, &personal(), None, READY)
+            .await
+            .unwrap();
         let reqs = fake.requests();
         let methods: Vec<&str> = reqs.iter().map(|r| r.method.as_str()).collect();
         let at = |m: &str| methods.iter().position(|x| *x == m).unwrap();
@@ -1029,7 +1042,7 @@ mod tests {
     async fn every_agent_pane_is_marked_with_its_task() {
         let fake = FakeHerdr::new();
         let mut t = task(spec());
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(
@@ -1043,12 +1056,44 @@ mod tests {
             branch: Some("pastor/k2".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         let pane = t.pane_id.clone().unwrap();
         assert_ne!(pane, "w1:p1");
         assert_eq!(fake.pane_env(&pane)["PASTOR_TASK"], "t-7");
+    }
+
+    /// A head address reaches the agent as `PASTOR_HEAD`, after the
+    /// `[agents]` env so config cannot clear it; without one there is none.
+    #[tokio::test]
+    async fn the_head_address_goes_in_the_pane_env() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "claude-personal".into(),
+            ..spec()
+        });
+        let mut agents = personal();
+        agents
+            .0
+            .get_mut("claude-personal")
+            .unwrap()
+            .env
+            .insert("PASTOR_HEAD".into(), "elsewhere".into());
+        dispatch(&fake, &mut t, &agents, Some("user@head.example"), READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(env["PASTOR_HEAD"], "user@head.example");
+        assert_eq!(env["PASTOR_TASK"], "t-7");
+
+        let fake = FakeHerdr::new();
+        let mut t = task(spec());
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert!(env.get("PASTOR_HEAD").is_none(), "{env}");
     }
 
     #[tokio::test]
@@ -1059,7 +1104,7 @@ mod tests {
             branch: Some("pastor/k1".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         let wt = fake
@@ -1092,7 +1137,7 @@ mod tests {
                     worktree,
                     ..spec()
                 });
-                dispatch(&fake, &mut t, &Agents::default(), READY)
+                dispatch(&fake, &mut t, &Agents::default(), None, READY)
                     .await
                     .unwrap();
                 let method = if worktree {
@@ -1132,7 +1177,7 @@ mod tests {
                 repo: Some(repo.into()),
                 ..spec()
             });
-            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap_err();
             assert!(!err.is_transport(), "the machine is fine: {err}");
@@ -1161,7 +1206,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_millis(300));
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Running);
@@ -1188,7 +1233,7 @@ mod tests {
         let mut t = task(spec());
         t.machine = Some("pi-1".into());
         let started = Instant::now();
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(
@@ -1220,6 +1265,7 @@ mod tests {
             &fake,
             &mut t,
             &Agents::default(),
+            None,
             Duration::from_millis(200),
         )
         .await
@@ -1254,7 +1300,7 @@ mod tests {
         });
         let mut t = task(spec());
         let started = Instant::now();
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Blocked);
@@ -1286,7 +1332,7 @@ mod tests {
             }
         });
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Blocked);
@@ -1299,7 +1345,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_start_behaviour(StartBehaviour::Fail("unsupported_agent_kind".into()));
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("unsupported_agent_kind"));
@@ -1329,7 +1375,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_pane_busy_for(2);
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Running);
@@ -1347,7 +1393,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_pane_busy_for(PANE_BUSY_ATTEMPTS + 1);
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("agent_pane_busy"));
@@ -1375,7 +1421,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_start_behaviour(StartBehaviour::Fail("agent_name_taken".into()));
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("agent_name_taken"));
@@ -1398,7 +1444,7 @@ mod tests {
         let mut t = task(spec());
         t.machine = Some("pi-1".into());
         let started = Instant::now();
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(
@@ -1428,7 +1474,7 @@ mod tests {
             repo: None,
             ..spec()
         });
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(
@@ -1462,7 +1508,7 @@ mod tests {
                 repo: Some(repo.into()),
                 ..spec()
             });
-            dispatch(&fake, &mut t, &Agents::default(), READY)
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap();
             assert_eq!(t.state, TaskState::Running, "{repo}");
@@ -1492,7 +1538,7 @@ mod tests {
                 repo: repo.map(str::to_string),
                 ..spec()
             });
-            dispatch(&fake, &mut t, &Agents::default(), READY)
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap();
             let create = fake
@@ -1516,7 +1562,7 @@ mod tests {
             worktree: true,
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert!(methods(&fake).contains(&"worktree.create".to_string()));
@@ -1535,7 +1581,7 @@ mod tests {
             place: Place::Own,
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_ne!(t.workspace_id.as_deref(), Some(ws.as_str()));
@@ -1559,7 +1605,7 @@ mod tests {
             place: Place::Pastor,
             ..spec()
         });
-        dispatch(&fake, &mut one, &Agents::default(), READY)
+        dispatch(&fake, &mut one, &Agents::default(), None, READY)
             .await
             .unwrap();
         let ws = one.workspace_id.clone().unwrap();
@@ -1569,7 +1615,7 @@ mod tests {
             ..spec()
         });
         two.id = 8;
-        dispatch(&fake, &mut two, &Agents::default(), READY)
+        dispatch(&fake, &mut two, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(two.workspace_id.as_deref(), Some(ws.as_str()));
@@ -1610,7 +1656,7 @@ mod tests {
             worktree: true,
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         let checkout = t.spec.checkout.clone().expect("checkout recorded");
@@ -1641,7 +1687,7 @@ mod tests {
             place: Place::Pane("work".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(t.workspace_id.as_deref(), Some(ws.as_str()));
@@ -1655,7 +1701,7 @@ mod tests {
                 worktree,
                 ..spec()
             });
-            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap_err();
             assert!(!err.is_transport());
@@ -1688,7 +1734,7 @@ mod tests {
             place: Place::Pane("work".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(t.workspace_id.as_deref(), Some(ws.as_str()));
@@ -1704,7 +1750,7 @@ mod tests {
                 place: Place::Pane("work".into()),
                 ..spec()
             });
-            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap_err();
             assert!(!err.is_transport());
