@@ -339,7 +339,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand head; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand head; and __fish_seen_subcommand_from set" -l force -d 'Save it even if the head does not answer'
 complete -c pastor -n "__fish_pastor_using_subcommand head; and __fish_seen_subcommand_from set" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand head; and __fish_seen_subcommand_from show" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
-complete -c pastor -n "__fish_pastor_using_subcommand head; and __fish_seen_subcommand_from show" -l json
+complete -c pastor -n "__fish_pastor_using_subcommand head; and __fish_seen_subcommand_from show" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand head; and __fish_seen_subcommand_from show" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand head; and __fish_seen_subcommand_from unset" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand head; and __fish_seen_subcommand_from unset" -s h -l help -d 'Print help'
