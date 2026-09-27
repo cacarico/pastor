@@ -368,6 +368,54 @@ pub enum RequestError {
     /// malformed reply.
     #[error(transparent)]
     Exchange(anyhow::Error),
+    /// A remote head (`head::RemoteHead`): ssh exited with no reply. The
+    /// message carries ssh's stderr.
+    #[error("{0}")]
+    Unreachable(String),
+    /// A remote head: `pastor bridge` answered with an error of its own
+    /// (`no_head`) instead of the head's reply.
+    #[error("{message}")]
+    Refused { code: String, message: String },
+}
+
+static REMOTE_HEAD: std::sync::OnceLock<Option<crate::head::RemoteHead>> =
+    std::sync::OnceLock::new();
+
+/// Sets the head this process's requests go to over ssh. Only the `pastor`
+/// binary calls it, once, from `--head`, `PASTOR_HEAD` or client.toml.
+pub fn set_remote_head(head: Option<crate::head::RemoteHead>) {
+    let _ = REMOTE_HEAD.set(head);
+}
+
+/// The remote head `set_remote_head` left, if any.
+pub fn remote_head() -> Option<&'static crate::head::RemoteHead> {
+    REMOTE_HEAD.get().and_then(Option::as_ref)
+}
+
+/// One request to the head, wherever it is: over ssh to a remote head when
+/// one is set, else to this machine's socket. Every CLI request goes through
+/// here.
+pub async fn request_head(
+    paths: &crate::config::Paths,
+    req: &IpcRequest,
+) -> Result<IpcResponse, RequestError> {
+    request_head_with_timeout(paths, req, DEFAULT_REQUEST_TIMEOUT).await
+}
+
+/// `request_head` with its own bound on the round trip.
+pub async fn request_head_with_timeout(
+    paths: &crate::config::Paths,
+    req: &IpcRequest,
+    timeout: Duration,
+) -> Result<IpcResponse, RequestError> {
+    match remote_head() {
+        Some(head) => {
+            let line =
+                request_line(req, caller_task().as_deref()).map_err(RequestError::Exchange)?;
+            head.request(&line, timeout).await
+        }
+        None => request_with_timeout(&paths.socket_file(), req, timeout).await,
+    }
 }
 
 /// One request, one reply, then the connection closes. Bounded by

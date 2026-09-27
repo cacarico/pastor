@@ -250,8 +250,8 @@ pub fn task_detail(t: &Task) -> String {
 /// The head handles each request in a detached task, so a timed-out `run`,
 /// `task retry`, `tick` or `job run` may still land; sending it again blindly
 /// can queue a duplicate.
-pub fn request_failure(err: &RequestError) -> (&'static str, String) {
-    match err {
+pub fn request_failure(err: &RequestError) -> (String, String) {
+    let (code, message) = match err {
         RequestError::Connect(e) if connect_error_means_no_daemon(e) => (
             "runtime_error",
             format!("pastor serve is not running ({e}); start it with `pastor serve`"),
@@ -271,18 +271,21 @@ pub fn request_failure(err: &RequestError) -> (&'static str, String) {
             "runtime_error",
             format!("pastor serve dropped the request: {e:#}"),
         ),
-    }
+        RequestError::Unreachable(message) => ("head_unreachable", message.clone()),
+        RequestError::Refused { code, message } => return (code.clone(), message.clone()),
+    };
+    (code.to_string(), message)
 }
 
 /// Tasks still holding a pane on a machine the flock no longer has. Nothing
 /// reconciles them, so their state is the last one seen; the MACHINE column
 /// says so instead of looking live. Rows and tasks are in the same order
 /// (`task_rows`).
-pub fn mark_removed(rows: &mut [Vec<String>], tasks: &[Task], flock: &Flock) {
+pub fn mark_removed(rows: &mut [Vec<String>], tasks: &[Task], known: impl Fn(&str) -> bool) {
     for (row, t) in rows.iter_mut().zip(tasks) {
         if let Some(m) = &t.machine
             && t.state.occupies_pane()
-            && flock.get(m).is_none()
+            && !known(m)
         {
             row[2] = format!("{m} (removed)");
         }
@@ -845,7 +848,7 @@ mod tests {
             }],
         };
         let mut rows = task_rows(&tasks);
-        mark_removed(&mut rows, &tasks, &flock);
+        mark_removed(&mut rows, &tasks, |m| flock.get(m).is_some());
         assert_eq!(rows[0][2], "pi-3 (removed)");
         assert_eq!(
             rows[1][2], "pi-3",

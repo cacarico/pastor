@@ -9,6 +9,7 @@ pub mod dispatch;
 pub mod edit;
 pub mod events;
 pub mod fleet_edit;
+pub mod head;
 pub mod herdr;
 pub mod hooks;
 pub mod ipc;

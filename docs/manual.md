@@ -1215,6 +1215,69 @@ line and exits non-zero. It checks nothing itself: the head refuses what it
 would refuse from a local CLI, so ssh access to the head's user is access to
 the fleet.
 
+## A head on another machine
+
+The CLI can use a head that runs on another machine. It reaches it the same
+way pastor reaches a machine: ssh, never a network port.
+
+```bash
+pastor head set user@pi-1                                # checks the head, then saves it
+pastor head set user@pi-1 --pastor '~/.local/bin/pastor' # pastor is not on its PATH over ssh
+pastor head set user@pi-1 --force                        # save it even if it does not answer
+pastor head show [--json]                                # head: user@pi-1 (remote), or head: this machine
+pastor head unset                                        # back to this machine's head
+```
+
+The setting lives in `~/.config/pastor/client.toml`:
+
+```toml
+[head]
+ssh = "user@pi-1"               # an ssh destination, as ssh takes it
+pastor = "~/.local/bin/pastor"  # optional: pastor's path on the head
+```
+
+`PASTOR_HEAD=<dest>` names a head for one shell over the file, and
+`pastor --head <dest> ...` for one command over both. `head` never edits
+`flock.toml`.
+
+With a head set, each request goes through
+
+```
+ssh -o BatchMode=yes -o ControlMaster=auto -o ControlPersist=60s \
+    -o ControlPath=<state dir>/ssh-%C <dest> <pastor> bridge
+```
+
+one request line in, one reply line back (see [The bridge](#the-bridge)).
+It needs:
+
+- key-based ssh from here to the head: `BatchMode` never asks for a password
+  or a host key, so either one missing fails at once;
+- pastor on the head, on the PATH a non-interactive shell there gets, or
+  named with `--pastor` (the remote shell expands a `~` in it);
+- `pastor serve` running there.
+
+`head set` sends one ping first and saves nothing if it fails:
+`head_unreachable` when ssh fails (the message carries ssh's stderr),
+`no_head` when nothing runs there, `head_too_old` when that pastor has no
+`bridge` or speaks an older protocol. Any command fails the same way later;
+it never falls back to this machine's files.
+
+These commands go to a remote head: `task run|list|show|read|retry|close|prune|send|done`,
+`machine list`, `tick`, `job list|run|reload`. `machine list`'s first line
+names the head by its ssh destination and shows its herdr as `-`. `task run`
+fills what its flags leave out from the built-in defaults, not from the
+head's `[defaults]` (the head still resolves the agent with its own).
+
+Local on purpose, as with no head set: `completions`, `setup`, `head`,
+`bridge`, `connector` (connectors are this machine's), `task attach` and
+`open` (they go to the machine directly, reading this machine's
+`flock.toml`).
+
+Every other command would read or edit this machine's files instead of the
+head's, so it fails with `remote_head_unsupported` until it is moved behind
+the head; run it on the head. `pastor serve` refuses to start while a remote
+head is set (`remote_head_set`).
+
 ## Trust model
 
 pastor gives an agent what the head's user has on each machine. It reaches a
@@ -1354,10 +1417,11 @@ sends nothing. A head from before these requests is refused
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, defaults, agents (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
+~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
 ~/.local/state/pastor/pastor.db   tasks (schema 8, with retry_of, flock, trust_sent, activity_seen and ended), seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
-~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host
+~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host, and one (`head-<hash>`) for a remote head
 ~/.config/systemd/user/{pastor,herdr}.service   written by `pastor setup systemd`
 ~/Library/LaunchAgents/pastor.{serve,herdr}.plist   written by `pastor setup launchd` (macOS)
 ~/.config/pastor/connectors/<id>/.env   a connector's secrets and settings

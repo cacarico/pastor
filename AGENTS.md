@@ -154,6 +154,11 @@ Still open as of the last review; none of them blocks normal use.
   and passed on every rerun.
 - Cron minutes that do not exist on a spring-forward day are skipped;
   Vixie cron runs them instead.
+- With a remote head (`pastor head set`), `task run` fills what its flags
+  leave out from the built-in defaults, not the head's `[defaults]` timeout
+  and place, and most commands that read or edit files (machine and flock
+  edits, job edits, `events`, `trust`, describes) fail with
+  `remote_head_unsupported` until they move behind the head.
 
 ## Where things live
 
@@ -161,6 +166,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
+~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
 ~/.local/state/pastor/pastor.db   tasks (schema 8), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1

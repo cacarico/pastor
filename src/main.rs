@@ -30,13 +30,15 @@ Skip it if a pastor skill is already in your context.";
     version,
     about = "run coding agents on machines you own",
     arg_required_else_help = true,
-    args_conflicts_with_subcommands = true,
     after_help = AGENT_FOOTER
 )]
 struct Cli {
     /// Print the agent skill (SKILL.md) for this version and exit
     #[arg(long, exclusive = true)]
     skill: bool,
+    /// Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)
+    #[arg(long, global = true, value_name = "DEST")]
+    head: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -96,6 +98,11 @@ enum Command {
     },
     /// Pass request lines from stdin to this machine's head; for a remote CLI over ssh
     Bridge,
+    /// Which head this CLI uses: this machine's, or one on another machine over ssh
+    Head {
+        #[command(subcommand)]
+        cmd: pastor::head::HeadCmd,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -410,6 +417,16 @@ fn main() {
         complete(&args[2..]);
     }
     let cli = Cli::parse();
+    // `exclusive` does not cover subcommands, and `--head` being global rules
+    // out `args_conflicts_with_subcommands`, so `--skill task` is refused here.
+    if cli.skill && cli.command.is_some() {
+        <Cli as clap::CommandFactory>::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--skill cannot be used with a subcommand",
+            )
+            .exit();
+    }
     if cli.skill {
         print!("{SKILL}");
         return;
@@ -435,6 +452,39 @@ fn main() {
             Err(err) => fail("config_error", &format!("{err:#}")),
         }
     }
+    let remote = match pastor::head::load(&pastor::head::client_file(&paths)) {
+        Ok(file) => pastor::head::resolve(
+            &paths,
+            cli.head.as_deref(),
+            std::env::var(pastor::head::HEAD_ENV).ok().as_deref(),
+            file,
+        ),
+        Err(err) => match err.downcast_ref::<CliError>() {
+            Some(e) => fail(&e.code, &e.message),
+            None => fail("config_error", &format!("{err:#}")),
+        },
+    };
+    if let Some(r) = &remote {
+        match remote_route(&command) {
+            RemoteRoute::Head | RemoteRoute::Here => {}
+            RemoteRoute::Serve => fail(
+                "remote_head_set",
+                &format!(
+                    "a remote head is set ({}); pastor serve would be a second head. Run `pastor head unset` first",
+                    r.ssh
+                ),
+            ),
+            RemoteRoute::Unsupported => fail(
+                "remote_head_unsupported",
+                &format!(
+                    "`pastor {}` does not work with a remote head yet: it would act on this machine's files; run it on {}, or `pastor head unset`",
+                    command_path(),
+                    r.ssh
+                ),
+            ),
+        }
+    }
+    pastor::ipc::set_remote_head(remote.clone());
     pastor::ipc::set_caller_task(pastor::ipc::task_from_env());
     if let Some(task) = pastor::ipc::caller_task()
         && changes_fleet(&command)
@@ -445,12 +495,18 @@ fn main() {
     }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async {
-        // Commands that never talk to the head do not read `head`.
-        let head = match head_use(&command) {
+        // Commands that never talk to the head do not read `head`, and with a
+        // remote head, commands that stay here on purpose do not ask it.
+        let head_use = match remote_route(&command) {
+            RemoteRoute::Here if remote.is_some() => None,
+            _ => head_use(&command),
+        };
+        let head = match head_use {
             Some(flocky) => {
                 probe_head(
                     &paths,
-                    flocky || flocks_declared(&paths),
+                    // A remote head's flock.toml is not here to read.
+                    flocky || remote.is_some() || flocks_declared(&paths),
                     needs_fleet_edit_protocol(&command),
                     protocol_need(&command),
                 )
@@ -483,6 +539,7 @@ fn main() {
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd),
             Command::Bridge => unreachable!("handled before the runtime"),
+            Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
         }
     });
     if let Err(err) = result {
@@ -557,12 +614,11 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 /// ending the command, for a caller that acts on it (an invalid edit
 /// reopens the editor). A request that never got an answer still ends it.
 async fn ask_or_refused(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    let socket = paths.socket_file();
-    let resp = match request(&socket, &req).await {
+    let resp = match pastor::ipc::request_head(paths, &req).await {
         Ok(resp) => resp,
         Err(err) => {
             let (code, message) = request_failure(&err);
-            fail(code, &message);
+            fail(&code, &message);
         }
     };
     if let IpcResponse::Error { code, message } = resp {
@@ -594,7 +650,25 @@ async fn probe_head(
     need: Option<(u32, &str)>,
 ) -> anyhow::Result<Head> {
     let socket = paths.socket_file();
-    match pastor::ipc::ping_head(&socket).await {
+    let ping = match pastor::ipc::remote_head() {
+        // A remote head is never absent: the command must not fall back to
+        // this machine's files, so no answer stops it.
+        Some(remote) => {
+            let line = pastor::ipc::request_line(&IpcRequest::Ping, None)?;
+            match remote.request(&line, pastor::head::PING_TIMEOUT).await {
+                Ok(IpcResponse::Pong { version, protocol }) => HeadPing::Pong { version, protocol },
+                Ok(other) => {
+                    return Err(CliError::err(
+                        "head_unresponsive",
+                        format!("the head on {} answered ping with {other:?}", remote.ssh),
+                    ));
+                }
+                Err(err) => return Err(pastor::head::failure(&err)),
+            }
+        }
+        None => pastor::ipc::ping_head(&socket).await,
+    };
+    match ping {
         HeadPing::NotRunning => Ok(Head::Absent),
         HeadPing::Unresponsive => Err(pastor::cli::CliError::err(
             "head_unresponsive",
@@ -669,6 +743,59 @@ fn head_use(command: &Command) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+/// How `command` runs while a remote head is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteRoute {
+    /// Through the head, over ssh: every file it needs is the head's.
+    Head,
+    /// Here, without the head, on purpose: connectors are this machine's,
+    /// and attach goes to the machine directly.
+    Here,
+    /// `pastor serve`: a second head.
+    Serve,
+    /// Not moved behind the head yet: it would read or edit this machine's
+    /// files, so it is refused rather than act on the wrong ones.
+    Unsupported,
+}
+
+fn remote_route(command: &Command) -> RemoteRoute {
+    match command {
+        Command::Task {
+            cmd: TaskCmd::Attach { .. },
+        } => RemoteRoute::Here,
+        Command::Task { .. }
+        | Command::Machine {
+            cmd: MachineCmd::List { .. },
+        }
+        | Command::Tick(_)
+        | Command::Job {
+            cmd: JobCmd::List { .. } | JobCmd::Run { .. } | JobCmd::Reload,
+        } => RemoteRoute::Head,
+        Command::Completions { .. }
+        | Command::Setup { .. }
+        | Command::Head { .. }
+        | Command::Bridge
+        | Command::Connector { .. } => RemoteRoute::Here,
+        Command::Serve => RemoteRoute::Serve,
+        _ => RemoteRoute::Unsupported,
+    }
+}
+
+/// The subcommand words the command line named (`machine add`), for a
+/// message about it.
+fn command_path() -> String {
+    let Ok(m) = <Cli as clap::CommandFactory>::command().try_get_matches() else {
+        return "?".into();
+    };
+    let mut words = Vec::new();
+    let mut cur = &m;
+    while let Some((name, sub)) = cur.subcommand() {
+        words.push(name.to_string());
+        cur = sub;
+    }
+    words.join(" ")
 }
 
 /// Whether `command` changes the fleet: the CLI's side of
@@ -850,7 +977,13 @@ fn run_prompt(a: &RunArgs) -> anyhow::Result<String> {
 
 async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     let prompt = run_prompt(&a)?;
-    let config = PastorConfig::load(&paths.config_file())?;
+    // With a remote head, pastor.toml is the head's and not here: the built-in
+    // defaults fill the spec, and the head resolves the agent again with its own.
+    let config = if pastor::ipc::remote_head().is_some() {
+        PastorConfig::default()
+    } else {
+        PastorConfig::load(&paths.config_file())?
+    };
     let spec = run_spec(&a, &config)?;
     let IpcResponse::Task(t) = ask(
         paths,
@@ -1058,6 +1191,17 @@ fn head_row() -> pastor::cli::HeadRow {
     pastor::cli::HeadRow::new(hostname, herdr_version)
 }
 
+/// A remote head's row: its ssh destination for the host and the version
+/// it answers ping with. Its herdr is not asked, so it reads `-`.
+async fn remote_head_row(paths: &Paths, ssh: &str) -> anyhow::Result<pastor::cli::HeadRow> {
+    let IpcResponse::Pong { version, .. } = ask(paths, IpcRequest::Ping).await? else {
+        unreachable!()
+    };
+    let mut row = pastor::cli::HeadRow::new(ssh.to_string(), None);
+    row.pastor_version = version;
+    Ok(row)
+}
+
 /// `machine list`: the head's view when it runs; otherwise a probe of each
 /// machine in flock.toml. The note that says so is printed only once
 /// everything worked, since a failure must leave exactly one JSON value on
@@ -1105,7 +1249,10 @@ async fn machine_list(
         .filter(|m| flock.is_none_or(|n| m.flock == n))
         .collect();
     pastor::cli::head_machine_first(&mut rows);
-    let head = head_row();
+    let head = match pastor::ipc::remote_head() {
+        Some(remote) => remote_head_row(paths, &remote.ssh).await?,
+        None => head_row(),
+    };
     if let Some(note) = note {
         eprintln!("{note}");
     }
@@ -1197,8 +1344,15 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
         // editor's delete-and-rename, or a race with `machine add|remove`
         // rewriting it) must mark nothing, not everything (Copilot
         // 4103271200, 4103271289, 4103271156).
-        if let Ok(flock) = Flock::load_existing(&paths.flock_file()) {
-            pastor::cli::mark_removed(&mut rows, &tasks, &flock);
+        // A remote head's flock.toml is not here: its machines are what it
+        // reports.
+        if pastor::ipc::remote_head().is_some() {
+            let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
+                unreachable!()
+            };
+            pastor::cli::mark_removed(&mut rows, &tasks, |m| ms.iter().any(|s| s.name == m));
+        } else if let Ok(flock) = Flock::load_existing(&paths.flock_file()) {
+            pastor::cli::mark_removed(&mut rows, &tasks, |m| flock.get(m).is_some());
         }
         println!("{}", pastor::cli::table(&pastor::cli::TASK_HEADER, &rows));
     }

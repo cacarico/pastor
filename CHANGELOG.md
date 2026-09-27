@@ -15,6 +15,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `last_output`, the last lines read from the agent's pane. A failure or
   timeout is logged, emitted as `connector.finish_failed` and never changes
   the task. `connector describe` shows the command.
+- `pastor head set <dest> [--pastor PATH] [--force]`, `pastor head show
+  [--json]` and `pastor head unset`: the CLI can use a head on another
+  machine, over ssh and `pastor bridge`. The setting is `[head]` in
+  `~/.config/pastor/client.toml`; `PASTOR_HEAD` and a global `--head <dest>`
+  override it. `head set` pings the head first and refuses with
+  `head_unreachable`, `no_head` or `head_too_old` unless `--force`. With a
+  remote head, `task` commands (but `attach`), `machine list`, `tick` and
+  `job list|run|reload` go to it; other commands that would act on local
+  files fail with `remote_head_unsupported`, and `pastor serve` refuses to
+  start.
 
 ### Changed
 
