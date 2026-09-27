@@ -649,7 +649,9 @@ A record, which is also what connector event hooks get on stdin:
 - `seq`: the record's number, from 1. It only grows, never repeats, and
   carries on across restarts of the head and rotations of the log (the last
   one given is kept in the head's database). Lines written before pastor
-  numbered records read as 0.
+  numbered records read as 0, and so does a record built after that if the
+  head's database cannot hand out a number for it; consumers must not assume
+  every new record has a positive `seq`.
 - `at`: when the daemon received the event, RFC 3339 UTC.
 - `type`: `task.queued|running|blocked|done|stale|failed|closed`,
   `task.input` (`pastor task send`), `task.trusted` (the head answered a
