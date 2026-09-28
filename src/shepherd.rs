@@ -552,4 +552,40 @@ mod tests {
             "{err}"
         );
     }
+
+    /// The same refusal for `[dispatch] preempt = true`: a head before
+    /// `PREEMPT_PROTOCOL` does not know the field and its `DispatchTable`
+    /// would refuse the whole `JobSubmit` as `invalid_dispatch` instead of
+    /// this clear `head_too_old`.
+    #[tokio::test]
+    async fn submit_to_head_refuses_a_head_that_predates_preempt() {
+        let old_head: Ask = Arc::new(|req| {
+            Box::pin(async move {
+                assert!(matches!(req, IpcRequest::Ping), "{req:?}");
+                Ok(IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol: crate::ipc::PREEMPT_PROTOCOL - 1,
+                    role: None,
+                })
+            })
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let fleet = Fleet::headless(store, old_head);
+        let job = crate::config::job::Job::parse(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\npreempt = true\nprompt = \"p\"\n",
+            "x",
+            &crate::config::Defaults::default(),
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let err = fleet
+            .submit_to_head(&job, vec![serde_json::json!({})])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliError>().map(|e| e.code.as_str()),
+            Some("head_too_old"),
+            "{err}"
+        );
+    }
 }

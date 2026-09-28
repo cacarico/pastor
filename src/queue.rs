@@ -158,6 +158,7 @@ fn why_waiting(
             Some(v) if !v.healthy => format!("{by}machine {m} is not connected"),
             Some(v) if v.has_room(claim) => {
                 v.live += 1;
+                v.live_jobs += usize::from(task.from_job());
                 format!("next pass: resumes on {m}")
             }
             Some(v) => format!("{by}machine {m} is full ({}/{})", v.live, v.max_agents),
@@ -282,6 +283,26 @@ mod tests {
         assert_eq!(
             whys(vec![task(1, None, None), task(2, None, None)], &views),
             ["next pass: a has room", "flock default is full"]
+        );
+    }
+
+    /// A paused job task that the simulation resumes takes the machine's
+    /// one job slot, so a job task queued behind it reads that slot as
+    /// taken instead of still free.
+    #[test]
+    fn a_resumed_paused_job_task_takes_the_job_slot_in_the_simulation() {
+        let mut paused = task(3, Some("default"), None);
+        paused.job = "board".into();
+        paused.state = TaskState::Paused;
+        paused.machine = Some("b".into());
+        let mut behind = task(4, Some("default"), None);
+        behind.job = "board".into();
+        let mut b = view("b", "default", 0, 0, true);
+        b.job_slots = 1;
+        assert_eq!(
+            whys(vec![paused, behind], &[b]),
+            ["next pass: resumes on b", "flock default is full",],
+            "the job slot the paused task takes is not free twice"
         );
     }
 

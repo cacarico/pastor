@@ -1006,6 +1006,23 @@ impl Fleet {
                 other => anyhow::bail!("the head answered a ping with {other:?}"),
             }
         }
+        // `preempt` rides in `dispatch` the same way; the head's
+        // `DispatchTable` refuses an unknown field, so a head before
+        // `PREEMPT_PROTOCOL` would answer an opaque `invalid_dispatch`
+        // instead of this clear refusal.
+        if job.preempt {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::PREEMPT_PROTOCOL,
+                    "a job with preempt",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
         let reply = forward(IpcRequest::JobSubmit {
             job: job.name.clone(),
             dispatch: job.dispatch.clone(),
@@ -7433,6 +7450,42 @@ mod tests {
             let again = start(&d, run("crit 2", spec(), Priority::Critical, true)).await;
             assert_eq!(again.state, TaskState::Queued);
             assert_eq!(get(&d, low.id).state, TaskState::Running);
+        }
+
+        /// Two low tasks paused for two critical ones, both pinned to the
+        /// same machine: closing only one critical frees a single slot, and
+        /// `dispatch_queued` resumes exactly one paused task, not both. Each
+        /// `resume_paused` call reads a fresh `views()` after the previous
+        /// one's actor has replied (`refresh_live` runs before the reply),
+        /// so the second sees the slot the first just took.
+        #[tokio::test]
+        async fn only_one_of_two_paused_tasks_resumes_into_one_freed_slot() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
+            let low1 = start(&d, run("low1", spec(), Priority::Low, false)).await;
+            let low2 = start(&d, run("low2", spec(), Priority::Low, false)).await;
+            assert_eq!(low1.state, TaskState::Running);
+            assert_eq!(low2.state, TaskState::Running);
+            let crit1 = start(&d, run("crit1", spec(), Priority::Critical, true)).await;
+            let crit2 = start(&d, run("crit2", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit1.state, TaskState::Running);
+            assert_eq!(crit2.state, TaskState::Running);
+            assert_eq!(get(&d, low1.id).state, TaskState::Paused);
+            assert_eq!(get(&d, low2.id).state, TaskState::Paused);
+
+            // Free exactly one slot.
+            d.handle(IpcRequest::TaskClose {
+                id: crit1.id,
+                remove_worktree: false,
+            })
+            .await;
+            d.fleet().dispatch_queued().await;
+
+            let states = [get(&d, low1.id).state, get(&d, low2.id).state];
+            let running = states.iter().filter(|s| **s == TaskState::Running).count();
+            let paused = states.iter().filter(|s| **s == TaskState::Paused).count();
+            assert_eq!(running, 1, "only one freed slot, only one may resume");
+            assert_eq!(paused, 1, "the other stays paused");
         }
 
         /// A resume whose agent does not come up fails the task, as any
