@@ -12,9 +12,9 @@ cmd = "pastor flock list"
 
 [[act.step]]
 out = '''
-NAME      DEFAULT  MACHINES                AGENTS  QUEUED
-personal  yes      desk 1/2, server-1 2/3  3       0
-work      no       laptop 0/2              0       0'''
+NAME     DEFAULT  MACHINES                AGENTS  QUEUED
+default  yes      desk 1/2, server-1 2/3  3       0
+sandbox  no       sandbox-1 0/1           0       0'''
 
 [[act.step]]
 cmd = '''
@@ -22,17 +22,17 @@ pastor task run "Fix the flaky login test" --repo '~/src/app' --worktree --model
 
 [[act.step]]
 out = '''
-ID    STATE   PRIORITY  MACHINE  FLOCK     AGENT   MODEL   JOB  AGE  NOTE
-t-12  queued  normal    -        personal  claude  sonnet  run  0s   Fix the flaky login test'''
+ID    STATE   PRIORITY  MACHINE  FLOCK    AGENT   MODEL   JOB  AGE  NOTE
+t-12  queued  normal    -        default  claude  sonnet  run  0s   Fix the flaky login test'''
 
 [[act.step]]
 cmd = '''
-pastor task run "Triage the new issues" --repo '~/src/tracker' --flock work --priority high'''
+pastor task run "Triage the new issues" --repo '~/src/tracker' --flock sandbox --priority high'''
 
 [[act.step]]
 out = '''
-ID    STATE   PRIORITY  MACHINE  FLOCK  AGENT   MODEL  JOB  AGE  NOTE
-t-13  queued  high      -        work   claude  -      run  0s   Triage the new issues'''
+ID    STATE   PRIORITY  MACHINE  FLOCK    AGENT           MODEL  JOB  AGE  NOTE
+t-13  queued  high      -        sandbox  claude-sandbox  -      run  0s   Triage the new issues'''
 
 [[act.step]]
 cmd = "pastor job run morning"
@@ -45,21 +45,21 @@ cmd = "pastor queue"
 
 [[act.step]]
 out = '''
-POS  TASK  LEVEL   WHERE           FROM         WAITED  WHY NOT YET
-1    t-15  normal  flock personal  job morning  6s      flock personal is full
-2    t-16  normal  flock personal  job morning  6s      flock personal is full'''
+POS  TASK  LEVEL   WHERE          FROM         WAITED  WHY NOT YET
+1    t-15  normal  flock default  job morning  6s      flock default is full
+2    t-16  normal  flock default  job morning  6s      flock default is full'''
 
 [[act.step]]
 cmd = "pastor task list"
 
 [[act.step]]
 out = '''
-ID    STATE    PRIORITY  MACHINE   FLOCK     AGENT   MODEL   JOB      AGE  NOTE
-t-12  running  normal    server-1  personal  claude  sonnet  run      1m   Fix the flaky login test
-t-13  blocked  high      laptop    work      claude  -       run      1m   agent asked: label them as bugs, or ask first?
-t-14  running  normal    desk      personal  claude  -       morning  40s  Update the dependencies
-t-15  queued   normal    -         personal  claude  -       morning  40s  Run the test suite
-t-16  queued   normal    -         personal  claude  -       morning  40s  Sort the inbox notes'''
+ID    STATE    PRIORITY  MACHINE    FLOCK    AGENT           MODEL   JOB      AGE  NOTE
+t-12  running  normal    server-1   default  claude          sonnet  run      1m   Fix the flaky login test
+t-13  blocked  high      sandbox-1  sandbox  claude-sandbox  -       run      1m   agent asked: 2 issues look like spam, skip them?
+t-14  running  normal    desk       default  claude          -       morning  40s  Update the dependencies
+t-15  queued   normal    -          default  claude          -       morning  40s  Run the test suite
+t-16  queued   normal    -          default  claude          -       morning  40s  Sort the inbox notes'''
 
 [[act]]
 label = "Running commands by hand is cool, but pastor is even more powerful in the hands of agents."
@@ -73,19 +73,19 @@ cmd = "pastor task list --blocked --json | jq -c '.[] | {id, state, error}'"
 
 [[act.step]]
 out = '''
-{"id":13,"state":"blocked","error":"agent asked: label them as bugs, or ask first?"}'''
+{"id":13,"state":"blocked","error":"agent asked: 2 issues look like spam, skip them?"}'''
 
 [[act.step]]
 cmd = "pastor task read t-13 --lines 3"
 
 [[act.step]]
 out = '''
-  Found 4 new issues. 3 are crashes with a stack trace.
-  Label them as bugs, or ask first?'''
+  Read 6 new issues: 4 bugs with steps to reproduce, summarised above.
+  2 look like spam (a link and no details). Skip them?'''
 
 [[act.step]]
 cmd = '''
-pastor task send t-13 "label them as bugs"'''
+pastor task send t-13 "yes, skip them"'''
 
 [[act.step]]
 out = "sent text and 1 key to t-13"
@@ -96,8 +96,8 @@ pastor task run "Address the review on #42" --repo '~/src/app' --worktree --mode
 
 [[act.step]]
 out = '''
-ID    STATE   PRIORITY  MACHINE  FLOCK     AGENT   MODEL   JOB  AGE  NOTE
-t-17  queued  normal    -        personal  claude  sonnet  run  0s   Address the review on #42'''
+ID    STATE   PRIORITY  MACHINE  FLOCK    AGENT   MODEL   JOB  AGE  NOTE
+t-17  queued  normal    -        default  claude  sonnet  run  0s   Address the review on #42'''
 
 [[act.step]]
 cmd = '''
@@ -105,11 +105,11 @@ pastor task run "CI is red on main: find out why" --repo '~/src/app' --priority 
 
 [[act.step]]
 out = '''
-ID    STATE   PRIORITY  MACHINE  FLOCK     AGENT   MODEL  JOB  AGE  NOTE
-t-18  queued  critical  -        personal  claude  -      run  0s   CI is red on main: find out why'''
+ID    STATE   PRIORITY  MACHINE  FLOCK    AGENT   MODEL  JOB  AGE  NOTE
+t-18  queued  critical  -        default  claude  -      run  0s   CI is red on main: find out why'''
 
 [[act.step]]
 report = '''
-t-13 asked about labels; I told it to label them as bugs.
+t-13 asked about two spam issues in the sandbox; I told it to skip them.
 The review on #42 is being addressed in t-17.
 CI on main is red: t-18 jumped the queue and paused a low task. Nothing needs you yet.'''
