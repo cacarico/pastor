@@ -633,11 +633,7 @@ fn main() {
                 ),
             );
         }
-        // A remote head refuses what its own `agents_change_fleet` and the
-        // task's role forbid; this machine's pastor.toml and store have no
-        // say in it.
-        let head_decides = remote.is_some() && remote_route(&command) == RemoteRoute::Head;
-        if !head_decides
+        if !head_decides(&paths, &command, remote.is_some())
             && changes_fleet(&command)
             && !ends_own_task(&command, &task)
             && !orchestrator_may(&command)
@@ -654,7 +650,10 @@ fn main() {
         // Commands that never talk to the head do not read `head`, and with a
         // remote head, commands that stay here on purpose do not ask it.
         let head_use = match remote_route(&command) {
-            RemoteRoute::Here if remote.is_some() => None,
+            RemoteRoute::Here if remote.is_some() && !reads_head_files(&command) => None,
+            // Attach and open go to the machine directly, but ask a remote
+            // head for the task and its files, so it must answer.
+            RemoteRoute::Here if remote.is_some() => Some(false),
             // What a local head leaves to the files here (`flock default
             // show`, `profile`) is fetched from a remote head, so it must
             // answer.
@@ -670,9 +669,7 @@ fn main() {
                 // by this machine's serve: the head only supplies its recent
                 // tasks, so a protocol need that is only about the file
                 // request (`needs_file_protocol`) does not apply to it.
-                let local_job_route = remote.is_some()
-                    && matches!(&command, Command::Job { cmd }
-                        if job_name(cmd).is_some_and(|name| is_local_job(&paths, name)));
+                let local_job_route = remote.is_some() && names_local_job(&paths, &command);
                 probe_head(
                     &paths,
                     // A remote head's flock.toml is not here to read.
@@ -1113,13 +1110,38 @@ fn remote_route(command: &Command) -> RemoteRoute {
     }
 }
 
+/// Whether a remote head, not this machine, judges whether the task
+/// calling may run `command`: the head refuses what its own
+/// `agents_change_fleet` and the task's role forbid, and this machine's
+/// pastor.toml and store have no say in it. A job whose file is here is
+/// not the head's: `job()` runs and edits it here, so the guard here
+/// applies.
+fn head_decides(paths: &Paths, command: &Command, remote: bool) -> bool {
+    remote && remote_route(command) == RemoteRoute::Head && !names_local_job(paths, command)
+}
+
+/// Whether `command` is a `job` command naming a job whose file is on this
+/// machine (`is_local_job`), which `job()` hands to `local_job` when the
+/// head is elsewhere.
+fn names_local_job(paths: &Paths, command: &Command) -> bool {
+    matches!(command, Command::Job { cmd }
+        if job_name(cmd).is_some_and(|name| is_local_job(paths, name)))
+}
+
 /// Whether `command`, sent to a remote head, fetches one of its files
-/// (`head_file`) where a local head's CLI would read the file here: it
-/// needs `FILE_PROTOCOL`.
+/// (`head_file`) or its task where a local head's CLI would read them
+/// here: it needs `FILE_PROTOCOL`. Attach and open stay here, but still
+/// ask the head.
 fn reads_head_files(command: &Command) -> bool {
     matches!(
         command,
         Command::Profile { .. }
+            | Command::Task {
+                cmd: TaskCmd::Attach { .. }
+            }
+            | Command::Machine {
+                cmd: MachineCmd::Open { .. }
+            }
             | Command::Flock {
                 cmd: FlockCmd::List { .. }
                     | FlockCmd::Default {
@@ -4580,6 +4602,42 @@ mod tests {
         let refused = spans(&refused);
         assert_eq!(refused[0], "machine authorized-key");
         assert!(matches!(route(&refused[0]), RemoteRoute::Unsupported(_)));
+    }
+
+    /// A job whose file is here runs and is edited here, not by the remote
+    /// head, so the caller's guard here applies to it; the head's own jobs
+    /// are the head's to judge.
+    #[test]
+    fn a_local_job_is_not_the_remote_heads_to_judge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        std::fs::write(paths.jobs_dir().join("here.toml"), "").unwrap();
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        for verb in ["run", "edit", "enable", "disable"] {
+            let here = parse(&["pastor", "job", verb, "here"]);
+            assert!(!head_decides(&paths, &here, true), "{verb}");
+            let theirs = parse(&["pastor", "job", verb, "theirs"]);
+            assert!(head_decides(&paths, &theirs, true), "{verb}");
+            assert!(!head_decides(&paths, &theirs, false), "{verb}");
+        }
+        assert!(head_decides(
+            &paths,
+            &parse(&["pastor", "job", "list"]),
+            true
+        ));
+    }
+
+    /// Attach and open stay here with a remote head, but ask it for the
+    /// task and its files, so they are probed for `FILE_PROTOCOL`.
+    #[test]
+    fn attach_and_open_read_the_remote_heads_files() {
+        for words in ["task attach", "machine open"] {
+            let command = sample_command(words);
+            assert_eq!(remote_route(&command), RemoteRoute::Here, "{words}");
+            assert!(reads_head_files(&command), "{words}");
+        }
+        assert!(!reads_head_files(&sample_command("completions")));
     }
 
     /// A parsed command for `words`, with what its required arguments need.

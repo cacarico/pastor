@@ -2237,7 +2237,8 @@ Local on purpose, as with no head set: `completions`, `setup`, `head`,
 (this machine's pastor.toml, which its headless serve reads), and
 `task attach` and `machine open`: they go to the machine directly, but ask
 the head for the task, its flock.toml and its pastor.toml instead of
-reading this machine's. The head's own machine, the local one in its
+reading this machine's, so they need the head up and at IPC protocol 6 or
+later. The head's own machine, the local one in its
 flock.toml, is reached at the head's ssh destination.
 
 Every other command runs on the head only. `machine authorized-key` prints a

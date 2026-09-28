@@ -29,8 +29,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   task, its flock.toml and pastor.toml; the head's own machine is reached at
   the head's ssh destination. `config edit --local` edits this machine's
   pastor.toml. `machine authorized-key` stays on the head and is refused
-  here, naming it. `flock list`, `flock default show` and `profile` need a
-  remote head speaking IPC protocol 6.
+  here, naming it. `flock list`, `flock default show`, `profile`, `task
+  attach` and `machine open` need a remote head speaking IPC protocol 6.
 - The manual has a "Moving the head" runbook.
 - A `critical` task started with `--preempt` (or `preempt = true` under a
   job's `[dispatch]`) that finds its machines full, job slots and burst
