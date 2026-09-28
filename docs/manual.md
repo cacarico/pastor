@@ -950,7 +950,8 @@ the lists in its pane's env instead, as `OPENCODE_PERMISSION`, the JSON
 opencode merges over its config's `permission`, and starts with no
 permission args. pastor writes the patterns in opencode's terms: everything
 is denied first (`"*": "deny"`), so a tool the lists do not allow is refused,
-not asked about; then each allowed tool, then each denied one, since opencode
+not asked about, except under `unrestricted`, which starts from
+`"*": "allow"` so tools with no Claude name, such as MCP ones, stay open; then each allowed tool, then each denied one, since opencode
 takes the last rule that matches. `Read` is opencode's `read` and `list`,
 `Glob` `glob`, `Grep` `grep`, `Edit`, `Write` and `NotebookEdit` `edit`,
 `Bash` `bash`, `WebFetch` `webfetch`, `WebSearch` `websearch` and `Task`

@@ -24,7 +24,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the whole log.
 - Profiles reach opencode tasks: an opencode agent under a profile gets the
   lists as `OPENCODE_PERMISSION` in its pane, in opencode's terms and denying
-  what they do not allow, with `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and
+  what they do not allow (under `unrestricted`, allowing it), with `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and
   `OPENCODE_CONFIG_CONTENT` set empty, so it never stops at a permission
   prompt (a profiled opencode task was `agent_tools_unsupported` before).
   A machine whose own opencode config has permission rules fails such a task

@@ -1311,7 +1311,7 @@ mod tests {
         let env = fake.pane_env(t.pane_id.as_deref().unwrap());
         assert_eq!(
             env["OPENCODE_PERMISSION"],
-            crate::config::opencode::permission_json(&t.spec.allow, &t.spec.deny)
+            crate::config::opencode::permission_json(&t.spec.allow, &t.spec.deny, false)
         );
         assert_eq!(env["OPENCODE_CONFIG"], "");
         let start = fake.requests();

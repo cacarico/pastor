@@ -79,11 +79,13 @@ fn translate(pattern: &str) -> Vec<(&'static str, Vec<String>)> {
 ///
 /// opencode takes the last rule that matches, in the object's order, and
 /// asks about nothing a rule denies, so the object opens with `"*": "deny"`
-/// (a tool no pattern allows is refused, not asked about), then each
+/// (a tool no pattern allows is refused, not asked about), or with
+/// `"*": "allow"` when `open` (profile `unrestricted`, every tool: opencode
+/// has tools no Claude name maps to, such as MCP ones), then each
 /// permission with its allows before its denies. A permission with only
 /// `*` is written as its action alone. Built by hand, since the order is
 /// the meaning and serde_json sorts its maps.
-pub fn permission_json(allow: &[String], deny: &[String]) -> String {
+pub fn permission_json(allow: &[String], deny: &[String], open: bool) -> String {
     let mut order: Vec<&'static str> = vec![];
     let mut rules: BTreeMap<&'static str, Vec<(String, &'static str)>> = BTreeMap::new();
     let mut add = |perm: &'static str, pattern: String, action: &'static str| {
@@ -109,7 +111,8 @@ pub fn permission_json(allow: &[String], deny: &[String]) -> String {
         }
     }
     let quote = |s: &str| serde_json::to_string(s).unwrap_or_default();
-    let mut out = format!("{{{}:{}", quote("*"), quote("deny"));
+    let fallback = if open { "allow" } else { "deny" };
+    let mut out = format!("{{{}:{}", quote("*"), quote(fallback));
     for perm in order {
         let list = &rules[perm];
         let value = match list.as_slice() {
@@ -156,7 +159,7 @@ mod tests {
         let review = crate::config::profile::Profiles::default()
             .resolve("review")
             .unwrap();
-        let json = permission_json(&review.allow, &review.deny);
+        let json = permission_json(&review.allow, &review.deny, false);
         assert!(json.starts_with(r#"{"*":"deny","#), "{json}");
         let v = parse(&json);
         assert_eq!(v["todowrite"], "allow");
@@ -179,6 +182,7 @@ mod tests {
         let json = permission_json(
             &strings(&["Bash", "Edit", "Bash(sudo:*)", "Read(~/.ssh/**)"]),
             &strings(&["Bash(sudo:*)", "Write", "Read(~/.ssh/**)"]),
+            false,
         );
         assert_eq!(
             json,
@@ -191,11 +195,25 @@ mod tests {
     /// denied; the `*` deny already covers it.
     #[test]
     fn unknown_tools_add_nothing() {
-        let json = permission_json(&strings(&["mcp__x", "Foo(bar)"]), &strings(&["Baz"]));
+        let json = permission_json(&strings(&["mcp__x", "Foo(bar)"]), &strings(&["Baz"]), false);
         assert_eq!(
             json,
             r#"{"*":"deny","todoread":"allow","todowrite":"allow"}"#
         );
+    }
+
+    /// `unrestricted` denies nothing, so the fallback is allow: `task`, MCP
+    /// tools and any other permission no Claude name maps to stay open.
+    #[test]
+    fn unrestricted_allows_what_it_does_not_name() {
+        let open = crate::config::profile::Profiles::default()
+            .resolve(crate::config::profile::UNRESTRICTED)
+            .unwrap();
+        let json = permission_json(&open.allow, &open.deny, true);
+        assert!(json.starts_with(r#"{"*":"allow","#), "{json}");
+        let v = parse(&json);
+        assert!(v.get("task").is_none(), "{json}");
+        assert_eq!(v["bash"], "allow");
     }
 
     /// A `"permission"` key in any of the files is a yes; the word as a

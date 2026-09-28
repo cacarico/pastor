@@ -994,7 +994,11 @@ impl Agents {
             }
             env.insert(
                 opencode::PERMISSION_ENV.into(),
-                opencode::permission_json(&spec.allow, &spec.deny),
+                opencode::permission_json(
+                    &spec.allow,
+                    &spec.deny,
+                    spec.profile() == Some(profile::UNRESTRICTED),
+                ),
             );
         }
         Ok(Launch {
@@ -2274,7 +2278,7 @@ mod tests {
         assert_eq!(launch.args, vec!["--model", "m"]);
         assert_eq!(
             launch.env["OPENCODE_PERMISSION"],
-            opencode::permission_json(&spec.allow, &spec.deny)
+            opencode::permission_json(&spec.allow, &spec.deny, false)
         );
         for key in opencode::CONFIG_ENV {
             assert_eq!(launch.env[key], "", "{key}");
