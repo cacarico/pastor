@@ -1415,10 +1415,10 @@ A record, which is also what connector event hooks get on stdin:
   turn on a question, `question`; on `connector.finish_failed`, `connector`
   (its id) and `reason` (why: the exit status and stderr tail, or a timeout);
   on `orchestrator.*`, `orchestrator` (its name) and: `lines` on `started`
-  (whose task is the record's `task`), `reason` on `skipped` (`busy`) and
-  `held` (`max_orchestrators`, with `max`, or `quota`, with `until`),
-  `until` on `quota`, and `stage` (`pre`, `agent` or `post`) and `error` on
-  `failed`.
+  (whose task is the record's `task`), `reason` on `skipped` (`busy` or
+  `post_pending`) and `held` (`max_orchestrators`, with `max`, or `quota`,
+  with `until`), `until` on `quota`, and `stage` (`pre`, `agent` or `post`)
+  and `error` on `failed`.
 - `summary`: on `task.done` and `task.failed`, how the round that just ended
   ended (see Task summaries): `round`, `outcome` (`done`, `partial`,
   `blocked`, `nothing to do`, `unknown`, or `no summary`), `text`, `source`
@@ -1595,8 +1595,9 @@ pastor task list --json | jq -r '.[] | select(.state == "blocked") | "TASK t-\(.
 A scheduled run:
 
 1. **Skip if busy.** While the last run's agent still works (queued,
-   starting, running, blocked or paused), the run is skipped, pre script
-   included, with `orchestrator.skipped`.
+   starting, running, blocked or paused), or its post script has not run
+   yet, the run is skipped, pre script included, with
+   `orchestrator.skipped`.
 2. **Pre.** The head runs `pre` in the file's directory with
    `PASTOR_ORCHESTRATOR=<name>`, `PASTOR_ORCHESTRATOR_STATE_DIR` (the
    orchestrator's scratch dir, kept between runs), `PASTOR_CONFIG_DIR`,
@@ -1607,7 +1608,7 @@ A scheduled run:
    its log, kept with its stdout under
    `~/.local/state/pastor/orchestrators/<name>/runs/`, with every `.env`
    value redacted. Exit 0 with no lines ends the run: no agent. An exit other
-   than 0, or a run past `timeout`, fails the run (`orchestrator.failed`,
+   than 0, a run past `timeout`, or more than 64 KiB of lines fails the run (`orchestrator.failed`,
    `stage: "pre"`): its lines are dropped and the orchestrator backs off as a
    failing job does, a minute doubling to an hour.
 3. **Agent.** With lines, one task with `role = "orchestrator"`, pinned to

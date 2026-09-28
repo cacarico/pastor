@@ -44,11 +44,12 @@ prompt = "Decide what to do with each line below."
 
 ## a run
 
-1. If the last run's agent still works, the run is skipped.
+1. If the last run's agent still works, or its post script has not run yet,
+   the run is skipped.
 2. The pre script runs on the head, with `PASTOR_ORCHESTRATOR` set to the
    orchestrator's name and a scratch dir in `PASTOR_ORCHESTRATOR_STATE_DIR`.
-   No lines: done, no agent. A failing script backs off, one minute doubling
-   to an hour.
+   No lines: done, no agent. A failing script, or one printing more than
+   64 KiB of lines, backs off, one minute doubling to an hour.
 3. With lines, one agent starts on the head's own machine with the role
    `orchestrator`, the handover note and every line.
 4. When that agent ends `done`, `failed` or `stale`, the post script runs once.

@@ -47,6 +47,12 @@ pub const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5 * 60);
 /// The longest handover note kept, in bytes; a longer one is cut.
 pub const NOTE_MAX: usize = 4096;
 
+/// The most a pre script may print, in bytes of kept lines. Its lines go
+/// into the agent's prompt and `state.json`, so a looping script must not
+/// grow either without bound; past this the run fails rather than hand the
+/// agent part of the list.
+pub const LINES_MAX_BYTES: usize = 64 * 1024;
+
 /// How long the head waits after a quota error whose message names no reset
 /// time.
 pub const QUOTA_WAIT: Duration = Duration::from_secs(3600);
@@ -435,7 +441,8 @@ pub enum RunOutcome {
     NoLines,
     /// An agent started with the lines.
     Started,
-    /// The last run's agent still worked: nothing ran.
+    /// The last run's agent still worked, or its post script had not run:
+    /// nothing ran.
     Skipped,
     /// Lines, but no agent: `max_orchestrators` or a quota wait.
     Held,
@@ -884,6 +891,9 @@ pub struct Runner {
     events: broadcast::Sender<PastorEvent>,
     entries: std::sync::Mutex<BTreeMap<String, Entry>>,
     locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held from counting working orchestrator agents to queueing one, so
+    /// runs of different orchestrators cannot both see a free slot.
+    admit: tokio::sync::Mutex<()>,
 }
 
 impl Runner {
@@ -900,6 +910,7 @@ impl Runner {
             events,
             entries: Default::default(),
             locks: Default::default(),
+            admit: Default::default(),
         })
     }
 
@@ -1203,6 +1214,30 @@ impl Runner {
             );
             return self.save_run(name, state, run);
         }
+        // `finish` left the last agent's post script pending (its task could
+        // not be read): a new agent would take its place in the state and
+        // the post script would never run.
+        if state.post_pending
+            && let Some(id) = state.task
+        {
+            tracing::warn!(
+                orchestrator = name,
+                task = id,
+                "run skipped: its last agent's post script waits"
+            );
+            run.outcome = RunOutcome::Skipped;
+            run.detail = Some(format!(
+                "the post script of {} has not run yet",
+                Task::agent_name_for(id)
+            ));
+            self.emit(
+                "skipped",
+                name,
+                Some(id),
+                serde_json::json!({"reason": "post_pending"}),
+            );
+            return self.save_run(name, state, run);
+        }
         let pre = self
             .script(orch, "pre", &sched.pre, sched.timeout, Vec::new())
             .await;
@@ -1247,6 +1282,7 @@ impl Runner {
             );
             return self.save_run(name, state, run);
         }
+        let _admit = self.admit.lock().await;
         let max = self.fleet.max_orchestrators() as usize;
         match working_orchestrators(&self.store) {
             Ok(n) if n >= max => {
@@ -1532,21 +1568,35 @@ impl Runner {
             timeout: Some(timeout),
         };
         let mut lines = Vec::new();
+        let mut kept = 0;
+        let mut overflow = false;
         let out_log = log.clone();
         let done = exec::run(inv, log.clone(), |line| {
             let mut l = out_log.lock().unwrap_or_else(|p| p.into_inner());
             l.line(&format!("stdout: {line}"));
             let clean = crate::template::strip_controls(&l.redact(line)).replace('\n', "");
-            if !clean.trim().is_empty() {
+            if clean.trim().is_empty() || overflow {
+                return;
+            }
+            kept += clean.len();
+            if kept > LINES_MAX_BYTES {
+                overflow = true;
+                lines.clear();
+            } else {
                 lines.push(clean);
             }
         })
         .await;
         Ok(ScriptRun {
-            result: if done.exit.success() {
-                Ok(lines)
-            } else {
+            result: if !done.exit.success() {
                 Err(done.reason())
+            } else if overflow {
+                Err(format!(
+                    "printed more than {} KiB of lines",
+                    LINES_MAX_BYTES / 1024
+                ))
+            } else {
+                Ok(lines)
             },
             log: Some(path),
         })
@@ -1919,6 +1969,77 @@ prompt = "You are the night orchestrator."
             TaskState::Done
         );
         assert_eq!(head.state().failures, 0);
+    }
+
+    #[tokio::test]
+    async fn a_pending_post_script_holds_the_next_run() {
+        let pre = "echo ran >> \"$PASTOR_ORCHESTRATOR_STATE_DIR/runs\"\necho 'PR #31'";
+        let mut head = Head::new(&scheduled(), pre, "");
+        let id = head.run().await.task.unwrap();
+        head.set_state(id, TaskState::Done);
+        head.kinds();
+        // As when `finish` could not read the task: the post script waits,
+        // and a new agent must not take the old one's place.
+        let run = head.runner.run(&head.orch(), Utc::now()).await;
+        assert_eq!(run.outcome, RunOutcome::Skipped, "{run:?}");
+        assert!(run.detail.unwrap().contains("post script"));
+        assert_eq!(head.kinds(), ["orchestrator.skipped"]);
+        let state = head.state();
+        assert_eq!(state.task, Some(id));
+        assert!(state.post_pending);
+        assert_eq!(state.lines, ["PR #31"]);
+        assert_eq!(head.tasks().len(), 1);
+        let runs = std::fs::read_to_string(
+            head.paths
+                .orchestrator_state_dir("merge")
+                .join("scratch/runs"),
+        )
+        .unwrap();
+        assert_eq!(runs.lines().count(), 1, "the pre script ran again");
+    }
+
+    #[tokio::test]
+    async fn a_pre_script_printing_too_much_fails_the_run() {
+        let pre = format!(
+            "i=0; while [ $i -lt {} ]; do echo 'PR #31 ci=failure'; i=$((i+1)); done",
+            LINES_MAX_BYTES / 16
+        );
+        let mut head = Head::new(&scheduled(), &pre, "");
+        let run = head.run().await;
+        assert_eq!(run.outcome, RunOutcome::Failed, "{run:?}");
+        assert!(run.lines.is_empty());
+        assert!(run.detail.as_deref().unwrap().contains("64 KiB"), "{run:?}");
+        assert!(head.tasks().is_empty());
+        assert_eq!(head.kinds(), ["orchestrator.failed"]);
+        assert!(head.state().lines.is_empty());
+        assert_eq!(head.state().failures, 1);
+    }
+
+    #[tokio::test]
+    async fn runs_of_two_orchestrators_share_the_limit() {
+        let head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        std::fs::write(head.dir.join("other.toml"), scheduled()).unwrap();
+        head.runner.reload(Utc::now());
+        // Queueing waits on the dispatch lock: held here, both runs reach
+        // it before either task exists, and only the limit's own lock keeps
+        // the second from counting the same free slot.
+        let pass = head.runner.fleet.hold_dispatch_lock().await;
+        let [a, b] = ["merge", "other"].map(|name| {
+            let runner = head.runner.clone();
+            let orch = runner.runnable(name).unwrap();
+            tokio::spawn(async move { runner.run_now(&orch).await })
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(pass);
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        let mut outcomes = [a.outcome, b.outcome];
+        outcomes.sort_by_key(|o| o.to_string());
+        assert_eq!(
+            outcomes,
+            [RunOutcome::Held, RunOutcome::Started],
+            "{a:?} {b:?}"
+        );
+        assert_eq!(head.tasks().len(), 1);
     }
 
     #[tokio::test]
