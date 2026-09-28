@@ -156,7 +156,7 @@ impl Job {
         let connector_config =
             serde_json::to_value(&file.connector.config).map_err(|e| e.to_string())?;
         catalog.check(&file.connector.use_, &connector_config)?;
-        let mut job = Job::from_dispatch(
+        Job::from_dispatch(
             name,
             schedule,
             file.enabled,

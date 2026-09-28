@@ -819,6 +819,7 @@ impl Fleet {
     }
 
     /// `queue_run`, for a task of `role` (`task run --role`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn queue_run_as(
         &self,
         prompt: String,
@@ -897,8 +898,13 @@ impl Fleet {
         );
         let level = (priority, from.as_deref());
         let description = job.task_description_for(item);
-        self.store
-            .insert_job_task_at(&job.name, &flock, item, level, description.as_deref(), |id| {
+        self.store.insert_job_task_at(
+            &job.name,
+            &flock,
+            item,
+            level,
+            description.as_deref(),
+            |id| {
                 let (prompt, mut spec) = render(id)?;
                 spec.agent = settled.agent;
                 spec.agent_args = settled.agent_args;
@@ -906,7 +912,8 @@ impl Fleet {
                 spec.deny = settled.deny;
                 spec.agent_source = settled.agent_source;
                 Ok((prompt, spec))
-            })
+            },
+        )
     }
 
     /// Whether job runs send their items to a head (`Fleet::headless`)
@@ -3436,6 +3443,7 @@ mod tests {
             agent: None,
             priority,
             role: TaskRole::Agent,
+            description: None,
         }
     }
 
@@ -3530,6 +3538,7 @@ mod tests {
             agent: None,
             priority,
             role: TaskRole::Agent,
+            description: None,
         };
         let level = |resp: IpcResponse| match resp {
             IpcResponse::Task(t) => (t.priority, t.priority_from.unwrap_or_default()),
@@ -4275,6 +4284,7 @@ mod tests {
             agent,
             priority,
             role,
+            description,
         } = run_model(None, None, machine)
         else {
             unreachable!()
@@ -4283,6 +4293,7 @@ mod tests {
             prompt,
             spec,
             flock,
+            description,
             agent: agent.map(|a| AgentChoice {
                 profile: profile.map(Into::into),
                 ..a
@@ -4368,6 +4379,7 @@ mod tests {
             agent,
             priority,
             role,
+            description,
         } = run_profile(Some("ci"), None)
         else {
             unreachable!()
@@ -4376,6 +4388,7 @@ mod tests {
             prompt,
             spec,
             flock,
+            description,
             agent: agent.map(|a| AgentChoice {
                 agent_args: Some(vec!["--permission-mode".into(), "bypassPermissions".into()]),
                 ..a
@@ -4444,7 +4457,7 @@ mod tests {
             panic!()
         };
         let text = crate::describe::machine_text(&m);
-        assert!(text.contains("profile:  unrestricted"), "{text}");
+        assert!(text.contains("profile:     unrestricted"), "{text}");
     }
 
     /// A profile dropped from pastor.toml while a task waits for a machine
@@ -4510,6 +4523,7 @@ mod tests {
                 agent: None,
                 priority: None,
                 role: Default::default(),
+                description: None,
             })
             .await
         else {
@@ -5674,6 +5688,7 @@ mod tests {
                     priority: None,
                     agents: Default::default(),
                     profile: None,
+                    description: None,
                 },
             },
             IpcRequest::TaskClose {
@@ -6090,6 +6105,7 @@ mod tests {
                     prompt: p.into(),
                     spec: spec(),
                     flock: "default".into(),
+                    description: None,
                 })
                 .unwrap()
         };

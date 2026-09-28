@@ -77,6 +77,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l place -d 'Where the agent\'s pane goes: repo (under the repo it works on), own (its own workspace), pastor (the `pastor` workspace) or pane:<workspace> (default: `[defaults] place`, else repo)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l role -d 'What the agent may change through the head: agent (read, and end its own task) or orchestrator (also run, retry and send to tasks and disable jobs). Only a person may start an orchestrator, never a task' -r -f -a "agent\t'Reads, and `task done` for its own task; everything else is refused unless `agents_change_fleet` is on'
 orchestrator\t'Also runs, retries and types into tasks and disables jobs (`IpcRequest::orchestrator_may`). Only a person makes one: `task run --role orchestrator` from outside any task'"
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l description -d 'One line on what the task is about, for `task list --wide` and `describe` (default: the prompt\'s first line)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l worktree -d 'A git worktree per task, branched from --repo (so it needs --repo)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l json -d 'Print as a JSON object'
@@ -88,6 +89,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l blocked -d 'Only blocked tasks, needing a human'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l done -d 'Only done tasks'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l all -d 'Every task, finished ones too (done, failed, stale, closed)'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -s w -l wide -d 'Add a DESCRIPTION column, cut to the terminal\'s width'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON array of full task records'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from describe" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
@@ -170,6 +172,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l burst -d 'How many past --max-agents a critical task may start; 0 for none' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l tag -d 'A label a task\'s --tag can ask for; repeat for more' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l flock -d 'The flock it joins (default: the default flock)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l description -d 'One line on what the machine is for, for `machine list --wide`' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l local -d 'This machine itself, through herdr\'s local socket; no ssh'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from add" -l herdr -d 'Also save it in herdr\'s sidebar (runs `herdr machine add`)'
@@ -181,6 +184,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from move" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from list" -l flock -d 'Only the machines of this flock' -r
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from list" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from list" -s w -l wide -d 'Add a DESCRIPTION column, cut to the terminal\'s width'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON object, {head, machines}: the head\'s row, then the machines'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand machine; and __fish_seen_subcommand_from describe" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
@@ -209,8 +213,10 @@ complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add remove default edit describe help" -f -a "describe" -d 'One flock in full: default or not, its agent, machines, live tasks'
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and not __fish_seen_subcommand_from list add remove default edit describe help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from list" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from list" -s w -l wide -d 'Add a DESCRIPTION column, cut to the terminal\'s width'
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON array'
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from add" -l description -d 'One line on what the flock is for, for `flock list --wide`' -r
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from add" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from add" -l default -d 'Make it the default flock too'
 complete -c pastor -n "__fish_pastor_using_subcommand flock; and __fish_seen_subcommand_from add" -s h -l help -d 'Print help'
@@ -249,6 +255,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -f -a "describe" -d 'One job in full: schedule, connector, dispatch, last runs, recent tasks'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -s w -l wide -d 'Add a DESCRIPTION column, cut to the terminal\'s width'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON array; with a head elsewhere, each job says `where` it lives (head or shepherd)'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from enable" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
@@ -341,6 +348,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from unlink" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from unlink" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from list" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from list" -s w -l wide -d 'Add a DESCRIPTION column, cut to the terminal\'s width'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON array'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from describe" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r

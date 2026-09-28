@@ -176,6 +176,7 @@ fn task(id: i64, state: TaskState) -> Task {
                 session_id: None,
             },
             flock: "default".into(),
+            description: None,
         })
         .unwrap();
     t.id = id;
@@ -196,6 +197,7 @@ fn job(name: &str, last: &str) -> JobStatus {
         next_due: None,
         running: false,
         flock: None,
+        description: None,
     }
 }
 

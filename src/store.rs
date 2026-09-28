@@ -2499,6 +2499,7 @@ mod tests {
                 "default",
                 &serde_json::json!({"key": "k"}),
                 (Priority::High, Some("job j")),
+                None,
                 |_| Ok(("p".into(), spec())),
             )
             .unwrap();

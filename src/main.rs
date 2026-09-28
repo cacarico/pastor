@@ -2331,7 +2331,7 @@ async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
     // With a head elsewhere, this machine's own jobs run in its headless
     // serve: the list shows both, and a job whose file is here is driven here.
     if let Some(remote) = pastor::ipc::remote_head() {
-        if let JobCmd::List { json } = cmd {
+        if let JobCmd::List { json, .. } = cmd {
             return shepherd_job_list(paths, &remote.ssh, json).await;
         }
         if job_name(&cmd).is_some_and(|name| is_local_job(paths, name)) {

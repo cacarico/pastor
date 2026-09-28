@@ -1377,6 +1377,7 @@ mod tests {
             next_due: None,
             running: false,
             flock: None,
+            description: None,
         }
     }
 

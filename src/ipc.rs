@@ -1225,6 +1225,7 @@ mod tests {
             agent: None,
             priority: None,
             role,
+            description: None,
         };
         let v = serde_json::to_value(run(TaskRole::Agent)).unwrap();
         assert!(v.get("role").is_none(), "{v}");
