@@ -391,6 +391,14 @@ async fn dispatch_steps(
         (None, Some(repo)) if spec.worktree => {
             let label = workspace_label(task, name);
             let (created, branch) = open_worktree(conn, &spec, repo, name, &label, resume).await?;
+            // `worktree.open` answering `already_open` means the checkout
+            // was already in a workspace another task opened: that
+            // workspace's label is unchanged by this task, so its own
+            // label, not the template just rendered, is what gets recorded.
+            if created.already_open {
+                task.spec.label.name = created.workspace.label.clone();
+                task.spec.label.note = Some(crate::task::JOINED_WORKSPACE.into());
+            }
             task.workspace_id = Some(created.workspace.workspace_id.clone());
             task.pane_id = Some(created.root_pane.pane_id.clone());
             task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
@@ -1851,6 +1859,43 @@ mod tests {
         assert_eq!(wt.params["cwd"], "/srv/app");
         assert_eq!(wt.params["branch"], "pastor/k1");
         assert_eq!(wt.params["label"], "home/t-7");
+    }
+
+    /// A retry's `worktree.open` can answer a workspace someone else already
+    /// has open on the checkout (`already_open`): that workspace's own
+    /// label, not the template this task just rendered, is what gets
+    /// recorded, and the task is marked as having joined it.
+    #[tokio::test]
+    async fn a_reopened_worktree_already_open_elsewhere_keeps_its_own_label() {
+        let fake = FakeHerdr::new();
+        fake.worktree_create("/srv/app", "pastor/k1", "seed")
+            .await
+            .unwrap();
+        let path = fake
+            .worktree_list("/srv/app")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|w| w.branch.as_deref() == Some("pastor/k1"))
+            .unwrap()
+            .path;
+        let mut t = task(DispatchSpec {
+            worktree: true,
+            reopen: Some(Box::new(Reopen {
+                branch: "pastor/k1".into(),
+                path,
+                agent: "someone-else".into(),
+            })),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.label.name.as_deref(), Some("seed"));
+        assert_eq!(
+            t.spec.label.note.as_deref(),
+            Some(crate::task::JOINED_WORKSPACE)
+        );
     }
 
     /// herdr takes `cwd` literally and opens the pane elsewhere when it does

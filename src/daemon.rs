@@ -1070,6 +1070,23 @@ impl Fleet {
                 other => anyhow::bail!("the head answered a ping with {other:?}"),
             }
         }
+        // A workspace label template rides in `dispatch` the same way; a
+        // head before `LABEL_PROTOCOL` would drop it (serde skips the
+        // unknown field) and name the workspace by its default instead of
+        // refusing.
+        if job.spec.label.template.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::LABEL_PROTOCOL,
+                    "a job naming a workspace label",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
         let reply = forward(IpcRequest::JobSubmit {
             job: job.name.clone(),
             dispatch: job.dispatch.clone(),
