@@ -1701,6 +1701,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 agent_args: None,
                 model: None,
                 priority: None,
+                agents: Default::default(),
             };
             // With a head the reload line comes with its answer, before the
             // herdr lines; without one it follows them.
@@ -2563,6 +2564,7 @@ async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> 
         row,
         session: m.session.clone(),
         model: m.model.clone(),
+        agents_by_kind: m.agents.clone(),
         tasks,
         recent_errors: pastor::describe::machine_errors(events_log(paths), name),
     };

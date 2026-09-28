@@ -121,6 +121,10 @@ pub struct MachineDescription {
     pub session: String,
     /// The machine's own `model`; `None` falls through to its flock's.
     pub model: Option<String>,
+    /// The machine's own `agents`, the agent per kind for a model of
+    /// another kind than its agent's. Missing from an older head.
+    #[serde(default)]
+    pub agents_by_kind: crate::config::KindAgents,
     /// The tasks whose agent holds a pane on it, newest first.
     pub tasks: Vec<Task>,
     /// Its recent `machine.*` events that carried an error, and its failed
@@ -139,6 +143,10 @@ pub struct FlockDescription {
     pub deny: Vec<String>,
     /// The flock's own `model`; `None` falls through to `[defaults]`.
     pub model: Option<String>,
+    /// The flock's own `agents`, as the machine's. Missing from an older
+    /// head.
+    #[serde(default)]
+    pub agents_by_kind: crate::config::KindAgents,
     pub machines: Vec<String>,
     /// Live agents on its machines; known only from a running head.
     pub agents: Option<usize>,
@@ -297,6 +305,7 @@ pub fn flock_description(
         allow: entry.allow,
         deny: entry.deny,
         model: entry.model,
+        agents_by_kind: entry.agents,
         machines: row.machines,
         agents: row.agents,
         tasks,
@@ -435,6 +444,19 @@ pub fn job_text(j: &JobDescription) -> String {
     out.join("\n")
 }
 
+/// An `agents` table as `kind=agent` words, or where the layer's lookup
+/// goes on to when it has none.
+fn by_kind(agents: &crate::config::KindAgents, next: &str) -> String {
+    if agents.is_empty() {
+        return format!("- (from {next})");
+    }
+    agents
+        .iter()
+        .map(|(kind, agent)| format!("{kind}={}", one_line(agent)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn machine_text(m: &MachineDescription) -> String {
     let r = &m.row;
     let room = crate::cli::capacity(r.max_agents, r.job_slots, r.burst);
@@ -454,6 +476,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
                 .clone()
                 .unwrap_or_else(|| "- (from its flock)".into()),
         ),
+        ("by kind", by_kind(&m.agents_by_kind, "its flock")),
         ("channel", r.channel.clone()),
         ("herdr", dash(r.herdr_version.clone())),
         ("protocol", dash(r.protocol.map(|p| p.to_string()))),
@@ -496,6 +519,7 @@ pub fn flock_text(f: &FlockDescription) -> String {
                 .clone()
                 .unwrap_or_else(|| "- (from [defaults])".into()),
         ),
+        ("by kind", by_kind(&f.agents_by_kind, "[defaults]")),
         ("machines", dash(Some(f.machines.join(",")))),
         ("agents", dash(f.agents.map(|n| n.to_string()))),
     ]);
@@ -668,12 +692,20 @@ mod tests {
             allow: vec![],
             deny: vec!["Bash(rm:*)".into()],
             model: Some("sonnet".into()),
+            agents_by_kind: Default::default(),
             machines: vec!["pi-1".into(), "pi-2".into()],
             agents: None,
             tasks: vec![],
         };
         let text = flock_text(&f);
         assert!(text.contains("agent:      - (from [defaults])"), "{text}");
+        assert!(text.contains("by kind:    - (from [defaults])"), "{text}");
+        let with = FlockDescription {
+            agents_by_kind: [("opencode".to_string(), "opencode".to_string())].into(),
+            ..f.clone()
+        };
+        let text = flock_text(&with);
+        assert!(text.contains("by kind:    opencode=opencode\n"), "{text}");
         assert!(text.contains("--model 'a b'"), "{text}");
         assert!(text.contains("model:      sonnet"), "{text}");
         assert!(text.contains("pi-1,pi-2"), "{text}");

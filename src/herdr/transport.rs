@@ -818,6 +818,7 @@ mod tests {
             agent_args: None,
             model: None,
             priority: None,
+            agents: Default::default(),
         }
     }
 
@@ -947,6 +948,7 @@ mod tests {
             agent_args: None,
             model: None,
             priority: None,
+            agents: Default::default(),
         };
         let paths = Paths::new("/tmp/c", "/tmp/s");
         let ep = Endpoint::from_machine(&m, &paths);
@@ -1436,6 +1438,7 @@ mod tests {
             agent_args: None,
             model: None,
             priority: None,
+            agents: Default::default(),
         };
         let paths = Paths::new("/tmp/c", &deep);
         let Endpoint::Ssh {

@@ -76,6 +76,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (MODEL, and `model` in `--json`), `flock describe`, `machine describe` and
   task events show it. The IPC protocol goes to 8, and every command that can
   make the head queue a task refuses an older head (`head_too_old`).
+- An agent per kind: `agents = { <kind> = "<agent>" }` on a `[[machine]]`
+  or `[[flock]]` in flock.toml, or under `[defaults]` in pastor.toml, names
+  the agent that runs a model whose kind differs from the default agent's.
+  The kind is looked up through the machine, the flock and `[defaults]`: a
+  layer's own `agent` of that kind, else its `agents` entry. An agent found
+  this way gets `agent_args` only from layers whose `agent` is that agent. An
+  unpinned task goes only to machines where the lookup finds one; with none
+  in the flock it waits and `task describe` says why. An entry whose agent
+  has another kind, or one for the kind of the layer's own agent, fails the
+  load. `task describe` shows `(from machine <m> agents.<kind>)`, and
+  `machine describe` and `flock describe` list the entry as `by kind`. An
+  older pastor refuses the key on a `[[flock]]`.
 - `docs/recommended-setup.md`: how to set up a fleet you'll keep. It covers
   flocks per account, least-privilege credentials for agent machines (a
   deploy key and a fine-grained token for one repository, so they can't
