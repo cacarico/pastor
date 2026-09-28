@@ -1430,7 +1430,11 @@ tags = ["fast"]
         f.check_config(&models, &Default::default(), &Default::default())
             .unwrap();
         let err = f
-            .check_config(&Default::default(), &Default::default(), &Default::default())
+            .check_config(
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+            )
             .unwrap_err()
             .to_string();
         assert!(

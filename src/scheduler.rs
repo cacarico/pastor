@@ -1175,8 +1175,12 @@ impl Scheduler {
             self.fleet.flock()
         } else {
             match Flock::load_existing(&files[1]).and_then(|f| {
-                f.check_config(&self.config.models, &self.config.agents, &self.config.profiles)
-                    .map(|()| f)
+                f.check_config(
+                    &self.config.models,
+                    &self.config.agents,
+                    &self.config.profiles,
+                )
+                .map(|()| f)
             }) {
                 Ok(f) => f,
                 Err(err) if is_not_found(&err) => {

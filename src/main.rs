@@ -1109,7 +1109,16 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if makes_orchestrator(command) {
+    if needs_agent_protocol(command) {
+        Some((
+            pastor::ipc::PROFILE_PROTOCOL,
+            if needs_place_protocol(command) {
+                "predates permission profiles and `task retry --place`, and would retry the task where it was, without them"
+            } else {
+                "predates permission profiles (or named models, flock agents and tool allow and deny lists), and would start the agent without them"
+            },
+        ))
+    } else if makes_orchestrator(command) {
         Some((
             pastor::ipc::ROLE_PROTOCOL,
             "predates task roles, and would start a plain agent instead of an orchestrator",
@@ -1119,34 +1128,25 @@ fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
             pastor::ipc::PRIORITY_PROTOCOL,
             "predates task priority, and would queue the task at its own level or refuse the request",
         ))
-    } else if needs_agent_protocol(command) {
+    } else if needs_head_reads_protocol(command) {
         Some((
-            pastor::ipc::PROFILE_PROTOCOL,
-            if needs_place_protocol(command) {
-                "predates permission profiles and `task retry --place`, and would retry the task where it was, without them"
-            } else {
-                "predates permission profiles (or named models, flock agents and tool allow and deny lists), and would start the agent without them"
-            },
-        ))
-    } else if needs_place_protocol(command) {
-        Some((
-            pastor::ipc::PLACE_PROTOCOL,
-            "predates `task retry --place` and would retry the task where it was",
+            pastor::ipc::HEAD_READS_PROTOCOL,
+            "predates this request through the head",
         ))
     } else if needs_file_protocol(command) {
         Some((
             pastor::ipc::FILE_PROTOCOL,
             "predates edits and job requests through the head, and would refuse them",
         ))
-    } else if needs_head_reads_protocol(command) {
-        Some((
-            pastor::ipc::HEAD_READS_PROTOCOL,
-            "predates this request through the head",
-        ))
     } else if matches!(command, Command::Events(_)) {
         Some((
             pastor::ipc::EVENTS_PROTOCOL,
             "predates reading the events log through the head",
+        ))
+    } else if needs_place_protocol(command) {
+        Some((
+            pastor::ipc::PLACE_PROTOCOL,
+            "predates `task retry --place` and would retry the task where it was",
         ))
     } else {
         None
@@ -2680,13 +2680,13 @@ mod tests {
         assert!(makes_orchestrator(&orch));
         assert_eq!(
             protocol_need(&orch).map(|(p, _)| p),
-            Some(pastor::ipc::ROLE_PROTOCOL)
+            Some(pastor::ipc::PROFILE_PROTOCOL)
         );
         let plain = parse(&["pastor", "task", "run", "x"]);
         assert!(!makes_orchestrator(&plain));
         assert_eq!(
             protocol_need(&plain).map(|(p, _)| p),
-            Some(pastor::ipc::MODEL_PROTOCOL)
+            Some(pastor::ipc::PROFILE_PROTOCOL)
         );
         assert!(Cli::try_parse_from(["pastor", "task", "run", "x", "--role", "boss"]).is_err());
         for argv in [
@@ -2830,7 +2830,7 @@ mod tests {
         let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
         assert_eq!(
             need(&["pastor", "task", "run", "hi", "--priority", "high"]),
-            Some(pastor::ipc::PRIORITY_PROTOCOL)
+            Some(pastor::ipc::PROFILE_PROTOCOL)
         );
         assert_eq!(
             need(&["pastor", "task", "priority", "t-1", "low"]),
@@ -2838,7 +2838,7 @@ mod tests {
         );
         assert_eq!(
             need(&["pastor", "task", "run", "hi"]),
-            Some(pastor::ipc::MODEL_PROTOCOL)
+            Some(pastor::ipc::PROFILE_PROTOCOL)
         );
         assert!(changes_fleet(&parse(&[
             "pastor", "task", "priority", "t-1", "low"

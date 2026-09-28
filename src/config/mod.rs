@@ -2060,7 +2060,7 @@ mod tests {
         let flock = |text: &str| {
             flock::Flock::parse(Path::new("flock.toml"), text)
                 .unwrap()
-                .check_config(&config.models, &config.agents)
+                .check_config(&config.models, &config.agents, &config.profiles)
         };
         flock(
             "[[flock]]\nname = \"p\"\ndefault = true\nagent = \"claude-personal\"\nagents = { opencode = \"opencode\" }\n",

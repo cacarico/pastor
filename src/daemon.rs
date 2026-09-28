@@ -932,6 +932,22 @@ impl Fleet {
                 other => anyhow::bail!("the head answered a ping with {other:?}"),
             }
         }
+        // A permission profile rides in `dispatch` the same way; a head
+        // before `PROFILE_PROTOCOL` would drop it (serde skips the unknown
+        // field) and start the agent unenforced instead of refusing.
+        if job.agent.profile.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::PROFILE_PROTOCOL,
+                    "a job naming a permission profile",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
         let reply = forward(IpcRequest::JobSubmit {
             job: job.name.clone(),
             dispatch: job.dispatch.clone(),
@@ -4161,6 +4177,8 @@ mod tests {
             spec,
             flock,
             agent,
+            priority,
+            role,
         } = run_model(None, None, machine)
         else {
             unreachable!()
@@ -4173,6 +4191,8 @@ mod tests {
                 profile: profile.map(Into::into),
                 ..a
             }),
+            priority,
+            role,
         }
     }
 
@@ -4250,6 +4270,8 @@ mod tests {
             spec,
             flock,
             agent,
+            priority,
+            role,
         } = run_profile(Some("ci"), None)
         else {
             unreachable!()
@@ -4262,6 +4284,8 @@ mod tests {
                 agent_args: Some(vec!["--permission-mode".into(), "bypassPermissions".into()]),
                 ..a
             }),
+            priority,
+            role,
         };
         assert_eq!(
             error_code(d.handle(conflict).await),
@@ -4340,7 +4364,7 @@ mod tests {
         };
         let t = d
             .fleet()
-            .queue_run("x".into(), spec(), None, Some(&ask))
+            .queue_run("x".into(), spec(), None, Some(&ask), None)
             .await
             .unwrap();
         assert_eq!(t.state, TaskState::Queued);
@@ -4388,6 +4412,8 @@ mod tests {
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
+                role: Default::default(),
             })
             .await
         else {
@@ -4399,7 +4425,13 @@ mod tests {
         pinned.machine = Some("pi".into());
         let t = d
             .fleet()
-            .queue_run("x".into(), pinned, None, Some(&AgentChoice::default()))
+            .queue_run(
+                "x".into(),
+                pinned,
+                None,
+                Some(&AgentChoice::default()),
+                None,
+            )
             .await
             .unwrap();
         let source = t.spec.agent_source.clone().unwrap();
@@ -4475,7 +4507,7 @@ mod tests {
         };
         let t = d
             .fleet()
-            .queue_run("x".into(), spec(), None, Some(&ask))
+            .queue_run("x".into(), spec(), None, Some(&ask), None)
             .await
             .unwrap();
         d.fleet().dispatch_queued().await;
@@ -5535,6 +5567,7 @@ mod tests {
                     model: None,
                     priority: None,
                     agents: Default::default(),
+                    profile: None,
                 },
             },
             IpcRequest::TaskClose {

@@ -878,7 +878,7 @@ mod tests {
             ..status("pi-3", "fleet@pi-3")
         };
         let row = MachineRow::from(&m);
-        assert_eq!(machine_rows(std::slice::from_ref(&row))[0][6], "1/2+1j+1b");
+        assert_eq!(machine_rows(std::slice::from_ref(&row))[0][7], "1/2+1j+1b");
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["job_slots"], 1);
         assert_eq!(v["burst"], 1);
