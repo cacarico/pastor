@@ -176,6 +176,14 @@ pastor flock describe work --json     # one flock: default, agent, machines, liv
 
 These commands edit `flock.toml` in place, keeping its comments.
 
+Before a new machine takes work unattended, go through this once:
+
+1. herdr, pastor and the agents must be on the PATH of a non-interactive ssh command. The head runs `ssh user@host sh -c 'herdr … remote-api-bridge'`, and many `~/.bashrc` files return early when not interactive (Debian's does), so put the PATH line before that check. Check each name on its own, since POSIX `command -v` takes one: `ssh user@host 'command -v claude && command -v herdr && command -v pastor'`.
+2. Every repo the flock's jobs and tasks use must exist at the same path on the machine. pastor does not clone. Clone each one before the machine joins a flock whose jobs use it.
+3. Save trust for each repo right after cloning: `pastor trust add <machine> <repo>`. The head then answers Claude's folder-trust prompt for that repo's tasks and worktrees on that machine. `pastor trust list` shows the pairs.
+4. Log the agent in, then finish its first-run setup once. For Claude, `claude auth login` saves credentials, but the first interactive start still stops on first-run screens (theme, login confirmation) and the first task sits `blocked`. Finish them with `pastor task attach t-N` and detach with ctrl+b q. `~/.claude.json` has `hasCompletedOnboarding: true` once it is done.
+5. Prove it with a task pinned to the machine: `pastor task run --machine <machine> --repo <repo> --worktree "Reply with the single word ready. Do not run any commands."`, then `pastor task read t-N` and `pastor task close t-N --remove-worktree` so the test checkout does not stay on disk.
+
 Every machine needs a herdr server running, and the head needs passwordless ssh to it. Start herdr with `herdr server`, or better as a user service: `pastor setup systemd --herdr --yes` on that machine. The head itself runs as a service with `pastor setup systemd --yes`. On macOS use `pastor setup launchd` with the same flags. Setup needs `--yes` when stdin is not a terminal. Ask the user before installing services.
 
 ## Events
@@ -218,6 +226,9 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - `failed` with "agent t-N not found": the agent's pane vanished before it was done (closed by hand, herdr restarted, or the agent crashed).
 - `failed` soon after start: the agent is usually not installed, or not on the PATH herdr sees on that machine.
 - `blocked` right after start: often Claude's "trust this folder" dialog on a repo that machine has not seen. Check with `pastor task read`, then `pastor task send t-N --trust` answers it and saves the repo as trusted, so its next tasks on that machine go through on their own.
+- `failed` at once with `repo <path> does not exist on <machine>`: the repo is not cloned there. pastor does not clone.
+- A task with no `--repo` starts in `~/pastor-tasks`, where Claude asks for trust once per machine. `pastor trust add` cannot cover it, since the task has no repo. Answer it once with `pastor task send t-N --trust`, or give tasks a `--repo`.
+- A prompt the agent does not take (typed while a trust prompt was answered by hand) is sent again up to twice; after that the task is `blocked` with an error saying so, and the agent sits idle at an empty input. Send the prompt again with `pastor task send t-N "<prompt>"` (the task id comes first).
 - A machine `polling`: herdr answers requests but its event stream will not open. It still takes tasks; pastor checks them every tick and keeps trying to subscribe.
-- A machine `reconnecting`: herdr is unreachable. Its tasks are reconciled when it comes back.
+- A machine `reconnecting`: herdr is unreachable. Its tasks are reconciled when it comes back. Stuck there with `herdr: not found`: herdr is not on the PATH of a non-interactive ssh command on that machine (see the checklist under The fleet).
 - A `timeout` error from the CLI: the head may still carry the request out. Check `pastor task list` before sending it again, or you may queue a duplicate.
