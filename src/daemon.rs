@@ -1430,10 +1430,13 @@ impl Fleet {
     }
 
     /// Where critical task `task` could start by pausing a task: the
-    /// machines it may run on (its flock, healthy, its tags, its pin, one
-    /// `accepts`) that have no room for `claim` now but would once their
-    /// newest pausable task (`Task::pausable`) is gone, the one with the
-    /// fewest live tasks first. Answers the machine and that task's id.
+    /// machines it may run on (in its flock, healthy, its tags, its pin, one
+    /// `accepts`) that have no room for `claim` or `flock` is at its number
+    /// there now, but would have both once one pausable task
+    /// (`Task::pausable`) is gone, the newest such, the machine with the
+    /// fewest live tasks first. Pausing another flock's task frees a slot,
+    /// not a seat in `flock`, so it only helps a machine short of slots.
+    /// Answers the machine and that task's id.
     fn pausable_for(
         &self,
         views: &[MachineView],
@@ -1443,13 +1446,14 @@ impl Fleet {
         accepts: &dyn Fn(&str) -> bool,
     ) -> Option<(String, i64)> {
         let agents = self.agents.read().unwrap().clone();
+        let default = self.flock().default_flock().to_string();
         let now = chrono::Utc::now();
         views
             .iter()
             .filter(|m| {
-                m.flock == flock
+                m.in_flock(flock)
                     && m.healthy
-                    && !m.has_room(claim)
+                    && !(m.has_room(claim) && m.flock_has_room(flock))
                     && task.spec.machine.as_ref().is_none_or(|p| *p == m.name)
                     && task.spec.tags.iter().all(|t| m.tags.contains(t))
                     && accepts(&m.name)
@@ -1461,32 +1465,40 @@ impl Fleet {
                     .ok()?
                     .into_iter()
                     .filter(|t| t.pausable(agents.kind(&t.spec.agent), now))
+                    .filter(|t| {
+                        let mut after = MachineView {
+                            live: m.live.saturating_sub(1),
+                            live_jobs: m.live_jobs.saturating_sub(usize::from(t.from_job())),
+                            ..m.clone()
+                        };
+                        let freed = t.flock.as_deref().unwrap_or(&default);
+                        if let Some(s) = after.flocks.iter_mut().find(|s| s.name == freed) {
+                            s.live = s.live.saturating_sub(1);
+                        }
+                        after.has_room(claim) && after.flock_has_room(flock)
+                    })
                     .max_by_key(|t| t.id)?;
-                let after = MachineView {
-                    live: m.live.saturating_sub(1),
-                    live_jobs: m.live_jobs.saturating_sub(usize::from(victim.from_job())),
-                    ..m.clone()
-                };
-                after
-                    .has_room(claim)
-                    .then(|| (m.live, m.name.clone(), victim.id))
+                Some((m.live, m.name.clone(), victim.id))
             })
             .min_by_key(|(live, _, _)| *live)
             .map(|(_, name, id)| (name, id))
     }
 
     /// Resume paused task `task` on the machine it was paused on, once that
-    /// machine is healthy, still in the flock and has room for it. It is
-    /// not settled again: it goes back to the agent and session it had.
+    /// machine is healthy, still in the flock and has room for it, its own
+    /// flock under its number there. It is not settled again: it goes back
+    /// to the agent and session it had.
     async fn resume_paused(&self, task: &Task) {
         let Some(machine) = task.pinned_machine() else {
             return;
         };
+        let flock = self.flock();
+        let target = task.flock.as_deref().unwrap_or(flock.default_flock());
         let views = self.views();
         let fits = views
             .iter()
             .find(|m| m.name == machine)
-            .is_some_and(|m| m.healthy && m.has_room(Claim::of(task)));
+            .is_some_and(|m| m.healthy && m.has_room(Claim::of(task)) && m.flock_has_room(target));
         if !fits || !self.in_flock(machine) {
             return;
         }
@@ -7443,6 +7455,42 @@ mod tests {
             assert!(
                 kept.iter().any(|w| w.path == checkout.path),
                 "the worktree is kept: {kept:?}"
+            );
+        }
+
+        /// A critical task whose flock is at its number pauses a task of
+        /// its own flock, even when another flock's task there is newer:
+        /// pausing that one frees a slot, not a seat in the flock.
+        #[tokio::test]
+        async fn a_preempting_task_pauses_in_its_own_flock_at_its_number() {
+            let fake = FakeHerdr::new();
+            let flock: Flock = toml::from_str(
+                "[[flock]]\nname = \"home\"\ndefault = true\nmachines = { desk = 3 }\n\n\
+                 [[flock]]\nname = \"work\"\nmachines = { desk = 1 }\n\n\
+                 [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 3\n",
+            )
+            .unwrap();
+            flock.validate().unwrap();
+            let (d, _tmp) = daemon_with_flock(flock, &[("desk", 3, fake.clone())]).await;
+            let in_flock = |prompt: &str, name: &str, priority: Priority, preempt: bool| {
+                let mut req = run(prompt, spec(), priority, preempt);
+                if let IpcRequest::Run { flock, .. } = &mut req {
+                    *flock = Some(name.into());
+                }
+                req
+            };
+            let work = start(&d, in_flock("work", "work", Priority::Low, false)).await;
+            let home = start(&d, in_flock("home", "home", Priority::Low, false)).await;
+            assert_eq!(get(&d, work.id).state, TaskState::Running);
+            assert_eq!(get(&d, home.id).state, TaskState::Running);
+
+            let crit = start(&d, in_flock("fix", "work", Priority::Critical, true)).await;
+            assert_eq!(crit.state, TaskState::Running, "started in the same pass");
+            assert_eq!(get(&d, work.id).state, TaskState::Paused);
+            assert_eq!(
+                get(&d, home.id).state,
+                TaskState::Running,
+                "not the newer one"
             );
         }
 
