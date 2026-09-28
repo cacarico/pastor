@@ -366,7 +366,7 @@ enum TaskCmd {
     Retry(pastor::task_cli::RetryArgs),
     /// Put a queued task at another level: low, normal, high or critical
     Priority(pastor::task_cli::PriorityArgs),
-    /// Close a task's pane (and with --remove-worktree its worktree), or an orphaned agent
+    /// Close tasks' panes (and with --remove-worktree their worktrees), or orphaned agents
     Close(pastor::task_cli::CloseArgs),
     /// Delete old finished tasks; their items stay seen
     Prune(pastor::task_cli::PruneArgs),

@@ -40,12 +40,14 @@ pub struct PriorityArgs {
 
 #[derive(Args, Debug)]
 pub struct CloseArgs {
-    /// A task, like t-12 or 12, or an orphaned agent named like one
-    pub task: String,
-    /// Remove the task's worktree too (refused if it has uncommitted changes)
+    /// Tasks, like t-12 or 12, or orphaned agents named like one; each is
+    /// closed in turn, and one that fails does not stop the rest
+    #[arg(required = true, value_name = "TASK")]
+    pub tasks: Vec<String>,
+    /// Remove each task's worktree too (refused if it has uncommitted changes)
     #[arg(long)]
     pub remove_worktree: bool,
-    /// Print as a JSON object
+    /// Print as a JSON object, or an array of them for several tasks
     #[arg(long)]
     pub json: bool,
 }
@@ -197,26 +199,88 @@ pub async fn priority(paths: &Paths, a: PriorityArgs) -> anyhow::Result<()> {
     }
 }
 
-/// `pastor task close t-N [--remove-worktree]`.
+/// `pastor task close t-N... [--remove-worktree]`. One task prints as it
+/// always has; several print one line (or JSON object) each, and any that
+/// failed make it `close_failed`.
 pub async fn close(paths: &Paths, a: CloseArgs) -> anyhow::Result<()> {
-    let id = task_id(&a.task)?;
-    let req = IpcRequest::TaskClose {
-        id,
-        remove_worktree: a.remove_worktree,
-    };
-    match ask(paths, req).await? {
-        IpcResponse::Task(t) => print_task(&t, a.json),
-        // An orphaned agent with no row: there is no task to print.
-        IpcResponse::Text(msg) if a.json => {
-            println!("{}", serde_json::json!({"message": msg}));
-            Ok(())
-        }
-        IpcResponse::Text(msg) => {
-            println!("{msg}");
-            Ok(())
-        }
-        other => Err(unexpected(other)),
+    if let [task] = a.tasks.as_slice() {
+        return match close_one(paths, task, a.remove_worktree).await? {
+            IpcResponse::Task(t) => print_task(&t, a.json),
+            // An orphaned agent with no row: there is no task to print.
+            IpcResponse::Text(msg) if a.json => {
+                println!("{}", serde_json::json!({"message": msg}));
+                Ok(())
+            }
+            IpcResponse::Text(msg) => {
+                println!("{msg}");
+                Ok(())
+            }
+            other => Err(unexpected(other)),
+        };
     }
+    let mut results = Vec::new();
+    let mut failed = Vec::new();
+    for task in &a.tasks {
+        let (line, json) = match close_one(paths, task, a.remove_worktree).await {
+            Ok(IpcResponse::Task(t)) => (
+                format!("{} {}", t.display_id(), t.state),
+                serde_json::json!({"task": t.display_id(), "state": t.state}),
+            ),
+            Ok(IpcResponse::Text(msg)) => (
+                format!("{task} {msg}"),
+                serde_json::json!({"task": task, "message": msg}),
+            ),
+            Ok(other) => return Err(unexpected(other)),
+            Err(e) => {
+                failed.push(task.as_str());
+                let (code, message) = match e.downcast_ref::<CliError>() {
+                    Some(e) => (e.code.clone(), e.message.clone()),
+                    None => ("runtime_error".to_string(), format!("{e:#}")),
+                };
+                (
+                    format!("{task} {code}: {message}"),
+                    serde_json::json!({"task": task, "code": code, "message": message}),
+                )
+            }
+        };
+        if a.json {
+            results.push(json);
+        } else {
+            println!("{line}");
+        }
+    }
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::err(
+            "close_failed",
+            format!(
+                "{} of {} not closed: {}",
+                failed.len(),
+                a.tasks.len(),
+                failed.join(", ")
+            ),
+        ))
+    }
+}
+
+async fn close_one(
+    paths: &Paths,
+    task: &str,
+    remove_worktree: bool,
+) -> anyhow::Result<IpcResponse> {
+    let id = task_id(task)?;
+    ask(
+        paths,
+        IpcRequest::TaskClose {
+            id,
+            remove_worktree,
+        },
+    )
+    .await
 }
 
 /// `pastor task done [t-N]`: the task given, or the one this pane runs.
