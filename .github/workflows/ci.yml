@@ -49,6 +49,14 @@ jobs:
       - run: make check
       # The machine actor tests five times over, to catch timing flakes.
       - run: make test-machine
+      # The CLI against a head over a real ssh: every other test runs a fake
+      # ssh, which let a ControlPath too long for a unix socket through in
+      # 0.7.0. sshd runs as the runner's user; /run/sshd is the privilege
+      # separation dir it checks for at start.
+      - run: |
+          sudo apt-get install -y --no-install-recommends openssh-server
+          sudo mkdir -p /run/sshd
+      - run: make test-ssh
 
   # The release builds are static musl binaries and a FreeBSD build is the
   # source-only route, so a change that only compiles against glibc on

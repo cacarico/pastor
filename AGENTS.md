@@ -71,8 +71,9 @@ down here because getting them wrong cost a day.
 
 - `make check` is the gate: fmt check, clippy with warnings as errors, the
   full suite. Run it before every commit. `make help` lists the rest.
-- CI (`.github/workflows/ci.yml`) runs `make check` and `make test-machine` on
-  every pull request that touches code (`paths:` skips docs-only diffs), or
+- CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine` and
+  `make test-ssh` (the CLI against a head over a real ssh, through a
+  throwaway sshd on localhost; `tests/real_ssh.rs`) on every pull request that touches code (`paths:` skips docs-only diffs), or
   by hand (`workflow_dispatch`). Since this project merges by fast-forwarding
   a PR's exact head sha to main, that sha was already checked on its PR, so
   push-to-main does not run `check` again; a direct push that skips a PR goes
