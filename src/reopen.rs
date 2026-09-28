@@ -164,7 +164,7 @@ pub async fn reopen(
 mod tests {
     use super::*;
     use crate::herdr::fake::FakeHerdr;
-    use crate::task::{Checkout, DispatchSpec, TaskState};
+    use crate::task::{Checkout, DispatchSpec, TaskRole, TaskState};
     use chrono::Utc;
 
     const SESSION: &str = "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21";
@@ -197,6 +197,7 @@ mod tests {
             workspace_id: Some("w9".into()),
             pane_id: Some("w9:p1".into()),
             agent_name: Some("t-4".into()),
+            role: TaskRole::Agent,
             state: TaskState::Closed,
             error: None,
             last_completion_seq: None,
