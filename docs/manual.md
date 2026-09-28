@@ -707,6 +707,54 @@ settles the model's args again from pastor.toml as it stands. Since a head
 from before models would start the agent without its model, every command
 that can make it queue a task refuses one (`head_too_old`).
 
+### Permission profiles
+
+A permission profile names a pair of tool pattern lists, `allow` and `deny`,
+in the syntax of [Tool allow and deny lists](#tool-allow-and-deny-lists), so
+a kind of work can be named once. Nothing reaches an agent yet: for now a
+profile is defined, checked and shown, and tasks still settle their lists
+from `[defaults]`, the flock and the job as above.
+
+Three are built in, in Claude Code's patterns:
+
+| Profile        | Allows                                                     | Denies                                                        |
+| -------------- | ---------------------------------------------------------- | ------------------------------------------------------------- |
+| `review`       | `Read`, `Glob`, `Grep`, `git status`, `diff`, `log`, `show`, `blame` | `Edit`, `Write`, `NotebookEdit`, `git push`, and the destructive ones |
+| `develop`      | the read tools, `Edit`, `Write`, `NotebookEdit`, `Bash`    | the destructive ones: `rm -rf`, `sudo`, `git push --force`   |
+| `unrestricted` | everything `develop` allows, `WebFetch`, `WebSearch`       | nothing                                                       |
+
+`[profiles.<name>]` in pastor.toml adds one, or replaces the built-in one of
+that name. Every key is optional: `description`, one line for `profile list`;
+`extends`, another profile, built in or not; `allow` and `deny`. Names follow
+the job names' rules (`[a-z0-9][a-z0-9_.-]{0,63}`).
+
+```toml
+# pastor.toml
+[profiles.ci]
+description = "develop, plus docker"
+extends = "develop"
+allow = ["Bash(docker:*)"]
+deny = ["WebFetch"]
+```
+
+A profile's lists are its own added to those of the profile it extends,
+farthest first, each pattern once. As everywhere in pastor a deny wins: a
+pattern any link denies is dropped from `allow`, so a profile can narrow the
+one it extends but never lift its deny. That is why `develop` does not extend
+`review`. An `extends` that names no profile, or a chain that comes back to
+itself, fails the file's load, as does a pattern that is empty or starts with
+`-`.
+
+```bash
+pastor profile list               # NAME, SOURCE (built-in, pastor.toml), EXTENDS, DESCRIPTION; --json
+pastor profile describe ci        # the chain (ci -> develop) and the allow and deny it adds up to; --json
+```
+
+Both read pastor.toml on this machine and never ask the head, so they work
+with it down; with a remote head set they are refused
+(`remote_head_unsupported`). A name that is not a profile is
+`unknown_profile`.
+
 ## Events
 
 `pastor serve` appends every task, job and machine event to
@@ -1615,7 +1663,7 @@ sends nothing. A head from before these requests is refused
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, head_address, defaults, agents (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, head_address, defaults, agents, models, profiles (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
@@ -1667,6 +1715,11 @@ deny_flag = "--disallowedTools"  # the flag before each deny pattern
 [models.sonnet]              # one table per model; none are built in
 kind = "claude"                  # the herdr agent kind that runs it (required)
 args = ["--model", "claude-sonnet-5"]  # put before agent_args (required, may be [])
+[profiles.ci]                # one table per permission profile; review, develop, unrestricted are built in
+description = "develop, plus docker"  # one line for `pastor profile list`
+extends = "develop"              # its lists come first; default: none
+allow = ["Bash(docker:*)"]       # added to what it extends
+deny = []                        # added too; wins over any allow
 ```
 
 `head_address` is the ssh destination other machines reach the head by. When
@@ -1686,7 +1739,8 @@ In bash and fish the script also offers the names a command takes: job names
 after `job describe`, `--job` and the like, flock and machine names after
 `--flock`, `--machine` and the flock and machine commands, task ids after the
 task commands, connector ids after `connector uninstall|unlink|try`, and
-the `[models]` names of pastor.toml after `--model`. A
+the `[models]` names of pastor.toml after `--model`, and profile names
+after `profile describe`. A
 static script cannot know them, so at TAB it runs `pastor __complete <shell>
 -- <words>`, which reads the job files, `flock.toml`, the connectors
 directory and the task store directly, never the head, and prints nothing

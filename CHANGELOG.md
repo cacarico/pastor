@@ -7,6 +7,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Permission profiles: `[profiles.<name>]` in pastor.toml, each an optional
+  `description`, `extends`, `allow` and `deny`, beside the built-in `review`,
+  `develop` and `unrestricted`. A profile's lists add up along its `extends`
+  chain, and a deny anywhere wins. `pastor profile list` and `pastor profile
+  describe <name>` (both with `--json`) show them; an unknown name is
+  `unknown_profile`, and a bad profile fails pastor.toml's load. Nothing
+  reaches an agent yet.
 - Named models: `[models.<name>]` in pastor.toml, each with a herdr agent
   `kind` and the `args` that select it. A task runs one with `pastor task run
   --model <name>`, a job's `[dispatch] model` (a template, so
