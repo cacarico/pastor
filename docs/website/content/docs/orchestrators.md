@@ -106,4 +106,11 @@ pastor orchestrator disable merge
 pastor orchestrator note --name merge "merged #31; #32 waits on review"
 ```
 
+## a night watch
+
+The [examples](../examples/#a-night-watch-that-merges-what-is-ready) have a
+whole one: a pre script that merges each approved, green PR with its threads
+resolved, sends a fix agent to one that conflicts or fails, rebases one PR
+at a time, and wakes the agent only for what needs judgment.
+
 More in the [manual](../manual/#orchestrators).

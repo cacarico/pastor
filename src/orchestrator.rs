@@ -3217,4 +3217,47 @@ prompt = "You are the night orchestrator."
         let held = head.runner.run_now(&other).await;
         assert_eq!(held.outcome, RunOutcome::Held, "{held:?}");
     }
+
+    /// Every orchestrator file the docs show (a `toml` fence whose first line
+    /// names a file under `orchestrators/`) is one the head would load, and
+    /// every pre script they show (a `sh` fence starting `#!/bin/sh`) is one
+    /// `sh -n` reads, so a copied example runs rather than failing on a key
+    /// or a quote.
+    #[test]
+    fn the_docs_orchestrator_examples_parse() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (mut files, mut scripts) = (0, 0);
+        for doc in [
+            "docs/manual.md",
+            "docs/website/content/docs/orchestrators.md",
+            "docs/website/content/docs/examples.md",
+        ] {
+            let text = std::fs::read_to_string(repo.join(doc)).unwrap();
+            for fence in text.split("```").skip(1).step_by(2) {
+                let (lang, body) = fence.split_once('\n').unwrap_or((fence, ""));
+                let first = body.lines().next().unwrap_or("");
+                if lang == "toml" && first.starts_with("# ~/.config/pastor/orchestrators/") {
+                    Orchestrator::parse(body, "example", Path::new("/o"))
+                        .unwrap_or_else(|e| panic!("{doc}: {first}: {e}"));
+                    files += 1;
+                } else if lang == "sh" && first == "#!/bin/sh" {
+                    let out = std::process::Command::new("sh")
+                        .args(["-n", "-c", body])
+                        .output()
+                        .unwrap();
+                    assert!(
+                        out.status.success(),
+                        "{doc}: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    scripts += 1;
+                }
+            }
+        }
+        // The manual's merge example, the page's, and the night watch.
+        assert!(
+            files >= 3 && scripts >= 2,
+            "{files} files, {scripts} scripts"
+        );
+    }
 }
