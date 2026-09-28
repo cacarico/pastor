@@ -8,7 +8,13 @@ manual: run-under-systemd
 
 `pastor setup` installs the head as a user service, so it starts at login
 and comes back after a crash. It uses systemd on Linux and launchd on macOS,
-and never needs root.
+and never needs root. Without one, `pastor serve` runs the head in the
+background until you `pastor serve stop` it or the machine restarts.
+
+The service runs `pastor serve --foreground`, which logs to the journal (or
+launchd's log) instead of `serve.log`. A unit written by an older pastor, with
+a bare `pastor serve`, stays in the foreground too, since pastor sees that
+systemd or launchd started it; re-run `pastor setup` to bring it up to date.
 
 ## linux
 
@@ -46,11 +52,15 @@ starts it. It takes the same flags. Logs go to
 ## check, restart, logs
 
 ```sh
+pastor serve status          # service: systemd
 systemctl --user status pastor
 systemctl --user restart pastor
 journalctl --user -u pastor
 pastor machine list
 ```
+
+`pastor serve stop` refuses a head a service runs, since the service would
+start it again: use `pastor setup systemd --stop` (or `launchd --stop`).
 
 Setup never restarts a running service, since restarting herdr stops its
 agents. After a change, restart it yourself. A unit that differs from what

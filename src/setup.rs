@@ -902,7 +902,8 @@ mod tests {
             }
             assert_eq!(t.lines().filter(|l| l.starts_with("ExecStart=")).count(), 1);
         }
-        assert!(PASTOR_UNIT.contains("ExecStart=%h/.cargo/bin/pastor serve"));
+        // In the foreground: a bare `pastor serve` would go to the background.
+        assert!(PASTOR_UNIT.contains("ExecStart=%h/.cargo/bin/pastor serve --foreground\n"));
         // pastor's own service is hardened where that costs nothing in a
         // user unit; herdr's is left open, since its agents need the user's
         // whole session (sudo included).
@@ -936,7 +937,7 @@ mod tests {
         assert_eq!(
             service,
             [
-                "ExecStart=/home/u/.cargo/bin/pastor serve",
+                "ExecStart=/home/u/.cargo/bin/pastor serve --foreground",
                 "Environment=\"PATH=/usr/bin:/home/u/my bin\"",
                 "Environment=PASTOR_STATE_DIR=/s/100%%",
             ]
@@ -975,7 +976,7 @@ mod tests {
         assert!(render(PASTOR_UNIT, Path::new("/bin/pa\rstor"), &[]).is_err());
         let text = render(PASTOR_UNIT, Path::new("/opt/$HOME/pastor"), &[]).unwrap();
         assert!(
-            text.contains("ExecStart=/opt/$$HOME/pastor serve\n"),
+            text.contains("ExecStart=/opt/$$HOME/pastor serve --foreground\n"),
             "{text}"
         );
     }
@@ -1055,7 +1056,10 @@ mod tests {
         assert_eq!(report.unit_path, unit_path);
         assert_eq!(report.written, Written::Created);
         let text = std::fs::read_to_string(&unit_path).unwrap();
-        assert!(text.contains("ExecStart=/opt/bin/pastor serve\n"), "{text}");
+        assert!(
+            text.contains("ExecStart=/opt/bin/pastor serve --foreground\n"),
+            "{text}"
+        );
         assert!(
             text.contains("Environment=PATH=/usr/bin:/opt/bin\n"),
             "{text}"

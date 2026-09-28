@@ -115,7 +115,9 @@ and so on. This page lists them; `--help` after any command lists its flags.
 
 | command | does |
 |---|---|
-| `pastor serve` | run the head: scheduler, machine channels, dispatch |
+| `pastor serve` | start the head in the background: scheduler, machine channels, dispatch; `-f` keeps it in the foreground |
+| `pastor serve status` | whether a head runs here: pid, version, service, log |
+| `pastor serve stop` | stop the head started with `pastor serve`; agents keep running |
 | `pastor tick` | run one scheduler pass now and report it; `--dry-run` writes nothing |
 | `pastor events` | show the events log |
 | `pastor completions` | print a shell completion script |

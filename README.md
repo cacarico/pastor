@@ -101,8 +101,12 @@ Add the machines. The head can take tasks too:
 ```sh
 pastor machine add here --local        # this machine
 pastor machine add pi-1 user@pi-1      # a machine you can ssh to
-pastor setup systemd                   # run the head as a user service (setup launchd on macOS)
+pastor serve                           # start the head in the background
 ```
+
+`pastor serve status` shows it and `pastor serve stop` stops it; its log is
+`~/.local/state/pastor/serve.log`. To keep it up after a reboot, run it as a
+user service instead: `pastor setup systemd` (`setup launchd` on macOS).
 
 Give it something to do, then check on it:
 

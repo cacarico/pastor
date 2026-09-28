@@ -83,6 +83,19 @@ impl Paths {
         self.state_dir.join("pastor.sock")
     }
 
+    /// A background `pastor serve`'s log (`serve_cli`), rotated to
+    /// `serve.log.1` .. `serve.log.3`. A head in the foreground or under a
+    /// service logs to stderr instead.
+    pub fn serve_log_file(&self) -> PathBuf {
+        self.state_dir.join("serve.log")
+    }
+
+    /// What the running `pastor serve` wrote about itself at start: its pid,
+    /// the service manager that runs it, its log (`serve_cli::Record`).
+    pub fn serve_record_file(&self) -> PathBuf {
+        self.state_dir.join("serve.json")
+    }
+
     /// The events log, one JSON `EventRecord` per line. Rotated by size to
     /// `events.jsonl.1`; read by `pastor events` straight from disk.
     pub fn events_file(&self) -> PathBuf {

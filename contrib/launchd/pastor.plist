@@ -20,6 +20,7 @@
 	<array>
 		<string>/usr/local/bin/pastor</string>
 		<string>serve</string>
+		<string>--foreground</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
