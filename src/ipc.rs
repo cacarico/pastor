@@ -178,7 +178,8 @@ pub enum IpcRequest {
     /// Re-read the jobs directory now.
     Reload,
     JobList,
-    /// Fire a job now, ignoring schedule, overlap and `enabled`.
+    /// Fire a job now, ignoring schedule and `enabled`; it waits for a run
+    /// already going.
     JobRun {
         name: String,
     },

@@ -1314,7 +1314,7 @@ repository, read from its `.git`. A linked connector shows the directory it
 points to, marked `(missing)` when that is gone. `list` keeps to its columns
 so it still fits 80 columns; the detail is here.
 
-`run` runs the connector once for a job and dispatches nothing. It uses the
+`try` runs the connector once for a job and dispatches nothing. It uses the
 `[connector]` table of `~/.config/pastor/jobs/<job>.toml` if that file exists,
 and an empty config only when there is no such file, so you can try a connector
 before writing the job. A job file that exists is never ignored: one that
@@ -1501,20 +1501,19 @@ It needs:
 `bridge` or speaks an older protocol. Any command fails the same way later;
 it never falls back to this machine's files.
 
-These commands go to a remote head: `task run|list|show|read|retry|priority|close|prune|send|done`,
+These commands go to a remote head: `task run|list|describe|read|retry|priority|close|prune|send|done`,
 `machine list`, `tick`, `job list|run|reload`, `events`. `machine list`'s first line
 names the head by its ssh destination and shows its herdr as `-`. `task run`
 fills what its flags leave out from the built-in defaults, not from the
 head's `[defaults]` (the head still resolves the agent with its own).
 
 Local on purpose, as with no head set: `completions`, `setup`, `head`,
-`bridge`, `connector` (connectors are this machine's), `task attach` and
-`open` (they go to the machine directly, reading this machine's
-`flock.toml`).
+`bridge`, `connector` (connectors are this machine's) and `task attach`
+(it goes to the machine directly, reading this machine's `flock.toml`).
 
 Every other command would read or edit this machine's files instead of the
 head's, so it fails with `remote_head_unsupported` until it is moved behind
-the head; run it on the head.
+the head; run it on the head. `machine open` is one of them.
 
 ### A headless serve
 
