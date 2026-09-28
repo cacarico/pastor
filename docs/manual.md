@@ -214,7 +214,8 @@ remove`. herdr never deletes the branch, even for a worktree it removes. Failed 
 own. The grace period keeps the pane there for `pastor task attach` (a
 Claude task can be reopened after it anyway; see [Reopening a finished
 task](#reopening-a-finished-task)); the
-check runs with each reconcile, while the machine is connected. An agent
+check runs every `close_done_after` (at most every reconcile) while the
+machine is connected. An agent
 that herdr shows working or blocked again
 at that moment is left alone, and its task goes back to running or blocked.
 
