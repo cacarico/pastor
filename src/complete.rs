@@ -19,6 +19,7 @@ use crate::task::LIVE_STATES;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Job,
+    Orchestrator,
     Flock,
     Machine,
     Task,
@@ -48,6 +49,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         (["connector", ..], "id") => Some(Kind::Connector),
         (["watch"], "connectors") => Some(Kind::Connector),
         (["job", _], "name") => Some(Kind::Job),
+        (["orchestrator", _], "name") => Some(Kind::Orchestrator),
         (["flock", _], "name") => Some(Kind::Flock),
         (["flock", "default", "set"], "name") => Some(Kind::Flock),
         (["machine", _], "name") => Some(Kind::Machine),
@@ -161,6 +163,7 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
                 (name, desc)
             })
             .collect(),
+        Kind::Orchestrator => dir_names(&paths.orchestrators_dir(), Some("toml")),
         Kind::Connector => dir_names(&paths.connectors_dir(), None),
         Kind::Flock => {
             let Ok(flock) = Flock::load(&paths.flock_file()) else {

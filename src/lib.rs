@@ -15,6 +15,7 @@ pub mod hooks;
 pub mod ipc;
 pub mod machine;
 pub mod orchestrator;
+pub mod orchestrator_cli;
 pub mod profile_cli;
 pub mod queue;
 pub mod queue_cli;

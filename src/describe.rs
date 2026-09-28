@@ -463,6 +463,82 @@ pub fn job_text(j: &JobDescription) -> String {
     out.join("\n")
 }
 
+/// `orchestrator describe`: the file's settings, its state, the note, the
+/// last runs with the lines each pre script printed, and recent events.
+pub fn orchestrator_text(d: &crate::orchestrator::OrchestratorDescription) -> String {
+    let s = &d.status;
+    let next = dash(
+        s.next_run
+            .map(|at| format!("{} ({})", at.format("%Y-%m-%d %H:%M:%S UTC"), in_(at))),
+    );
+    let mut rows = vec![
+        ("name", s.name.clone()),
+        ("description", description(&s.description)),
+        ("file", d.file.display().to_string()),
+        ("kind", dash(s.kind.map(|k| k.to_string()))),
+        ("state", s.state.clone()),
+        ("enabled", yes(s.enabled)),
+        ("schedule", dash(s.schedule.clone())),
+    ];
+    if s.kind == Some(crate::orchestrator::Kind::Scheduled) {
+        rows.push(("pre", words(&d.pre)));
+        rows.push(("post", dash(d.post.as_deref().map(words))));
+        rows.push(("timeout", dash(d.timeout.clone())));
+    }
+    rows.extend([
+        ("model", dash(d.model.clone())),
+        ("skill", dash(d.skill.clone())),
+        ("repo", dash(d.repo.clone())),
+        ("next run", next),
+        ("last run", ago(s.last_run_at)),
+        (
+            "last result",
+            dash(s.last_result.clone().map(|r| one_line(&r))),
+        ),
+        ("agent", dash(s.task.map(|t| format!("t-{t}")))),
+        ("quota until", ago(s.quota_until)),
+    ]);
+    let mut out = fields(&rows);
+    if let Some(e) = &s.error {
+        out.push(format!("file error: {}", one_line(e)));
+    }
+    section(
+        &mut out,
+        "prompt",
+        d.prompt
+            .as_deref()
+            .map(|p| p.lines().map(crate::cli::printable).collect())
+            .unwrap_or_default(),
+    );
+    section(
+        &mut out,
+        "note",
+        d.note
+            .as_deref()
+            .map(|n| n.lines().map(crate::cli::printable).collect())
+            .unwrap_or_default(),
+    );
+    let mut runs = Vec::new();
+    for r in d.runs.iter().rev() {
+        let mut head = format!("{} {}", r.at.format("%Y-%m-%d %H:%M:%S UTC"), r.outcome);
+        if let Some(t) = r.task {
+            head.push_str(&format!(" t-{t}"));
+        }
+        if let Some(detail) = &r.detail {
+            head.push_str(&format!(": {}", one_line(detail)));
+        }
+        runs.push(head);
+        runs.extend(r.lines.iter().map(|l| format!("  {}", one_line(l))));
+    }
+    section(&mut out, "last runs, newest first", runs);
+    section(
+        &mut out,
+        "recent events",
+        d.events.iter().map(EventRecord::line).collect(),
+    );
+    out.join("\n")
+}
+
 /// An `agents` table as `kind=agent` words, or where the layer's lookup
 /// goes on to when it has none.
 fn by_kind(agents: &crate::config::KindAgents, next: &str) -> String {

@@ -46,6 +46,9 @@ _pastor() {
             pastor,machine)
                 cmd="pastor__subcmd__machine"
                 ;;
+            pastor,orchestrator)
+                cmd="pastor__subcmd__orchestrator"
+                ;;
             pastor,profile)
                 cmd="pastor__subcmd__profile"
                 ;;
@@ -262,6 +265,9 @@ _pastor() {
             pastor__subcmd__help,machine)
                 cmd="pastor__subcmd__help__subcmd__machine"
                 ;;
+            pastor__subcmd__help,orchestrator)
+                cmd="pastor__subcmd__help__subcmd__orchestrator"
+                ;;
             pastor__subcmd__help,profile)
                 cmd="pastor__subcmd__help__subcmd__profile"
                 ;;
@@ -390,6 +396,24 @@ _pastor() {
                 ;;
             pastor__subcmd__help__subcmd__machine,remove)
                 cmd="pastor__subcmd__help__subcmd__machine__subcmd__remove"
+                ;;
+            pastor__subcmd__help__subcmd__orchestrator,describe)
+                cmd="pastor__subcmd__help__subcmd__orchestrator__subcmd__describe"
+                ;;
+            pastor__subcmd__help__subcmd__orchestrator,disable)
+                cmd="pastor__subcmd__help__subcmd__orchestrator__subcmd__disable"
+                ;;
+            pastor__subcmd__help__subcmd__orchestrator,enable)
+                cmd="pastor__subcmd__help__subcmd__orchestrator__subcmd__enable"
+                ;;
+            pastor__subcmd__help__subcmd__orchestrator,list)
+                cmd="pastor__subcmd__help__subcmd__orchestrator__subcmd__list"
+                ;;
+            pastor__subcmd__help__subcmd__orchestrator,note)
+                cmd="pastor__subcmd__help__subcmd__orchestrator__subcmd__note"
+                ;;
+            pastor__subcmd__help__subcmd__orchestrator,run)
+                cmd="pastor__subcmd__help__subcmd__orchestrator__subcmd__run"
                 ;;
             pastor__subcmd__help__subcmd__profile,describe)
                 cmd="pastor__subcmd__help__subcmd__profile__subcmd__describe"
@@ -549,6 +573,48 @@ _pastor() {
                 ;;
             pastor__subcmd__machine__subcmd__help,remove)
                 cmd="pastor__subcmd__machine__subcmd__help__subcmd__remove"
+                ;;
+            pastor__subcmd__orchestrator,describe)
+                cmd="pastor__subcmd__orchestrator__subcmd__describe"
+                ;;
+            pastor__subcmd__orchestrator,disable)
+                cmd="pastor__subcmd__orchestrator__subcmd__disable"
+                ;;
+            pastor__subcmd__orchestrator,enable)
+                cmd="pastor__subcmd__orchestrator__subcmd__enable"
+                ;;
+            pastor__subcmd__orchestrator,help)
+                cmd="pastor__subcmd__orchestrator__subcmd__help"
+                ;;
+            pastor__subcmd__orchestrator,list)
+                cmd="pastor__subcmd__orchestrator__subcmd__list"
+                ;;
+            pastor__subcmd__orchestrator,note)
+                cmd="pastor__subcmd__orchestrator__subcmd__note"
+                ;;
+            pastor__subcmd__orchestrator,run)
+                cmd="pastor__subcmd__orchestrator__subcmd__run"
+                ;;
+            pastor__subcmd__orchestrator__subcmd__help,describe)
+                cmd="pastor__subcmd__orchestrator__subcmd__help__subcmd__describe"
+                ;;
+            pastor__subcmd__orchestrator__subcmd__help,disable)
+                cmd="pastor__subcmd__orchestrator__subcmd__help__subcmd__disable"
+                ;;
+            pastor__subcmd__orchestrator__subcmd__help,enable)
+                cmd="pastor__subcmd__orchestrator__subcmd__help__subcmd__enable"
+                ;;
+            pastor__subcmd__orchestrator__subcmd__help,help)
+                cmd="pastor__subcmd__orchestrator__subcmd__help__subcmd__help"
+                ;;
+            pastor__subcmd__orchestrator__subcmd__help,list)
+                cmd="pastor__subcmd__orchestrator__subcmd__help__subcmd__list"
+                ;;
+            pastor__subcmd__orchestrator__subcmd__help,note)
+                cmd="pastor__subcmd__orchestrator__subcmd__help__subcmd__note"
+                ;;
+            pastor__subcmd__orchestrator__subcmd__help,run)
+                cmd="pastor__subcmd__orchestrator__subcmd__help__subcmd__run"
                 ;;
             pastor__subcmd__profile,describe)
                 cmd="pastor__subcmd__profile__subcmd__describe"
@@ -719,7 +785,7 @@ _pastor() {
 
     case "${cmd}" in
         pastor)
-            opts="-h -V --skill --head --help --version serve task queue machine flock tick job config completions events watch setup connector profile trust bridge head help"
+            opts="-h -V --skill --head --help --version serve task queue machine flock tick job orchestrator config completions events watch setup connector profile trust bridge head help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1735,7 +1801,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help)
-            opts="serve task queue machine flock tick job config completions events watch setup connector profile trust bridge head help"
+            opts="serve task queue machine flock tick job orchestrator config completions events watch setup connector profile trust bridge head help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2365,6 +2431,104 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help__subcmd__machine__subcmd__remove)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__orchestrator)
+            opts="list describe run enable disable note"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__orchestrator__subcmd__describe)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__orchestrator__subcmd__disable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__orchestrator__subcmd__enable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__orchestrator__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__orchestrator__subcmd__note)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__orchestrator__subcmd__run)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3348,6 +3512,248 @@ _pastor() {
             ;;
         pastor__subcmd__machine__subcmd__remove)
             opts="-h --herdr --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator)
+            opts="-h --head --help list describe run enable disable note help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__describe)
+            opts="-h --json --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__disable)
+            opts="-h --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__enable)
+            opts="-h --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__help)
+            opts="list describe run enable disable note help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__help__subcmd__describe)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__help__subcmd__disable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__help__subcmd__enable)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__help__subcmd__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__help__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__help__subcmd__note)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__help__subcmd__run)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__list)
+            opts="-w -h --wide --json --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__note)
+            opts="-h --name --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --name)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__orchestrator__subcmd__run)
+            opts="-h --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
