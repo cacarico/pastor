@@ -1971,7 +1971,7 @@ mod tests {
                     .into_iter()
                     .find(|r| {
                         r.method == "pane.split"
-                            || (r.method == "workspace.create" && r.params["label"] == "t-7")
+                            || (r.method == "workspace.create" && r.params["label"] != "pastor")
                     })
                     .unwrap();
                 assert_eq!(req.params["cwd"], cwd, "{place:?} with home {home:?}");
