@@ -305,27 +305,7 @@ pub async fn run_job(
             report.outcome = RunOutcome::Failed;
             report.error = Some(err.clone());
             if !dry_run {
-                state.failures += 1;
-                state.last_run_at = Some(now);
-                let wait = chrono::Duration::from_std(backoff_for(state.failures))
-                    .unwrap_or_else(|_| chrono::Duration::zero());
-                state.backoff_until = Some(now + wait);
-                state.last_result = Some(format!(
-                    "failed ({}x): {}",
-                    state.failures,
-                    first_line(&err)
-                ));
-                state.last_error = Some(err);
-                if let Err(e) = store.save_job_state(&state) {
-                    tracing::error!(job = %job.name, %e, "save job state");
-                }
-                let _ = events.send(PastorEvent {
-                    detail: None,
-                    kind: "job.failed".into(),
-                    task_id: None,
-                    machine: None,
-                    job: Some(job.name.clone()),
-                });
+                back_off(store, events, job, &mut state, now, err);
             }
             return report;
         }
@@ -338,6 +318,8 @@ pub async fn run_job(
     let mut insert_failed = false;
     // Rejected items and failed inserts, for `report.error` and `job list`.
     let mut problems: Vec<String> = Vec::new();
+    // A headless serve's new items, for one `JobSubmit` after the loop.
+    let mut to_head: Vec<Value> = Vec::new();
     for item in &output.items {
         if item.key.is_empty() {
             tracing::warn!(job = %job.name, "item without a key skipped");
@@ -366,12 +348,17 @@ pub async fn run_job(
             problems.push(format!("{}: rejected: {why}", item.key));
             continue;
         }
-        if report.created.len() as u32 >= job.max_tasks_per_run {
+        if (report.created.len() + to_head.len()) as u32 >= job.max_tasks_per_run {
             report.deferred += 1;
             continue;
         }
         if dry_run {
             report.created.push(item.key.clone());
+            continue;
+        }
+        // A headless serve sends them all to the head at once, below.
+        if fleet.submits_to_head() {
+            to_head.push(value);
             continue;
         }
         match fleet
@@ -389,8 +376,7 @@ pub async fn run_job(
                 });
                 report.created.push(t.display_id());
             }
-            // Queued by another request first, or, for a headless serve,
-            // by the head on a try whose reply was lost.
+            // Queued by another request first.
             Err(_) if store.is_seen(&job.name, &item.key).unwrap_or(false) => {
                 report.skipped_seen += 1;
             }
@@ -398,6 +384,44 @@ pub async fn run_job(
                 tracing::error!(job = %job.name, key = %item.key, %e, "create task");
                 problems.push(format!("{}: {e:#}", item.key));
                 insert_failed = true;
+            }
+        }
+    }
+    if !to_head.is_empty() {
+        match fleet.submit_to_head(job, to_head).await {
+            Ok(out) => {
+                for t in out.tasks {
+                    tracing::info!(job = %job.name, task = %t.display_id(), "task queued on the head");
+                    report.created.push(t.display_id());
+                }
+                report.skipped_seen += out.skipped.len();
+                for (key, why) in out.refused {
+                    if why == "max_tasks_per_run" {
+                        report.deferred += 1;
+                        continue;
+                    }
+                    tracing::warn!(job = %job.name, %key, %why, "the head refused an item");
+                    // An item whose paths the head rejects is its own fault,
+                    // as here; any other refusal may pass on a retry.
+                    if !why.starts_with("rejected: ") {
+                        insert_failed = true;
+                    }
+                    problems.push(format!("{key}: {why}"));
+                }
+            }
+            // Nothing reached the head's queue, or nothing is known to have:
+            // a failed run like a connector's, with its backoff, and the
+            // items asked for again on the next.
+            Err(err) => {
+                let err = match err.downcast_ref::<crate::cli::CliError>() {
+                    Some(e) => format!("{}: {}", e.code, e.message),
+                    None => format!("{err:#}"),
+                };
+                tracing::warn!(job = %job.name, %err, "items not sent to the head");
+                report.outcome = RunOutcome::Failed;
+                report.error = Some(err.clone());
+                back_off(store, events, job, &mut state, now, err);
+                return report;
             }
         }
     }
@@ -457,6 +481,39 @@ pub async fn run_job(
         }
     }
     report
+}
+
+/// A run that failed as a whole: the job's failure count goes up and it
+/// backs off, its cursor stays, and `job.failed` goes out.
+fn back_off(
+    store: &Store,
+    events: &broadcast::Sender<PastorEvent>,
+    job: &Job,
+    state: &mut JobState,
+    now: DateTime<Utc>,
+    err: String,
+) {
+    state.failures += 1;
+    state.last_run_at = Some(now);
+    let wait = chrono::Duration::from_std(backoff_for(state.failures))
+        .unwrap_or_else(|_| chrono::Duration::zero());
+    state.backoff_until = Some(now + wait);
+    state.last_result = Some(format!(
+        "failed ({}x): {}",
+        state.failures,
+        first_line(&err)
+    ));
+    state.last_error = Some(err);
+    if let Err(e) = store.save_job_state(state) {
+        tracing::error!(job = %job.name, %e, "save job state");
+    }
+    let _ = events.send(PastorEvent {
+        detail: None,
+        kind: "job.failed".into(),
+        task_id: None,
+        machine: None,
+        job: Some(job.name.clone()),
+    });
 }
 
 /// What a `JobSubmit` did with its items; see `IpcResponse::JobSubmitted`.
@@ -1794,6 +1851,14 @@ mod tests {
             agent: Default::default(),
             flock: None,
             priority: None,
+            dispatch: json!({
+                "agent": "claude",
+                "repo": "/srv/{{ job.name }}",
+                "worktree": true,
+                "branch": "pastor/{{ item.key }}",
+                "timeout": "60s",
+                "max_tasks_per_run": 5,
+            }),
         }
     }
 
@@ -1814,49 +1879,52 @@ mod tests {
     }
 
     /// A headless serve's fleet (`Fleet::headless`) whose head is `head`:
-    /// each forwarded `JobTask` is queued there as the head would, or
-    /// refused with `refuse` when set. Returns the requests it got.
+    /// each `JobSubmit` is queued there as the head's `Daemon::submit` does,
+    /// or refused with `refuse` (a code and a message) when set. Returns the
+    /// requests it got.
     fn headless_fleet(
         store: &Arc<Store>,
         head: Arc<Store>,
-        refuse: Arc<Mutex<Option<String>>>,
+        refuse: Arc<Mutex<Option<(String, String)>>>,
     ) -> (Fleet, Arc<Mutex<Vec<crate::ipc::IpcRequest>>>) {
         let got = Arc::new(Mutex::new(Vec::new()));
         let seen = got.clone();
-        let forward: crate::daemon::JobTaskForward = Arc::new(move |req| {
+        let ask: crate::daemon::HeadForward = Arc::new(move |req| {
             seen.lock().unwrap().push(req.clone());
             let head = head.clone();
             let refuse = refuse.lock().unwrap().clone();
             Box::pin(async move {
-                if let Some(why) = refuse {
-                    anyhow::bail!(why);
+                if let Some((code, message)) = refuse {
+                    return Err(crate::cli::CliError::err(&code, message));
                 }
-                let crate::ipc::IpcRequest::JobTask {
+                let crate::ipc::IpcRequest::JobSubmit {
                     job: name,
-                    flock,
-                    agent,
+                    dispatch,
                     prompt,
-                    spec,
-                    item,
+                    items,
                 } = req
                 else {
                     panic!("{req:?}")
                 };
-                let j = Job {
-                    prompt,
-                    spec,
-                    agent,
-                    flock,
-                    ..job(&name)
-                };
-                head.insert_job_task(&name, "default", &item, |id| render_task(&j, &item, id))
+                let j = Job::submitted(&name, &dispatch, &prompt, &Default::default())
+                    .map_err(anyhow::Error::msg)?;
+                let (tx, _rx) = events();
+                let out = submit_items(&fleet(&head), &head, &tx, &j, &items).await;
+                Ok(crate::ipc::IpcResponse::JobSubmitted {
+                    tasks: out.tasks,
+                    skipped: out.skipped,
+                    refused: out.refused,
+                })
             })
         });
-        (Fleet::headless(store.clone(), forward), got)
+        (Fleet::headless(store.clone(), ask), got)
     }
 
+    /// The items of a run go to the head in one `JobSubmit`, with the job's
+    /// `[dispatch]` table and its unrendered prompt; the head's tasks are
+    /// the run's, and only their keys are kept here.
     #[tokio::test]
-    async fn a_headless_run_sends_its_items_to_the_head_and_keeps_only_seen_keys() {
+    async fn a_headless_run_submits_its_items_to_the_head() {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let head = Arc::new(Store::open_in_memory().unwrap());
         let refuse = Arc::new(Mutex::new(None));
@@ -1864,79 +1932,153 @@ mod tests {
         let src = Scripted::with_keys(&["k1", "k2"]);
         *src.cursor.lock().unwrap() = Some("c1".into());
         let (tx, _rx) = events();
-        let mut j = job("j");
-        j.flock = Some("gpu".into());
+        let j = job("j");
         let report = run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
         assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
         assert_eq!(report.created, vec!["t-1", "t-2"]);
-        // The templates travel unrendered, with the job's own flock.
-        let first = got.lock().unwrap()[0].clone();
-        let crate::ipc::IpcRequest::JobTask { prompt, flock, .. } = first else {
-            panic!()
+        let sent = got.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one request per run");
+        let crate::ipc::IpcRequest::JobSubmit {
+            job: name,
+            dispatch,
+            prompt,
+            items,
+        } = &sent[0]
+        else {
+            panic!("{sent:?}")
         };
-        assert_eq!(prompt, j.prompt);
-        assert_eq!(flock.as_deref(), Some("gpu"));
+        assert_eq!(name, "j");
+        assert_eq!(dispatch, &j.dispatch);
+        assert_eq!(prompt, &j.prompt);
+        let keys: Vec<&str> = items.iter().map(|i| i["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["k1", "k2"]);
         // The rows are the head's, rendered with the head's ids.
-        let tasks = head.list_tasks(&TaskFilter::default()).unwrap();
-        assert_eq!(tasks.len(), 2);
+        assert_eq!(head.list_tasks(&TaskFilter::default()).unwrap().len(), 2);
         assert_eq!(
             head.get_task(1).unwrap().unwrap().prompt,
             "j: title of k1 (t-1)"
         );
         assert!(store.list_tasks(&TaskFilter::default()).unwrap().is_empty());
-        assert!(store.is_seen("j", "k1").unwrap() && store.is_seen("j", "k2").unwrap());
+        assert_eq!(store.seen_task("j", "k1").unwrap(), Some(Some(1)));
+        assert_eq!(store.seen_task("j", "k2").unwrap(), Some(Some(2)));
         assert_eq!(
             store.job_state("j").unwrap().unwrap().cursor.as_deref(),
             Some("c1")
         );
 
-        // Seen here, so the next run sends nothing again.
+        // Seen here, so the next run sends only the new item.
         src.items.lock().unwrap().push(item("k3"));
         *src.cursor.lock().unwrap() = Some("c2".into());
-        *refuse.lock().unwrap() = Some("head_unreachable: ssh failed".into());
         let report = run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
         assert_eq!(report.skipped_seen, 2);
-        // A head that does not take the item fails the run and holds the
-        // cursor, so the item is asked for again.
-        assert_eq!(report.outcome, RunOutcome::Failed);
-        assert!(report.error.unwrap().contains("ssh failed"));
-        assert!(!store.is_seen("j", "k3").unwrap());
-        assert_eq!(
-            store.job_state("j").unwrap().unwrap().cursor.as_deref(),
-            Some("c1")
-        );
-        *refuse.lock().unwrap() = None;
-        let report = run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
         assert_eq!(report.created, vec!["t-3"]);
-        assert_eq!(got.lock().unwrap().len(), 4);
+        let sent = got.lock().unwrap().clone();
+        let crate::ipc::IpcRequest::JobSubmit { items, .. } = &sent[1] else {
+            panic!()
+        };
+        assert_eq!(items.len(), 1);
+        // A run with nothing new asks the head nothing.
+        run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
+        assert_eq!(got.lock().unwrap().len(), 2);
     }
 
-    /// A head that answers `already_seen` queued the key on a try whose
-    /// reply was lost: the key is seen here and the cursor moves on.
+    /// A head that cannot be reached, or refuses the job's name, fails the
+    /// run as a failing connector does: it backs off, `job.failed` goes out,
+    /// and no item is kept, so the next run asks for them again.
     #[tokio::test]
-    async fn a_headless_run_counts_a_key_the_head_already_queued_as_seen() {
-        let store = Arc::new(Store::open_in_memory().unwrap());
-        let forward: crate::daemon::JobTaskForward = Arc::new(|_| {
-            Box::pin(async {
-                Err(crate::cli::CliError::err(
-                    crate::ipc::ALREADY_SEEN,
-                    "its task is gone",
-                ))
-            })
-        });
-        let fleet = Fleet::headless(store.clone(), forward);
-        let src = Scripted::with_keys(&["k1"]);
-        *src.cursor.lock().unwrap() = Some("c1".into());
-        let (tx, _rx) = events();
-        let report = run_job(&fleet, &job("j"), &src, &tx, Utc::now(), false).await;
+    async fn a_headless_run_the_head_does_not_take_fails_and_backs_off() {
+        for (code, message) in [
+            ("head_unreachable", "ssh: no route to host"),
+            ("job_name_taken", "the head has a job file named j"),
+        ] {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let head = Arc::new(Store::open_in_memory().unwrap());
+            let refuse = Arc::new(Mutex::new(Some((code.to_string(), message.to_string()))));
+            let (fleet, got) = headless_fleet(&store, head.clone(), refuse.clone());
+            let src = Scripted::with_keys(&["k1"]);
+            *src.cursor.lock().unwrap() = Some("c1".into());
+            let (tx, mut rx) = events();
+            let now = Utc::now();
+            let report = run_job(&fleet, &job("j"), &src, &tx, now, false).await;
+            assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
+            assert_eq!(
+                report.error.as_deref(),
+                Some(format!("{code}: {message}").as_str())
+            );
+            assert!(report.created.is_empty());
+            assert!(!store.is_seen("j", "k1").unwrap());
+            let state = store.job_state("j").unwrap().unwrap();
+            assert_eq!(state.cursor, None, "{code}");
+            assert_eq!(state.failures, 1);
+            assert!(state.backoff_until.is_some_and(|t| t > now));
+            assert!(state.last_result.unwrap().contains(code));
+            assert_eq!(rx.try_recv().unwrap().kind, "job.failed");
+
+            *refuse.lock().unwrap() = None;
+            let report = run_job(&fleet, &job("j"), &src, &tx, Utc::now(), false).await;
+            assert_eq!(report.created, vec!["t-1"], "{code}");
+            assert_eq!(got.lock().unwrap().len(), 2);
+            let state = store.job_state("j").unwrap().unwrap();
+            assert_eq!((state.failures, state.cursor.as_deref()), (0, Some("c1")));
+        }
+    }
+
+    /// The head's answer, item by item: a key it had seen (queued on a try
+    /// whose reply was lost) is seen here too; one past its cap waits for
+    /// the next run and holds the cursor; one whose paths it rejects is
+    /// reported and lets the cursor move; any other refusal fails the run.
+    #[tokio::test]
+    async fn a_headless_run_reads_the_heads_answer_item_by_item() {
+        let answer = |skipped: &[&str], refused: &[(&str, &str)]| {
+            let skipped: Vec<String> = skipped.iter().map(|k| k.to_string()).collect();
+            let refused: Vec<(String, String)> = refused
+                .iter()
+                .map(|(k, w)| (k.to_string(), w.to_string()))
+                .collect();
+            let ask: crate::daemon::HeadForward = Arc::new(move |_| {
+                let (skipped, refused) = (skipped.clone(), refused.clone());
+                Box::pin(async move {
+                    Ok(crate::ipc::IpcResponse::JobSubmitted {
+                        tasks: vec![],
+                        skipped,
+                        refused,
+                    })
+                })
+            });
+            ask
+        };
+        let run = |ask: crate::daemon::HeadForward| async move {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let fleet = Fleet::headless(store.clone(), ask);
+            let src = Scripted::with_keys(&["k1"]);
+            *src.cursor.lock().unwrap() = Some("c1".into());
+            let (tx, _rx) = events();
+            let report = run_job(&fleet, &job("j"), &src, &tx, Utc::now(), false).await;
+            let cursor = store.job_state("j").unwrap().unwrap().cursor;
+            (report, cursor, store)
+        };
+
+        let (report, cursor, store) = run(answer(&["k1"], &[])).await;
         assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
         assert_eq!(report.skipped_seen, 1);
-        assert!(report.created.is_empty() && report.error.is_none());
         assert_eq!(store.seen_task("j", "k1").unwrap(), Some(None));
-        assert_eq!(
-            store.job_state("j").unwrap().unwrap().cursor.as_deref(),
-            Some("c1")
-        );
+        assert_eq!(cursor.as_deref(), Some("c1"));
+
+        let (report, cursor, store) = run(answer(&[], &[("k1", "max_tasks_per_run")])).await;
+        assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
+        assert_eq!(report.deferred, 1);
+        assert!(!store.is_seen("j", "k1").unwrap());
+        assert_eq!(cursor, None);
+
+        let (report, cursor, _) = run(answer(&[], &[("k1", "rejected: repo: bad")])).await;
+        assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
+        assert_eq!(report.error.as_deref(), Some("k1: rejected: repo: bad"));
+        assert_eq!(cursor.as_deref(), Some("c1"));
+
+        let (report, cursor, _) = run(answer(&[], &[("k1", "unknown flock gpu")])).await;
+        assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
+        assert_eq!(report.error.as_deref(), Some("k1: unknown flock gpu"));
+        assert_eq!(cursor, None);
     }
 
     #[tokio::test]

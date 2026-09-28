@@ -1,7 +1,7 @@
 //! A headless `pastor serve`, the shepherd: with a head set on another
 //! machine, this one runs its own jobs and connector hooks and nothing else.
-//! No queue, no machine actors, no task store: each item a job finds goes to
-//! the head as `IpcRequest::JobTask`, and the head's events come back through
+//! No queue, no machine actors, no task store: the items a job run finds go
+//! to the head in one `IpcRequest::JobSubmit`, and the head's events come back through
 //! `EventsSince` for the hooks here. Its own small database
 //! (`Paths::shepherd_db_file`) keeps the jobs' state and seen keys and how far
 //! it has read the head's events.
@@ -15,13 +15,12 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::cli::CliError;
 use crate::config::{PastorConfig, Paths};
-use crate::daemon::{Answer, Daemon, Fleet, JobTaskForward, answer_on, jobs_answer};
+use crate::daemon::{Answer, Daemon, Fleet, answer_on, jobs_answer};
 use crate::events::{EventRecord, EventsPage};
 use crate::head::RemoteHead;
 use crate::ipc::{IPC_PROTOCOL, IpcRequest, IpcResponse, SHEPHERD_ROLE, request_line};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::Store;
-use crate::task::Task;
 
 /// The meta key that holds the last head event handed to the hooks.
 const CURSOR_KEY: &str = "head_event_seq";
@@ -29,7 +28,7 @@ const CURSOR_KEY: &str = "head_event_seq";
 /// How many head events one `EventsSince` asks for.
 const PAGE: u32 = 200;
 
-/// How long a request to the head may take. A `JobTask` waits for the
+/// How long a request to the head may take. A `JobSubmit` waits for the
 /// head's dispatch pass, agent readiness included.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -52,20 +51,6 @@ pub fn ask_remote(head: RemoteHead) -> Ask {
                 Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
                 Ok(resp) => Ok(resp),
                 Err(err) => Err(crate::head::failure(&err)),
-            }
-        })
-    })
-}
-
-/// What a job run's fleet sends each item through: a `JobTask` to the head,
-/// which answers the task it queued.
-fn forward(ask: Ask) -> JobTaskForward {
-    Arc::new(move |req| {
-        let ask = ask.clone();
-        Box::pin(async move {
-            match ask(req).await? {
-                IpcResponse::Task(t) => Ok::<Task, anyhow::Error>(t),
-                other => anyhow::bail!("the head answered a job task with {other:?}"),
             }
         })
     })
@@ -149,7 +134,7 @@ pub async fn run(paths: Paths, head: String, ask: Ask) -> anyhow::Result<()> {
             follow.pass().await;
         }
     });
-    let fleet = Arc::new(Fleet::headless(store.clone(), forward(ask)));
+    let fleet = Arc::new(Fleet::headless(store.clone(), ask));
     let scheduler = Scheduler::new(paths.clone(), &config, store, fleet, events)
         .with_connectors()
         .with_config_baseline(on_disk)
@@ -489,7 +474,7 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let (events, _) = broadcast::channel(4);
         let ask = head(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(true)));
-        let fleet = Arc::new(Fleet::headless(store.clone(), forward(ask)));
+        let fleet = Arc::new(Fleet::headless(store.clone(), ask));
         let config = PastorConfig::default();
         let scheduler = Scheduler::new(paths.clone(), &config, store, fleet, events)
             .headless()

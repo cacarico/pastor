@@ -125,11 +125,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   above already routes their CLI commands through. Agents on the head's
   machine get none.
 - With a head set, `pastor serve` runs headless instead of refusing: it runs
-  this machine's jobs and connector hooks and nothing else. Each item a job
-  finds goes to the head as a new `JobTask` request (IPC protocol 9), which
-  renders, queues and dispatches it as that job's task, and answers a key
-  it queued before with that task again (`already_seen` once it is
-  pruned), so a lost reply does not hold the job's cursor; the head's events
+  this machine's jobs and connector hooks and nothing else. The new items a
+  job run finds go to the head in one `JobSubmit`, with the job's
+  `[dispatch]` table as written, and the head renders, queues and dispatches
+  them as that job's tasks; keys it queued or had seen are marked seen here,
+  so a lost reply does not hold the job's cursor. A head that does not
+  answer fails the run with `head_unreachable`, and a head with a job file
+  of that name with `job_name_taken`: a failed run with backoff, and no item
+  kept, so the next run asks for them again. The head's events
   come back each tick for the hooks here. It keeps job state, seen keys and
   its event cursor in `shepherd.db`, and answers `ping` (role `shepherd`),
   `tick` and `job list|run|reload` on the local socket, `shepherd_unsupported`
