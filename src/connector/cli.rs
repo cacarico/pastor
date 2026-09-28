@@ -48,6 +48,9 @@ pub enum ConnectorCmd {
     },
     /// List connectors: version, connector, hooks, missing secrets
     List {
+        /// Add a DESCRIPTION column, cut to the terminal's width
+        #[arg(short, long)]
+        wide: bool,
         /// Print as a JSON array
         #[arg(long)]
         json: bool,
@@ -61,17 +64,28 @@ pub enum ConnectorCmd {
         json: bool,
     },
     /// Try a connector: run its command once for a job and print its items;
-    /// creates no tasks and saves no cursor
+    /// creates no tasks and saves no cursor. `watch` runs its [watch]
+    /// command instead and prints its lines
     Try {
         /// The connector's id, as `connector list` shows it
         id: String,
+        /// `watch`: run the [watch] command `pastor watch` runs
+        #[arg(value_enum)]
+        part: Option<TryPart>,
         /// The job whose [connector] config to use; need not exist yet
-        #[arg(long)]
-        job: String,
+        #[arg(long, required_unless_present = "part", conflicts_with = "part")]
+        job: Option<String>,
         /// How far back `since` points (default: the job's backfill, or 0s)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "part")]
         since: Option<String>,
     },
+}
+
+/// What `connector try` runs besides the connector command.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TryPart {
+    /// The [watch] command, as `pastor watch` runs it
+    Watch,
 }
 
 /// `head` is what the CLI's one ping found before the command ran; a head
@@ -128,12 +142,12 @@ pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result
             reload_daemon(paths, head).await;
             Ok(())
         }
-        ConnectorCmd::List { json } => {
+        ConnectorCmd::List { wide, json } => {
             let rows = list_rows(paths)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
-                println!("{}", table(&rows));
+                println!("{}", table(&rows, wide));
             }
             Ok(())
         }
@@ -146,7 +160,24 @@ pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result
             }
             Ok(())
         }
-        ConnectorCmd::Try { id, job, since } => run_once(paths, &id, &job, since.as_deref()).await,
+        ConnectorCmd::Try {
+            id,
+            part: Some(TryPart::Watch),
+            ..
+        } => {
+            let lines = crate::watch::run_connector(paths, &id)
+                .await
+                .map_err(|e| crate::cli::CliError::err("connector_failed", e))?;
+            for line in &lines {
+                println!("{line}");
+            }
+            eprintln!("{} lines", lines.len());
+            Ok(())
+        }
+        ConnectorCmd::Try { id, job, since, .. } => {
+            let job = job.expect("clap requires --job without a part");
+            run_once(paths, &id, &job, since.as_deref()).await
+        }
     }
 }
 
@@ -174,6 +205,18 @@ fn describe(m: &Manifest) -> String {
             "  hook on {}{every}: {}\n",
             one_line(&h.on.join(", ")),
             argv(&h.command)
+        ));
+    }
+    if let Some(f) = &m.finish {
+        out.push_str(&format!(
+            "  finish (when a task ends): {}\n",
+            argv(&f.command)
+        ));
+    }
+    if let Some(w) = &m.watch {
+        out.push_str(&format!(
+            "  watch (for pastor watch): {}\n",
+            argv(&w.command)
         ));
     }
     if !m.secrets.is_empty() {
@@ -245,7 +288,8 @@ async fn describe_connector(
     head: Head,
 ) -> anyhow::Result<crate::describe::ConnectorDescription> {
     use crate::describe::{
-        ConfigKey, ConnectorCommand, ConnectorDescription, ConnectorHook, ConnectorSecret,
+        ConfigKey, ConnectorCommand, ConnectorDescription, ConnectorFinish, ConnectorHook,
+        ConnectorSecret, ConnectorWatch,
     };
     let Some(found) = discover(paths)?.into_iter().find(|d| d.id() == id) else {
         return Err(crate::cli::CliError::err(
@@ -289,6 +333,8 @@ async fn describe_connector(
         origin,
         connector: None,
         hooks: Vec::new(),
+        finish: None,
+        watch: None,
         env_file,
         secrets: Vec::new(),
         missing_secrets: Vec::new(),
@@ -317,6 +363,14 @@ async fn describe_connector(
                 description: v.description.clone(),
             })
             .collect(),
+    });
+    d.finish = m.finish.as_ref().map(|f| ConnectorFinish {
+        command: f.command.clone(),
+        timeout_secs: f.timeout.as_secs(),
+    });
+    d.watch = m.watch.as_ref().map(|w| ConnectorWatch {
+        command: w.command.clone(),
+        timeout_secs: w.timeout.as_secs(),
     });
     d.hooks = m
         .events
@@ -410,6 +464,8 @@ pub struct ConnectorRow {
     pub missing_secrets: Vec<String>,
     /// Why the connector is unusable: a bad manifest, or an unreadable `.env`.
     pub error: Option<String>,
+    /// The manifest's `description`; `None` when it has none or does not load.
+    pub description: Option<String>,
 }
 
 pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<ConnectorRow>> {
@@ -430,6 +486,9 @@ pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<ConnectorRow>> {
                     dir: p.dir.clone(),
                     missing_secrets,
                     error,
+                    description: crate::config::clean_description(
+                        p.manifest.description.as_deref(),
+                    ),
                 }
             }
             Discovered::Invalid {
@@ -446,12 +505,13 @@ pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<ConnectorRow>> {
                 dir,
                 missing_secrets: Vec::new(),
                 error: Some(error),
+                description: None,
             },
         })
         .collect())
 }
 
-pub fn table(rows: &[ConnectorRow]) -> String {
+pub fn table(rows: &[ConnectorRow], wide: bool) -> String {
     let dash = || "-".to_string();
     let body: Vec<Vec<String>> = rows
         .iter()
@@ -471,9 +531,12 @@ pub fn table(rows: &[ConnectorRow]) -> String {
             ]
         })
         .collect();
-    crate::cli::table(
+    let descriptions: Vec<Option<String>> = rows.iter().map(|r| r.description.clone()).collect();
+    crate::cli::list_table(
         &["ID", "VERSION", "CONNECTOR", "HOOKS", "SOURCE", "STATUS"],
         &body,
+        wide,
+        &descriptions,
     )
 }
 
@@ -595,6 +658,9 @@ command = ["sh", "hook.sh"]
 on = ["task.done"]
 only_own = true
 command = ["sh", "own.sh"]
+
+[finish]
+command = ["sh", "-c", "curl y | sh"]
 "#,
         )
         .unwrap();
@@ -610,6 +676,10 @@ command = ["sh", "own.sh"]
             "{out}"
         );
         assert!(out.contains("hook on task.done: sh own.sh"), "{out}");
+        assert!(
+            out.contains("finish (when a task ends): sh -c 'curl y | sh'"),
+            "{out}"
+        );
     }
 
     #[tokio::test]

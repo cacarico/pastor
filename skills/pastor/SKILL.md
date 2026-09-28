@@ -31,7 +31,7 @@ Runtime errors are one JSON object on stderr, `{"code": ..., "message": ...}`, w
 pastor machine list
 ```
 
-With a head running, it opens with a line about the head (its pastor and herdr versions, its host, how many machines follow), then one row per machine: `NAME`, `HOST`, `FLOCK`, `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `PASTOR` (the pastor installed there, `-` when unknown), `AGENTS` (live tasks over `max_agents`), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head running, it says so on stderr and probes each machine directly instead: CHANNEL is then `probed` (herdr answered), `server down` (a local socket with no server), `unreachable` (ssh or transport failed) or `error` (herdr answered the ping with an error), and HERDR, PASTOR and AGENTS come from that probe. Report what it shows rather than starting `pastor serve` yourself, which is a long-running daemon.
+With a head running, it opens with a line about the head (its pastor and herdr versions, its host, how many machines follow), then one row per machine: `NAME`, `HOST`, `FLOCK`, `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `PASTOR` (the pastor installed there, `-` when unknown), `AGENTS` (live tasks over the machine's room: `max_agents`, then `+1j` for job slots and `+1b` for burst when set), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head running, it says so on stderr and probes each machine directly instead: CHANNEL is then `probed` (herdr answered), `server down` (a local socket with no server), `unreachable` (ssh or transport failed) or `error` (herdr answered the ping with an error), and HERDR, PASTOR and AGENTS come from that probe. Report what it shows rather than starting `pastor serve` yourself, which is a long-running daemon.
 
 ```bash
 pastor task list          # live tasks: queued, starting, running, blocked
@@ -55,10 +55,14 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 - `--worktree` makes a git worktree of `--repo` for the task, on `--branch` or `pastor/t-N`. It needs `--repo` and the repo cloned on that machine.
 - `--place` says where the agent's pane goes on the machine's herdr. `repo` (the default): a worktree task in its new worktree, a task whose `--repo` a workspace already shows (a fix round in a pull request's worktree) in a new pane there, anything else in its own workspace `t-N`. `own`: always its own workspace. `pastor`: a pane in the machine's `pastor` workspace, made on first use. `pane:<workspace>`: a pane in the workspace with that label, refused if the machine has none. A job sets it with `place` in `[dispatch]`, `pastor.toml` with `place` under `[defaults]`. Closing a task closes only its own pane, never a workspace it joined.
 - `--agent-arg` passes one argument to the agent and always takes the next word, dashes included. Repeat it, in order.
+- `--model NAME` runs a model named under `[models.<name>]` in `pastor.toml` (its `kind` and `args`); the model's args go before the agent's. Without it the task takes the `model` of its machine, then its flock, then `[defaults]`, then none. A name `[models]` lacks is `unknown_model`; a model whose kind is not the agent's is `model_kind_mismatch`, and an unpinned task only goes to machines whose agent has the model's kind. `--model` takes a name, never raw args: those go in `--agent-arg`. A model of another kind than the default agent's runs on the agent a machine, flock or `[defaults]` names for that kind in `agents = { <kind> = "<agent>" }`; a machine with none never gets it.
+- `--priority LEVEL` (`low`, `normal`, `high`, `critical`) queues the task at that level: when machines are full, dispatch takes queued tasks by level, highest first, then by position, then age. Without it the task takes the `priority` of the machine it is pinned to, then its flock, then `[defaults]`, then `normal`. Another word is `unknown_priority`. `pastor task priority t-N LEVEL` changes a queued task's level (`not_queued` once a machine took it); `task retry` keeps it. `pastor queue` lists the queued tasks in the order they will start, with how long each has waited and why it has not started (`--flock`, `--machine`, `--json`); `pastor queue move t-N` with `--top`, `--before t-M`, `--after t-M` or `--to N` puts one there, at the level of where it lands.
 - Without `--agent` and `--agent-arg`, the task takes the `agent` and `agent_args` of the machine it runs on from `flock.toml`, then its flock's, then `[defaults]` in `pastor.toml`, then `claude`. Args follow the agent they were written for: a flock's args for codex never reach a task run with `--agent claude`. `pastor task describe t-N` prints what the task resolved to and where each came from; an unpinned task settles its agent again when it is placed on a machine.
 - An agent name can be a definition in `pastor.toml`: `[agents.claude-personal]` with `kind = "claude"` and `env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }` runs Claude on another account. `--agent claude-personal` (or a flock's `agent`) picks it; herdr starts the `kind`, with the env set on the task's pane, and Claude's trust keys and tool flags follow the kind.
-- Tool permissions: the agent keeps its own permission mode. `allow` and `deny` lists of tool patterns (`"Bash(git:*)"`) in `[defaults]`, a `[[flock]]` entry or a job's `[dispatch]` add up, and deny wins over allow; pastor passes them as the agent's own flags (`--allowedTools`, `--disallowedTools` for Claude). An agent with no such flags refuses tasks that carry a list (`agent_tools_unsupported`). Never add `--dangerously-skip-permissions` or similar to `--agent-arg` on your own: a prompt-injected agent would then act as the machine's user with nothing to stop it. Leave that decision to the user.
+- `--profile NAME` runs the task under a permission profile (`pastor profile list`: `review`, `develop`, `unrestricted`, and `[profiles.<name>]` in `pastor.toml`). Without it the task takes the `profile` of its machine, then its flock, then `[defaults]`, then none. The profile's allow and deny go before the task's own, and a Claude agent starts with `--permission-mode dontAsk`: it never stops at a permission prompt, it is refused what the lists and its settings do not allow. Agent args that pick a permission mode are then refused (`profile_args_conflict`). An opencode agent gets the lists as `OPENCODE_PERMISSION` in its pane, denying what they do not allow (`unrestricted` allows it); a machine whose own opencode config has permission rules fails such a task (`opencode_permissions_conflict`). `unrestricted` runs only on a machine whose own profile is `unrestricted` (`profile_not_allowed`). An unknown name is `unknown_profile`. Pick the narrowest profile that does the job: `review` for reading, `develop` for changing a checkout.
+- Tool permissions: without a profile the agent keeps its own permission mode. `allow` and `deny` lists of tool patterns (`"Bash(git:*)"`) in `[defaults]`, a `[[flock]]` entry or a job's `[dispatch]` add up, and deny wins over allow; pastor passes them as the agent's own flags (`--allowedTools`, `--disallowedTools` for Claude). An agent with no such flags refuses tasks that carry a list (`agent_tools_unsupported`). Never add `--dangerously-skip-permissions` or similar to `--agent-arg` on your own: a prompt-injected agent would then act as the machine's user with nothing to stop it. Leave that decision to the user.
 - `--timeout` bounds the task; past it the task goes `stale`.
+- `--description TEXT` gives the task one line on what it is about, shown by `pastor task list --wide`, `task describe` and in `--json`; without it the prompt's first line stands in. Jobs, flocks and machines carry one too (`description` in their files); `--wide` on any `list` adds the column.
 - `--prompt-file PATH` takes the prompt from a file on the machine running the CLI (`-` is stdin) in place of the argument; give exactly one of the two. Use it for a long prompt: quotes, backticks and `$` need no escaping, and trailing newlines are dropped. An unreadable file fails with `prompt_file_unreadable`, an empty one with `prompt_file_empty`.
 
 pastor sends the prompt as is, and the agent knows nothing else. Write it so the agent can finish alone: say where it is (its own worktree and branch), what to change, what to commit and where to push, what report to write, and to print `DONE` as its last line.
@@ -71,7 +75,7 @@ pastor task read t-12          # recent pane output; --lines N for more
 pastor events --task t-12      # what happened to it, and when
 ```
 
-`pastor task attach t-12` puts a human terminal into the agent's pane (ctrl+b q detaches). It needs a real terminal; as an agent, use `pastor task read`.
+`pastor task attach t-12` puts a human terminal into the agent's pane (ctrl+b q detaches). On a closed or failed Claude task whose pane is gone, it reopens the agent's own session (`claude --resume`) in a new pane on the task's machine, re-creating a removed worktree first; the task itself does not change. Other agents cannot be reopened. It needs a real terminal; as an agent, use `pastor task read`.
 
 States:
 
@@ -106,7 +110,9 @@ pastor task read t-12                       # see what it is asking first
 pastor task send t-12 "yes, go on"          # types the text, then Enter; --no-enter leaves Enter out
 pastor task send t-12 --key esc             # named keys, in order; repeat --key
 pastor task send t-12 --trust               # accept the folder-trust prompt, and trust that repo on that machine
-pastor trust list                           # saved (machine, repo) pairs; pastor trust remove <machine> <repo>
+pastor trust list                           # saved (machine, repo) pairs
+pastor trust add <machine> <repo>           # trust a repo on a machine; remove undoes it
+pastor profile list                         # permission profiles; pastor profile describe <name> shows its allow and deny
 ```
 
 Only starting, running and blocked tasks take input, and done ones whose pane is still open (`task_not_live` otherwise); a done task sent input goes back to running, so `pastor task send t-12 "commit and push"` finishes work an agent left undone. Read the pane before you answer; never send what a human should decide. Once a repo is trusted on a machine, the head answers the trust prompt of its later tasks there by itself, once per task (`task.trusted`), worktrees included, and only while the pane shows that prompt; a task blocked on any other dialog is left for you. `--trust` answers only a task blocked on its startup prompt (`not_at_trust_prompt` otherwise) and needs `trust_keys` for the agent (Claude has them built in); `no_trust_keys` otherwise.
@@ -125,7 +131,7 @@ tags = ["arm"]
 prompt = "It is {{ item.key }}. Run the suite and fix what broke. Task {{ task.id }}."
 ```
 
-`[dispatch]` takes the same things as `pastor task run`, plus tool lists: `agent`, `agent_args`, `allow`, `deny`, `repo`, `worktree`, `branch`, `tags`, `flock`, `machine`, `timeout`, `place`, plus `max_tasks_per_run` and the `prompt` template.
+`[dispatch]` takes the same things as `pastor task run`, plus tool lists: `agent`, `agent_args`, `model` (a name, or a template like `"{{ item.model }}"`; empty falls through to the flock's), `priority` (a level, or a template like `"{{ item.priority }}"`; empty falls through), `profile`, `allow`, `deny`, `repo`, `worktree`, `branch`, `tags`, `flock`, `machine`, `timeout`, `place`, plus `max_tasks_per_run`, the `prompt` template and a `description` template for each task (default `"{{ item.title }}"`).
 
 ```bash
 pastor job list            # schedule, enabled, last and next run, errors
@@ -142,7 +148,7 @@ The head picks up job file edits by itself. A file that stops parsing keeps its 
 
 ## The fleet
 
-`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2), `tags`, `flock`, and optionally the `agent` and `agent_args` its tasks get when they name none, before the flock's. `[[flock]]` entries (`name`, `default = true` on one of them, and optionally the `agent` and `agent_args` its tasks and jobs get when they name none, and `allow` and `deny` tool lists added to theirs) declare the flocks; a machine with no `flock` is in the default one, and a file with no `[[flock]]` has a single flock named `default`.
+`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2), `job_slots` (default 1: extra slots only tasks from jobs take, a free one first), `burst` (default 1: how many past `max_agents` a `critical` task may start; `0` turns either off), `tags`, `flock`, and optionally the `agent`, `agent_args`, `model` and `profile` its tasks get when they name none, before the flock's. `[[flock]]` entries (`name`, `default = true` on one of them, and optionally the `agent`, `agent_args`, `model` and `profile` its tasks and jobs get when they name none, and `allow` and `deny` tool lists added to theirs) declare the flocks; a machine with no `flock` is in the default one, and a file with no `[[flock]]` has a single flock named `default`.
 
 ```bash
 pastor machine add pi-3 user@pi-3 --max-agents 2 --tag arm --herdr
@@ -176,6 +182,16 @@ timeout 60 pastor events --follow   # --follow never returns on its own; always 
 
 It reads the log file, so it works with the head down.
 
+To wait on the fleet rather than read its history, use `pastor watch`: one line per change to act on (`TASK t-12 failed ...`, `JOB nightly failing: ...`, `HEAD down: ...`, and the lines of connectors with a `[watch]` command).
+
+```bash
+pastor watch --now                         # what needs attention now: blocked, done, failed, stale tasks, failing jobs
+timeout 1800 pastor watch --name night     # never returns on its own; bound it and run it again with the same --name
+pastor watch --name night --json --interval 2m --connector prs
+```
+
+A watcher keeps a cursor under its `--name`, so one started again repeats nothing; `--reset` starts it over at the end of the log. It only reads, so it works from a pastor task too.
+
 ## When pastor dispatched you
 
 You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `HERDR_ENV=1` is set, your herdr agent and workspace are named `t-N`), and the prompt reads like a self-contained work order. Then:
@@ -185,7 +201,8 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - Do not ask questions. Nobody is watching; a permission prompt or a question leaves the task `blocked` until a human happens to attach. If something is missing, say so in your report and stop.
 - When finished, run `pastor task done` (it ends your own task, from `PASTOR_TASK`), print `DONE` as your last line, then go idle. pastor marks the task `done` at once and closes your pane after `close_done_after`, freeing the machine's slot.
 - Do not close your pane or exit to clean up; `pastor task done` is how you say you are finished.
-- Do not run, send to, attach to, retry, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor machine open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `read`, and `describe` for tasks, jobs, machines, flocks and connectors) is fine.
+- Do not run, send to, attach to, retry, reprioritize, move in the queue, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor machine open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `queue`, `read`, `events`, `watch`, and `describe` for tasks, jobs, machines, flocks and connectors) is fine.
+- If `pastor task describe $PASTOR_TASK` says `role: orchestrator`, a person started you to coordinate: you may also `pastor task run`, `task retry` and `task send`, and `pastor job disable` a failing job. Everything else above is still refused, `task close` and `job enable` included, and you may never start another orchestrator (`--role orchestrator` is `role_refused` from any task).
 
 ## When something goes wrong
 

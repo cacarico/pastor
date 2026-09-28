@@ -305,27 +305,7 @@ pub async fn run_job(
             report.outcome = RunOutcome::Failed;
             report.error = Some(err.clone());
             if !dry_run {
-                state.failures += 1;
-                state.last_run_at = Some(now);
-                let wait = chrono::Duration::from_std(backoff_for(state.failures))
-                    .unwrap_or_else(|_| chrono::Duration::zero());
-                state.backoff_until = Some(now + wait);
-                state.last_result = Some(format!(
-                    "failed ({}x): {}",
-                    state.failures,
-                    first_line(&err)
-                ));
-                state.last_error = Some(err);
-                if let Err(e) = store.save_job_state(&state) {
-                    tracing::error!(job = %job.name, %e, "save job state");
-                }
-                let _ = events.send(PastorEvent {
-                    detail: None,
-                    kind: "job.failed".into(),
-                    task_id: None,
-                    machine: None,
-                    job: Some(job.name.clone()),
-                });
+                back_off(store, events, job, &mut state, now, err);
             }
             return report;
         }
@@ -338,6 +318,8 @@ pub async fn run_job(
     let mut insert_failed = false;
     // Rejected items and failed inserts, for `report.error` and `job list`.
     let mut problems: Vec<String> = Vec::new();
+    // A headless serve's new items, for one `JobSubmit` after the loop.
+    let mut to_head: Vec<Value> = Vec::new();
     for item in &output.items {
         if item.key.is_empty() {
             tracing::warn!(job = %job.name, "item without a key skipped");
@@ -366,12 +348,22 @@ pub async fn run_job(
             problems.push(format!("{}: rejected: {why}", item.key));
             continue;
         }
-        if report.created.len() as u32 >= job.max_tasks_per_run {
+        // A headless serve's own `max_tasks_per_run` may differ from the
+        // head's `[defaults]` for this job; leave the cap to the head's
+        // `JobSubmit` handling (`Daemon::submit`) instead of pre-capping here.
+        if !fleet.submits_to_head()
+            && (report.created.len() + to_head.len()) as u32 >= job.max_tasks_per_run
+        {
             report.deferred += 1;
             continue;
         }
         if dry_run {
             report.created.push(item.key.clone());
+            continue;
+        }
+        // A headless serve sends them all to the head at once, below.
+        if fleet.submits_to_head() {
+            to_head.push(value);
             continue;
         }
         match fleet
@@ -389,10 +381,52 @@ pub async fn run_job(
                 });
                 report.created.push(t.display_id());
             }
+            // Queued by another request first.
+            Err(_) if store.is_seen(&job.name, &item.key).unwrap_or(false) => {
+                report.skipped_seen += 1;
+            }
             Err(e) => {
                 tracing::error!(job = %job.name, key = %item.key, %e, "create task");
                 problems.push(format!("{}: {e:#}", item.key));
                 insert_failed = true;
+            }
+        }
+    }
+    if !to_head.is_empty() {
+        match fleet.submit_to_head(job, to_head).await {
+            Ok(out) => {
+                for t in out.tasks {
+                    tracing::info!(job = %job.name, task = %t.display_id(), "task queued on the head");
+                    report.created.push(t.display_id());
+                }
+                report.skipped_seen += out.skipped.len();
+                for (key, why) in out.refused {
+                    if why == "max_tasks_per_run" {
+                        report.deferred += 1;
+                        continue;
+                    }
+                    tracing::warn!(job = %job.name, %key, %why, "the head refused an item");
+                    // An item whose paths the head rejects is its own fault,
+                    // as here; any other refusal may pass on a retry.
+                    if !why.starts_with("rejected: ") {
+                        insert_failed = true;
+                    }
+                    problems.push(format!("{key}: {why}"));
+                }
+            }
+            // Nothing reached the head's queue, or nothing is known to have:
+            // a failed run like a connector's, with its backoff, and the
+            // items asked for again on the next.
+            Err(err) => {
+                let err = match err.downcast_ref::<crate::cli::CliError>() {
+                    Some(e) => format!("{}: {}", e.code, e.message),
+                    None => format!("{err:#}"),
+                };
+                tracing::warn!(job = %job.name, %err, "items not sent to the head");
+                report.outcome = RunOutcome::Failed;
+                report.error = Some(err.clone());
+                back_off(store, events, job, &mut state, now, err);
+                return report;
             }
         }
     }
@@ -454,6 +488,121 @@ pub async fn run_job(
     report
 }
 
+/// A run that failed as a whole: the job's failure count goes up and it
+/// backs off, its cursor stays, and `job.failed` goes out.
+fn back_off(
+    store: &Store,
+    events: &broadcast::Sender<PastorEvent>,
+    job: &Job,
+    state: &mut JobState,
+    now: DateTime<Utc>,
+    err: String,
+) {
+    state.failures += 1;
+    state.last_run_at = Some(now);
+    let wait = chrono::Duration::from_std(backoff_for(state.failures))
+        .unwrap_or_else(|_| chrono::Duration::zero());
+    state.backoff_until = Some(now + wait);
+    state.last_result = Some(format!(
+        "failed ({}x): {}",
+        state.failures,
+        first_line(&err)
+    ));
+    state.last_error = Some(err);
+    if let Err(e) = store.save_job_state(state) {
+        tracing::error!(job = %job.name, %e, "save job state");
+    }
+    let _ = events.send(PastorEvent {
+        detail: None,
+        kind: "job.failed".into(),
+        task_id: None,
+        machine: None,
+        job: Some(job.name.clone()),
+    });
+}
+
+/// What a `JobSubmit` did with its items; see `IpcResponse::JobSubmitted`.
+#[derive(Debug, Default)]
+pub struct Submitted {
+    pub tasks: Vec<crate::task::Task>,
+    pub skipped: Vec<String>,
+    pub refused: Vec<(String, String)>,
+}
+
+/// Queue a submitted job's items as `run_job` queues a run's: a key already
+/// seen (or repeated in `items`) is skipped, an item whose values fail
+/// `check_item_paths` is refused with the reason, and past
+/// `max_tasks_per_run` tasks the rest are refused with `max_tasks_per_run`.
+/// Each task is one transaction (`Store::insert_job_task`). Dispatch is the
+/// caller's.
+pub async fn submit_items(
+    fleet: &Fleet,
+    store: &Store,
+    events: &broadcast::Sender<PastorEvent>,
+    job: &Job,
+    items: &[Value],
+) -> Submitted {
+    let mut out = Submitted::default();
+    let mut in_request: HashSet<String> = HashSet::new();
+    for item in items {
+        let Some(key) = item.get("key").and_then(Value::as_str).map(str::to_string) else {
+            out.refused
+                .push((String::new(), "item has no string key".into()));
+            continue;
+        };
+        if key.is_empty() {
+            out.refused.push((key, "item has an empty key".into()));
+            continue;
+        }
+        if !in_request.insert(key.clone()) {
+            out.skipped.push(key);
+            continue;
+        }
+        match store.is_seen(&job.name, &key) {
+            Ok(true) => {
+                out.skipped.push(key);
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                out.refused.push((key, format!("seen-store: {e:#}")));
+                continue;
+            }
+        }
+        if let Err(why) = check_item_paths(job, item) {
+            out.refused.push((key, format!("rejected: {why}")));
+            continue;
+        }
+        if out.tasks.len() as u32 >= job.max_tasks_per_run {
+            out.refused.push((key, "max_tasks_per_run".into()));
+            continue;
+        }
+        match fleet
+            .queue_job_task(job, item, |id| render_task(job, item, id))
+            .await
+        {
+            Ok(t) => {
+                tracing::info!(job = %job.name, task = %t.display_id(), %key, "submitted task queued");
+                let _ = events.send(PastorEvent {
+                    detail: None,
+                    kind: "task.queued".into(),
+                    task_id: Some(t.id),
+                    machine: None,
+                    job: Some(t.job.clone()),
+                });
+                out.tasks.push(t);
+            }
+            // Another submitter queued the key first.
+            Err(_) if store.is_seen(&job.name, &key).unwrap_or(false) => out.skipped.push(key),
+            Err(e) => {
+                tracing::warn!(job = %job.name, %key, %e, "submitted item not queued");
+                out.refused.push((key, format!("{e:#}")));
+            }
+        }
+    }
+    out
+}
+
 /// What `pastor job list` shows for one job file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
@@ -474,6 +623,9 @@ pub struct JobStatus {
     /// when the file never parsed.
     #[serde(default)]
     pub flock: Option<String>,
+    /// The file's `description`, from its last good parse.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// A job as the scheduler holds it: the last good parse, plus the current
@@ -535,6 +687,18 @@ pub enum SchedulerCommand {
     /// Apply `pastor.toml` and `flock.toml` if they changed on disk
     /// (`reload_config`), before a `task run` queues against them.
     SyncConfig { reply: oneshot::Sender<()> },
+    /// Build the job a `JobSubmit` names from its `[dispatch]`, with the job
+    /// files and `pastor.toml` as they stand now: `Err((code, message))` for
+    /// a name a job file has, or a table that does not validate.
+    Submitted {
+        name: String,
+        dispatch: Value,
+        prompt: String,
+        reply: oneshot::Sender<Result<Job, (String, String)>>,
+    },
+    /// The items `Submitted` reserved `name` for are queued now (or never
+    /// will be, on error); release the reservation.
+    Released { name: String },
 }
 
 #[derive(Clone)]
@@ -578,6 +742,25 @@ impl SchedulerHandle {
     pub async fn job_list(&self) -> anyhow::Result<Vec<JobStatus>> {
         self.send(|reply| SchedulerCommand::JobList { reply }).await
     }
+    pub async fn submitted(
+        &self,
+        name: String,
+        dispatch: Value,
+        prompt: String,
+    ) -> anyhow::Result<Result<Job, (String, String)>> {
+        self.send(|reply| SchedulerCommand::Submitted {
+            name,
+            dispatch,
+            prompt,
+            reply,
+        })
+        .await
+    }
+    /// Release the name `submitted` reserved, once the caller is done
+    /// queueing its items (whatever the outcome).
+    pub async fn released(&self, name: String) {
+        let _ = self.tx.send(SchedulerCommand::Released { name }).await;
+    }
     pub async fn sync_config(&self) -> anyhow::Result<()> {
         self.send(|reply| SchedulerCommand::SyncConfig { reply })
             .await
@@ -607,6 +790,12 @@ pub struct Scheduler {
     /// host a stream connector.
     standalone: bool,
     entries: HashMap<String, Entry>,
+    /// Names `submitted` has handed out a `Job` for but whose items are not
+    /// queued yet: held taken so a concurrent job-file reload, `fire` or tick
+    /// cannot start a run of the same name and mix its tasks and `seen` keys
+    /// with the submitter's. Released once the caller queues them (or gives
+    /// up), by `Released`.
+    reserved: HashSet<String>,
     /// (file name, mtime, size) of every job file at the last load; `None`
     /// until the first.
     fingerprint: Option<Vec<(PathBuf, Option<SystemTime>, u64)>>,
@@ -629,6 +818,9 @@ pub struct Scheduler {
     /// `pastor.toml` as last applied. `tick`, `defaults` and the machine
     /// timings (`daemon::machine_settings`) all come from it.
     config: PastorConfig,
+    /// A headless serve's scheduler: flock.toml is the head's business, so
+    /// it is never read here, and tasks go to the head (`Fleet::headless`).
+    headless: bool,
     /// `pastor.toml` and `flock.toml` as last applied. `None` makes the next
     /// `reload_config` apply whatever is on disk; `Daemon::start` sets it
     /// with `with_config_baseline` to what its caller saw before loading.
@@ -656,6 +848,7 @@ impl Scheduler {
             resolve: None,
             standalone: false,
             entries: HashMap::new(),
+            reserved: HashSet::new(),
             fingerprint: None,
             in_flight: Vec::new(),
             last_turn: HashMap::new(),
@@ -664,6 +857,7 @@ impl Scheduler {
             warned_removed: HashSet::new(),
             config: config.clone(),
             config_fingerprint: None,
+            headless: false,
         }
     }
 
@@ -675,6 +869,12 @@ impl Scheduler {
     /// nothing on disk changed.
     pub fn with_config_baseline(mut self, baseline: ConfigFingerprint) -> Self {
         self.config_fingerprint = Some(baseline);
+        self
+    }
+
+    /// For a headless serve: see `headless`.
+    pub fn headless(mut self) -> Self {
+        self.headless = true;
         self
     }
 
@@ -724,12 +924,29 @@ impl Scheduler {
         store: Arc<Store>,
     ) -> anyhow::Result<Scheduler> {
         let flock = Flock::load(&paths.flock_file())?;
+        flock.check_config(&config.models, &config.agents, &config.profiles)?;
         let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()).with_flock(flock));
         let (events, _) = broadcast::channel(1);
         Ok(Scheduler {
             standalone: true,
             ..Scheduler::new(paths, config, store, fleet, events)
         })
+    }
+
+    /// `standalone` for a headless serve's jobs while it is down, over its
+    /// own store (`Paths::shepherd_db_file`): flock.toml is the head's
+    /// business, so it is not read here.
+    pub fn standalone_headless(
+        paths: Paths,
+        config: &PastorConfig,
+        store: Arc<Store>,
+    ) -> Scheduler {
+        let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()));
+        let (events, _) = broadcast::channel(1);
+        Scheduler {
+            standalone: true,
+            ..Scheduler::new(paths, config, store, fleet, events).headless()
+        }
     }
 
     pub fn spawn(self) -> SchedulerHandle {
@@ -788,6 +1005,15 @@ impl Scheduler {
                             let _ = reply.send(());
                             retime(&mut tick, self.tick);
                         }
+                        SchedulerCommand::Submitted { name, dispatch, prompt, reply } => {
+                            self.reload_config(false).await;
+                            self.reload();
+                            let _ = reply.send(self.submitted(&name, &dispatch, &prompt));
+                            retime(&mut tick, self.tick);
+                        }
+                        SchedulerCommand::Released { name } => {
+                            self.reserved.remove(&name);
+                        }
                         SchedulerCommand::JobList { reply } => {
                             self.reload();
                             self.reap().await;
@@ -797,6 +1023,26 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// `SchedulerCommand::Submitted`. A job file of the name, valid or not,
+    /// owns it: its tasks and `seen` keys would mix with the submitter's.
+    fn submitted(
+        &mut self,
+        name: &str,
+        dispatch: &Value,
+        prompt: &str,
+    ) -> Result<Job, (String, String)> {
+        if self.entries.contains_key(name) || self.reserved.contains(name) {
+            return Err((
+                "job_name_taken".into(),
+                format!("the head has a job file named {name}"),
+            ));
+        }
+        let job = Job::submitted(name, dispatch, prompt, &self.defaults)
+            .map_err(|e| ("invalid_dispatch".into(), e))?;
+        self.reserved.insert(name.to_string());
+        Ok(job)
     }
 
     /// Re-read the jobs directory if any file was added, removed or touched.
@@ -928,18 +1174,29 @@ impl Scheduler {
                 tracing::error!(%err, "pastor.toml does not load; the previous version stays in use")
             }
         }
-        let flock = match Flock::load_existing(&files[1]) {
-            Ok(f) => f,
-            Err(err) if is_not_found(&err) => {
-                tracing::warn!(
-                    path = %files[1].display(),
-                    "flock.toml is missing; the previous flock stays in use"
-                );
-                self.fleet.flock()
-            }
-            Err(err) => {
-                tracing::error!(%err, "flock.toml does not load; the previous flock stays in use");
-                self.fleet.flock()
+        let flock = if self.headless {
+            self.fleet.flock()
+        } else {
+            match Flock::load_existing(&files[1]).and_then(|f| {
+                f.check_config(
+                    &self.config.models,
+                    &self.config.agents,
+                    &self.config.profiles,
+                )
+                .map(|()| f)
+            }) {
+                Ok(f) => f,
+                Err(err) if is_not_found(&err) => {
+                    tracing::warn!(
+                        path = %files[1].display(),
+                        "flock.toml is missing; the previous flock stays in use"
+                    );
+                    self.fleet.flock()
+                }
+                Err(err) => {
+                    tracing::error!(%err, "flock.toml does not load; the previous flock stays in use");
+                    self.fleet.flock()
+                }
             }
         };
         let diff = self.fleet.apply_config(&self.config, &flock).await;
@@ -1055,6 +1312,7 @@ impl Scheduler {
                             .task_flock(j.flock.as_deref(), j.spec.machine.as_deref())
                             .unwrap_or_else(|_| j.flock.clone().unwrap_or_default())
                     }),
+                    description: e.job.as_ref().and_then(|j| j.description.clone()),
                 }
             })
             .collect();
@@ -1073,6 +1331,7 @@ impl Scheduler {
             .entries
             .values()
             .filter_map(|e| e.job.clone())
+            .filter(|j| !self.reserved.contains(&j.name))
             .filter(|j| matches!(self.due_of(j, states.get(&j.name), now), Due::Now))
             .collect();
         for job in due {
@@ -1088,10 +1347,15 @@ impl Scheduler {
         self.warn_long_queued(now);
     }
 
-    /// `pastor job run`: now, regardless of schedule, overlap and `enabled`.
+    /// `pastor job run`: now, regardless of schedule and `enabled`.
     /// A fire while a run is going queues behind it (see `Turn`), so the
     /// second run starts from the state the first one saved.
     pub fn fire(&mut self, name: &str, now: DateTime<Utc>) -> Result<String, String> {
+        if self.reserved.contains(name) {
+            return Err(format!(
+                "{name:?} is a submitted job whose items are still queueing; try again shortly"
+            ));
+        }
         let job = self
             .entries
             .get(name)
@@ -1209,6 +1473,12 @@ impl Scheduler {
         for name in &names {
             let name = name.as_str();
             if only.is_some_and(|o| o != name) {
+                continue;
+            }
+            if self.reserved.contains(name) {
+                // A job file just landed under a name `submitted` reserved;
+                // its items are still queueing. Let this pass skip it rather
+                // than run it against the submitter's still-forming state.
                 continue;
             }
             let entry = &self.entries[name];
@@ -1583,6 +1853,8 @@ mod tests {
 
     pub(super) fn job(name: &str) -> Job {
         Job {
+            task_description: None,
+            description: None,
             name: name.into(),
             schedule: Schedule::Every(Duration::from_secs(60)),
             enabled: true,
@@ -1606,9 +1878,19 @@ mod tests {
                 reopen: None,
                 agent_source: None,
                 place: Default::default(),
+                session_id: None,
             },
             agent: Default::default(),
             flock: None,
+            priority: None,
+            dispatch: json!({
+                "agent": "claude",
+                "repo": "/srv/{{ job.name }}",
+                "worktree": true,
+                "branch": "pastor/{{ item.key }}",
+                "timeout": "60s",
+                "max_tasks_per_run": 5,
+            }),
         }
     }
 
@@ -1626,6 +1908,209 @@ mod tests {
         broadcast::Receiver<PastorEvent>,
     ) {
         broadcast::channel(16)
+    }
+
+    /// A headless serve's fleet (`Fleet::headless`) whose head is `head`:
+    /// each `JobSubmit` is queued there as the head's `Daemon::submit` does,
+    /// or refused with `refuse` (a code and a message) when set. Returns the
+    /// requests it got.
+    fn headless_fleet(
+        store: &Arc<Store>,
+        head: Arc<Store>,
+        refuse: Arc<Mutex<Option<(String, String)>>>,
+    ) -> (Fleet, Arc<Mutex<Vec<crate::ipc::IpcRequest>>>) {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let seen = got.clone();
+        let ask: crate::daemon::HeadForward = Arc::new(move |req| {
+            seen.lock().unwrap().push(req.clone());
+            let head = head.clone();
+            let refuse = refuse.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some((code, message)) = refuse {
+                    return Err(crate::cli::CliError::err(&code, message));
+                }
+                let crate::ipc::IpcRequest::JobSubmit {
+                    job: name,
+                    dispatch,
+                    prompt,
+                    items,
+                } = req
+                else {
+                    panic!("{req:?}")
+                };
+                let j = Job::submitted(&name, &dispatch, &prompt, &Default::default())
+                    .map_err(anyhow::Error::msg)?;
+                let (tx, _rx) = events();
+                let out = submit_items(&fleet(&head), &head, &tx, &j, &items).await;
+                Ok(crate::ipc::IpcResponse::JobSubmitted {
+                    tasks: out.tasks,
+                    skipped: out.skipped,
+                    refused: out.refused,
+                })
+            })
+        });
+        (Fleet::headless(store.clone(), ask), got)
+    }
+
+    /// The items of a run go to the head in one `JobSubmit`, with the job's
+    /// `[dispatch]` table and its unrendered prompt; the head's tasks are
+    /// the run's, and only their keys are kept here.
+    #[tokio::test]
+    async fn a_headless_run_submits_its_items_to_the_head() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let head = Arc::new(Store::open_in_memory().unwrap());
+        let refuse = Arc::new(Mutex::new(None));
+        let (fleet, got) = headless_fleet(&store, head.clone(), refuse.clone());
+        let src = Scripted::with_keys(&["k1", "k2"]);
+        *src.cursor.lock().unwrap() = Some("c1".into());
+        let (tx, _rx) = events();
+        let j = job("j");
+        let report = run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
+        assert_eq!(report.created, vec!["t-1", "t-2"]);
+        let sent = got.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one request per run");
+        let crate::ipc::IpcRequest::JobSubmit {
+            job: name,
+            dispatch,
+            prompt,
+            items,
+        } = &sent[0]
+        else {
+            panic!("{sent:?}")
+        };
+        assert_eq!(name, "j");
+        assert_eq!(dispatch, &j.dispatch);
+        assert_eq!(prompt, &j.prompt);
+        let keys: Vec<&str> = items.iter().map(|i| i["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["k1", "k2"]);
+        // The rows are the head's, rendered with the head's ids.
+        assert_eq!(head.list_tasks(&TaskFilter::default()).unwrap().len(), 2);
+        assert_eq!(
+            head.get_task(1).unwrap().unwrap().prompt,
+            "j: title of k1 (t-1)"
+        );
+        assert!(store.list_tasks(&TaskFilter::default()).unwrap().is_empty());
+        assert_eq!(store.seen_task("j", "k1").unwrap(), Some(Some(1)));
+        assert_eq!(store.seen_task("j", "k2").unwrap(), Some(Some(2)));
+        assert_eq!(
+            store.job_state("j").unwrap().unwrap().cursor.as_deref(),
+            Some("c1")
+        );
+
+        // Seen here, so the next run sends only the new item.
+        src.items.lock().unwrap().push(item("k3"));
+        *src.cursor.lock().unwrap() = Some("c2".into());
+        let report = run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.skipped_seen, 2);
+        assert_eq!(report.created, vec!["t-3"]);
+        let sent = got.lock().unwrap().clone();
+        let crate::ipc::IpcRequest::JobSubmit { items, .. } = &sent[1] else {
+            panic!()
+        };
+        assert_eq!(items.len(), 1);
+        // A run with nothing new asks the head nothing.
+        run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
+        assert_eq!(got.lock().unwrap().len(), 2);
+    }
+
+    /// A head that cannot be reached, or refuses the job's name, fails the
+    /// run as a failing connector does: it backs off, `job.failed` goes out,
+    /// and no item is kept, so the next run asks for them again.
+    #[tokio::test]
+    async fn a_headless_run_the_head_does_not_take_fails_and_backs_off() {
+        for (code, message) in [
+            ("head_unreachable", "ssh: no route to host"),
+            ("job_name_taken", "the head has a job file named j"),
+        ] {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let head = Arc::new(Store::open_in_memory().unwrap());
+            let refuse = Arc::new(Mutex::new(Some((code.to_string(), message.to_string()))));
+            let (fleet, got) = headless_fleet(&store, head.clone(), refuse.clone());
+            let src = Scripted::with_keys(&["k1"]);
+            *src.cursor.lock().unwrap() = Some("c1".into());
+            let (tx, mut rx) = events();
+            let now = Utc::now();
+            let report = run_job(&fleet, &job("j"), &src, &tx, now, false).await;
+            assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
+            assert_eq!(
+                report.error.as_deref(),
+                Some(format!("{code}: {message}").as_str())
+            );
+            assert!(report.created.is_empty());
+            assert!(!store.is_seen("j", "k1").unwrap());
+            let state = store.job_state("j").unwrap().unwrap();
+            assert_eq!(state.cursor, None, "{code}");
+            assert_eq!(state.failures, 1);
+            assert!(state.backoff_until.is_some_and(|t| t > now));
+            assert!(state.last_result.unwrap().contains(code));
+            assert_eq!(rx.try_recv().unwrap().kind, "job.failed");
+
+            *refuse.lock().unwrap() = None;
+            let report = run_job(&fleet, &job("j"), &src, &tx, Utc::now(), false).await;
+            assert_eq!(report.created, vec!["t-1"], "{code}");
+            assert_eq!(got.lock().unwrap().len(), 2);
+            let state = store.job_state("j").unwrap().unwrap();
+            assert_eq!((state.failures, state.cursor.as_deref()), (0, Some("c1")));
+        }
+    }
+
+    /// The head's answer, item by item: a key it had seen (queued on a try
+    /// whose reply was lost) is seen here too; one past its cap waits for
+    /// the next run and holds the cursor; one whose paths it rejects is
+    /// reported and lets the cursor move; any other refusal fails the run.
+    #[tokio::test]
+    async fn a_headless_run_reads_the_heads_answer_item_by_item() {
+        let answer = |skipped: &[&str], refused: &[(&str, &str)]| {
+            let skipped: Vec<String> = skipped.iter().map(|k| k.to_string()).collect();
+            let refused: Vec<(String, String)> = refused
+                .iter()
+                .map(|(k, w)| (k.to_string(), w.to_string()))
+                .collect();
+            let ask: crate::daemon::HeadForward = Arc::new(move |_| {
+                let (skipped, refused) = (skipped.clone(), refused.clone());
+                Box::pin(async move {
+                    Ok(crate::ipc::IpcResponse::JobSubmitted {
+                        tasks: vec![],
+                        skipped,
+                        refused,
+                    })
+                })
+            });
+            ask
+        };
+        let run = |ask: crate::daemon::HeadForward| async move {
+            let store = Arc::new(Store::open_in_memory().unwrap());
+            let fleet = Fleet::headless(store.clone(), ask);
+            let src = Scripted::with_keys(&["k1"]);
+            *src.cursor.lock().unwrap() = Some("c1".into());
+            let (tx, _rx) = events();
+            let report = run_job(&fleet, &job("j"), &src, &tx, Utc::now(), false).await;
+            let cursor = store.job_state("j").unwrap().unwrap().cursor;
+            (report, cursor, store)
+        };
+
+        let (report, cursor, store) = run(answer(&["k1"], &[])).await;
+        assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
+        assert_eq!(report.skipped_seen, 1);
+        assert_eq!(store.seen_task("j", "k1").unwrap(), Some(None));
+        assert_eq!(cursor.as_deref(), Some("c1"));
+
+        let (report, cursor, store) = run(answer(&[], &[("k1", "max_tasks_per_run")])).await;
+        assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
+        assert_eq!(report.deferred, 1);
+        assert!(!store.is_seen("j", "k1").unwrap());
+        assert_eq!(cursor, None);
+
+        let (report, cursor, _) = run(answer(&[], &[("k1", "rejected: repo: bad")])).await;
+        assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
+        assert_eq!(report.error.as_deref(), Some("k1: rejected: repo: bad"));
+        assert_eq!(cursor.as_deref(), Some("c1"));
+
+        let (report, cursor, _) = run(answer(&[], &[("k1", "unknown flock gpu")])).await;
+        assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
+        assert_eq!(report.error.as_deref(), Some("k1: unknown flock gpu"));
+        assert_eq!(cursor, None);
     }
 
     #[tokio::test]
@@ -2584,6 +3069,7 @@ mod tests {
         // A running task left on "a" while its actor is wedged.
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),
@@ -3567,6 +4053,7 @@ mod tests {
         };
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),
@@ -3590,6 +4077,7 @@ mod tests {
         let (mut s, _tmp) = scheduler_with(&store);
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),
@@ -3616,6 +4104,7 @@ mod tests {
         let (mut s, _tmp) = scheduler_with(&store);
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),
@@ -3640,6 +4129,7 @@ mod tests {
         let (mut s, _tmp) = scheduler_with(&store);
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),

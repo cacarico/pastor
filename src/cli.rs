@@ -1,5 +1,5 @@
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::flock::{DEFAULT_FLOCK, Flock};
 use crate::ipc::{RequestError, connect_error_means_no_daemon};
@@ -72,6 +72,89 @@ pub fn table(header: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
+/// The fewest characters of a description `--wide` keeps on a narrow
+/// terminal; the table wraps rather than show less.
+const MIN_DESCRIPTION: usize = 20;
+
+/// `table` with a DESCRIPTION column last, one per row (`-` for none), each
+/// on one escaped line. With `width` (a terminal's), a description longer
+/// than what the other columns leave is cut to fit, ending in `…`; it keeps
+/// `MIN_DESCRIPTION` characters however narrow. Without it nothing is cut.
+pub fn wide_table(
+    header: &[&str],
+    rows: &[Vec<String>],
+    descriptions: &[Option<String>],
+    width: Option<usize>,
+) -> String {
+    let before: usize = (0..header.len())
+        .map(|i| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(|c| c.chars().count())
+                .chain([header[i].len()])
+                .max()
+                .unwrap_or(0)
+                + 2
+        })
+        .sum();
+    let room = width.map(|w| w.saturating_sub(before).max(MIN_DESCRIPTION));
+    let mut full_header = header.to_vec();
+    full_header.push("DESCRIPTION");
+    let full_rows: Vec<Vec<String>> = rows
+        .iter()
+        .zip(descriptions.iter().chain(std::iter::repeat(&None)))
+        .map(|(row, d)| {
+            let mut text = d.as_deref().map_or_else(|| "-".to_string(), one_line);
+            if let Some(room) = room
+                && text.chars().count() > room
+            {
+                text = text.chars().take(room - 1).chain(['…']).collect();
+            }
+            let mut row = row.clone();
+            row.push(text);
+            row
+        })
+        .collect();
+    table(&full_header, &full_rows)
+}
+
+/// A list command's table: `table`, or with `--wide` the `wide_table`
+/// cut to this terminal (`terminal_width`).
+pub fn list_table(
+    header: &[&str],
+    rows: &[Vec<String>],
+    wide: bool,
+    descriptions: &[Option<String>],
+) -> String {
+    if wide {
+        wide_table(header, rows, descriptions, terminal_width())
+    } else {
+        table(header, rows)
+    }
+}
+
+/// The width of the terminal stdout is, from the terminal itself, else
+/// `$COLUMNS`. `None` when stdout is not a terminal: piped or saved, a
+/// list is not cut.
+pub fn terminal_width() -> Option<usize> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    // SAFETY: TIOCGWINSZ only writes a `winsize` into the one we pass.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
+    {
+        return Some(ws.ws_col as usize);
+    }
+    std::env::var("COLUMNS")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)
+}
+
 pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
     tasks
         .iter()
@@ -80,9 +163,11 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
             vec![
                 t.display_id(),
                 t.state.to_string(),
+                t.priority.to_string(),
                 t.machine.clone().unwrap_or_else(|| "-".into()),
                 t.flock.clone().unwrap_or_else(|| "-".into()),
                 t.spec.agent.clone(),
+                t.model().unwrap_or("-").to_string(),
                 t.job.clone(),
                 age(t.created_at),
                 note,
@@ -170,6 +255,15 @@ pub fn task_detail(t: &Task) -> String {
     let source = t.spec.agent_source.as_deref();
     let from = |label: Option<&String>| label.map(|l| format!(" (from {l})")).unwrap_or_default();
     let agent = format!("{}{}", t.spec.agent, from(source.map(|s| &s.agent)));
+    let model = match t.model() {
+        Some(m) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
+        None => "-".to_string(),
+    };
+    let priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
+    let profile = match t.profile() {
+        Some(p) => format!("{p}{}", from(source.and_then(|s| s.profile_from.as_ref()))),
+        None => "-".to_string(),
+    };
     let args = if t.spec.agent_args.is_empty() {
         "-".to_string()
     } else {
@@ -208,10 +302,14 @@ pub fn task_detail(t: &Task) -> String {
     let mut fields = vec![
         ("id", t.display_id()),
         ("state", t.state.to_string()),
+        ("priority", priority),
         ("job", t.job.clone()),
+        ("role", t.role.to_string()),
         ("flock", opt(&t.flock)),
         ("machine", opt(&t.machine)),
         ("agent", agent),
+        ("model", model),
+        ("profile", profile),
         ("agent args", args),
         ("allow", list(&t.spec.allow)),
         ("deny", list(&t.spec.deny)),
@@ -220,6 +318,7 @@ pub fn task_detail(t: &Task) -> String {
         ("tags", tags),
         ("timeout", format!("{}s", t.spec.timeout_secs)),
         ("pane", opt(&t.pane_id)),
+        ("session", opt(&t.spec.session_id)),
         ("created", when(Some(t.created_at))),
         ("started", when(t.started_at)),
         ("finished", when(t.finished_at)),
@@ -233,6 +332,16 @@ pub fn task_detail(t: &Task) -> String {
         .into_iter()
         .map(|(k, v)| format!("{:<12}{}", format!("{k}:"), one_line(&v)))
         .collect();
+    // As written, bar control characters: `describe` is where a long or
+    // multi-line description is read whole.
+    out.insert(
+        1,
+        format!(
+            "description: {} (from {})",
+            printable(&t.description_text()),
+            t.description_from()
+        ),
+    );
     out.push("prompt:".into());
     out.extend(
         printable(&t.prompt)
@@ -250,8 +359,8 @@ pub fn task_detail(t: &Task) -> String {
 /// The head handles each request in a detached task, so a timed-out `run`,
 /// `task retry`, `tick` or `job run` may still land; sending it again blindly
 /// can queue a duplicate.
-pub fn request_failure(err: &RequestError) -> (&'static str, String) {
-    match err {
+pub fn request_failure(err: &RequestError) -> (String, String) {
+    let (code, message) = match err {
         RequestError::Connect(e) if connect_error_means_no_daemon(e) => (
             "runtime_error",
             format!("pastor serve is not running ({e}); start it with `pastor serve`"),
@@ -271,26 +380,29 @@ pub fn request_failure(err: &RequestError) -> (&'static str, String) {
             "runtime_error",
             format!("pastor serve dropped the request: {e:#}"),
         ),
-    }
+        RequestError::Unreachable(message) => ("head_unreachable", message.clone()),
+        RequestError::Refused { code, message } => return (code.clone(), message.clone()),
+    };
+    (code.to_string(), message)
 }
 
 /// Tasks still holding a pane on a machine the flock no longer has. Nothing
 /// reconciles them, so their state is the last one seen; the MACHINE column
 /// says so instead of looking live. Rows and tasks are in the same order
 /// (`task_rows`).
-pub fn mark_removed(rows: &mut [Vec<String>], tasks: &[Task], flock: &Flock) {
+pub fn mark_removed(rows: &mut [Vec<String>], tasks: &[Task], known: impl Fn(&str) -> bool) {
     for (row, t) in rows.iter_mut().zip(tasks) {
         if let Some(m) = &t.machine
             && t.state.occupies_pane()
-            && flock.get(m).is_none()
+            && !known(m)
         {
-            row[2] = format!("{m} (removed)");
+            row[3] = format!("{m} (removed)");
         }
     }
 }
 
-pub const TASK_HEADER: [&str; 8] = [
-    "ID", "STATE", "MACHINE", "FLOCK", "AGENT", "JOB", "AGE", "NOTE",
+pub const TASK_HEADER: [&str; 10] = [
+    "ID", "STATE", "PRIORITY", "MACHINE", "FLOCK", "AGENT", "MODEL", "JOB", "AGE", "NOTE",
 ];
 
 /// One flock in `pastor flock list`. `agents` is the live agents on its
@@ -303,6 +415,8 @@ pub struct FlockRow {
     pub machines: Vec<String>,
     pub agents: Option<usize>,
     pub queued: usize,
+    /// Its `[[flock]]` entry's `description`.
+    pub description: Option<String>,
 }
 
 pub const FLOCK_HEADER: [&str; 5] = ["NAME", "DEFAULT", "MACHINES", "AGENTS", "QUEUED"];
@@ -337,6 +451,9 @@ pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]
                 machines,
                 agents,
                 queued,
+                description: flock
+                    .entry(name)
+                    .and_then(|e| crate::config::clean_description(e.description.as_deref())),
             }
         })
         .collect()
@@ -426,7 +543,7 @@ pub fn herdr_version_from(output: &str) -> Option<String> {
 /// a probe could not count the agents. `pastor_version` is the pastor
 /// installed on the machine, `null` when there is none or it cannot be known
 /// (always for a `command` machine).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineRow {
     pub name: String,
     pub host: String,
@@ -440,10 +557,24 @@ pub struct MachineRow {
     pub error: Option<String>,
     pub live: Option<usize>,
     pub max_agents: u32,
+    /// `MachineConfig::job_slots` and `burst`, shown after `max_agents` as
+    /// `2+1j+1b` when either is set. Defaulted so a CLI can still read a
+    /// head that predates these fields.
+    #[serde(default)]
+    pub job_slots: u32,
+    #[serde(default)]
+    pub burst: u32,
     pub tags: Vec<String>,
     /// `MachineStatus::orphans`; a probe works them out itself from
     /// `agent.list` and the store, and leaves them empty when it cannot.
     pub orphans: Vec<String>,
+    /// `MachineStatus::profile`; a probe settles it from this machine's
+    /// pastor.toml and flock.toml.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Its `description` in flock.toml.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl From<&MachineStatus> for MachineRow {
@@ -461,15 +592,20 @@ impl From<&MachineStatus> for MachineRow {
             error: m.error.clone(),
             live: Some(m.live),
             max_agents: m.max_agents,
+            job_slots: m.job_slots,
+            burst: m.burst,
             tags: m.tags.clone(),
             orphans: m.orphans.clone(),
+            profile: m.profile.clone(),
+            description: m.description.clone(),
         }
     }
 }
 
 /// AGENTS counts orphans too; ORPHANS names them (see `MachineStatus::orphans`).
-pub const MACHINE_HEADER: [&str; 10] = [
-    "NAME", "HOST", "FLOCK", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS", "ERROR",
+pub const MACHINE_HEADER: [&str; 11] = [
+    "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
+    "ERROR",
 ];
 
 /// The machine that is the head itself: the first `local` one, whose herdr
@@ -504,6 +640,19 @@ pub fn head_line(head: &HeadRow, rows: &[MachineRow]) -> String {
     line
 }
 
+/// A machine's room as `machine list` shows it: `max_agents`, then
+/// `+<n>j` for job slots and `+<n>b` for burst when they are set.
+pub fn capacity(max_agents: u32, job_slots: u32, burst: u32) -> String {
+    let mut out = max_agents.to_string();
+    if job_slots > 0 {
+        out.push_str(&format!("+{job_slots}j"));
+    }
+    if burst > 0 {
+        out.push_str(&format!("+{burst}b"));
+    }
+    out
+}
+
 /// One row per machine, in the order given.
 pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
     let dash = || "-".to_string();
@@ -513,13 +662,14 @@ pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
                 m.name.clone(),
                 m.host.clone(),
                 m.flock.clone(),
+                m.profile.clone().unwrap_or_else(dash),
                 m.channel.clone(),
                 m.herdr_version.clone().unwrap_or_else(dash),
                 m.pastor_version.clone().unwrap_or_else(dash),
                 format!(
                     "{}/{}",
                     m.live.map_or_else(dash, |n| n.to_string()),
-                    m.max_agents
+                    capacity(m.max_agents, m.job_slots, m.burst)
                 ),
                 if m.orphans.is_empty() {
                     dash()
@@ -599,6 +749,42 @@ pub fn job_rows(jobs: &[JobStatus]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// A job in `job list --json` on a shepherd: its status, and `where` it
+/// lives, so a script need not read the two tables.
+#[derive(Debug, Serialize)]
+pub struct PlacedJob<'a> {
+    #[serde(flatten)]
+    pub job: &'a JobStatus,
+    /// `head` or `shepherd`.
+    #[serde(rename = "where")]
+    pub place: &'static str,
+}
+
+/// The head's jobs, then this machine's, each tagged with where it lives.
+pub fn placed_jobs<'a>(head: &'a [JobStatus], here: &'a [JobStatus]) -> Vec<PlacedJob<'a>> {
+    let tag = |jobs: &'a [JobStatus], place| jobs.iter().map(move |job| PlacedJob { job, place });
+    tag(head, "head").chain(tag(here, "shepherd")).collect()
+}
+
+/// `job list` on a shepherd: the head's jobs under `head: <head>`, then this
+/// machine's under `shepherd: <host> (this machine)`, a blank line between.
+/// A side with no jobs prints its header and `no jobs`.
+pub fn job_sections(head: &str, head_jobs: &[JobStatus], host: &str, here: &[JobStatus]) -> String {
+    let section = |header: String, jobs: &[JobStatus]| {
+        let body = if jobs.is_empty() {
+            "no jobs".to_string()
+        } else {
+            table(&JOB_HEADER, &job_rows(jobs))
+        };
+        format!("{header}\n{}", body.trim_end())
+    };
+    format!(
+        "{}\n\n{}",
+        section(format!("head: {head}"), head_jobs),
+        section(format!("shepherd: {host} (this machine)"), here)
+    )
+}
+
 pub const RUN_HEADER: [&str; 7] = [
     "JOB", "OUTCOME", "ITEMS", "CREATED", "SEEN", "DEFERRED", "ERROR",
 ];
@@ -626,6 +812,7 @@ mod tests {
     fn task_with(spec: crate::task::DispatchSpec) -> Task {
         let now = Utc::now();
         Task {
+            description: None,
             id: 3,
             job: "run".into(),
             item: serde_json::Value::Null,
@@ -642,16 +829,21 @@ mod tests {
             activity_seen: false,
             ended: false,
             retry_of: None,
+            priority: Default::default(),
+            priority_from: None,
+            queue_pos: 0,
             created_at: now,
             started_at: Some(now),
             finished_at: None,
             updated_at: now,
             flock: None,
+            role: Default::default(),
         }
     }
 
     fn status(name: &str, host: &str) -> MachineStatus {
         MachineStatus {
+            description: None,
             name: name.into(),
             host: host.into(),
             endpoint: format!("ssh {host} (session default)"),
@@ -662,9 +854,14 @@ mod tests {
             error: None,
             live: 1,
             max_agents: 3,
+            live_jobs: 0,
+            job_slots: 0,
+            burst: 0,
             tags: vec!["fast".into(), "arm".into()],
             orphans: vec![],
             flock: None,
+            shutting_down: false,
+            profile: None,
         }
     }
 
@@ -677,12 +874,13 @@ mod tests {
     }
 
     /// The head's own machine (the `local` one) comes first; the others
-    /// keep flock order. FLOCK follows HOST.
+    /// keep flock order. FLOCK follows HOST, and PROFILE follows FLOCK.
     #[test]
     fn machine_table_puts_the_heads_machine_first_with_its_flock() {
         let mut rows = vec![
             MachineRow {
                 flock: "work".into(),
+                profile: Some("develop".into()),
                 ..row("pi-3", "user@pi-3")
             },
             row("here", "local"),
@@ -695,8 +893,8 @@ mod tests {
         assert_eq!(
             cells(0),
             [
-                "NAME", "HOST", "FLOCK", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
-                "ERROR"
+                "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS",
+                "ORPHANS", "TAGS", "ERROR"
             ]
         );
         assert_eq!(cells(1)[..3], ["here", "local", "default"]);
@@ -706,6 +904,7 @@ mod tests {
                 "pi-3",
                 "user@pi-3",
                 "work",
+                "develop",
                 "connected",
                 "0.9.1",
                 "0.2.0",
@@ -756,6 +955,7 @@ mod tests {
                 "pi-3",
                 "user@pi-3",
                 "default",
+                "-",
                 "unreachable",
                 "-",
                 "-",
@@ -765,6 +965,27 @@ mod tests {
                 "no route to host"
             ]
         );
+    }
+
+    /// Job slots and burst show after max_agents only when set; the JSON
+    /// always has both.
+    #[test]
+    fn machine_list_shows_job_slots_and_burst() {
+        assert_eq!(capacity(2, 0, 0), "2");
+        assert_eq!(capacity(2, 1, 1), "2+1j+1b");
+        assert_eq!(capacity(3, 2, 0), "3+2j");
+        assert_eq!(capacity(3, 0, 1), "3+1b");
+        let m = MachineStatus {
+            job_slots: 1,
+            burst: 1,
+            max_agents: 2,
+            ..status("pi-3", "fleet@pi-3")
+        };
+        let row = MachineRow::from(&m);
+        assert_eq!(machine_rows(std::slice::from_ref(&row))[0][7], "1/2+1j+1b");
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["job_slots"], 1);
+        assert_eq!(v["burst"], 1);
     }
 
     /// The head is not a machine: scripts that walk `machines` must not trip
@@ -818,6 +1039,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -832,26 +1054,33 @@ mod tests {
         let flock = Flock {
             flocks: vec![],
             machines: vec![MachineConfig {
+                description: None,
                 name: "pi-1".into(),
                 local: true,
                 ssh: None,
                 command: None,
                 session: "default".into(),
                 max_agents: 2,
+                job_slots: 1,
+                burst: 1,
                 tags: vec![],
                 flock: None,
                 agent: None,
                 agent_args: None,
+                model: None,
+                priority: None,
+                agents: Default::default(),
+                profile: None,
             }],
         };
         let mut rows = task_rows(&tasks);
-        mark_removed(&mut rows, &tasks, &flock);
-        assert_eq!(rows[0][2], "pi-3 (removed)");
+        mark_removed(&mut rows, &tasks, |m| flock.get(m).is_some());
+        assert_eq!(rows[0][3], "pi-3 (removed)");
         assert_eq!(
-            rows[1][2], "pi-3",
+            rows[1][3], "pi-3",
             "a closed task is history, not a live row"
         );
-        assert_eq!(rows[2][2], "pi-1");
+        assert_eq!(rows[2][3], "pi-1");
     }
 
     #[test]
@@ -876,6 +1105,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -914,6 +1144,10 @@ mod tests {
                 ask: Default::default(),
                 agent: "machine own".into(),
                 agent_args: Some("flock personal".into()),
+                model: None,
+                model_from: None,
+                profile: None,
+                profile_from: None,
             })),
             ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
         };
@@ -932,6 +1166,10 @@ mod tests {
                 ask: Default::default(),
                 agent: "defaults".into(),
                 agent_args: None,
+                model: None,
+                model_from: None,
+                profile: None,
+                profile_from: None,
             })),
             ..spec
         }));
@@ -940,6 +1178,77 @@ mod tests {
             "{bare}"
         );
         assert!(bare.contains("agent args: -\n"), "{bare}");
+    }
+
+    /// `task describe` gives the level and the layer that set it, and
+    /// `task list` the level, beside the state.
+    #[test]
+    fn a_tasks_priority_shows_with_where_it_came_from() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(
+            task_detail(&t).contains("priority:   normal\n"),
+            "{}",
+            task_detail(&t)
+        );
+        t.priority = crate::task::Priority::High;
+        t.priority_from = Some("flock work".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("priority:   high (from flock work)\n"),
+            "{out}"
+        );
+        let rows = task_rows(std::slice::from_ref(&t));
+        assert_eq!(TASK_HEADER[2], "PRIORITY");
+        assert_eq!(rows[0][2], "high");
+        let json = t.to_json();
+        assert_eq!(json["priority"], "high");
+        assert_eq!(json["priority_from"], "flock work");
+    }
+
+    /// `task describe` names the task's role, and `task list --json`'s
+    /// record carries it, plain agents included.
+    #[test]
+    fn a_task_shows_its_role() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(task_detail(&t).contains("role:       agent\n"));
+        assert_eq!(t.to_json()["role"], "agent");
+        t.role = crate::task::TaskRole::Orchestrator;
+        assert!(task_detail(&t).contains("role:       orchestrator\n"));
+        assert_eq!(t.to_json()["role"], "orchestrator");
+    }
+
+    /// `task describe` says what the task is about and where that came
+    /// from, near the top.
+    #[test]
+    fn task_detail_shows_the_description_and_its_source() {
+        let mut t = task_with(crate::task::DispatchSpec {
+            agent: "claude".into(),
+            agent_args: vec![],
+            allow: vec![],
+            deny: vec![],
+            repo: None,
+            worktree: false,
+            branch: None,
+            machine: None,
+            tags: vec![],
+            timeout_secs: 60,
+            checkout: None,
+            reopen: None,
+            agent_source: None,
+            place: Default::default(),
+            session_id: None,
+        });
+        let out = task_detail(&t);
+        assert!(
+            out.starts_with("id:         t-3\ndescription: fix it (from the prompt)\n"),
+            "{out}"
+        );
+        t.description = Some("Fix the flaky test".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("\ndescription: Fix the flaky test (from --description)\n"),
+            "{out}"
+        );
     }
 
     /// An error can be raw multi-line stderr; it must stay one field on one
@@ -961,6 +1270,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);
@@ -1005,6 +1315,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
         let note = task_rows(std::slice::from_ref(&t))[0]
@@ -1033,6 +1344,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
         let out = task_detail(&t);
@@ -1053,11 +1365,98 @@ mod tests {
         assert_eq!(out, "A     BB\nx\nlong  y");
     }
 
+    fn job_status(name: &str) -> JobStatus {
+        JobStatus {
+            name: name.into(),
+            schedule: Some("every 1h".into()),
+            enabled: true,
+            connector: Some("clock".into()),
+            error: None,
+            last_run_at: None,
+            last_result: None,
+            next_due: None,
+            running: false,
+            flock: None,
+            description: None,
+        }
+    }
+
+    /// Two tables, the head's first; a side with none says `no jobs`.
+    #[test]
+    fn job_sections_show_the_head_then_this_machine() {
+        let text = job_sections("user@pi-1", &[job_status("a")], "laptop", &[]);
+        let (head, here) = text.split_once("\n\n").unwrap();
+        assert_eq!(
+            head,
+            format!(
+                "head: user@pi-1\n{}",
+                table(&JOB_HEADER, &job_rows(&[job_status("a")])).trim_end()
+            )
+        );
+        assert_eq!(here, "shepherd: laptop (this machine)\nno jobs");
+        let text = job_sections("user@pi-1", &[], "laptop", &[job_status("b")]);
+        assert!(
+            text.starts_with("head: user@pi-1\nno jobs\n\nshepherd: laptop (this machine)\nNAME"),
+            "{text}"
+        );
+    }
+
+    /// One flat array in `--json`, each job saying where it lives.
+    #[test]
+    fn placed_jobs_say_where_each_job_lives() {
+        let head = [job_status("a")];
+        let here = [job_status("b"), job_status("c")];
+        let v = serde_json::to_value(placed_jobs(&head, &here)).unwrap();
+        let got: Vec<(&str, &str)> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| (j["name"].as_str().unwrap(), j["where"].as_str().unwrap()))
+            .collect();
+        assert_eq!(got, [("a", "head"), ("b", "shepherd"), ("c", "shepherd")]);
+        assert_eq!(v[0]["schedule"], "every 1h");
+    }
+
+    /// `--wide` adds DESCRIPTION last. On a terminal it is cut to what the
+    /// other columns leave, 20 characters at least; off one it is whole.
+    #[test]
+    fn wide_tables_add_a_description_cut_to_the_width() {
+        let rows = vec![
+            vec!["a".to_string(), "x".to_string()],
+            vec!["bb".to_string(), "".to_string()],
+        ];
+        let long = "Carry out the answers on the Pastor board's Answered list";
+        let descriptions = vec![Some(long.to_string()), None];
+        let whole = wide_table(&["A", "BB"], &rows, &descriptions, None);
+        assert_eq!(
+            whole,
+            format!("A   BB  DESCRIPTION\na   x   {long}\nbb      -")
+        );
+        // "a   x   " is 8 wide, so 40 columns leave 32.
+        let cut = wide_table(&["A", "BB"], &rows, &descriptions, Some(40));
+        let first = cut.lines().nth(1).unwrap();
+        assert_eq!(first.chars().count(), 40, "{first}");
+        assert!(first.ends_with('…'), "{first}");
+        assert!(
+            first.starts_with("a   x   Carry out the answers"),
+            "{first}"
+        );
+        let narrow = wide_table(&["A", "BB"], &rows, &descriptions, Some(10));
+        let first = narrow.lines().nth(1).unwrap();
+        assert_eq!(first.chars().count(), 8 + 20, "at least 20 kept: {first}");
+        // A description that fits is left alone; a newline shows escaped.
+        let short = vec![Some("two\nlines".to_string()), None];
+        let out = wide_table(&["A", "BB"], &rows, &short, Some(40));
+        assert!(out.contains("two\\nlines"), "{out}");
+        assert!(!out.contains('…'), "{out}");
+    }
+
     #[test]
     fn job_rows_show_errors_over_results_and_relative_next() {
         use crate::scheduler::JobStatus;
         let now = chrono::Utc::now();
         let ok = JobStatus {
+            description: None,
             name: "a".into(),
             schedule: Some("every 5m".into()),
             enabled: true,
@@ -1070,6 +1469,7 @@ mod tests {
             flock: Some("work".into()),
         };
         let broken = JobStatus {
+            description: None,
             name: "b".into(),
             schedule: None,
             enabled: false,
@@ -1174,9 +1574,9 @@ mod tests {
         assert_eq!(orphan_lines(&three, None, Some(DEFAULT_FLOCK)).len(), 3);
         assert!(orphan_lines(&three, Some("pi-3"), Some(DEFAULT_FLOCK)).is_empty());
         let rows = machine_rows(&[MachineRow::from(&m), MachineRow::from(&none)]);
-        assert_eq!(rows[0][6], "3/4");
-        assert_eq!(rows[0][7], "t-4,t-9");
-        assert_eq!(rows[1][7], "-");
+        assert_eq!(rows[0][7], "3/4");
+        assert_eq!(rows[0][8], "t-4,t-9");
+        assert_eq!(rows[1][8], "-");
         assert_eq!(rows[0].len(), MACHINE_HEADER.len());
     }
 }

@@ -1,0 +1,65 @@
+{{ define "meta" }}v{{ hugo.Data.cargo.package.version }} · Apache-2.0<br>linux · macOS · a personal tool{{ end }}
+
+{{ define "main" }}
+<main class="grid home">
+  <section class="pane" style="grid-area: what">
+    <h2 class="t">what</h2>
+    <p>pastor runs coding agents (Claude Code, opencode, Codex) on machines I own: a home server, a Raspberry Pi, a spare laptop.</p>
+    <p>I hand it a task or a schedule and close my laptop. Later I check what got done, and which agent stopped to ask me something.</p>
+  </section>
+
+  <section class="pane focus" style="grid-area: install">
+    <h2 class="t">install</h2>
+<pre class="cmd"><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/cacarico/pastor/main/install.sh | sh</pre>
+    <p>One binary in <b>~/.local/bin</b>. Each machine needs herdr 0.9+, and the head needs ssh to the others. <a href="{{ "docs/install/" | relURL }}">more</a></p>
+  </section>
+
+  <section class="pane" style="grid-area: how">
+    <h2 class="t">how</h2>
+    <ol class="steps">
+      <li>You give it work: one task, or a job that finds work on a schedule.</li>
+      <li>It picks a free machine and starts the agent in a herdr terminal there.</li>
+      <li>It watches the agent: running, blocked on a question, or done.</li>
+      <li>You read the output, answer the question, or attach and take over.</li>
+    </ol>
+  </section>
+
+  {{/* The commands mirror the README's Quick start; keep them in step. */}}
+  <section class="pane" style="grid-area: first">
+    <h2 class="t">first run</h2>
+<pre class="cmd"><span class="c"># add a machine, keep the head running</span>
+<span class="p">$ </span>pastor machine add pi-1 user@pi-1
+<span class="p">$ </span>pastor setup systemd
+
+<span class="c"># give it a task, in its own git worktree</span>
+<span class="p">$ </span>pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --worktree
+
+<span class="c"># later: see where things are</span>
+<span class="p">$ </span>pastor task list
+
+<span class="c"># t-1 is blocked: the agent asked something</span>
+<span class="p">$ </span>pastor task read t-1
+<span class="p">$ </span>pastor task send t-1 "yes, go ahead"
+<span class="p">$ </span><span class="cursor"> </span></pre>
+    <p><a href="{{ "docs/first-run/" | relURL }}">the first run, step by step</a></p>
+  </section>
+
+  <section class="pane" style="grid-area: not">
+    <h2 class="t">what it is not</h2>
+    <ul class="not">
+      <li><span><b>a platform.</b> Built for my own workflow first. Ideas are welcome when they fit.</span></li>
+      <li><span><b>a cloud service.</b> Everything runs on your machines, over ssh.</span></li>
+      <li><span><b>a chat app.</b> Every agent is a real terminal you can attach to.</span></li>
+      <li><span><b>stable.</b> It is young. Compatibility is best effort.</span></li>
+    </ul>
+  </section>
+</main>
+{{ end }}
+
+{{ define "status" }}
+    <span class="mode">ABOUT</span>
+    <span><k>1-4</k> switch</span>
+    <span><k>j</k>/<k>k</k> scroll</span>
+    <span><a href="{{ site.Params.blog }}">why I built it</a></span>
+    <span class="right">agents do the work · pastor keeps track</span>
+{{ end }}

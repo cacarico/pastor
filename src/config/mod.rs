@@ -1,5 +1,7 @@
 pub mod flock;
 pub mod job;
+pub mod opencode;
+pub mod profile;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -70,6 +72,12 @@ impl Paths {
     }
     pub fn db_file(&self) -> PathBuf {
         self.state_dir.join("pastor.db")
+    }
+    /// A headless serve's own database: its jobs' state and seen keys, and
+    /// how far it has read the head's events. Never `db_file`, which is a
+    /// head's task store.
+    pub fn shepherd_db_file(&self) -> PathBuf {
+        self.state_dir.join("shepherd.db")
     }
     pub fn socket_file(&self) -> PathBuf {
         self.state_dir.join("pastor.sock")
@@ -430,6 +438,22 @@ pub struct Defaults {
     pub allow: Vec<String>,
     /// Tool patterns every task's agent must never use; wins over `allow`.
     pub deny: Vec<String>,
+    /// The `[models]` entry tasks run when their run flags, job, machine and
+    /// flock name none. See `resolve_agent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The level of tasks whose run flags, job, pinned machine and flock
+    /// name none; unset, `normal`. See `resolve_priority`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::task::Priority>,
+    /// The agent that runs a model of another kind than `agent`'s, by kind
+    /// (`{ opencode = "opencode" }`). See `resolve_agent_for`.
+    #[serde(skip_serializing_if = "KindAgents::is_empty")]
+    pub agents: KindAgents,
+    /// The permission profile tasks run under when their run flags, job,
+    /// machine and flock name none. See `resolve_agent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
     /// Where a task's pane goes when its run flags and job say nothing
@@ -453,6 +477,13 @@ pub struct AgentChoice {
     /// Tool patterns added to the flock's and `[defaults]` deny lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// A `[models]` name, before the machine's, the flock's and `[defaults]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// A permission profile, before the machine's, the flock's and
+    /// `[defaults]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// Where a task's agent, or its args, came from (`Defaults::resolve_agent_on`).
@@ -479,6 +510,59 @@ pub struct AgentPick {
     /// `None` when no layer's args were written for the agent: it runs
     /// with none.
     pub args_from: Option<Layer>,
+    /// The `[models]` name the task runs, and the layer that named it;
+    /// `None` when no layer names one. Its args are not in `agent_args`:
+    /// `Models::apply` puts them in front.
+    pub model: Option<(String, Layer)>,
+    /// The agent is `agent_from`'s `agents` entry for its kind, not its
+    /// `agent` (`Defaults::resolve_agent_for`).
+    pub by_kind: bool,
+    /// The permission profile the task runs under, and the layer that named
+    /// it; `None` when no layer names one. `Profiles::apply` adds its lists.
+    pub profile: Option<(String, Layer)>,
+}
+
+/// `agents = { <kind> = "<agent>" }` on a machine, a flock or `[defaults]`:
+/// the agent that layer runs a model of that kind on when its own `agent`
+/// is of another kind.
+pub type KindAgents = std::collections::BTreeMap<String, String>;
+
+/// Refuse a layer's `agents` entry whose agent is not of the kind it is
+/// filed under, or one for the kind of the layer's own agent (`own`),
+/// which that agent already runs. `agents` is `[agents]` from pastor.toml.
+pub fn check_kind_agents(
+    own: Option<&str>,
+    by_kind: &KindAgents,
+    agents: &Agents,
+) -> Result<(), String> {
+    for (kind, agent) in by_kind {
+        let is = agents.kind(agent);
+        if is != kind {
+            return Err(format!("agents.{kind}: agent {agent} is {is}, not {kind}"));
+        }
+        if let Some(own) = own
+            && agents.kind(own) == kind
+        {
+            return Err(format!(
+                "agents.{kind}: its own agent {own} is already {kind}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an `agents` key or agent that is empty: what `check_kind_agents`
+/// can check without `[agents]`.
+pub fn check_kind_agent_names(by_kind: &KindAgents) -> Result<(), String> {
+    for (kind, agent) in by_kind {
+        if kind.trim().is_empty() {
+            return Err("agents: a kind must not be empty".into());
+        }
+        if agent.trim().is_empty() {
+            return Err(format!("agents.{kind} must not be empty"));
+        }
+    }
+    Ok(())
 }
 
 impl AgentPick {
@@ -578,6 +662,22 @@ impl Defaults {
                     .map(|a| (Some(layer), a.clone()))
             })
             .unwrap_or_default();
+        let model = [
+            (Layer::Ask, ask.model.as_ref()),
+            (Layer::Machine, machine.and_then(|m| m.model.as_ref())),
+            (Layer::Flock, flock.and_then(|f| f.model.as_ref())),
+            (Layer::Defaults, self.model.as_ref()),
+        ]
+        .into_iter()
+        .find_map(|(layer, name)| Some((name?.clone(), layer)));
+        let profile = [
+            (Layer::Ask, ask.profile.as_ref()),
+            (Layer::Machine, machine.and_then(|m| m.profile.as_ref())),
+            (Layer::Flock, flock.and_then(|f| f.profile.as_ref())),
+            (Layer::Defaults, self.profile.as_ref()),
+        ]
+        .into_iter()
+        .find_map(|(layer, name)| Some((name?.clone(), layer)));
         AgentPick {
             agent,
             agent_args,
@@ -585,7 +685,108 @@ impl Defaults {
             deny,
             agent_from,
             args_from,
+            model,
+            by_kind: false,
+            profile,
         }
+    }
+
+    /// `resolve_agent_on`, then, when the task's model runs on another kind
+    /// than that agent's, the agent for the model's kind: at the machine,
+    /// the flock and these defaults in turn, the layer's `agent` if it is
+    /// of that kind, else its `agents` entry for it. An agent the task or
+    /// job named itself is kept, as is the first agent when no layer has
+    /// one of the kind, for `Models::apply` to refuse. An agent found this
+    /// way takes `agent_args` only from layers whose `agent` is that same
+    /// one: a layer's args with no `agent` are for its default agent.
+    pub fn resolve_agent_for(
+        &self,
+        ask: &AgentChoice,
+        machine: Option<&flock::MachineConfig>,
+        flock: Option<&flock::FlockEntry>,
+        models: &Models,
+        agents: &Agents,
+    ) -> AgentPick {
+        let pick = self.resolve_agent_on(ask, machine, flock);
+        let Some(kind) = pick
+            .model
+            .as_ref()
+            .and_then(|(name, _)| models.0.get(name))
+            .map(|def| def.kind.as_str())
+        else {
+            return pick;
+        };
+        if pick.agent_from == Layer::Ask || agents.kind(&pick.agent) == kind {
+            return pick;
+        }
+        let layers = [
+            (
+                Layer::Machine,
+                machine.and_then(|m| m.agent.as_deref()),
+                machine.map(|m| &m.agents),
+                machine.and_then(|m| m.agent_args.as_ref()),
+            ),
+            (
+                Layer::Flock,
+                flock.and_then(|f| f.agent.as_deref()),
+                flock.map(|f| &f.agents),
+                flock.and_then(|f| f.agent_args.as_ref()),
+            ),
+            (
+                Layer::Defaults,
+                Some(self.agent.as_str()),
+                Some(&self.agents),
+                Some(&self.agent_args),
+            ),
+        ];
+        let found = layers
+            .iter()
+            .find_map(|&(layer, own, by_kind, _)| match own {
+                Some(own) if agents.kind(own) == kind => Some((layer, own.to_string(), false)),
+                _ => Some((layer, by_kind?.get(kind)?.clone(), true)),
+            });
+        let Some((agent_from, agent, by_kind)) = found else {
+            return pick;
+        };
+        let (args_from, agent_args) = layers
+            .iter()
+            .find_map(|&(layer, own, _, args)| {
+                args.filter(|_| own == Some(agent.as_str()))
+                    .map(|a| (Some(layer), a.clone()))
+            })
+            .unwrap_or_default();
+        AgentPick {
+            agent,
+            agent_args,
+            agent_from,
+            args_from,
+            by_kind,
+            ..pick
+        }
+    }
+}
+
+impl Defaults {
+    /// A task's level: from the first of `ask` (`--priority`, a job's
+    /// `priority`), the machine it is pinned to, its flock and these
+    /// defaults that sets one, and the layer that did; `normal` from none.
+    /// Only a pinned task has a machine here: an unpinned one is queued
+    /// before any machine is picked, and its level is settled then.
+    pub fn resolve_priority(
+        &self,
+        ask: Option<crate::task::Priority>,
+        pinned: Option<&flock::MachineConfig>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> (crate::task::Priority, Option<Layer>) {
+        [
+            (Layer::Ask, ask),
+            (Layer::Machine, pinned.and_then(|m| m.priority)),
+            (Layer::Flock, flock.and_then(|f| f.priority)),
+            (Layer::Defaults, self.priority),
+        ]
+        .into_iter()
+        .find_map(|(layer, p)| Some((p?, Some(layer))))
+        .unwrap_or_default()
     }
 }
 
@@ -596,6 +797,10 @@ impl Default for Defaults {
             agent_args: vec![],
             allow: vec![],
             deny: vec![],
+            model: None,
+            priority: None,
+            agents: KindAgents::new(),
+            profile: None,
             max_tasks_per_run: 5,
             timeout: "2h".into(),
             place: crate::task::Place::Repo,
@@ -705,6 +910,23 @@ fn bottom_prompt(screen: &str) -> String {
     lines[start.min(lines.len())..].join("\n")
 }
 
+/// What a Claude agent under a permission profile starts with: it denies
+/// whatever its allow list and settings do not already allow, instead of
+/// asking, so the task never stops at a permission prompt.
+const CLAUDE_NO_ASK: [&str; 2] = ["--permission-mode", "dontAsk"];
+
+/// The code of a task whose profile meets agent args that pick a permission
+/// mode of their own.
+pub const PROFILE_ARGS_CONFLICT: &str = "profile_args_conflict";
+
+/// Does `arg` pick Claude's permission mode, or turn its permissions off?
+fn is_permission_arg(arg: &str) -> bool {
+    arg == "--permission-mode"
+        || arg.starts_with("--permission-mode=")
+        || arg == "--dangerously-skip-permissions"
+        || arg == "--allow-dangerously-skip-permissions"
+}
+
 /// Claude Code's own names for the allow and deny lists (`claude --help`).
 /// Both take several patterns and may repeat, so one flag per pattern works.
 const CLAUDE_TOOL_FLAGS: (&str, &str) = ("--allowedTools", "--disallowedTools");
@@ -757,25 +979,76 @@ impl Agents {
 
     /// How to start `spec`'s agent: its kind, `launch_args` and the env of
     /// its definition. Refused as `launch_args` is.
-    pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, String> {
+    /// An opencode agent under a profile gets its lists in the env instead
+    /// (`opencode::permission_json`), over its definition's, with the
+    /// variables that would load another config emptied.
+    pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, AgentRefusal> {
+        let mut env = self
+            .0
+            .get(&spec.agent)
+            .map(|d| d.env.clone())
+            .unwrap_or_default();
+        if self.opencode_profile(spec) {
+            for key in opencode::CONFIG_ENV {
+                env.insert(key.into(), String::new());
+            }
+            env.insert(
+                opencode::PERMISSION_ENV.into(),
+                opencode::permission_json(
+                    &spec.allow,
+                    &spec.deny,
+                    spec.profile() == Some(profile::UNRESTRICTED),
+                ),
+            );
+        }
         Ok(Launch {
             kind: self.kind(&spec.agent).to_string(),
             args: self.launch_args(spec)?,
-            env: self
-                .0
-                .get(&spec.agent)
-                .map(|d| d.env.clone())
-                .unwrap_or_default(),
+            env,
         })
     }
 
-    /// The argv after the agent's name for `spec`: its `agent_args`, then
-    /// the flag and pattern of each `allow`, then of each `deny`. Refused
-    /// when a list is not empty and the agent has no flag for it: dropping
-    /// a deny list without a word would be worse than not starting.
-    pub fn launch_args(&self, spec: &crate::task::DispatchSpec) -> Result<Vec<String>, String> {
+    /// Does `spec` run an opencode agent under a permission profile? Its
+    /// lists then go in `OPENCODE_PERMISSION`, not in flags.
+    pub fn opencode_profile(&self, spec: &crate::task::DispatchSpec) -> bool {
+        spec.profile().is_some() && self.kind(&spec.agent) == opencode::KIND
+    }
+
+    /// The argv after the agent's name for `spec`: its `agent_args`, then,
+    /// under a permission profile, the args that stop a Claude agent from
+    /// asking (`--permission-mode dontAsk`), then the flag and pattern of
+    /// each `allow`, then of each `deny`; an opencode agent under a profile
+    /// gets no tool flags, its lists going in `launch`'s env. Refused when a list is not empty
+    /// and the agent has no flag for it (`agent_tools_unsupported`):
+    /// dropping a deny list without a word would be worse than not
+    /// starting. Refused too when a profile applies and the args already
+    /// pick a permission mode (`profile_args_conflict`): the agent would
+    /// take the last one, and either the profile or the args would be
+    /// silently lost.
+    pub fn launch_args(
+        &self,
+        spec: &crate::task::DispatchSpec,
+    ) -> Result<Vec<String>, AgentRefusal> {
         let (allow_flag, deny_flag) = self.tool_flags(&spec.agent);
         let mut args = spec.agent_args.clone();
+        if let Some(profile) = spec.profile()
+            && self.kind(&spec.agent) == "claude"
+        {
+            if let Some(arg) = args.iter().find(|a| is_permission_arg(a)) {
+                return Err(AgentRefusal {
+                    code: PROFILE_ARGS_CONFLICT,
+                    message: format!(
+                        "task runs under profile {profile}, and agent {}'s args set {arg}; \
+                         drop it from agent_args or the model's args, or run without a profile",
+                        spec.agent
+                    ),
+                });
+            }
+            args.extend(CLAUDE_NO_ASK.map(str::to_string));
+        }
+        if self.opencode_profile(spec) {
+            return Ok(args);
+        }
         for (list, flag, key) in [
             (&spec.allow, allow_flag, "allow_flag"),
             (&spec.deny, deny_flag, "deny_flag"),
@@ -784,10 +1057,13 @@ impl Agents {
                 continue;
             }
             let Some(flag) = flag else {
-                return Err(format!(
-                    "agent {} has no {key} to pass its tool list; set [agents.{}] {key} in pastor.toml",
-                    spec.agent, spec.agent
-                ));
+                return Err(AgentRefusal {
+                    code: "agent_tools_unsupported",
+                    message: format!(
+                        "agent {} has no {key} to pass its tool list; set [agents.{}] {key} in pastor.toml",
+                        spec.agent, spec.agent
+                    ),
+                });
             };
             for p in list {
                 args.push(flag.clone());
@@ -795,6 +1071,139 @@ impl Agents {
             }
         }
         Ok(args)
+    }
+}
+
+/// One model under `[models.<name>]` in `pastor.toml`: the herdr agent kind
+/// it runs on and the args that pick it. A task names it with `model`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDef {
+    /// The herdr agent kind (`claude`, `codex`) whose agents can run it.
+    pub kind: String,
+    /// Put before the task's `agent_args` (`["--model", "claude-sonnet-5"]`).
+    pub args: Vec<String>,
+}
+
+/// `[models.<name>]`, by model name. No model is built in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Models(pub std::collections::BTreeMap<String, ModelDef>);
+
+/// A description as pastor keeps one: trimmed, and `None` when that leaves
+/// nothing. Jobs, flocks, machines and tasks all take theirs through it.
+pub fn clean_description(text: Option<&str>) -> Option<String> {
+    text.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// Model names go in the store, in events and on the command line, so they
+/// keep to the job names' alphabet: `[a-z0-9][a-z0-9_.-]{0,63}`. That also
+/// keeps a raw agent arg such as `--model` from passing for one.
+pub fn check_model_name(name: &str) -> Result<(), String> {
+    let first_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let rest_ok = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c));
+    if first_ok && rest_ok && name.len() <= 64 {
+        Ok(())
+    } else {
+        Err(format!(
+            "model name {name:?} must match [a-z0-9][a-z0-9_.-]{{0,63}}"
+        ))
+    }
+}
+
+/// Profile names go where model names go, so they keep to the same
+/// alphabet; a raw arg such as `--permission-mode` never passes for one.
+pub fn check_profile_name(name: &str) -> Result<(), String> {
+    check_model_name(name).map_err(|e| e.replacen("model name", "profile name", 1))
+}
+
+/// The code of a model whose kind is not the task's agent's.
+pub const MODEL_KIND_MISMATCH: &str = "model_kind_mismatch";
+
+/// Why a task's agent cannot run as resolved: a stable code for the CLI's
+/// error and a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRefusal {
+    /// `unknown_model`, `model_kind_mismatch`, `agent_tools_unsupported`,
+    /// `unknown_profile`, `profile_not_allowed` or `profile_args_conflict`.
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for AgentRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Models {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The names, sorted, for errors and shell completion.
+    pub fn names(&self) -> Vec<&str> {
+        self.0.keys().map(String::as_str).collect()
+    }
+
+    /// `name`'s definition, or `unknown_model`.
+    pub fn get(&self, name: &str) -> Result<&ModelDef, AgentRefusal> {
+        self.0.get(name).ok_or_else(|| AgentRefusal {
+            code: "unknown_model",
+            message: if self.0.is_empty() {
+                format!("model {name} is not in [models] in pastor.toml, which names none")
+            } else {
+                format!(
+                    "model {name} is not in [models] in pastor.toml; it has {}",
+                    self.names().join(", ")
+                )
+            },
+        })
+    }
+
+    /// `get`, for a check that only needs to know it is there.
+    pub fn check(&self, name: &str) -> Result<(), String> {
+        self.get(name).map(drop).map_err(|e| e.message)
+    }
+
+    /// Settle `pick`'s model into `spec`: the model's args before the
+    /// agent's own. Refused when the model is not defined or its kind is not
+    /// the one of the agent the task runs (`agents.kind`).
+    pub fn apply(
+        &self,
+        pick: &AgentPick,
+        agents: &Agents,
+        spec: &mut crate::task::DispatchSpec,
+    ) -> Result<(), AgentRefusal> {
+        let Some((name, _)) = &pick.model else {
+            return Ok(());
+        };
+        let def = self.get(name)?;
+        let kind = agents.kind(&pick.agent);
+        if def.kind != kind {
+            // Not the task's own agent: no layer had one of the kind.
+            let none = if pick.agent_from == Layer::Ask {
+                String::new()
+            } else {
+                format!(", and no layer's agents.{} names one", def.kind)
+            };
+            return Err(AgentRefusal {
+                code: MODEL_KIND_MISMATCH,
+                message: format!(
+                    "model {name} runs on {} agents, and agent {} is {kind}{none}",
+                    def.kind, pick.agent
+                ),
+            });
+        }
+        spec.agent_args = def.args.iter().chain(&pick.agent_args).cloned().collect();
+        Ok(())
     }
 }
 
@@ -820,9 +1229,43 @@ pub struct PastorConfig {
     /// refuses it. A guard against an agent acting on its own; the agent runs
     /// as the same user, so it is not a security boundary.
     pub agents_change_fleet: bool,
+    /// The ssh destination other machines reach the head by. Agents on
+    /// machines other than the head's own get it as `ipc::HEAD_ENV`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_address: Option<String>,
     pub defaults: Defaults,
     #[serde(skip_serializing_if = "is_empty_agents")]
     pub agents: Agents,
+    #[serde(skip_serializing_if = "Models::is_empty")]
+    pub models: Models,
+    /// `[profiles.<name>]`: permission profiles beside the built-in ones.
+    #[serde(skip_serializing_if = "profile::Profiles::is_empty")]
+    pub profiles: profile::Profiles,
+    /// What `pastor watch` runs besides the head's events.
+    #[serde(skip_serializing_if = "WatchConfig::is_empty")]
+    pub watch: WatchConfig,
+}
+
+/// `[watch]` in pastor.toml.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WatchConfig {
+    /// `[[watch.connector]]`: the connectors whose `[watch]` command `pastor
+    /// watch` runs each interval, unless `--connector` names others.
+    pub connector: Vec<WatchConnector>,
+}
+
+impl WatchConfig {
+    pub fn is_empty(&self) -> bool {
+        self.connector.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchConnector {
+    /// The connector's id, as `connector list` shows it.
+    pub name: String,
 }
 
 fn is_empty_agents(a: &Agents) -> bool {
@@ -839,8 +1282,12 @@ impl Default for PastorConfig {
             agent_ready_timeout: "30s".into(),
             close_done_after: "15m".into(),
             agents_change_fleet: false,
+            head_address: None,
             defaults: Defaults::default(),
             agents: Agents::default(),
+            models: Models::default(),
+            profiles: profile::Profiles::default(),
+            watch: WatchConfig::default(),
         }
     }
 }
@@ -903,6 +1350,16 @@ impl PastorConfig {
         ] {
             check_tools(key, list).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         }
+        // It ends up as an ssh destination in an agent's pane, the same way a
+        // machine's own `ssh` does; reject what that validation rejects.
+        if let Some(head) = &cfg.head_address
+            && let Some(problem) = flock::ssh_target_problem(head)
+        {
+            anyhow::bail!(
+                "{}: head_address must be an ssh destination: {problem}",
+                path.display()
+            );
+        }
         for (name, def) in &cfg.agents.0 {
             if def.kind.as_deref().is_some_and(|k| k.trim().is_empty()) {
                 anyhow::bail!("{}: agents.{name}.kind must not be empty", path.display());
@@ -934,6 +1391,31 @@ impl PastorConfig {
                     path.display()
                 );
             }
+        }
+        for (name, def) in &cfg.models.0 {
+            check_model_name(name)
+                .map_err(|e| anyhow::anyhow!("{}: models: {e}", path.display()))?;
+            if def.kind.trim().is_empty() {
+                anyhow::bail!("{}: models.{name}.kind must not be empty", path.display());
+            }
+        }
+        check_kind_agent_names(&cfg.defaults.agents)
+            .and_then(|()| {
+                check_kind_agents(Some(&cfg.defaults.agent), &cfg.defaults.agents, &cfg.agents)
+            })
+            .map_err(|e| anyhow::anyhow!("{}: defaults.{e}", path.display()))?;
+        if let Some(m) = &cfg.defaults.model {
+            cfg.models
+                .check(m)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.model: {e}", path.display()))?;
+        }
+        cfg.profiles
+            .validate()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        if let Some(p) = &cfg.defaults.profile {
+            cfg.profiles
+                .resolve(p)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.profile: {e}", path.display()))?;
         }
         if cfg.agent_ready_timeout_duration() >= cfg.request_timeout_duration() {
             anyhow::bail!(
@@ -1025,6 +1507,26 @@ mod tests {
         assert!(!PastorConfig::default().agents_change_fleet);
         let cfg: PastorConfig = toml::from_str("agents_change_fleet = true").unwrap();
         assert!(cfg.agents_change_fleet);
+    }
+
+    /// `head_address` is an ssh destination: optional, and when set a
+    /// non-empty word.
+    #[test]
+    fn head_address_is_an_ssh_destination() {
+        let path = Path::new("pastor.toml");
+        assert_eq!(PastorConfig::default().head_address, None);
+        let cfg = PastorConfig::parse(path, "head_address = \"user@head.example\"").unwrap();
+        assert_eq!(cfg.head_address.as_deref(), Some("user@head.example"));
+        for bad in [
+            "\"\"",
+            "\"  \"",
+            "\"user@head example\"",
+            "\"head\\n\"",
+            "\"-oProxyCommand=evil\"",
+        ] {
+            let err = PastorConfig::parse(path, &format!("head_address = {bad}")).unwrap_err();
+            assert!(err.to_string().contains("head_address"), "{bad}: {err}");
+        }
     }
 
     use super::*;
@@ -1272,6 +1774,349 @@ mod tests {
         assert_eq!(p.deny, vec!["Bash(rm:*)"]);
     }
 
+    /// `[models.<name>]` needs a kind and args, a name in the job names'
+    /// alphabet, and nothing else; `[defaults] model` must name one.
+    #[test]
+    fn models_load_and_bad_ones_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nmodel = \"sonnet\"\n[models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n[models.plain]\nkind = \"codex\"\nargs = []\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            cfg.models.0["sonnet"].args,
+            vec!["--model", "claude-sonnet-5"]
+        );
+        assert!(cfg.models.0["plain"].args.is_empty());
+        for (text, says) in [
+            ("[models.sonnet]\nkind = \"claude\"\n", "args"),
+            ("[models.sonnet]\nargs = []\n", "kind"),
+            (
+                "[models.sonnet]\nkind = \" \"\nargs = []\n",
+                "models.sonnet.kind",
+            ),
+            (
+                "[models.Sonnet]\nkind = \"claude\"\nargs = []\n",
+                "must match",
+            ),
+            (
+                "[models.\"--model\"]\nkind = \"claude\"\nargs = []\n",
+                "must match",
+            ),
+            (
+                "[models.sonnet]\nkind = \"claude\"\nargs = []\nenv = {}\n",
+                "env",
+            ),
+            ("[defaults]\nmodel = \"haiku\"\n", "defaults.model"),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            assert!(err.contains(says), "{text}: {err}");
+        }
+    }
+
+    /// `[profiles]` loads, and a bad profile fails the file's load.
+    #[test]
+    fn profiles_load_and_bad_ones_fail_the_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[profiles.ci]\nextends = \"develop\"\nallow = [\"Bash(docker:*)\"]\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        let ci = cfg.profiles.resolve("ci").unwrap();
+        assert_eq!(ci.chain, vec!["ci", "develop"]);
+        std::fs::write(&path, "[profiles.ci]\nextends = \"nope\"\n").unwrap();
+        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        assert!(err.contains("profiles.ci") && err.contains("nope"), "{err}");
+    }
+
+    /// The level comes from the first of the ask, the pinned machine, the
+    /// flock and `[defaults]` that sets one; with none it is `normal`.
+    #[test]
+    fn the_priority_comes_from_the_first_layer_that_sets_one() {
+        use crate::task::Priority;
+        let d = Defaults {
+            priority: Some(Priority::Low),
+            ..Default::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "p".into(),
+            priority: Some(Priority::High),
+            ..Default::default()
+        };
+        let machine: flock::MachineConfig =
+            toml::from_str("name = \"m\"\nlocal = true\npriority = \"critical\"\n").unwrap();
+        assert_eq!(
+            d.resolve_priority(Some(Priority::Normal), Some(&machine), Some(&flock)),
+            (Priority::Normal, Some(Layer::Ask))
+        );
+        assert_eq!(
+            d.resolve_priority(None, Some(&machine), Some(&flock)),
+            (Priority::Critical, Some(Layer::Machine))
+        );
+        assert_eq!(
+            d.resolve_priority(None, None, Some(&flock)),
+            (Priority::High, Some(Layer::Flock))
+        );
+        assert_eq!(
+            d.resolve_priority(None, None, None),
+            (Priority::Low, Some(Layer::Defaults))
+        );
+        assert_eq!(
+            Defaults::default().resolve_priority(None, None, None),
+            (Priority::Normal, None)
+        );
+    }
+
+    /// `[defaults] priority`, a flock's and a machine's take only the four
+    /// levels.
+    #[test]
+    fn a_priority_in_a_config_file_must_be_a_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "[defaults]\npriority = \"high\"\n").unwrap();
+        assert_eq!(
+            PastorConfig::load(&path).unwrap().defaults.priority,
+            Some(crate::task::Priority::High)
+        );
+        std::fs::write(&path, "[defaults]\npriority = \"urgent\"\n").unwrap();
+        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        assert!(err.contains("urgent"), "{err}");
+        for text in [
+            "[[flock]]\nname = \"p\"\ndefault = true\npriority = \"asap\"\n",
+            "[[machine]]\nname = \"m\"\nlocal = true\npriority = \"asap\"\n",
+        ] {
+            let err = format!(
+                "{:#}",
+                flock::Flock::parse(std::path::Path::new("flock.toml"), text).unwrap_err()
+            );
+            assert!(err.contains("asap"), "{text}: {err}");
+        }
+    }
+
+    /// The model comes from the first of the ask, the machine, the flock
+    /// and `[defaults]` that names one, and its args go before the agent's.
+    #[test]
+    fn the_model_comes_from_the_first_layer_that_names_one() {
+        let d = Defaults {
+            model: Some("opus".into()),
+            agent_args: vec!["-v".into()],
+            ..Default::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "p".into(),
+            model: Some("sonnet".into()),
+            ..Default::default()
+        };
+        let machine: flock::MachineConfig =
+            toml::from_str("name = \"m\"\nlocal = true\nmodel = \"haiku\"\n").unwrap();
+        let ask = |model: Option<&str>| AgentChoice {
+            model: model.map(Into::into),
+            ..Default::default()
+        };
+        let model = |p: AgentPick| p.model.unwrap();
+        assert_eq!(
+            model(d.resolve_agent_on(&ask(Some("gpt")), Some(&machine), Some(&flock))),
+            ("gpt".into(), Layer::Ask)
+        );
+        assert_eq!(
+            model(d.resolve_agent_on(&ask(None), Some(&machine), Some(&flock))),
+            ("haiku".into(), Layer::Machine)
+        );
+        assert_eq!(
+            model(d.resolve_agent(&ask(None), Some(&flock))),
+            ("sonnet".into(), Layer::Flock)
+        );
+        assert_eq!(
+            model(d.resolve_agent(&ask(None), None)),
+            ("opus".into(), Layer::Defaults)
+        );
+        assert_eq!(
+            Defaults::default().resolve_agent(&ask(None), None).model,
+            None
+        );
+
+        let models: Models = toml::from_str(
+            "[opus]\nkind = \"claude\"\nargs = [\"--model\", \"claude-opus-5-5\"]\n",
+        )
+        .unwrap();
+        let agents = Agents::default();
+        let pick = d.resolve_agent(&ask(None), None);
+        let mut spec = spec_with("claude", &[], &[]);
+        pick.apply_to(&mut spec);
+        models.apply(&pick, &agents, &mut spec).unwrap();
+        assert_eq!(spec.agent_args, vec!["--model", "claude-opus-5-5", "-v"]);
+
+        let codex = AgentChoice {
+            agent: Some("codex".into()),
+            ..Default::default()
+        };
+        let err = models
+            .apply(&d.resolve_agent(&codex, None), &agents, &mut spec)
+            .unwrap_err();
+        assert_eq!(err.code, MODEL_KIND_MISMATCH);
+        let err = models
+            .apply(
+                &d.resolve_agent(&ask(Some("gpt")), None),
+                &agents,
+                &mut spec,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "unknown_model");
+    }
+
+    /// A model of another kind than the default agent's runs on the first
+    /// layer's agent of that kind: its own `agent`, else its `agents` entry.
+    /// That agent takes args only from layers that name it; claude's never
+    /// reach it. An agent the task named is kept, and so is the default one
+    /// when no layer has the kind.
+    #[test]
+    fn a_model_of_another_kind_takes_the_agent_named_for_its_kind() {
+        let models: Models = toml::from_str(
+            "[gpt]\nkind = \"opencode\"\nargs = [\"--model\", \"openai/gpt-5.5\"]\n",
+        )
+        .unwrap();
+        let agents: Agents = toml::from_str(
+            "[claude-personal]\nkind = \"claude\"\n[oc-work]\nkind = \"opencode\"\n",
+        )
+        .unwrap();
+        let d = Defaults {
+            agent_args: vec!["--permission-mode".into(), "auto".into()],
+            ..Default::default()
+        };
+        let flock: flock::FlockEntry =
+            toml::from_str("name = \"p\"\nagent = \"claude-personal\"\nagent_args = [\"-v\"]\n")
+                .unwrap();
+        let machine = |extra: &str| -> flock::MachineConfig {
+            toml::from_str(&format!("name = \"m\"\nlocal = true\n{extra}")).unwrap()
+        };
+        let gpt = AgentChoice {
+            model: Some("gpt".into()),
+            ..Default::default()
+        };
+        let pick = |ask: &AgentChoice, m: &flock::MachineConfig| {
+            d.resolve_agent_for(ask, Some(m), Some(&flock), &models, &agents)
+        };
+
+        let p = pick(&gpt, &machine("agents = { opencode = \"opencode\" }\n"));
+        assert_eq!(
+            (p.agent.as_str(), p.agent_from, p.by_kind),
+            ("opencode", Layer::Machine, true)
+        );
+        assert!(p.agent_args.is_empty(), "{:?}", p.agent_args);
+        assert_eq!(p.args_from, None);
+        let mut spec = spec_with("claude", &[], &[]);
+        p.apply_to(&mut spec);
+        models.apply(&p, &agents, &mut spec).unwrap();
+        assert_eq!(spec.agent_args, vec!["--model", "openai/gpt-5.5"]);
+
+        // The machine's own agent of the kind wins, with its own args; a
+        // layer's args with no agent stay with the default agent.
+        let m = machine("agent = \"oc-work\"\nagent_args = [\"--x\"]\n");
+        let p = pick(&gpt, &m);
+        assert_eq!((p.agent.as_str(), p.by_kind), ("oc-work", false));
+        assert_eq!(p.agent_args, vec!["--x"]);
+        let m = machine("agent_args = [\"--claude-only\"]\nagents = { opencode = \"oc-work\" }\n");
+        let p = pick(&gpt, &m);
+        assert_eq!(p.agent, "oc-work");
+        assert!(p.agent_args.is_empty(), "{:?}", p.agent_args);
+
+        // A flock's agents entry when the machine has none.
+        let flock_oc: flock::FlockEntry = toml::from_str(
+            "name = \"p\"\nagent = \"claude-personal\"\nagents = { opencode = \"oc-work\" }\n",
+        )
+        .unwrap();
+        let p = d.resolve_agent_for(&gpt, Some(&machine("")), Some(&flock_oc), &models, &agents);
+        assert_eq!(
+            (p.agent.as_str(), p.agent_from, p.by_kind),
+            ("oc-work", Layer::Flock, true)
+        );
+
+        // No layer has one: the default agent, for `apply` to refuse.
+        let p = pick(&gpt, &machine(""));
+        assert_eq!(p.agent, "claude-personal");
+        let err = models.apply(&p, &agents, &mut spec).unwrap_err();
+        assert_eq!(err.code, MODEL_KIND_MISMATCH);
+        assert!(err.message.contains("no layer's agents.opencode"), "{err}");
+
+        // The task's own agent is kept.
+        let asked = AgentChoice {
+            agent: Some("claude".into()),
+            ..gpt.clone()
+        };
+        let p = pick(&asked, &machine("agents = { opencode = \"opencode\" }\n"));
+        assert_eq!(p.agent, "claude");
+        let err = models.apply(&p, &agents, &mut spec).unwrap_err();
+        assert!(!err.message.contains("agents."), "{err}");
+    }
+
+    /// An `agents` entry whose agent is of another kind than its key, and
+    /// one for the kind of the layer's own agent, fail the load: in
+    /// `[defaults]`, and on a flock or machine against `[agents]`.
+    #[test]
+    fn a_bad_agents_entry_fails_the_load() {
+        let path = Path::new("pastor.toml");
+        let agents = "[agents.claude-personal]\nkind = \"claude\"\n";
+        let cfg = PastorConfig::parse(
+            path,
+            &format!("[defaults]\nagents = {{ opencode = \"opencode\" }}\n{agents}"),
+        )
+        .unwrap();
+        assert_eq!(cfg.defaults.agents["opencode"], "opencode");
+        for (defaults, says) in [
+            (
+                "agents = { opencode = \"claude-personal\" }",
+                "defaults.agents.opencode: agent claude-personal is claude, not opencode",
+            ),
+            (
+                "agents = { claude = \"claude-personal\" }",
+                "defaults.agents.claude: its own agent claude is already claude",
+            ),
+            (
+                "agents = { opencode = \"\" }",
+                "defaults.agents.opencode must not be empty",
+            ),
+        ] {
+            let err = format!(
+                "{:#}",
+                PastorConfig::parse(path, &format!("[defaults]\n{defaults}\n{agents}"))
+                    .unwrap_err()
+            );
+            assert!(err.contains(says), "{defaults}: {err}");
+        }
+
+        let config = PastorConfig::parse(path, agents).unwrap();
+        let flock = |text: &str| {
+            flock::Flock::parse(Path::new("flock.toml"), text)
+                .unwrap()
+                .check_config(&config.models, &config.agents, &config.profiles)
+        };
+        flock(
+            "[[flock]]\nname = \"p\"\ndefault = true\nagent = \"claude-personal\"\nagents = { opencode = \"opencode\" }\n",
+        )
+        .unwrap();
+        for (text, says) in [
+            (
+                "[[machine]]\nname = \"m\"\nlocal = true\nagents = { opencode = \"claude-personal\" }\n",
+                "machine m: agents.opencode: agent claude-personal is claude, not opencode",
+            ),
+            (
+                "[[flock]]\nname = \"p\"\ndefault = true\nagent = \"claude-personal\"\nagents = { claude = \"claude\" }\n",
+                "flock p: agents.claude: its own agent claude-personal is already claude",
+            ),
+        ] {
+            let err = flock(text).unwrap_err().to_string();
+            assert!(err.contains(says), "{text}: {err}");
+        }
+    }
+
     fn spec_with(agent: &str, allow: &[&str], deny: &[&str]) -> crate::task::DispatchSpec {
         crate::task::DispatchSpec {
             agent: agent.into(),
@@ -1288,6 +2133,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         }
     }
 
@@ -1318,7 +2164,7 @@ mod tests {
         let err = agents
             .launch_args(&spec_with("codex", &[], &["Bash(rm:*)"]))
             .unwrap_err();
-        assert!(err.contains("[agents.codex] deny_flag"), "{err}");
+        assert!(err.message.contains("[agents.codex] deny_flag"), "{err}");
 
         let mut own = Agents::default();
         own.0.insert(
@@ -1333,6 +2179,194 @@ mod tests {
             vec!["--model", "m", "--deny", "x"]
         );
         assert!(own.launch_args(&spec_with("codex", &["y"], &[])).is_err());
+    }
+
+    /// Under a profile a Claude agent starts with `--permission-mode
+    /// dontAsk` after its args and before its tool flags; args that pick a
+    /// permission mode of their own are refused. An agent of another kind
+    /// gets the lists only, through its own flags.
+    #[test]
+    fn a_profile_starts_claude_without_asking() {
+        let with_profile = |agent: &str, args: &[&str]| {
+            let mut spec = spec_with(agent, &["Edit"], &["Bash(sudo:*)"]);
+            spec.agent_args = args.iter().map(|s| s.to_string()).collect();
+            spec.agent_source = Some(Box::new(crate::task::AgentSource {
+                ask: AgentChoice::default(),
+                agent: "defaults".into(),
+                agent_args: None,
+                model: None,
+                model_from: None,
+                profile: Some("develop".into()),
+                profile_from: Some("defaults".into()),
+            }));
+            spec
+        };
+        let agents = Agents::default();
+        assert_eq!(
+            agents
+                .launch_args(&with_profile("claude", &["--model", "m"]))
+                .unwrap(),
+            vec![
+                "--model",
+                "m",
+                "--permission-mode",
+                "dontAsk",
+                "--allowedTools",
+                "Edit",
+                "--disallowedTools",
+                "Bash(sudo:*)"
+            ]
+        );
+        for arg in [
+            &["--permission-mode", "bypassPermissions"][..],
+            &["--permission-mode=acceptEdits"],
+            &["--dangerously-skip-permissions"],
+        ] {
+            let err = agents
+                .launch_args(&with_profile("claude", arg))
+                .unwrap_err();
+            assert_eq!(err.code, PROFILE_ARGS_CONFLICT, "{arg:?}");
+            assert!(err.message.contains("profile develop"), "{err}");
+        }
+        // Without a profile the same args pass as written.
+        let mut plain = with_profile("claude", &["--dangerously-skip-permissions"]);
+        plain.agent_source = None;
+        assert_eq!(
+            agents.launch_args(&plain).unwrap()[..1],
+            ["--dangerously-skip-permissions"]
+        );
+        // A definition of kind claude is claude.
+        let personal: Agents = toml::from_str("[claude-personal]\nkind = \"claude\"\n").unwrap();
+        assert!(
+            personal
+                .launch_args(&with_profile("claude-personal", &[]))
+                .unwrap()
+                .contains(&"dontAsk".to_string())
+        );
+        let codex: Agents =
+            toml::from_str("[codex]\nallow_flag = \"--allow\"\ndeny_flag = \"--deny\"\n").unwrap();
+        assert_eq!(
+            codex
+                .launch_args(&with_profile("codex", &["--permission-mode", "x"]))
+                .unwrap(),
+            vec![
+                "--permission-mode",
+                "x",
+                "--allow",
+                "Edit",
+                "--deny",
+                "Bash(sudo:*)"
+            ]
+        );
+    }
+
+    /// Under a profile an opencode agent gets its lists as
+    /// `OPENCODE_PERMISSION`, not as flags, whatever flags it defines, and
+    /// the variables that point it at another config emptied, over its own
+    /// env. Without a profile its lists still need flags.
+    #[test]
+    fn a_profile_reaches_opencode_through_its_env() {
+        let mut spec = spec_with("opencode", &["Edit"], &["Bash(sudo:*)"]);
+        spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            ask: AgentChoice::default(),
+            agent: "defaults".into(),
+            agent_args: None,
+            model: None,
+            model_from: None,
+            profile: Some("develop".into()),
+            profile_from: Some("defaults".into()),
+        }));
+        let agents: Agents = toml::from_str(
+            "[opencode]\nallow_flag = \"--allow\"\n\
+             env = { OPENCODE_CONFIG = \"~/x.json\", OPENCODE_PERMISSION = \"{}\", KEEP = \"1\" }\n",
+        )
+        .unwrap();
+        let launch = agents.launch(&spec).unwrap();
+        assert_eq!(launch.kind, "opencode");
+        assert_eq!(launch.args, vec!["--model", "m"]);
+        assert_eq!(
+            launch.env["OPENCODE_PERMISSION"],
+            opencode::permission_json(&spec.allow, &spec.deny, false)
+        );
+        for key in opencode::CONFIG_ENV {
+            assert_eq!(launch.env[key], "", "{key}");
+        }
+        assert_eq!(launch.env["KEEP"], "1");
+
+        // A definition of kind opencode is opencode.
+        let mine: Agents = toml::from_str("[oc]\nkind = \"opencode\"\n").unwrap();
+        spec.agent = "oc".into();
+        assert!(
+            mine.launch(&spec)
+                .unwrap()
+                .env
+                .contains_key("OPENCODE_PERMISSION")
+        );
+
+        spec.agent = "opencode".into();
+        spec.agent_source = None;
+        let err = Agents::default().launch(&spec).unwrap_err();
+        assert_eq!(err.code, "agent_tools_unsupported");
+        spec.allow.clear();
+        spec.deny.clear();
+        assert!(Agents::default().launch(&spec).unwrap().env.is_empty());
+    }
+
+    /// A task's profile comes from the first layer that names one, like its
+    /// model; `[defaults] profile` must be one there is.
+    #[test]
+    fn the_profile_comes_from_the_first_layer_that_names_one() {
+        let d = Defaults {
+            profile: Some("review".into()),
+            ..Defaults::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "f".into(),
+            profile: Some("develop".into()),
+            ..Default::default()
+        };
+        let machine: flock::MachineConfig =
+            toml::from_str("name = \"m\"\nlocal = true\nprofile = \"ci\"\n").unwrap();
+        let ask = |profile: Option<&str>| AgentChoice {
+            profile: profile.map(Into::into),
+            ..Default::default()
+        };
+        let profile = |p: AgentPick| p.profile.unwrap();
+        assert_eq!(
+            profile(d.resolve_agent_on(&ask(Some("x")), Some(&machine), Some(&flock))),
+            ("x".into(), Layer::Ask)
+        );
+        assert_eq!(
+            profile(d.resolve_agent_on(&ask(None), Some(&machine), Some(&flock))),
+            ("ci".into(), Layer::Machine)
+        );
+        assert_eq!(
+            profile(d.resolve_agent(&ask(None), Some(&flock))),
+            ("develop".into(), Layer::Flock)
+        );
+        assert_eq!(
+            profile(d.resolve_agent(&ask(None), None)),
+            ("review".into(), Layer::Defaults)
+        );
+        assert_eq!(
+            Defaults::default().resolve_agent(&ask(None), None).profile,
+            None
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "[defaults]\nprofile = \"ci\"\n[profiles.ci]\n").unwrap();
+        assert_eq!(
+            PastorConfig::load(&path)
+                .unwrap()
+                .defaults
+                .profile
+                .as_deref(),
+            Some("ci")
+        );
+        std::fs::write(&path, "[defaults]\nprofile = \"nope\"\n").unwrap();
+        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        assert!(err.contains("defaults.profile: profile nope"), "{err}");
     }
 
     #[test]
@@ -1580,6 +2614,8 @@ mod tests {
             agent_args: Some(vec!["-v".into()]),
             allow: vec![],
             deny: vec![],
+            model: None,
+            profile: None,
         };
         assert_eq!(pick(&own, Some(&work)), ("aider".into(), "-v".into()));
         // Args follow the agent they were written for: the flock's are for
@@ -1589,6 +2625,8 @@ mod tests {
             agent_args: None,
             allow: vec![],
             deny: vec![],
+            model: None,
+            profile: None,
         };
         assert_eq!(
             pick(&claude, Some(&work)),
@@ -1599,6 +2637,8 @@ mod tests {
             agent_args: None,
             allow: vec![],
             deny: vec![],
+            model: None,
+            profile: None,
         };
         assert_eq!(
             pick(&codex, Some(&work)),

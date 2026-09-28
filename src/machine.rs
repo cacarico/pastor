@@ -157,7 +157,17 @@ pub struct MachineStatus {
     pub protocol: Option<u32>,
     pub error: Option<String>,
     pub live: usize,
+    /// How many of `live` are tasks from jobs (`Task::from_job`). Defaulted
+    /// so a CLI can still read a head that predates the field.
+    #[serde(default)]
+    pub live_jobs: usize,
     pub max_agents: u32,
+    /// `MachineConfig::job_slots` and `burst`. Defaulted to 0, none, so a
+    /// CLI reading a head that predates them shows none.
+    #[serde(default)]
+    pub job_slots: u32,
+    #[serde(default)]
+    pub burst: u32,
     pub tags: Vec<String>,
     /// Agents named like a task (`t-<id>`) that no open task on this machine
     /// owns: the row is failed, closed or gone (a dispatch that failed after
@@ -170,6 +180,24 @@ pub struct MachineStatus {
     /// from an actor, and from a head that predates flocks.
     #[serde(default)]
     pub flock: Option<String>,
+    /// The actor was stopped by a reload that took this machine out of the
+    /// flock, but it has not ended yet (`Fleet::statuses` fills it in). A
+    /// caller that grants access by flock membership must treat this machine
+    /// as removed, not as still in `flock`. `false` from an actor, and from
+    /// a head that predates the field.
+    #[serde(default)]
+    pub shutting_down: bool,
+    /// The permission profile a task here runs under when it names none:
+    /// the machine's own, else its flock's, else `[defaults]`. The actor
+    /// does not know it; `Fleet::statuses` fills it in. `None` when no
+    /// layer names one, and from a head that predates profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// The machine's `description` in flock.toml, as the head last applied
+    /// it; `Fleet::statuses` fills it in. `None` from an actor, and from a
+    /// head that predates it.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,6 +229,9 @@ pub struct MachineSettings {
     /// `[agents]` in `pastor.toml`: the keys that answer each agent's
     /// folder-trust prompt.
     pub agents: crate::config::Agents,
+    /// `head_address` in `pastor.toml`, for a machine other than the head's
+    /// own (`daemon::actor_settings`): its agents get it as `ipc::HEAD_ENV`.
+    pub head_address: Option<String>,
 }
 
 impl Default for MachineSettings {
@@ -216,6 +247,7 @@ impl Default for MachineSettings {
             close_done_after: Some(Duration::from_secs(15 * 60)),
             version_every: Duration::from_secs(10 * 60),
             agents: crate::config::Agents::default(),
+            head_address: None,
         }
     }
 }
@@ -347,6 +379,9 @@ pub struct ActorStopped {
 pub struct MachineHandle {
     pub name: String,
     pub max_agents: u32,
+    /// Set by `with_slots`; 0 from `spawn_machine`.
+    pub job_slots: u32,
+    pub burst: u32,
     pub tags: Vec<String>,
     pub tx: mpsc::Sender<MachineCommand>,
     pub status: Arc<RwLock<MachineStatus>>,
@@ -386,6 +421,18 @@ pub enum ShutdownOutcome {
 }
 
 impl MachineHandle {
+    /// Give the machine `job_slots` and `burst` (`MachineConfig`), on the
+    /// handle for the picker and in the status for `machine list`.
+    pub fn with_slots(mut self, job_slots: u32, burst: u32) -> MachineHandle {
+        self.job_slots = job_slots;
+        self.burst = burst;
+        let mut s = self.status.write().unwrap();
+        s.job_slots = job_slots;
+        s.burst = burst;
+        drop(s);
+        self
+    }
+
     /// Stop the actor and wait until its task has ended. A flock reload calls
     /// this for a machine it removes or replaces, before it spawns the
     /// replacement, so a removed actor cannot write a row after removal and a
@@ -523,6 +570,7 @@ pub fn spawn_machine(
 ) -> MachineHandle {
     let (tx, rx) = mpsc::channel(32);
     let status = Arc::new(RwLock::new(MachineStatus {
+        description: None,
         name: name.clone(),
         host: connector.host(),
         endpoint: connector.describe(),
@@ -532,10 +580,15 @@ pub fn spawn_machine(
         protocol: None,
         error: None,
         live: 0,
+        live_jobs: 0,
         max_agents,
+        job_slots: 0,
+        burst: 0,
         tags: tags.clone(),
         orphans: vec![],
         flock: None,
+        shutting_down: false,
+        profile: None,
     }));
     let actor = Actor {
         name: name.clone(),
@@ -558,6 +611,8 @@ pub fn spawn_machine(
     MachineHandle {
         name,
         max_agents,
+        job_slots: 0,
+        burst: 0,
         tags,
         tx,
         status,
@@ -1006,6 +1061,7 @@ impl Actor {
                 // leaving it out would let the picker over-dispatch.
                 let mut s = self.status.write().unwrap();
                 s.live = v.len() + self.orphans.len();
+                s.live_jobs = v.iter().filter(|t| t.from_job()).count();
                 s.orphans = self.orphans.iter().map(|(name, _)| name.clone()).collect();
             }
             Err(err) => {
@@ -2133,6 +2189,7 @@ impl Actor {
                 self.connector.as_ref(),
                 &mut task,
                 &self.settings.agents,
+                self.settings.head_address.as_deref(),
                 self.settings.agent_ready_timeout,
             ),
         )
@@ -2443,7 +2500,15 @@ impl Actor {
         };
         let timeout = self.settings.request_timeout;
         match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
-            Ok(Ok(text)) => Ok(crate::task::trailing_question(&text)),
+            Ok(Ok(text)) => {
+                // Kept only when the task really is done: a tail left by a
+                // question would reach a later failed task's finish command.
+                let question = crate::task::trailing_question(&text);
+                if question.is_none() {
+                    self.store.note_pane_tail(task.id, &text);
+                }
+                Ok(question)
+            }
             Ok(Err(err)) if err.is_transport() => Err(err.into()),
             Ok(Err(err)) => {
                 tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a question");
@@ -2910,6 +2975,7 @@ mod tests {
             close_done_after: None,
             version_every: Duration::from_millis(200),
             agents: Default::default(),
+            head_address: None,
         }
     }
 
@@ -2957,12 +3023,14 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         }
     }
 
     fn new_task(store: &Store) -> Task {
         store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -3337,6 +3405,32 @@ mod tests {
         fake.set_pane_text(&pane, "● Kept it. Pushed the branch.\n\n❯\n");
         fake.set_status(&pane, AgentStatus::Idle);
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// The pane text read to settle a task as done is kept as its tail, for
+    /// its connector's finish command (`Store::take_pane_tail`).
+    #[tokio::test]
+    async fn a_done_task_leaves_the_end_of_its_pane_for_the_finish_command() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(100)),
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● Opened https://example.org/pr/7\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        let tail = store.take_pane_tail(t.id).expect("a tail was kept");
+        assert!(tail.contains("Opened https://example.org/pr/7"), "{tail}");
     }
 
     /// A pane read that never answers is an outage, not an empty pane: the
@@ -3837,6 +3931,7 @@ mod tests {
     fn worktree_task(store: &Store) -> Task {
         store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -4259,6 +4354,7 @@ mod tests {
     fn placed_task(store: &Store, place: Place, worktree: bool) -> Task {
         store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -4977,6 +5073,7 @@ mod tests {
     fn repo_task(store: &Store, agent: &str, repo: Option<&str>) -> Task {
         store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -5604,6 +5701,7 @@ mod tests {
         .await;
         let task = store
             .insert_task(NewTask {
+                description: None,
                 job: "nightly".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -7051,6 +7149,7 @@ mod tests {
         .await;
         let t = store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),

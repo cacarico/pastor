@@ -1,26 +1,36 @@
 //! `pastor job|machine|flock|connector describe`: one thing in full, for a human, or
-//! as JSON with `--json`. The CLI gathers the parts (from the head when one
-//! runs, else from the files and the store); this module holds their shape
-//! and how they read.
+//! as JSON with `--json`. A running head builds a machine's or a flock's
+//! description itself (`IpcRequest::MachineDescribe`, `FlockDescribe`); with
+//! none, the CLI gathers the parts from the files and the store. This module
+//! holds their shape, the parts both sides share, and how they read.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::cli::CliError;
 use crate::cli::{
     JOB_HEADER, MachineRow, TASK_HEADER, age, in_, job_rows, one_line, table, task_rows,
 };
+use crate::config::Paths;
+use crate::config::flock::Flock;
 use crate::connector::install::Origin;
+use crate::edit::ConfigFile;
 use crate::events::EventRecord;
 use crate::herdr::shell_quote;
+use crate::machine::MachineStatus;
 use crate::scheduler::JobStatus;
-use crate::task::Task;
+use crate::store::{Store, TaskFilter};
+use crate::task::{LIVE_STATES, PANE_OWNING_STATES, Task};
 
 /// How many recent tasks and events a description lists.
 pub const RECENT: usize = 10;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobDescription {
     pub name: String,
+    /// The file's `description`.
+    #[serde(default)]
+    pub description: Option<String>,
     pub file: String,
     pub schedule: Option<String>,
     pub enabled: bool,
@@ -45,11 +55,80 @@ pub struct JobDescription {
     pub events: Vec<EventRecord>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `job describe` for `name`: how `statuses` (the head's, or a standalone
+/// scheduler's) report it, its tables as written in its file under `paths`,
+/// and its state, recent tasks and events from `store` and the events log.
+/// The head (`JobDescribe`) and the CLI with no head both build it here.
+pub fn job(
+    paths: &Paths,
+    name: &str,
+    statuses: Vec<JobStatus>,
+    store: &Store,
+) -> anyhow::Result<JobDescription> {
+    let path = ConfigFile::Job(name.to_string()).path(paths)?;
+    let Some(status) = statuses.into_iter().find(|j| j.name == name) else {
+        return Err(CliError::err(
+            "job_not_found",
+            format!("the head has no job {name}"),
+        ));
+    };
+    // The tables as written, so a file that does not parse still shows what
+    // it says as far as TOML goes.
+    let raw: Option<toml::Table> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok());
+    let table = |key: &str| {
+        raw.as_ref()
+            .and_then(|r| r.get(key))
+            .and_then(|v| serde_json::to_value(v).ok())
+    };
+    let state = store.job_state(name)?.unwrap_or_default();
+    let tasks = store
+        .list_tasks(&TaskFilter {
+            job: Some(name.to_string()),
+            ..Default::default()
+        })?
+        .into_iter()
+        .take(RECENT)
+        .collect();
+    let log = crate::events::read(&paths.events_file(), None).unwrap_or_default();
+    let events = recent_events(log, |e| {
+        e.kind.starts_with("job.") && e.job.as_deref() == Some(name)
+    });
+    Ok(JobDescription {
+        name: name.to_string(),
+        description: status.description.clone(),
+        file: path.display().to_string(),
+        schedule: status.schedule,
+        enabled: status.enabled,
+        error: status.error,
+        running: status.running,
+        flock: status.flock,
+        connector: table("connector"),
+        dispatch: table("dispatch"),
+        next_due: status.next_due,
+        last_run_at: status.last_run_at.or(state.last_run_at),
+        last_ok_at: state.last_ok_at,
+        last_result: status.last_result.or(state.last_result),
+        last_error: state.last_error,
+        failures: state.failures,
+        backoff_until: state.backoff_until,
+        tasks,
+        events,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineDescription {
     #[serde(flatten)]
     pub row: MachineRow,
     pub session: String,
+    /// The machine's own `model`; `None` falls through to its flock's.
+    pub model: Option<String>,
+    /// The machine's own `agents`, the agent per kind for a model of
+    /// another kind than its agent's. Missing from an older head.
+    #[serde(default)]
+    pub agents_by_kind: crate::config::KindAgents,
     /// The tasks whose agent holds a pane on it, newest first.
     pub tasks: Vec<Task>,
     /// Its recent `machine.*` events that carried an error, and its failed
@@ -57,15 +136,27 @@ pub struct MachineDescription {
     pub recent_errors: Vec<EventRecord>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlockDescription {
     pub name: String,
+    /// Its `[[flock]]` entry's `description`.
+    #[serde(default)]
+    pub description: Option<String>,
     pub default: bool,
     /// The flock's own agent settings; `None` falls through to `[defaults]`.
     pub agent: Option<String>,
     pub agent_args: Option<Vec<String>>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    /// The flock's own `model`; `None` falls through to `[defaults]`.
+    pub model: Option<String>,
+    /// The flock's own `agents`, as the machine's. Missing from an older
+    /// head.
+    #[serde(default)]
+    pub agents_by_kind: crate::config::KindAgents,
+    /// The flock's own `profile`; `None` falls through to `[defaults]`.
+    #[serde(default)]
+    pub profile: Option<String>,
     pub machines: Vec<String>,
     /// Live agents on its machines; known only from a running head.
     pub agents: Option<usize>,
@@ -94,6 +185,10 @@ pub struct ConnectorDescription {
     pub origin: Origin,
     pub connector: Option<ConnectorCommand>,
     pub hooks: Vec<ConnectorHook>,
+    /// Run when a task of one of its jobs is done or failed.
+    pub finish: Option<ConnectorFinish>,
+    /// Run by `pastor watch` each interval.
+    pub watch: Option<ConnectorWatch>,
     pub env_file: String,
     /// Declared secrets and whether the `.env` sets them; never their values.
     pub secrets: Vec<ConnectorSecret>,
@@ -121,6 +216,18 @@ pub struct ConfigKey {
 pub struct ConnectorHook {
     pub on: Vec<String>,
     pub only_own: bool,
+    pub command: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorFinish {
+    pub command: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorWatch {
     pub command: Vec<String>,
     pub timeout_secs: u64,
 }
@@ -155,12 +262,80 @@ pub fn recent_events(
     kept
 }
 
+/// The tasks `machine describe` lists: those whose agent holds a pane on
+/// `name`.
+pub fn machine_tasks(name: &str) -> TaskFilter {
+    TaskFilter {
+        machine: Some(name.to_string()),
+        states: Some(PANE_OWNING_STATES.to_vec()),
+        ..Default::default()
+    }
+}
+
+/// The tasks `flock describe` lists: the live ones in `name`.
+pub fn flock_tasks(name: &str) -> TaskFilter {
+    TaskFilter {
+        flock: Some(name.to_string()),
+        states: Some(LIVE_STATES.to_vec()),
+        ..Default::default()
+    }
+}
+
+/// `name`'s recent errors: its `machine.*` events that carried one, and
+/// the tasks that failed on it.
+pub fn machine_errors(events: Vec<EventRecord>, name: &str) -> Vec<EventRecord> {
+    recent_events(events, |e| {
+        let machine_error = e.kind.starts_with("machine.")
+            && e.machine
+                .as_ref()
+                .is_some_and(|s| s.name == name && s.error.is_some());
+        let failed_here = e.kind == "task.failed"
+            && e.task.as_ref().and_then(|t| t.machine.as_deref()) == Some(name);
+        machine_error || failed_here
+    })
+}
+
+/// Flock `name` of `flock`, with the live agents of `live` when a head
+/// knows them. `None` when `flock` has no such flock.
+pub fn flock_description(
+    flock: &Flock,
+    name: &str,
+    live: Option<&[MachineStatus]>,
+    tasks: Vec<Task>,
+) -> Option<FlockDescription> {
+    let row = crate::cli::flock_list(flock, live, &[])
+        .into_iter()
+        .find(|r| r.name == name)?;
+    let entry = flock.entry(name).cloned().unwrap_or_default();
+    Some(FlockDescription {
+        name: row.name,
+        description: row.description,
+        default: row.default,
+        agent: entry.agent,
+        agent_args: entry.agent_args,
+        allow: entry.allow,
+        deny: entry.deny,
+        model: entry.model,
+        agents_by_kind: entry.agents,
+        profile: entry.profile,
+        machines: row.machines,
+        agents: row.agents,
+        tasks,
+    })
+}
+
 /// `key: value` lines with the values in one column.
 fn fields(rows: &[(&str, String)]) -> Vec<String> {
     let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0) + 2;
     rows.iter()
         .map(|(k, v)| format!("{:<width$}{v}", format!("{k}:")))
         .collect()
+}
+
+/// A description as `describe` shows it: whole, newlines kept, other
+/// control characters escaped; `-` for none.
+fn description(v: &Option<String>) -> String {
+    dash(v.as_deref().map(crate::cli::printable))
 }
 
 fn dash(v: Option<String>) -> String {
@@ -246,6 +421,7 @@ pub fn job_text(j: &JobDescription) -> String {
         .map(str::to_string);
     let mut out = fields(&[
         ("name", j.name.clone()),
+        ("description", description(&j.description)),
         ("file", j.file.clone()),
         ("schedule", dash(j.schedule.clone())),
         ("enabled", yes(j.enabled)),
@@ -287,18 +463,41 @@ pub fn job_text(j: &JobDescription) -> String {
     out.join("\n")
 }
 
+/// An `agents` table as `kind=agent` words, or where the layer's lookup
+/// goes on to when it has none.
+fn by_kind(agents: &crate::config::KindAgents, next: &str) -> String {
+    if agents.is_empty() {
+        return format!("- (from {next})");
+    }
+    agents
+        .iter()
+        .map(|(kind, agent)| format!("{kind}={}", one_line(agent)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn machine_text(m: &MachineDescription) -> String {
     let r = &m.row;
+    let room = crate::cli::capacity(r.max_agents, r.job_slots, r.burst);
     let agents = match r.live {
-        Some(n) => format!("{n} of {}", r.max_agents),
-        None => format!("- of {}", r.max_agents),
+        Some(n) => format!("{n} of {room}"),
+        None => format!("- of {room}"),
     };
     let mut out = fields(&[
         ("name", r.name.clone()),
+        ("description", description(&r.description)),
         ("host", r.host.clone()),
         ("endpoint", r.endpoint.clone()),
         ("flock", r.flock.clone()),
         ("session", m.session.clone()),
+        (
+            "model",
+            m.model
+                .clone()
+                .unwrap_or_else(|| "- (from its flock)".into()),
+        ),
+        ("by kind", by_kind(&m.agents_by_kind, "its flock")),
+        ("profile", dash(r.profile.clone())),
         ("channel", r.channel.clone()),
         ("herdr", dash(r.herdr_version.clone())),
         ("protocol", dash(r.protocol.map(|p| p.to_string()))),
@@ -320,6 +519,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
 pub fn flock_text(f: &FlockDescription) -> String {
     let mut out = fields(&[
         ("name", f.name.clone()),
+        ("description", description(&f.description)),
         ("default", yes(f.default)),
         (
             "agent",
@@ -335,6 +535,19 @@ pub fn flock_text(f: &FlockDescription) -> String {
         ),
         ("allow", words(&f.allow)),
         ("deny", words(&f.deny)),
+        (
+            "model",
+            f.model
+                .clone()
+                .unwrap_or_else(|| "- (from [defaults])".into()),
+        ),
+        ("by kind", by_kind(&f.agents_by_kind, "[defaults]")),
+        (
+            "profile",
+            f.profile
+                .clone()
+                .unwrap_or_else(|| "- (from [defaults])".into()),
+        ),
         ("machines", dash(Some(f.machines.join(",")))),
         ("agents", dash(f.agents.map(|n| n.to_string()))),
     ]);
@@ -354,7 +567,7 @@ pub fn connector_text(c: &ConnectorDescription) -> String {
         ("name", text(&c.name)),
         ("version", dash(c.version.clone())),
         ("min pastor", dash(c.min_pastor_version.clone())),
-        ("description", text(&c.description)),
+        ("description", description(&c.description)),
         ("authors", dash(Some(one_line(&c.authors.join(", "))))),
         ("homepage", text(&c.homepage)),
         ("repository", text(&c.repository)),
@@ -440,6 +653,18 @@ pub fn connector_text(c: &ConnectorDescription) -> String {
         })
         .collect();
     section(&mut out, "hooks", hooks);
+    let finish = c
+        .finish
+        .iter()
+        .map(|f| format!("{} [timeout {}s]", argv(&f.command), f.timeout_secs))
+        .collect();
+    section(&mut out, "finish", finish);
+    let watch = c
+        .watch
+        .iter()
+        .map(|w| format!("{} [timeout {}s]", argv(&w.command), w.timeout_secs))
+        .collect();
+    section(&mut out, "watch", watch);
     let secrets = c
         .secrets
         .iter()
@@ -488,21 +713,43 @@ mod tests {
     #[test]
     fn a_flock_without_its_own_agent_says_where_it_comes_from() {
         let f = FlockDescription {
+            description: None,
             name: "work".into(),
             default: false,
             agent: None,
             agent_args: Some(vec!["--model".into(), "a b".into()]),
             allow: vec![],
             deny: vec!["Bash(rm:*)".into()],
+            model: Some("sonnet".into()),
+            agents_by_kind: Default::default(),
+            profile: Some("develop".into()),
             machines: vec!["pi-1".into(), "pi-2".into()],
             agents: None,
             tasks: vec![],
         };
         let text = flock_text(&f);
-        assert!(text.contains("agent:      - (from [defaults])"), "{text}");
+        assert!(text.contains("agent:       - (from [defaults])"), "{text}");
+        assert!(text.contains("by kind:     - (from [defaults])"), "{text}");
+        let with = FlockDescription {
+            agents_by_kind: [("opencode".to_string(), "opencode".to_string())].into(),
+            ..f.clone()
+        };
+        let text = flock_text(&with);
+        assert!(text.contains("by kind:     opencode=opencode\n"), "{text}");
         assert!(text.contains("--model 'a b'"), "{text}");
+        assert!(text.contains("model:       sonnet"), "{text}");
+        assert!(text.contains("profile:     develop"), "{text}");
         assert!(text.contains("pi-1,pi-2"), "{text}");
         assert!(text.ends_with("tasks: none"), "{text}");
+        assert!(text.contains("\ndescription: -\n"), "{text}");
+        let described = flock_text(&FlockDescription {
+            description: Some("Paid work".into()),
+            ..f
+        });
+        assert!(
+            described.starts_with("name:        work\ndescription: Paid work\n"),
+            "{described}"
+        );
     }
 
     #[test]
@@ -515,6 +762,7 @@ mod tests {
             job: None,
             machine: None,
             detail: None,
+            model: None,
         };
         let all: Vec<EventRecord> = (0..15).map(|i| ev(&format!("job.{i}"))).collect();
         let kept = recent_events(all, |e| e.kind != "job.14");

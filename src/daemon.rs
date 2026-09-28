@@ -6,18 +6,29 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
-use crate::config::flock::{EditError, Flock, FlockDoc, MachineConfig, TaskFlockError};
-use crate::config::{AgentChoice, AgentPick, Agents, Defaults, Layer, PastorConfig, Paths};
-use crate::dispatch::{MachineView, pick_machine};
+use crate::config::flock::{
+    DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig, TaskFlockError,
+};
+use crate::config::{
+    AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer, MODEL_KIND_MISMATCH, Models,
+    PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
+};
+use crate::dispatch::{Claim, MachineView, pick_machine, pick_machine_where};
 use crate::herdr::{Connector, Endpoint};
-use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
+use crate::ipc::{HeadPing, IpcRequest, IpcResponse, MODEL_PROTOCOL, check_protocol};
 use crate::machine::{
     ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, SendInput,
     SendRefused, ShutdownOutcome, spawn_machine,
 };
+use crate::queue::{QueueEntry, QueueSpot};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
-use crate::store::{NewTask, RetryError, Store, TaskFilter};
-use crate::task::{AgentSource, PANE_OWNING_STATES, Task, TaskState};
+use crate::store::{MoveError, Moved, NewTask, PriorityError, RetryError, Store, TaskFilter};
+use crate::task::{AgentSource, PANE_OWNING_STATES, Priority, Task, TaskRole, TaskState};
+
+/// How a headless serve's fleet reaches the head with the items a job run
+/// found (`IpcRequest::JobSubmit`): one request, its reply, or an `Err` for
+/// an unreachable head or an error reply (a `CliError` with its code).
+pub type HeadForward = crate::shepherd::Ask;
 
 /// Builds a machine's transport from its flock entry. `serve` uses
 /// `endpoint_factory`; tests hand out fakes by machine name.
@@ -41,6 +52,7 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         poll_every: config.tick_duration(),
         close_done_after: config.close_done_after_duration(),
         agents: config.agents.clone(),
+        head_address: config.head_address.clone(),
         ..Default::default()
     }
 }
@@ -126,17 +138,29 @@ fn flock_of(flock: &Flock, name: &str) -> String {
         .to_string()
 }
 
-/// The part of a machine's entry its actor is built from. The flock and the
-/// agent are not: they only decide which tasks the machine is offered and
-/// what they run, which dispatch reads from the flock last applied, so
-/// moving a machine or changing its agent keeps its connection and the
-/// tasks already on it.
+/// The part of a machine's entry its actor is built from. The flock, the
+/// agent and its per-kind agents are not: they only decide which tasks the
+/// machine is offered and what they run, which dispatch reads from the flock
+/// last applied, so moving a machine or changing its agent keeps its
+/// connection and the tasks already on it.
 fn actor_config(m: &MachineConfig) -> MachineConfig {
     MachineConfig {
         flock: None,
         agent: None,
         agent_args: None,
+        agents: Default::default(),
+        description: None,
         ..m.clone()
+    }
+}
+
+/// `settings` as the actor for `m` runs them: an agent on the head's own
+/// machine (`local`) reaches the head through its socket, so it is not told
+/// the head's address.
+pub fn actor_settings(m: &MachineConfig, settings: &MachineSettings) -> MachineSettings {
+    MachineSettings {
+        head_address: settings.head_address.clone().filter(|_| !m.local),
+        ..settings.clone()
     }
 }
 
@@ -172,8 +196,10 @@ pub enum QueueError<E = anyhow::Error> {
     UnknownMachine(String),
     /// Names a flock that does not exist, or one its pinned machine is not in.
     Flock(TaskFlockError),
-    /// Its agent cannot be started as resolved (`Agents::launch_args`).
-    Agent(String),
+    /// Its agent cannot be started as resolved: a model `[models]` lacks
+    /// or of another kind (`Models::apply`), or a tool list it has no flag
+    /// for (`Agents::launch_args`).
+    Agent(AgentRefusal),
     /// The insert failed; for `queue_retry`, the `RetryError` that says why.
     Store(E),
 }
@@ -213,12 +239,19 @@ pub struct Fleet {
     /// `[agents]` as last applied: whether a queued task's agent can take
     /// its tool lists (`Agents::launch_args`).
     agents: RwLock<Agents>,
+    /// `[models]` as last applied: what a task's `model` names.
+    models: RwLock<Models>,
+    /// `[profiles]` as last applied: what a task's `profile` names.
+    profiles: RwLock<crate::config::profile::Profiles>,
     /// `agents_change_fleet` as last applied: whether the head takes a
     /// fleet-changing request from an agent it started.
     agents_change_fleet: std::sync::atomic::AtomicBool,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
+    /// Set for a headless serve (`Fleet::headless`): job tasks go to the
+    /// head instead of this store, and the head checks their flock.
+    forward: Option<HeadForward>,
     dispatch_lock: tokio::sync::Mutex<()>,
 }
 
@@ -238,10 +271,23 @@ impl Fleet {
             wanted: RwLock::default(),
             defaults: RwLock::default(),
             agents: RwLock::default(),
+            models: RwLock::default(),
+            profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             store,
             spawner: None,
+            forward: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// A headless serve's fleet: no machines and no flock, and every job
+    /// task it queues goes through `forward` to the head. `store` keeps only
+    /// the jobs' state and seen keys.
+    pub fn headless(store: Arc<Store>, forward: HeadForward) -> Fleet {
+        Fleet {
+            forward: Some(forward),
+            ..Fleet::new(Vec::new(), store)
         }
     }
 
@@ -265,9 +311,12 @@ impl Fleet {
             wanted: RwLock::default(),
             defaults: RwLock::default(),
             agents: RwLock::default(),
+            models: RwLock::default(),
+            profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             store,
             spawner: Some(Spawner { connect, events }),
+            forward: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -282,15 +331,28 @@ impl Fleet {
             .collect()
     }
 
-    /// Every machine's status with the flock it is in (see `flock_of`), in
-    /// flock order: what `machine list` and `machine.*` events report.
+    /// Every machine's status with the flock it is in (see `flock_of`) and
+    /// whether it is `shutting_down`, in flock order: what `machine list`
+    /// and `machine.*` events report, and what a caller granting access by
+    /// flock membership (`bridge::machine_flock`) must check before trusting
+    /// the flock it reports for a machine no longer in `wanted`.
     pub fn statuses(&self) -> Vec<crate::machine::MachineStatus> {
         let wanted = self.flock();
-        self.machines()
+        self.members
+            .read()
+            .unwrap()
             .iter()
-            .map(|h| crate::machine::MachineStatus {
-                flock: Some(flock_of(&wanted, &h.name)),
-                ..h.snapshot()
+            .map(|m| {
+                let flock = flock_of(&wanted, &m.handle.name);
+                crate::machine::MachineStatus {
+                    profile: self.own_profile(&flock, Some(&m.handle.name)),
+                    flock: Some(flock),
+                    shutting_down: m.shutting_down,
+                    description: wanted
+                        .get(&m.handle.name)
+                        .and_then(|c| crate::config::clean_description(c.description.as_deref())),
+                    ..m.handle.snapshot()
+                }
             })
             .collect()
     }
@@ -317,6 +379,8 @@ impl Fleet {
     pub fn set_config(&self, config: &PastorConfig) {
         *self.defaults.write().unwrap() = config.defaults.clone();
         *self.agents.write().unwrap() = config.agents.clone();
+        *self.models.write().unwrap() = config.models.clone();
+        *self.profiles.write().unwrap() = config.profiles.clone();
         self.agents_change_fleet.store(
             config.agents_change_fleet,
             std::sync::atomic::Ordering::Relaxed,
@@ -348,9 +412,21 @@ impl Fleet {
         )
     }
 
+    /// The profile a task in `flock` on `machine` runs under when it names
+    /// none: the machine's, else the flock's, else `[defaults]`.
+    pub fn own_profile(&self, flock: &str, machine: Option<&str>) -> Option<String> {
+        self.resolve_agent(&AgentChoice::default(), flock, machine)
+            .profile
+            .map(|(name, _)| name)
+    }
+
     /// `resolve_agent` written into `spec`, with the ask and where the agent
-    /// and its args came from (`DispatchSpec::agent_source`). `asked_by`
-    /// names the ask: `task run` or `job <name>`.
+    /// and its args came from (`DispatchSpec::agent_source`), its model's
+    /// args put in front (`Models::apply`) and its profile's lists added
+    /// (`Profiles::apply`). `asked_by` names the ask: `task run` or `job
+    /// <name>`. Refused when the model is not in `[models]` or not of the
+    /// agent's kind, or the profile is unknown or `unrestricted` where the
+    /// machine's own is not; `spec` is then only partly settled.
     fn settle(
         &self,
         spec: &mut crate::task::DispatchSpec,
@@ -358,37 +434,98 @@ impl Fleet {
         flock: &str,
         machine: Option<&str>,
         asked_by: &str,
-    ) {
-        let pick = self.resolve_agent(ask, flock, machine);
-        pick.apply_to(spec);
-        let label = |layer| match layer {
-            Layer::Ask => asked_by.to_string(),
-            Layer::Machine => format!("machine {}", machine.unwrap_or("-")),
-            Layer::Flock => format!("flock {flock}"),
-            Layer::Defaults => "defaults".to_string(),
+    ) -> Result<(), AgentRefusal> {
+        let models = self.models.read().unwrap();
+        let agents = self.agents.read().unwrap();
+        let pick = {
+            let wanted = self.wanted.read().unwrap();
+            self.defaults.read().unwrap().resolve_agent_for(
+                ask,
+                machine.and_then(|m| wanted.get(m)),
+                wanted.entry(flock),
+                &models,
+                &agents,
+            )
         };
+        pick.apply_to(spec);
+        let label = |layer| layer_label(layer, asked_by, flock, machine);
+        let mut agent_from = label(pick.agent_from);
+        if pick.by_kind {
+            agent_from.push_str(&format!(" agents.{}", agents.kind(&pick.agent)));
+        }
         spec.agent_source = Some(Box::new(AgentSource {
             ask: ask.clone(),
-            agent: label(pick.agent_from),
+            agent: agent_from,
             agent_args: pick.args_from.map(label),
+            model: pick.model.as_ref().map(|(name, _)| name.clone()),
+            model_from: pick.model.as_ref().map(|&(_, layer)| label(layer)),
+            profile: pick.profile.as_ref().map(|(name, _)| name.clone()),
+            profile_from: pick.profile.as_ref().map(|&(_, layer)| label(layer)),
         }));
+        models.apply(&pick, &agents, spec)?;
+        // What the machine's owner lets run there (the unrestricted rule).
+        let own = self.own_profile(flock, machine);
+        self.profiles
+            .read()
+            .unwrap()
+            .apply(&pick, own.as_deref(), spec)
+    }
+
+    /// The level of a task being queued in `flock`, pinned to `pinned` if it
+    /// is, and the label of the layer that set it
+    /// (`Defaults::resolve_priority`), from the flock and defaults as they
+    /// stand now. `asked_by` names the ask, as for `settle`.
+    fn settle_priority(
+        &self,
+        ask: Option<Priority>,
+        flock: &str,
+        pinned: Option<&str>,
+        asked_by: &str,
+    ) -> (Priority, Option<String>) {
+        let wanted = self.wanted.read().unwrap();
+        let (priority, layer) = self.defaults.read().unwrap().resolve_priority(
+            ask,
+            pinned.and_then(|m| wanted.get(m)),
+            wanted.entry(flock),
+        );
+        (
+            priority,
+            layer.map(|l| layer_label(l, asked_by, flock, pinned)),
+        )
     }
 
     /// `settle` for a task being queued: on the machine it is pinned to,
     /// else with no machine yet, as dispatch settles it again on the one it
-    /// picks. Refused when the agent cannot be started as resolved (a tool
-    /// list it has no flag for) on any machine it may land on. Checked here
-    /// so the task is refused, not queued to fail at dispatch.
+    /// picks. Refused when the agent cannot be started as resolved on any
+    /// machine it may land on: a model `[models]` does not have, a tool list
+    /// the agent has no flag for, or, on the machine it is pinned to or with
+    /// an agent it asked for itself, a model of another kind. Checked here so
+    /// the task is refused, not queued to fail at dispatch. An unpinned task
+    /// whose model does not suit some machine's agent only skips that machine
+    /// (`dispatch_queued`), and waits when none suits.
     fn settle_agent(
         &self,
         spec: &mut crate::task::DispatchSpec,
         ask: &AgentChoice,
         flock: &str,
         asked_by: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), AgentRefusal> {
         let pinned = spec.machine.clone();
-        self.settle(spec, ask, flock, pinned.as_deref(), asked_by);
-        let mut landings = vec![spec.clone()];
+        // Unpinned, with the agent left to the machine, its kind is known
+        // only on the machine: a mismatch here is not the task's to fix. So
+        // is the machine's own profile, which decides where `unrestricted`
+        // may run.
+        let per_machine = |e: &AgentRefusal| {
+            pinned.is_none()
+                && ((e.code == MODEL_KIND_MISMATCH && ask.agent.is_none())
+                    || e.code == PROFILE_NOT_ALLOWED)
+        };
+        let mut landings = Vec::new();
+        match self.settle(spec, ask, flock, pinned.as_deref(), asked_by) {
+            Ok(()) => landings.push(spec.clone()),
+            Err(e) if per_machine(&e) => {}
+            Err(e) => return Err(e),
+        }
         if pinned.is_none() {
             let wanted = self.flock();
             for m in wanted
@@ -397,8 +534,11 @@ impl Fleet {
                 .filter(|m| wanted.flock_of(m) == flock)
             {
                 let mut s = spec.clone();
-                self.settle(&mut s, ask, flock, Some(&m.name), asked_by);
-                landings.push(s);
+                match self.settle(&mut s, ask, flock, Some(&m.name), asked_by) {
+                    Ok(()) => landings.push(s),
+                    Err(e) if per_machine(&e) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         let agents = self.agents.read().unwrap();
@@ -441,6 +581,10 @@ impl Fleet {
     /// no dispatch can find. `run_job` checks this before the connector and
     /// `queue_job_task` again under the dispatch lock.
     pub fn job_task_flock(&self, job: &crate::config::job::Job) -> anyhow::Result<String> {
+        // The flocks are the head's; it checks them when the task arrives.
+        if self.forward.is_some() {
+            return Ok(job.flock.clone().unwrap_or_default());
+        }
         if let Some(m) = &job.spec.machine
             && !self.in_flock(m)
         {
@@ -459,7 +603,7 @@ impl Fleet {
         *self.wanted.write().unwrap() = flock;
     }
 
-    /// Hold the dispatch lock, as a dispatch pass does.
+    /// Hold the dispatch lock, as a dispatch pass does, for a test.
     #[cfg(test)]
     pub async fn hold_dispatch_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.dispatch_lock.lock().await
@@ -529,7 +673,7 @@ impl Fleet {
         }
         let mut plan: Vec<Step> = Vec::new();
         for m in &flock.machines {
-            let want = (actor_config(m), settings.clone());
+            let want = (actor_config(m), actor_settings(m, settings));
             plan.push(match old.iter().position(|o| o.handle.name == m.name) {
                 Some(i) if !old[i].shutting_down && old[i].spawned_from.as_ref() == Some(&want) => {
                     Step::Keep(old.remove(i))
@@ -606,6 +750,7 @@ impl Fleet {
     }
 
     fn spawn(&self, spawner: &Spawner, m: &MachineConfig, settings: &MachineSettings) -> Member {
+        let settings = &actor_settings(m, settings);
         let handle = spawn_machine(
             m.name.clone(),
             m.max_agents,
@@ -614,7 +759,8 @@ impl Fleet {
             self.store.clone(),
             settings.clone(),
             spawner.events.clone(),
-        );
+        )
+        .with_slots(m.job_slots, m.burst);
         Member {
             handle,
             spawned_from: Some((actor_config(m), settings.clone())),
@@ -633,8 +779,11 @@ impl Fleet {
                 MachineView {
                     name: m.handle.name.clone(),
                     max_agents: m.handle.max_agents,
+                    job_slots: m.handle.job_slots,
+                    burst: m.handle.burst,
                     tags: m.handle.tags.clone(),
                     live: s.live,
+                    live_jobs: s.live_jobs,
                     // An aborted actor answers nothing, and a dispatch to
                     // it would wait for as long as it stays wedged.
                     healthy: !m.shutting_down && s.channel.accepts_dispatch(),
@@ -654,13 +803,32 @@ impl Fleet {
     /// machines are the flock, all in the default one.
     /// `ask` is what the run's flags said about the agent; the flock and
     /// `[defaults]` fill in the rest. `None`, from a client that predates
-    /// it, keeps the agent `spec` already carries.
+    /// it, keeps the agent `spec` already carries. `priority` is
+    /// `--priority`; without it the pinned machine, the flock or
+    /// `[defaults]` set the level.
     pub async fn queue_run(
+        &self,
+        prompt: String,
+        spec: crate::task::DispatchSpec,
+        flock: Option<&str>,
+        ask: Option<&AgentChoice>,
+        priority: Option<Priority>,
+    ) -> Result<Task, QueueError> {
+        self.queue_run_as(prompt, spec, flock, ask, priority, TaskRole::Agent, None)
+            .await
+    }
+
+    /// `queue_run`, for a task of `role` (`task run --role`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn queue_run_as(
         &self,
         prompt: String,
         mut spec: crate::task::DispatchSpec,
         flock: Option<&str>,
         ask: Option<&AgentChoice>,
+        priority: Option<Priority>,
+        role: TaskRole,
+        description: Option<String>,
     ) -> Result<Task, QueueError> {
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
@@ -676,14 +844,22 @@ impl Fleet {
             self.settle_agent(&mut spec, ask, &flock, "task run")
                 .map_err(QueueError::Agent)?;
         }
+        let (priority, from) =
+            self.settle_priority(priority, &flock, spec.machine.as_deref(), "task run");
         self.store
-            .insert_task(NewTask {
-                job: "run".into(),
-                item: serde_json::Value::Null,
-                prompt,
-                spec,
-                flock,
-            })
+            .insert_task_at(
+                NewTask {
+                    description,
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt,
+                    spec,
+                    flock,
+                },
+                priority,
+                from.as_deref(),
+                role,
+            )
             .map_err(QueueError::Store)
     }
 
@@ -701,24 +877,139 @@ impl Fleet {
         item: &serde_json::Value,
         render: impl FnOnce(i64) -> Result<(String, crate::task::DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
+        if self.forward.is_some() {
+            anyhow::bail!("a headless serve queues nothing here; its runs submit to the head");
+        }
         let _pass = self.dispatch_lock.lock().await;
         let flock = self.job_task_flock(job)?;
         let mut settled = job.spec.clone();
-        self.settle_agent(
-            &mut settled,
-            &job.agent,
+        let ask = AgentChoice {
+            model: job.model_for(item).map_err(anyhow::Error::msg)?,
+            ..job.agent.clone()
+        };
+        let asked_by = format!("job {}", job.name);
+        self.settle_agent(&mut settled, &ask, &flock, &asked_by)
+            .map_err(|e| anyhow::Error::msg(e.message))?;
+        let (priority, from) = self.settle_priority(
+            job.priority_for(item).map_err(anyhow::Error::msg)?,
             &flock,
-            &format!("job {}", job.name),
+            job.spec.machine.as_deref(),
+            &asked_by,
+        );
+        let level = (priority, from.as_deref());
+        let description = job.task_description_for(item);
+        self.store.insert_job_task_at(
+            &job.name,
+            &flock,
+            item,
+            level,
+            description.as_deref(),
+            |id| {
+                let (prompt, mut spec) = render(id)?;
+                spec.agent = settled.agent;
+                spec.agent_args = settled.agent_args;
+                spec.allow = settled.allow;
+                spec.deny = settled.deny;
+                spec.agent_source = settled.agent_source;
+                Ok((prompt, spec))
+            },
         )
-        .map_err(anyhow::Error::msg)?;
-        self.store.insert_job_task(&job.name, &flock, item, |id| {
-            let (prompt, mut spec) = render(id)?;
-            spec.agent = settled.agent;
-            spec.agent_args = settled.agent_args;
-            spec.allow = settled.allow;
-            spec.deny = settled.deny;
-            spec.agent_source = settled.agent_source;
-            Ok((prompt, spec))
+    }
+
+    /// Whether job runs send their items to a head (`Fleet::headless`)
+    /// instead of queueing them here.
+    pub fn submits_to_head(&self) -> bool {
+        self.forward.is_some()
+    }
+
+    /// A headless serve's job run hands the head what it found, in one
+    /// `JobSubmit`: the head keeps the `seen` keys, renders and queues each
+    /// item as that job's task, and dispatches them. The keys it queued or
+    /// had seen are marked seen here too, since this store is the one the
+    /// job's next run checks. An unreachable head, or an error reply such as
+    /// `job_name_taken`, is an `Err` with its code, and nothing is kept.
+    pub async fn submit_to_head(
+        &self,
+        job: &crate::config::job::Job,
+        items: Vec<serde_json::Value>,
+    ) -> anyhow::Result<crate::scheduler::Submitted> {
+        let Some(forward) = &self.forward else {
+            anyhow::bail!("this pastor serve is the head; it queues its jobs' items itself");
+        };
+        // A named model rides in `dispatch`, which only a head of
+        // `MODEL_PROTOCOL` or later reads; an older one would drop it and
+        // start the agent on its default model without a word.
+        if job.agent.model.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(&version, protocol, MODEL_PROTOCOL, "a job naming a model")?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
+        // A permission profile rides in `dispatch` the same way; a head
+        // before `PROFILE_PROTOCOL` would drop it (serde skips the unknown
+        // field) and start the agent unenforced instead of refusing.
+        if job.agent.profile.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::PROFILE_PROTOCOL,
+                    "a job naming a permission profile",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
+        // A description template rides in `dispatch` the same way; the
+        // head's `DispatchTable` refuses an unknown field, so an older head
+        // would answer an opaque `invalid_dispatch` instead of this clear
+        // refusal.
+        if job.task_description.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::DESCRIPTION_PROTOCOL,
+                    "a job naming a description",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
+        let reply = forward(IpcRequest::JobSubmit {
+            job: job.name.clone(),
+            dispatch: job.dispatch.clone(),
+            prompt: job.prompt.clone(),
+            items,
+        })
+        .await?;
+        let (tasks, skipped, refused) = match reply {
+            IpcResponse::JobSubmitted {
+                tasks,
+                skipped,
+                refused,
+            } => (tasks, skipped, refused),
+            IpcResponse::Error { code, message } => {
+                return Err(crate::cli::CliError::err(&code, message));
+            }
+            other => anyhow::bail!("the head answered a job submit with {other:?}"),
+        };
+        for t in &tasks {
+            if let Some(key) = t.item.get("key").and_then(serde_json::Value::as_str) {
+                self.store.mark_seen(&job.name, key, Some(t.id))?;
+            }
+        }
+        for key in &skipped {
+            self.store.mark_seen(&job.name, key, None)?;
+        }
+        Ok(crate::scheduler::Submitted {
+            tasks,
+            skipped,
+            refused,
         })
     }
 
@@ -751,6 +1042,38 @@ impl Fleet {
         Ok(())
     }
 
+    /// One `edit` of `file` by the head, and the wanted flock it leaves, as
+    /// one step under the dispatch lock: a `task run` sees the flock from
+    /// before the edit or from after it, never the file edited and the
+    /// wanted flock still old. The reload that follows (the scheduler's, which
+    /// takes this lock itself, so it cannot run inside this step) then only
+    /// starts and stops actors. A file that does not load after the edit,
+    /// or names a model `[models]` lacks, leaves the wanted flock as it was;
+    /// that reload logs it and falls back to this flock, so it must still
+    /// be the last valid one.
+    pub async fn edit_flock_file<T>(
+        &self,
+        file: &std::path::Path,
+        edit: impl FnOnce(&std::path::Path) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let _pass = self.dispatch_lock.lock().await;
+        let done = edit(file)?;
+        // A fixed fleet has no applied flock, which a reload leaves alone too.
+        if self.spawner.is_some()
+            && let Ok(flock) = Flock::load_existing(file)
+            && flock
+                .check_config(
+                    &self.models.read().unwrap(),
+                    &self.agents.read().unwrap(),
+                    &self.profiles.read().unwrap(),
+                )
+                .is_ok()
+        {
+            *self.wanted.write().unwrap() = flock;
+        }
+        Ok(done)
+    }
+
     /// `queue_task` for a retry of task `id` (`Store::insert_retry`). The
     /// copy keeps the original's pin and flock, so both get the same checks
     /// under the same lock: a failed task outlives `flock remove`, which only
@@ -776,17 +1099,88 @@ impl Fleet {
             {
                 return Err(QueueError::Flock(TaskFlockError::UnknownFlock(f.clone())));
             }
-            // The copy keeps the agent and tool lists as resolved, so only
-            // an `[agents]` edit since can make them unstartable.
-            self.agents
-                .read()
-                .unwrap()
-                .launch_args(&t.spec)
-                .map_err(QueueError::Agent)?;
+            // Dispatch settles the copy's agent again from what it asked
+            // for, so it is checked as a new task would be: a model since
+            // dropped from `[models]` refuses it here. A copy of a task from
+            // before that keeps its agent and tool lists as resolved, and
+            // only an `[agents]` edit since can make them unstartable.
+            match &t.spec.agent_source {
+                Some(source) => {
+                    let flock = t
+                        .flock
+                        .clone()
+                        .unwrap_or_else(|| self.flock().default_flock().to_string());
+                    let mut spec = t.spec.clone();
+                    self.settle_agent(&mut spec, &source.ask, &flock, &asked_by(&t))
+                        .map_err(QueueError::Agent)?;
+                }
+                None => {
+                    self.agents
+                        .read()
+                        .unwrap()
+                        .launch_args(&t.spec)
+                        .map_err(QueueError::Agent)?;
+                }
+            }
         }
         self.store
             .insert_retry_placed(id, place)
             .map_err(QueueError::Store)
+    }
+
+    /// Set a queued task's priority (`Store::set_priority`), under the
+    /// dispatch lock like `queue_run`: otherwise a dispatch pass could read
+    /// the old priority, this update land on the still-queued row, and the
+    /// pass then claim it by the stale ordering, reporting the change
+    /// applied while it had no effect on that dispatch.
+    pub async fn set_priority(
+        &self,
+        id: i64,
+        priority: Priority,
+        from: &str,
+    ) -> Result<Task, PriorityError> {
+        let _pass = self.dispatch_lock.lock().await;
+        self.store.set_priority(id, priority, from)
+    }
+
+    /// Move a queued task (`Store::move_queued`), under the dispatch lock
+    /// for the reason `set_priority` is: a pass must not take the queue in
+    /// the old order after the move has answered.
+    pub async fn move_queued(&self, id: i64, to: QueueSpot) -> Result<Moved, MoveError> {
+        let _pass = self.dispatch_lock.lock().await;
+        self.store.move_queued(id, to)
+    }
+
+    /// The queue as `pastor queue` shows it: dispatch order, each task with
+    /// why it waits on the machines as they are now, then filtered.
+    pub fn queue(
+        &self,
+        flock: Option<&str>,
+        machine: Option<&str>,
+    ) -> anyhow::Result<Vec<QueueEntry>> {
+        let queued = self.store.queued_tasks()?;
+        let wanted = self.flock();
+        // Same model/agent compatibility check `dispatch_queued` applies: a
+        // machine whose agent cannot run the task's model does not take it.
+        let accepts = |task: &Task, machine: &str| {
+            let Some(source) = task.spec.agent_source.as_ref() else {
+                return true;
+            };
+            let target = task.flock.as_deref().unwrap_or(wanted.default_flock());
+            let mut spec = task.spec.clone();
+            self.settle(
+                &mut spec,
+                &source.ask,
+                target,
+                Some(machine),
+                &asked_by(task),
+            )
+            .is_ok()
+        };
+        let mut entries =
+            crate::queue::entries(queued, &self.views(), wanted.default_flock(), &accepts);
+        entries.retain(|e| e.matches(flock, machine));
+        Ok(entries)
     }
 
     /// Try to place every queued task, oldest first. Serialised: a pass sees the
@@ -807,23 +1201,88 @@ impl Fleet {
         let flock = self.flock();
         for task in queued {
             let target = task.flock.as_deref().unwrap_or(flock.default_flock());
-            let Some(name) = pick_machine(&self.views(), target, &task.spec) else {
+            let views = self.views();
+            // The agent can depend on the machine: a machine whose agent
+            // cannot run the task's model does not take it. A task from
+            // before `agent_source` keeps the agent it was queued with.
+            // A profile it inherited (from a machine or flock, not its own
+            // ask) is pinned onto the ask here, so a re-settle that can no
+            // longer resolve it refuses instead of quietly dropping it.
+            let settled_on = |machine: &str| {
+                let source = task.spec.agent_source.as_ref()?;
+                let mut ask = source.ask.clone();
+                if ask.profile.is_none() {
+                    ask.profile = source.profile.clone();
+                }
+                let mut spec = task.spec.clone();
+                let r = self.settle(&mut spec, &ask, target, Some(machine), &asked_by(&task));
+                Some(r.map(|()| spec))
+            };
+            let claim = Claim::of(&task);
+            let picked = pick_machine_where(&views, target, &task.spec, claim, &|m| {
+                settled_on(m).is_none_or(|r| r.is_ok())
+            });
+            let Some(name) = picked else {
+                // Say why: no machine of the flock has an agent for its
+                // model, or one would take it but for its model.
+                let none_has = || {
+                    let kind = self
+                        .models
+                        .read()
+                        .unwrap()
+                        .get(task.model()?)
+                        .ok()?
+                        .kind
+                        .clone();
+                    let mut members = flock
+                        .machines
+                        .iter()
+                        .filter(|m| flock.flock_of(m) == target)
+                        .peekable();
+                    let none = task.spec.machine.is_none()
+                        && members.peek().is_some()
+                        && members.all(|m| {
+                            matches!(settled_on(&m.name), Some(Err(e)) if e.code == MODEL_KIND_MISMATCH)
+                        });
+                    none.then(|| {
+                        let a = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                            "an"
+                        } else {
+                            "a"
+                        };
+                        format!("no machine in flock {target} has {a} {kind} agent")
+                    })
+                };
+                let why = none_has().or_else(|| {
+                    let m = pick_machine(&views, target, &task.spec, claim)?;
+                    Some(settled_on(&m)?.err()?.to_string())
+                });
+                if let Some(why) = why {
+                    let note = format!("{WAITING_FOR_MODEL}: {why}");
+                    if task.error.as_deref() != Some(note.as_str()) {
+                        let mut t = task.clone();
+                        t.error = Some(note);
+                        if let Err(err) = self.store.update_task(&mut t) {
+                            tracing::warn!(task = %task.display_id(), %err, "note why it waits");
+                        }
+                    }
+                }
                 continue;
             };
             let Some(handle) = self.get(&name) else {
                 continue;
             };
-            // The agent can depend on the machine, now known. A task from
-            // before `agent_source` keeps the agent it was queued with.
-            if let Some(source) = &task.spec.agent_source {
+            if let Some(Ok(spec)) = settled_on(&name) {
                 let mut on = task.clone();
-                let asked_by = if task.job == "run" {
-                    "task run".to_string()
-                } else {
-                    format!("job {}", task.job)
-                };
-                self.settle(&mut on.spec, &source.ask, target, Some(&name), &asked_by);
-                if on.spec != task.spec
+                on.spec = spec;
+                if on
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
+                {
+                    on.error = None;
+                }
+                if (on.spec != task.spec || on.error != task.error)
                     && let Err(err) = self.store.update_task(&mut on)
                 {
                     tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
@@ -842,11 +1301,72 @@ impl Fleet {
     }
 }
 
+/// How `AgentSource` and `Task::priority_from` name a layer: `asked_by`
+/// for the ask, else the machine, the flock or `defaults`.
+fn layer_label(layer: Layer, asked_by: &str, flock: &str, machine: Option<&str>) -> String {
+    match layer {
+        Layer::Ask => asked_by.to_string(),
+        Layer::Machine => format!("machine {}", machine.unwrap_or("-")),
+        Layer::Flock => format!("flock {flock}"),
+        Layer::Defaults => "defaults".to_string(),
+    }
+}
+
+use crate::queue::{WAITING_FOR_MODEL, asked_by};
+
+/// An error from code the CLI shares with the head, as a reply: its
+/// `CliError` code when it has one, else `runtime_error`.
+fn cli_error(err: anyhow::Error) -> IpcResponse {
+    match err.downcast_ref::<crate::cli::CliError>() {
+        Some(e) => IpcResponse::error(&e.code, &e.message),
+        None => IpcResponse::error("runtime_error", format!("{err:#}")),
+    }
+}
+
+/// The answer to `Tick`, `Reload`, `JobList` or `JobRun` from `scheduler`,
+/// the same from the head and a headless serve; `None` for any other
+/// request.
+pub(crate) async fn jobs_answer(
+    scheduler: &SchedulerHandle,
+    req: IpcRequest,
+) -> Option<IpcResponse> {
+    Some(match req {
+        IpcRequest::Tick { job, dry_run } => match scheduler.tick(job, dry_run).await {
+            Ok(runs) => IpcResponse::Runs(runs),
+            Err(err) => IpcResponse::error("scheduler_error", err),
+        },
+        IpcRequest::Reload => match scheduler.reload().await {
+            Ok(jobs) => IpcResponse::Jobs(jobs),
+            Err(err) => IpcResponse::error("scheduler_error", err),
+        },
+        IpcRequest::JobList => match scheduler.job_list().await {
+            Ok(jobs) => IpcResponse::Jobs(jobs),
+            Err(err) => IpcResponse::error("scheduler_error", err),
+        },
+        IpcRequest::JobRun { name } => match scheduler.fire(&name).await {
+            Ok(Ok(msg)) => IpcResponse::Text(msg),
+            Ok(Err(reason)) => IpcResponse::error("job_not_found", reason),
+            Err(err) => IpcResponse::error("scheduler_error", err),
+        },
+        _ => return None,
+    })
+}
+
 /// Why an agent pastor started, in task `task`, was refused a change to
 /// the fleet. The CLI says the same for a change it makes on its own.
+/// What the head says when it refuses `task`, of `role`, a fleet change.
+pub fn refusal(task: &str, role: TaskRole) -> String {
+    match role {
+        TaskRole::Agent => agent_refusal(task),
+        TaskRole::Orchestrator => format!(
+            "{task} is an orchestrator, and an orchestrator may only run, retry and send to tasks and disable jobs besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
+        ),
+    }
+}
+
 pub fn agent_refusal(task: &str) -> String {
     format!(
-        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, serve or set up a head, open herdr's UI; `pastor task done` may end only its own task); set agents_change_fleet = true in pastor.toml to allow it"
+        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, reprioritize, move in the queue, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, serve or set up a head, open herdr's UI; `pastor task done` may end only its own task); set agents_change_fleet = true in pastor.toml to allow it"
     )
 }
 
@@ -944,6 +1464,81 @@ impl ExtraSignals {
     }
 }
 
+/// What answers a request line on the socket: the head (`Daemon`) or a
+/// headless serve (`shepherd::Shepherd`).
+pub(crate) trait Answer: Send + Sync + 'static {
+    fn answer(
+        &self,
+        req: IpcRequest,
+        from_task: Option<String>,
+    ) -> impl std::future::Future<Output = IpcResponse> + Send;
+}
+
+impl Answer for Daemon {
+    async fn answer(&self, req: IpcRequest, from_task: Option<String>) -> IpcResponse {
+        self.handle_from(req, from_task.as_deref()).await
+    }
+}
+
+/// The accept loop on a socket `daemon` already owns, until a signal. See
+/// `Daemon::run_with_listener`.
+pub(crate) async fn answer_on<A: Answer>(
+    daemon: Arc<A>,
+    listener: tokio::net::UnixListener,
+    socket: PathBuf,
+) -> anyhow::Result<()> {
+    let mut extra_signals = ExtraSignals::new()?;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    // Out of file descriptors, or a client that hung up
+                    // mid-accept: the listener is fine, and exiting would
+                    // hand every other client a restart loop. Back off so
+                    // EMFILE does not spin, then keep serving.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept on the socket failed");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                };
+                let d = daemon.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let resp = match read_request(r, MAX_IPC_REQUEST, IPC_READ_TIMEOUT).await {
+                        Ok(line) => match crate::ipc::parse_request_line(line.trim()) {
+                            Ok((req, from_task)) => d.answer(req, from_task).await,
+                            Err(err) => IpcResponse::error("invalid_request", err),
+                        },
+                        Err(RequestReadError::TooLarge) => IpcResponse::error(
+                            "request_too_large",
+                            format!("a request is at most {MAX_IPC_REQUEST} bytes"),
+                        ),
+                        Err(RequestReadError::NotUtf8) => {
+                            IpcResponse::error("invalid_request", "a request must be UTF-8")
+                        }
+                        Err(_) => return,
+                    };
+                    let mut out = serde_json::to_string(&resp).unwrap_or_else(|e| format!("{{\"kind\":\"error\",\"code\":\"internal\",\"message\":\"{e}\"}}"));
+                    out.push('\n');
+                    let _ = w.write_all(out.as_bytes()).await;
+                });
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutting down on SIGINT; agents keep running");
+                let _ = std::fs::remove_file(&socket);
+                return Ok(());
+            }
+            msg = extra_signals.recv() => {
+                tracing::info!("{msg}");
+                let _ = std::fs::remove_file(&socket);
+                return Ok(());
+            }
+        }
+    }
+}
+
 impl Daemon {
     /// `on_disk` is `ConfigFingerprint::sample` taken before `config` and
     /// `flock` were read (or built): the scheduler keeps them until either
@@ -982,7 +1577,7 @@ impl Daemon {
             log_rx,
             Some(to_hooks),
         );
-        crate::hooks::spawn(paths.clone(), hooks_rx);
+        crate::hooks::spawn(paths.clone(), store.clone(), events.downgrade(), hooks_rx);
         let scheduler = Scheduler::new(
             paths.clone(),
             &config,
@@ -1025,7 +1620,9 @@ impl Daemon {
     /// the shared database — not after, which is what let a second daemon
     /// reconcile and mutate the store for up to the probe timeout before it
     /// finally bailed.
-    async fn bind_socket(socket: &std::path::Path) -> anyhow::Result<tokio::net::UnixListener> {
+    pub(crate) async fn bind_socket(
+        socket: &std::path::Path,
+    ) -> anyhow::Result<tokio::net::UnixListener> {
         if socket.exists() {
             // Staleness is a property of the connect, not of the reply: a live
             // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
@@ -1033,17 +1630,31 @@ impl Daemon {
             // looks exactly like a wedged one from the outside. Only a refused (or
             // absent) connect means nothing is actually listening; anything else
             // must be left alone rather than unlinked and stolen.
-            match crate::ipc::probe_daemon(socket).await {
-                DaemonProbe::Running => anyhow::bail!(
-                    "another pastor daemon is already running on {}",
-                    socket.display()
-                ),
-                DaemonProbe::Unresponsive => anyhow::bail!(
+            match crate::ipc::ping_head(socket).await {
+                HeadPing::Pong { role: Some(r), .. } if r == crate::ipc::SHEPHERD_ROLE => {
+                    return Err(crate::cli::CliError::err(
+                        "shepherd_running",
+                        format!(
+                            "a headless pastor serve is already running on {}; stop it first",
+                            socket.display()
+                        ),
+                    ));
+                }
+                HeadPing::Pong { .. } => {
+                    return Err(crate::cli::CliError::err(
+                        "head_running",
+                        format!(
+                            "another pastor daemon is already running on {}, as this machine's head; stop it first",
+                            socket.display()
+                        ),
+                    ));
+                }
+                HeadPing::Unresponsive => anyhow::bail!(
                     "a daemon is listening on {} but did not respond within 2s; \
                      remove the socket file by hand only if that daemon is dead",
                     socket.display()
                 ),
-                DaemonProbe::NotRunning => std::fs::remove_file(socket)?,
+                HeadPing::NotRunning => std::fs::remove_file(socket)?,
             }
         }
         let listener = tokio::net::UnixListener::bind(socket)?;
@@ -1087,71 +1698,95 @@ impl Daemon {
     /// stayed down. All three now take the same shutdown path.
     pub async fn run_with_listener(self, listener: tokio::net::UnixListener) -> anyhow::Result<()> {
         let socket = self.socket_path();
-        let daemon = Arc::new(self);
-        let mut extra_signals = ExtraSignals::new()?;
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    let stream = match accepted {
-                        Ok((stream, _)) => stream,
-                        // Out of file descriptors, or a client that hung up
-                        // mid-accept: the listener is fine, and exiting would
-                        // hand every other client a restart loop. Back off so
-                        // EMFILE does not spin, then keep serving.
-                        Err(e) => {
-                            tracing::warn!(error = %e, "accept on the socket failed");
-                            tokio::time::sleep(ACCEPT_BACKOFF).await;
-                            continue;
-                        }
-                    };
-                    let d = daemon.clone();
-                    tokio::spawn(async move {
-                        let (r, mut w) = stream.into_split();
-                        let resp = match read_request(r, MAX_IPC_REQUEST, IPC_READ_TIMEOUT).await {
-                            Ok(line) => match crate::ipc::parse_request_line(line.trim()) {
-                                Ok((req, from_task)) => d.handle_from(req, from_task.as_deref()).await,
-                                Err(err) => IpcResponse::error("invalid_request", err),
-                            },
-                            Err(RequestReadError::TooLarge) => IpcResponse::error(
-                                "request_too_large",
-                                format!("a request is at most {MAX_IPC_REQUEST} bytes"),
-                            ),
-                            Err(RequestReadError::NotUtf8) => {
-                                IpcResponse::error("invalid_request", "a request must be UTF-8")
-                            }
-                            Err(_) => return,
-                        };
-                        let mut out = serde_json::to_string(&resp).unwrap_or_else(|e| format!("{{\"kind\":\"error\",\"code\":\"internal\",\"message\":\"{e}\"}}"));
-                        out.push('\n');
-                        let _ = w.write_all(out.as_bytes()).await;
-                    });
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("shutting down on SIGINT; agents keep running");
-                    let _ = std::fs::remove_file(&socket);
-                    return Ok(());
-                }
-                msg = extra_signals.recv() => {
-                    tracing::info!("{msg}");
-                    let _ = std::fs::remove_file(&socket);
-                    return Ok(());
-                }
-            }
-        }
+        answer_on(Arc::new(self), listener, socket).await
     }
 
     /// `handle`, for a caller that says it runs in a task's pane
     /// (`ipc::TASK_ENV`): unless `agents_change_fleet` is on, such a caller
-    /// may read but not change the fleet, save to end its own task.
+    /// may read but not change the fleet, save to end its own task, and an
+    /// orchestrator (`TaskRole::Orchestrator`) may make the changes
+    /// `IpcRequest::orchestrator_may` lists. No caller in a task may make an
+    /// orchestrator, `agents_change_fleet` or not: only a person does.
     pub async fn handle_from(&self, req: IpcRequest, from_task: Option<&str>) -> IpcResponse {
-        if let Some(task) = from_task
-            && req.changes_fleet()
-            && !req.ends_own_task(task)
-            && !self.fleet.agents_change_fleet()
-        {
-            return IpcResponse::error("agent_refused", agent_refusal(task));
+        let Some(task) = from_task else {
+            return self.handle(req).await;
+        };
+        if let Some(why) = self.makes_orchestrator(&req) {
+            return IpcResponse::error("role_refused", format!("{task} is a task, and {why}"));
+        }
+        if req.changes_fleet() && !req.ends_own_task(task) && !self.fleet.agents_change_fleet() {
+            let role = self.caller_role(task);
+            if !(role == TaskRole::Orchestrator && req.orchestrator_may()) {
+                return IpcResponse::error("agent_refused", refusal(task, role));
+            }
         }
         self.handle(req).await
+    }
+
+    /// Why `req` would make an orchestrator, which only a person may do:
+    /// `task run --role orchestrator`, or a retry of an orchestrator task,
+    /// whose copy keeps the role.
+    fn makes_orchestrator(&self, req: &IpcRequest) -> Option<String> {
+        match req {
+            IpcRequest::Run {
+                role: TaskRole::Orchestrator,
+                ..
+            } => Some("only a person may run a task with --role orchestrator".into()),
+            IpcRequest::TaskRetry { id, .. }
+                if self
+                    .store
+                    .get_task(*id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|t| t.role == TaskRole::Orchestrator) =>
+            {
+                Some(format!(
+                    "t-{id} is an orchestrator, whose retry would be one too; only a person may retry it"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The role of `task`, the task a caller says it runs in. One the store
+    /// does not know, or cannot read, is a plain agent: the refusal is the
+    /// safe side.
+    fn caller_role(&self, task: &str) -> TaskRole {
+        crate::task::parse_task_id(task)
+            .and_then(|id| self.store.get_task(id).ok().flatten())
+            .map_or(TaskRole::Agent, |t| t.role)
+    }
+
+    /// One `fleet_edit` edit of flock.toml for a CLI, then the reload that
+    /// applies it: what the CLI would do with no head, done here so the
+    /// head's file is the one changed. The edit and the wanted flock it
+    /// leaves change together under the dispatch lock (`Fleet::edit_flock_file`),
+    /// so a `task run` sees the flock from before or after it, never a mix.
+    /// Answers `Text`: what the edit did, `sep`, and how the reload went.
+    async fn edit_flock_file(
+        &self,
+        sep: &str,
+        edit: impl FnOnce(&std::path::Path) -> anyhow::Result<String>,
+    ) -> IpcResponse {
+        let done = self
+            .fleet
+            .edit_flock_file(&self.paths.flock_file(), edit)
+            .await;
+        let done = match done {
+            Ok(done) => done,
+            Err(err) => {
+                return match err.downcast_ref::<EditError>() {
+                    Some(e) => IpcResponse::error(e.code(), e),
+                    None => IpcResponse::error("runtime_error", format!("{err:#}")),
+                };
+            }
+        };
+        match self.scheduler.reload().await {
+            Ok(_) => IpcResponse::Text(format!("{done}{sep}the running pastor serve picked it up")),
+            Err(err) => IpcResponse::Text(format!(
+                "{done}{sep}the reload after it failed ({err}); run `pastor job reload`"
+            )),
+        }
     }
 
     pub async fn handle(&self, req: IpcRequest) -> IpcResponse {
@@ -1159,12 +1794,16 @@ impl Daemon {
             IpcRequest::Ping => IpcResponse::Pong {
                 version: env!("CARGO_PKG_VERSION").into(),
                 protocol: crate::ipc::IPC_PROTOCOL,
+                role: None,
             },
             IpcRequest::Run {
                 prompt,
                 spec,
                 flock,
                 agent,
+                priority,
+                role,
+                description,
             } => {
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
@@ -1187,7 +1826,15 @@ impl Daemon {
                 }
                 let task = match self
                     .fleet
-                    .queue_run(prompt, spec, flock.as_deref(), agent.as_ref())
+                    .queue_run_as(
+                        prompt,
+                        spec,
+                        flock.as_deref(),
+                        agent.as_ref(),
+                        priority,
+                        role,
+                        crate::config::clean_description(description.as_deref()),
+                    )
                     .await
                 {
                     Ok(t) => t,
@@ -1204,7 +1851,7 @@ impl Daemon {
                         );
                     }
                     Err(QueueError::Agent(err)) => {
-                        return IpcResponse::error("agent_tools_unsupported", err);
+                        return IpcResponse::error(err.code, err.message);
                     }
                     Err(QueueError::Store(err)) => {
                         return IpcResponse::error("store_error", err);
@@ -1227,6 +1874,32 @@ impl Daemon {
             IpcRequest::List { filter } => match self.store.list_tasks(&filter) {
                 Ok(ts) => IpcResponse::Tasks(ts),
                 Err(err) => IpcResponse::error("store_error", err),
+            },
+            IpcRequest::TaskPriority { id, priority } => {
+                match self.fleet.set_priority(id, priority, "task priority").await {
+                    Ok(t) => IpcResponse::Task(t),
+                    Err(err @ PriorityError::NotFound(_)) => {
+                        IpcResponse::error("task_not_found", err)
+                    }
+                    Err(err @ PriorityError::NotQueued { .. }) => {
+                        IpcResponse::error("not_queued", err)
+                    }
+                    Err(PriorityError::Store(err)) => {
+                        IpcResponse::error("store_error", format!("{err:#}"))
+                    }
+                }
+            }
+            IpcRequest::Queue { flock, machine } => {
+                match self.fleet.queue(flock.as_deref(), machine.as_deref()) {
+                    Ok(entries) => IpcResponse::Queue(entries),
+                    Err(err) => IpcResponse::error("store_error", format!("{err:#}")),
+                }
+            }
+            IpcRequest::QueueMove { id, to } => match self.fleet.move_queued(id, to).await {
+                Ok(moved) => IpcResponse::Moved(moved),
+                Err(err @ MoveError::NotFound(_)) => IpcResponse::error("task_not_found", err),
+                Err(err @ MoveError::NotQueued { .. }) => IpcResponse::error("not_queued", err),
+                Err(MoveError::Store(err)) => IpcResponse::error("store_error", format!("{err:#}")),
             },
             IpcRequest::TaskShow { id } => match self.store.get_task(id) {
                 Ok(Some(t)) => IpcResponse::Task(t),
@@ -1284,23 +1957,62 @@ impl Daemon {
                     )),
                 }
             }
-            IpcRequest::Tick { job, dry_run } => match self.scheduler.tick(job, dry_run).await {
-                Ok(runs) => IpcResponse::Runs(runs),
-                Err(err) => IpcResponse::error("scheduler_error", err),
-            },
-            IpcRequest::Reload => match self.scheduler.reload().await {
-                Ok(jobs) => IpcResponse::Jobs(jobs),
-                Err(err) => IpcResponse::error("scheduler_error", err),
-            },
-            IpcRequest::JobList => match self.scheduler.job_list().await {
-                Ok(jobs) => IpcResponse::Jobs(jobs),
-                Err(err) => IpcResponse::error("scheduler_error", err),
-            },
-            IpcRequest::JobRun { name } => match self.scheduler.fire(&name).await {
-                Ok(Ok(msg)) => IpcResponse::Text(msg),
-                Ok(Err(reason)) => IpcResponse::error("job_not_found", reason),
-                Err(err) => IpcResponse::error("scheduler_error", err),
-            },
+            IpcRequest::FlockAdd {
+                name,
+                default,
+                description,
+            } => {
+                let store = &self.store;
+                self.edit_flock_file("; ", |file| {
+                    crate::fleet_edit::add_flock(
+                        file,
+                        &name,
+                        default,
+                        description.as_deref(),
+                        || {
+                            Ok(store
+                                .queued_tasks()?
+                                .iter()
+                                .filter(|t| t.flock.as_deref() == Some(DEFAULT_FLOCK))
+                                .map(|t| t.display_id())
+                                .collect())
+                        },
+                    )
+                })
+                .await
+            }
+            IpcRequest::FlockSetDefault { name } => {
+                self.edit_flock_file("; ", |file| crate::fleet_edit::set_default(file, &name))
+                    .await
+            }
+            // The CLI prints its herdr lines after this one, so the reload
+            // gets a line of its own, as without a head.
+            IpcRequest::MachineAdd { machine } => {
+                self.edit_flock_file("\n", |file| crate::fleet_edit::add_machine(file, &machine))
+                    .await
+            }
+            IpcRequest::MachineRemove { name } => {
+                self.edit_flock_file("; ", |file| crate::fleet_edit::remove_machine(file, &name))
+                    .await
+            }
+            IpcRequest::MachineMove { name, flock } => {
+                self.edit_flock_file("; ", |file| {
+                    crate::fleet_edit::move_machine(file, &name, &flock)
+                })
+                .await
+            }
+            req @ (IpcRequest::Tick { .. }
+            | IpcRequest::Reload
+            | IpcRequest::JobList
+            | IpcRequest::JobRun { .. }) => jobs_answer(&self.scheduler, req)
+                .await
+                .expect("a job request"),
+            IpcRequest::JobSubmit {
+                job,
+                dispatch,
+                prompt,
+                items,
+            } => self.submit(job, dispatch, prompt, items).await,
             IpcRequest::TaskRetry { id, place } => self.retry(id, place).await,
             IpcRequest::TaskClose {
                 id,
@@ -1339,7 +2051,216 @@ impl Daemon {
                     Err(err) => IpcResponse::error("events_read_failed", err),
                 }
             }
+            IpcRequest::FileGet { file } => self.file_get(&file).unwrap_or_else(cli_error),
+            IpcRequest::FilePut {
+                file,
+                text,
+                base_hash,
+            } => match self.file_put(&file, &text, &base_hash) {
+                Ok(path) => IpcResponse::Text(format!(
+                    "saved {}; {}",
+                    path.display(),
+                    self.reload_after_edit().await
+                )),
+                Err(err) => cli_error(err),
+            },
+            IpcRequest::JobDescribe { name } => {
+                let statuses = match self.scheduler.job_list().await {
+                    Ok(jobs) => jobs,
+                    Err(err) => return IpcResponse::error("scheduler_error", err),
+                };
+                match crate::describe::job(&self.paths, &name, statuses, &self.store) {
+                    Ok(d) => IpcResponse::Job(d),
+                    Err(err) => cli_error(err),
+                }
+            }
+            IpcRequest::JobTask {
+                job,
+                flock,
+                agent,
+                prompt,
+                spec,
+                item,
+                description,
+            } => {
+                let job = crate::config::job::Job {
+                    task_description: description,
+                    description: None,
+                    name: job,
+                    // A headless serve schedules the job; the head only
+                    // queues what it found, so these are never read.
+                    schedule: crate::schedule::Schedule::Every(Duration::from_secs(3600)),
+                    enabled: true,
+                    connector: String::new(),
+                    connector_config: serde_json::Value::Null,
+                    prompt,
+                    max_tasks_per_run: 1,
+                    backfill: Duration::ZERO,
+                    spec,
+                    agent,
+                    flock,
+                    // A headless serve resolves priority itself before
+                    // sending the item; the head does not re-render it.
+                    priority: None,
+                    dispatch: serde_json::Value::Null,
+                };
+                self.job_task(job, item).await
+            }
+            IpcRequest::JobSetEnabled { name, enabled } => {
+                let set = crate::edit::ConfigFile::Job(name.clone())
+                    .path(&self.paths)
+                    .and_then(|path| crate::config::job::set_enabled(&path, enabled));
+                if let Err(err) = set {
+                    return cli_error(err);
+                }
+                let verb = if enabled { "enabled" } else { "disabled" };
+                match self.scheduler.reload().await {
+                    Ok(_) => IpcResponse::Text(format!("{verb} {name}")),
+                    Err(err) => IpcResponse::Text(format!(
+                        "{verb} {name}; the reload after it failed ({err}); run `pastor job reload`"
+                    )),
+                }
+            }
+            IpcRequest::TrustList => match self.store.trusted_repos() {
+                Ok(list) => IpcResponse::Trusted(list),
+                Err(err) => IpcResponse::error("store_error", err),
+            },
+            IpcRequest::TrustAdd { machine, repo } => {
+                match self.store.trust_repo(&machine, &repo) {
+                    Ok(true) => IpcResponse::Text(format!("{repo} on {machine} is trusted")),
+                    Ok(false) => {
+                        IpcResponse::Text(format!("{repo} on {machine} was already trusted"))
+                    }
+                    Err(err) => IpcResponse::error("store_error", err),
+                }
+            }
+            IpcRequest::TrustRemove { machine, repo } => {
+                match self.store.untrust(&machine, &repo) {
+                    Ok(true) => {
+                        IpcResponse::Text(format!("{repo} on {machine} is no longer trusted"))
+                    }
+                    Ok(false) => IpcResponse::error(
+                        "not_trusted",
+                        format!("{repo} on {machine} is not trusted"),
+                    ),
+                    Err(err) => IpcResponse::error("store_error", err),
+                }
+            }
+            IpcRequest::FlockDescribe { name } => self.describe_flock(&name),
+            IpcRequest::MachineDescribe { name } => self.describe_machine(&name),
         }
+    }
+
+    /// `FileGet`: the head's own copy of the file, and its hash.
+    fn file_get(&self, file: &str) -> anyhow::Result<IpcResponse> {
+        let path = file.parse::<crate::edit::ConfigFile>()?.path(&self.paths)?;
+        let (text, hash) = crate::edit::get(&path)?;
+        Ok(IpcResponse::File(crate::ipc::FileText {
+            path: path.display().to_string(),
+            text,
+            hash,
+        }))
+    }
+
+    /// `FilePut`: checked and written by `edit::put`, as an edit with no
+    /// head is. Answers where it wrote.
+    fn file_put(&self, file: &str, text: &str, base_hash: &str) -> anyhow::Result<PathBuf> {
+        let file = file.parse::<crate::edit::ConfigFile>()?;
+        let path = file.path(&self.paths)?;
+        let check = file.checker(&self.paths)?;
+        crate::edit::put(&path, text, base_hash, &check)?;
+        Ok(path)
+    }
+
+    /// What a saved edit tells the user about the reload that follows it.
+    async fn reload_after_edit(&self) -> String {
+        match self.scheduler.reload().await {
+            Ok(_) => "the running pastor serve picked it up".into(),
+            Err(err) => format!("the reload after it failed ({err}); run `pastor job reload`"),
+        }
+    }
+
+    /// `JobSubmit`: the scheduler builds the job, so the job files and
+    /// `[defaults]` it checks against are the ones it runs with; the items
+    /// are queued here, off its loop, and dispatched like a run's.
+    async fn submit(
+        &self,
+        name: String,
+        dispatch: serde_json::Value,
+        prompt: String,
+        items: Vec<serde_json::Value>,
+    ) -> IpcResponse {
+        let job = match self.scheduler.submitted(name, dispatch, prompt).await {
+            Ok(Ok(job)) => job,
+            Ok(Err((code, message))) => return IpcResponse::error(&code, message),
+            Err(err) => return IpcResponse::error("scheduler_error", err),
+        };
+        let out =
+            crate::scheduler::submit_items(&self.fleet, &self.store, &self.events, &job, &items)
+                .await;
+        // The name is reserved from the moment the scheduler builds the
+        // `Job`, above, so a concurrent job-file reload or scheduled run
+        // cannot mix its tasks and `seen` keys with this job's until now.
+        self.scheduler.released(job.name.clone()).await;
+        if !out.tasks.is_empty() {
+            self.fleet.dispatch_queued().await;
+        }
+        // As queued: dispatch may have moved them on since.
+        let tasks = out
+            .tasks
+            .into_iter()
+            .map(|t| self.store.get_task(t.id).ok().flatten().unwrap_or(t))
+            .collect();
+        IpcResponse::JobSubmitted {
+            tasks,
+            skipped: out.skipped,
+            refused: out.refused,
+        }
+    }
+
+    /// `FlockDescribe`: from the flock last applied and the live agents,
+    /// not from flock.toml as it reads now.
+    fn describe_flock(&self, name: &str) -> IpcResponse {
+        let flock = self.fleet.flock();
+        if !flock.has_flock(name) {
+            return IpcResponse::error("unknown_flock", format!("no flock {name}"));
+        }
+        let tasks = match self.store.list_tasks(&crate::describe::flock_tasks(name)) {
+            Ok(ts) => ts,
+            Err(err) => return IpcResponse::error("store_error", err),
+        };
+        let statuses = self.fleet.statuses();
+        match crate::describe::flock_description(&flock, name, Some(&statuses), tasks) {
+            Some(d) => IpcResponse::FlockDescription(d),
+            None => IpcResponse::error("unknown_flock", format!("no flock {name}")),
+        }
+    }
+
+    /// `MachineDescribe`: one of the head's machines, as its actor sees it.
+    fn describe_machine(&self, name: &str) -> IpcResponse {
+        let unknown =
+            || IpcResponse::error("unknown_machine", format!("no machine {name} in the flock"));
+        let flock = self.fleet.flock();
+        let Some(m) = flock.get(name) else {
+            return unknown();
+        };
+        let Some(status) = self.fleet.statuses().into_iter().find(|s| s.name == name) else {
+            return unknown();
+        };
+        let tasks = match self.store.list_tasks(&crate::describe::machine_tasks(name)) {
+            Ok(ts) => ts,
+            Err(err) => return IpcResponse::error("store_error", err),
+        };
+        // A description is still worth sending without the log.
+        let events = crate::events::read(&self.paths.events_file(), None).unwrap_or_default();
+        IpcResponse::MachineDescription(crate::describe::MachineDescription {
+            row: crate::cli::MachineRow::from(&status),
+            session: m.session.clone(),
+            model: m.model.clone(),
+            agents_by_kind: m.agents.clone(),
+            tasks,
+            recent_errors: crate::describe::machine_errors(events, name),
+        })
     }
 
     /// `TaskSend`: through the actor of the task's machine, which checks the
@@ -1439,6 +2360,95 @@ impl Daemon {
     /// `TaskRetry`: a new queued row copying `id` (see `Store::insert_retry`),
     /// dispatched at once like a `Run`. Answers the new row as it stands after
     /// the dispatch pass.
+    /// `JobTask`: one item a headless serve's job found, queued here as
+    /// that job's task, with the checks and rendering the head's own jobs
+    /// get (`run_job`), then dispatched.
+    async fn job_task(&self, job: crate::config::job::Job, item: serde_json::Value) -> IpcResponse {
+        if let Err(err) = crate::config::job::check_name(&job.name) {
+            return IpcResponse::error("invalid_request", format!("job name: {err}"));
+        }
+        if item
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return IpcResponse::error("invalid_request", "the item has no string key");
+        }
+        if job.spec.worktree && job.spec.repo.is_none() {
+            return IpcResponse::error(
+                "worktree_needs_repo",
+                "a worktree task needs a repo to branch from",
+            );
+        }
+        if let Err(why) = crate::scheduler::check_item_paths(&job, &item) {
+            return IpcResponse::error("item_rejected", why);
+        }
+        let key = item
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if let Some(resp) = self.seen_job_task(&job.name, key) {
+            return resp;
+        }
+        // As for `Run`: the agent resolves against the config as it reads now.
+        if let Err(err) = self.scheduler.sync_config().await {
+            tracing::warn!(%err, "config not re-read before a job task");
+        }
+        let task = match self
+            .fleet
+            .queue_job_task(&job, &item, |id| {
+                crate::scheduler::render_task(&job, &item, id)
+            })
+            .await
+        {
+            Ok(t) => t,
+            // Another request queued the key first.
+            Err(err) => {
+                return self
+                    .seen_job_task(&job.name, key)
+                    .unwrap_or_else(|| IpcResponse::error("job_task_refused", format!("{err:#}")));
+            }
+        };
+        tracing::info!(job = %job.name, task = %task.display_id(), "task queued for a headless serve");
+        let _ = self.events.send(PastorEvent {
+            detail: None,
+            kind: "task.queued".into(),
+            task_id: Some(task.id),
+            machine: None,
+            job: Some(task.job.clone()),
+        });
+        self.fleet.dispatch_queued().await;
+        match self.store.get_task(task.id) {
+            Ok(Some(t)) => IpcResponse::Task(t),
+            Ok(None) => IpcResponse::error("task_not_found", task.id),
+            Err(err) => IpcResponse::error("store_error", err),
+        }
+    }
+
+    /// The answer to a `JobTask` whose key this head has seen: the task it
+    /// queued then, so a serve that lost the first reply can mark the key
+    /// seen and move its cursor. `already_seen` when that row is gone.
+    /// `None` for an unseen key.
+    fn seen_job_task(&self, job: &str, key: &str) -> Option<IpcResponse> {
+        let id = match self.store.seen_task(job, key) {
+            Ok(Some(id)) => id,
+            Ok(None) => return None,
+            Err(err) => return Some(IpcResponse::error("store_error", err)),
+        };
+        let gone = || {
+            IpcResponse::error(
+                crate::ipc::ALREADY_SEEN,
+                format!("job {job} queued item {key} already, and its task is gone"),
+            )
+        };
+        let Some(id) = id else { return Some(gone()) };
+        Some(match self.store.get_task(id) {
+            Ok(Some(t)) => IpcResponse::Task(t),
+            Ok(None) => gone(),
+            Err(err) => IpcResponse::error("store_error", err),
+        })
+    }
+
     async fn retry(&self, id: i64, place: Option<crate::task::Place>) -> IpcResponse {
         // The store checks the state and copies in one statement; its error
         // says which check failed, so a row pruned by a concurrent request is
@@ -1452,7 +2462,7 @@ impl Daemon {
                 );
             }
             Err(QueueError::Agent(err)) => {
-                return IpcResponse::error("agent_tools_unsupported", err);
+                return IpcResponse::error(err.code, err.message);
             }
             // A retry keeps the flock of the task it copies; nothing chooses one.
             Err(QueueError::Flock(err)) => {
@@ -1637,6 +2647,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     let on_disk = ConfigFingerprint::sample(&paths);
     let config = PastorConfig::load(&paths.config_file())?;
     let flock = Flock::load(&paths.flock_file())?;
+    flock.check_config(&config.models, &config.agents, &config.profiles)?;
     anyhow::ensure!(
         !flock.machines.is_empty(),
         "flock is empty; add a machine with `pastor machine add`"
@@ -1660,16 +2671,24 @@ mod tests {
 
     fn machine(name: &str, max: u32) -> MachineConfig {
         MachineConfig {
+            description: None,
             name: name.into(),
             local: false,
             ssh: None,
             command: Some(vec!["fake".into()]),
             session: "default".into(),
             max_agents: max,
+            // No job slots or burst: tests of max_agents alone.
+            job_slots: 0,
+            burst: 0,
             tags: vec![],
             flock: None,
             agent: None,
             agent_args: None,
+            model: None,
+            priority: None,
+            agents: Default::default(),
+            profile: None,
         }
     }
 
@@ -1689,6 +2708,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         }
     }
 
@@ -1830,6 +2850,7 @@ mod tests {
         healthy(&fleet, "a").await;
         let t = store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "p".into(),
@@ -1861,6 +2882,52 @@ mod tests {
             TaskState::Running
         );
         assert_eq!(fleet.get("a").unwrap().snapshot().live, 1);
+    }
+
+    /// Through the fleet: a task on another machine starts with
+    /// `PASTOR_HEAD`, one on the head's own machine without it.
+    #[tokio::test]
+    async fn a_task_off_the_head_machine_is_told_where_the_head_is() {
+        let (here, there) = (FakeHerdr::new(), FakeHerdr::new());
+        let (fleet, store) = managed(&[("here", here.clone()), ("there", there.clone())]);
+        let mut flock = flock_of(&[("here", 1), ("there", 1)]);
+        flock.machines[0].local = true;
+        flock.machines[0].command = None;
+        let settings = MachineSettings {
+            head_address: Some("user@head.example".into()),
+            ..fast()
+        };
+        fleet.apply_flock(&flock, &settings).await;
+        healthy(&fleet, "here").await;
+        healthy(&fleet, "there").await;
+        let mut ids = vec![];
+        for _ in 0..2 {
+            let t = store
+                .insert_task(NewTask {
+                    description: None,
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                    flock: "default".into(),
+                })
+                .unwrap();
+            ids.push(t.id);
+        }
+        fleet.dispatch_queued().await;
+        for id in ids {
+            let t = store.get_task(id).unwrap().unwrap();
+            let fake = match t.machine.as_deref() {
+                Some("here") => &here,
+                Some("there") => &there,
+                other => panic!("t-{id} on {other:?}"),
+            };
+            let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+            match t.machine.as_deref() {
+                Some("there") => assert_eq!(env["PASTOR_HEAD"], "user@head.example"),
+                _ => assert!(env.get("PASTOR_HEAD").is_none(), "{env}"),
+            }
+        }
     }
 
     /// Copilot 4103070196: an old actor that does not end within the
@@ -1947,6 +3014,7 @@ mod tests {
         let put = |machine: &str, state: TaskState| {
             let mut t = store
                 .insert_task(NewTask {
+                    description: None,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt: "p".into(),
@@ -1982,6 +3050,7 @@ mod tests {
         let put = |machine: &str, state: TaskState| {
             let mut t = store
                 .insert_task(NewTask {
+                    description: None,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt: "p".into(),
@@ -2059,16 +3128,222 @@ mod tests {
         (d, tmp)
     }
 
+    /// `JobSubmit` queues another machine's items as this head's own job
+    /// would: rendered the same, deduplicated by `seen`, capped by
+    /// `max_tasks_per_run`, and refused for a name a job file owns or a
+    /// `[dispatch]` that does not validate.
+    #[tokio::test]
+    async fn job_submit_queues_items_like_a_local_job() {
+        let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+        let dispatch = serde_json::json!({
+            "repo": "~/work/{{ item.repo }}",
+            "branch": "pastor/{{ item.key }}",
+            "max_tasks_per_run": 2,
+        });
+        let prompt = "{{ job.name }} {{ task.id }}: {{ item.title }}";
+        let submit = |job: &str, dispatch: &serde_json::Value, items: Vec<serde_json::Value>| {
+            IpcRequest::JobSubmit {
+                job: job.into(),
+                dispatch: dispatch.clone(),
+                prompt: prompt.into(),
+                items,
+            }
+        };
+        let item = |key: &str| serde_json::json!({"key": key, "repo": "r", "title": "fix it"});
+        let resp = d
+            .handle(submit(
+                "vault",
+                &dispatch,
+                vec![
+                    item("c1"),
+                    item("c1"),
+                    serde_json::json!({"key": "bad", "repo": "..", "title": "x"}),
+                    item("c2"),
+                    item("c3"),
+                ],
+            ))
+            .await;
+        let IpcResponse::JobSubmitted {
+            tasks,
+            skipped,
+            refused,
+        } = resp
+        else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(tasks.len(), 2, "{tasks:?}");
+        assert_eq!(skipped, vec!["c1"]);
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert_eq!(refused[0].0, "bad");
+        assert!(refused[0].1.contains("repo"), "{refused:?}");
+        assert_eq!(
+            refused[1],
+            ("c3".to_string(), "max_tasks_per_run".to_string())
+        );
+
+        // Rendered exactly as a job file with the same [dispatch] would be.
+        let file = format!(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nrepo = \"~/work/{{{{ item.repo }}}}\"\nbranch = \"pastor/{{{{ item.key }}}}\"\nprompt = \"{prompt}\"\n"
+        );
+        let local = crate::config::job::Job::parse(
+            &file,
+            "vault",
+            &test_config().defaults,
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let t = &tasks[0];
+        assert_eq!(t.job, "vault");
+        let (want_prompt, want_spec) =
+            crate::scheduler::render_task(&local, &item("c1"), t.id).unwrap();
+        assert_eq!(t.prompt, want_prompt);
+        assert_eq!(t.prompt, format!("vault t-{}: fix it", t.id));
+        assert_eq!(t.spec.repo, want_spec.repo);
+        assert_eq!(t.spec.branch.as_deref(), Some("pastor/c1"));
+        assert!(d.store.is_seen("vault", "c1").unwrap());
+
+        // A second submitter of the same job shares its seen keys.
+        let resp = d
+            .handle(submit("vault", &dispatch, vec![item("c1"), item("c3")]))
+            .await;
+        let IpcResponse::JobSubmitted {
+            tasks,
+            skipped,
+            refused,
+        } = resp
+        else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(skipped, vec!["c1"]);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].item["key"], "c3");
+
+        // A job file owns its name, even an invalid one.
+        let jobs = d.paths.jobs_dir();
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::write(jobs.join("mine.toml"), &file).unwrap();
+        std::fs::write(jobs.join("broken.toml"), "not toml [").unwrap();
+        for name in ["mine", "broken"] {
+            let resp = d.handle(submit(name, &dispatch, vec![item("x")])).await;
+            let IpcResponse::Error { code, .. } = resp else {
+                panic!("{resp:?}")
+            };
+            assert_eq!(code, "job_name_taken", "{name}");
+        }
+        assert!(!d.store.is_seen("mine", "x").unwrap());
+
+        // A [dispatch] the job file would refuse, with the job file's error.
+        let resp = d
+            .handle(submit(
+                "other",
+                &serde_json::json!({"worktree": true}),
+                vec![item("x")],
+            ))
+            .await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "invalid_dispatch");
+        assert_eq!(message, "dispatch.worktree = true needs dispatch.repo");
+        assert!(!d.store.is_seen("other", "x").unwrap());
+    }
+
+    #[tokio::test]
+    async fn trust_is_listed_added_and_removed_on_the_head() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let add = || IpcRequest::TrustAdd {
+            machine: "a".into(),
+            repo: "/r".into(),
+        };
+        let resp = d.handle(add()).await;
+        assert!(
+            matches!(&resp, IpcResponse::Text(t) if t == "/r on a is trusted"),
+            "{resp:?}"
+        );
+        let resp = d.handle(add()).await;
+        assert!(
+            matches!(&resp, IpcResponse::Text(t) if t.contains("already")),
+            "{resp:?}"
+        );
+        let IpcResponse::Trusted(list) = d.handle(IpcRequest::TrustList).await else {
+            panic!()
+        };
+        assert_eq!(list.len(), 1);
+        assert!(d.store.is_trusted("a", "/r").unwrap());
+        let remove = || IpcRequest::TrustRemove {
+            machine: "a".into(),
+            repo: "/r".into(),
+        };
+        assert!(matches!(d.handle(remove()).await, IpcResponse::Text(_)));
+        let resp = d.handle(remove()).await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "not_trusted"),
+            "{resp:?}"
+        );
+        let IpcResponse::Trusted(list) = d.handle(IpcRequest::TrustList).await else {
+            panic!()
+        };
+        assert!(list.is_empty());
+    }
+
+    /// The head describes from the flock it applied, not from flock.toml as
+    /// it reads now: a file that does not load leaves the last one in use.
+    #[tokio::test]
+    async fn describe_answers_from_the_applied_flock() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        std::fs::write(d.paths.flock_file(), "not [[ toml").unwrap();
+        let resp = d
+            .handle(IpcRequest::MachineDescribe { name: "a".into() })
+            .await;
+        let IpcResponse::MachineDescription(m) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(m.row.name, "a");
+        assert_eq!(m.row.channel, "connected");
+        assert_eq!(m.row.live, Some(0));
+        let resp = d
+            .handle(IpcRequest::MachineDescribe { name: "b".into() })
+            .await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "unknown_machine"),
+            "{resp:?}"
+        );
+        let resp = d
+            .handle(IpcRequest::FlockDescribe {
+                name: "default".into(),
+            })
+            .await;
+        let IpcResponse::FlockDescription(f) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(f.default);
+        assert_eq!(f.machines, ["a"]);
+        assert_eq!(f.agents, Some(0));
+        let resp = d
+            .handle(IpcRequest::FlockDescribe {
+                name: "nope".into(),
+            })
+            .await;
+        assert!(
+            matches!(&resp, IpcResponse::Error { code, .. } if code == "unknown_flock"),
+            "{resp:?}"
+        );
+    }
+
     #[tokio::test]
     async fn run_dispatches_immediately() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let mut events = d.subscribe();
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -2113,10 +3388,13 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
         let IpcResponse::Task(first) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "1".into(),
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -2125,10 +3403,13 @@ mod tests {
         assert_eq!(first.state, TaskState::Running);
         let IpcResponse::Task(second) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "2".into(),
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -2154,11 +3435,198 @@ mod tests {
         );
     }
 
+    fn run_at(prompt: &str, priority: Option<Priority>) -> IpcRequest {
+        IpcRequest::Run {
+            prompt: prompt.into(),
+            spec: spec(),
+            flock: None,
+            agent: None,
+            priority,
+            role: TaskRole::Agent,
+            description: None,
+        }
+    }
+
+    /// When a slot frees, the queued task of the highest level takes it,
+    /// whatever its age; `task priority` moves a queued task, and refuses
+    /// one that left the queue, one that is not there and an agent pastor
+    /// started.
+    #[tokio::test]
+    async fn the_highest_level_takes_a_freed_slot() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+        let task = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let first = task(d.handle(run_at("1", None)).await);
+        assert_eq!(first.state, TaskState::Running);
+        let normal = task(d.handle(run_at("2", None)).await);
+        let high = task(d.handle(run_at("3", Some(Priority::High))).await);
+        let low = task(d.handle(run_at("4", Some(Priority::Low))).await);
+        assert_eq!(normal.priority, Priority::Normal);
+        assert_eq!(normal.priority_from, None);
+        assert_eq!(high.priority, Priority::High);
+        assert_eq!(high.priority_from.as_deref(), Some("task run"));
+
+        let set = |id: i64, priority: Priority| IpcRequest::TaskPriority { id, priority };
+        let raised = task(d.handle(set(low.id, Priority::Critical)).await);
+        assert_eq!(raised.priority, Priority::Critical);
+        assert_eq!(raised.priority_from.as_deref(), Some("task priority"));
+        assert_eq!(
+            error_code(d.handle(set(first.id, Priority::Low)).await),
+            "not_queued"
+        );
+        assert_eq!(
+            error_code(d.handle(set(999, Priority::Low)).await),
+            "task_not_found"
+        );
+        assert_eq!(
+            error_code(
+                d.handle_from(set(normal.id, Priority::Low), Some("t-1"))
+                    .await
+            ),
+            "agent_refused"
+        );
+
+        fake.close_pane(first.pane_id.as_deref().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.store.get_task(first.id).unwrap().unwrap().state != TaskState::Closed {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        d.fleet().dispatch_queued().await;
+        let state = |id: i64| d.store.get_task(id).unwrap().unwrap().state;
+        assert_eq!(state(low.id), TaskState::Running);
+        assert_eq!(state(high.id), TaskState::Queued);
+        assert_eq!(state(normal.id), TaskState::Queued);
+    }
+
+    /// A task's level comes from `--priority`, else the machine it is
+    /// pinned to, else its flock, else `[defaults]`; an unpinned task never
+    /// takes a machine's. A job's comes from its template, and an empty
+    /// value falls through; a value that is not a level is the item's error.
+    #[tokio::test]
+    async fn a_tasks_priority_comes_from_its_layers() {
+        use crate::config::flock::FlockEntry;
+        let mut urgent = machine("a", 4);
+        urgent.flock = Some("work".into());
+        urgent.priority = Some(Priority::Critical);
+        let mut plain = machine("b", 4);
+        plain.flock = Some("work".into());
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "work".into(),
+                default: true,
+                priority: Some(Priority::High),
+                ..Default::default()
+            }],
+            machines: vec![urgent, plain],
+        };
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("a", 4, FakeHerdr::new()), ("b", 4, FakeHerdr::new())],
+        )
+        .await;
+        let run = |machine: Option<&str>, priority: Option<Priority>| IpcRequest::Run {
+            prompt: "x".into(),
+            spec: DispatchSpec {
+                machine: machine.map(Into::into),
+                ..spec()
+            },
+            flock: None,
+            agent: None,
+            priority,
+            role: TaskRole::Agent,
+            description: None,
+        };
+        let level = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => (t.priority, t.priority_from.unwrap_or_default()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            level(d.handle(run(Some("a"), None)).await),
+            (Priority::Critical, "machine a".into())
+        );
+        assert_eq!(
+            level(d.handle(run(Some("a"), Some(Priority::Low))).await),
+            (Priority::Low, "task run".into())
+        );
+        assert_eq!(
+            level(d.handle(run(Some("b"), None)).await),
+            (Priority::High, "flock work".into())
+        );
+        assert_eq!(
+            level(d.handle(run(None, None)).await),
+            (Priority::High, "flock work".into())
+        );
+
+        let config = test_config();
+        let text = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\npriority = \"{{ item.priority }}\"\nprompt = \"p\"\n";
+        let job = crate::config::job::Job::parse(
+            text,
+            "j",
+            &config.defaults,
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let queue = |item: serde_json::Value| {
+            let job = job.clone();
+            let fleet = d.fleet().clone();
+            async move {
+                fleet
+                    .queue_job_task(&job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                    .await
+            }
+        };
+        let t = queue(serde_json::json!({"key": "a", "priority": "low"}))
+            .await
+            .unwrap();
+        assert_eq!(t.priority, Priority::Low);
+        assert_eq!(t.priority_from.as_deref(), Some("job j"));
+        let t = queue(serde_json::json!({"key": "b", "priority": ""}))
+            .await
+            .unwrap();
+        assert_eq!(t.priority, Priority::High);
+        assert_eq!(t.priority_from.as_deref(), Some("flock work"));
+        let err = queue(serde_json::json!({"key": "c", "priority": "urgent"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unknown_priority"), "{err:#}");
+    }
+
+    /// A retry keeps the level of the task it copies, and where it came
+    /// from.
+    #[tokio::test]
+    async fn a_retry_keeps_its_priority() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let IpcResponse::Task(mut t) = d.handle(run_at("x", Some(Priority::High))).await else {
+            panic!()
+        };
+        t.state = TaskState::Failed;
+        t.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut t).unwrap();
+        let IpcResponse::Task(copy) = d
+            .handle(IpcRequest::TaskRetry {
+                id: t.id,
+                place: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(copy.retry_of, Some(t.id));
+        assert_eq!(copy.priority, Priority::High);
+        assert_eq!(copy.priority_from.as_deref(), Some("task run"));
+    }
+
     #[tokio::test]
     async fn pinned_unknown_machine_and_bad_ids_are_errors() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     machine: Some("zzz".into()),
@@ -2166,6 +3634,7 @@ mod tests {
                 },
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         let IpcResponse::Error { code, .. } = resp else {
@@ -2185,6 +3654,8 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new()), ("b", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     machine: Some("b".into()),
@@ -2192,6 +3663,7 @@ mod tests {
                 },
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -2237,6 +3709,8 @@ mod tests {
 
     fn run_in(flock: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            role: Default::default(),
+            description: None,
             prompt: "x".into(),
             spec: DispatchSpec {
                 machine: machine.map(Into::into),
@@ -2244,6 +3718,7 @@ mod tests {
             },
             flock: flock.map(Into::into),
             agent: None,
+            priority: None,
         }
     }
 
@@ -2261,10 +3736,13 @@ mod tests {
         )
         .await;
         let run = |flock: &str, agent: Option<AgentChoice>| IpcRequest::Run {
+            role: Default::default(),
+            description: None,
             prompt: "x".into(),
             spec: spec(),
             flock: Some(flock.into()),
             agent,
+            priority: None,
         };
         let queued = |resp: IpcResponse| match resp {
             IpcResponse::Task(t) => (t.spec.agent, t.spec.agent_args.join(" ")),
@@ -2285,6 +3763,8 @@ mod tests {
             agent_args: None,
             allow: vec![],
             deny: vec![],
+            model: None,
+            profile: None,
         });
         assert_eq!(
             queued(d.handle(run("work", own)).await),
@@ -2345,6 +3825,8 @@ mod tests {
         )
         .await;
         let run = |agent: Option<&str>| IpcRequest::Run {
+            role: Default::default(),
+            description: None,
             prompt: "x".into(),
             spec: spec(),
             flock: Some("work".into()),
@@ -2353,6 +3835,7 @@ mod tests {
                 allow: vec!["Edit".into()],
                 ..Default::default()
             }),
+            priority: None,
         };
         let IpcResponse::Task(t) = d.handle(run(None)).await else {
             panic!()
@@ -2411,10 +3894,13 @@ mod tests {
         std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: spec(),
                 flock: Some("work".into()),
                 agent: Some(AgentChoice::default()),
+                priority: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -2422,6 +3908,778 @@ mod tests {
         };
         assert_eq!(t.spec.agent, "claude-personal");
         assert_eq!(t.spec.deny, vec!["WebFetch"]);
+    }
+
+    /// pastor.toml with `sonnet` and `opus` for claude and `gpt` for codex,
+    /// and `claude-personal`, a claude.
+    fn models_config() -> PastorConfig {
+        let mut c = test_config();
+        c.agents.0.insert(
+            "claude-personal".into(),
+            crate::config::AgentDef {
+                kind: Some("claude".into()),
+                ..Default::default()
+            },
+        );
+        for (name, kind, arg) in [
+            ("sonnet", "claude", "claude-sonnet-5"),
+            ("opus", "claude", "claude-opus-5-5"),
+            ("gpt", "codex", "gpt-x"),
+        ] {
+            c.models.0.insert(
+                name.into(),
+                crate::config::ModelDef {
+                    kind: kind.into(),
+                    args: vec!["--model".into(), arg.into()],
+                },
+            );
+        }
+        c
+    }
+
+    /// A daemon over `machines` in the flock `personal`, which runs
+    /// `claude-personal` with `-v` and the model `flock_model`, and
+    /// `models_config` on disk: `task run` re-reads both files.
+    async fn models_daemon(
+        flock_model: Option<&str>,
+        machines: Vec<MachineConfig>,
+        fakes: &[(&str, u32, FakeHerdr)],
+    ) -> (Daemon, tempfile::TempDir) {
+        use crate::config::flock::FlockEntry;
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "personal".into(),
+                default: true,
+                agent: Some("claude-personal".into()),
+                agent_args: Some(vec!["-v".into()]),
+                ..Default::default()
+            }],
+            machines,
+        };
+        let (d, tmp) = daemon_with_flock(flock.clone(), fakes).await;
+        std::fs::write(
+            d.paths.config_file(),
+            toml::to_string(&models_config()).unwrap(),
+        )
+        .unwrap();
+        let mut flock = flock;
+        flock.flocks[0].model = flock_model.map(Into::into);
+        flock.save(&d.paths.flock_file()).unwrap();
+        (d, tmp)
+    }
+
+    fn run_model(model: Option<&str>, agent: Option<&str>, machine: Option<&str>) -> IpcRequest {
+        IpcRequest::Run {
+            role: Default::default(),
+            description: None,
+            prompt: "x".into(),
+            spec: DispatchSpec {
+                machine: machine.map(Into::into),
+                ..spec()
+            },
+            flock: None,
+            agent: Some(AgentChoice {
+                agent: agent.map(Into::into),
+                model: model.map(Into::into),
+                ..Default::default()
+            }),
+            priority: None,
+        }
+    }
+
+    /// `--model` puts the model's args before the agent's own, herdr starts
+    /// the agent with them, and the task keeps the name and where it came
+    /// from.
+    #[tokio::test]
+    async fn a_task_runs_the_model_it_names() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) =
+            models_daemon(None, vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
+        let resp = d.handle(run_model(Some("sonnet"), None, None)).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.spec.agent, "claude-personal");
+        assert_eq!(t.spec.agent_args, vec!["--model", "claude-sonnet-5", "-v"]);
+        assert_eq!(t.model(), Some("sonnet"));
+        let source = t.spec.agent_source.clone().unwrap();
+        assert_eq!(source.model_from.as_deref(), Some("task run"));
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "claude");
+        let args = start.params["args"].as_array().unwrap();
+        assert_eq!(
+            args[..3],
+            serde_json::json!(["--model", "claude-sonnet-5", "-v"])
+                .as_array()
+                .unwrap()[..]
+        );
+        assert_eq!(args[3], "--session-id");
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("model:      sonnet (from task run)"),
+            "{text}"
+        );
+    }
+
+    /// A flock's model reaches its tasks that name none; `--model` wins.
+    #[tokio::test]
+    async fn a_flocks_model_runs_unless_the_task_names_one() {
+        let (d, _tmp) = models_daemon(
+            Some("sonnet"),
+            vec![machine("pi", 2)],
+            &[("pi", 2, FakeHerdr::new())],
+        )
+        .await;
+        let IpcResponse::Task(t) = d.handle(run_model(None, None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.model(), Some("sonnet"));
+        assert_eq!(
+            t.spec.agent_source.as_ref().unwrap().model_from.as_deref(),
+            Some("flock personal")
+        );
+        assert_eq!(t.spec.agent_args[..2], ["--model", "claude-sonnet-5"]);
+        let IpcResponse::Task(t) = d.handle(run_model(Some("opus"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.model(), Some("opus"));
+        assert_eq!(t.spec.agent_args[..2], ["--model", "claude-opus-5-5"]);
+    }
+
+    /// A name `[models]` lacks, and a model of another kind than the agent
+    /// the task asked for, or than every agent the machine it is pinned to
+    /// can run, are refused.
+    #[tokio::test]
+    async fn an_unknown_or_mismatched_model_is_refused() {
+        let cx = MachineConfig {
+            agent: Some("codex".into()),
+            ..machine("cx", 1)
+        };
+        let (d, _tmp) = models_daemon(
+            None,
+            vec![machine("pi", 1), cx],
+            &[("pi", 1, FakeHerdr::new()), ("cx", 1, FakeHerdr::new())],
+        )
+        .await;
+        let resp = d.handle(run_model(Some("haiku"), None, None)).await;
+        match resp {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "unknown_model", "{message}");
+                assert!(message.contains("gpt, opus, sonnet"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            error_code(
+                d.handle(run_model(Some("sonnet"), Some("codex"), None))
+                    .await
+            ),
+            "model_kind_mismatch"
+        );
+        assert_eq!(
+            error_code(d.handle(run_model(Some("gpt"), None, Some("pi"))).await),
+            "model_kind_mismatch"
+        );
+        assert!(d.store.queued_tasks().unwrap().is_empty());
+        // cx's own agent is codex, but its flock's is a claude.
+        let IpcResponse::Task(t) = d.handle(run_model(Some("sonnet"), None, Some("cx"))).await
+        else {
+            panic!()
+        };
+        assert_eq!(t.spec.agent, "claude-personal");
+    }
+
+    /// An unpinned task goes only to a machine whose agent has its model's
+    /// kind; with none, it waits, and says why.
+    #[tokio::test]
+    async fn a_model_skips_machines_of_another_kind() {
+        let cx = MachineConfig {
+            agent: Some("codex".into()),
+            ..machine("cx", 1)
+        };
+        let (d, _tmp) = models_daemon(
+            None,
+            vec![machine("pi", 1), cx],
+            &[("pi", 1, FakeHerdr::new()), ("cx", 1, FakeHerdr::new())],
+        )
+        .await;
+        let IpcResponse::Task(t) = d.handle(run_model(Some("gpt"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(
+            (t.machine.as_deref(), t.spec.agent.as_str()),
+            (Some("cx"), "codex")
+        );
+        assert_eq!(t.spec.agent_args, vec!["--model", "gpt-x"]);
+        // cx is full, and pi's agent is a claude.
+        let IpcResponse::Task(t) = d.handle(run_model(Some("gpt"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.unwrap_or_default();
+        assert!(err.starts_with("waiting for a machine"), "{err}");
+        assert!(err.contains("model gpt runs on codex agents"), "{err}");
+    }
+
+    /// `models_daemon` with `gpt5`, a model for opencode agents, in
+    /// `[models]` as well.
+    async fn opencode_daemon(
+        machines: Vec<MachineConfig>,
+        fakes: &[(&str, u32, FakeHerdr)],
+    ) -> (Daemon, tempfile::TempDir) {
+        let (d, tmp) = models_daemon(None, machines, fakes).await;
+        let mut config = models_config();
+        config.models.0.insert(
+            "gpt5".into(),
+            crate::config::ModelDef {
+                kind: "opencode".into(),
+                args: vec!["--model".into(), "openai/gpt-5.5".into()],
+            },
+        );
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        d.fleet().set_config(&config);
+        (d, tmp)
+    }
+
+    /// A model of another kind than the flock's agent runs on the machine
+    /// whose `agents` names one of its kind, as that agent, without the
+    /// flock's claude args; describe says where the agent came from.
+    #[tokio::test]
+    async fn a_model_of_another_kind_runs_on_the_agent_named_for_it() {
+        let desk = MachineConfig {
+            agents: [("opencode".to_string(), "opencode".to_string())].into(),
+            ..machine("desk", 1)
+        };
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = opencode_daemon(
+            vec![machine("pi", 1), desk],
+            &[("pi", 1, FakeHerdr::new()), ("desk", 1, fake.clone())],
+        )
+        .await;
+        let IpcResponse::Task(t) = d.handle(run_model(Some("gpt5"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(
+            (t.machine.as_deref(), t.spec.agent.as_str()),
+            (Some("desk"), "opencode")
+        );
+        assert_eq!(t.spec.agent_args, vec!["--model", "openai/gpt-5.5"]);
+        let start = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "agent.start")
+            .unwrap();
+        assert_eq!(start.params["kind"], "opencode");
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!(["--model", "openai/gpt-5.5"])
+        );
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("agent:      opencode (from machine desk agents.opencode)\n"),
+            "{text}"
+        );
+        // A claude model still runs on the flock's claude agent there.
+        let IpcResponse::Task(t) = d.handle(run_model(Some("sonnet"), None, Some("pi"))).await
+        else {
+            panic!()
+        };
+        assert_eq!(t.spec.agent, "claude-personal");
+    }
+
+    /// With no machine of the flock naming an agent of the model's kind,
+    /// the task waits and says so; pinned to such a machine, it is refused.
+    #[tokio::test]
+    async fn a_model_no_machine_has_an_agent_for_waits_or_is_refused() {
+        let (d, _tmp) = opencode_daemon(
+            vec![machine("pi", 1), machine("pi-2", 1)],
+            &[("pi", 1, FakeHerdr::new()), ("pi-2", 1, FakeHerdr::new())],
+        )
+        .await;
+        let IpcResponse::Task(t) = d.handle(run_model(Some("gpt5"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.unwrap_or_default();
+        assert!(
+            err.contains("no machine in flock personal has an opencode agent"),
+            "{err}"
+        );
+        let resp = d.handle(run_model(Some("gpt5"), None, Some("pi-2"))).await;
+        match resp {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "model_kind_mismatch", "{message}");
+                assert!(message.contains("no layer's agents.opencode"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A retry settles its model again, so one since dropped from
+    /// `[models]` is refused.
+    #[tokio::test]
+    async fn a_retry_of_a_dropped_model_is_unknown() {
+        let (d, _tmp) =
+            models_daemon(None, vec![machine("pi", 2)], &[("pi", 2, FakeHerdr::new())]).await;
+        let IpcResponse::Task(mut t) = d.handle(run_model(Some("sonnet"), None, None)).await else {
+            panic!()
+        };
+        t.state = TaskState::Failed;
+        t.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut t).unwrap();
+        let mut config = models_config();
+        config.models.0.remove("sonnet");
+        d.fleet().set_config(&config);
+        let retry = IpcRequest::TaskRetry {
+            id: t.id,
+            place: None,
+        };
+        assert_eq!(error_code(d.handle(retry.clone()).await), "unknown_model");
+        d.fleet().set_config(&models_config());
+        let IpcResponse::Task(copy) = d.handle(retry).await else {
+            panic!()
+        };
+        assert_eq!(copy.model(), Some("sonnet"));
+    }
+
+    /// `models_config` with `[profiles.ci]`, develop plus make.
+    fn profiles_config() -> PastorConfig {
+        let mut c = models_config();
+        c.profiles.0.insert(
+            "ci".into(),
+            crate::config::profile::ProfileDef {
+                extends: Some("develop".into()),
+                allow: vec!["Bash(make:*)".into()],
+                ..Default::default()
+            },
+        );
+        c
+    }
+
+    /// `models_daemon` with `profiles_config` on disk and applied.
+    async fn profiles_daemon(
+        machines: Vec<MachineConfig>,
+        fakes: &[(&str, u32, FakeHerdr)],
+    ) -> (Daemon, tempfile::TempDir) {
+        let (d, tmp) = models_daemon(None, machines, fakes).await;
+        apply_config(&d, &profiles_config()).await;
+        (d, tmp)
+    }
+
+    /// Write `config` to pastor.toml and have the head reload it, as an
+    /// edit and `pastor job reload` would: the fleet and its actors both
+    /// take it.
+    async fn apply_config(d: &Daemon, config: &PastorConfig) {
+        std::fs::write(d.paths.config_file(), toml::to_string(config).unwrap()).unwrap();
+        let resp = d.handle(IpcRequest::Reload).await;
+        assert!(matches!(resp, IpcResponse::Jobs(_)), "{resp:?}");
+    }
+
+    fn run_profile(profile: Option<&str>, machine: Option<&str>) -> IpcRequest {
+        let IpcRequest::Run {
+            prompt,
+            spec,
+            flock,
+            agent,
+            priority,
+            role,
+            description,
+        } = run_model(None, None, machine)
+        else {
+            unreachable!()
+        };
+        IpcRequest::Run {
+            prompt,
+            spec,
+            flock,
+            description,
+            agent: agent.map(|a| AgentChoice {
+                profile: profile.map(Into::into),
+                ..a
+            }),
+            priority,
+            role,
+        }
+    }
+
+    /// `--profile` adds the profile's lists to the task's, the task keeps
+    /// its name and where it came from, and herdr starts Claude with
+    /// `--permission-mode dontAsk` and the lists as its flags.
+    #[tokio::test]
+    async fn a_task_runs_under_the_profile_it_names() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
+        let IpcResponse::Task(t) = d.handle(run_profile(Some("ci"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.profile(), Some("ci"));
+        let source = t.spec.agent_source.clone().unwrap();
+        assert_eq!(source.profile_from.as_deref(), Some("task run"));
+        assert!(t.spec.allow.contains(&"Edit".to_string()));
+        assert_eq!(
+            t.spec.allow.last().map(String::as_str),
+            Some("Bash(make:*)")
+        );
+        assert!(t.spec.deny.contains(&"Bash(sudo:*)".to_string()));
+        assert_eq!(t.to_json()["profile"], "ci");
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        let args: Vec<&str> = start.params["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(args[..3], ["-v", "--permission-mode", "dontAsk"]);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--disallowedTools", "Bash(sudo:*)"]),
+            "{args:?}"
+        );
+        let text = crate::cli::task_detail(&t);
+        assert!(text.contains("profile:    ci (from task run)"), "{text}");
+
+        // With no profile named anywhere, nothing changes.
+        let IpcResponse::Task(t) = d.handle(run_profile(None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.profile(), None);
+        assert!(t.spec.allow.is_empty());
+    }
+
+    /// A machine's profile reaches its tasks, before its flock's; a name
+    /// that is no profile is refused, and so are agent args that pick a
+    /// permission mode while a profile applies.
+    #[tokio::test]
+    async fn a_machines_profile_applies_and_bad_ones_are_refused() {
+        let pi = MachineConfig {
+            profile: Some("review".into()),
+            ..machine("pi", 2)
+        };
+        let (d, _tmp) = profiles_daemon(vec![pi], &[("pi", 2, FakeHerdr::new())]).await;
+        let IpcResponse::Task(t) = d.handle(run_profile(None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.profile(), Some("review"));
+        assert_eq!(
+            t.spec.agent_source.unwrap().profile_from.as_deref(),
+            Some("machine pi")
+        );
+        assert!(t.spec.deny.contains(&"Edit".to_string()));
+
+        assert_eq!(
+            error_code(d.handle(run_profile(Some("nope"), None)).await),
+            "unknown_profile"
+        );
+        let IpcRequest::Run {
+            prompt,
+            spec,
+            flock,
+            agent,
+            priority,
+            role,
+            description,
+        } = run_profile(Some("ci"), None)
+        else {
+            unreachable!()
+        };
+        let conflict = IpcRequest::Run {
+            prompt,
+            spec,
+            flock,
+            description,
+            agent: agent.map(|a| AgentChoice {
+                agent_args: Some(vec!["--permission-mode".into(), "bypassPermissions".into()]),
+                ..a
+            }),
+            priority,
+            role,
+        };
+        assert_eq!(
+            error_code(d.handle(conflict).await),
+            crate::config::PROFILE_ARGS_CONFLICT
+        );
+    }
+
+    /// The unrestricted rule: a task may ask for `unrestricted` only where
+    /// the machine's own profile is `unrestricted`. Pinned elsewhere it is
+    /// refused; unpinned it goes to such a machine, or waits and says why.
+    #[tokio::test]
+    async fn unrestricted_runs_only_on_a_machine_that_is_unrestricted() {
+        let box1 = MachineConfig {
+            profile: Some("unrestricted".into()),
+            ..machine("box", 1)
+        };
+        let (d, _tmp) = profiles_daemon(
+            vec![machine("pi", 2), box1],
+            &[("pi", 2, FakeHerdr::new()), ("box", 1, FakeHerdr::new())],
+        )
+        .await;
+        assert_eq!(
+            error_code(
+                d.handle(run_profile(Some("unrestricted"), Some("pi")))
+                    .await
+            ),
+            PROFILE_NOT_ALLOWED
+        );
+        let IpcResponse::Task(t) = d.handle(run_profile(Some("unrestricted"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("box"));
+        assert_eq!(t.profile(), Some("unrestricted"));
+        // box is full, and pi is not unrestricted.
+        let IpcResponse::Task(t) = d.handle(run_profile(Some("unrestricted"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.unwrap_or_default();
+        assert!(err.starts_with("waiting for a machine"), "{err}");
+        assert!(err.contains("runs only where"), "{err}");
+        // On pi, a task that names none runs without one.
+        let IpcResponse::Task(t) = d.handle(run_profile(None, Some("pi"))).await else {
+            panic!()
+        };
+        assert_eq!(t.profile(), None);
+        // `machine list` and `machine describe` show each machine's own.
+        let IpcResponse::Machines(ms) = d.handle(IpcRequest::FlockList).await else {
+            panic!()
+        };
+        let own: Vec<_> = ms
+            .iter()
+            .map(|m| (m.name.as_str(), m.profile.as_deref()))
+            .collect();
+        assert_eq!(own, [("pi", None), ("box", Some("unrestricted"))]);
+        let IpcResponse::MachineDescription(m) = d
+            .handle(IpcRequest::MachineDescribe { name: "box".into() })
+            .await
+        else {
+            panic!()
+        };
+        let text = crate::describe::machine_text(&m);
+        assert!(text.contains("profile:     unrestricted"), "{text}");
+    }
+
+    /// A profile dropped from pastor.toml while a task waits for a machine
+    /// keeps it waiting, with the reason in its error, rather than start
+    /// it without the profile; put back, the task runs under it.
+    #[tokio::test]
+    async fn a_profile_removed_while_queued_holds_the_task() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 1)], &[("pi", 1, fake.clone())]).await;
+        let ask = AgentChoice {
+            profile: Some("ci".into()),
+            ..Default::default()
+        };
+        let t = d
+            .fleet()
+            .queue_run("x".into(), spec(), None, Some(&ask), None)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Queued);
+        apply_config(&d, &models_config()).await;
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.clone().unwrap_or_default();
+        assert!(err.contains("profile ci is not built in"), "{err}");
+        assert!(!fake.requests().iter().any(|r| r.method == "agent.start"));
+
+        apply_config(&d, &profiles_config()).await;
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_ne!(t.state, TaskState::Queued);
+        assert_eq!(t.error, None);
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert!(
+            start.params["args"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("dontAsk"))
+        );
+    }
+
+    /// A task that inherited its profile from `[defaults]` (not its own
+    /// ask) while queued for a busy machine keeps that profile pinned: once
+    /// `[defaults].profile` moves on and the profile itself is gone too, the
+    /// re-settle at placement holds the task rather than start it with none
+    /// of the profile's lists, silently, because the ask itself never named
+    /// one.
+    #[tokio::test]
+    async fn a_profile_inherited_from_defaults_is_pinned_while_queued() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 1)], &[("pi", 1, fake.clone())]).await;
+        let mut with_default_profile = profiles_config();
+        with_default_profile.defaults.profile = Some("ci".into());
+        apply_config(&d, &with_default_profile).await;
+
+        // Occupy pi's one slot so the new task must wait.
+        let IpcResponse::Task(busy) = d
+            .handle(IpcRequest::Run {
+                prompt: "busy".into(),
+                spec: spec(),
+                flock: None,
+                agent: None,
+                priority: None,
+                role: Default::default(),
+                description: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(busy.state, TaskState::Running);
+
+        let mut pinned = spec();
+        pinned.machine = Some("pi".into());
+        let t = d
+            .fleet()
+            .queue_run(
+                "x".into(),
+                pinned,
+                None,
+                Some(&AgentChoice::default()),
+                None,
+            )
+            .await
+            .unwrap();
+        let source = t.spec.agent_source.clone().unwrap();
+        assert_eq!(source.profile.as_deref(), Some("ci"));
+        assert_eq!(source.profile_from.as_deref(), Some("defaults"));
+        assert!(source.ask.profile.is_none(), "the ask itself named none");
+
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued, "pi is still busy");
+
+        // `[defaults]` moves on, and the profile it named is dropped too.
+        let mut without = profiles_config();
+        without.profiles.0.remove("ci");
+        apply_config(&d, &without).await;
+
+        // Free pi's slot.
+        fake.close_pane(busy.pane_id.as_deref().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.store.get_task(busy.id).unwrap().unwrap().state != TaskState::Closed {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued, "held rather than started bare");
+        let err = t.error.clone().unwrap_or_default();
+        assert!(err.contains("profile ci is not built in"), "{err}");
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|r| r.method == "agent.start")
+                .count(),
+            1,
+            "only the busy task ever started"
+        );
+    }
+
+    /// A retry settles its profile again, so one since dropped is refused.
+    #[tokio::test]
+    async fn a_retry_of_a_dropped_profile_is_unknown() {
+        let (d, _tmp) =
+            profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, FakeHerdr::new())]).await;
+        let IpcResponse::Task(mut t) = d.handle(run_profile(Some("ci"), None)).await else {
+            panic!()
+        };
+        t.state = TaskState::Failed;
+        t.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut t).unwrap();
+        d.fleet().set_config(&models_config());
+        let retry = IpcRequest::TaskRetry {
+            id: t.id,
+            place: None,
+        };
+        assert_eq!(error_code(d.handle(retry).await), "unknown_profile");
+    }
+
+    /// Claude resolves `~` in a pattern itself, on its own machine, so a
+    /// profile's `~` is passed as written: a machine that cannot report a
+    /// home still runs it.
+    #[tokio::test]
+    async fn a_profiles_tilde_is_passed_as_written_without_a_home() {
+        let fake = FakeHerdr::new();
+        fake.set_home(None);
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 1)], &[("pi", 1, fake.clone())]).await;
+        let mut config = profiles_config();
+        config.profiles.0.get_mut("ci").unwrap().deny = vec!["Read(~/.ssh/**)".into()];
+        apply_config(&d, &config).await;
+        let ask = AgentChoice {
+            profile: Some("ci".into()),
+            ..Default::default()
+        };
+        let t = d
+            .fleet()
+            .queue_run("x".into(), spec(), None, Some(&ask), None)
+            .await
+            .unwrap();
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_ne!(t.state, TaskState::Failed, "{:?}", t.error);
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert!(
+            start.params["args"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("Read(~/.ssh/**)"))
+        );
+    }
+
+    /// A job's model is a template: the item's model when it has one, the
+    /// flock's when it renders empty, and an item error when `[models]`
+    /// lacks it.
+    #[tokio::test]
+    async fn a_jobs_model_comes_from_its_item() {
+        let (d, _tmp) = models_daemon(
+            Some("sonnet"),
+            vec![machine("pi", 4)],
+            &[("pi", 4, FakeHerdr::new())],
+        )
+        .await;
+        let config = models_config();
+        let _ = d.scheduler.sync_config().await;
+        let text = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nmodel = \"{{ item.model }}\"\nprompt = \"p\"\n";
+        let job = crate::config::job::Job::parse(
+            text,
+            "j",
+            &config.defaults,
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let queue = |item: serde_json::Value| {
+            let job = job.clone();
+            let fleet = d.fleet().clone();
+            async move {
+                fleet
+                    .queue_job_task(&job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                    .await
+            }
+        };
+        let t = queue(serde_json::json!({"key": "a", "model": "opus"}))
+            .await
+            .unwrap();
+        assert_eq!(t.model(), Some("opus"));
+        assert_eq!(
+            t.spec.agent_source.as_ref().unwrap().model_from.as_deref(),
+            Some("job j")
+        );
+        let t = queue(serde_json::json!({"key": "b"})).await.unwrap();
+        assert_eq!(t.model(), Some("sonnet"));
+        let err = queue(serde_json::json!({"key": "c", "model": "haiku"}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("model haiku is not in [models]"),
+            "{err:#}"
+        );
     }
 
     /// `personal` holds `own`, which runs `claude-personal`, and `plain`,
@@ -2457,10 +4715,13 @@ mod tests {
         )
         .await;
         let run = || IpcRequest::Run {
+            role: Default::default(),
+            description: None,
             prompt: "x".into(),
             spec: spec(),
             flock: None,
             agent: Some(AgentChoice::default()),
+            priority: None,
         };
         let mut seen = vec![];
         for _ in 0..2 {
@@ -2525,6 +4786,7 @@ mod tests {
                 pinned.clone(),
                 None,
                 Some(&AgentChoice::default()),
+                None,
             )
             .await
             .unwrap();
@@ -2538,7 +4800,7 @@ mod tests {
         };
         let t = d
             .fleet()
-            .queue_run("x".into(), pinned, None, Some(&asked))
+            .queue_run("x".into(), pinned, None, Some(&asked), None)
             .await
             .unwrap();
         assert_eq!(t.spec.agent, "aider");
@@ -2609,6 +4871,178 @@ mod tests {
         );
     }
 
+    /// The flock of `name` as the head's fleet reports it, `None` once it
+    /// is gone from the fleet.
+    fn fleet_flock_of(d: &Daemon, name: &str) -> Option<String> {
+        d.fleet()
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.flock)
+    }
+
+    /// `flock add`, `flock default`, `machine add|move|remove` go through the
+    /// head: it edits flock.toml with the CLI's own code, reloads, answers
+    /// `Text`, and its fleet matches the file afterwards.
+    #[tokio::test]
+    async fn fleet_edits_go_through_the_head() {
+        let (d, tmp) = daemon_with_flock(
+            home_and_work(),
+            &[
+                ("h", 2, FakeHerdr::new()),
+                ("w", 2, FakeHerdr::new()),
+                ("n", 2, FakeHerdr::new()),
+            ],
+        )
+        .await;
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let on_disk = || Flock::load(&paths.flock_file()).unwrap();
+        let text = |resp: IpcResponse| match resp {
+            IpcResponse::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+
+        let said = text(
+            d.handle(IpcRequest::FlockAdd {
+                description: None,
+                name: "spare".into(),
+                default: false,
+            })
+            .await,
+        );
+        assert!(said.starts_with("added flock spare; "), "{said}");
+        assert!(said.contains("picked it up"), "{said}");
+        assert!(on_disk().has_flock("spare"));
+        assert!(d.fleet().flock().has_flock("spare"));
+
+        let said = text(
+            d.handle(IpcRequest::FlockSetDefault {
+                name: "work".into(),
+            })
+            .await,
+        );
+        assert!(said.starts_with("work is the default flock"), "{said}");
+        assert_eq!(on_disk().default_flock(), "work");
+        assert_eq!(d.fleet().flock().default_flock(), "work");
+
+        let said = text(
+            d.handle(IpcRequest::MachineAdd {
+                machine: MachineConfig {
+                    flock: Some("spare".into()),
+                    ..machine("n", 2)
+                },
+            })
+            .await,
+        );
+        assert!(said.starts_with("added n to flock spare in "), "{said}");
+        assert!(on_disk().get("n").is_some());
+        wait_until("n in the fleet", || {
+            fleet_flock_of(&d, "n").as_deref() == Some("spare")
+        })
+        .await;
+
+        let said = text(
+            d.handle(IpcRequest::MachineMove {
+                name: "h".into(),
+                flock: "spare".into(),
+            })
+            .await,
+        );
+        assert!(said.starts_with("moved h to flock spare"), "{said}");
+        assert_eq!(on_disk().machine_flock("h"), Some("spare"));
+        assert_eq!(fleet_flock_of(&d, "h").as_deref(), Some("spare"));
+
+        let said = text(
+            d.handle(IpcRequest::MachineRemove { name: "w".into() })
+                .await,
+        );
+        assert!(said.starts_with("removed w; "), "{said}");
+        assert!(on_disk().get("w").is_none());
+        wait_until("w out of the fleet", || fleet_flock_of(&d, "w").is_none()).await;
+
+        // A refused edit keeps its code and leaves the file alone.
+        let before = std::fs::read_to_string(paths.flock_file()).unwrap();
+        for (req, code) in [
+            (
+                IpcRequest::FlockAdd {
+                    description: None,
+                    name: "spare".into(),
+                    default: false,
+                },
+                "flock_exists",
+            ),
+            (
+                IpcRequest::FlockSetDefault {
+                    name: "nope".into(),
+                },
+                "unknown_flock",
+            ),
+            (
+                IpcRequest::MachineAdd {
+                    machine: machine("h", 2),
+                },
+                "machine_exists",
+            ),
+            (
+                IpcRequest::MachineMove {
+                    name: "h".into(),
+                    flock: "nope".into(),
+                },
+                "unknown_flock",
+            ),
+            (
+                IpcRequest::MachineRemove {
+                    name: "nope".into(),
+                },
+                "unknown_machine",
+            ),
+        ] {
+            assert_eq!(error_code(d.handle(req).await), code);
+        }
+        assert_eq!(std::fs::read_to_string(paths.flock_file()).unwrap(), before);
+    }
+
+    /// `flock add --default` on a file with only the implicit flock keeps its
+    /// machines there while the head has tasks queued in it.
+    #[tokio::test]
+    async fn flock_add_default_through_the_head_sees_queued_tasks() {
+        let (d, _tmp) = daemon_with_flock(
+            Flock {
+                flocks: vec![],
+                machines: vec![machine("a", 1)],
+            },
+            &[("a", 1, FakeHerdr::new())],
+        )
+        .await;
+        let t = d
+            .store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "p".into(),
+                // Pinned to a machine the fleet lacks, so it stays queued.
+                spec: DispatchSpec {
+                    machine: Some("gone".into()),
+                    ..spec()
+                },
+                flock: crate::config::flock::DEFAULT_FLOCK.into(),
+            })
+            .unwrap();
+        let IpcResponse::Text(said) = d
+            .handle(IpcRequest::FlockAdd {
+                description: None,
+                name: "work".into(),
+                default: true,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert!(said.contains(&t.display_id()), "{said}");
+        assert_eq!(fleet_flock_of(&d, "a").as_deref(), Some("default"));
+    }
+
     /// A retry copies the flock of the task it retries. A failed task keeps
     /// its flock after `flock remove` (only queued tasks block that), so its
     /// retry is refused with `unknown_flock` rather than queued in a flock
@@ -2664,7 +5098,7 @@ mod tests {
                 let fleet = fleet.clone();
                 async move {
                     fleet
-                        .queue_run("x".into(), spec(), Some("spare"), None)
+                        .queue_run("x".into(), spec(), Some("spare"), None, None)
                         .await
                 }
             };
@@ -2696,6 +5130,66 @@ mod tests {
                     "{err:#}"
                 );
             }
+        }
+    }
+
+    /// A machine edit changes the file and the wanted flock in one step: a
+    /// `task run` that comes right after, before any reload, is refused for
+    /// the removed machine, and one queued for a moved machine lands in its
+    /// new flock. Before, the lock was released between the file edit and
+    /// the reload, and such a run queued against the old flock.
+    #[tokio::test]
+    async fn machine_edit_updates_the_wanted_flock_under_the_lock() {
+        let (d, tmp) = flocked_daemon().await;
+        let fleet = d.fleet();
+        let file = Paths::new(tmp.path().join("c"), tmp.path().join("s")).flock_file();
+        fleet
+            .edit_flock_file(&file, |f| crate::fleet_edit::move_machine(f, "w", "home"))
+            .await
+            .unwrap();
+        let t = fleet
+            .queue_run("x".into(), spec_on("w"), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(t.flock.as_deref(), Some("home"), "w moved to home");
+        fleet
+            .edit_flock_file(&file, |f| crate::fleet_edit::remove_machine(f, "w"))
+            .await
+            .unwrap();
+        let run = fleet
+            .queue_run("x".into(), spec_on("w"), None, None, None)
+            .await;
+        assert!(matches!(run, Err(QueueError::UnknownMachine(_))), "{run:?}");
+    }
+
+    /// An edit that leaves flock.toml naming a model `[models]` lacks keeps
+    /// the wanted flock as it was. The reload after it falls back to the
+    /// wanted flock, so publishing the edit would have kept the unknown model
+    /// in use instead of the previous flock.
+    #[tokio::test]
+    async fn flock_edit_with_an_unknown_model_keeps_the_wanted_flock() {
+        let (d, tmp) = flocked_daemon().await;
+        let fleet = d.fleet();
+        let file = Paths::new(tmp.path().join("c"), tmp.path().join("s")).flock_file();
+        let before = fleet.flock();
+        fleet
+            .edit_flock_file(&file, |f| {
+                let mut flock = Flock::load_existing(f)?;
+                flock.machines[0].model = Some("nope".into());
+                flock.save(f)
+            })
+            .await
+            .unwrap();
+        assert_eq!(fleet.flock(), before);
+        let err = d.scheduler.reload().await;
+        assert!(err.is_ok(), "{err:?}");
+        assert_eq!(fleet.flock(), before, "the reload kept the previous flock");
+    }
+
+    fn spec_on(machine: &str) -> DispatchSpec {
+        DispatchSpec {
+            machine: Some(machine.into()),
+            ..spec()
         }
     }
 
@@ -2757,6 +5251,7 @@ mod tests {
         let t = d
             .store()
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "p".into(),
@@ -2810,10 +5305,13 @@ mod tests {
         assert!(diff.is_empty(), "{diff:?}");
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: spec(),
                 flock: Some("home".into()),
                 agent: Some(AgentChoice::default()),
+                priority: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -2833,6 +5331,8 @@ mod tests {
         let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(false).await;
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     machine: Some("b".into()),
@@ -2840,6 +5340,7 @@ mod tests {
                 },
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         let IpcResponse::Error { code, .. } = resp else {
@@ -2904,10 +5405,13 @@ mod tests {
         let resp = crate::ipc::request(
             &socket,
             &IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             },
         )
         .await
@@ -2952,11 +5456,18 @@ mod tests {
     }
 
     fn run_hi() -> IpcRequest {
+        run_hi_as(TaskRole::Agent)
+    }
+
+    fn run_hi_as(role: TaskRole) -> IpcRequest {
         IpcRequest::Run {
+            role,
+            description: None,
             prompt: "hi".into(),
             spec: spec(),
             flock: None,
             agent: None,
+            priority: None,
         }
     }
 
@@ -3050,6 +5561,231 @@ mod tests {
             matches!(&resp, IpcResponse::Error { code, .. } if code == "task_not_live"),
             "{resp:?}"
         );
+    }
+
+    /// An orchestrator task, queued as a person would, and its agent name.
+    async fn orchestrator(d: &Daemon) -> String {
+        let IpcResponse::Task(t) = d.handle(run_hi_as(TaskRole::Orchestrator)).await else {
+            panic!("run failed")
+        };
+        assert_eq!(t.role, TaskRole::Orchestrator);
+        t.display_id()
+    }
+
+    fn code_of(resp: &IpcResponse) -> Option<&str> {
+        match resp {
+            IpcResponse::Error { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// A job file `name` in the head's jobs directory, enabled.
+    fn write_job(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        let file = paths.jobs_dir().join(format!("{name}.toml"));
+        std::fs::write(
+            &file,
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p {{ task.id }}\"\n",
+        )
+        .unwrap();
+        file
+    }
+
+    /// An orchestrator may run, retry and send to tasks and disable a job,
+    /// all from its own pane with `agents_change_fleet` off.
+    #[tokio::test]
+    async fn an_orchestrator_may_run_retry_send_and_disable() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        assert!(!d.fleet().agents_change_fleet());
+        let me = orchestrator(&d).await;
+        let own = me.as_str();
+
+        let resp = d.handle_from(run_hi(), Some(own)).await;
+        let IpcResponse::Task(worker) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(worker.role, TaskRole::Agent);
+
+        let send = IpcRequest::TaskSend {
+            id: worker.id,
+            input: crate::machine::SendInput {
+                text: Some("go on".into()),
+                enter: true,
+                ..Default::default()
+            },
+        };
+        let resp = d.handle_from(send, Some(own)).await;
+        assert_ne!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+
+        let mut failed = d.store.get_task(worker.id).unwrap().unwrap();
+        failed.state = TaskState::Failed;
+        d.store.update_task(&mut failed).unwrap();
+        let resp = d
+            .handle_from(
+                IpcRequest::TaskRetry {
+                    id: worker.id,
+                    place: None,
+                },
+                Some(own),
+            )
+            .await;
+        let IpcResponse::Task(retry) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(retry.retry_of, Some(worker.id));
+
+        let file = write_job(&tmp, "clock");
+        let resp = d
+            .handle_from(
+                IpcRequest::JobSetEnabled {
+                    name: "clock".into(),
+                    enabled: false,
+                },
+                Some(own),
+            )
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("enabled = false")
+        );
+    }
+
+    /// Everything else that changes the fleet is refused an orchestrator,
+    /// with a message that names the role; a plain agent is still refused
+    /// what an orchestrator may do.
+    #[tokio::test]
+    async fn an_orchestrator_is_refused_every_other_fleet_change() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let me = orchestrator(&d).await;
+        let IpcResponse::Task(worker) = d.handle(run_hi()).await else {
+            panic!("run failed")
+        };
+        let file = write_job(&tmp, "clock");
+        let refused = [
+            IpcRequest::FilePut {
+                file: "job:clock".into(),
+                text: String::new(),
+                base_hash: String::new(),
+            },
+            IpcRequest::MachineAdd {
+                machine: crate::config::flock::MachineConfig {
+                    name: "m".into(),
+                    local: true,
+                    ssh: None,
+                    command: None,
+                    session: "default".into(),
+                    max_agents: 1,
+                    job_slots: 1,
+                    burst: 1,
+                    tags: vec![],
+                    flock: None,
+                    agent: None,
+                    agent_args: None,
+                    model: None,
+                    priority: None,
+                    agents: Default::default(),
+                    profile: None,
+                    description: None,
+                },
+            },
+            IpcRequest::TaskClose {
+                id: worker.id,
+                remove_worktree: false,
+            },
+            IpcRequest::JobSetEnabled {
+                name: "clock".into(),
+                enabled: true,
+            },
+            IpcRequest::JobRun {
+                name: "clock".into(),
+            },
+            IpcRequest::Reload,
+        ];
+        for req in refused {
+            let resp = d.handle_from(req.clone(), Some(&me)).await;
+            let IpcResponse::Error { code, message } = resp else {
+                panic!("{req:?} was not refused: {resp:?}")
+            };
+            assert_eq!(code, "agent_refused", "{req:?}");
+            assert!(message.contains("orchestrator"), "{message}");
+            assert!(message.contains(&me), "{message}");
+        }
+        assert_eq!(
+            d.store.get_task(worker.id).unwrap().unwrap().state,
+            worker.state
+        );
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("enabled"));
+
+        let agent = worker.display_id();
+        let resp = d.handle_from(run_hi(), Some(&agent)).await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        let resp = d
+            .handle_from(
+                IpcRequest::JobSetEnabled {
+                    name: "clock".into(),
+                    enabled: false,
+                },
+                Some(&agent),
+            )
+            .await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        // A task the head does not know is a plain agent.
+        let resp = d.handle_from(run_hi(), Some("t-999")).await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+    }
+
+    /// No task makes an orchestrator, not an orchestrator and not with
+    /// `agents_change_fleet` on: neither with `--role orchestrator` nor by
+    /// retrying one. A person may.
+    #[tokio::test]
+    async fn only_a_person_makes_an_orchestrator() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        d.fleet().set_config(&PastorConfig {
+            agents_change_fleet: true,
+            ..test_config()
+        });
+        let me = orchestrator(&d).await;
+        let IpcResponse::Task(worker) = d.handle(run_hi()).await else {
+            panic!("run failed")
+        };
+        let run_orch = run_hi_as(TaskRole::Orchestrator);
+        for caller in [me.as_str(), &worker.display_id()] {
+            let resp = d.handle_from(run_orch.clone(), Some(caller)).await;
+            let IpcResponse::Error { code, message } = resp else {
+                panic!("{resp:?}")
+            };
+            assert_eq!(code, "role_refused");
+            assert!(message.contains("orchestrator"), "{message}");
+        }
+        let id = crate::task::parse_task_id(&me).unwrap();
+        let mut failed = d.store.get_task(id).unwrap().unwrap();
+        failed.state = TaskState::Failed;
+        d.store.update_task(&mut failed).unwrap();
+        let retry = IpcRequest::TaskRetry { id, place: None };
+        let resp = d
+            .handle_from(retry.clone(), Some(&worker.display_id()))
+            .await;
+        assert_eq!(code_of(&resp), Some("role_refused"), "{resp:?}");
+        let before = d.store.list_tasks(&TaskFilter::default()).unwrap().len();
+        assert_eq!(before, 2);
+        let IpcResponse::Task(again) = d.handle_from(retry, None).await else {
+            panic!("a person's retry failed")
+        };
+        assert_eq!(again.role, TaskRole::Orchestrator);
+        // With agents_change_fleet on, a plain agent may still close tasks.
+        let resp = d
+            .handle_from(
+                IpcRequest::TaskClose {
+                    id: worker.id,
+                    remove_worktree: false,
+                },
+                Some(&worker.display_id()),
+            )
+            .await;
+        assert_ne!(code_of(&resp), Some("agent_refused"), "{resp:?}");
     }
 
     /// The refusal names every operation it covers, so its advice holds for
@@ -3275,6 +6011,7 @@ mod tests {
             let store = Store::open(&paths.db_file()).unwrap();
             store
                 .insert_task(NewTask {
+                    description: None,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt: "p".into(),
@@ -3310,6 +6047,7 @@ mod tests {
         for p in ["1", "2"] {
             d.store()
                 .insert_task(NewTask {
+                    description: None,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt: p.into(),
@@ -3342,6 +6080,175 @@ mod tests {
             1,
             "one agent on a max_agents = 1 machine"
         );
+    }
+
+    /// A machine with max_agents = 1, one job slot and one burst: a second
+    /// `task run` task waits, a job task takes the job slot, and a critical
+    /// task goes past the full shared slot on burst.
+    #[tokio::test]
+    async fn dispatch_uses_job_slots_and_burst() {
+        let fake = FakeHerdr::new();
+        let flock = Flock {
+            flocks: vec![],
+            machines: vec![MachineConfig {
+                job_slots: 1,
+                burst: 1,
+                ..machine("a", 1)
+            }],
+        };
+        let (d, _tmp) = daemon_with_flock(flock, &[("a", 1, fake.clone())]).await;
+        let insert = |job: &str, p: &str| {
+            d.store()
+                .insert_task(NewTask {
+                    job: job.into(),
+                    item: serde_json::Value::Null,
+                    prompt: p.into(),
+                    spec: spec(),
+                    flock: "default".into(),
+                    description: None,
+                })
+                .unwrap()
+        };
+        let first = insert("run", "1");
+        let second = insert("run", "2");
+        let job = insert("nightly", "3");
+        let fleet = d.fleet();
+        fleet.dispatch_queued().await;
+        let state = |id: i64| d.store().get_task(id).unwrap().unwrap().state;
+        assert_eq!(state(first.id), TaskState::Running);
+        assert_eq!(state(second.id), TaskState::Queued, "held at max_agents");
+        assert_eq!(state(job.id), TaskState::Running, "in the job slot");
+
+        let critical = insert("run", "4");
+        d.store()
+            .set_priority(critical.id, Priority::Critical, "test")
+            .unwrap();
+        fleet.dispatch_queued().await;
+        assert_eq!(state(critical.id), TaskState::Running, "on burst");
+        assert_eq!(state(second.id), TaskState::Queued);
+        assert_eq!(fake.agents().len(), 3);
+    }
+
+    /// `FileGet` and `FilePut` act on the head's own files, named only as
+    /// `flock`, `config` or `job:<name>`, and write only a valid edit made
+    /// from the file as it is now.
+    #[tokio::test]
+    async fn file_requests_edit_the_heads_files() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        let job = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p {{ task.id }}\"\n";
+        let file = paths.jobs_dir().join("clock.toml");
+        std::fs::write(&file, job).unwrap();
+        let code = |r: IpcResponse| match r {
+            IpcResponse::Error { code, .. } => code,
+            other => panic!("{other:?}"),
+        };
+        for bad in ["/etc/passwd", "job:../pastor", "jobs"] {
+            let r = d.handle(IpcRequest::FileGet { file: bad.into() }).await;
+            assert!(
+                ["invalid_file", "job_not_found"].contains(&code(r).as_str()),
+                "{bad}"
+            );
+        }
+        let r = d
+            .handle(IpcRequest::FileGet {
+                file: "job:ghost".into(),
+            })
+            .await;
+        assert_eq!(code(r), "job_not_found");
+
+        let IpcResponse::File(got) = d
+            .handle(IpcRequest::FileGet {
+                file: "job:clock".into(),
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(got.text, job);
+        assert_eq!(got.hash, crate::edit::hash(job));
+        let put = |text: &str, base_hash: &str| IpcRequest::FilePut {
+            file: "job:clock".into(),
+            text: text.into(),
+            base_hash: base_hash.into(),
+        };
+        let r = d.handle(put(&job.replace("1h", "soon"), &got.hash)).await;
+        assert_eq!(code(r), "invalid_edit");
+        let r = d
+            .handle(put(&job.replace("1h", "2h"), &crate::edit::hash("old")))
+            .await;
+        assert_eq!(code(r), "edit_conflict");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), job);
+        let IpcResponse::Text(msg) = d.handle(put(&job.replace("1h", "2h"), &got.hash)).await
+        else {
+            panic!()
+        };
+        assert!(msg.starts_with("saved "), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            job.replace("1h", "2h")
+        );
+    }
+
+    /// `JobTask`, from a headless serve: rendered with this head's id,
+    /// queued as that job's task and dispatched, its key seen here too; an
+    /// item seen already answers its task again, or `already_seen` once
+    /// that is gone; one that would climb out of its branch is refused.
+    #[tokio::test]
+    async fn a_job_task_is_rendered_queued_and_dispatched_here() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let req = |key: &str, branch: Option<&str>| IpcRequest::JobTask {
+            description: None,
+            job: "sweep".into(),
+            flock: None,
+            agent: AgentChoice::default(),
+            prompt: "sweep {{ item.key }} for {{ job.name }} as {{ task.id }}".into(),
+            spec: crate::task::DispatchSpec {
+                repo: Some("/tmp".into()),
+                branch: branch.map(Into::into),
+                ..spec()
+            },
+            item: serde_json::json!({ "key": key }),
+        };
+        let IpcResponse::Task(t) = d.handle(req("k1", None)).await else {
+            panic!()
+        };
+        assert_eq!(t.job, "sweep");
+        assert_eq!(t.prompt, format!("sweep k1 for sweep as t-{}", t.id));
+        assert_eq!(t.state, TaskState::Running);
+        assert!(d.store().is_seen("sweep", "k1").unwrap());
+        // A resubmitted key, as after a lost reply, gets the same task back.
+        let IpcResponse::Task(again) = d.handle(req("k1", None)).await else {
+            panic!()
+        };
+        assert_eq!(again.id, t.id);
+        assert_eq!(
+            d.store().list_tasks(&TaskFilter::default()).unwrap().len(),
+            1
+        );
+        d.store().mark_seen("sweep", "gone", None).unwrap();
+        assert_eq!(
+            error_code(d.handle(req("gone", None)).await),
+            crate::ipc::ALREADY_SEEN
+        );
+        assert_eq!(
+            error_code(d.handle(req("..", Some("b/{{ item.key }}"))).await),
+            "item_rejected"
+        );
+        let IpcRequest::JobTask { spec, .. } = req("k2", None) else {
+            panic!()
+        };
+        let keyless = IpcRequest::JobTask {
+            description: None,
+            job: "sweep".into(),
+            flock: None,
+            agent: AgentChoice::default(),
+            prompt: "p".into(),
+            spec,
+            item: serde_json::json!({}),
+        };
+        assert_eq!(error_code(d.handle(keyless).await), "invalid_request");
     }
 
     #[tokio::test]
@@ -3442,6 +6349,7 @@ mod tests {
         let mut t = d
             .store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "p".into(),
@@ -3482,16 +6390,44 @@ mod tests {
         assert_ne!(settings, machine_settings(&test_config()));
     }
 
+    /// Agents on other machines are told where the head is; those on the
+    /// head's own machine use its socket, and with no `head_address` nobody
+    /// is told.
+    #[test]
+    fn only_agents_off_the_head_machine_get_the_head_address() {
+        let machine = |text: &str| -> MachineConfig {
+            toml::from_str(&format!("name = \"m\"\n{text}")).unwrap()
+        };
+        let local = machine("local = true");
+        let remote = machine("ssh = \"pi\"");
+        let config = PastorConfig {
+            head_address: Some("user@head.example".into()),
+            ..test_config()
+        };
+        let settings = machine_settings(&config);
+        assert_eq!(
+            actor_settings(&remote, &settings).head_address.as_deref(),
+            Some("user@head.example")
+        );
+        assert_eq!(actor_settings(&local, &settings).head_address, None);
+        let unset = machine_settings(&test_config());
+        assert_eq!(actor_settings(&remote, &unset).head_address, None);
+        assert_eq!(actor_settings(&local, &unset).head_address, None);
+    }
+
     #[tokio::test]
     async fn task_send_reaches_a_live_task_and_refuses_the_rest() {
         let fake = FakeHerdr::new();
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -3621,10 +6557,13 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -3652,10 +6591,13 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -4016,6 +6958,8 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     worktree: true,
@@ -4023,6 +6967,7 @@ mod tests {
                 },
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         assert_eq!(error_code(resp), "worktree_needs_repo");

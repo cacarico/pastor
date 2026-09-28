@@ -8,14 +8,22 @@ use crate::config::AgentChoice;
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::store::TaskFilter;
-use crate::task::{DispatchSpec, Task, TaskState};
+use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 
 /// The head's IPC protocol, answered in `Pong`. Bumped when a request gains a
 /// field an older head would silently ignore (serde skips unknown fields), so
 /// the CLI can refuse to send it there. A head that answers no protocol is 0.
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`). 2: flock agents and tool
-/// lists. 3: `TaskRetry::place`. 4: `EventsSince`.
-pub const IPC_PROTOCOL: u32 = 4;
+/// lists. 3: `TaskRetry::place`. 4: `EventsSince`. 5: flock and machine
+/// edits (`FLEET_EDIT_PROTOCOL`). 6: `FileGet`, `FilePut`, `JobDescribe`,
+/// `JobSetEnabled`. 7: `JobSubmit`. 8: named models (`AgentChoice::model`).
+/// 9: `JobTask`, and `Pong::role`. 10: `TrustList`, `TrustAdd`,
+/// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. 11: task priority
+/// (`Run::priority`, `TaskPriority`). 12: `Run::role`. 13: permission
+/// profiles (`AgentChoice::profile`). 14: `Queue` and `QueueMove`. 15:
+/// descriptions (`Run::description`, `FlockAdd::description`,
+/// `JobTask::description`).
+pub const IPC_PROTOCOL: u32 = 15;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -24,6 +32,10 @@ pub const IPC_PROTOCOL: u32 = 4;
 /// against an agent acting on its own, not a boundary: the agent runs as the
 /// same user and can unset it.
 pub const TASK_ENV: &str = "PASTOR_TASK";
+
+/// Set in an agent's pane on a machine other than the head's: the ssh
+/// destination (`head_address` in pastor.toml) that reaches the head.
+pub const HEAD_ENV: &str = "PASTOR_HEAD";
 
 /// The field beside a request's own that names the task it comes from.
 pub const FROM_TASK_FIELD: &str = "from_task";
@@ -44,6 +56,77 @@ pub const PLACE_PROTOCOL: u32 = 3;
 /// to read the request and answers an error.
 pub const EVENTS_PROTOCOL: u32 = 4;
 
+/// The first protocol whose head edits flock.toml itself for `flock
+/// add|default` and `machine add|remove|move`. An older one does not know
+/// those requests.
+pub const FLEET_EDIT_PROTOCOL: u32 = 5;
+/// The first protocol whose head takes `FileGet`, `FilePut`, `JobDescribe`
+/// and `JobSetEnabled`. An older one refuses them as unknown requests.
+pub const FILE_PROTOCOL: u32 = 6;
+/// The first protocol whose head takes `JobTask`, what a headless serve
+/// sends for each item its jobs find. An older one refuses it as unknown.
+pub const SHEPHERD_PROTOCOL: u32 = 9;
+
+/// `Pong::role` of a headless `pastor serve`: it runs this machine's jobs
+/// and hooks against a head elsewhere, and is not a head itself.
+pub const SHEPHERD_ROLE: &str = "shepherd";
+
+/// The error code a head answers a `JobTask` with when it queued that
+/// job's key before and the task row is gone; a live row is answered
+/// again instead.
+pub const ALREADY_SEEN: &str = "already_seen";
+
+/// The first protocol whose head answers `TrustList`, `TrustAdd`,
+/// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. An older one reads
+/// them as an unknown request and answers `invalid_request`, so the CLI
+/// refuses it with `head_too_old` first.
+pub const HEAD_READS_PROTOCOL: u32 = 10;
+
+/// The first protocol whose head honours `Run::role`. An older one would
+/// queue a plain agent and say it succeeded.
+pub const ROLE_PROTOCOL: u32 = 12;
+
+/// The first protocol whose head keeps what `task run --description`,
+/// `flock add --description` and `machine add --description` send. An older
+/// one would drop it without a word.
+pub const DESCRIPTION_PROTOCOL: u32 = 14;
+
+/// The first protocol whose head knows `JobSubmit`. An older one refuses the
+/// request as unreadable; `check_protocol` says why before it is sent.
+pub const JOB_SUBMIT_PROTOCOL: u32 = 7;
+
+/// The first protocol whose head runs a task's named model (`--model`, a
+/// flock's or job's `model`). An older one would drop it and start the agent
+/// on its default model without a word.
+pub const MODEL_PROTOCOL: u32 = 8;
+
+/// The first protocol whose head honours `Run::priority` and knows
+/// `TaskPriority`. An older one would queue the task at its own level
+/// without a word, or refuse the request as unreadable.
+pub const PRIORITY_PROTOCOL: u32 = 11;
+
+/// The first protocol whose head runs a task under its permission profile
+/// (`--profile`, a job's, machine's or flock's `profile`). An older one
+/// would drop it and start the agent asking before every tool, or with
+/// fewer denies, without a word.
+pub const PROFILE_PROTOCOL: u32 = 13;
+
+/// The first protocol whose head knows `Queue` and `QueueMove`; an older
+/// one refuses them as unreadable.
+pub const QUEUE_PROTOCOL: u32 = 14;
+
+/// `head_too_old` unless the head (its version and protocol, from `Pong`)
+/// speaks at least `needed`; `what` names what the older head lacks.
+pub fn check_protocol(version: &str, protocol: u32, needed: u32, what: &str) -> anyhow::Result<()> {
+    if protocol >= needed {
+        return Ok(());
+    }
+    Err(crate::cli::CliError::err(
+        "head_too_old",
+        format!("the running pastor serve ({version}) predates {what}; restart it"),
+    ))
+}
+
 // One request is read per connection and dropped once answered, so the
 // size of the largest variant (`Run`) costs nothing worth a box.
 #[allow(clippy::large_enum_variant)]
@@ -62,6 +145,20 @@ pub enum IpcRequest {
         /// client that predates it: `spec` already holds the agent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<AgentChoice>,
+        /// `--priority`; `None` lets the pinned machine, the flock or
+        /// `[defaults]` set the level. Left out when not given, so an older
+        /// head still reads the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<crate::task::Priority>,
+        /// The task's role (`task run --role`). Left out for a plain agent,
+        /// so an older head still reads the request; given, the CLI sends it
+        /// only to a head of `ROLE_PROTOCOL` or later.
+        #[serde(default, skip_serializing_if = "TaskRole::is_agent")]
+        role: TaskRole,
+        /// `task run --description`, trimmed; `None` reads as the prompt's
+        /// first line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     List {
         filter: TaskFilter,
@@ -79,6 +176,34 @@ pub enum IpcRequest {
     FlockRemove {
         name: String,
     },
+    /// `flock add`, done by the head so the queued-task check and the edit
+    /// are one step against `Run`, as for `FlockRemove`. Answers `Text`.
+    FlockAdd {
+        name: String,
+        default: bool,
+        /// `flock add --description`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// `flock default`. Answers `Text`.
+    FlockSetDefault {
+        name: String,
+    },
+    /// `machine add`, the flock.toml part; `--herdr` stays with the CLI,
+    /// whose herdr it is. Answers `Text`.
+    MachineAdd {
+        machine: crate::config::flock::MachineConfig,
+    },
+    /// `machine remove`, the flock.toml part, as for `MachineAdd`. Answers
+    /// `Text`.
+    MachineRemove {
+        name: String,
+    },
+    /// `machine move`. Answers `Text`.
+    MachineMove {
+        name: String,
+        flock: String,
+    },
     /// One scheduler pass now; `job` forces that job regardless of schedule.
     Tick {
         job: Option<String>,
@@ -87,7 +212,8 @@ pub enum IpcRequest {
     /// Re-read the jobs directory now.
     Reload,
     JobList,
-    /// Fire a job now, ignoring schedule, overlap and `enabled`.
+    /// Fire a job now, ignoring schedule and `enabled`; it waits for a run
+    /// already going.
     JobRun {
         name: String,
     },
@@ -101,6 +227,28 @@ pub enum IpcRequest {
         /// of `PLACE_PROTOCOL` or later.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         place: Option<crate::task::Place>,
+    },
+    /// Put a queued task at another level (`task priority`). Refused
+    /// `not_queued` for a task that has left the queue. Answers `Task`.
+    TaskPriority {
+        id: i64,
+        priority: crate::task::Priority,
+    },
+    /// The queued tasks in dispatch order, each with why it waits
+    /// (`pastor queue`); `flock` and `machine` keep a flock's tasks or the
+    /// ones pinned to a machine. Answers `Queue`.
+    Queue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flock: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<String>,
+    },
+    /// Put a queued task elsewhere in the queue (`pastor queue move`).
+    /// Refused `not_queued` when it, or the task it goes before or after,
+    /// has left the queue. Answers `Moved`.
+    QueueMove {
+        id: i64,
+        to: crate::queue::QueueSpot,
     },
     /// Close the task's pane (or, with `remove_worktree`, its worktree) and
     /// mark it closed. Answers `Task`, or `Text` for an orphaned agent with no
@@ -138,6 +286,82 @@ pub enum IpcRequest {
         states: Vec<TaskState>,
         older_than_secs: u64,
     },
+    /// The text of one of the head's config files, `flock`, `config` or
+    /// `job:<name>` (`edit::ConfigFile`), with its hash. Answers `File`.
+    FileGet {
+        file: String,
+    },
+    /// Replace one of the head's config files with `text`, through
+    /// `edit::put`: refused `invalid_edit` when the head would not load it,
+    /// `edit_conflict` when the file's hash is no longer `base_hash`. A saved
+    /// file reloads the head. Answers `Text`.
+    FilePut {
+        file: String,
+        text: String,
+        base_hash: String,
+    },
+    /// What `job describe --json` prints, from the head's files. Answers
+    /// `Job`.
+    JobDescribe {
+        name: String,
+    },
+    /// `job enable|disable` on the head's job file, then a reload. Answers
+    /// `Text`.
+    JobSetEnabled {
+        name: String,
+        enabled: bool,
+    },
+    /// Items another machine's job found, to become tasks here: the head
+    /// keeps the `seen` keys, so no item is queued twice. `dispatch` is the
+    /// job file's `[dispatch]` table and `prompt` its template; each item is
+    /// an object with a string `key`. Refused with `job_name_taken` when the
+    /// head has a job file of that name. Answers `JobSubmitted`.
+    JobSubmit {
+        job: String,
+        dispatch: serde_json::Value,
+        prompt: String,
+        items: Vec<serde_json::Value>,
+    },
+    /// One item a headless serve's job found, queued as that job's task on
+    /// the head. `prompt` and `spec` are the job's unrendered templates: the
+    /// head renders them with the id it gives the task, and resolves the
+    /// agent from `agent` and `flock` as it would for its own job. Answers
+    /// `Task`.
+    JobTask {
+        job: String,
+        #[serde(default)]
+        flock: Option<String>,
+        agent: AgentChoice,
+        prompt: String,
+        spec: DispatchSpec,
+        item: serde_json::Value,
+        /// The job's `[dispatch] description` template, rendered on the
+        /// head like `prompt`. A head that predates it gives the task none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Every saved folder trust. Answers `Trusted`.
+    TrustList,
+    /// Save `repo` on `machine` as trusted. Answers `Text`.
+    TrustAdd {
+        machine: String,
+        repo: String,
+    },
+    /// Forget a saved trust. Answers `Text`, or `not_trusted`.
+    TrustRemove {
+        machine: String,
+        repo: String,
+    },
+    /// `flock describe`, from the flock the head last applied. Answers
+    /// `FlockDescription`.
+    FlockDescribe {
+        name: String,
+    },
+    /// `machine describe`, from the head's machines. Answers
+    /// `MachineDescription`.
+    MachineDescribe {
+        name: String,
+    },
 }
 
 impl IpcRequest {
@@ -153,17 +377,50 @@ impl IpcRequest {
             | IpcRequest::TaskRead { .. }
             | IpcRequest::FlockList
             | IpcRequest::JobList
-            | IpcRequest::EventsSince { .. } => false,
+            | IpcRequest::EventsSince { .. }
+            | IpcRequest::TrustList
+            | IpcRequest::FlockDescribe { .. }
+            | IpcRequest::MachineDescribe { .. }
+            | IpcRequest::Queue { .. } => false,
+            IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
             | IpcRequest::Tick { .. }
             | IpcRequest::Run { .. }
             | IpcRequest::FlockRemove { .. }
+            | IpcRequest::FlockAdd { .. }
+            | IpcRequest::FlockSetDefault { .. }
+            | IpcRequest::MachineAdd { .. }
+            | IpcRequest::MachineRemove { .. }
+            | IpcRequest::MachineMove { .. }
             | IpcRequest::JobRun { .. }
             | IpcRequest::TaskRetry { .. }
+            | IpcRequest::TaskPriority { .. }
+            | IpcRequest::QueueMove { .. }
             | IpcRequest::TaskClose { .. }
             | IpcRequest::TaskSend { .. }
             | IpcRequest::TaskDone { .. }
-            | IpcRequest::TaskPrune { .. } => true,
+            | IpcRequest::TaskPrune { .. }
+            | IpcRequest::FilePut { .. }
+            | IpcRequest::JobSetEnabled { .. }
+            | IpcRequest::JobSubmit { .. }
+            | IpcRequest::JobTask { .. }
+            | IpcRequest::TrustAdd { .. }
+            | IpcRequest::TrustRemove { .. } => true,
+        }
+    }
+
+    /// Whether an orchestrator task (`TaskRole::Orchestrator`) may make this
+    /// change without `agents_change_fleet`: run, retry and type into tasks,
+    /// and disable a job. One arm per request, so adding one is one line.
+    /// Making another orchestrator is refused apart from this, whoever asks
+    /// from inside a task (`Daemon::handle_from`).
+    pub fn orchestrator_may(&self) -> bool {
+        match self {
+            IpcRequest::Run { .. } => true,
+            IpcRequest::TaskRetry { .. } => true,
+            IpcRequest::TaskSend { .. } => true,
+            IpcRequest::JobSetEnabled { enabled, .. } => !enabled,
+            _ => false,
         }
     }
 
@@ -236,6 +493,9 @@ pub enum IpcResponse {
         /// `IPC_PROTOCOL` of the head; missing from a head older than it.
         #[serde(default)]
         protocol: u32,
+        /// `SHEPHERD_ROLE` from a headless serve; absent from a head.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
     },
     Task(Task),
     Tasks(Vec<Task>),
@@ -249,6 +509,31 @@ pub enum IpcResponse {
     Jobs(Vec<JobStatus>),
     Pruned(crate::store::PruneOutcome),
     Events(crate::events::EventsPage),
+    File(FileText),
+    Job(crate::describe::JobDescription),
+    /// `JobSubmit`'s outcome: the tasks queued, the keys already seen (or
+    /// repeated in the request), and each item refused with its reason.
+    JobSubmitted {
+        tasks: Vec<Task>,
+        skipped: Vec<String>,
+        refused: Vec<(String, String)>,
+    },
+    Trusted(Vec<crate::store::TrustedRepo>),
+    FlockDescription(crate::describe::FlockDescription),
+    MachineDescription(crate::describe::MachineDescription),
+    Queue(Vec<crate::queue::QueueEntry>),
+    Moved(crate::store::Moved),
+}
+
+/// One of the head's config files as `FileGet` found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileText {
+    /// Where it is on the head, for messages and the editor's temp copy.
+    pub path: String,
+    /// Empty for a missing flock.toml or pastor.toml.
+    pub text: String,
+    /// `edit::hash` of `text`, to send back as `FilePut::base_hash`.
+    pub hash: String,
 }
 
 impl IpcResponse {
@@ -287,6 +572,54 @@ pub enum RequestError {
     /// malformed reply.
     #[error(transparent)]
     Exchange(anyhow::Error),
+    /// A remote head (`head::RemoteHead`): ssh exited with no reply. The
+    /// message carries ssh's stderr.
+    #[error("{0}")]
+    Unreachable(String),
+    /// A remote head: `pastor bridge` answered with an error of its own
+    /// (`no_head`) instead of the head's reply.
+    #[error("{message}")]
+    Refused { code: String, message: String },
+}
+
+static REMOTE_HEAD: std::sync::OnceLock<Option<crate::head::RemoteHead>> =
+    std::sync::OnceLock::new();
+
+/// Sets the head this process's requests go to over ssh. Only the `pastor`
+/// binary calls it, once, from `--head`, `PASTOR_HEAD` or client.toml.
+pub fn set_remote_head(head: Option<crate::head::RemoteHead>) {
+    let _ = REMOTE_HEAD.set(head);
+}
+
+/// The remote head `set_remote_head` left, if any.
+pub fn remote_head() -> Option<&'static crate::head::RemoteHead> {
+    REMOTE_HEAD.get().and_then(Option::as_ref)
+}
+
+/// One request to the head, wherever it is: over ssh to a remote head when
+/// one is set, else to this machine's socket. Every CLI request goes through
+/// here.
+pub async fn request_head(
+    paths: &crate::config::Paths,
+    req: &IpcRequest,
+) -> Result<IpcResponse, RequestError> {
+    request_head_with_timeout(paths, req, DEFAULT_REQUEST_TIMEOUT).await
+}
+
+/// `request_head` with its own bound on the round trip.
+pub async fn request_head_with_timeout(
+    paths: &crate::config::Paths,
+    req: &IpcRequest,
+    timeout: Duration,
+) -> Result<IpcResponse, RequestError> {
+    match remote_head() {
+        Some(head) => {
+            let line =
+                request_line(req, caller_task().as_deref()).map_err(RequestError::Exchange)?;
+            head.request(&line, timeout).await
+        }
+        None => request_with_timeout(&paths.socket_file(), req, timeout).await,
+    }
 }
 
 /// One request, one reply, then the connection closes. Bounded by
@@ -406,7 +739,11 @@ pub fn connect_error_means_no_daemon(err: &std::io::Error) -> bool {
 pub enum HeadPing {
     NotRunning,
     Unresponsive,
-    Pong { version: String, protocol: u32 },
+    Pong {
+        version: String,
+        protocol: u32,
+        role: Option<String>,
+    },
 }
 
 pub async fn ping_head(socket: &Path) -> HeadPing {
@@ -416,7 +753,15 @@ pub async fn ping_head(socket: &Path) -> HeadPing {
         Err(_) => return HeadPing::Unresponsive,
     };
     match tokio::time::timeout(PING_TIMEOUT, round_trip(stream, &IpcRequest::Ping)).await {
-        Ok(Ok(IpcResponse::Pong { version, protocol })) => HeadPing::Pong { version, protocol },
+        Ok(Ok(IpcResponse::Pong {
+            version,
+            protocol,
+            role,
+        })) => HeadPing::Pong {
+            version,
+            protocol,
+            role,
+        },
         _ => HeadPing::Unresponsive,
     }
 }
@@ -502,6 +847,7 @@ mod tests {
     fn minimal_task() -> Task {
         let now = chrono::Utc::now();
         Task {
+            description: None,
             id: 1,
             job: "run".into(),
             item: serde_json::Value::Null,
@@ -521,6 +867,7 @@ mod tests {
                 reopen: None,
                 agent_source: None,
                 place: Default::default(),
+                session_id: None,
             },
             machine: None,
             workspace_id: None,
@@ -533,11 +880,15 @@ mod tests {
             activity_seen: false,
             ended: false,
             retry_of: None,
+            priority: Default::default(),
+            priority_from: None,
+            queue_pos: 0,
             created_at: now,
             started_at: None,
             finished_at: None,
             updated_at: now,
             flock: None,
+            role: Default::default(),
         }
     }
 
@@ -553,6 +904,7 @@ mod tests {
             IpcResponse::Pong {
                 version: "1".into(),
                 protocol: IPC_PROTOCOL,
+                role: Some(SHEPHERD_ROLE.into()),
             },
             IpcResponse::Task(minimal_task()),
             IpcResponse::Tasks(vec![minimal_task()]),
@@ -573,10 +925,22 @@ mod tests {
                     job: Some("run".into()),
                     machine: None,
                     detail: None,
+                    model: None,
                 }],
                 gap: false,
                 oldest: Some(812),
+                newest: Some(812),
             }),
+            IpcResponse::File(FileText {
+                path: "/c/flock.toml".into(),
+                text: "a = 1\n".into(),
+                hash: "00".into(),
+            }),
+            IpcResponse::JobSubmitted {
+                tasks: vec![minimal_task()],
+                skipped: vec!["k1".into()],
+                refused: vec![("k2".into(), "max_tasks_per_run".into())],
+            },
             IpcResponse::error("some_code", "some message"),
         ];
         for resp in responses {
@@ -596,6 +960,19 @@ mod tests {
             IpcRequest::Reload,
             IpcRequest::JobList,
             IpcRequest::JobRun { name: "j".into() },
+            IpcRequest::FileGet {
+                file: "job:j".into(),
+            },
+            IpcRequest::FilePut {
+                file: "config".into(),
+                text: "tick = \"5s\"\n".into(),
+                base_hash: "ab".into(),
+            },
+            IpcRequest::JobDescribe { name: "j".into() },
+            IpcRequest::JobSetEnabled {
+                name: "j".into(),
+                enabled: true,
+            },
         ] {
             let json = serde_json::to_string(&req).unwrap();
             let back: IpcRequest = serde_json::from_str(&json).unwrap();
@@ -680,16 +1057,45 @@ mod tests {
                 limit: 10,
                 task: None,
             },
+            IpcRequest::FileGet {
+                file: "flock".into(),
+            },
+            IpcRequest::JobDescribe { name: "j".into() },
+            IpcRequest::TrustList,
+            IpcRequest::FlockDescribe { name: "f".into() },
+            IpcRequest::MachineDescribe { name: "m".into() },
+            IpcRequest::Queue {
+                flock: Some("work".into()),
+                machine: None,
+            },
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
         }
-        let changes = [
+        for req in fleet_changes() {
+            assert!(req.changes_fleet(), "{req:?}");
+        }
+    }
+
+    /// One of every request that changes the fleet.
+    fn fleet_changes() -> Vec<IpcRequest> {
+        vec![
             IpcRequest::Run {
+                description: None,
                 prompt: "p".into(),
                 spec: minimal_task().spec,
                 flock: None,
                 agent: None,
+                priority: None,
+                role: TaskRole::Agent,
+            },
+            IpcRequest::TaskPriority {
+                id: 1,
+                priority: crate::task::Priority::High,
+            },
+            IpcRequest::QueueMove {
+                id: 1,
+                to: crate::queue::QueueSpot::Before(2),
             },
             IpcRequest::TaskSend {
                 id: 1,
@@ -705,6 +1111,38 @@ mod tests {
                 older_than_secs: 0,
             },
             IpcRequest::FlockRemove { name: "f".into() },
+            IpcRequest::FlockAdd {
+                description: None,
+                name: "f".into(),
+                default: false,
+            },
+            IpcRequest::FlockSetDefault { name: "f".into() },
+            IpcRequest::MachineAdd {
+                machine: crate::config::flock::MachineConfig {
+                    description: None,
+                    name: "m".into(),
+                    local: true,
+                    ssh: None,
+                    command: None,
+                    session: "default".into(),
+                    max_agents: 1,
+                    job_slots: 1,
+                    burst: 1,
+                    tags: vec![],
+                    flock: None,
+                    agent: None,
+                    agent_args: None,
+                    model: None,
+                    priority: None,
+                    agents: Default::default(),
+                    profile: None,
+                },
+            },
+            IpcRequest::MachineRemove { name: "m".into() },
+            IpcRequest::MachineMove {
+                name: "m".into(),
+                flock: "f".into(),
+            },
             IpcRequest::Tick {
                 job: None,
                 dry_run: false,
@@ -715,10 +1153,92 @@ mod tests {
             },
             IpcRequest::Reload,
             IpcRequest::JobRun { name: "j".into() },
-        ];
-        for req in changes {
-            assert!(req.changes_fleet(), "{req:?}");
+            IpcRequest::FilePut {
+                file: "job:j".into(),
+                text: String::new(),
+                base_hash: String::new(),
+            },
+            IpcRequest::JobSetEnabled {
+                name: "j".into(),
+                enabled: false,
+            },
+            IpcRequest::JobSetEnabled {
+                name: "j".into(),
+                enabled: true,
+            },
+            IpcRequest::JobSubmit {
+                job: "j".into(),
+                dispatch: serde_json::Value::Null,
+                prompt: "p".into(),
+                items: vec![],
+            },
+            IpcRequest::TrustAdd {
+                machine: "m".into(),
+                repo: "/r".into(),
+            },
+            IpcRequest::TrustRemove {
+                machine: "m".into(),
+                repo: "/r".into(),
+            },
+        ]
+    }
+
+    /// An orchestrator may run, retry and type into tasks and disable a job,
+    /// and nothing else that changes the fleet: not `task close`, not a job
+    /// enabled, not a file or machine edit.
+    #[test]
+    fn an_orchestrator_may_make_exactly_the_specs_changes() {
+        for req in fleet_changes() {
+            let allowed = matches!(
+                req,
+                IpcRequest::Run { .. }
+                    | IpcRequest::TaskRetry { .. }
+                    | IpcRequest::TaskSend { .. }
+                    | IpcRequest::JobSetEnabled { enabled: false, .. }
+            );
+            assert_eq!(req.orchestrator_may(), allowed, "{req:?}");
         }
+        assert!(
+            !IpcRequest::JobSetEnabled {
+                name: "j".into(),
+                enabled: true
+            }
+            .orchestrator_may()
+        );
+        assert!(
+            !IpcRequest::TaskClose {
+                id: 1,
+                remove_worktree: false
+            }
+            .orchestrator_may()
+        );
+    }
+
+    /// A plain agent's `Run` leaves `role` out, so an older head reads it;
+    /// an orchestrator's names it, and both read back.
+    #[test]
+    fn run_names_its_role_only_when_not_a_plain_agent() {
+        let run = |role| IpcRequest::Run {
+            prompt: "p".into(),
+            spec: minimal_task().spec,
+            flock: None,
+            agent: None,
+            priority: None,
+            role,
+            description: None,
+        };
+        let v = serde_json::to_value(run(TaskRole::Agent)).unwrap();
+        assert!(v.get("role").is_none(), "{v}");
+        let v = serde_json::to_value(run(TaskRole::Orchestrator)).unwrap();
+        assert_eq!(v["role"], "orchestrator");
+        let back: IpcRequest = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            IpcRequest::Run {
+                role: TaskRole::Orchestrator,
+                ..
+            }
+        ));
     }
 
     /// The CLI tells the head which task it runs in, beside the request's
@@ -740,6 +1260,26 @@ mod tests {
         let (_, from) = parse_request_line(line.trim()).unwrap();
         assert_eq!(from, None);
         assert!(parse_request_line("not json").is_err());
+    }
+
+    /// A client refuses to send `JobSubmit` to a head older than
+    /// `JOB_SUBMIT_PROTOCOL`, which would not read it.
+    #[test]
+    fn an_older_head_is_too_old_to_submit_to() {
+        let err = check_protocol("0.5.0", 3, JOB_SUBMIT_PROTOCOL, "job submit").unwrap_err();
+        let err = err.downcast_ref::<crate::cli::CliError>().unwrap();
+        assert_eq!(err.code, "head_too_old");
+        assert!(err.message.contains("0.5.0"), "{}", err.message);
+        assert!(check_protocol("0.6.0", IPC_PROTOCOL, JOB_SUBMIT_PROTOCOL, "job submit").is_ok());
+        let v = serde_json::to_value(IpcRequest::JobSubmit {
+            job: "j".into(),
+            dispatch: serde_json::json!({"repo": "r"}),
+            prompt: "p".into(),
+            items: vec![serde_json::json!({"key": "k"})],
+        })
+        .unwrap();
+        assert_eq!(v["op"], "job_submit");
+        assert_eq!(v["items"][0]["key"], "k");
     }
 
     #[tokio::test]

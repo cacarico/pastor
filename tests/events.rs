@@ -25,6 +25,7 @@ fn task(id: i64) -> Task {
     let store = Store::open_in_memory().unwrap();
     let mut t = store
         .insert_task(NewTask {
+            description: None,
             job: "triage".into(),
             item: serde_json::json!({"key": "k"}),
             prompt: "p".into(),
@@ -43,6 +44,7 @@ fn task(id: i64) -> Task {
                 reopen: None,
                 agent_source: None,
                 place: Default::default(),
+                session_id: None,
             },
             flock: "default".into(),
         })
@@ -60,6 +62,7 @@ fn record(kind: &str, t: Option<&Task>, job: Option<&str>) -> EventRecord {
         task: t.cloned(),
         job: job.map(Into::into),
         machine: None,
+        model: None,
     }
 }
 
@@ -181,16 +184,23 @@ async fn the_daemon_writes_the_events_log() {
     let flock = Flock {
         flocks: vec![],
         machines: vec![MachineConfig {
+            description: None,
             name: "m".into(),
             local: false,
             ssh: None,
             command: Some(vec!["fake".into()]),
             session: "default".into(),
             max_agents: 1,
+            job_slots: 1,
+            burst: 1,
             tags: vec![],
             flock: None,
             agent: None,
             agent_args: None,
+            model: None,
+            priority: None,
+            agents: Default::default(),
+            profile: None,
         }],
     };
     let fake: Arc<dyn Connector> = Arc::new(FakeHerdr::new());
@@ -239,6 +249,8 @@ async fn the_daemon_writes_the_events_log() {
     let resp = pastor::ipc::request(
         &socket,
         &IpcRequest::Run {
+            role: Default::default(),
+            description: None,
             prompt: "hi".into(),
             spec: DispatchSpec {
                 agent: "claude".into(),
@@ -255,9 +267,11 @@ async fn the_daemon_writes_the_events_log() {
                 reopen: None,
                 agent_source: None,
                 place: Default::default(),
+                session_id: None,
             },
             flock: None,
             agent: None,
+            priority: None,
         },
     )
     .await

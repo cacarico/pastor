@@ -833,6 +833,11 @@ fn describe_a_connector_installed_from_github() {
         serde_json::json!(["task.queued", "task.done"])
     );
     assert_eq!(d["hooks"][0]["only_own"], true);
+    assert_eq!(
+        d["finish"]["command"],
+        serde_json::json!(["sh", "finish.sh"])
+    );
+    assert_eq!(d["finish"]["timeout_secs"], 10);
     assert_eq!(d["secrets"][0]["name"], "FIXTURE_TOKEN");
     assert_eq!(d["secrets"][0]["set"], false);
     assert_eq!(d["missing_secrets"], serde_json::json!(["FIXTURE_TOKEN"]));
@@ -856,6 +861,8 @@ fn describe_a_connector_installed_from_github() {
         "channel (required): Echoed back in the first item",
         "FIXTURE_TOKEN (missing)",
         "on task.queued, task.done (own jobs only): sh hook.sh",
+        "finish",
+        "sh finish.sh [timeout 10s]",
         "status:",
         "missing secrets: FIXTURE_TOKEN",
         "support",
@@ -1073,6 +1080,18 @@ fn a_daemon_runs_connector_jobs_and_hooks_hear_their_events() {
             == 2
             && records(&notify).len() == 2
     });
+    // The finish command ran once per task, with the task-end object.
+    let finish = cli.dir("s/connectors/support/finish-records.jsonl");
+    wait(60, "echo's finish command ran for both tasks", || {
+        records(&finish).len() == 2
+    });
+    for r in records(&finish) {
+        assert_eq!(r["state"], "done", "{r}");
+        assert_eq!(r["job"], "support");
+        assert_eq!(r["task"]["job"], "support");
+        assert!(r["task"]["item"]["title"].is_string(), "{r}");
+        assert!(r["last_output"].is_string(), "{r}");
+    }
     let got = records(&echo);
     assert_eq!(
         got.iter().filter(|r| r["type"] == "task.queued").count(),

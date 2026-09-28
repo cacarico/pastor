@@ -34,6 +34,8 @@ struct ManifestFile {
     secrets: BTreeMap<String, SecretDecl>,
     #[serde(default)]
     events: Vec<HookFile>,
+    finish: Option<FinishFile>,
+    watch: Option<WatchFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +55,20 @@ struct HookFile {
     on: Vec<String>,
     #[serde(default)]
     only_own: bool,
+    command: Vec<String>,
+    timeout: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinishFile {
+    command: Vec<String>,
+    timeout: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WatchFile {
     command: Vec<String>,
     timeout: Option<String>,
 }
@@ -106,6 +122,11 @@ pub struct Manifest {
     pub connector: Option<ConnectorSpec>,
     pub secrets: BTreeMap<String, SecretDecl>,
     pub events: Vec<Hook>,
+    /// Run once when a task of one of this connector's jobs ends.
+    pub finish: Option<Finish>,
+    /// Run by `pastor watch` each interval; each stdout line is a line
+    /// for the watcher, printed once.
+    pub watch: Option<Watch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +142,20 @@ pub struct ConnectorSpec {
 pub struct Hook {
     pub on: Vec<String>,
     pub only_own: bool,
+    pub command: Vec<String>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finish {
+    pub command: Vec<String>,
+    pub timeout: Duration,
+}
+
+/// The `[watch]` table. Not `[events]`: that name is the hooks' array of
+/// tables, and TOML cannot hold a table and an array of tables by one name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Watch {
     pub command: Vec<String>,
     pub timeout: Duration,
 }
@@ -196,8 +231,37 @@ impl Manifest {
                 command: h.command,
             });
         }
-        if connector.is_none() && events.is_empty() {
-            return Err("a connector must provide a [connector], [[events]] hooks, or both".into());
+        let finish = file
+            .finish
+            .map(|f| -> Result<Finish, String> {
+                check_command("finish.command", &f.command)?;
+                Ok(Finish {
+                    timeout: timeout_or_default("finish.timeout", f.timeout.as_deref())?,
+                    command: f.command,
+                })
+            })
+            .transpose()?;
+        if finish.is_some() && connector.is_none() {
+            return Err(
+                "finish: needs a [connector]; only a connector's own jobs have tasks to finish"
+                    .into(),
+            );
+        }
+        let watch = file
+            .watch
+            .map(|w| -> Result<Watch, String> {
+                check_command("watch.command", &w.command)?;
+                Ok(Watch {
+                    timeout: timeout_or_default("watch.timeout", w.timeout.as_deref())?,
+                    command: w.command,
+                })
+            })
+            .transpose()?;
+        if connector.is_none() && events.is_empty() && watch.is_none() {
+            return Err(
+                "a connector must provide a [connector], [[events]] hooks or a [watch] command"
+                    .into(),
+            );
         }
         Ok(Manifest {
             name: file.name.unwrap_or_else(|| file.id.clone()),
@@ -212,6 +276,8 @@ impl Manifest {
             connector,
             secrets: file.secrets,
             events,
+            finish,
+            watch,
         })
     }
 
@@ -519,6 +585,63 @@ command = ["bash", "dm-me.sh"]
     }
 
     #[test]
+    fn finish_is_optional_and_defaults_its_timeout() {
+        let head = "id = \"f\"\nversion = \"1.0.0\"\n[connector]\ncommand = [\"x\"]\n";
+        assert!(Manifest::parse(head).unwrap().finish.is_none());
+        let m = Manifest::parse(&format!(
+            "{head}[finish]\ncommand = [\"sh\", \"done.sh\"]\n"
+        ))
+        .unwrap();
+        let f = m.finish.unwrap();
+        assert_eq!(f.command, vec!["sh", "done.sh"]);
+        assert_eq!(f.timeout, DEFAULT_TIMEOUT);
+        let m = Manifest::parse(&format!(
+            "{head}[finish]\ncommand = [\"x\"]\ntimeout = \"5s\"\n"
+        ))
+        .unwrap();
+        assert_eq!(m.finish.unwrap().timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rejects_bad_finish_tables() {
+        let head = "id = \"f\"\nversion = \"1.0.0\"\n";
+        let conn = "[connector]\ncommand = [\"x\"]\n";
+        for (text, needle) in [
+            (
+                format!("{head}{conn}[finish]\ncommand = []\n"),
+                "finish.command",
+            ),
+            (
+                format!("{head}{conn}[finish]\ncommand = [\"\"]\n"),
+                "finish.command",
+            ),
+            (
+                format!("{head}{conn}[finish]\ncommand = [\"x\"]\ntimeout = \"0s\"\n"),
+                "finish.timeout",
+            ),
+            (
+                format!("{head}{conn}[finish]\ncommand = [\"x\"]\ntimeout = \"soon\"\n"),
+                "finish.timeout",
+            ),
+            (
+                format!("{head}{conn}[finish]\ncommand = [\"x\"]\non = 1\n"),
+                "on",
+            ),
+            // Only a connector command makes jobs, so a finish command
+            // without one could never run.
+            (
+                format!(
+                    "{head}[[events]]\non = [\"task.done\"]\ncommand = [\"x\"]\n[finish]\ncommand = [\"x\"]\n"
+                ),
+                "finish: needs a [connector]",
+            ),
+        ] {
+            let err = Manifest::parse(&text).unwrap_err();
+            assert!(err.contains(needle), "{needle}: {err}\n{text}");
+        }
+    }
+
+    #[test]
     fn min_pastor_version_compares_numerically() {
         let text = "id = \"a\"\nversion = \"0.1.0\"\nmin_pastor_version = \"0.10.0\"\n[connector]\ncommand = [\"x\"]\n";
         assert!(Manifest::parse_for(text, &Version(0, 9, 0)).is_err());
@@ -546,5 +669,55 @@ command = ["bash", "dm-me.sh"]
                 .unwrap_err()
                 .contains("no connector")
         );
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    const HEAD: &str = "id = \"w\"\nversion = \"1.0.0\"\n";
+
+    /// A `[watch]` command alone makes a connector: it feeds `pastor watch`
+    /// and needs neither a connector command nor hooks.
+    #[test]
+    fn a_watch_command_alone_makes_a_connector() {
+        let m =
+            Manifest::parse(&format!("{HEAD}[watch]\ncommand = [\"sh\", \"prs.sh\"]\n")).unwrap();
+        let w = m.watch.unwrap();
+        assert_eq!(w.command, vec!["sh", "prs.sh"]);
+        assert_eq!(w.timeout, DEFAULT_TIMEOUT);
+        let m = Manifest::parse(&format!(
+            "{HEAD}[watch]\ncommand = [\"x\"]\ntimeout = \"5s\"\n"
+        ))
+        .unwrap();
+        assert_eq!(m.watch.unwrap().timeout, Duration::from_secs(5));
+    }
+
+    /// `[[events]]` stays the hooks' array; `[watch]` sits beside it.
+    #[test]
+    fn a_watch_command_sits_beside_hooks() {
+        let m = Manifest::parse(&format!(
+            "{HEAD}[[events]]\non = [\"task.done\"]\ncommand = [\"h\"]\n[watch]\ncommand = [\"w\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(m.events.len(), 1);
+        assert_eq!(m.watch.unwrap().command, vec!["w"]);
+    }
+
+    #[test]
+    fn rejects_bad_watch_tables() {
+        for (text, needle) in [
+            (format!("{HEAD}[watch]\ncommand = []\n"), "watch.command"),
+            (
+                format!("{HEAD}[watch]\ncommand = [\"x\"]\ntimeout = \"0s\"\n"),
+                "watch.timeout",
+            ),
+            (format!("{HEAD}[watch]\ncommand = [\"x\"]\non = 1\n"), "on"),
+            (HEAD.to_string(), "[watch]"),
+        ] {
+            let err = Manifest::parse(&text).unwrap_err();
+            assert!(err.contains(needle), "{needle}: {err}\n{text}");
+        }
     }
 }

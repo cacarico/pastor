@@ -273,7 +273,7 @@ fn completions_offer_only_the_nested_spellings() {
         .lines()
         .find(|l| {
             l.trim_start()
-                .starts_with("opts=\"-h -V --skill --help --version")
+                .starts_with("opts=\"-h -V --skill --head --help --version")
         })
         .unwrap_or_else(|| panic!("no top-level opts line:\n{bash}"));
     assert!(fish.contains("-l skill"), "fish does not offer --skill");
@@ -346,6 +346,16 @@ fn help_footer_points_agents_at_the_skill() {
 /// `--agent-arg` reaches herdr's `agent.start` as `args`, in order, and shows
 /// in `task describe` and `task list --json`; without it, the flock's
 /// `agent_args` do, then `[defaults] agent_args`.
+/// A claude agent's args without the `--session-id <uuid>` dispatch puts
+/// last.
+fn without_session(args: &serde_json::Value) -> serde_json::Value {
+    let mut args = args.as_array().unwrap().clone();
+    let n = args.len();
+    assert!(n >= 2 && args[n - 2] == "--session-id", "{args:?}");
+    args.truncate(n - 2);
+    serde_json::Value::Array(args)
+}
+
 #[test]
 fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     let env = start();
@@ -367,7 +377,11 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(task["spec"]["agent_args"], want);
     let start = env.agent_start_params("t-1");
-    assert_eq!(start["args"], want, "{start}");
+    // A claude agent starts on a session of its own, after its args, and
+    // the task records it.
+    let session = start["args"][3].as_str().unwrap().to_string();
+    assert_eq!(start["args"][2], "--session-id", "{start}");
+    assert_eq!(without_session(&start["args"]), want, "{start}");
     assert_eq!(start["kind"], "claude");
 
     let out = env.cmd(&["task", "describe", "t-1"]);
@@ -376,6 +390,10 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
         text.contains("agent args: --model claude-opus-5-5"),
         "{text}"
     );
+    assert!(text.contains(&format!("session:    {session}\n")), "{text}");
+    let out = env.cmd(&["task", "describe", "t-1", "--json"]);
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["spec"]["session_id"], session.as_str(), "{task}");
     let out = env.cmd(&["task", "list", "--all", "--json"]);
     let tasks: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(tasks[0]["spec"]["agent_args"], want, "{tasks}");
@@ -395,7 +413,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     );
     let start = env.agent_start_params("t-2");
     assert_eq!(
-        start["args"],
+        without_session(&start["args"]),
         serde_json::json!(["--model", "claude-sonnet-5"]),
         "{start}"
     );
@@ -424,7 +442,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     );
     let start = env.agent_start_params("t-3");
     assert_eq!(
-        start["args"],
+        without_session(&start["args"]),
         serde_json::json!([
             "--model",
             "claude-haiku-4-5",
@@ -528,6 +546,80 @@ fn machine_add_and_remove_edit_the_file() {
     assert_eq!(out.status.code(), Some(2));
     assert!(run(&["machine", "remove", "pi-3"]).status.success());
     assert!(!run(&["machine", "remove", "pi-3"]).status.success());
+}
+
+/// The line pastor prints for a machine's key names this very binary, and
+/// the machine must be in flock.toml. The key comes from a file or stdin.
+#[test]
+fn authorized_key_prints_the_locked_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\n",
+    )
+    .unwrap();
+    let key = tmp.path().join("id.pub");
+    std::fs::write(&key, "ssh-ed25519 AAAAC3Nza user@pi-1\n").unwrap();
+    let run = |args: &[&str], stdin: &str| {
+        let mut child = pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_pastor")).unwrap();
+    let want = format!(
+        "command=\"{} bridge --agent --machine pi-1\",no-pty,no-user-rc,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3Nza user@pi-1\n",
+        exe.display()
+    );
+    let out = run(
+        &[
+            "machine",
+            "authorized-key",
+            "pi-1",
+            "--key",
+            key.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+    let out = run(
+        &["machine", "authorized-key", "pi-1", "--key", "-"],
+        "ssh-ed25519 AAAAC3Nza user@pi-1\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+    let out = run(
+        &[
+            "machine",
+            "authorized-key",
+            "pi-9",
+            "--key",
+            key.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown_machine"));
 }
 
 /// Copilot 4102376166: a socket that accepts but never answers `Ping` is
@@ -1307,18 +1399,18 @@ fn machine_list_opens_with_a_line_about_the_head() {
     assert_eq!(
         lines[0],
         [
-            "NAME", "HOST", "FLOCK", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
-            "ERROR"
+            "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS",
+            "TAGS", "ERROR"
         ],
         "{stdout}"
     );
     assert_eq!(
-        lines[1][..4],
-        ["fake", "fake-herdr", "default", "connected"],
+        lines[1][..5],
+        ["fake", "fake-herdr", "default", "-", "connected"],
         "{stdout}"
     );
     // A command bridge cannot say which pastor is behind it.
-    assert_eq!(lines[1][5..7], ["-", "0/2"], "{stdout}");
+    assert_eq!(lines[1][6..8], ["-", "0/2+1j+1b"], "{stdout}");
     assert_eq!(lines.len(), 2, "{stdout}");
 
     let out = env.cmd(&["machine", "list", "--json"]);
@@ -1419,23 +1511,23 @@ fn machine_list_without_daemon_probes_each_machine() {
         .collect();
     // No head, no line about it: the stderr notice says so instead.
     assert_eq!(
-        lines[0][..4],
-        ["NAME", "HOST", "FLOCK", "CHANNEL"],
+        lines[0][..5],
+        ["NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL"],
         "{stdout}"
     );
     assert_eq!(
-        lines[1][..4],
-        ["fake", "fake-herdr", "default", "probed"],
+        lines[1][..5],
+        ["fake", "fake-herdr", "default", "-", "probed"],
         "{stdout}"
     );
-    assert_eq!(&lines[1][5..], ["-", "0/2", "-", "arm"], "{stdout}");
+    assert_eq!(&lines[1][6..], ["-", "0/2+1j+1b", "-", "arm"], "{stdout}");
     assert_eq!(
-        lines[2][..4],
-        ["gone", "no-such-bridge", "default", "unreachable"],
+        lines[2][..5],
+        ["gone", "no-such-bridge", "default", "-", "unreachable"],
         "{stdout}"
     );
-    assert_eq!(lines[2][4..7], ["-", "-", "-/1"], "{stdout}");
-    assert!(lines[2].len() > 9, "ERROR should say why: {stdout}");
+    assert_eq!(lines[2][5..8], ["-", "-", "-/1+1j+1b"], "{stdout}");
+    assert!(lines[2].len() > 10, "ERROR should say why: {stdout}");
 
     // The same JSON shape as with a head.
     let out = run(&["machine", "list", "--json"]);
@@ -1449,6 +1541,8 @@ fn machine_list_without_daemon_probes_each_machine() {
     assert!(ms[1]["error"].is_string(), "{v}");
     assert_eq!(ms[0]["channel"], "probed");
     assert_eq!(ms[0]["live"], 0);
+    assert_eq!(ms[0]["job_slots"], 1, "{v}");
+    assert_eq!(ms[0]["burst"], 1, "{v}");
 
     std::fs::write(config.join("flock.toml"), "[[machine]\n").unwrap();
     let out = run(&["machine", "list"]);
@@ -1496,7 +1590,7 @@ fn machine_list_without_daemon_reads_a_local_machine_with_no_server_as_down() {
         .collect();
     assert_eq!(lines[1][..2], ["loopback", "local"], "{stdout}");
     // "server down" has a space, so it lands split across two columns.
-    assert_eq!(lines[1][3..5], ["server", "down"], "{stdout}");
+    assert_eq!(lines[1][4..6], ["server", "down"], "{stdout}");
 
     let out = pastor()
         .args(["machine", "list", "--json"])
@@ -1574,13 +1668,14 @@ fn machine_list_without_daemon_shows_a_local_machine_s_pastor_version() {
         .lines()
         .map(|l| l.split_whitespace().collect())
         .collect();
-    assert_eq!(lines[0][4..6], ["HERDR", "PASTOR"], "{stdout}");
+    assert_eq!(lines[0][5..7], ["HERDR", "PASTOR"], "{stdout}");
     assert_eq!(
-        lines[1][..6],
+        lines[1][..7],
         [
             "here",
             "local",
             "default",
+            "-",
             "probed",
             "fake",
             env!("CARGO_PKG_VERSION")
@@ -1685,6 +1780,157 @@ fn flock_flags_refuse_a_head_from_before_flocks() {
     }
     let ops = ops.lock().unwrap();
     assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
+}
+
+/// A head from before descriptions would drop `--description` without a
+/// word, so the CLI refuses to send it one; without the flag it still goes.
+#[test]
+fn description_flags_refuse_a_head_from_before_descriptions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"pi-1\"\nlocal = true\n",
+    )
+    .unwrap();
+    let reqs = text_head(&state.join("pastor.sock"), 10);
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["task", "run", "hi", "--description", "d"][..],
+        &["flock", "add", "work", "--description", "d"],
+        &["machine", "add", "pi-2", "--local", "--description", "d"],
+    ] {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+    }
+    assert!(
+        reqs.lock().unwrap().iter().all(|r| r["op"] == "ping"),
+        "only pings"
+    );
+    ok(run(&["flock", "add", "work"]));
+}
+
+/// A head at `socket` that speaks IPC protocol `protocol`: it answers ping
+/// with a pong, and every other request with the text `said by the head`. It
+/// records each request whole.
+fn text_head(
+    socket: &std::path::Path,
+    protocol: u32,
+) -> std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let reqs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = reqs.clone();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let reply = if req["op"] == "ping" {
+                serde_json::json!({"kind": "pong", "data": {"version": "test", "protocol": protocol}})
+            } else {
+                serde_json::json!({"kind": "text", "data": "said by the head"})
+            };
+            seen.lock().unwrap().push(req);
+            let _ = stream.write_all(format!("{reply}\n").as_bytes());
+        }
+    });
+    reqs
+}
+
+/// With a head running, `flock add|default` and `machine add|remove|move`
+/// send the edit to the head and print its answer: the CLI leaves its own
+/// flock.toml alone, since the head's is the one that counts. A head from
+/// before these requests is refused with `head_too_old` before anything is
+/// sent.
+#[test]
+fn flock_and_machine_edits_go_through_the_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let flock_file = config.join("flock.toml");
+    std::fs::write(&flock_file, NAMED_FLOCKS).unwrap();
+    let socket = state.join("pastor.sock");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let cases: [(&[&str], serde_json::Value); 6] = [
+        (
+            &["flock", "add", "spare"],
+            serde_json::json!({"op": "flock_add", "name": "spare", "default": false}),
+        ),
+        (
+            &["flock", "add", "spare", "--default"],
+            serde_json::json!({"op": "flock_add", "name": "spare", "default": true}),
+        ),
+        (
+            &["flock", "default", "set", "work"],
+            serde_json::json!({"op": "flock_set_default", "name": "work"}),
+        ),
+        (
+            &[
+                "machine", "add", "pi-2", "--local", "--flock", "work", "--tag", "gpu",
+            ],
+            serde_json::json!({"op": "machine_add", "machine": {
+                "name": "pi-2", "local": true, "session": "default", "max_agents": 2,
+                "tags": ["gpu"], "flock": "work"}}),
+        ),
+        (
+            &["machine", "remove", "pi-1"],
+            serde_json::json!({"op": "machine_remove", "name": "pi-1"}),
+        ),
+        (
+            &["machine", "move", "pi-1", "work"],
+            serde_json::json!({"op": "machine_move", "name": "pi-1", "flock": "work"}),
+        ),
+    ];
+
+    let reqs = text_head(&socket, pastor::ipc::FLEET_EDIT_PROTOCOL);
+    for (args, want) in &cases {
+        let out = run(args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "said by the head\n",
+            "{args:?}"
+        );
+        let sent = reqs.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(&sent, want, "{args:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), NAMED_FLOCKS);
+
+    std::fs::remove_file(&socket).unwrap();
+    let reqs = text_head(&socket, pastor::ipc::FLEET_EDIT_PROTOCOL - 1);
+    for (args, _) in &cases {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), NAMED_FLOCKS);
+    let reqs = reqs.lock().unwrap();
+    assert!(
+        reqs.iter().all(|r| r["op"] == "ping"),
+        "only pings: {reqs:?}"
+    );
 }
 
 /// Copilot 4106353474: once flock.toml declares named flocks, a command with
@@ -2396,7 +2642,11 @@ fn a_task_waits_for_its_flock_end_to_end() {
     assert!(listed("default").is_empty());
     let table = ok(env.cmd(&["task", "list"]));
     let header: Vec<&str> = table.lines().next().unwrap().split_whitespace().collect();
-    assert_eq!(header[..4], ["ID", "STATE", "MACHINE", "FLOCK"], "{table}");
+    assert_eq!(
+        header[..5],
+        ["ID", "STATE", "PRIORITY", "MACHINE", "FLOCK"],
+        "{table}"
+    );
     assert!(
         ok(env.cmd(&["task", "describe", &format!("t-{id}")])).contains("flock:      work"),
         "task describe names the flock"
@@ -2736,6 +2986,77 @@ fn an_agent_may_end_its_own_task_only() {
     env.fails_with(&["task", "done"], "usage_error");
     // A human may end any task.
     assert_eq!(env.json(&["task", "done", "t-2", "--json"])["ended"], true);
+}
+
+/// A person starts an orchestrator with `task run --role orchestrator`; from
+/// its pane it may run tasks, but not close one or make another
+/// orchestrator, and no plain agent may make one either. `task describe` and
+/// `task list --json` name the role.
+#[test]
+fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
+    let env = start();
+    let o = env.json(&[
+        "task",
+        "run",
+        "plan",
+        "--repo",
+        "/tmp",
+        "--role",
+        "orchestrator",
+        "--json",
+    ]);
+    assert_eq!(o["role"], "orchestrator", "{o}");
+    let from = |task: &str, args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("PASTOR_TASK", task)
+            .output()
+            .unwrap()
+    };
+    let worker: serde_json::Value = serde_json::from_str(&ok(from(
+        "t-1",
+        &["task", "run", "go", "--repo", "/tmp", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(worker["role"], "agent", "{worker}");
+    for task in ["t-1", "t-2"] {
+        let out = from(
+            task,
+            &[
+                "task",
+                "run",
+                "go",
+                "--repo",
+                "/tmp",
+                "--role",
+                "orchestrator",
+            ],
+        );
+        assert_eq!(error_code(&out), "role_refused", "{task}");
+    }
+    // t-1's guard runs before the head is ever asked, so it must still know
+    // t-1 is an orchestrator: its refusal names the role, not "agent".
+    let closed = from("t-1", &["task", "close", "t-2"]);
+    assert_eq!(error_code(&closed), "agent_refused");
+    let err = String::from_utf8_lossy(&closed.stderr);
+    assert!(err.contains("orchestrator"), "{err}");
+    assert!(!err.contains("is an agent pastor started"), "{err}");
+    assert_eq!(
+        error_code(&from("t-2", &["task", "run", "go", "--repo", "/tmp"])),
+        "agent_refused"
+    );
+    let listed = env.json(&["task", "list", "--json"]);
+    let roles: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["agent", "orchestrator"], "{listed}");
+    let text = ok(env.cmd(&["task", "describe", "t-1"]));
+    assert!(text.contains("role:       orchestrator"), "{text}");
 }
 
 /// Machine, flock and job edits need no head, so the CLI refuses them
@@ -3295,6 +3616,151 @@ fn describe_a_job_flock_and_task_without_a_head() {
     );
 }
 
+/// Without a head: descriptions of jobs, flocks, machines and tasks show
+/// in `--wide` lists (whole, since stdout is not a terminal), in
+/// `describe`, and always in `--json`; `flock add` and `machine add` write
+/// them.
+#[test]
+fn descriptions_show_in_lists_describe_and_json_without_a_head() {
+    let o = offline();
+    std::fs::write(
+        o.config.join("jobs/nightly.toml"),
+        format!("description = \"Sweep the repo every night\"\n{NIGHTLY}"),
+    )
+    .unwrap();
+    std::fs::write(
+        o.config.join("jobs/bare.toml"),
+        "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\ndescription = \"#{{ item.key }}\"\nprompt = \"p\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        o.config.join("flock.toml"),
+        "[[flock]]\nname = \"home\"\ndefault = true\ndescription = \"Personal errands\"\n\n\
+         [[machine]]\nname = \"pi-1\"\nlocal = true\ndescription = \"The desk one\"\n",
+    )
+    .unwrap();
+    ok(o.cmd(&["tick", "--job", "nightly"]));
+
+    let plain = ok(o.cmd(&["job", "list"]));
+    assert!(!plain.contains("DESCRIPTION"), "{plain}");
+    let wide = ok(o.cmd(&["job", "list", "--wide"]));
+    let header = wide.lines().next().unwrap();
+    assert!(header.ends_with("DESCRIPTION"), "{wide}");
+    assert!(wide.contains("Sweep the repo every night"), "{wide}");
+    let bare = wide.lines().find(|l| l.starts_with("bare")).unwrap();
+    assert!(bare.ends_with(" -"), "no description reads -: {wide}");
+    let jobs: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["job", "list", "--json", "-w"]))).unwrap();
+    assert_eq!(jobs[0]["name"], "bare");
+    assert_eq!(jobs[0]["description"], serde_json::Value::Null);
+    assert_eq!(jobs[1]["description"], "Sweep the repo every night");
+    let j: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["job", "describe", "nightly", "--json"]))).unwrap();
+    assert_eq!(j["description"], "Sweep the repo every night");
+    let text = ok(o.cmd(&["job", "describe", "bare"]));
+    assert!(text.contains("\ndescription:"), "{text}");
+
+    // The clock item's title is the task's description.
+    let tasks: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["task", "list", "--json"]))).unwrap();
+    let title = tasks[0]["item"]["title"].as_str().unwrap().to_string();
+    assert_eq!(tasks[0]["description"], title.as_str());
+    assert_eq!(tasks[0]["description_from"], "job nightly");
+    let wide = ok(o.cmd(&["task", "list", "-w"]));
+    assert!(
+        wide.lines().next().unwrap().ends_with("DESCRIPTION"),
+        "{wide}"
+    );
+    assert!(wide.lines().nth(1).unwrap().ends_with(&title), "{wide}");
+    let text = ok(o.cmd(&["task", "describe", "t-1"]));
+    assert!(
+        text.contains(&format!("description: {title} (from job nightly)")),
+        "{text}"
+    );
+
+    let wide = ok(o.cmd(&["flock", "list", "--wide"]));
+    assert!(wide.contains("Personal errands"), "{wide}");
+    let flocks: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["flock", "list", "--json"]))).unwrap();
+    assert_eq!(flocks[0]["description"], "Personal errands");
+    let f: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["flock", "describe", "home", "--json"]))).unwrap();
+    assert_eq!(f["description"], "Personal errands");
+
+    let wide = ok(o.cmd(&["machine", "list", "--wide"]));
+    assert!(wide.contains("The desk one"), "{wide}");
+    let ms: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["machine", "list", "--json"]))).unwrap();
+    assert_eq!(ms["machines"][0]["description"], "The desk one");
+    let m: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["machine", "describe", "pi-1", "--json"]))).unwrap();
+    assert_eq!(m["description"], "The desk one");
+    let text = ok(o.cmd(&["machine", "describe", "pi-1"]));
+    assert!(text.contains("description: The desk one"), "{text}");
+
+    let wide = ok(o.cmd(&["connector", "list", "--wide"]));
+    assert!(
+        wide.lines().next().unwrap().ends_with("DESCRIPTION"),
+        "{wide}"
+    );
+
+    ok(o.cmd(&["flock", "add", "work", "--description", " Paid work "]));
+    ok(o.cmd(&[
+        "machine",
+        "add",
+        "pi-2",
+        "user@pi-2",
+        "--flock",
+        "work",
+        "--description",
+        "A spare",
+    ]));
+    let file = std::fs::read_to_string(o.config.join("flock.toml")).unwrap();
+    assert!(file.contains("description = \"Paid work\""), "{file}");
+    assert!(file.contains("description = \"A spare\""), "{file}");
+}
+
+/// With a head: `task run --description` sets the task's; without it the
+/// prompt's first line stands in.
+#[test]
+fn task_run_takes_a_description_through_the_head() {
+    let env = start();
+    let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
+        "task",
+        "run",
+        "fix it\nthen stop",
+        "--description",
+        "Fix the flaky test",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(t["description"], "Fix the flaky test");
+    assert_eq!(t["description_from"], "--description");
+    let bare: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
+        "task",
+        "run",
+        "look around\nslowly",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(bare["description"], "look around");
+    assert_eq!(bare["description_from"], "the prompt");
+    let wide = ok(env.cmd(&["task", "list", "--all", "--wide"]));
+    assert!(wide.contains("Fix the flaky test"), "{wide}");
+    assert!(wide.contains("look around"), "{wide}");
+    let text = ok(env.cmd(&["task", "describe", &format!("t-{}", t["id"])]));
+    assert!(
+        text.contains("description: Fix the flaky test (from --description)"),
+        "{text}"
+    );
+    ok(env.cmd(&["flock", "add", "lab", "--description", "Test rigs"]));
+    let file = std::fs::read_to_string(env.config.join("flock.toml")).unwrap();
+    assert!(file.contains("description = \"Test rigs\""), "{file}");
+    let ms: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["machine", "list", "--json", "--wide"]))).unwrap();
+    assert_eq!(ms["machines"][0]["description"], serde_json::Value::Null);
+}
+
 #[test]
 fn describe_a_machine_and_its_flock_with_a_head() {
     let env = start();
@@ -3319,6 +3785,68 @@ fn describe_a_machine_and_its_flock_with_a_head() {
     assert_eq!(f["default"], true);
     assert_eq!(f["machines"], serde_json::json!(["fake"]));
     assert!(f["agents"].is_u64(), "a head knows the live agents: {f}");
+
+    // A flock.toml that no longer loads leaves the head's flock in use, and
+    // the CLI describes that one, not the file.
+    std::fs::write(env.config.join("flock.toml"), "not [[ toml").unwrap();
+    let m: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["machine", "describe", "fake", "--json"]))).unwrap();
+    assert_eq!(m["channel"], "connected");
+    assert_eq!(m["tasks"][0]["id"], t["id"]);
+    let f: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["flock", "describe", "default", "--json"]))).unwrap();
+    assert_eq!(f["machines"], serde_json::json!(["fake"]));
+    assert_eq!(
+        error_code(&env.cmd(&["machine", "describe", "nope"])),
+        "unknown_machine"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["flock", "describe", "nope"])),
+        "unknown_flock"
+    );
+}
+
+/// With a head running, `trust` goes through it: the CLI works with the
+/// store out of its reach, as it is on another machine.
+#[test]
+fn trust_add_list_and_remove_go_through_the_head() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = start();
+    let db = env.state.join("pastor.db");
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let text = ok(env.cmd(&["trust", "add", "fake", "/tmp/app"]));
+    assert!(text.contains("/tmp/app on fake is trusted"), "{text}");
+    let list: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["trust", "list", "--json"]))).unwrap();
+    assert_eq!(list[0]["machine"], "fake", "{list}");
+    assert_eq!(list[0]["repo"], "/tmp/app", "{list}");
+    assert!(ok(env.cmd(&["trust", "list"])).contains("/tmp/app"));
+    ok(env.cmd(&["trust", "remove", "fake", "/tmp/app"]));
+    assert_eq!(
+        error_code(&env.cmd(&["trust", "remove", "fake", "/tmp/app"])),
+        "not_trusted"
+    );
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn trust_add_list_and_remove_without_a_head() {
+    let o = offline();
+    let text = ok(o.cmd(&["trust", "add", "pi-1", "/srv/app"]));
+    assert!(text.contains("/srv/app on pi-1 is trusted"), "{text}");
+    let text = ok(o.cmd(&["trust", "add", "pi-1", "/srv/app"]));
+    assert!(text.contains("already"), "{text}");
+    let list: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["trust", "list", "--json"]))).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list[0]["machine"], "pi-1");
+    assert!(list[0]["trusted_at"].is_string(), "{list}");
+    ok(o.cmd(&["trust", "remove", "pi-1", "/srv/app"]));
+    assert_eq!(
+        error_code(&o.cmd(&["trust", "remove", "pi-1", "/srv/app"])),
+        "not_trusted"
+    );
+    assert!(ok(o.cmd(&["trust", "list"])).contains("no trusted repos"));
 }
 
 /// clap leaves a visible alias out of the `help` subtree, so `pastor help
@@ -3591,6 +4119,34 @@ fn complete_offers_machine_names() {
     assert!(!ok);
 }
 
+/// fish shows a job's, flock's or machine's description beside its name;
+/// one without keeps what it showed before.
+#[test]
+fn complete_shows_descriptions_beside_names() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("jobs/nightly.toml"),
+        "description = \"Run the suite at night\"\nevery = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"lab\"\ndescription = \"Test rigs\"\n\n\
+         [[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\nflock = \"home\"\ndescription = \"The desk one\"\n\n\
+         [[machine]]\nname = \"pi-2\"\nssh = \"user@pi-2\"\nflock = \"lab\"\n",
+    )
+    .unwrap();
+    let (ok, out) = complete(&config, &state, &["job", "describe", ""]);
+    assert!(ok);
+    assert_eq!(out, "nightly\tRun the suite at night\ntriage\n");
+    let (ok, out) = complete(&config, &state, &["flock", "describe", ""]);
+    assert!(ok);
+    assert_eq!(out, "home\tdefault\nlab\tTest rigs\n");
+    let (ok, out) = complete(&config, &state, &["machine", "describe", ""]);
+    assert!(ok);
+    assert_eq!(out, "pi-1\tThe desk one\npi-2\tlab\n");
+}
+
 #[test]
 fn complete_offers_connector_ids() {
     let (_tmp, config, state) = completion_config();
@@ -3598,6 +4154,8 @@ fn complete_offers_connector_ids() {
         &["connector", "uninstall", ""][..],
         &["connector", "unlink", ""],
         &["connector", "try", ""],
+        &["watch", "--connector", ""],
+        &["watch", "--now", "--connector=g"],
     ] {
         let (ok, out) = complete(&config, &state, words);
         assert!(ok, "{words:?}");
@@ -3637,6 +4195,190 @@ fn complete_offers_task_ids_with_their_note() {
         assert!(out.starts_with("t-1\tclock "), "{words:?}: {out}");
         assert_eq!(out.lines().count(), 1, "{words:?}: {out}");
     }
+}
+
+/// `queue move` offers the queued tasks, for the task and for `--before`
+/// and `--after`, with their level; `pastor queue` with no head shows the
+/// store's queue and says it cannot tell why each waits.
+#[test]
+fn complete_offers_queued_tasks_and_the_queue_reads_offline() {
+    let (_tmp, config, state) = completion_config();
+    let tick = pastor()
+        .args(["tick", "--job", "nightly"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .env("PASTOR_DATA_DIR", state.join("data"))
+        .output()
+        .unwrap();
+    assert!(
+        tick.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tick.stderr)
+    );
+    for words in [
+        &["queue", "move", ""][..],
+        &["queue", "move", "t-1", "--before", ""],
+        &["queue", "move", "t-1", "--after", ""],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(ok, "{words:?}");
+        assert!(out.starts_with("t-1\tnormal clock "), "{words:?}: {out}");
+    }
+    let out = pastor()
+        .args(["queue"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .env("PASTOR_DATA_DIR", state.join("data"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("job nightly"), "{text}");
+    assert!(text.contains("pastor serve is not running"), "{text}");
+}
+
+/// `pastor queue` lists the queued tasks in the order they will start,
+/// numbered over the whole queue, with where they wait, who queued them and
+/// why they have not started; `--flock`, `--machine` and `--json` narrow
+/// and shape it. `queue move` puts a task where it says, lifting or
+/// lowering its level to fit, and refuses a task that is not queued, a
+/// flag short or too many, and an agent pastor started.
+#[test]
+fn the_queue_lists_and_moves_tasks() {
+    let env = start();
+    ok(env.cmd(&["flock", "add", "work"]));
+    ok(env.cmd(&["flock", "add", "lab"]));
+    let run = |args: &[&str]| -> String {
+        let mut argv = vec!["task", "run"];
+        argv.extend_from_slice(args);
+        argv.push("--json");
+        let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&argv))).unwrap();
+        assert_eq!(t["state"], "queued", "{t}");
+        format!("t-{}", t["id"])
+    };
+    let a = run(&["a", "--flock", "work"]);
+    let b = run(&["b", "--flock", "work", "--priority", "high"]);
+    let c = run(&["c", "--flock", "lab"]);
+    let ids = |args: &[&str]| -> Vec<(u64, String)> {
+        let mut argv = vec!["queue", "--json"];
+        argv.extend_from_slice(args);
+        let v: Vec<serde_json::Value> = serde_json::from_str(&ok(env.cmd(&argv))).unwrap();
+        v.iter()
+            .map(|e| {
+                (
+                    e["pos"].as_u64().unwrap(),
+                    e["id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let pos = |n: u64, id: &str| (n, id.to_string());
+    assert_eq!(ids(&[]), [pos(1, &b), pos(2, &a), pos(3, &c)]);
+    assert_eq!(ids(&["--flock", "lab"]), [pos(3, &c)]);
+    assert!(ids(&["--machine", "fake"]).is_empty());
+
+    let table = ok(env.cmd(&["queue"]));
+    let mut lines = table.lines();
+    let header: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+    assert_eq!(
+        header,
+        [
+            "POS", "TASK", "LEVEL", "WHERE", "FROM", "WAITED", "WHY", "NOT", "YET"
+        ],
+        "{table}"
+    );
+    let first: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+    assert_eq!(
+        first[..6],
+        ["1", b.as_str(), "high", "flock", "work", "task"],
+        "{table}"
+    );
+    assert!(table.contains("flock work has no machines"), "{table}");
+    let v: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(env.cmd(&["queue", "--json"]))).unwrap();
+    assert_eq!(v[2]["where"], "flock lab", "{v:?}");
+    assert_eq!(v[2]["from"], "task run", "{v:?}");
+    assert_eq!(v[2]["why"], "flock lab has no machines", "{v:?}");
+
+    // To the top in front of a high task: lifted.
+    let out = ok(env.cmd(&["queue", "move", &c, "--top"]));
+    assert_eq!(
+        out.trim(),
+        format!("{c} is 1 of 3 in the queue; lifted from normal to high")
+    );
+    assert_eq!(ids(&[]), [pos(1, &c), pos(2, &b), pos(3, &a)]);
+    // Behind a normal task: lowered.
+    let out = ok(env.cmd(&["queue", "move", &b, "--after", &a]));
+    assert_eq!(
+        out.trim(),
+        format!("{b} is 3 of 3 in the queue; lowered from high to normal")
+    );
+    // Between two tasks of its own level: kept.
+    let v: serde_json::Value = serde_json::from_str(&ok(
+        env.cmd(&["queue", "move", &b, "--before", &a, "--json"])
+    ))
+    .unwrap();
+    assert_eq!(
+        (v["pos"].as_u64(), v["of"].as_u64()),
+        (Some(2), Some(3)),
+        "{v}"
+    );
+    assert_eq!(v["priority_was"], "normal", "{v}");
+    assert_eq!(v["task"]["priority"], "normal", "{v}");
+    let out = ok(env.cmd(&["queue", "move", &a, "--to", "1"]));
+    assert_eq!(
+        out.trim(),
+        format!("{a} is 1 of 3 in the queue; lifted from normal to high")
+    );
+    // --top on the first task changes nothing.
+    let out = ok(env.cmd(&["queue", "move", &a, "--top"]));
+    assert_eq!(out.trim(), format!("{a} is 1 of 3 in the queue"));
+
+    // A task a machine took has left the queue, and so has no place in it.
+    let running: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["task", "run", "d", "--json"]))).unwrap();
+    let d = format!("t-{}", running["id"]);
+    assert_eq!(
+        error_code(&env.cmd(&["queue", "move", &d, "--top"])),
+        "not_queued"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["queue", "move", &a, "--before", &d])),
+        "not_queued"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["queue", "move", "t-99", "--top"])),
+        "task_not_found"
+    );
+    for args in [
+        &["queue", "move", "t-1"][..],
+        &["queue", "move", "t-1", "--top", "--to", "2"],
+        &["queue", "move", "t-1", "--to", "0"],
+        &["queue", "--json", "move", "t-1", "--top"],
+    ] {
+        assert_eq!(env.cmd(args).status.code(), Some(2), "{args:?}");
+    }
+    let from_agent = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("PASTOR_TASK", "t-3")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        error_code(&from_agent(&["queue", "move", &c, "--top"])),
+        "agent_refused"
+    );
+    assert!(
+        from_agent(&["queue"]).status.success(),
+        "reading the queue is fine"
+    );
 }
 
 /// The installed scripts ask `pastor __complete` at TAB time; fish needs a
@@ -3829,4 +4571,1240 @@ fn bridge_relays_invalid_utf8_bytes_to_the_head() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["kind"], "error", "{stdout}");
     assert_eq!(v["data"]["code"], "invalid_request", "{stdout}");
+}
+
+/// A second config dir that shares `env`'s state dir, so its socket reaches
+/// `env`'s head: a CLI on another machine, with its own (stale) copy of
+/// the nightly job. Anything it edits through the head lands in `env`'s
+/// config, never in its own.
+fn laptop(env: &Env) -> Offline {
+    let mut o = offline();
+    o.state = env.state.clone();
+    o
+}
+
+#[test]
+fn edit_with_a_head_changes_the_head_s_files() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let l = laptop(&env);
+    let head_job = env.config.join("jobs/nightly.toml");
+
+    let edited = format!("enabled = false\n{NIGHTLY}");
+    let text = ok(l.edit(&l.editor(&[&edited]), &["job", "edit", "nightly"], ""));
+    assert!(text.contains("saved"), "{text}");
+    assert!(text.contains("picked it up"), "{text}");
+    assert_eq!(l.seen(0), NIGHTLY, "the editor starts from the head's file");
+    assert_eq!(std::fs::read_to_string(&head_job).unwrap(), edited);
+    assert_eq!(
+        std::fs::read_to_string(l.config.join("jobs/nightly.toml")).unwrap(),
+        NIGHTLY,
+        "the local copy is not touched"
+    );
+    let jobs: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(env.cmd(&["job", "list", "--json"]))).unwrap();
+    assert_eq!(jobs[0]["enabled"], false);
+
+    // flock.toml and pastor.toml: the head's, which the laptop does not have.
+    let head_flock = std::fs::read_to_string(env.config.join("flock.toml")).unwrap();
+    let l2 = laptop(&env);
+    let flock = format!("{head_flock}# edited\n");
+    ok(l2.edit(&l2.editor(&[&flock]), &["flock", "edit"], ""));
+    assert_eq!(l2.seen(0), head_flock);
+    assert_eq!(
+        std::fs::read_to_string(env.config.join("flock.toml")).unwrap(),
+        flock
+    );
+    assert!(!l2.config.join("flock.toml").exists());
+    let head_config = std::fs::read_to_string(env.config.join("pastor.toml")).unwrap();
+    let l3 = laptop(&env);
+    let config = format!("{head_config}# edited\n");
+    ok(l3.edit(&l3.editor(&[&config]), &["config", "edit"], ""));
+    assert_eq!(
+        std::fs::read_to_string(env.config.join("pastor.toml")).unwrap(),
+        config
+    );
+    assert!(!l3.config.join("pastor.toml").exists());
+
+    // An unchanged file sends nothing and says so.
+    let text = ok(l3.edit("true", &["config", "edit"], ""));
+    assert!(text.contains("no changes"), "{text}");
+    // A job only the laptop has is not the head's.
+    std::fs::write(l3.config.join("jobs/mine.toml"), NIGHTLY).unwrap();
+    assert_eq!(
+        error_code(&l3.edit("true", &["job", "edit", "mine"], "")),
+        "job_not_found"
+    );
+}
+
+#[test]
+fn edit_with_a_head_refuses_an_invalid_or_stale_edit() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let head_job = env.config.join("jobs/nightly.toml");
+
+    // Invalid, not reopened: the head's error is shown, its file is untouched.
+    let l = laptop(&env);
+    let broken = NIGHTLY.replace("1h", "soon");
+    let out = l.edit(&l.editor(&[&broken]), &["job", "edit", "nightly"], "n\n");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(last_error(&out).0, "invalid_edit");
+    assert!(stderr.contains("soon"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&head_job).unwrap(), NIGHTLY);
+
+    // Invalid, then fixed in the reopened editor.
+    let l = laptop(&env);
+    let fixed = NIGHTLY.replace("1h", "4h");
+    ok(l.edit(
+        &l.editor(&[&broken, &fixed]),
+        &["job", "edit", "nightly"],
+        "y\n",
+    ));
+    assert_eq!(l.runs(), 2);
+    assert!(l.seen(1).starts_with("# pastor:"), "{}", l.seen(1));
+    assert_eq!(std::fs::read_to_string(&head_job).unwrap(), fixed);
+
+    // Changed on the head while the editor was open: a stale hash.
+    let l = laptop(&env);
+    let ed = l.tmp.path().join("race.sh");
+    std::fs::write(
+        &ed,
+        format!(
+            "#!/bin/sh\necho '# changed elsewhere' >> {}\necho '# mine' >> \"$1\"\n",
+            head_job.display()
+        ),
+    )
+    .unwrap();
+    let out = l.edit(
+        &format!("sh {}", ed.display()),
+        &["job", "edit", "nightly"],
+        "",
+    );
+    assert_eq!(last_error(&out).0, "edit_conflict");
+    let now = std::fs::read_to_string(&head_job).unwrap();
+    assert!(
+        now.ends_with("# changed elsewhere\n") && !now.contains("# mine"),
+        "{now}"
+    );
+}
+
+#[test]
+fn job_describe_enable_and_disable_go_through_a_head() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let l = laptop(&env);
+    // The laptop has no job file: only the head knows the job.
+    std::fs::remove_file(l.config.join("jobs/nightly.toml")).unwrap();
+    let j: serde_json::Value =
+        serde_json::from_str(&ok(l.cmd(&["job", "describe", "nightly", "--json"]))).unwrap();
+    assert_eq!(j["name"], "nightly");
+    assert_eq!(j["schedule"], "every 1h");
+    assert_eq!(j["connector"]["use"], "clock");
+    assert!(
+        j["file"]
+            .as_str()
+            .unwrap()
+            .starts_with(env.config.to_str().unwrap()),
+        "{j}"
+    );
+    let text = ok(l.cmd(&["job", "describe", "nightly"]));
+    assert!(text.contains("every 1h"), "{text}");
+    assert_eq!(
+        error_code(&l.cmd(&["job", "describe", "ghost"])),
+        "job_not_found"
+    );
+
+    let head_job = env.config.join("jobs/nightly.toml");
+    let text = ok(l.cmd(&["job", "disable", "nightly"]));
+    assert!(text.contains("disabled nightly"), "{text}");
+    assert!(
+        std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("enabled = false")
+    );
+    let jobs: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(env.cmd(&["job", "list", "--json"]))).unwrap();
+    assert_eq!(jobs[0]["enabled"], false);
+    ok(l.cmd(&["job", "enable", "nightly"]));
+    assert!(
+        std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("enabled = true")
+    );
+    assert!(!l.config.join("jobs/nightly.toml").exists());
+    assert_eq!(
+        error_code(&l.cmd(&["job", "enable", "ghost"])),
+        "job_not_found"
+    );
+}
+
+/// A CLI with its own, empty config and state dirs, and a fake `ssh` first on
+/// its PATH. The fake ignores ssh's options, runs the remote command here and
+/// picks the head by destination: `head-up` is `head`'s state dir, `no-head`
+/// an empty one, `unreachable` fails as ssh does when it cannot connect.
+struct Client {
+    tmp: tempfile::TempDir,
+    config: std::path::PathBuf,
+    state: std::path::PathBuf,
+    /// Its own data dir, so a `connector link` never lands in the real one.
+    data: std::path::PathBuf,
+    path: std::ffi::OsString,
+}
+
+fn client(head: Option<&Env>) -> Client {
+    client_to(head.map(|e| (e.config.as_path(), e.state.as_path())))
+}
+
+/// `client`, whose `head-up` is the machine with these config and state
+/// dirs.
+fn client_to(head: Option<(&std::path::Path, &std::path::Path)>) -> Client {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let empty = tmp.path().join("empty");
+    let (up_config, up_state) = match head {
+        Some((config, state)) => (config.to_path_buf(), state.to_path_buf()),
+        None => (empty.clone(), empty.clone()),
+    };
+    let script = format!(
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+dest=$1; shift
+case "$dest" in
+  head-up) export PASTOR_CONFIG_DIR='{}' PASTOR_STATE_DIR='{}' ;;
+  no-head) export PASTOR_CONFIG_DIR='{e}' PASTOR_STATE_DIR='{e}' ;;
+  *) echo "ssh: connect to host $dest port 22: Connection refused" >&2; exit 255 ;;
+esac
+exec sh -c "$*"
+"#,
+        up_config.display(),
+        up_state.display(),
+        e = empty.display(),
+    );
+    let ssh = bin.join("ssh");
+    std::fs::write(&ssh, script).unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = std::ffi::OsString::from(&bin);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    Client {
+        config: tmp.path().join("c"),
+        state: tmp.path().join("s"),
+        data: tmp.path().join("d"),
+        tmp,
+        path,
+    }
+}
+
+impl Client {
+    fn cmd(&self, args: &[&str]) -> std::process::Output {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .env("PASTOR_DATA_DIR", &self.data)
+            .env("PATH", &self.path)
+            .env_remove("PASTOR_HEAD")
+            .output()
+            .unwrap()
+    }
+
+    /// `head set <dest>` with pastor's path the test binary.
+    fn head_set(&self, dest: &str, extra: &[&str]) -> std::process::Output {
+        let mut args = vec![
+            "head",
+            "set",
+            dest,
+            "--pastor",
+            env!("CARGO_BIN_EXE_pastor"),
+        ];
+        args.extend_from_slice(extra);
+        self.cmd(&args)
+    }
+}
+
+/// With a head set, `task run`, `task list`, `task show` and `machine list`
+/// go to it over ssh and `pastor bridge`, and print and exit as they do on
+/// the head's own machine. Nothing reads or writes the CLI's own files but
+/// client.toml.
+#[test]
+fn a_remote_head_answers_what_the_local_one_would() {
+    let env = start();
+    let c = client(Some(&env));
+    let out = ok(c.head_set("head-up", &[]));
+    assert!(out.starts_with("head: head-up (remote, pastor "), "{out}");
+    assert_eq!(ok(c.cmd(&["head", "show"])), "head: head-up (remote)\n");
+    let v: serde_json::Value =
+        serde_json::from_str(&ok(c.cmd(&["head", "show", "--json"]))).unwrap();
+    assert_eq!(v["remote"], true);
+    assert_eq!(v["ssh"], "head-up");
+    assert_eq!(v["from"], "file");
+
+    let t: serde_json::Value = serde_json::from_str(&ok(
+        c.cmd(&["task", "run", "hello", "--repo", "/tmp", "--json"])
+    ))
+    .unwrap();
+    assert_eq!(t["machine"], "fake");
+    assert_eq!(t["agent_name"], "t-1");
+    env.wait_done("t-1");
+
+    for args in [
+        &["task", "list", "--all", "--json"][..],
+        &["task", "describe", "t-1", "--json"],
+        &["task", "list"],
+    ] {
+        let (remote, local) = (c.cmd(args), env.cmd(args));
+        assert_eq!(remote.status.code(), local.status.code(), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&remote.stdout),
+            String::from_utf8_lossy(&local.stdout),
+            "{args:?}"
+        );
+    }
+    let (remote, local) = (
+        c.cmd(&["task", "describe", "t-9"]),
+        env.cmd(&["task", "describe", "t-9"]),
+    );
+    assert_eq!(error_code(&remote), "task_not_found");
+    assert_eq!(remote.stderr, local.stderr);
+
+    // The machines are the head's; the head's line names where it is.
+    let remote = ok(c.cmd(&["machine", "list"]));
+    let local = ok(env.cmd(&["machine", "list"]));
+    assert!(
+        remote.starts_with(&format!(
+            "pastor {} on head-up (herdr -), 1 machine",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{remote}"
+    );
+    let table = |s: &str| s.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert_eq!(table(&remote), table(&local));
+    let v: serde_json::Value =
+        serde_json::from_str(&ok(c.cmd(&["machine", "list", "--json"]))).unwrap();
+    assert_eq!(v["head"]["host"], "head-up");
+    assert_eq!(v["machines"][0]["name"], "fake");
+
+    // `--head` and PASTOR_HEAD name a head for one command, over the file.
+    let out = c.cmd(&["--head", "unreachable", "task", "list"]);
+    assert_eq!(error_code(&out), "head_unreachable");
+
+    let names: Vec<String> = std::fs::read_dir(&c.config)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["client.toml"], "nothing else written here");
+    assert!(!c.state.join("pastor.db").exists());
+}
+
+/// With a head set, `pastor events` pages through the head's log with
+/// `EventsSince` and prints what the head's own `pastor events` prints, with
+/// `--json` and `--task` too; `--follow` asks again every second and prints
+/// what the head logs after it started.
+#[test]
+fn events_from_a_remote_head_match_the_local_log() {
+    use std::io::BufRead;
+    let env = start();
+    let c = client(Some(&env));
+    ok(c.head_set("head-up", &[]));
+    ok(c.cmd(&["task", "run", "one", "--repo", "/tmp"]));
+    env.wait_done("t-1");
+
+    for args in [
+        &["events"][..],
+        &["events", "--json"],
+        &["events", "--task", "t-1"],
+        &["events", "--task", "t-9", "--json"],
+    ] {
+        // The head may log a machine event between the two reads; compare
+        // the lines both saw.
+        let local = ok(env.cmd(args));
+        let remote = ok(c.cmd(args));
+        assert!(!remote.is_empty() || args.contains(&"t-9"), "{args:?}");
+        assert!(
+            remote.starts_with(&local) || local.starts_with(&remote),
+            "{args:?}\nremote:\n{remote}\nlocal:\n{local}"
+        );
+    }
+    assert!(ok(c.cmd(&["events", "--task", "t-1"])).contains("task.done"));
+    assert_eq!(
+        error_code(&c.cmd(&["events", "--task", "x"])),
+        error_code(&env.cmd(&["events", "--task", "x"]))
+    );
+    assert!(!c.state.join("events.jsonl").exists());
+
+    let mut follow = pastor()
+        .args(["events", "--follow", "--task", "t-2", "--json"])
+        .env("PASTOR_CONFIG_DIR", &c.config)
+        .env("PASTOR_STATE_DIR", &c.state)
+        .env("PATH", &c.path)
+        .env_remove("PASTOR_HEAD")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(follow.stdout.take().unwrap()).lines();
+    ok(c.cmd(&["task", "run", "two", "--repo", "/tmp"]));
+    let mut kinds = vec![];
+    while !kinds.iter().any(|k| k == "task.done") {
+        let line = lines.next().expect("follow ended").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["task"]["id"], 2, "{v}");
+        kinds.push(v["type"].as_str().unwrap().to_string());
+    }
+    follow.kill().unwrap();
+    follow.wait().unwrap();
+    assert_eq!(kinds[0], "task.queued", "{kinds:?}");
+    let local: Vec<String> = ok(env.cmd(&["events", "--task", "t-2", "--json"]))
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kinds, local[..kinds.len()]);
+}
+
+/// A command not moved behind the head yet would act on this machine's
+/// files; it is refused instead, and `serve` would be a second head. The
+/// commands that are local on purpose still run.
+#[test]
+fn a_remote_head_refuses_what_would_act_on_local_files() {
+    let c = client(None);
+    ok(c.head_set("unreachable", &["--force"]));
+    for args in [
+        &["machine", "add", "pi-1", "--local"][..],
+        &["flock", "list"],
+        &["trust", "list"],
+        &["config", "edit"],
+    ] {
+        let out = c.cmd(args);
+        assert_eq!(error_code(&out), "remote_head_unsupported", "{args:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains(&args[..args.len().min(2)].join(" ")),
+            "{v}"
+        );
+    }
+    assert!(!c.config.join("flock.toml").exists());
+    ok(c.cmd(&["completions", "bash"]));
+    ok(c.cmd(&["connector", "list"]));
+
+    ok(c.cmd(&["head", "unset"]));
+    assert_eq!(ok(c.cmd(&["head", "show"])), "head: this machine\n");
+    let out = c.cmd(&["task", "list"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("pastor serve is not running"),
+        "back to the local head, and there is none"
+    );
+}
+
+/// `head set` pings through the bridge first: ssh that cannot connect is
+/// `head_unreachable` with ssh's own words, a machine with no head running is
+/// `no_head`, a pastor with no `bridge` is `head_too_old`. Nothing is saved
+/// unless `--force` says so.
+#[test]
+fn head_set_refuses_a_head_that_does_not_answer() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = client(None);
+    let out = c.head_set("unreachable", &[]);
+    assert_eq!(error_code(&out), "head_unreachable");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Connection refused"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!c.config.join("client.toml").exists());
+
+    assert_eq!(error_code(&c.head_set("no-head", &[])), "no_head");
+    assert_eq!(ok(c.cmd(&["head", "show"])), "head: this machine\n");
+
+    let old = c.tmp.path().join("old-pastor");
+    std::fs::write(
+        &old,
+        "#!/bin/sh\necho \"error: unrecognized subcommand '$1'\" >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = c.cmd(&["head", "set", "no-head", "--pastor", old.to_str().unwrap()]);
+    assert_eq!(error_code(&out), "head_too_old");
+
+    let out = c.head_set("no-head", &["--force"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("saved anyway"));
+    assert_eq!(ok(c.cmd(&["head", "show"])), "head: no-head (remote)\n");
+    let text = std::fs::read_to_string(c.config.join("client.toml")).unwrap();
+    assert!(text.contains("ssh = \"no-head\""), "{text}");
+    // A command then says the same, and never falls back to this machine.
+    assert_eq!(error_code(&c.cmd(&["task", "list"])), "no_head");
+    assert_eq!(error_code(&c.cmd(&["task", "describe", "t-1"])), "no_head");
+}
+
+/// `--model` offers the `[models]` names, with their kind.
+#[test]
+fn complete_offers_model_names_after_model() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "[models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n\
+         [models.gpt]\nkind = \"codex\"\nargs = []\n",
+    )
+    .unwrap();
+    let (ok, out) = complete(&config, &state, &["task", "run", "--model", ""]);
+    assert!(ok);
+    assert_eq!(out, "gpt\tcodex\nsonnet\tclaude\n");
+}
+
+/// `--priority` and `task priority` offer the levels.
+#[test]
+fn complete_offers_the_levels() {
+    let (_tmp, config, state) = completion_config();
+    let levels = "low\nnormal\nhigh\ncritical\n";
+    let (ok, out) = complete(&config, &state, &["task", "run", "--priority", ""]);
+    assert!(ok);
+    assert_eq!(out, levels);
+    let (ok, out) = complete(&config, &state, &["task", "priority", "t-1", ""]);
+    assert!(ok);
+    assert_eq!(out, levels);
+}
+
+/// `--priority` queues the task at that level, which list, describe and
+/// the JSON show; `task priority` moves a queued task and refuses one that
+/// left the queue; a word that is not a level is `unknown_priority`.
+#[test]
+fn a_tasks_priority_is_set_shown_and_changed() {
+    let env = start();
+    let out = env.cmd(&["task", "run", "hi", "--priority", "high", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["priority"], "high", "{task}");
+    assert_eq!(task["priority_from"], "task run", "{task}");
+    let out = env.cmd(&["task", "describe", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("priority:   high (from task run)\n"),
+        "{text}"
+    );
+    let out = env.cmd(&["task", "list", "--all"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines().next().unwrap().contains("STATE    PRIORITY"),
+        "{text}"
+    );
+    // t-1 went to a machine at once: it has left the queue.
+    let out = env.cmd(&["task", "priority", "t-1", "low"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(last_error(&out).0, "not_queued");
+
+    for args in [
+        &["task", "run", "x", "--priority", "urgent"][..],
+        &["task", "priority", "t-1", "urgent"],
+    ] {
+        let out = env.cmd(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(last_error(&out).0, "unknown_priority", "{args:?}");
+    }
+}
+
+/// `--model sonnet` starts the agent with the model's args before its own,
+/// and describe, list and the JSON name it; a name `[models]` lacks, one of
+/// another kind than `--agent`, and raw args in `--model` are refused.
+#[test]
+fn a_named_model_reaches_herdr_and_bad_ones_are_refused() {
+    let env = start();
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [defaults]\nagent_args = [\"-v\"]\n\
+         [models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n",
+    )
+    .unwrap();
+    let out = env.cmd(&["task", "run", "hi", "--model", "sonnet", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["model"], "sonnet", "{task}");
+    let start = env.agent_start_params("t-1");
+    assert_eq!(
+        without_session(&start["args"]),
+        serde_json::json!(["--model", "claude-sonnet-5", "-v"]),
+        "{start}"
+    );
+    let out = env.cmd(&["task", "describe", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("model:      sonnet (from task run)\n"),
+        "{text}"
+    );
+    let out = env.cmd(&["task", "list", "--all"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines().next().unwrap().contains("AGENT   MODEL"),
+        "{text}"
+    );
+    assert!(text.contains("claude  sonnet"), "{text}");
+
+    for (args, code) in [
+        (&["--model", "haiku"][..], "unknown_model"),
+        (&["--model=--model claude-opus-5-5"], "unknown_model"),
+        (
+            &["--model", "sonnet", "--agent", "codex"],
+            "model_kind_mismatch",
+        ),
+    ] {
+        let out = env.cmd(&[&["task", "run", "x"][..], args].concat());
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(last_error(&out).0, code, "{args:?}");
+    }
+}
+
+/// A model of another kind than the machine's agent runs as the agent its
+/// `agents` names for that kind, with only the model's args, and describe
+/// says where it came from; without that entry, a task pinned there is
+/// refused.
+#[test]
+fn a_model_of_another_kind_runs_on_the_machines_agent_for_it() {
+    let env = start();
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [defaults]\nagent_args = [\"-v\"]\n\
+         [models.gpt]\nkind = \"opencode\"\nargs = [\"--model\", \"openai/gpt-5.5\"]\n",
+    )
+    .unwrap();
+    let flock_file = env.config.join("flock.toml");
+    let plain = std::fs::read_to_string(&flock_file).unwrap();
+    std::fs::write(
+        &flock_file,
+        format!("{plain}agents = {{ opencode = \"opencode\" }}\n"),
+    )
+    .unwrap();
+    env.json(&["task", "run", "hi", "--model", "gpt", "--json"]);
+    let start = env.agent_start_params("t-1");
+    assert_eq!(start["kind"], "opencode", "{start}");
+    assert_eq!(
+        start["args"],
+        serde_json::json!(["--model", "openai/gpt-5.5"]),
+        "{start}"
+    );
+    let out = env.cmd(&["task", "describe", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("agent:      opencode (from machine fake agents.opencode)\n"),
+        "{text}"
+    );
+    let out = env.cmd(&["machine", "describe", "fake"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("opencode=opencode"), "{text}");
+
+    std::fs::write(&flock_file, plain).unwrap();
+    env.fails_with(
+        &["task", "run", "x", "--model", "gpt", "--machine", "fake"],
+        "model_kind_mismatch",
+    );
+}
+
+/// `--profile ci` starts Claude with `--permission-mode dontAsk` and the
+/// profile's lists as its flags, and describe and the JSON name it; an
+/// unknown name, raw args in `--profile`, `unrestricted` pinned to a machine
+/// that is not, and args that pick a permission mode are refused.
+#[test]
+fn a_profile_reaches_herdr_and_bad_ones_are_refused() {
+    let env = start();
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [profiles.ci]\nallow = [\"Bash(make:*)\"]\ndeny = [\"WebFetch\"]\n",
+    )
+    .unwrap();
+    let t = env.json(&["task", "run", "hi", "--profile", "ci", "--json"]);
+    assert_eq!(t["profile"], "ci", "{t}");
+    let start = env.agent_start_params("t-1");
+    assert_eq!(
+        without_session(&start["args"]),
+        serde_json::json!([
+            "--permission-mode",
+            "dontAsk",
+            "--allowedTools",
+            "Bash(make:*)",
+            "--disallowedTools",
+            "WebFetch"
+        ]),
+        "{start}"
+    );
+    let out = env.cmd(&["task", "describe", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("profile:    ci (from task run)\n"), "{text}");
+
+    for (args, code) in [
+        (&["--profile", "nope"][..], "unknown_profile"),
+        (&["--profile=--permission-mode"], "unknown_profile"),
+        (
+            &["--profile", "unrestricted", "--machine", "fake"],
+            "profile_not_allowed",
+        ),
+        (
+            &[
+                "--profile",
+                "ci",
+                "--agent-arg",
+                "--dangerously-skip-permissions",
+            ],
+            "profile_args_conflict",
+        ),
+    ] {
+        let out = env.cmd(&[&["task", "run", "x"][..], args].concat());
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(last_error(&out).0, code, "{args:?}");
+    }
+}
+
+/// opencode has no flags for tool lists, so a profiled opencode task is
+/// taken, and its agent starts with no permission args: its rules go in the
+/// pane's env (`OPENCODE_PERMISSION`, checked in `dispatch`'s tests).
+#[test]
+fn a_profile_reaches_opencode_without_flags() {
+    let env = start();
+    let t = env.json(&[
+        "task",
+        "run",
+        "hi",
+        "--agent",
+        "opencode",
+        "--profile",
+        "review",
+        "--json",
+    ]);
+    assert_eq!(t["profile"], "review", "{t}");
+    let start = env.agent_start_params("t-1");
+    assert_eq!(start["kind"], "opencode", "{start}");
+    assert_eq!(start["args"], serde_json::json!([]), "{start}");
+}
+
+/// `make smoke-profiles`'s script, against the fake herdr: a review task
+/// per agent that ends done passes, and the tasks are closed after; with no
+/// machine named it refuses to start.
+#[test]
+fn the_profile_smoke_script_passes_tasks_that_end_done() {
+    let env = start();
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/smoke-profiles.sh");
+    let run = |vars: &[(&str, &str)]| {
+        let mut c = Command::new("sh");
+        c.arg(script)
+            .env("PASTOR", env!("CARGO_BIN_EXE_pastor"))
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("POLL", "1")
+            .env("TIMEOUT", "30")
+            .env_remove("PASTOR_TASK")
+            .env_remove("CLAUDE")
+            .env_remove("OPENCODE");
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    let out = run(&[("REPO", "/srv/app")]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+
+    let out = run(&[
+        ("REPO", "/srv/app"),
+        ("CLAUDE", "fake"),
+        ("OPENCODE", "fake"),
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text.contains("PASS claude on fake: t-1 done"), "{text}");
+    assert!(text.contains("PASS opencode on fake: t-2 done"), "{text}");
+    for (t, agent) in [("t-1", "claude"), ("t-2", "opencode")] {
+        let got = env.json(&["task", "describe", t, "--json"]);
+        assert_eq!(got["state"], "closed", "{got}");
+        assert_eq!(got["profile"], "review", "{got}");
+        assert_eq!(got["spec"]["agent"], agent, "{got}");
+    }
+}
+
+/// `task attach` on a task whose pane is gone: one of a kind with no
+/// session keeps the old error with a hint that only Claude tasks reopen; a
+/// Claude task goes on to its machine to reopen the session, which a
+/// `command` machine cannot show.
+#[test]
+fn attach_on_a_closed_task_reopens_only_a_claude_session() {
+    let env = start();
+    let t = env.json(&["task", "run", "hi", "--agent", "opencode", "--json"]);
+    assert_eq!(t["spec"].get("session_id"), None, "{t}");
+    env.json(&["task", "close", "t-1", "--json"]);
+    let out = env.cmd(&["task", "attach", "t-1"]);
+    assert_eq!(error_code(&out), "no_agent");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("t-1 is closed; nothing to attach to"), "{err}");
+    assert!(err.contains("only Claude tasks can be reopened"), "{err}");
+
+    let t = env.json(&["task", "run", "hi", "--json"]);
+    assert!(t["spec"]["session_id"].is_string(), "{t}");
+    env.json(&["task", "close", "t-2", "--json"]);
+    env.fails_with(&["task", "attach", "t-2"], "no_terminal");
+}
+
+impl Client {
+    /// `pastor serve` in the background, its log in `serve.log`.
+    fn serve(&self) -> Served {
+        let log = self.tmp.path().join("serve.log");
+        let child = pastor()
+            .args(["serve"])
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .env("PASTOR_DATA_DIR", &self.data)
+            .env("PATH", &self.path)
+            .env_remove("PASTOR_HEAD")
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        Served { child, log }
+    }
+
+    /// One request line to this machine's own socket, through `pastor
+    /// bridge`, and its reply.
+    fn local(&self, line: &str) -> serde_json::Value {
+        use std::io::Write;
+        let mut child = pastor()
+            .args(["bridge"])
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .env("PASTOR_DATA_DIR", &self.data)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{line}").unwrap();
+        let out = child.wait_with_output().unwrap();
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stdout)))
+    }
+}
+
+struct Served {
+    child: std::process::Child,
+    log: std::path::PathBuf,
+}
+
+impl Served {
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Wait until the log says `what`, failing if serve exits first.
+    fn wait_log(&mut self, what: &str) {
+        let deadline = Instant::now() + WAIT;
+        while !self.log().contains(what) {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "serve exited:\n{}",
+                self.log()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "never logged {what:?}:\n{}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// With a head set, `pastor serve` runs headless: this machine's jobs run
+/// here, their tasks go to the head, and this machine's hooks hear the
+/// head's events. It keeps job state in its own small database, answers
+/// only its own job requests on the local socket, and a head refuses to
+/// start beside it.
+#[test]
+fn a_headless_serve_runs_its_jobs_through_the_head() {
+    let env = start();
+    let c = client(Some(&env));
+    let notify =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/connector/notify");
+    ok(c.cmd(&["connector", "link", notify.to_str().unwrap()]));
+    ok(c.head_set("head-up", &[]));
+    std::fs::create_dir_all(c.config.join("jobs")).unwrap();
+    std::fs::write(c.config.join("pastor.toml"), "tick = \"1s\"\n").unwrap();
+    std::fs::write(
+        c.config.join("jobs/sweep.toml"),
+        "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nrepo = \"/tmp\"\nprompt = \"sweep {{ item.key }} for {{ job.name }} as {{ task.id }}\"\n",
+    )
+    .unwrap();
+    let mut serve = c.serve();
+    serve.wait_log("headless");
+
+    // The job ran here and its task is the head's, rendered with the
+    // head's id.
+    let deadline = Instant::now() + WAIT;
+    let task = loop {
+        let out = ok(env.cmd(&["task", "list", "--all", "--json"]));
+        let tasks: serde_json::Value = serde_json::from_str(&out).unwrap();
+        if let Some(t) = tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["job"] == "sweep")
+        {
+            break t.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no task reached the head:\n{}",
+            serve.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let id = task["agent_name"].as_str().unwrap_or("t-1").to_string();
+    assert!(
+        task["prompt"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("for sweep as {id}")),
+        "{task}"
+    );
+    env.wait_done(&id);
+
+    // The head's task.done reached this machine's hook.
+    let heard = c.state.join("connectors/@notify/notify.jsonl");
+    let deadline = Instant::now() + WAIT;
+    while !std::fs::read_to_string(&heard)
+        .unwrap_or_default()
+        .contains("sweep")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the hook never heard:\n{}",
+            serve.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Its own small database, never the head's task store.
+    assert!(c.state.join("shepherd.db").exists());
+    assert!(!c.state.join("pastor.db").exists());
+
+    let pong = c.local(r#"{"op":"ping"}"#);
+    assert_eq!(pong["data"]["role"], "shepherd", "{pong}");
+    let jobs = c.local(r#"{"op":"job_list"}"#);
+    assert_eq!(jobs["data"][0]["name"], "sweep", "{jobs}");
+    assert!(
+        jobs["data"][0]["last_result"]
+            .as_str()
+            .unwrap()
+            .starts_with("ok:"),
+        "{jobs}"
+    );
+    let run = c.local(r#"{"op":"job_run","name":"ghost"}"#);
+    assert_eq!(run["data"]["code"], "job_not_found", "{run}");
+    let list = c.local(r#"{"op":"list","filter":{}}"#);
+    assert_eq!(list["data"]["code"], "shepherd_unsupported", "{list}");
+
+    // `head set` at this machine is refused, --force or not: it answers,
+    // and is not a head.
+    let other = client_to(Some((&c.config, &c.state)));
+    assert_eq!(
+        error_code(&other.head_set("head-up", &[])),
+        "shepherd_running"
+    );
+    assert_eq!(
+        error_code(&other.head_set("head-up", &["--force"])),
+        "shepherd_running"
+    );
+    assert!(!other.config.join("client.toml").exists());
+
+    // A second serve, headless or head, refuses the socket.
+    assert_eq!(error_code(&c.cmd(&["serve"])), "shepherd_running");
+    ok(c.cmd(&["head", "unset"]));
+    std::fs::write(
+        c.config.join("flock.toml"),
+        "[[machine]]\nname = \"m\"\nlocal = true\n",
+    )
+    .unwrap();
+    assert_eq!(error_code(&c.cmd(&["serve"])), "shepherd_running");
+    assert!(serve.child.try_wait().unwrap().is_none(), "{}", serve.log());
+}
+
+/// A head this machine cannot reach is a warning, not a reason to stop:
+/// the headless serve keeps running and asks again each tick.
+#[test]
+fn a_headless_serve_waits_for_an_unreachable_head() {
+    let c = client(None);
+    ok(c.head_set("unreachable", &["--force"]));
+    std::fs::create_dir_all(&c.config).unwrap();
+    std::fs::write(c.config.join("pastor.toml"), "tick = \"1s\"\n").unwrap();
+    let mut serve = c.serve();
+    serve.wait_log("shepherd_needs_head");
+    serve.wait_log("headless");
+    let pong = c.local(r#"{"op":"ping"}"#);
+    assert_eq!(pong["data"]["role"], "shepherd", "{pong}");
+}
+
+/// A head that holds this machine's socket keeps a headless serve from
+/// starting.
+#[test]
+fn a_headless_serve_refuses_a_running_head() {
+    let env = start();
+    let c = Client {
+        config: env.config.clone(),
+        state: env.state.clone(),
+        ..client(Some(&env))
+    };
+    let out = c.cmd(&["--head", "head-up", "serve"]);
+    assert_eq!(error_code(&out), "head_running");
+}
+
+/// `pastor profile list|describe` read pastor.toml with no head: the
+/// built-in profiles and the written ones, `extends` followed, and an
+/// unknown name refused.
+#[test]
+fn profile_list_and_describe_show_the_profiles() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "[profiles.ci]\ndescription = \"develop, plus docker\"\nextends = \"develop\"\nallow = [\"Bash(docker:*)\"]\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .env("PASTOR_DATA_DIR", state.join("data"))
+            .output()
+            .unwrap()
+    };
+    let out = run(&["profile", "list"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    let names: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["ci", "develop", "review", "unrestricted"],
+        "{text}"
+    );
+    assert!(
+        text.contains("pastor.toml  develop  develop, plus docker"),
+        "{text}"
+    );
+
+    let out = run(&["profile", "describe", "ci", "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let ci: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(ci["chain"], serde_json::json!(["ci", "develop"]));
+    assert_eq!(ci["source"], "config");
+    assert_eq!(
+        ci["allow"].as_array().unwrap().last().unwrap(),
+        "Bash(docker:*)"
+    );
+    assert!(
+        ci["deny"]
+            .as_array()
+            .unwrap()
+            .contains(&"Bash(sudo:*)".into())
+    );
+
+    let out = run(&["profile", "describe", "review"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("source: built-in"), "{text}");
+    assert!(text.contains("deny: Edit, Write"), "{text}");
+
+    assert_eq!(
+        last_error(&run(&["profile", "describe", "nope"])).0,
+        "unknown_profile"
+    );
+    let (ok, out) = complete(&config, &state, &["profile", "describe", ""]);
+    assert!(ok);
+    assert!(
+        out.starts_with("ci\tdevelop, plus docker\ndevelop\t"),
+        "{out}"
+    );
+}
+
+impl Client {
+    /// `cmd` with `editor` as $EDITOR.
+    fn edit(&self, editor: &std::path::Path, args: &[&str]) -> std::process::Output {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .env("PASTOR_DATA_DIR", &self.data)
+            .env("PATH", &self.path)
+            .env_remove("PASTOR_HEAD")
+            .env_remove("VISUAL")
+            .env("EDITOR", editor)
+            .env("TMPDIR", self.tmp.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+}
+
+const SWEEP: &str = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nrepo = \"/tmp\"\nprompt = \"sweep {{ item.key }}\"\n";
+
+/// The two tables of `job list` on a shepherd: the head's, then this
+/// machine's, as `(header, body)`.
+fn job_sections(text: &str) -> Vec<(String, String)> {
+    text.split("\n\n")
+        .map(|s| {
+            let (header, body) = s.split_once('\n').unwrap_or((s, ""));
+            (header.to_string(), body.trim_end().to_string())
+        })
+        .collect()
+}
+
+/// With a head set, `job list` shows the head's jobs and this machine's in
+/// two tables, a side with none saying so, and `--json` one flat array whose
+/// jobs say `where` they live. `job run|enable|disable|describe|edit` go to
+/// wherever the job's file is: here, or the head.
+#[test]
+fn a_shepherd_lists_and_drives_its_jobs_and_the_head_s() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let head_job = env.config.join("jobs/nightly.toml");
+    let c = client(Some(&env));
+    ok(c.head_set("head-up", &[]));
+
+    let out = c.cmd(&["job", "list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let sections = job_sections(&ok(out));
+    assert_eq!(sections.len(), 2, "{sections:?}");
+    assert_eq!(sections[0].0, "head: head-up");
+    assert!(sections[0].1.starts_with("NAME"), "{sections:?}");
+    assert!(sections[0].1.contains("nightly"), "{sections:?}");
+    assert!(sections[1].0.starts_with("shepherd: "), "{sections:?}");
+    assert!(sections[1].0.ends_with(" (this machine)"), "{sections:?}");
+    assert_eq!(sections[1].1, "no jobs");
+    assert!(stderr.contains("not running"), "{stderr}");
+
+    std::fs::create_dir_all(c.config.join("jobs")).unwrap();
+    let here_job = c.config.join("jobs/sweep.toml");
+    std::fs::write(&here_job, SWEEP).unwrap();
+    let sections = job_sections(&ok(c.cmd(&["job", "list"])));
+    assert!(!sections[0].1.contains("sweep"), "{sections:?}");
+    assert!(sections[1].1.starts_with("NAME"), "{sections:?}");
+    assert!(sections[1].1.contains("sweep"), "{sections:?}");
+    assert!(!sections[1].1.contains("nightly"), "{sections:?}");
+    let jobs: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(c.cmd(&["job", "list", "--json"]))).unwrap();
+    let wheres: Vec<(&str, &str)> = jobs
+        .iter()
+        .map(|j| (j["name"].as_str().unwrap(), j["where"].as_str().unwrap()))
+        .collect();
+    assert_eq!(wheres, [("nightly", "head"), ("sweep", "shepherd")]);
+
+    // Each job where its file is, with no serve here.
+    let text = ok(c.cmd(&["job", "disable", "sweep"]));
+    assert!(text.contains("disabled sweep"), "{text}");
+    assert!(
+        std::fs::read_to_string(&here_job)
+            .unwrap()
+            .contains("enabled = false")
+    );
+    let text = ok(c.cmd(&["job", "disable", "nightly"]));
+    assert!(text.contains("disabled nightly"), "{text}");
+    assert!(
+        std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("enabled = false")
+    );
+    assert!(!c.config.join("jobs/nightly.toml").exists());
+    let d: serde_json::Value =
+        serde_json::from_str(&ok(c.cmd(&["job", "describe", "sweep", "--json"]))).unwrap();
+    assert!(
+        d["file"]
+            .as_str()
+            .unwrap()
+            .starts_with(c.config.to_str().unwrap()),
+        "{d}"
+    );
+    assert_eq!(d["enabled"], false, "{d}");
+    let d: serde_json::Value =
+        serde_json::from_str(&ok(c.cmd(&["job", "describe", "nightly", "--json"]))).unwrap();
+    assert!(
+        d["file"]
+            .as_str()
+            .unwrap()
+            .starts_with(env.config.to_str().unwrap()),
+        "{d}"
+    );
+    assert_eq!(
+        error_code(&c.cmd(&["job", "describe", "ghost"])),
+        "job_not_found"
+    );
+    // A job here runs in this machine's serve, which is down.
+    let out = c.cmd(&["job", "run", "sweep"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not running"));
+
+    let editor = c.tmp.path().join("ed.sh");
+    std::fs::write(&editor, "#!/bin/sh\necho '# edited' >> \"$1\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = ok(c.edit(&editor, &["job", "edit", "sweep"]));
+    assert!(text.contains("saved"), "{text}");
+    assert!(
+        std::fs::read_to_string(&here_job)
+            .unwrap()
+            .ends_with("# edited\n")
+    );
+    assert!(
+        !std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("# edited")
+    );
+
+    // With this machine's serve up, its jobs come from it.
+    let mut serve = c.serve();
+    serve.wait_log("headless");
+    let out = c.cmd(&["job", "list", "--json"]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("not running"));
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&ok(out)).unwrap();
+    assert_eq!(jobs[1]["name"], "sweep", "{jobs:?}");
+    assert_eq!(jobs[1]["where"], "shepherd", "{jobs:?}");
+    let text = ok(c.cmd(&["job", "enable", "sweep"]));
+    assert!(text.contains("enabled sweep"), "{text}");
+    assert!(text.contains("picked it up"), "{text}");
+    let jobs: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(c.cmd(&["job", "list", "--json"]))).unwrap();
+    assert_eq!(jobs[1]["enabled"], true, "{jobs:?}");
+    ok(c.cmd(&["job", "run", "sweep"]));
+    ok(c.cmd(&["job", "enable", "nightly"]));
+    assert!(
+        std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("enabled = true")
+    );
+    let text = ok(c.edit(&editor, &["job", "edit", "sweep"]));
+    assert!(text.contains("picked it up"), "{text}");
+    assert!(serve.child.try_wait().unwrap().is_none(), "{}", serve.log());
 }

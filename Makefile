@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check fmt lint test test-machine leaks smoke install install-completions completions demo clean
+.PHONY: help build release check fmt lint test test-machine leaks smoke smoke-profiles install install-completions completions demo site site-serve clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -55,6 +55,11 @@ leaks: ## scan the whole git history for secrets, as CI does
 smoke: ## opt-in test against a real herdr: make smoke SESSION=default
 	PASTOR_REAL_HERDR_SESSION=$(or $(SESSION),default) cargo test --test real_herdr -- --ignored --nocapture
 
+# Needs a running head that runs this pastor, and the machines named in its
+# flock.toml; see scripts/smoke-profiles.sh. Starts real agents on them.
+smoke-profiles: ## live review task per agent: make smoke-profiles REPO='~/src/x' CLAUDE=m1 OPENCODE=m2
+	REPO="$(REPO)" CLAUDE="$(CLAUDE)" OPENCODE="$(OPENCODE)" scripts/smoke-profiles.sh
+
 install: ## install pastor into ~/.cargo/bin, with bash and fish completions
 	cargo install --path . --force --bin pastor
 	@$(MAKE) --no-print-directory install-completions
@@ -103,6 +108,14 @@ completions: ## regenerate contrib/completions/pastor.{bash,fish} from the CLI
 	mkdir -p contrib/completions
 	target/debug/pastor completions bash > contrib/completions/pastor.bash
 	target/debug/pastor completions fish > contrib/completions/pastor.fish
+
+# The website is a Hugo site in docs/website; the docs page is docs/manual.md
+# itself, mounted, so it cannot drift from the manual. Needs hugo from mise.
+site: ## build the website into docs/website/public
+	hugo --source docs/website --cleanDestinationDir
+
+site-serve: ## serve the website with live reload on http://127.0.0.1:1313
+	hugo server --source docs/website
 
 clean:
 	cargo clean

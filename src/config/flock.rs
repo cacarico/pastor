@@ -9,6 +9,12 @@ fn default_session() -> String {
 fn default_max_agents() -> u32 {
     2
 }
+fn default_one() -> u32 {
+    1
+}
+fn is_one(n: &u32) -> bool {
+    *n == 1
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineConfig {
@@ -24,6 +30,14 @@ pub struct MachineConfig {
     pub session: String,
     #[serde(default = "default_max_agents")]
     pub max_agents: u32,
+    /// Slots on top of `max_agents` that only tasks from jobs take; `0`
+    /// turns them off (see `dispatch::MachineView::has_room`).
+    #[serde(default = "default_one", skip_serializing_if = "is_one")]
+    pub job_slots: u32,
+    /// How many tasks past `max_agents` a `critical` task may start; `0`
+    /// turns it off.
+    #[serde(default = "default_one", skip_serializing_if = "is_one")]
+    pub burst: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     /// The flock this machine belongs to; `None` is the default flock.
@@ -36,6 +50,27 @@ pub struct MachineConfig {
     /// Like `agent`, for the agent's args; `[]` means none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_args: Option<Vec<String>>,
+    /// The `[models]` name for tasks on this machine that name none, before
+    /// its flock's and `[defaults]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The level of tasks pinned to this machine that name none, before
+    /// its flock's and `[defaults]` (see `Defaults::resolve_priority`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::task::Priority>,
+    /// The agent that runs a model of another kind than `agent`'s here, by
+    /// kind (see `Defaults::resolve_agent_for`).
+    #[serde(default, skip_serializing_if = "crate::config::KindAgents::is_empty")]
+    pub agents: crate::config::KindAgents,
+    /// The permission profile for tasks on this machine that name none,
+    /// before its flock's and `[defaults]`. Also what decides whether a task
+    /// may ask for `unrestricted` here (`Profiles::apply`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// One line on what the machine is for (`machine list --wide`,
+    /// `describe`); nothing reads it but people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
@@ -64,6 +99,24 @@ pub struct FlockEntry {
     /// Tool patterns this flock's agents must not use, on top of `[defaults]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// The `[models]` name for this flock's tasks that name none, before
+    /// `[defaults] model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The level of this flock's tasks that name none, before `[defaults]
+    /// priority`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::task::Priority>,
+    /// Like the machine's `agents`, before `[defaults] agents`.
+    #[serde(default, skip_serializing_if = "crate::config::KindAgents::is_empty")]
+    pub agents: crate::config::KindAgents,
+    /// The permission profile for this flock's tasks that name none, before
+    /// `[defaults] profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// One line on what the flock is for (`flock list --wide`, `describe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Why a task cannot have the flock it asked for (`Flock::task_flock`).
@@ -149,6 +202,15 @@ impl Flock {
             }
             crate::config::check_tools(&format!("flock {}: allow", f.name), &f.allow)?;
             crate::config::check_tools(&format!("flock {}: deny", f.name), &f.deny)?;
+            if let Some(m) = &f.model {
+                crate::config::check_model_name(m).map_err(|e| format!("flock {}: {e}", f.name))?;
+            }
+            crate::config::check_kind_agent_names(&f.agents)
+                .map_err(|e| format!("flock {}: {e}", f.name))?;
+            if let Some(p) = &f.profile {
+                crate::config::check_profile_name(p)
+                    .map_err(|e| format!("flock {}: {e}", f.name))?;
+            }
         }
         if !self.flocks.is_empty() {
             let defaults: Vec<&str> = self
@@ -198,6 +260,16 @@ impl Flock {
                     m.name, m.session
                 ));
             }
+            if let Some(model) = &m.model {
+                crate::config::check_model_name(model)
+                    .map_err(|e| format!("machine {}: {e}", m.name))?;
+            }
+            crate::config::check_kind_agent_names(&m.agents)
+                .map_err(|e| format!("machine {}: {e}", m.name))?;
+            if let Some(p) = &m.profile {
+                crate::config::check_profile_name(p)
+                    .map_err(|e| format!("machine {}: {e}", m.name))?;
+            }
             if m.max_agents == 0 {
                 return Err(format!("machine {}: max_agents must be at least 1", m.name));
             }
@@ -205,6 +277,43 @@ impl Flock {
                 && !self.has_flock(f)
             {
                 return Err(format!("machine {}: flock {f} is not declared", m.name));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a flock or machine `model` that `[models]` in pastor.toml does
+    /// not define, an `agents` entry `check_kind_agents` refuses by the kinds
+    /// `[agents]` gives, or a `profile` that is neither built in nor in
+    /// `[profiles]`. Apart from `validate` because models, agents and
+    /// profiles live in the other file; every caller that loads both runs it.
+    pub fn check_config(
+        &self,
+        models: &crate::config::Models,
+        agents: &crate::config::Agents,
+        profiles: &crate::config::profile::Profiles,
+    ) -> anyhow::Result<()> {
+        let flocks = self
+            .flocks
+            .iter()
+            .map(|f| ("flock", &f.name, &f.model, &f.agent, &f.agents, &f.profile));
+        let machines = self.machines.iter().map(|m| {
+            (
+                "machine", &m.name, &m.model, &m.agent, &m.agents, &m.profile,
+            )
+        });
+        for (what, name, model, agent, by_kind, profile) in flocks.chain(machines) {
+            if let Some(model) = model {
+                models
+                    .check(model)
+                    .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
+            }
+            crate::config::check_kind_agents(agent.as_deref(), by_kind, agents)
+                .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
+            if let Some(profile) = profile {
+                profiles
+                    .resolve(profile)
+                    .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
             }
         }
         Ok(())
@@ -637,6 +746,17 @@ impl FlockDoc {
         })
     }
 
+    /// `flock add --description`: set the description of the declared flock
+    /// `name`.
+    pub fn describe_flock(&mut self, name: &str, text: &str) -> Result<(), EditError> {
+        let t = self
+            .tables_mut("flock")
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+            .ok_or_else(|| EditError::UnknownFlock(name.into()))?;
+        t.insert("description", toml_edit::value(text));
+        Ok(())
+    }
+
     /// `flock remove`: refused while machines are in it, while `queued`
     /// (the ids of the queued tasks that name it) is not empty, or while it
     /// is the default. Dispatch only looks in declared flocks, so a queued
@@ -712,7 +832,7 @@ impl std::fmt::Display for FlockDoc {
 /// parses a target that starts with `-` as an option (`-oProxyCommand=...`
 /// runs a local command), and pastor passes it after `--` as well; spaces and
 /// control characters have no place in a `[user@]host`.
-fn ssh_target_problem(target: &str) -> Option<&'static str> {
+pub(crate) fn ssh_target_problem(target: &str) -> Option<&'static str> {
     if target.is_empty() {
         Some("is empty")
     } else if target.starts_with('-') {
@@ -732,16 +852,23 @@ mod tests {
 
     fn pi(name: &str) -> MachineConfig {
         MachineConfig {
+            description: None,
             name: name.into(),
             local: false,
             ssh: Some(format!("fleet@{name}")),
             command: None,
             session: "default".into(),
             max_agents: 2,
+            job_slots: 1,
+            burst: 1,
             tags: vec![],
             flock: None,
             agent: None,
             agent_args: None,
+            model: None,
+            priority: None,
+            agents: Default::default(),
+            profile: None,
         }
     }
 
@@ -749,6 +876,25 @@ mod tests {
         let f: Flock = toml::from_str(text).map_err(|e| e.to_string())?;
         f.validate()?;
         Ok(f)
+    }
+
+    /// `job_slots` and `burst` default to 1, `0` is allowed, and a file
+    /// that leaves them at 1 does not write them.
+    #[test]
+    fn job_slots_and_burst_default_to_one() {
+        let f: Flock = toml::from_str(
+            "[[machine]]\nname = \"a\"\nlocal = true\n\n[[machine]]\nname = \"b\"\nlocal = true\njob_slots = 0\nburst = 2\n",
+        )
+        .unwrap();
+        f.validate().unwrap();
+        assert_eq!((f.machines[0].job_slots, f.machines[0].burst), (1, 1));
+        assert_eq!((f.machines[1].job_slots, f.machines[1].burst), (0, 2));
+        let out = toml::to_string(&f).unwrap();
+        assert!(
+            out.contains("job_slots = 0") && out.contains("burst = 2"),
+            "{out}"
+        );
+        assert_eq!(out.matches("burst").count(), 1, "{out}");
     }
 
     #[test]
@@ -942,6 +1088,49 @@ flock = "work"
             d.add_machine(&pi("pi-3")).unwrap_err(),
             EditError::MachineExists("pi-3".into())
         );
+    }
+
+    /// A flock and a machine may say what they are for; a file without
+    /// descriptions loads as before. `flock add` and `machine add` write
+    /// one when given.
+    #[test]
+    fn flocks_and_machines_take_a_description() {
+        let f: Flock = toml::from_str(
+            "[[flock]]\nname = \"life\"\ndefault = true\ndescription = \"Personal errands\"\n\n\
+             [[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\ndescription = \"The desk one\"\n\n\
+             [[machine]]\nname = \"pi-2\"\nssh = \"user@pi-2\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            f.entry("life").unwrap().description.as_deref(),
+            Some("Personal errands")
+        );
+        assert_eq!(
+            f.get("pi-1").unwrap().description.as_deref(),
+            Some("The desk one")
+        );
+        assert_eq!(f.get("pi-2").unwrap().description, None);
+        let old: Flock = toml::from_str(COMMENTED).unwrap();
+        assert!(old.machines.iter().all(|m| m.description.is_none()));
+
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        d.add_flock("work", false, &[]).unwrap();
+        d.describe_flock("work", "Paid work").unwrap();
+        d.add_machine(&MachineConfig {
+            description: Some("A spare".into()),
+            ..pi("pi-9")
+        })
+        .unwrap();
+        let f = d.flock().unwrap();
+        assert_eq!(
+            f.entry("work").unwrap().description.as_deref(),
+            Some("Paid work")
+        );
+        assert_eq!(
+            f.get("pi-9").unwrap().description.as_deref(),
+            Some("A spare")
+        );
+        assert!(d.describe_flock("nope", "x").is_err());
     }
 
     /// The first named flock puts the implicit one on paper, as the default,
@@ -1281,6 +1470,81 @@ tags = ["fast"]
         std::fs::write(&path, "").unwrap();
         let f = Flock::load_existing(&path).unwrap();
         assert!(f.machines.is_empty());
+    }
+
+    /// A flock's or a machine's `model` must be a model name, and one that
+    /// pastor.toml's `[models]` defines.
+    #[test]
+    fn a_model_must_be_a_name_that_models_define() {
+        let flock = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"p\"\n"
+                ),
+            )
+        };
+        let err = format!("{:#}", flock("model = \"--model x\"").unwrap_err());
+        assert!(err.contains("flock p: model name"), "{err}");
+        let f = flock("model = \"sonnet\"").unwrap();
+        let models: crate::config::Models =
+            toml::from_str("[sonnet]\nkind = \"claude\"\nargs = []\n").unwrap();
+        f.check_config(&models, &Default::default(), &Default::default())
+            .unwrap();
+        let err = f
+            .check_config(
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("flock p: model sonnet is not in [models]"),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            Flock::parse(
+                Path::new("flock.toml"),
+                "[[machine]]\nname = \"m\"\nlocal = true\nmodel = \"A\"\n"
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("machine m: model name"), "{err}");
+    }
+
+    /// A flock's or a machine's `profile` must be a profile name, and one
+    /// that is built in or in pastor.toml's `[profiles]`.
+    #[test]
+    fn a_profile_must_be_built_in_or_in_profiles() {
+        let flock = |extra: &str, machine: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"p\"\n{machine}\n"
+                ),
+            )
+        };
+        let err = format!("{:#}", flock("profile = \"--yolo\"", "").unwrap_err());
+        assert!(err.contains("flock p: profile name"), "{err}");
+        let err = format!("{:#}", flock("", "profile = \"A\"").unwrap_err());
+        assert!(err.contains("machine m: profile name"), "{err}");
+        let none = crate::config::Models::default();
+        let f = flock("profile = \"develop\"", "profile = \"ci\"").unwrap();
+        assert_eq!(f.flocks[0].profile.as_deref(), Some("develop"));
+        let err = f
+            .check_config(&none, &Default::default(), &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("machine m: profile ci is not built in"),
+            "{err}"
+        );
+        let profiles: crate::config::profile::Profiles =
+            toml::from_str("[ci]\nextends = \"develop\"\n").unwrap();
+        f.check_config(&none, &Default::default(), &profiles)
+            .unwrap();
     }
 
     #[test]

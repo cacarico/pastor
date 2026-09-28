@@ -93,6 +93,58 @@ impl std::str::FromStr for TaskState {
     }
 }
 
+/// A queued task's level: dispatch takes queued tasks by level, highest
+/// first, then by position, then by age (`Store::queued_tasks`). Settled
+/// when the task is queued (`Defaults::resolve_priority`) and stored on it.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    Low,
+    #[default]
+    Normal,
+    High,
+    Critical,
+}
+
+/// The code of a level that is not one of `Priority`'s.
+pub const UNKNOWN_PRIORITY: &str = "unknown_priority";
+
+impl Priority {
+    pub const ALL: [Priority; 4] = [
+        Priority::Low,
+        Priority::Normal,
+        Priority::High,
+        Priority::Critical,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Priority::Low => "low",
+            Priority::Normal => "normal",
+            Priority::High => "high",
+            Priority::Critical => "critical",
+        }
+    }
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Priority {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Priority::ALL
+            .into_iter()
+            .find(|p| p.as_str() == s)
+            .ok_or_else(|| format!("unknown priority {s:?}; use low, normal, high or critical"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchSpec {
     pub agent: String,
@@ -142,6 +194,12 @@ pub struct DispatchSpec {
     /// `repo`.
     #[serde(default, skip_serializing_if = "Place::is_repo")]
     pub place: Place,
+    /// The Claude session the agent was started on (`--session-id`),
+    /// recorded by dispatch so `pastor task attach` can resume it once the
+    /// pane is gone. `None` for another kind of agent, and when the task's
+    /// own args pick the session (`picks_session`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Where dispatch puts a task's pane: `--place`, a job's `[dispatch] place`
@@ -231,6 +289,20 @@ pub struct AgentSource {
     /// for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_args: Option<String>,
+    /// The `[models]` name the task runs, whose args lead `agent_args`;
+    /// `None` when no layer names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Where `model` came from, labelled like `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_from: Option<String>,
+    /// The permission profile the task runs under, whose lists are in the
+    /// spec's `allow` and `deny`; `None` when no layer names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Where `profile` came from, labelled like `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_from: Option<String>,
 }
 
 /// A worktree herdr made for a task: its branch and where it is on disk.
@@ -252,6 +324,13 @@ pub struct Reopen {
     pub branch: String,
     pub path: String,
     pub agent: String,
+}
+
+impl DispatchSpec {
+    /// The permission profile the task runs under, if it runs one.
+    pub fn profile(&self) -> Option<&str> {
+        self.agent_source.as_ref()?.profile.as_deref()
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -309,6 +388,29 @@ pub struct Task {
     /// it reads as the default flock.
     #[serde(default)]
     pub flock: Option<String>,
+    /// The task's level in the queue. `normal` on a row from before it.
+    #[serde(default)]
+    pub priority: Priority,
+    /// Where `priority` came from, labelled like `AgentSource::agent`
+    /// (`task run`, `job <name>`, `machine <name>`, `flock <name>`,
+    /// `defaults`, `task priority`); `None` when no layer set one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_from: Option<String>,
+    /// The task's position among queued tasks of its level, lowest first;
+    /// its id unless something has moved it.
+    #[serde(default)]
+    pub queue_pos: i64,
+    /// What the head lets the task's agent change (`TaskRole`). `agent` on
+    /// every row from before roles.
+    #[serde(default)]
+    pub role: TaskRole,
+    /// One line on what the task is about, fixed when it was queued: `task
+    /// run --description`, or its job's `[dispatch] description` rendered
+    /// for its item. `None` when neither said anything, and on rows from
+    /// before it: those read as the prompt's first line
+    /// (`description_text`).
+    #[serde(default)]
+    pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -316,11 +418,106 @@ pub struct Task {
 }
 
 impl Task {
+    /// Whether a job made this task; `pastor task run` tasks carry the job
+    /// name `run`. Only these take a machine's job slots.
+    pub fn from_job(&self) -> bool {
+        self.job != "run"
+    }
+
     pub fn display_id(&self) -> String {
         format!("t-{}", self.id)
     }
     pub fn agent_name_for(id: i64) -> String {
         format!("t-{id}")
+    }
+    /// The `[models]` name the task runs, if it runs one.
+    pub fn model(&self) -> Option<&str> {
+        self.spec.agent_source.as_ref()?.model.as_deref()
+    }
+    /// The permission profile the task runs under, if it runs one.
+    pub fn profile(&self) -> Option<&str> {
+        self.spec.profile()
+    }
+    /// The task's description, else its prompt's first line, trimmed.
+    pub fn description_text(&self) -> String {
+        match &self.description {
+            Some(d) => d.clone(),
+            None => self.prompt.lines().next().unwrap_or("").trim().to_string(),
+        }
+    }
+    /// Where `description_text` came from: `--description` for a one-off
+    /// task, `job <name>` for a job's, else `the prompt`.
+    pub fn description_from(&self) -> String {
+        match (&self.description, self.job.as_str()) {
+            (None, _) => "the prompt".into(),
+            (Some(_), "run") => "--description".into(),
+            (Some(_), job) => format!("job {job}"),
+        }
+    }
+    /// The task as `--json` prints it: its row, with `model` and `profile`
+    /// beside it, and its description always a string, with where it came
+    /// from.
+    pub fn to_json(&self) -> Value {
+        let mut v = serde_json::to_value(self).unwrap_or(Value::Null);
+        if let Value::Object(o) = &mut v {
+            o.insert(
+                "model".into(),
+                self.model().map_or(Value::Null, Value::from),
+            );
+            o.insert(
+                "profile".into(),
+                self.profile().map_or(Value::Null, Value::from),
+            );
+            o.insert("description".into(), self.description_text().into());
+            o.insert("description_from".into(), self.description_from().into());
+        }
+        v
+    }
+}
+
+/// What a task's agent may change through the head. A guard against an
+/// agent's mistakes, not a boundary: the agent runs as the same user as
+/// pastor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRole {
+    /// Reads, and `task done` for its own task; everything else is refused
+    /// unless `agents_change_fleet` is on.
+    #[default]
+    Agent,
+    /// Also runs, retries and types into tasks and disables jobs
+    /// (`IpcRequest::orchestrator_may`). Only a person makes one: `task run
+    /// --role orchestrator` from outside any task.
+    Orchestrator,
+}
+
+impl TaskRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskRole::Agent => "agent",
+            TaskRole::Orchestrator => "orchestrator",
+        }
+    }
+
+    pub fn is_agent(&self) -> bool {
+        *self == TaskRole::Agent
+    }
+}
+
+impl std::fmt::Display for TaskRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TaskRole {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "agent" => Ok(TaskRole::Agent),
+            "orchestrator" => Ok(TaskRole::Orchestrator),
+            other => Err(format!("unknown role {other:?}; agent or orchestrator")),
+        }
     }
 }
 
@@ -331,6 +528,59 @@ pub fn parse_task_id(s: &str) -> Option<i64> {
 /// What to say when `s` is not something `parse_task_id` takes.
 pub fn bad_task_id(s: &str) -> String {
     format!("{s} is not a task id; write it like t-12 or 12")
+}
+
+/// Claude's flags that choose the session it starts on (`claude --help`).
+/// Agent args with any of them keep their own, and pastor records none.
+const CLAUDE_SESSION_FLAGS: [&str; 6] = [
+    "--session-id",
+    "--resume",
+    "-r",
+    "--continue",
+    "-c",
+    "--fork-session",
+];
+
+/// Do `args` already choose Claude's session, as `--flag value` or
+/// `--flag=value`?
+pub fn picks_session(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        let flag = a.split_once('=').map_or(a.as_str(), |(f, _)| f);
+        CLAUDE_SESSION_FLAGS.contains(&flag)
+    })
+}
+
+/// A new random (version 4) UUID for `claude --session-id`, from the
+/// kernel's random source. `None` when it cannot be read: the task then
+/// starts without a session of pastor's choosing, as before.
+pub fn new_session_id() -> Option<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .ok()?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
+
+/// Is `s` a UUID as Claude takes one: 8-4-4-4-12 hex digits. A recorded
+/// session goes into a command line on another machine, so attach checks
+/// it first.
+pub fn is_session_id(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.iter().map(|p| p.len()).eq([8, 4, 4, 4, 12])
+        && parts
+            .iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,6 +802,7 @@ mod tests {
     pub fn task(state: TaskState, last_completion_seq: Option<u64>) -> Task {
         let now = Utc::now();
         Task {
+            description: None,
             id: 1,
             job: "run".into(),
             item: Value::Null,
@@ -571,6 +822,7 @@ mod tests {
                 reopen: None,
                 agent_source: None,
                 place: Default::default(),
+                session_id: None,
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),
@@ -583,11 +835,15 @@ mod tests {
             activity_seen: false,
             ended: false,
             retry_of: None,
+            priority: Default::default(),
+            priority_from: None,
+            queue_pos: 0,
             created_at: now,
             started_at: Some(now),
             finished_at: None,
             updated_at: now,
             flock: None,
+            role: Default::default(),
         }
     }
 

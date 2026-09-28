@@ -8,18 +8,26 @@ pub mod describe;
 pub mod dispatch;
 pub mod edit;
 pub mod events;
+pub mod fleet_edit;
+pub mod head;
 pub mod herdr;
 pub mod hooks;
 pub mod ipc;
 pub mod machine;
+pub mod profile_cli;
+pub mod queue;
+pub mod queue_cli;
+pub mod reopen;
 pub mod schedule;
 pub mod scheduler;
 pub mod setup;
+pub mod shepherd;
 pub mod store;
 pub mod task;
 pub mod task_cli;
 pub mod template;
 pub mod trust_cli;
+pub mod watch;
 
 /// Lowest herdr socket protocol pastor speaks. herdr 0.9.0 and 0.9.1 ship 22.
 pub const MIN_HERDR_PROTOCOL: u32 = 22;

@@ -23,6 +23,12 @@ pub enum Kind {
     Machine,
     Task,
     Connector,
+    Model,
+    Profile,
+    /// A task's level; fixed, not read from any file.
+    Priority,
+    /// A queued task, in the order dispatch takes them.
+    QueuedTask,
 }
 
 /// The kind of name the argument `id` of the subcommand at `path` (canonical
@@ -31,11 +37,16 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
     match (path, id) {
         // A new flock's or machine's name is the user's to choose.
         ([_, "add"], "name") => None,
+        (["queue", "move"], "task" | "before" | "after") => Some(Kind::QueuedTask),
         (_, "flock") => Some(Kind::Flock),
         (_, "machine") => Some(Kind::Machine),
         (_, "task") => Some(Kind::Task),
         (_, "job") => Some(Kind::Job),
+        (_, "model") => Some(Kind::Model),
+        (_, "profile") => Some(Kind::Profile),
+        (_, "priority") | (["task", "priority"], "level") => Some(Kind::Priority),
         (["connector", ..], "id") => Some(Kind::Connector),
+        (["watch"], "connectors") => Some(Kind::Connector),
         (["job", _], "name") => Some(Kind::Job),
         (["flock", _], "name") => Some(Kind::Flock),
         (["flock", "default", "set"], "name") => Some(Kind::Flock),
@@ -138,7 +149,13 @@ pub fn name_options(root: &Command) -> Vec<String> {
 /// to offer them. Anything unreadable is no names.
 pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
     match kind {
-        Kind::Job => dir_names(&paths.jobs_dir(), Some("toml")),
+        Kind::Job => dir_names(&paths.jobs_dir(), Some("toml"))
+            .into_iter()
+            .map(|(name, _)| {
+                let desc = job_description(&paths.jobs_dir(), &name);
+                (name, desc)
+            })
+            .collect(),
         Kind::Connector => dir_names(&paths.connectors_dir(), None),
         Kind::Flock => {
             let Ok(flock) = Flock::load(&paths.flock_file()) else {
@@ -148,7 +165,13 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
             flock
                 .flock_names()
                 .into_iter()
-                .map(|n| (n.to_string(), (n == default).then(|| "default".into())))
+                .map(|n| {
+                    let desc = flock
+                        .entry(n)
+                        .and_then(|e| crate::config::clean_description(e.description.as_deref()))
+                        .or_else(|| (n == default).then(|| "default".into()));
+                    (n.to_string(), desc)
+                })
                 .collect()
         }
         Kind::Machine => {
@@ -158,11 +181,50 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
             flock
                 .machines
                 .iter()
-                .map(|m| (m.name.clone(), Some(flock.flock_of(m).to_string())))
+                .map(|m| {
+                    let desc = crate::config::clean_description(m.description.as_deref())
+                        .unwrap_or_else(|| flock.flock_of(m).to_string());
+                    (m.name.clone(), Some(desc))
+                })
                 .collect()
         }
         Kind::Task => tasks(paths),
+        Kind::QueuedTask => queued_tasks(paths),
+        Kind::Priority => crate::task::Priority::ALL
+            .iter()
+            .map(|p| (p.to_string(), None))
+            .collect(),
+        Kind::Model => {
+            let Ok(config) = crate::config::PastorConfig::load(&paths.config_file()) else {
+                return Vec::new();
+            };
+            config
+                .models
+                .0
+                .iter()
+                .map(|(name, m)| (name.clone(), Some(m.kind.clone())))
+                .collect()
+        }
+        Kind::Profile => {
+            let Ok(config) = crate::config::PastorConfig::load(&paths.config_file()) else {
+                return Vec::new();
+            };
+            config
+                .profiles
+                .all()
+                .into_iter()
+                .map(|(name, (def, _))| (name, def.description.map(|d| one_line(&d))))
+                .collect()
+        }
     }
+}
+
+/// The `description` at the top of job `name`'s file, read as plain TOML:
+/// a file that no longer parses as a job still shows its line.
+fn job_description(dir: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crate::config::job::job_path(dir, name)).ok()?;
+    let table: toml::Table = toml::from_str(&text).ok()?;
+    crate::config::clean_description(table.get("description")?.as_str())
 }
 
 /// Live tasks first, then finished ones, newest first in each; the note
@@ -178,6 +240,26 @@ fn tasks(paths: &Paths) -> Vec<(String, Option<String>)> {
     tasks
         .iter()
         .map(|t| (t.display_id(), Some(task_note(t))))
+        .collect()
+}
+
+/// The queued tasks in the order `pastor queue` lists them, each with its
+/// level and note.
+fn queued_tasks(paths: &Paths) -> Vec<(String, Option<String>)> {
+    let Ok(store) = Store::open_read_only(&paths.db_file()) else {
+        return Vec::new();
+    };
+    let Ok(tasks) = store.queued_tasks() else {
+        return Vec::new();
+    };
+    tasks
+        .iter()
+        .map(|t| {
+            (
+                t.display_id(),
+                Some(format!("{} {}", t.priority, task_note(t))),
+            )
+        })
         .collect()
 }
 

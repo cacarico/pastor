@@ -7,7 +7,7 @@ use crate::config::Agents;
 use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
 };
-use crate::task::{Checkout, DispatchSpec, Place, Reopen, Task, TaskState};
+use crate::task::{Checkout, DispatchSpec, Place, Priority, Reopen, Task, TaskState};
 
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
 const READY_POLL: Duration = Duration::from_millis(500);
@@ -26,22 +26,79 @@ const PANE_BUSY_WAIT: Duration = Duration::from_millis(500);
 pub struct MachineView {
     pub name: String,
     pub max_agents: u32,
+    /// Slots only job tasks take, on top of `max_agents`.
+    pub job_slots: u32,
+    /// How far past `max_agents` a critical task may go.
+    pub burst: u32,
     pub tags: Vec<String>,
+    /// Every pane-owning task and orphan on the machine.
     pub live: usize,
+    /// How many of `live` come from a job (`Task::from_job`).
+    pub live_jobs: usize,
     pub healthy: bool,
     /// The flock the machine is in now.
     pub flock: String,
 }
 
+/// What a task may take on a machine: a job slot if it comes from a job,
+/// burst if it is critical.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Claim {
+    pub from_job: bool,
+    pub critical: bool,
+}
+
+impl Claim {
+    pub fn of(task: &Task) -> Claim {
+        Claim {
+            from_job: task.from_job(),
+            critical: task.priority == Priority::Critical,
+        }
+    }
+}
+
+impl MachineView {
+    /// Is there a slot for a task that claims `claim`? Up to `job_slots`
+    /// live job tasks sit in job slots; every other live task counts
+    /// against `max_agents`. A job task takes a free job slot, then a
+    /// shared one; a critical task that finds the shared slots full may go
+    /// up to `max_agents + burst`.
+    pub fn has_room(&self, claim: Claim) -> bool {
+        let in_job_slots = self.live_jobs.min(self.job_slots as usize);
+        let shared = (self.live - in_job_slots) as u64;
+        (claim.from_job && self.live_jobs < self.job_slots as usize)
+            || shared < self.max_agents as u64
+            || (claim.critical && shared < self.max_agents as u64 + self.burst as u64)
+    }
+}
+
 /// Only machines in `flock`, the task's, qualify. Of those the pinned machine
-/// wins. Otherwise: healthy, has every required tag, below capacity, fewest
-/// live tasks. Ties keep flock order.
-pub fn pick_machine(machines: &[MachineView], flock: &str, spec: &DispatchSpec) -> Option<String> {
+/// wins. Otherwise: healthy, has every required tag, has room for `claim`
+/// (`MachineView::has_room`), fewest live tasks. Ties keep flock order.
+pub fn pick_machine(
+    machines: &[MachineView],
+    flock: &str,
+    spec: &DispatchSpec,
+    claim: Claim,
+) -> Option<String> {
+    pick_machine_where(machines, flock, spec, claim, &|_| true)
+}
+
+/// `pick_machine` among the machines `accepts` takes by name, as a machine
+/// of another flock is left out: one whose agent cannot run the task's model.
+pub fn pick_machine_where(
+    machines: &[MachineView],
+    flock: &str,
+    spec: &DispatchSpec,
+    claim: Claim,
+    accepts: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     let fits = |m: &MachineView| {
         m.flock == flock
             && m.healthy
-            && (m.live as u64) < m.max_agents as u64
+            && m.has_room(claim)
             && spec.tags.iter().all(|t| m.tags.contains(t))
+            && accepts(&m.name)
     };
     if let Some(pinned) = &spec.machine {
         return machines
@@ -106,10 +163,13 @@ impl DispatchError {
 /// accepts; it must stay below the caller's per-request timeout, or a slow
 /// agent surfaces as a confusing "request timed out". `agents` turns the
 /// task's tool lists into the agent's own flags (`Agents::launch_args`).
+/// `head`, when given, is where the agent reaches the head from its machine
+/// (`ipc::HEAD_ENV`).
 pub async fn dispatch(
     conn: &dyn Connector,
     task: &mut Task,
     agents: &Agents,
+    head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     let name = Task::agent_name_for(task.id);
@@ -119,7 +179,7 @@ pub async fn dispatch(
     task.prompt_pending = false;
     task.activity_seen = false;
 
-    let result = dispatch_steps(conn, task, &name, agents, ready_timeout).await;
+    let result = dispatch_steps(conn, task, &name, agents, head, ready_timeout).await;
     match &result {
         Ok(DispatchOutcome::Running) => {
             task.state = TaskState::Running;
@@ -147,13 +207,47 @@ async fn dispatch_steps(
     task: &mut Task,
     name: &str,
     agents: &Agents,
+    head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
-    let launch = agents.launch(&spec).map_err(DispatchError::Task)?;
+    let mut launch = agents
+        .launch(&spec)
+        .map_err(|e| DispatchError::Task(e.message))?;
+    // opencode merges `OPENCODE_PERMISSION` over its own config's rules, so a
+    // machine with rules of its own would run the task under both. A machine
+    // that cannot tell (a `command` one) goes ahead.
+    if agents.opencode_profile(&spec)
+        && conn
+            .opencode_permission_rules()
+            .await
+            .map_err(CallError::from)?
+            == Some(true)
+    {
+        return Err(DispatchError::Task(format!(
+            "{}: the opencode config on {} has permission rules of its own, which opencode would \
+             merge with profile {}'s; move them out of ~/.config/opencode, or run without a profile",
+            crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
+            task.machine.as_deref().unwrap_or("this machine"),
+            spec.profile().unwrap_or_default(),
+        )));
+    }
+    // A Claude agent starts on a session pastor names, so `task attach` can
+    // resume it once the pane is gone; last, after the tool flags. The task
+    // records it only once `agent.start` succeeds (`finish_dispatch`): a
+    // task that failed before then never had that conversation to resume.
+    task.spec.session_id = None;
+    let mut session = None;
+    if launch.kind == "claude"
+        && !crate::task::picks_session(&launch.args)
+        && let Some(id) = crate::task::new_session_id()
+    {
+        launch.args.extend(["--session-id".to_string(), id.clone()]);
+        session = Some(id);
+    }
     let repo = match spec.repo.as_deref() {
         Some(repo) => Some(expand_home(conn, "repo", repo, task.machine.as_deref()).await?),
         None => None,
@@ -168,6 +262,11 @@ async fn dispatch_steps(
     // The mark the head refuses fleet changes by (`ipc::TASK_ENV`). Last,
     // so an `[agents]` env cannot clear it.
     env.insert(crate::ipc::TASK_ENV.into(), name.to_string());
+    // Where an agent off the head's machine reaches the head; the same
+    // reason puts it last.
+    if let Some(head) = head {
+        env.insert(crate::ipc::HEAD_ENV.into(), head.to_string());
+    }
     if let Some(dir) = repo.as_deref() {
         check_repo_exists(conn, dir, task.machine.as_deref()).await?;
     }
@@ -230,7 +329,7 @@ async fn dispatch_steps(
             created.root_pane.pane_id
         }
     };
-    finish_dispatch(conn, task, name, &launch, &pane_id, ready_timeout).await
+    finish_dispatch(conn, task, name, &launch, session, &pane_id, ready_timeout).await
 }
 
 /// Start the agent in its pane, wait for it to come up and prompt it.
@@ -239,6 +338,7 @@ async fn finish_dispatch(
     task: &mut Task,
     name: &str,
     launch: &crate::config::Launch,
+    session: Option<String>,
     pane_id: &str,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
@@ -247,6 +347,7 @@ async fn finish_dispatch(
     // the kind and the pane). Readiness shows up afterwards, in `agent.list` and
     // in whether `agent.prompt` is accepted.
     start_agent(conn, name, &launch.kind, &launch.args, pane_id).await?;
+    task.spec.session_id = session;
 
     let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
@@ -636,8 +737,11 @@ mod tests {
         MachineView {
             name: name.into(),
             max_agents: max,
+            job_slots: 0,
+            burst: 0,
             tags: tags.iter().map(|s| s.to_string()).collect(),
             live,
+            live_jobs: 0,
             healthy,
             flock: "default".into(),
         }
@@ -654,20 +758,20 @@ mod tests {
             },
         ];
         assert_eq!(
-            pick_machine(&ms, "default", &spec()).as_deref(),
+            pick_machine(&ms, "default", &spec(), Claim::default()).as_deref(),
             Some("home-1")
         );
         assert_eq!(
-            pick_machine(&ms, "work", &spec()).as_deref(),
+            pick_machine(&ms, "work", &spec(), Claim::default()).as_deref(),
             Some("work-1")
         );
-        assert_eq!(pick_machine(&ms, "play", &spec()), None);
+        assert_eq!(pick_machine(&ms, "play", &spec(), Claim::default()), None);
         let pinned_elsewhere = DispatchSpec {
             machine: Some("work-1".into()),
             ..spec()
         };
         assert_eq!(
-            pick_machine(&ms, "default", &pinned_elsewhere),
+            pick_machine(&ms, "default", &pinned_elsewhere, Claim::default()),
             None,
             "a pinned machine that moved to another flock takes nothing"
         );
@@ -689,6 +793,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         }
     }
 
@@ -701,7 +806,7 @@ mod tests {
             let fake = FakeHerdr::new();
             fake.set_missing_dir("/srv/app");
             let mut t = task(DispatchSpec { worktree, ..spec() });
-            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap_err();
             assert!(!err.is_transport(), "the machine is fine: {err}");
@@ -717,6 +822,7 @@ mod tests {
                     .any(|r| r.method.ends_with(".create")),
                 "nothing was created"
             );
+            assert_eq!(t.spec.session_id, None, "no session to resume");
         }
     }
 
@@ -730,7 +836,7 @@ mod tests {
             repo: Some("~/gone".into()),
             ..spec()
         });
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(
@@ -739,9 +845,22 @@ mod tests {
         );
     }
 
+    /// `args` with the `--session-id` dispatch gave `t` after them.
+    fn with_session(t: &Task, args: Value) -> Value {
+        let mut args = args.as_array().unwrap().clone();
+        let id = t
+            .spec
+            .session_id
+            .clone()
+            .expect("a claude task records a session");
+        args.extend([Value::from("--session-id"), Value::from(id)]);
+        Value::Array(args)
+    }
+
     fn task(spec: DispatchSpec) -> Task {
         let now = Utc::now();
         Task {
+            description: None,
             id: 7,
             job: "run".into(),
             item: Value::Null,
@@ -758,11 +877,15 @@ mod tests {
             activity_seen: false,
             ended: false,
             retry_of: None,
+            priority: Default::default(),
+            priority_from: None,
+            queue_pos: 0,
             created_at: now,
             started_at: None,
             finished_at: None,
             updated_at: now,
             flock: None,
+            role: Default::default(),
         }
     }
 
@@ -773,9 +896,157 @@ mod tests {
             mv("b", 2, 1, &[], true),
             mv("c", 2, 0, &[], true),
         ];
-        assert_eq!(pick_machine(&ms, "default", &spec()).as_deref(), Some("c"));
+        assert_eq!(
+            pick_machine(&ms, "default", &spec(), Claim::default()).as_deref(),
+            Some("c")
+        );
         let full = vec![mv("a", 1, 1, &[], true)];
-        assert_eq!(pick_machine(&full, "default", &spec()), None);
+        assert_eq!(
+            pick_machine(&full, "default", &spec(), Claim::default()),
+            None
+        );
+    }
+
+    /// `mv` with job slots and burst, and how many of `live` are job tasks.
+    fn slots(max: u32, job_slots: u32, burst: u32, live: usize, live_jobs: usize) -> MachineView {
+        MachineView {
+            job_slots,
+            burst,
+            live_jobs,
+            ..mv("m", max, live, &[], true)
+        }
+    }
+
+    const RUN: Claim = Claim {
+        from_job: false,
+        critical: false,
+    };
+    const JOB: Claim = Claim {
+        from_job: true,
+        critical: false,
+    };
+    const CRITICAL_RUN: Claim = Claim {
+        from_job: false,
+        critical: true,
+    };
+    const CRITICAL_JOB: Claim = Claim {
+        from_job: true,
+        critical: true,
+    };
+
+    #[test]
+    fn job_slots_alone_are_for_job_tasks() {
+        // Two `task run` tasks fill max_agents = 2; the job slot is free.
+        let m = slots(2, 1, 0, 2, 0);
+        assert!(m.has_room(JOB), "a job task takes the free job slot");
+        assert!(
+            !m.has_room(RUN),
+            "a normal task is still held at max_agents"
+        );
+        assert!(!m.has_room(CRITICAL_RUN), "no burst");
+        // The job slot taken, a second job task finds no room.
+        assert!(!slots(2, 1, 0, 3, 1).has_room(JOB));
+        // A job task in the job slot leaves the shared slots to others.
+        assert!(slots(2, 1, 0, 2, 1).has_room(RUN));
+        // Job tasks past the job slots count against max_agents.
+        assert!(!slots(2, 1, 0, 3, 3).has_room(RUN));
+        assert!(!slots(2, 1, 0, 3, 3).has_room(JOB));
+        assert!(slots(2, 1, 0, 2, 2).has_room(JOB), "a shared slot is free");
+    }
+
+    #[test]
+    fn burst_alone_is_for_critical_tasks() {
+        let m = slots(2, 0, 1, 2, 0);
+        assert!(
+            m.has_room(CRITICAL_RUN),
+            "critical goes one past max_agents"
+        );
+        assert!(
+            !m.has_room(RUN),
+            "a normal task is still held at max_agents"
+        );
+        assert!(!m.has_room(JOB), "no job slots");
+        assert!(m.has_room(CRITICAL_JOB), "a critical job task bursts too");
+        assert!(
+            !slots(2, 0, 1, 3, 0).has_room(CRITICAL_RUN),
+            "burst used up"
+        );
+        assert!(slots(2, 0, 2, 3, 0).has_room(CRITICAL_RUN));
+    }
+
+    #[test]
+    fn job_slots_and_burst_together() {
+        // Shared slots full, job slot free, burst free.
+        let m = slots(2, 1, 1, 2, 0);
+        assert!(m.has_room(JOB));
+        assert!(m.has_room(CRITICAL_RUN));
+        assert!(!m.has_room(RUN));
+        // A job task in its slot does not use up the burst.
+        let m = slots(2, 1, 1, 3, 1);
+        assert!(m.has_room(CRITICAL_RUN), "burst counts outside job slots");
+        assert!(!m.has_room(JOB), "job slot taken, shared slots full");
+        assert!(m.has_room(CRITICAL_JOB), "then burst");
+        // Everything taken.
+        let m = slots(2, 1, 1, 4, 1);
+        assert!(!m.has_room(CRITICAL_JOB));
+        assert!(!m.has_room(CRITICAL_RUN));
+    }
+
+    #[test]
+    fn zero_turns_job_slots_and_burst_off() {
+        let m = slots(2, 0, 0, 2, 0);
+        for claim in [RUN, JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert!(!m.has_room(claim), "{claim:?}");
+        }
+        let m = slots(2, 0, 0, 1, 1);
+        for claim in [RUN, JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert!(m.has_room(claim), "{claim:?}");
+        }
+    }
+
+    #[test]
+    fn critical_job_task_takes_a_job_slot_first() {
+        // Job slot free, shared slots free: the critical job task still
+        // fits without burst, and once it runs it sits in the job slot, so
+        // the shared slots stay open for a normal task.
+        let before = slots(1, 1, 1, 0, 0);
+        assert!(before.has_room(CRITICAL_JOB));
+        let after = slots(1, 1, 1, 1, 1);
+        assert!(after.has_room(RUN), "the shared slot is still free");
+        assert!(after.has_room(CRITICAL_RUN));
+        // Shared slot and job slot full: burst is the last step.
+        let full = slots(1, 1, 1, 2, 1);
+        assert!(!full.has_room(RUN));
+        assert!(!full.has_room(JOB));
+        assert!(full.has_room(CRITICAL_JOB));
+    }
+
+    #[test]
+    fn pick_machine_takes_the_fewest_live_among_those_with_room() {
+        let ms = vec![
+            // Fewest live, but full for a normal task.
+            MachineView {
+                name: "a".into(),
+                ..slots(1, 1, 0, 1, 0)
+            },
+            MachineView {
+                name: "b".into(),
+                ..slots(3, 0, 0, 2, 0)
+            },
+            MachineView {
+                name: "c".into(),
+                ..slots(3, 0, 0, 3, 0)
+            },
+        ];
+        assert_eq!(
+            pick_machine(&ms, "default", &spec(), RUN).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            pick_machine(&ms, "default", &spec(), JOB).as_deref(),
+            Some("a"),
+            "a's job slot is room for a job task, and a has fewest live"
+        );
     }
 
     #[test]
@@ -792,7 +1063,8 @@ mod tests {
                 &DispatchSpec {
                     machine: Some("c".into()),
                     ..spec()
-                }
+                },
+                Claim::default(),
             )
             .as_deref(),
             Some("c")
@@ -804,7 +1076,8 @@ mod tests {
                 &DispatchSpec {
                     machine: Some("b".into()),
                     ..spec()
-                }
+                },
+                Claim::default(),
             ),
             None,
             "pinned but unhealthy"
@@ -816,7 +1089,8 @@ mod tests {
                 &DispatchSpec {
                     machine: Some("zzz".into()),
                     ..spec()
-                }
+                },
+                Claim::default(),
             ),
             None,
             "pinned but unknown"
@@ -828,7 +1102,8 @@ mod tests {
                 &DispatchSpec {
                     tags: vec!["gpu".into()],
                     ..spec()
-                }
+                },
+                Claim::default(),
             )
             .as_deref(),
             Some("c")
@@ -840,7 +1115,8 @@ mod tests {
                 &DispatchSpec {
                     tags: vec!["fast".into()],
                     ..spec()
-                }
+                },
+                Claim::default(),
             )
             .as_deref(),
             Some("a"),
@@ -853,7 +1129,8 @@ mod tests {
                 &DispatchSpec {
                     tags: vec!["nope".into()],
                     ..spec()
-                }
+                },
+                Claim::default(),
             ),
             None
         );
@@ -863,7 +1140,7 @@ mod tests {
     async fn dispatch_sends_prompt_verbatim() {
         let fake = FakeHerdr::new();
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Running);
@@ -881,10 +1158,94 @@ mod tests {
         assert_eq!(ws.params["label"], "t-7");
         let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
         assert_eq!(start.params["kind"], "claude");
-        assert_eq!(start.params["args"], serde_json::json!(["--model", "opus"]));
+        assert_eq!(
+            start.params["args"],
+            with_session(&t, serde_json::json!(["--model", "opus"]))
+        );
         let prompt = reqs.iter().find(|r| r.method == "agent.prompt").unwrap();
         assert_eq!(prompt.params["target"], "t-7");
         assert_eq!(prompt.params["text"], "line one\n\"two\" {{ three }}");
+    }
+
+    /// A claude task starts on a session of its own, `--session-id` after
+    /// every other arg, and the task records it so attach can resume it
+    /// once the pane is gone.
+    #[tokio::test]
+    async fn a_claude_task_starts_on_a_session_it_records() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            deny: vec!["WebFetch".into()],
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let id = t.spec.session_id.clone().expect("a session id");
+        assert!(crate::task::is_session_id(&id), "{id}");
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!([
+                "--model",
+                "opus",
+                "--disallowedTools",
+                "WebFetch",
+                "--session-id",
+                id
+            ])
+        );
+        // Another task, another session.
+        let mut u = task(spec());
+        u.id = 8;
+        dispatch(&FakeHerdr::new(), &mut u, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_ne!(u.spec.session_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// Agent args that already pick a session keep it, and pastor records
+    /// none; an agent of another kind gets no flag it would not know.
+    #[tokio::test]
+    async fn a_session_the_args_pick_or_another_kind_gets_no_session_id() {
+        for args in [
+            vec!["--session-id", "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["--session-id=0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["--resume", "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["-r", "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--resume", "x", "--fork-session"],
+        ] {
+            let fake = FakeHerdr::new();
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            let mut t = task(DispatchSpec {
+                agent_args: args.clone(),
+                ..spec()
+            });
+            // A stale id copied from somewhere else is dropped, too.
+            t.spec.session_id = Some("stale".into());
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            assert_eq!(t.spec.session_id, None, "{args:?}");
+            let reqs = fake.requests();
+            let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+            assert_eq!(start.params["args"], serde_json::json!(args));
+        }
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "codex".into(),
+            agent_args: vec![],
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.session_id, None);
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["args"], serde_json::json!([]));
     }
 
     /// The tool lists reach herdr as the agent's own flags, after its args.
@@ -896,22 +1257,100 @@ mod tests {
             deny: vec!["WebFetch".into()],
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         let reqs = fake.requests();
         let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
         assert_eq!(
             start.params["args"],
-            serde_json::json!([
-                "--model",
-                "opus",
-                "--allowedTools",
-                "Bash(git:*)",
-                "--disallowedTools",
-                "WebFetch"
-            ])
+            with_session(
+                &t,
+                serde_json::json!([
+                    "--model",
+                    "opus",
+                    "--allowedTools",
+                    "Bash(git:*)",
+                    "--disallowedTools",
+                    "WebFetch"
+                ])
+            )
         );
+    }
+
+    fn opencode_under(profile: Option<&str>) -> DispatchSpec {
+        DispatchSpec {
+            agent: "opencode".into(),
+            agent_args: vec![],
+            allow: vec!["Read".into()],
+            deny: vec!["Edit".into()],
+            agent_source: Some(Box::new(crate::task::AgentSource {
+                ask: Default::default(),
+                agent: "defaults".into(),
+                agent_args: None,
+                model: None,
+                model_from: None,
+                profile: profile.map(str::to_string),
+                profile_from: Some("defaults".into()),
+            })),
+            ..spec()
+        }
+    }
+
+    /// A profiled opencode task starts with its rules in the pane's env.
+    /// On a machine whose own opencode config has permission rules it fails
+    /// before anything is made there: opencode would merge them with the
+    /// profile's. A machine that cannot tell goes ahead, and a task with no
+    /// profile never asks.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_refuses_a_machine_with_its_own_rules() {
+        let fake = FakeHerdr::new();
+        let mut t = task(opencode_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(
+            env["OPENCODE_PERMISSION"],
+            crate::config::opencode::permission_json(&t.spec.allow, &t.spec.deny, false)
+        );
+        assert_eq!(env["OPENCODE_CONFIG"], "");
+        let start = fake.requests();
+        let start = start.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "opencode");
+        assert_eq!(start.params["args"], serde_json::json!([]));
+
+        let fake = FakeHerdr::new();
+        fake.set_opencode_permissions(Some(true));
+        let mut t = task(opencode_under(Some("review")));
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("opencode_permissions_conflict"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("pi-1"), "{err}");
+        assert!(!err.is_transport());
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+
+        fake.set_opencode_permissions(None);
+        let mut t = task(opencode_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+
+        let fake = FakeHerdr::new();
+        fake.set_opencode_permissions(Some(true));
+        let mut t = task(DispatchSpec {
+            allow: vec![],
+            deny: vec![],
+            ..opencode_under(None)
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
     }
 
     /// An agent that cannot take a list it was given fails the task before
@@ -924,7 +1363,7 @@ mod tests {
             deny: vec!["WebFetch".into()],
             ..spec()
         });
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("deny_flag"), "{err}");
@@ -964,7 +1403,9 @@ mod tests {
             deny: vec!["WebFetch".into()],
             ..spec()
         });
-        dispatch(&fake, &mut t, &personal(), READY).await.unwrap();
+        dispatch(&fake, &mut t, &personal(), None, READY)
+            .await
+            .unwrap();
         let reqs = fake.requests();
         let ws = reqs
             .iter()
@@ -981,7 +1422,10 @@ mod tests {
         assert_eq!(start.params["name"], "t-7");
         assert_eq!(
             start.params["args"],
-            serde_json::json!(["--model", "opus", "--disallowedTools", "WebFetch"])
+            with_session(
+                &t,
+                serde_json::json!(["--model", "opus", "--disallowedTools", "WebFetch"])
+            )
         );
         assert_eq!(fake.pane_env(t.pane_id.as_deref().unwrap()), want);
         assert!(!reqs.iter().any(|r| r.method == "pane.split"));
@@ -998,7 +1442,9 @@ mod tests {
             branch: Some("pastor/k1".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &personal(), READY).await.unwrap();
+        dispatch(&fake, &mut t, &personal(), None, READY)
+            .await
+            .unwrap();
         let reqs = fake.requests();
         let methods: Vec<&str> = reqs.iter().map(|r| r.method.as_str()).collect();
         let at = |m: &str| methods.iter().position(|x| *x == m).unwrap();
@@ -1029,7 +1475,7 @@ mod tests {
     async fn every_agent_pane_is_marked_with_its_task() {
         let fake = FakeHerdr::new();
         let mut t = task(spec());
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(
@@ -1043,12 +1489,44 @@ mod tests {
             branch: Some("pastor/k2".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         let pane = t.pane_id.clone().unwrap();
         assert_ne!(pane, "w1:p1");
         assert_eq!(fake.pane_env(&pane)["PASTOR_TASK"], "t-7");
+    }
+
+    /// A head address reaches the agent as `PASTOR_HEAD`, after the
+    /// `[agents]` env so config cannot clear it; without one there is none.
+    #[tokio::test]
+    async fn the_head_address_goes_in_the_pane_env() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "claude-personal".into(),
+            ..spec()
+        });
+        let mut agents = personal();
+        agents
+            .0
+            .get_mut("claude-personal")
+            .unwrap()
+            .env
+            .insert("PASTOR_HEAD".into(), "elsewhere".into());
+        dispatch(&fake, &mut t, &agents, Some("user@head.example"), READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(env["PASTOR_HEAD"], "user@head.example");
+        assert_eq!(env["PASTOR_TASK"], "t-7");
+
+        let fake = FakeHerdr::new();
+        let mut t = task(spec());
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert!(env.get("PASTOR_HEAD").is_none(), "{env}");
     }
 
     #[tokio::test]
@@ -1059,7 +1537,7 @@ mod tests {
             branch: Some("pastor/k1".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         let wt = fake
@@ -1092,7 +1570,7 @@ mod tests {
                     worktree,
                     ..spec()
                 });
-                dispatch(&fake, &mut t, &Agents::default(), READY)
+                dispatch(&fake, &mut t, &Agents::default(), None, READY)
                     .await
                     .unwrap();
                 let method = if worktree {
@@ -1132,7 +1610,7 @@ mod tests {
                 repo: Some(repo.into()),
                 ..spec()
             });
-            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap_err();
             assert!(!err.is_transport(), "the machine is fine: {err}");
@@ -1161,7 +1639,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_millis(300));
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Running);
@@ -1188,7 +1666,7 @@ mod tests {
         let mut t = task(spec());
         t.machine = Some("pi-1".into());
         let started = Instant::now();
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(
@@ -1220,6 +1698,7 @@ mod tests {
             &fake,
             &mut t,
             &Agents::default(),
+            None,
             Duration::from_millis(200),
         )
         .await
@@ -1254,7 +1733,7 @@ mod tests {
         });
         let mut t = task(spec());
         let started = Instant::now();
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Blocked);
@@ -1286,7 +1765,7 @@ mod tests {
             }
         });
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Blocked);
@@ -1299,7 +1778,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_start_behaviour(StartBehaviour::Fail("unsupported_agent_kind".into()));
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("unsupported_agent_kind"));
@@ -1319,6 +1798,17 @@ mod tests {
             "created workspace is recorded even on failure"
         );
         assert!(!fake.requests().iter().any(|r| r.method == "agent.prompt"));
+        // Claude never ran, so there is no session for attach to resume.
+        let start = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "agent.start");
+        assert!(
+            start.unwrap().params["args"]
+                .to_string()
+                .contains("--session-id")
+        );
+        assert_eq!(t.spec.session_id, None);
     }
 
     /// herdr answers `agent_pane_busy` while the new pane's shell is still
@@ -1329,7 +1819,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_pane_busy_for(2);
         let mut t = task(spec());
-        let out = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let out = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(out, DispatchOutcome::Running);
@@ -1347,7 +1837,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_pane_busy_for(PANE_BUSY_ATTEMPTS + 1);
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("agent_pane_busy"));
@@ -1375,7 +1865,7 @@ mod tests {
         let fake = FakeHerdr::new();
         fake.set_start_behaviour(StartBehaviour::Fail("agent_name_taken".into()));
         let mut t = task(spec());
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("agent_name_taken"));
@@ -1398,7 +1888,7 @@ mod tests {
         let mut t = task(spec());
         t.machine = Some("pi-1".into());
         let started = Instant::now();
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(
@@ -1428,7 +1918,7 @@ mod tests {
             repo: None,
             ..spec()
         });
-        let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap_err();
         assert!(
@@ -1462,7 +1952,7 @@ mod tests {
                 repo: Some(repo.into()),
                 ..spec()
             });
-            dispatch(&fake, &mut t, &Agents::default(), READY)
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap();
             assert_eq!(t.state, TaskState::Running, "{repo}");
@@ -1492,7 +1982,7 @@ mod tests {
                 repo: repo.map(str::to_string),
                 ..spec()
             });
-            dispatch(&fake, &mut t, &Agents::default(), READY)
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap();
             let create = fake
@@ -1516,7 +2006,7 @@ mod tests {
             worktree: true,
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert!(methods(&fake).contains(&"worktree.create".to_string()));
@@ -1535,7 +2025,7 @@ mod tests {
             place: Place::Own,
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_ne!(t.workspace_id.as_deref(), Some(ws.as_str()));
@@ -1559,7 +2049,7 @@ mod tests {
             place: Place::Pastor,
             ..spec()
         });
-        dispatch(&fake, &mut one, &Agents::default(), READY)
+        dispatch(&fake, &mut one, &Agents::default(), None, READY)
             .await
             .unwrap();
         let ws = one.workspace_id.clone().unwrap();
@@ -1569,7 +2059,7 @@ mod tests {
             ..spec()
         });
         two.id = 8;
-        dispatch(&fake, &mut two, &Agents::default(), READY)
+        dispatch(&fake, &mut two, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(two.workspace_id.as_deref(), Some(ws.as_str()));
@@ -1610,7 +2100,7 @@ mod tests {
             worktree: true,
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         let checkout = t.spec.checkout.clone().expect("checkout recorded");
@@ -1641,7 +2131,7 @@ mod tests {
             place: Place::Pane("work".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(t.workspace_id.as_deref(), Some(ws.as_str()));
@@ -1655,7 +2145,7 @@ mod tests {
                 worktree,
                 ..spec()
             });
-            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap_err();
             assert!(!err.is_transport());
@@ -1688,7 +2178,7 @@ mod tests {
             place: Place::Pane("work".into()),
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(t.workspace_id.as_deref(), Some(ws.as_str()));
@@ -1704,7 +2194,7 @@ mod tests {
                 place: Place::Pane("work".into()),
                 ..spec()
             });
-            let err = dispatch(&fake, &mut t, &Agents::default(), READY)
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap_err();
             assert!(!err.is_transport());

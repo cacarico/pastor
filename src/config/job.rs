@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::config::{AgentChoice, Defaults, check_tools, parse_duration};
 use crate::connector::Catalog;
 use crate::schedule::Schedule;
-use crate::task::{DispatchSpec, Place};
+use crate::task::{DispatchSpec, Place, Priority};
 use crate::template;
 
 fn default_true() -> bool {
@@ -24,6 +24,8 @@ fn default_true() -> bool {
 #[serde(deny_unknown_fields)]
 pub struct JobFile {
     pub name: Option<String>,
+    /// One line on what the job does, for `job list --wide` and `describe`.
+    pub description: Option<String>,
     pub every: Option<String>,
     pub cron: Option<String>,
     #[serde(default = "default_true")]
@@ -51,6 +53,16 @@ pub struct DispatchTable {
     pub allow: Vec<String>,
     /// Added to the flock's and `[defaults]` deny list.
     pub deny: Vec<String>,
+    /// A `[models]` name, or a template of one (`{{ item.model }}`) rendered
+    /// per item; rendered empty, the machine's, flock's or `[defaults]` model.
+    pub model: Option<String>,
+    /// A level (`low`, `normal`, `high`, `critical`), or a template of one
+    /// (`{{ item.priority }}`) rendered per item; rendered empty, the pinned
+    /// machine's, flock's or `[defaults]` level.
+    pub priority: Option<String>,
+    /// A permission profile, built in or in `[profiles]`, before the
+    /// machine's, the flock's and `[defaults]`.
+    pub profile: Option<String>,
     pub repo: Option<String>,
     pub worktree: bool,
     pub branch: Option<String>,
@@ -64,12 +76,24 @@ pub struct DispatchTable {
     pub place: Option<Place>,
     pub max_tasks_per_run: Option<u32>,
     pub backfill: Option<String>,
+    /// The template of each task's description; `None` is
+    /// `DEFAULT_TASK_DESCRIPTION`.
+    pub description: Option<String>,
     pub prompt: String,
 }
+
+/// A job task's description when `[dispatch]` names none: its item's title,
+/// so a board card's task reads as the card.
+pub const DEFAULT_TASK_DESCRIPTION: &str = "{{ item.title }}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub name: String,
+    /// The file's `description`, trimmed; `None` when it has none.
+    pub description: Option<String>,
+    /// `[dispatch] description`, unrendered: `task_description_for` renders
+    /// it for one item.
+    pub task_description: Option<String>,
     pub schedule: Schedule,
     pub enabled: bool,
     pub connector: String,
@@ -84,11 +108,20 @@ pub struct Job {
     /// flock's is only known when a task is queued, which re-resolves it
     /// from `agent` (`Fleet::queue_job_task`).
     pub spec: DispatchSpec,
-    /// What `[dispatch]` itself says about the agent.
+    /// What `[dispatch]` itself says about the agent. Its `model` is still a
+    /// template: `model_for` renders it for one item.
     pub agent: AgentChoice,
     /// `dispatch.flock`, checked against flock.toml at each run (see
     /// `Flock::task_flock`): the job file does not know the flocks.
     pub flock: Option<String>,
+    /// `dispatch.priority`, still a template: `priority_for` renders it for
+    /// one item.
+    pub priority: Option<String>,
+    /// The `[dispatch]` table as written, as JSON and without `prompt`: what
+    /// a headless serve sends the head with its items (`IpcRequest::
+    /// JobSubmit`), so the head applies its own `[defaults]` to what the
+    /// file leaves out. `Null` for a job the head built from a `JobTask`.
+    pub dispatch: Value,
 }
 
 impl Job {
@@ -102,6 +135,13 @@ impl Job {
         catalog: &dyn Catalog,
     ) -> Result<Job, String> {
         let file: JobFile = toml::from_str(text).map_err(|e| e.to_string())?;
+        let raw: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        let dispatch = raw
+            .get("dispatch")
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(Value::Null);
         let name = file.name.clone().unwrap_or_else(|| stem.to_string());
         if name != stem {
             return Err(format!(
@@ -116,12 +156,118 @@ impl Job {
         let connector_config =
             serde_json::to_value(&file.connector.config).map_err(|e| e.to_string())?;
         catalog.check(&file.connector.use_, &connector_config)?;
-        let d = file.dispatch;
+        Job::from_dispatch(
+            name,
+            schedule,
+            file.enabled,
+            file.connector.use_,
+            connector_config,
+            file.dispatch,
+            defaults,
+        )
+        .map(|job| Job {
+            dispatch: Value::Object(table_without_prompt(&dispatch)),
+            description: crate::config::clean_description(file.description.as_deref()),
+            ..job
+        })
+    }
+
+    /// A job another machine runs and submits items for (`IpcRequest::
+    /// JobSubmit`): its `[dispatch]` table as JSON, with `prompt` beside it
+    /// (it wins over a `prompt` inside the table). Checked exactly as a job
+    /// file's `[dispatch]` is. It has no schedule or connector on the head:
+    /// those stay on the submitter, and nothing here reads them.
+    pub fn submitted(
+        name: &str,
+        dispatch: &Value,
+        prompt: &str,
+        defaults: &Defaults,
+    ) -> Result<Job, String> {
+        check_name(name)?;
+        let mut table = match dispatch {
+            Value::Object(m) => m.clone(),
+            Value::Null => serde_json::Map::new(),
+            _ => return Err("dispatch must be a table".into()),
+        };
+        table.insert("prompt".into(), Value::String(prompt.to_string()));
+        let d: DispatchTable =
+            serde_json::from_value(Value::Object(table)).map_err(|e| e.to_string())?;
+        Job::from_dispatch(
+            name.to_string(),
+            Schedule::Every(Duration::MAX),
+            true,
+            String::new(),
+            Value::Null,
+            d,
+            defaults,
+        )
+        .map(|job| Job {
+            dispatch: Value::Object(table_without_prompt(dispatch)),
+            ..job
+        })
+    }
+
+    /// The `[dispatch]` checks and defaults, shared by a job file and a
+    /// submitted job.
+    fn from_dispatch(
+        name: String,
+        schedule: Schedule,
+        enabled: bool,
+        connector: String,
+        connector_config: Value,
+        d: DispatchTable,
+        defaults: &Defaults,
+    ) -> Result<Job, String> {
         if d.prompt.trim().is_empty() {
             return Err("dispatch.prompt is required".into());
         }
         if d.worktree && d.repo.is_none() {
             return Err("dispatch.worktree = true needs dispatch.repo".into());
+        }
+        if let Some(text) = &d.description {
+            for path in
+                template::placeholders(text).map_err(|e| format!("dispatch.description: {e}"))?
+            {
+                if !(path.starts_with("item.") || path == "job.name") {
+                    return Err(format!(
+                        "dispatch.description: unknown placeholder {{{{ {path} }}}}; use item.* or job.name"
+                    ));
+                }
+            }
+        }
+        if let Some(model) = &d.model {
+            for path in template::placeholders(model).map_err(|e| format!("dispatch.model: {e}"))? {
+                if !(path.starts_with("item.") || path == "job.name") {
+                    return Err(format!(
+                        "dispatch.model: unknown placeholder {{{{ {path} }}}}; use item.* or job.name"
+                    ));
+                }
+            }
+            if !model.contains("{{") {
+                crate::config::check_model_name(model)
+                    .map_err(|e| format!("dispatch.model: {e}"))?;
+            }
+        }
+        if let Some(priority) = &d.priority {
+            for path in
+                template::placeholders(priority).map_err(|e| format!("dispatch.priority: {e}"))?
+            {
+                if !(path.starts_with("item.") || path == "job.name") {
+                    return Err(format!(
+                        "dispatch.priority: unknown placeholder {{{{ {path} }}}}; use item.* or job.name"
+                    ));
+                }
+            }
+            if !priority.contains("{{") && !priority.trim().is_empty() {
+                priority
+                    .trim()
+                    .parse::<Priority>()
+                    .map_err(|e| format!("dispatch.priority: {e}"))?;
+            }
+        }
+        if let Some(profile) = &d.profile {
+            crate::config::check_profile_name(profile)
+                .map_err(|e| format!("dispatch.profile: {e}"))?;
         }
         for (field, text) in [
             ("prompt", Some(d.prompt.as_str())),
@@ -177,19 +323,25 @@ impl Job {
             agent_args: d.agent_args,
             allow: d.allow,
             deny: d.deny,
+            model: d.model,
+            profile: d.profile,
         };
         let pick = defaults.resolve_agent(&agent, None);
         Ok(Job {
             name,
+            description: None,
+            task_description: d.description,
             schedule,
-            enabled: file.enabled,
-            connector: file.connector.use_,
+            enabled,
+            connector,
             connector_config,
             prompt: d.prompt,
             max_tasks_per_run,
             backfill,
             flock: d.flock,
+            priority: d.priority,
             agent,
+            dispatch: Value::Null,
             spec: DispatchSpec {
                 agent: pick.agent,
                 agent_args: pick.agent_args,
@@ -205,8 +357,65 @@ impl Job {
                 reopen: None,
                 agent_source: None,
                 place: d.place.unwrap_or_else(|| defaults.place.clone()),
+                session_id: None,
             },
         })
+    }
+
+    /// The job's `priority` rendered for `item`: `None` when the job sets
+    /// none, or its template renders empty, so the pinned machine's, flock's
+    /// or `[defaults]` level applies. A rendered value that is not a level
+    /// is refused (`unknown_priority`), and the item with it.
+    pub fn priority_for(&self, item: &Value) -> Result<Option<Priority>, String> {
+        let Some(priority) = &self.priority else {
+            return Ok(None);
+        };
+        let ctx = serde_json::json!({"item": item, "job": {"name": self.name}});
+        let text = template::render(priority, &ctx)
+            .map_err(|e| format!("dispatch.priority: {e}"))?
+            .text;
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        text.parse()
+            .map(Some)
+            .map_err(|e| format!("dispatch.priority: {} ({e})", crate::task::UNKNOWN_PRIORITY))
+    }
+
+    /// The description of this job's task for `item`: `[dispatch]
+    /// description` rendered, else its item's title, trimmed. `None` when
+    /// that is empty, or a path the item lacks leaves it so: the task then
+    /// reads as its prompt's first line.
+    pub fn task_description_for(&self, item: &Value) -> Option<String> {
+        let text = self
+            .task_description
+            .as_deref()
+            .unwrap_or(DEFAULT_TASK_DESCRIPTION);
+        let ctx = serde_json::json!({"item": item, "job": {"name": self.name}});
+        let rendered = template::render(text, &ctx).ok()?.text;
+        crate::config::clean_description(Some(&rendered))
+    }
+
+    /// The job's `model` rendered for `item`: `None` when the job names
+    /// none, or its template renders empty, so the machine's, flock's or
+    /// `[defaults]` model applies. A rendered value that is not a model name
+    /// is refused; whether `[models]` has it is checked when the task is
+    /// queued.
+    pub fn model_for(&self, item: &Value) -> Result<Option<String>, String> {
+        let Some(model) = &self.agent.model else {
+            return Ok(None);
+        };
+        let ctx = serde_json::json!({"item": item, "job": {"name": self.name}});
+        let text = template::render(model, &ctx)
+            .map_err(|e| format!("dispatch.model: {e}"))?
+            .text;
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        crate::config::check_model_name(text).map_err(|e| format!("dispatch.model: {e}"))?;
+        Ok(Some(text.to_string()))
     }
 }
 
@@ -216,6 +425,13 @@ impl Job {
 /// outside a full `Job::parse` (the CLI's `enable`/`disable`) can reject a
 /// name before joining it under the jobs directory: an unvalidated name like
 /// `"../pastor"` resolves outside it entirely.
+/// A `[dispatch]` table with `prompt` removed, since it travels beside it.
+fn table_without_prompt(table: &Value) -> serde_json::Map<String, Value> {
+    let mut map = table.as_object().cloned().unwrap_or_default();
+    map.remove("prompt");
+    map
+}
+
 pub fn check_name(name: &str) -> Result<(), String> {
     let first_ok = name
         .chars()
@@ -301,7 +517,17 @@ pub fn load_file(path: &Path, stem: &str, defaults: &Defaults, catalog: &dyn Cat
 /// one before the first table) and nothing else, so comments and layout the
 /// user wrote survive. The result must still parse or the file is left alone.
 pub fn set_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    // Resolve the real file first: `path` may be a symlink (e.g. into a
+    // dotfiles repo), and writing the temp file next to `path` then renaming
+    // over it would replace the link with a plain file. Writing beside, and
+    // renaming onto, the canonical target keeps the link and edits what it
+    // points to. The edit lock is held from the read to the rename so a
+    // `put` or another toggle cannot be overwritten with stale text.
+    let target =
+        std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    let _lock = crate::edit::lock_file(&target)?;
+    let text =
+        std::fs::read_to_string(&target).with_context(|| format!("read {}", target.display()))?;
     let line = format!("enabled = {enabled}");
     let mut out: Vec<String> = Vec::new();
     let mut replaced = false;
@@ -341,13 +567,6 @@ pub fn set_enabled(path: &Path, enabled: bool) -> anyhow::Result<()> {
     // does not know yet), which is not what "leave a broken edit alone" means.
     toml::from_str::<toml::Value>(&new_text)
         .with_context(|| format!("{} would not parse after the edit", path.display()))?;
-    // Resolve the real file first: `path` may be a symlink (e.g. into a
-    // dotfiles repo), and writing the temp file next to `path` then renaming
-    // over it would replace the link with a plain file. Writing beside, and
-    // renaming onto, the canonical target keeps the link and edits what it
-    // points to.
-    let target =
-        std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
     let tmp = target.with_extension("toml.tmp");
     std::fs::write(&tmp, &new_text).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &target).with_context(|| format!("rename to {}", target.display()))?;
@@ -414,6 +633,156 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert_eq!(job.max_tasks_per_run, 5);
         assert_eq!(job.backfill, Duration::ZERO);
         assert!(job.prompt.contains("{{ item.author }}"));
+    }
+
+    /// A job's own `description` is plain text, trimmed; none is fine. Its
+    /// `[dispatch] description` is rendered per item, `{{ item.title }}`
+    /// when left out, and one that renders empty gives the task none.
+    #[test]
+    fn a_job_and_its_tasks_have_descriptions() {
+        let old = Job::parse(SPEC_EXAMPLE, "support-slack", &defaults(), &Builtins).unwrap();
+        assert_eq!(old.description, None);
+        let item = serde_json::json!({"key": "k", "title": " Fix the login page \n", "n": 7});
+        assert_eq!(
+            old.task_description_for(&item).as_deref(),
+            Some("Fix the login page")
+        );
+        assert_eq!(
+            old.task_description_for(&serde_json::json!({"key": "k"})),
+            None
+        );
+
+        let job = |top: &str, dispatch: &str| {
+            Job::parse(
+                &format!(
+                    "{top}every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\n{dispatch}prompt = \"p\"\n"
+                ),
+                "j",
+                &defaults(),
+                &Builtins,
+            )
+        };
+        let j = job(
+            "description = \"  Carry out the answers  \"\n",
+            "description = \"#{{ item.n }} for {{ job.name }}\"\n",
+        )
+        .unwrap();
+        assert_eq!(j.description.as_deref(), Some("Carry out the answers"));
+        assert_eq!(j.task_description_for(&item).as_deref(), Some("#7 for j"));
+        let empty = job(
+            "description = \"\"\n",
+            "description = \"{{ item.nope }}\"\n",
+        )
+        .unwrap();
+        assert_eq!(empty.description, None);
+        assert_eq!(empty.task_description_for(&item), None);
+        let err = job("", "description = \"{{ task.id }}\"\n").unwrap_err();
+        assert!(err.contains("dispatch.description"), "{err}");
+    }
+
+    /// A job's `model` is a template rendered per item: empty means the job
+    /// names none, and what it renders must be a model name.
+    #[test]
+    fn a_jobs_model_renders_per_item() {
+        let job = |model: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nmodel = {model:?}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &defaults(),
+                &Builtins,
+            )
+        };
+        let j = job("{{ item.model }}").unwrap();
+        let item = |v: serde_json::Value| j.model_for(&v);
+        assert_eq!(
+            item(serde_json::json!({"model": "opus"}))
+                .unwrap()
+                .as_deref(),
+            Some("opus")
+        );
+        assert_eq!(item(serde_json::json!({})).unwrap(), None);
+        assert_eq!(item(serde_json::json!({"model": " "})).unwrap(), None);
+        let err = item(serde_json::json!({"model": "--model x"})).unwrap_err();
+        assert!(err.contains("dispatch.model"), "{err}");
+        assert_eq!(
+            job("sonnet")
+                .unwrap()
+                .model_for(&serde_json::json!({}))
+                .unwrap()
+                .as_deref(),
+            Some("sonnet")
+        );
+        assert!(job("{{ task.id }}").unwrap_err().contains("dispatch.model"));
+        assert!(job("Sonnet").unwrap_err().contains("dispatch.model"));
+    }
+
+    /// A job's `priority` is a template rendered per item: empty falls
+    /// through to the next layer, and what it renders must be a level.
+    #[test]
+    fn a_jobs_priority_renders_per_item() {
+        let job = |priority: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\npriority = {priority:?}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &defaults(),
+                &Builtins,
+            )
+        };
+        let j = job("{{ item.priority }}").unwrap();
+        let item = |v: serde_json::Value| j.priority_for(&v);
+        assert_eq!(
+            item(serde_json::json!({"priority": "critical"})).unwrap(),
+            Some(Priority::Critical)
+        );
+        assert_eq!(item(serde_json::json!({})).unwrap(), None);
+        assert_eq!(item(serde_json::json!({"priority": " "})).unwrap(), None);
+        let err = item(serde_json::json!({"priority": "urgent"})).unwrap_err();
+        assert!(err.contains("unknown_priority"), "{err}");
+        assert!(err.contains("urgent"), "{err}");
+        assert_eq!(
+            job("high")
+                .unwrap()
+                .priority_for(&serde_json::json!({}))
+                .unwrap(),
+            Some(Priority::High)
+        );
+        assert_eq!(
+            job("")
+                .unwrap()
+                .priority_for(&serde_json::json!({}))
+                .unwrap(),
+            None
+        );
+        assert!(
+            job("{{ task.id }}")
+                .unwrap_err()
+                .contains("dispatch.priority")
+        );
+        assert!(job("urgent").unwrap_err().contains("dispatch.priority"));
+    }
+
+    /// A job's `profile` is a plain profile name, kept in its ask; whether
+    /// pastor.toml has it is checked when a task is queued.
+    #[test]
+    fn a_jobs_profile_is_a_name() {
+        let job = |profile: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprofile = {profile:?}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &defaults(),
+                &Builtins,
+            )
+        };
+        assert_eq!(job("ci").unwrap().agent.profile.as_deref(), Some("ci"));
+        for bad in ["Ci", "--permission-mode", "{{ item.profile }}"] {
+            assert!(job(bad).unwrap_err().contains("dispatch.profile"), "{bad}");
+        }
     }
 
     /// `[defaults] agent_args` fills in for a job file that has no
@@ -563,6 +932,10 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             max_tasks_per_run: 2,
             timeout: "30m".into(),
             place: Default::default(),
+            model: None,
+            priority: None,
+            agents: Default::default(),
+            profile: None,
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");
@@ -670,6 +1043,85 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         )
         .unwrap_err();
         assert!(err.contains("prompt is required"), "{err}");
+    }
+
+    /// A job keeps its `[dispatch]` table as written, less the prompt, for
+    /// a headless serve to submit: the head builds the same job from it.
+    #[test]
+    fn a_job_keeps_its_dispatch_table_for_the_head() {
+        let file = Job::parse(SPEC_EXAMPLE, "support-slack", &defaults(), &Builtins).unwrap();
+        assert!(file.dispatch.get("prompt").is_none(), "{:?}", file.dispatch);
+        assert_eq!(file.dispatch["repo"], "~/work/support");
+        assert_eq!(file.dispatch["timeout"], "2h");
+        assert!(file.dispatch.get("place").is_none(), "the head's default");
+        let sub =
+            Job::submitted("support-slack", &file.dispatch, &file.prompt, &defaults()).unwrap();
+        assert_eq!(sub.spec, file.spec);
+        assert_eq!(sub.agent, file.agent);
+        assert_eq!(sub.flock, file.flock);
+        assert_eq!(sub.prompt, file.prompt);
+        assert_eq!(sub.dispatch, file.dispatch);
+    }
+
+    /// A submitted job's `[dispatch]` is the job file's, checked the same
+    /// way: the same job, and the same error for the same mistake.
+    #[test]
+    fn a_submitted_dispatch_is_checked_like_a_job_file() {
+        let file = Job::parse(SPEC_EXAMPLE, "support-slack", &defaults(), &Builtins).unwrap();
+        let text: toml::Table = toml::from_str(SPEC_EXAMPLE).unwrap();
+        let mut dispatch = serde_json::to_value(&text["dispatch"]).unwrap();
+        let prompt = dispatch["prompt"].as_str().unwrap().to_string();
+        dispatch.as_object_mut().unwrap().remove("prompt");
+        let sub = Job::submitted("support-slack", &dispatch, &prompt, &defaults()).unwrap();
+        assert_eq!(sub.spec, file.spec);
+        assert_eq!(sub.agent, file.agent);
+        assert_eq!(sub.flock, file.flock);
+        assert_eq!(sub.prompt, file.prompt);
+        assert_eq!(sub.max_tasks_per_run, file.max_tasks_per_run);
+
+        let bad = |extra: &str| {
+            let file = format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            );
+            let file_err = Job::parse(&file, "ok", &defaults(), &Builtins).unwrap_err();
+            let table: toml::Table = toml::from_str(extra).unwrap();
+            let json = serde_json::to_value(&table).unwrap();
+            let err = Job::submitted("ok", &json, "p", &defaults()).unwrap_err();
+            (file_err, err)
+        };
+        for extra in [
+            "worktree = true\n",
+            "max_tasks_per_run = 0\n",
+            "branch = \"{{ item.key }}/x\"\n",
+            "timeout = \"soon\"\n",
+        ] {
+            let (file_err, err) = bad(extra);
+            assert_eq!(err, file_err, "{extra}");
+        }
+        let (file_err, err) = bad("colour = \"blue\"\n");
+        assert!(file_err.contains("unknown field `colour`"), "{file_err}");
+        assert!(err.contains("unknown field `colour`"), "{err}");
+
+        let err = Job::submitted("run", &Value::Null, "p", &defaults()).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+        let err = Job::submitted("ok", &Value::Null, " ", &defaults()).unwrap_err();
+        assert!(err.contains("prompt is required"), "{err}");
+        let err = Job::submitted("ok", &serde_json::json!([1]), "p", &defaults()).unwrap_err();
+        assert!(err.contains("must be a table"), "{err}");
+
+        // A shepherd sends `description` inside `[dispatch]` like any key.
+        let sub = Job::submitted(
+            "ok",
+            &serde_json::json!({"description": "#{{ item.key }}"}),
+            "p",
+            &defaults(),
+        )
+        .unwrap();
+        assert_eq!(
+            sub.task_description_for(&serde_json::json!({"key": "k1"}))
+                .as_deref(),
+            Some("#k1")
+        );
     }
 
     #[test]

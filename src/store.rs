@@ -8,9 +8,10 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
+use crate::queue::QueueSpot;
+use crate::task::{DispatchSpec, PANE_OWNING_STATES, Priority, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 11;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -61,7 +62,20 @@ pub struct TrustedRepo {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The last lines read from a finishing task's pane, by task id; in
+    /// memory only (see `note_pane_tail`).
+    pane_tails: Mutex<PaneTails>,
 }
+
+/// Tails kept at once. Only a task's finish command asks for one, so most are
+/// never taken; the oldest go first.
+const PANE_TAILS_MAX: usize = 64;
+
+/// Lines of a pane kept as a task's tail.
+const PANE_TAIL_LINES: usize = 40;
+
+#[derive(Default)]
+struct PaneTails(std::collections::VecDeque<(i64, String)>);
 
 /// `update_task` found the row changed since this copy was read. The caller holds
 /// stale data; reload and decide again rather than overwrite.
@@ -92,6 +106,57 @@ pub enum RetryError {
     Store(#[from] anyhow::Error),
 }
 
+/// Why `move_queued` changed nothing, each with its own IPC code. The id
+/// is the task moved or the one it was to go before or after.
+#[derive(Debug, thiserror::Error)]
+pub enum MoveError {
+    #[error("task t-{0} not found")]
+    NotFound(i64),
+    #[error("t-{id} is {state}; only queued tasks have a place in the queue")]
+    NotQueued { id: i64, state: TaskState },
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
+impl From<rusqlite::Error> for MoveError {
+    fn from(err: rusqlite::Error) -> Self {
+        MoveError::Store(err.into())
+    }
+}
+
+/// What `move_queued` did: the task, its level before, and where it is now
+/// (from 1) in a queue of `of` tasks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Moved {
+    pub task: Task,
+    pub was: Priority,
+    pub pos: usize,
+    pub of: usize,
+}
+
+/// The order dispatch takes queued tasks in: by level, highest first, then
+/// by position, then oldest first.
+const QUEUE_ORDER: &str = "CASE priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2
+                                  WHEN 'normal' THEN 1 ELSE 0 END DESC,
+                         COALESCE(queue_pos, id), created_at, id";
+
+/// Why `set_priority` changed nothing, each with its own IPC code.
+#[derive(Debug, thiserror::Error)]
+pub enum PriorityError {
+    #[error("task t-{0} not found")]
+    NotFound(i64),
+    #[error("t-{id} is {state}; only a queued task's priority can change")]
+    NotQueued { id: i64, state: TaskState },
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
+impl From<rusqlite::Error> for PriorityError {
+    fn from(err: rusqlite::Error) -> Self {
+        PriorityError::Store(err.into())
+    }
+}
+
 impl From<rusqlite::Error> for RetryError {
     fn from(err: rusqlite::Error) -> Self {
         RetryError::Store(err.into())
@@ -107,6 +172,9 @@ pub struct NewTask {
     /// The flock the task targets, already resolved (see
     /// `Flock::task_flock`): only its machines take the task.
     pub flock: String,
+    /// `task run --description`, trimmed; `None` reads as the prompt's
+    /// first line (`Task::description_text`).
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -185,6 +253,7 @@ impl Store {
         );
         Ok(Store {
             conn: Mutex::new(conn),
+            pane_tails: Mutex::default(),
         })
     }
 
@@ -250,6 +319,11 @@ impl Store {
                         trust_sent INTEGER NOT NULL DEFAULT 0,
                         activity_seen INTEGER NOT NULL DEFAULT 0,
                         ended INTEGER NOT NULL DEFAULT 0,
+                        priority TEXT NOT NULL DEFAULT 'normal',
+                        priority_from TEXT,
+                        queue_pos INTEGER,
+                        role TEXT NOT NULL DEFAULT 'agent',
+                        description TEXT,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -325,6 +399,28 @@ impl Store {
                 if v < 8 {
                     tx.execute_batch(V8_TABLES)?;
                 }
+                // A task's level and its place in the queue
+                // (`queued_tasks`). Rows from before are `normal`, placed
+                // by id: the order they had.
+                if v < 9 {
+                    add_column(&tx, "priority", "priority TEXT NOT NULL DEFAULT 'normal'")?;
+                    add_column(&tx, "priority_from", "priority_from TEXT")?;
+                    add_column(&tx, "queue_pos", "queue_pos INTEGER")?;
+                    tx.execute(
+                        "UPDATE tasks SET queue_pos = id WHERE queue_pos IS NULL",
+                        [],
+                    )?;
+                }
+                // What the task's agent may change (`Task::role`); every
+                // older row is a plain agent.
+                if v < 10 {
+                    add_column(&tx, "role", "role TEXT NOT NULL DEFAULT 'agent'")?;
+                }
+                // What the task is about (`Task::description`). Older rows
+                // get none and read as their prompt's first line.
+                if v < 11 {
+                    add_column(&tx, "description", "description TEXT")?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -337,19 +433,59 @@ impl Store {
         tx.commit()?;
         Ok(Store {
             conn: Mutex::new(conn),
+            pane_tails: Mutex::default(),
         })
     }
 
     pub fn insert_task(&self, t: NewTask) -> anyhow::Result<Task> {
+        self.insert_task_at(t, Priority::Normal, None, crate::task::TaskRole::Agent)
+    }
+
+    /// `insert_task` at `priority`, which `from` set (`Task::priority_from`),
+    /// for a task of `role` (`task run --role`). The task goes last among
+    /// its level's queued tasks: its position is its id.
+    pub fn insert_task_at(
+        &self,
+        t: NewTask,
+        priority: Priority,
+        from: Option<&str>,
+        role: crate::task::TaskRole,
+    ) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)",
-            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, now],
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, role, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?10, ?10)",
+            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, role.as_str(), t.description, now],
         )?;
-        let id = conn.last_insert_rowid();
+        let id = tx.last_insert_rowid();
+        place_last(&tx, id)?;
+        tx.commit()?;
         drop(conn);
         self.get_task(id)?.context("task vanished after insert")
+    }
+
+    /// Remember the last lines of `text`, what pastor read from `task_id`'s
+    /// pane when it judged the task done, for the finish command of its
+    /// connector (`take_pane_tail`). Kept in memory, not the database: it is
+    /// pane text, it is only useful for the minute between the read and the
+    /// finish, and a restart in between just leaves the command with none.
+    pub fn note_pane_tail(&self, task_id: i64, text: &str) {
+        let lines: Vec<&str> = text.trim_end().lines().collect();
+        let tail = lines[lines.len().saturating_sub(PANE_TAIL_LINES)..].join("\n");
+        let mut tails = self.pane_tails.lock().unwrap_or_else(|p| p.into_inner());
+        tails.0.retain(|(id, _)| *id != task_id);
+        if tails.0.len() >= PANE_TAILS_MAX {
+            tails.0.pop_front();
+        }
+        tails.0.push_back((task_id, tail));
+    }
+
+    /// The tail `note_pane_tail` kept for `task_id`, once.
+    pub fn take_pane_tail(&self, task_id: i64) -> Option<String> {
+        let mut tails = self.pane_tails.lock().unwrap_or_else(|p| p.into_inner());
+        let at = tails.0.iter().position(|(id, _)| *id == task_id)?;
+        tails.0.remove(at).map(|(_, t)| t)
     }
 
     /// The next event sequence number: one more than the last one given,
@@ -485,26 +621,30 @@ impl Store {
             None => serde_json::json!({}),
         }
         .to_string();
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         // Check and copy in one statement, so a task closed, pruned or
-        // finished by another writer in between is not retried.
-        let n = conn.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, retry_of, created_at, updated_at)
+        // finished by another writer in between is not retried. The copy
+        // keeps the level, its role, description and where it came from,
+        // but queues last in it.
+        let n = tx.execute(
+            "INSERT INTO tasks (job, item, prompt, spec, flock, role, description, state, retry_of, priority, priority_from, created_at, updated_at)
              SELECT job, item, prompt,
-                    json_patch(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
+                    json_patch(json_remove(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
                          THEN json_remove(spec, '$.checkout', '$.reopen')
                          WHEN state = 'failed' AND json_extract(spec, '$.checkout') IS NOT NULL
                          THEN json_set(json_remove(spec, '$.branch', '$.checkout'), '$.reopen',
                                        json_object('branch', json_extract(spec, '$.checkout.branch'),
                                                    'path', json_extract(spec, '$.checkout.path'),
                                                    'agent', COALESCE(agent_name, 't-' || id)))
-                         ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END, ?3),
-                    flock, 'queued', id, ?2, ?2 FROM tasks
+                         ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
+                         '$.session_id'), ?3),
+                    flock, role, description, 'queued', id, priority, priority_from, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
         )?;
         if n == 0 {
-            let state: Option<String> = conn
+            let state: Option<String> = tx
                 .query_row("SELECT state FROM tasks WHERE id = ?1", params![of], |r| {
                     r.get(0)
                 })
@@ -517,7 +657,9 @@ impl Store {
                 },
             });
         }
-        let id = conn.last_insert_rowid();
+        let id = tx.last_insert_rowid();
+        place_last(&tx, id)?;
+        tx.commit()?;
         drop(conn);
         Ok(self.get_task(id)?.context("task vanished after insert")?)
     }
@@ -691,13 +833,155 @@ impl Store {
             .collect())
     }
 
+    /// Queued tasks in the order dispatch takes them: by level, highest
+    /// first, then by position, then oldest first.
     pub fn queued_tasks(&self) -> anyhow::Result<Vec<Task>> {
-        let mut v = self.list_tasks(&TaskFilter {
-            states: Some(vec![TaskState::Queued]),
-            ..Default::default()
-        })?;
-        v.reverse();
-        Ok(v)
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM tasks WHERE state = 'queued' ORDER BY {QUEUE_ORDER}"
+        ))?;
+        let rows = stmt.query_map([], row_to_task)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Put queued task `id` at `priority`, set by `from`. Refused unless the
+    /// task is queued: one a machine took has left the queue. It keeps its
+    /// position, so among its new level's tasks it goes by when it was
+    /// queued.
+    pub fn set_priority(
+        &self,
+        id: i64,
+        priority: Priority,
+        from: &str,
+    ) -> Result<Task, PriorityError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE tasks SET priority = ?2, priority_from = ?3, updated_at = ?4
+             WHERE id = ?1 AND state = 'queued'",
+            params![id, priority.as_str(), from, now],
+        )?;
+        if n == 0 {
+            let state: Option<String> = conn
+                .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            return Err(match state {
+                None => PriorityError::NotFound(id),
+                Some(state) => PriorityError::NotQueued {
+                    id,
+                    state: state.parse().map_err(anyhow::Error::msg)?,
+                },
+            });
+        }
+        drop(conn);
+        Ok(self.get_task(id)?.context("task vanished after update")?)
+    }
+
+    /// Move queued task `id` to `spot` (`pastor queue move`). It takes the
+    /// level of where it lands: lifted when the task behind it is higher,
+    /// lowered when the one ahead is lower (at the top there is none ahead,
+    /// so `--top` only lifts). Its level's queued tasks then share out the
+    /// positions they held between them in their new order, so the moved
+    /// one sits between its neighbours and a new task, placed by its id,
+    /// still queues last. Refused unless both it and the task it is moved
+    /// before or after are queued.
+    pub fn move_queued(&self, id: i64, spot: QueueSpot) -> Result<Moved, MoveError> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut queue: Vec<(i64, Priority, i64)> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, priority, COALESCE(queue_pos, id) FROM tasks
+                 WHERE state = 'queued' ORDER BY {QUEUE_ORDER}"
+            ))?;
+            let rows = stmt.query_map([], |r| {
+                let p: String = r.get(1)?;
+                Ok((r.get(0)?, p.parse().unwrap_or_default(), r.get(2)?))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let refusal = |tx: &rusqlite::Transaction, id: i64| -> MoveError {
+            let state: rusqlite::Result<Option<String>> = tx
+                .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional();
+            match state {
+                Err(err) => err.into(),
+                Ok(None) => MoveError::NotFound(id),
+                Ok(Some(state)) => match state.parse() {
+                    Ok(state) => MoveError::NotQueued { id, state },
+                    Err(err) => MoveError::Store(anyhow::anyhow!(err)),
+                },
+            }
+        };
+        let index = |queue: &[(i64, Priority, i64)], id: i64| queue.iter().position(|q| q.0 == id);
+        let Some(at) = index(&queue, id) else {
+            return Err(refusal(&tx, id));
+        };
+        if let QueueSpot::Before(other) | QueueSpot::After(other) = spot
+            && index(&queue, other).is_none()
+        {
+            return Err(refusal(&tx, other));
+        }
+        let (_, was, own) = queue.remove(at);
+        let i = match spot {
+            QueueSpot::Top => 0,
+            QueueSpot::To(n) => n.saturating_sub(1).min(queue.len()),
+            QueueSpot::Before(other) | QueueSpot::After(other) if other == id => at,
+            QueueSpot::Before(other) => index(&queue, other).expect("checked"),
+            QueueSpot::After(other) => index(&queue, other).expect("checked") + 1,
+        };
+        let mut level = was;
+        if let Some(behind) = queue.get(i)
+            && behind.1 > level
+        {
+            level = behind.1;
+        }
+        if i > 0 && queue[i - 1].1 < level {
+            level = queue[i - 1].1;
+        }
+        queue.insert(i, (id, level, own));
+        let mine: Vec<(i64, i64)> = queue
+            .iter()
+            .filter(|q| q.1 == level)
+            .map(|q| (q.0, q.2))
+            .collect();
+        let mut slots: Vec<i64> = mine.iter().map(|m| m.1).collect();
+        slots.sort_unstable();
+        // Ties (a hand edit) would leave the order to age: make them strict.
+        for k in 1..slots.len() {
+            slots[k] = slots[k].max(slots[k - 1] + 1);
+        }
+        for ((task, pos), slot) in mine.iter().zip(slots) {
+            if *pos != slot {
+                tx.execute(
+                    "UPDATE tasks SET queue_pos = ?2 WHERE id = ?1",
+                    params![task, slot],
+                )?;
+            }
+        }
+        if level != was {
+            tx.execute(
+                "UPDATE tasks SET priority = ?2, priority_from = 'queue move' WHERE id = ?1",
+                params![id, level.as_str()],
+            )?;
+        }
+        tx.execute(
+            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        let task = self.get_task(id)?.context("task vanished after move")?;
+        Ok(Moved {
+            task,
+            was,
+            pos: i + 1,
+            of: queue.len(),
+        })
     }
 
     /// Put every task that has no flock, a row from before flocks, in
@@ -757,6 +1041,19 @@ impl Store {
         Ok(())
     }
 
+    /// The task `(job, key)` was seen as: `None` when it is unseen,
+    /// `Some(None)` when seen with no task id recorded.
+    pub fn seen_task(&self, job: &str, key: &str) -> anyhow::Result<Option<Option<i64>>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT task_id FROM seen WHERE job = ?1 AND key = ?2",
+                params![job, key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn is_seen(&self, job: &str, key: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row(
@@ -771,12 +1068,34 @@ impl Store {
     /// it was given, and record `(job, key)` as seen: one transaction, so no
     /// reader ever sees an unrendered task and a render failure leaves the key
     /// unseen. A key already in `seen` violates the primary key and nothing is
-    /// written.
+    /// written. `description` is the task's, already rendered; `None` reads
+    /// as the prompt's first line.
     pub fn insert_job_task(
         &self,
         job: &str,
         flock: &str,
         item: &Value,
+        description: Option<&str>,
+        render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
+    ) -> anyhow::Result<Task> {
+        self.insert_job_task_at(
+            job,
+            flock,
+            item,
+            (Priority::Normal, None),
+            description,
+            render,
+        )
+    }
+
+    /// `insert_job_task` at a level, and what set it (`Task::priority_from`).
+    pub fn insert_job_task_at(
+        &self,
+        job: &str,
+        flock: &str,
+        item: &Value,
+        (priority, from): (Priority, Option<&str>),
+        description: Option<&str>,
         render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
         let key = item
@@ -788,10 +1107,11 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, 'queued', ?4, ?4)",
-            params![job, serde_json::to_string(item)?, flock, now],
+            "INSERT INTO tasks (job, item, prompt, spec, flock, description, state, priority, priority_from, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, ?7, 'queued', ?5, ?6, ?4, ?4)",
+            params![job, serde_json::to_string(item)?, flock, now, priority.as_str(), from, description],
         )?;
         let id = tx.last_insert_rowid();
+        place_last(&tx, id)?;
         let (prompt, spec) =
             render(id).map_err(|e| anyhow::anyhow!("render task t-{id} for job {job}: {e}"))?;
         tx.execute(
@@ -887,8 +1207,31 @@ impl Store {
         Ok(n == 1)
     }
 
-    #[cfg(test)]
-    pub(crate) fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+    /// Record `key` as seen for `job` without a task row here: a headless
+    /// serve's item became task `task_id` on the head, whose store holds
+    /// the row, or `None` when the head no longer has it. Seen already is
+    /// not an error.
+    pub fn mark_seen(&self, job: &str, key: &str, task_id: Option<i64>) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
+            params![job, key, task_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Set `key` in the meta table, where the schema version lives too.
+    pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(key != "schema_version", "schema_version is not a setting");
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
@@ -896,6 +1239,13 @@ impl Store {
             })
             .optional()?)
     }
+}
+
+/// Give new task `id` its position: its id, so it queues after every task
+/// of its level already there.
+fn place_last(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("UPDATE tasks SET queue_pos = id WHERE id = ?1", params![id])?;
+    Ok(())
 }
 
 /// `ALTER TABLE tasks ADD COLUMN <definition>` unless `tasks` already has
@@ -931,10 +1281,12 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let item: String = row.get("item")?;
     let spec: String = row.get("spec")?;
     let state: String = row.get("state")?;
+    let priority: String = row.get("priority")?;
     let created_at: String = row.get("created_at")?;
     let updated_at: String = row.get("updated_at")?;
     let started_at: Option<String> = row.get("started_at")?;
     let finished_at: Option<String> = row.get("finished_at")?;
+    let role: String = row.get("role")?;
     Ok(Task {
         id: row.get("id")?,
         job: row.get("job")?,
@@ -959,6 +1311,15 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         ended: row.get("ended")?,
         retry_of: row.get("retry_of")?,
         flock: row.get("flock")?,
+        priority: priority
+            .parse()
+            .map_err(|_| conversion_failure(format!("unknown task priority {priority:?}")))?,
+        priority_from: row.get("priority_from")?,
+        queue_pos: row
+            .get::<_, Option<i64>>("queue_pos")?
+            .unwrap_or(row.get("id")?),
+        role: role.parse().map_err(conversion_failure::<String>)?,
+        description: row.get("description")?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -1000,7 +1361,61 @@ fn row_to_job_state(row: &Row<'_>) -> rusqlite::Result<JobState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::{Checkout, Reopen};
+    use crate::task::{Checkout, Reopen, TaskRole};
+
+    /// A headless serve keeps seen keys and its event cursor with no task
+    /// rows of its own.
+    #[test]
+    fn seen_keys_and_settings_without_tasks() {
+        let s = Store::open_in_memory().unwrap();
+        s.mark_seen("j", "k1", Some(7)).unwrap();
+        s.mark_seen("j", "k1", Some(8)).unwrap();
+        s.mark_seen("j", "k3", None).unwrap();
+        assert!(s.is_seen("j", "k1").unwrap());
+        assert!(!s.is_seen("j", "k2").unwrap());
+        assert_eq!(s.seen_task("j", "k1").unwrap(), Some(Some(7)));
+        assert_eq!(s.seen_task("j", "k2").unwrap(), None);
+        assert_eq!(s.seen_task("j", "k3").unwrap(), Some(None));
+        assert_eq!(s.meta("head_event_seq").unwrap(), None);
+        s.set_meta("head_event_seq", "12").unwrap();
+        s.set_meta("head_event_seq", "13").unwrap();
+        assert_eq!(s.meta("head_event_seq").unwrap().as_deref(), Some("13"));
+        assert!(s.set_meta("schema_version", "1").is_err());
+        assert_eq!(
+            s.meta("schema_version").unwrap(),
+            Some(SCHEMA_VERSION.to_string())
+        );
+    }
+
+    #[test]
+    fn a_pane_tail_is_the_last_lines_and_taken_once() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.take_pane_tail(1), None);
+        let text: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        s.note_pane_tail(1, &text);
+        let tail = s.take_pane_tail(1).unwrap();
+        assert_eq!(tail.lines().count(), PANE_TAIL_LINES);
+        assert!(
+            tail.starts_with("line 61\n") && tail.ends_with("line 100"),
+            "{tail}"
+        );
+        assert_eq!(s.take_pane_tail(1), None, "taken once");
+        s.note_pane_tail(2, "a");
+        s.note_pane_tail(2, "b");
+        assert_eq!(s.take_pane_tail(2).as_deref(), Some("b"), "the newest read");
+    }
+
+    #[test]
+    fn pane_tails_are_bounded_and_the_oldest_go() {
+        let s = Store::open_in_memory().unwrap();
+        for id in 0..(PANE_TAILS_MAX as i64 + 5) {
+            s.note_pane_tail(id, "x");
+        }
+        assert_eq!(s.take_pane_tail(0), None);
+        assert_eq!(s.take_pane_tail(4), None);
+        assert!(s.take_pane_tail(5).is_some());
+        assert!(s.take_pane_tail(PANE_TAILS_MAX as i64 + 4).is_some());
+    }
 
     fn spec() -> DispatchSpec {
         DispatchSpec {
@@ -1018,6 +1433,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         }
     }
 
@@ -1028,6 +1444,7 @@ mod tests {
             prompt: "do it\nnow \"quoted\" {{ x }}".into(),
             spec: spec(),
             flock: "default".into(),
+            description: None,
         }
     }
 
@@ -1498,7 +1915,7 @@ mod tests {
         let item = serde_json::json!({"key": "k1", "title": "t"});
         assert!(!s.is_seen("j", "k1").unwrap());
         let t = s
-            .insert_job_task("j", "default", &item, |id| {
+            .insert_job_task("j", "default", &item, None, |id| {
                 Ok((
                     format!("prompt for t-{id}"),
                     DispatchSpec {
@@ -1522,7 +1939,7 @@ mod tests {
         // The same key again: refused, nothing written.
         let before = s.list_tasks(&TaskFilter::default()).unwrap().len();
         assert!(
-            s.insert_job_task("j", "default", &item, |_| Ok(("x".into(), spec())))
+            s.insert_job_task("j", "default", &item, None, |_| Ok(("x".into(), spec())))
                 .is_err()
         );
         assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), before);
@@ -1530,7 +1947,7 @@ mod tests {
         // A render failure rolls the whole thing back: no task, key still unseen.
         let item2 = serde_json::json!({"key": "k2"});
         let err = s
-            .insert_job_task("j", "default", &item2, |_| Err("nope".into()))
+            .insert_job_task("j", "default", &item2, None, |_| Err("nope".into()))
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
         assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), before);
@@ -1542,6 +1959,7 @@ mod tests {
                 "j",
                 "default",
                 &serde_json::json!({"title": "no key"}),
+                None,
                 |_| Ok(("x".into(), spec()))
             )
             .is_err()
@@ -1607,7 +2025,7 @@ mod tests {
         assert_eq!(ids("default"), [home.id]);
         assert!(ids("nope").is_empty());
         let job = s
-            .insert_job_task("j", "work", &serde_json::json!({"key": "k"}), |_| {
+            .insert_job_task("j", "work", &serde_json::json!({"key": "k"}), None, |_| {
                 Ok(("p".into(), spec()))
             })
             .unwrap();
@@ -1668,6 +2086,76 @@ mod tests {
         assert_eq!(r.flock.as_deref(), Some("work"));
     }
 
+    /// A task keeps the description it was queued with; one queued without
+    /// reads as its prompt's first line. A retry copies it.
+    #[test]
+    fn a_task_keeps_its_description_and_a_retry_copies_it() {
+        let s = Store::open_in_memory().unwrap();
+        let given = s
+            .insert_task(NewTask {
+                description: Some("Fix the flaky test".into()),
+                ..new_task("run")
+            })
+            .unwrap();
+        assert_eq!(given.description.as_deref(), Some("Fix the flaky test"));
+        assert_eq!(given.description_text(), "Fix the flaky test");
+        assert_eq!(given.description_from(), "--description");
+        let bare = s.insert_task(new_task("run")).unwrap();
+        assert_eq!(bare.description, None);
+        assert_eq!(bare.description_text(), "do it");
+        assert_eq!(bare.description_from(), "the prompt");
+        let json = bare.to_json();
+        assert_eq!(json["description"], "do it");
+        assert_eq!(json["description_from"], "the prompt");
+
+        let job = s
+            .insert_job_task(
+                "j",
+                "default",
+                &serde_json::json!({"key": "k"}),
+                Some("Card title"),
+                |_| Ok(("p".into(), spec())),
+            )
+            .unwrap();
+        assert_eq!(job.description.as_deref(), Some("Card title"));
+        assert_eq!(job.description_from(), "job j");
+
+        set_state(&s, given.id, TaskState::Failed);
+        let r = s.insert_retry(given.id).unwrap();
+        assert_eq!(r.description.as_deref(), Some("Fix the flaky test"));
+    }
+
+    /// A v8 database has no description column: opening it adds one, and
+    /// its rows read as their prompt's first line.
+    #[test]
+    fn a_v8_database_gains_the_description_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN description;
+                 UPDATE meta SET value = '8' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let old = s.get_task(1).unwrap().unwrap();
+        assert_eq!(old.description, None);
+        assert_eq!(old.description_text(), "do it");
+        let new = s
+            .insert_task(NewTask {
+                description: Some("d".into()),
+                ..new_task("run")
+            })
+            .unwrap();
+        assert_eq!(new.description.as_deref(), Some("d"));
+    }
+
     /// `task retry --place` replaces where the copy's pane goes and keeps
     /// everything else; without it the copy keeps the original's place.
     #[test]
@@ -1720,10 +2208,12 @@ mod tests {
             if owned {
                 t.agent_name = Some(Task::agent_name_for(t.id));
                 t.spec.checkout = Some(Box::new(checkout.clone()));
+                t.spec.session_id = Some("0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21".into());
                 s.update_task(&mut t).unwrap();
             }
             let r = s.insert_retry(t.id).unwrap();
             assert_eq!(r.spec.checkout, None, "a retry owns no checkout yet");
+            assert_eq!(r.spec.session_id, None, "nor a session");
             (t.id, r.spec.branch, r.spec.reopen)
         };
         let (id, branch, reopen) = task(true, true, TaskState::Failed);
@@ -1873,6 +2363,339 @@ mod tests {
         assert!(s.get_task(1).unwrap().unwrap().ended);
     }
 
+    /// A v8 database has no roles; opening it adds the column and every
+    /// row reads as a plain agent.
+    #[test]
+    fn a_v8_database_gains_role_as_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN role;
+                 UPDATE meta SET value = '8' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(s.get_task(1).unwrap().unwrap().role, TaskRole::Agent);
+    }
+
+    /// A task keeps the role it was queued with, and its retry, the same
+    /// task again, keeps it too.
+    #[test]
+    fn a_task_keeps_its_role_and_a_retry_copies_it() {
+        let s = Store::open_in_memory().unwrap();
+        let plain = s.insert_task(new_task("run")).unwrap();
+        assert_eq!(plain.role, TaskRole::Agent);
+        let o = s
+            .insert_task_at(
+                new_task("run"),
+                Priority::Normal,
+                None,
+                TaskRole::Orchestrator,
+            )
+            .unwrap();
+        assert_eq!(o.role, TaskRole::Orchestrator);
+        let mut o = s.get_task(o.id).unwrap().unwrap();
+        assert_eq!(o.role, TaskRole::Orchestrator);
+        o.state = TaskState::Failed;
+        s.update_task(&mut o).unwrap();
+        let r = s.insert_retry(o.id).unwrap();
+        assert_eq!(r.role, TaskRole::Orchestrator);
+    }
+
+    /// A v8 database has no levels or positions: its rows become `normal`,
+    /// placed by id, so the queue keeps the order it had.
+    #[test]
+    fn a_v8_database_gains_priority_and_queue_pos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN priority;
+                 ALTER TABLE tasks DROP COLUMN priority_from;
+                 ALTER TABLE tasks DROP COLUMN queue_pos;
+                 UPDATE meta SET value = '8' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let q = s.queued_tasks().unwrap();
+        assert_eq!(q.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 2]);
+        for t in &q {
+            assert_eq!(t.priority, Priority::Normal);
+            assert_eq!(t.priority_from, None);
+            assert_eq!(t.queue_pos, t.id);
+        }
+        let conn = Connection::open(&path).unwrap();
+        let unset: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE queue_pos IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unset, 0);
+    }
+
+    /// Dispatch takes queued tasks by level, highest first, then by
+    /// position, then oldest first; a task that left the queue is not in it.
+    #[test]
+    fn queued_tasks_go_by_level_then_position_then_age() {
+        let s = Store::open_in_memory().unwrap();
+        let at = |p: Priority| {
+            s.insert_task_at(new_task("run"), p, None, TaskRole::Agent)
+                .unwrap()
+                .id
+        };
+        let low = at(Priority::Low);
+        let normal = at(Priority::Normal);
+        let high = at(Priority::High);
+        let critical = at(Priority::Critical);
+        let high2 = at(Priority::High);
+        let normal2 = at(Priority::Normal);
+        let taken = at(Priority::Critical);
+        s.claim_task(taken, "m").unwrap().unwrap();
+        let order = |s: &Store| {
+            s.queued_tasks()
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&s), vec![critical, high, high2, normal, normal2, low]);
+        // Position before age: a task moved ahead of its level goes first.
+        s.execute_raw(&format!(
+            "UPDATE tasks SET queue_pos = 0 WHERE id = {high2}"
+        ));
+        assert_eq!(order(&s), vec![critical, high2, high, normal, normal2, low]);
+        // Age breaks a tie in position.
+        s.execute_raw(&format!(
+            "UPDATE tasks SET queue_pos = 5, created_at = '2000-01-01T00:00:00+00:00' WHERE id = {normal2};
+             UPDATE tasks SET queue_pos = 5 WHERE id = {normal}"
+        ));
+        assert_eq!(order(&s), vec![critical, high2, high, normal2, normal, low]);
+    }
+
+    /// A job's task and a retry keep the level they are given, and each new
+    /// task is placed by its id.
+    #[test]
+    fn job_tasks_and_retries_keep_their_level() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_job_task_at(
+                "j",
+                "default",
+                &serde_json::json!({"key": "k"}),
+                (Priority::High, Some("job j")),
+                None,
+                |_| Ok(("p".into(), spec())),
+            )
+            .unwrap();
+        assert_eq!(t.priority, Priority::High);
+        assert_eq!(t.priority_from.as_deref(), Some("job j"));
+        assert_eq!(t.queue_pos, t.id);
+        set_state(&s, t.id, TaskState::Failed);
+        let r = s.insert_retry(t.id).unwrap();
+        assert_eq!(r.priority, Priority::High);
+        assert_eq!(r.priority_from.as_deref(), Some("job j"));
+        assert_eq!(r.queue_pos, r.id);
+    }
+
+    /// The queue as (id, level) pairs, in dispatch order.
+    fn queue_of(s: &Store) -> Vec<(i64, Priority)> {
+        s.queued_tasks()
+            .unwrap()
+            .iter()
+            .map(|t| (t.id, t.priority))
+            .collect()
+    }
+
+    /// `--before`, `--after` and `--to` put a task where they say within
+    /// its level, leaving its level alone, and the level's positions are
+    /// shared out again so a new task still queues last.
+    #[test]
+    fn move_queued_places_a_task_within_its_level() {
+        use crate::queue::QueueSpot::*;
+        use Priority::Normal as N;
+        let s = Store::open_in_memory().unwrap();
+        let ids: Vec<i64> = (0..4)
+            .map(|_| s.insert_task(new_task("run")).unwrap().id)
+            .collect();
+        let [a, b, c, d] = ids[..] else { panic!() };
+        let m = s.move_queued(d, Before(b)).unwrap();
+        assert_eq!((m.pos, m.of, m.was), (2, 4, N));
+        assert_eq!(m.task.priority, N);
+        assert_eq!(m.task.priority_from, None, "the level did not change");
+        assert_eq!(queue_of(&s), [(a, N), (d, N), (b, N), (c, N)]);
+        let m = s.move_queued(a, After(c)).unwrap();
+        assert_eq!(m.pos, 4);
+        assert_eq!(queue_of(&s), [(d, N), (b, N), (c, N), (a, N)]);
+        s.move_queued(c, To(1)).unwrap();
+        assert_eq!(queue_of(&s), [(c, N), (d, N), (b, N), (a, N)]);
+        let m = s.move_queued(c, To(99)).unwrap();
+        assert_eq!(m.pos, 4, "past the end is last");
+        assert_eq!(queue_of(&s), [(d, N), (b, N), (a, N), (c, N)]);
+        let m = s.move_queued(b, Before(b)).unwrap();
+        assert_eq!(m.pos, 2, "before itself stays put");
+        assert_eq!(queue_of(&s), [(d, N), (b, N), (a, N), (c, N)]);
+        let e = s.insert_task(new_task("run")).unwrap().id;
+        assert_eq!(queue_of(&s).last(), Some(&(e, N)));
+        let pos: Vec<i64> = s
+            .queued_tasks()
+            .unwrap()
+            .iter()
+            .map(|t| t.queue_pos)
+            .collect();
+        assert!(pos.windows(2).all(|w| w[0] < w[1]), "{pos:?}");
+    }
+
+    /// A task moved in front of a higher one is lifted to its level, and
+    /// one moved behind a lower one lowered to it; the move is what set
+    /// the level. `--top` on a high task in front of a critical one lifts it,
+    /// and on the first task changes nothing.
+    #[test]
+    fn move_queued_lifts_and_lowers() {
+        use crate::queue::QueueSpot::*;
+        use crate::task::TaskRole;
+        use Priority::*;
+        let s = Store::open_in_memory().unwrap();
+        let at = |p: Priority| {
+            s.insert_task_at(new_task("run"), p, Some("task run"), TaskRole::Agent)
+                .unwrap()
+                .id
+        };
+        let crit = at(Critical);
+        let high = at(High);
+        let normal = at(Normal);
+        let low = at(Low);
+        let m = s.move_queued(normal, Before(high)).unwrap();
+        assert_eq!((m.was, m.task.priority, m.pos), (Normal, High, 2));
+        assert_eq!(m.task.priority_from.as_deref(), Some("queue move"));
+        assert_eq!(
+            queue_of(&s),
+            [(crit, Critical), (normal, High), (high, High), (low, Low)]
+        );
+        let m = s.move_queued(high, After(low)).unwrap();
+        assert_eq!((m.was, m.task.priority, m.pos), (High, Low, 4));
+        assert_eq!(
+            queue_of(&s),
+            [(crit, Critical), (normal, High), (low, Low), (high, Low)]
+        );
+        let m = s.move_queued(low, Top).unwrap();
+        assert_eq!((m.was, m.task.priority, m.pos), (Low, Critical, 1));
+        assert_eq!(
+            queue_of(&s),
+            [
+                (low, Critical),
+                (crit, Critical),
+                (normal, High),
+                (high, Low)
+            ]
+        );
+        let m = s.move_queued(low, Top).unwrap();
+        assert_eq!((m.was, m.task.priority, m.pos), (Critical, Critical, 1));
+        // Behind a lower task at the very end lowers too, but between two
+        // of its own level it stays.
+        let m = s.move_queued(crit, To(4)).unwrap();
+        assert_eq!((m.was, m.task.priority), (Critical, Low));
+        assert_eq!(
+            queue_of(&s),
+            [(low, Critical), (normal, High), (high, Low), (crit, Low)]
+        );
+    }
+
+    /// The queue is one order across flocks: a task can go before a task
+    /// of another flock, and keeps its own flock.
+    #[test]
+    fn move_queued_crosses_flocks() {
+        use crate::queue::QueueSpot::*;
+        let s = Store::open_in_memory().unwrap();
+        let home = s.insert_task(new_task("run")).unwrap().id;
+        let work = s
+            .insert_task(NewTask {
+                flock: "work".into(),
+                ..new_task("run")
+            })
+            .unwrap()
+            .id;
+        let m = s.move_queued(work, Before(home)).unwrap();
+        assert_eq!(m.pos, 1);
+        assert_eq!(m.task.flock.as_deref(), Some("work"));
+        assert_eq!(
+            queue_of(&s),
+            [(work, Priority::Normal), (home, Priority::Normal)]
+        );
+    }
+
+    /// Only a queued task moves, and only before or after a queued one;
+    /// a refusal names the task at fault and changes nothing.
+    #[test]
+    fn move_queued_refuses_what_is_not_queued() {
+        use crate::queue::QueueSpot::*;
+        let s = Store::open_in_memory().unwrap();
+        let taken = s.insert_task(new_task("run")).unwrap().id;
+        let q = s.insert_task(new_task("run")).unwrap().id;
+        s.claim_task(taken, "m").unwrap().unwrap();
+        match s.move_queued(taken, Top) {
+            Err(MoveError::NotQueued { id, state }) => {
+                assert_eq!((id, state), (taken, TaskState::Starting))
+            }
+            other => panic!("{other:?}"),
+        }
+        match s.move_queued(q, Before(taken)) {
+            Err(MoveError::NotQueued { id, .. }) => assert_eq!(id, taken),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            s.move_queued(99, Top),
+            Err(MoveError::NotFound(99))
+        ));
+        assert!(matches!(
+            s.move_queued(q, After(98)),
+            Err(MoveError::NotFound(98))
+        ));
+    }
+
+    /// Only a queued task's level changes; the refusal names the state.
+    #[test]
+    fn set_priority_changes_only_a_queued_task() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s.insert_task(new_task("run")).unwrap();
+        let b = s.insert_task(new_task("run")).unwrap();
+        let t = s
+            .set_priority(b.id, Priority::Critical, "task priority")
+            .unwrap();
+        assert_eq!(t.priority, Priority::Critical);
+        assert_eq!(t.priority_from.as_deref(), Some("task priority"));
+        assert_eq!(t.queue_pos, b.id);
+        assert_eq!(s.queued_tasks().unwrap()[0].id, b.id);
+        s.claim_task(a.id, "m").unwrap().unwrap();
+        match s.set_priority(a.id, Priority::Low, "task priority") {
+            Err(PriorityError::NotQueued { state, .. }) => assert_eq!(state, TaskState::Starting),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            s.set_priority(99, Priority::Low, "task priority"),
+            Err(PriorityError::NotFound(99))
+        ));
+        assert_eq!(
+            s.get_task(a.id).unwrap().unwrap().priority,
+            Priority::Normal
+        );
+    }
+
     /// Event sequence numbers keep growing across a restart of the store,
     /// and a v7 database, which has none, starts them at 1.
     #[test]
@@ -1961,11 +2784,16 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN trust_sent;
                  ALTER TABLE tasks DROP COLUMN activity_seen;
                  ALTER TABLE tasks DROP COLUMN ended;
+                 ALTER TABLE tasks DROP COLUMN priority;
+                 ALTER TABLE tasks DROP COLUMN priority_from;
+                 ALTER TABLE tasks DROP COLUMN queue_pos;
+                 ALTER TABLE tasks DROP COLUMN role;
+                 ALTER TABLE tasks DROP COLUMN description;
                  DROP TABLE trusted_repos;
                  DROP TABLE event_seq;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '8' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '11' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -1991,7 +2819,11 @@ mod tests {
                 || c == "flock"
                 || c == "trust_sent"
                 || c == "activity_seen"
-                || c == "ended"),
+                || c == "ended"
+                || c == "priority"
+                || c == "queue_pos"
+                || c == "role"
+                || c == "description"),
             "rolled back: {cols:?}"
         );
         drop(conn);
@@ -2051,7 +2883,7 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         let item = serde_json::json!({"key": "k1", "title": "t"});
         let old = s
-            .insert_job_task("j", "default", &item, |_| Ok(("p".into(), spec())))
+            .insert_job_task("j", "default", &item, None, |_| Ok(("p".into(), spec())))
             .unwrap();
         for state in [
             TaskState::Queued,
@@ -2213,7 +3045,7 @@ mod tests {
         let mk = |key: &str, state: TaskState, finished: Option<DateTime<Utc>>| {
             let item = serde_json::json!({ "key": key });
             let t = s
-                .insert_job_task("j", "default", &item, |_| Ok(("p".into(), spec())))
+                .insert_job_task("j", "default", &item, None, |_| Ok(("p".into(), spec())))
                 .unwrap();
             let mut t = set_state(&s, t.id, state);
             t.finished_at = finished;

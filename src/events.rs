@@ -1,7 +1,8 @@
 //! The events log: every `PastorEvent` the daemon broadcasts, stamped and
 //! expanded into an `EventRecord` and appended to `events.jsonl` under the
 //! state dir. `pastor events` reads the file, not the daemon, so it works with
-//! the daemon down; `--follow` tails it.
+//! the daemon down; `--follow` tails it. With a remote head it pages through
+//! `IpcRequest::EventsSince` instead (`page_remote`).
 //!
 //! The JSON of `EventRecord` is also what connector event hooks get on stdin, so
 //! it is a connector-facing format: fields are only ever added, never renamed.
@@ -55,6 +56,10 @@ pub struct EventRecord {
     pub kind: String,
     /// The full task row at the time the record was built.
     pub task: Option<Task>,
+    /// The `[models]` name the task runs (`Task::model`); absent on a task
+    /// that runs none and on events with no task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub job: Option<String>,
     /// Set on `machine.*` events: the machine's status at that moment.
     pub machine: Option<MachineStatus>,
@@ -127,6 +132,7 @@ impl EventRecord {
             detail: ev.detail.clone(),
             at: Utc::now(),
             kind: ev.kind.clone(),
+            model: task.as_ref().and_then(|t| t.model().map(str::to_string)),
             task,
             job,
             machine,
@@ -249,7 +255,17 @@ pub fn spawn_log(
                         tracing::error!(%err, "events log: write failed");
                     }
                     if let Some(tx) = &forward {
-                        match tx.try_send(rec) {
+                        // A finish command hangs on these two: wait for room
+                        // rather than lose them (the runner drains at once).
+                        let vital = matches!(rec.kind.as_str(), "task.done" | "task.failed");
+                        let sent = if vital {
+                            tx.send(rec)
+                                .await
+                                .map_err(|e| mpsc::error::TrySendError::Closed(e.0))
+                        } else {
+                            tx.try_send(rec)
+                        };
+                        match sent {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(rec)) => {
                                 tracing::warn!(
@@ -378,6 +394,12 @@ pub struct EventsPage {
     /// The oldest sequence number still in the log; `None` when it holds no
     /// numbered record.
     pub oldest: Option<u64>,
+    /// The newest sequence number in the log, whatever the cursor, limit and
+    /// task: where a reader that wants only what comes next starts (`pastor
+    /// watch`). `None` when it holds no numbered record, and from a head
+    /// that predates it.
+    #[serde(default)]
+    pub newest: Option<u64>,
 }
 
 /// The records numbered after `after`, oldest first, at most `limit`, only
@@ -387,6 +409,7 @@ pub struct EventsPage {
 pub fn since(path: &Path, after: u64, limit: u32, task: Option<i64>) -> anyhow::Result<EventsPage> {
     let all = read(path, None)?;
     let oldest = all.iter().map(|r| r.seq).filter(|&s| s > 0).min();
+    let newest = all.iter().map(|r| r.seq).max().filter(|&s| s > 0);
     let gap = oldest.is_some_and(|o| o > after.saturating_add(1));
     let events = all
         .into_iter()
@@ -397,6 +420,7 @@ pub fn since(path: &Path, after: u64, limit: u32, task: Option<i64>) -> anyhow::
         events,
         gap,
         oldest,
+        newest,
     })
 }
 
@@ -493,10 +517,65 @@ pub async fn follow(
     }
 }
 
+/// How many records `pastor events` asks a remote head for at a time.
+pub const REMOTE_PAGE: u32 = 500;
+
+/// How often `--follow` asks a remote head for new records.
+const REMOTE_POLL: Duration = Duration::from_secs(1);
+
+/// `pastor events` against a remote head: every record from the start of the
+/// head's log, a page of `limit` at a time through `fetch` (an
+/// `EventsSince` from the cursor it is given), and with `follow` a new ask
+/// every `poll` once a page comes back short, until `on` returns false.
+/// A page with `gap` set gets one line through `warn`, and the cursor moves
+/// to just before the page's oldest record, so the same loss is not reported
+/// again on the next poll.
+pub async fn page_remote<F, Fut>(
+    limit: u32,
+    follow: bool,
+    poll: Duration,
+    mut fetch: F,
+    mut on: impl FnMut(&EventRecord) -> bool,
+    mut warn: impl FnMut(&str),
+) -> anyhow::Result<()>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<EventsPage>>,
+{
+    let mut after = 0u64;
+    loop {
+        let page = fetch(after).await?;
+        if page.gap
+            && let Some(oldest) = page.oldest
+        {
+            warn(&format!(
+                "pastor: events {} to {} were rotated out of the head's log before they were read",
+                after + 1,
+                oldest - 1
+            ));
+            after = after.max(oldest - 1);
+        }
+        let full = page.events.len() >= limit as usize;
+        for r in &page.events {
+            if !on(r) {
+                return Ok(());
+            }
+            after = after.max(r.seq);
+        }
+        if full {
+            continue;
+        }
+        if !follow {
+            return Ok(());
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub struct EventsArgs {
-    /// Keep printing new events as they are written (reads the file; works
-    /// with the daemon down)
+    /// Keep printing new events as they are written (reads the file, and
+    /// works with the daemon down; with a remote head, asks it every second)
     #[arg(long)]
     pub follow: bool,
     /// Only events about this task, like t-12 or 12
@@ -524,6 +603,34 @@ pub async fn cli(paths: &Paths, args: EventsArgs) -> anyhow::Result<()> {
         // A closed stdout (`pastor events | head`) ends the command quietly.
         writeln!(std::io::stdout(), "{line}").is_ok()
     };
+    if crate::ipc::remote_head().is_some() {
+        let fetch = |after| {
+            let req = crate::ipc::IpcRequest::EventsSince {
+                after,
+                limit: REMOTE_PAGE,
+                task,
+            };
+            async move {
+                let resp = crate::ipc::request_head(paths, &req)
+                    .await
+                    .map_err(|e| crate::head::failure(&e))?;
+                match resp {
+                    crate::ipc::IpcResponse::Events(page) => Ok(page),
+                    crate::ipc::IpcResponse::Error { code, message } => {
+                        Err(crate::cli::CliError::err(&code, message))
+                    }
+                    other => Err(crate::cli::CliError::err(
+                        "internal",
+                        format!("unexpected daemon reply: {other:?}"),
+                    )),
+                }
+            }
+        };
+        return page_remote(REMOTE_PAGE, args.follow, REMOTE_POLL, fetch, print, |w| {
+            eprintln!("{w}")
+        })
+        .await;
+    }
     let path = paths.events_file();
     if args.follow {
         follow(&path, task, print).await
@@ -552,6 +659,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let t = store
             .insert_task(NewTask {
+                description: None,
                 job: job.into(),
                 item: serde_json::json!({"key": "k1", "title": "fix it"}),
                 prompt: "do it".into(),
@@ -570,6 +678,7 @@ mod tests {
                     reopen: None,
                     agent_source: None,
                     place: Default::default(),
+                    session_id: None,
                 },
                 flock: "work".into(),
             })
@@ -607,9 +716,12 @@ mod tests {
         MachineHandle {
             name: name.into(),
             max_agents: 2,
+            job_slots: 0,
+            burst: 0,
             tags: vec![],
             tx,
             status: Arc::new(RwLock::new(MachineStatus {
+                description: None,
                 name: name.into(),
                 host: name.into(),
                 endpoint: format!("ssh {name}"),
@@ -620,9 +732,14 @@ mod tests {
                 error: Some("ssh: connection refused".into()),
                 live: 1,
                 max_agents: 2,
+                live_jobs: 0,
+                job_slots: 0,
+                burst: 0,
                 tags: vec![],
                 orphans: vec![],
                 flock: None,
+                shutting_down: false,
+                profile: None,
             })),
             task: None,
         }
@@ -705,6 +822,7 @@ mod tests {
             task: task.cloned(),
             job: task.map(|t| t.job.clone()),
             machine: None,
+            model: None,
         }
     }
 
@@ -938,7 +1056,7 @@ mod tests {
         // Fill the one slot up front, so the log task's own send finds it full.
         fwd.try_send(record("task.queued", Some(&t))).unwrap();
         let log = spawn_log(path.clone(), DEFAULT_MAX_BYTES, store, None, rx, Some(fwd));
-        tx.send(ev("task.done", Some(t.id), None, None)).unwrap();
+        tx.send(ev("task.blocked", Some(t.id), None, None)).unwrap();
         drop(tx);
         tokio::time::timeout(Duration::from_secs(5), log)
             .await
@@ -947,11 +1065,39 @@ mod tests {
         // The write to events.jsonl happened regardless of the full queue.
         let recs = read(&path, None).unwrap();
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].kind, "task.done");
+        assert_eq!(recs[0].kind, "task.blocked");
         // Only the pre-filled record made it to the hooks side; the log
         // task's own record was dropped for hooks, not queued or blocked on.
         assert_eq!(hooks_rx.try_recv().unwrap().kind, "task.queued");
         assert!(hooks_rx.try_recv().is_err());
+    }
+
+    /// A record a finish command hangs on is not dropped for a full queue:
+    /// the log task waits for room and the record reaches the hooks side.
+    #[tokio::test]
+    async fn a_finishing_record_waits_for_room_in_the_hooks_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (store, t) = store_with_task("triage");
+        let (tx, rx) = broadcast::channel(16);
+        let (fwd, mut hooks_rx) = mpsc::channel(1);
+        fwd.try_send(record("task.queued", Some(&t))).unwrap();
+        let log = spawn_log(
+            path,
+            DEFAULT_MAX_BYTES,
+            Arc::new(store),
+            None,
+            rx,
+            Some(fwd),
+        );
+        tx.send(ev("task.done", Some(t.id), None, None)).unwrap();
+        drop(tx);
+        assert_eq!(hooks_rx.recv().await.unwrap().kind, "task.queued");
+        assert_eq!(hooks_rx.recv().await.unwrap().kind, "task.done");
+        tokio::time::timeout(Duration::from_secs(5), log)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     /// The log task must not keep the fleet alive: the fleet holds the machine
@@ -1161,6 +1307,11 @@ mod tests {
         let page = since(&path, 5, 100, None).unwrap();
         assert!(page.events.is_empty());
         assert!(!page.gap);
+        // A limit of 0 answers where the log ends, for a reader that starts
+        // there, whatever the cursor and the filter.
+        let page = since(&path, 0, 0, Some(t2.id)).unwrap();
+        assert!(page.events.is_empty());
+        assert_eq!(page.newest, Some(5));
 
         // Two rotations push 1..=5 out of both files.
         let w = LogWriter::new(path.clone(), line_len * 2 + 10);
@@ -1179,5 +1330,98 @@ mod tests {
         // A cursor right before the oldest record lost nothing.
         let page = since(&path, oldest - 1, 100, None).unwrap();
         assert!(!page.gap);
+    }
+
+    /// A scripted head for `page_remote`: answers `EventsSince` from `log`
+    /// as `since` would, and records every cursor it was asked for.
+    struct ScriptedHead {
+        log: Vec<EventRecord>,
+        asked: Vec<u64>,
+    }
+
+    impl ScriptedHead {
+        fn page(&mut self, after: u64, limit: u32, task: Option<i64>) -> EventsPage {
+            self.asked.push(after);
+            let oldest = self.log.iter().map(|r| r.seq).filter(|&s| s > 0).min();
+            let newest = self.log.iter().map(|r| r.seq).max().filter(|&s| s > 0);
+            EventsPage {
+                gap: oldest.is_some_and(|o| o > after + 1),
+                oldest,
+                newest,
+                events: self
+                    .log
+                    .iter()
+                    .filter(|r| r.seq > after && matches(r, task))
+                    .take(limit as usize)
+                    .cloned()
+                    .collect(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn page_remote_reads_every_page_then_stops() {
+        let head = std::sync::Mutex::new(ScriptedHead {
+            log: (1..=5).map(|s| numbered(s, "job.fired", None)).collect(),
+            asked: vec![],
+        });
+        let (mut seen, mut warnings) = (vec![], vec![]);
+        page_remote(
+            2,
+            false,
+            Duration::ZERO,
+            |after| {
+                let page = head.lock().unwrap().page(after, 2, None);
+                async move { Ok(page) }
+            },
+            |r| {
+                seen.push(r.seq);
+                true
+            },
+            |w| warnings.push(w.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen, [1, 2, 3, 4, 5]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Two full pages, then a short one ends it.
+        assert_eq!(head.lock().unwrap().asked, [0, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn page_remote_follows_and_warns_once_per_gap() {
+        let head = std::sync::Mutex::new(ScriptedHead {
+            log: (4..=5).map(|s| numbered(s, "job.fired", None)).collect(),
+            asked: vec![],
+        });
+        let (mut seen, mut warnings) = (vec![], vec![]);
+        page_remote(
+            10,
+            true,
+            Duration::ZERO,
+            |after| {
+                let mut h = head.lock().unwrap();
+                let page = h.page(after, 10, None);
+                // While the follower waits, the log rotates past its cursor
+                // (5): 6 and 7 are lost, 8 and 9 are left.
+                if after == 5 && h.asked.len() == 3 {
+                    h.log = (8..=9).map(|s| numbered(s, "job.fired", None)).collect();
+                }
+                async move { Ok(page) }
+            },
+            |r| {
+                seen.push(r.seq);
+                r.seq < 9
+            },
+            |w| warnings.push(w.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen, [4, 5, 8, 9]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("1 to 3"), "{warnings:?}");
+        assert!(warnings[1].contains("6 to 7"), "{warnings:?}");
+        // The cursor moved past each gap, so no poll reported it again.
+        assert_eq!(head.lock().unwrap().asked, [0, 5, 5, 5]);
     }
 }

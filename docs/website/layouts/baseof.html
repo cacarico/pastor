@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ if .IsHome }}pastor{{ else }}{{ .Title }} · pastor docs{{ end }}</title>
+  <meta name="description" content="pastor runs coding agents on machines you own, keeps track of them, and tells you when one needs an answer.">
+  <link rel="stylesheet" href="{{ "style.css" | relURL }}">
+  <script src="{{ "keys.js" | relURL }}" defer></script>
+</head>
+<body>
+<div class="screen">
+  <header class="hd">
+    <a href="{{ "/" | relURL }}" aria-label="pastor home"><pre class="logo" aria-hidden="true"> ___    _    ___  _____   ___   ___
+| _ \  /_\  / __||_   _| / _ \ | _ \
+|  _/ / _ \ \__ \  | |  | (_) ||   /
+|_|  /_/ \_\|___/  |_|   \___/ |_|_\</pre></a>
+    <div class="meta">{{ block "meta" . }}{{ end }}</div>
+  </header>
+
+  {{- $docs := eq .Section "docs" }}
+  <nav class="tabs">
+    <a data-key="1" href="{{ "/" | relURL }}"{{ if .IsHome }} class="on"{{ end }}><k>1</k> about</a>
+    <a data-key="2" href="{{ "docs/" | relURL }}"{{ if $docs }} class="on"{{ end }}><k>2</k> docs</a>
+    <a data-key="3" href="{{ "docs/install/" | relURL }}"><k>3</k> install</a>
+    <a data-key="4" data-confirm href="{{ site.Params.repo }}" target="_blank" rel="noopener"><k>4</k> source</a>
+  </nav>
+
+  {{ block "main" . }}{{ end }}
+
+  <footer class="status">
+    {{ block "status" . }}{{ end }}
+  </footer>
+</div>
+
+{{- /* Asked before a link marked data-confirm leaves the site. keys.js
+       opens it; without scripts those links just work as links. */}}
+<dialog class="confirm" id="confirm" aria-labelledby="confirm-title">
+  <form method="dialog" class="pane focus">
+    <h2 class="t" id="confirm-title">leave pastor?</h2>
+    <p>Open <b id="confirm-dest"></b> in a new tab?</p>
+    <p class="choices">
+      <button value="yes" autofocus><k>y</k> yes, go</button>
+      <button value="no"><k>n</k> no, stay</button>
+    </p>
+    <p class="hint"><k>h</k>/<k>l</k> choose · <k>enter</k> confirm · <k>esc</k> stay</p>
+  </form>
+</dialog>
+</body>
+</html>

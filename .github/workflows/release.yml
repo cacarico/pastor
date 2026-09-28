@@ -17,6 +17,10 @@
 # gated on the `release: published` event, never on `push`). A prerelease
 # is never published there; cut one to crates.io by hand if that's ever
 # wanted (see CONTRIBUTING.md).
+#
+# Every job runs only in cacarico/pastor. Work happens in a private copy
+# that carries the same tags; a tag pushed there must not draft a release
+# or reach crates.io.
 name: release
 
 on:
@@ -44,7 +48,7 @@ jobs:
   # publishing it (see CONTRIBUTING.md). `--verify-tag` below only checks that
   # the tag exists on GitHub.
   verify:
-    if: github.event_name == 'push'
+    if: github.repository == 'cacarico/pastor' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -83,7 +87,7 @@ jobs:
   # a build that links but cannot start, which a cross-compile alone would
   # not.
   build:
-    if: github.event_name == 'push'
+    if: github.repository == 'cacarico/pastor' && github.event_name == 'push'
     needs: verify
     strategy:
       fail-fast: false
@@ -157,7 +161,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push'
+    if: github.repository == 'cacarico/pastor' && github.event_name == 'push'
     needs: [verify, build]
     runs-on: ubuntu-24.04
     permissions:
@@ -210,7 +214,7 @@ jobs:
   # whatever the tag pointed at then; CONTRIBUTING.md's policy that a tag is
   # never moved is what makes trusting it again here safe.
   publish-crate:
-    if: github.event_name == 'release' && !github.event.release.prerelease
+    if: github.repository == 'cacarico/pastor' && github.event_name == 'release' && !github.event.release.prerelease
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -86,7 +86,9 @@ down here because getting them wrong cost a day.
   reporting are repository settings. Its pull requests pass CI like any other.
 - Nothing in the suite talks to a real herdr. `make smoke SESSION=s` runs the
   opt-in test against one on the same host; do it on a fleet machine before
-  trusting a change to the transport or dispatch.
+  trusting a change to the transport or dispatch. `make smoke-profiles`
+  runs a live review task per agent through a head running the build under
+  test; do it before trusting a change to permission profiles.
 - Work on a branch, open a pull request, never push `main`.
 - Commit messages: conventional prefix, plain subject, a body that explains
   the why. No `Co-Authored-By` or other trailers.
@@ -152,8 +154,19 @@ Still open as of the last review; none of them blocks normal use.
 - `tests/transport.rs` `command_transport_talks_to_fake_herdr` failed once
   under a loaded `make check` (the stdio fake-herdr closed before replying)
   and passed on every rerun.
+- With the head set, `tick` and `job reload` go to the head only; the
+  headless serve (`src/shepherd.rs`) is reached by the other `job` commands
+  (`main.rs` `local_job`). Its own `job.failed` and `task.queued` events are only logged, never
+  written to an events log or heard by its hooks. Its jobs share the head's
+  seen table by name, so a head job of the same name with the same item key
+  refuses the item (`job_task_refused`).
 - Cron minutes that do not exist on a spring-forward day are skipped;
   Vixie cron runs them instead.
+- With a remote head (`pastor head set`), `task run` fills what its flags
+  leave out from the built-in defaults, not the head's `[defaults]` timeout
+  and place, and most commands that read or edit files (machine and flock
+  edits, job edits, `events`, `trust`, describes) fail with
+  `remote_head_unsupported` until they move behind the head.
 
 ## Where things live
 
@@ -161,9 +174,12 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
-~/.local/state/pastor/pastor.db   tasks (schema 8), seen keys, event seq, job state (SQLite)
+~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
+~/.local/state/pastor/pastor.db   tasks (schema 9), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
+~/.local/state/pastor/watch/<name>.json `pastor watch` cursors
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
 ~/.config/systemd/user/*.service  from `pastor setup systemd [--herdr]`
 ~/.config/pastor/connectors/<id>/.env   connector secrets and settings

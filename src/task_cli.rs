@@ -5,11 +5,11 @@ use clap::{ArgGroup, Args};
 use crate::cli::{CliError, TASK_HEADER, request_failure, table, task_rows};
 use crate::config::{Paths, parse_duration};
 use crate::ipc::{
-    Head, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, request,
+    Head, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, request_head,
 };
 use crate::machine::SendInput;
 use crate::store::{PruneOutcome, Store};
-use crate::task::{Task, TaskState, parse_task_id};
+use crate::task::{Priority, Task, TaskState, UNKNOWN_PRIORITY, parse_task_id};
 
 #[derive(Args, Debug)]
 pub struct RetryArgs {
@@ -19,6 +19,18 @@ pub struct RetryArgs {
     /// pastor or pane:<workspace>
     #[arg(long, value_name = "PLACE")]
     pub place: Option<crate::task::Place>,
+    /// Print as a JSON object
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct PriorityArgs {
+    /// A task, like t-12 or 12: a queued one
+    pub task: String,
+    /// Its new level: low, normal, high or critical
+    #[arg(value_name = "LEVEL")]
+    pub level: String,
     /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
@@ -98,6 +110,13 @@ pub struct PruneArgs {
     pub json: bool,
 }
 
+/// A level as `--priority` and `task priority` take it, or
+/// `unknown_priority`.
+pub fn parse_priority(s: &str) -> anyhow::Result<Priority> {
+    s.parse()
+        .map_err(|e: String| CliError::err(UNKNOWN_PRIORITY, e))
+}
+
 fn task_id(s: &str) -> anyhow::Result<i64> {
     parse_task_id(s).ok_or_else(|| CliError::err("usage_error", crate::task::bad_task_id(s)))
 }
@@ -107,19 +126,19 @@ fn task_id(s: &str) -> anyhow::Result<i64> {
 /// that says `runtime_error`, and only for a refused or missing socket: a
 /// timed-out retry may still land, and a connect denied for permissions may
 /// hide a live head.
-fn request_error(err: &RequestError) -> anyhow::Error {
+pub(crate) fn request_error(err: &RequestError) -> anyhow::Error {
     let (code, message) = request_failure(err);
     let code = match err {
-        RequestError::Connect(e) if connect_error_means_no_daemon(e) => "daemon_not_running",
+        RequestError::Connect(e) if connect_error_means_no_daemon(e) => "daemon_not_running".into(),
         _ => code,
     };
-    CliError::err(code, message)
+    CliError::err(&code, message)
 }
 
 /// One request to the daemon. Retry and close need it: one dispatches, the
 /// other talks to herdr on the task's machine.
 async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    let resp = request(&paths.socket_file(), &req)
+    let resp = request_head(paths, &req)
         .await
         .map_err(|e| request_error(&e))?;
     match resp {
@@ -130,7 +149,7 @@ async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
 
 fn print_task(t: &Task, json: bool) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(t)?);
+        println!("{}", serde_json::to_string_pretty(&t.to_json())?);
     } else {
         println!(
             "{}",
@@ -149,6 +168,16 @@ pub async fn retry(paths: &Paths, a: RetryArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
     let req = IpcRequest::TaskRetry { id, place: a.place };
     match ask(paths, req).await? {
+        IpcResponse::Task(t) => print_task(&t, a.json),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// `pastor task priority t-N LEVEL`: a queued task at another level.
+pub async fn priority(paths: &Paths, a: PriorityArgs) -> anyhow::Result<()> {
+    let id = task_id(&a.task)?;
+    let priority = parse_priority(&a.level)?;
+    match ask(paths, IpcRequest::TaskPriority { id, priority }).await? {
         IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }
