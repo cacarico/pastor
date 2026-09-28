@@ -1,14 +1,19 @@
-# A commit is only ever checked once: `pull_request` covers every commit on
-# a branch, and this project merges by fast-forwarding a PR's exact head sha
-# to main after CI passed on that same sha in the PR, so a push to main
-# never carries an unchecked commit through the normal flow. Running `check`
-# again on push to main would just repeat that same run for runner time, so
-# it is dropped; `workflow_dispatch` keeps a manual way to run it (for a
-# direct push to main that skipped a PR, or to re-check main by hand).
-# `check`, `test-machine` and `portability` only exercise what they build
-# or read, so `paths:` skips docs-only changes, but not the docs the tests
-# read (README.md, docs/manual.md, docs/recommended-setup.md, the website
-# content, everything under skills/, the plugin manifest);
+# Pull requests merge with a merge commit (`gh pr merge --merge`) and no
+# other way: not `--rebase`, not `--squash`, and not a push of the PR's head
+# straight to main.
+# `pull_request` runs CI on GitHub's merge of the PR into main as main was
+# when the run started. main can move before the PR merges, so two PRs
+# green on their own run can still break main together (#8 and #14 did,
+# fixed in #21). So `check` (with `make test-machine` and `make test-ssh`)
+# and `portability` run on push to main too, on the tree main really has.
+# `workflow_dispatch` keeps a manual way to re-check any ref. `paths:`
+# skips docs-only changes, since these jobs only exercise what they build
+# or read, but not the docs the tests read (README.md, docs/manual.md,
+# docs/recommended-setup.md, the website content, everything under
+# skills/, the plugin manifest). On push to main it also takes
+# CHANGELOG.md and changes/**, which `make check` reads through
+# `scripts/changelog.sh check`: the changelog workflow runs only on pull
+# requests, so a changelog-only merge would otherwise go unchecked on main.
 # gitleaks has no such filter because a secret can land in any file.
 name: ci
 
@@ -33,6 +38,29 @@ on:
       - ".github/workflows/release.yml"
       - "install.sh"
       - ".github/actions/**"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "skills/**"
+      - "README.md"
+      - "docs/manual.md"
+      - "docs/recommended-setup.md"
+      - "docs/website/content/**"
+      - ".claude-plugin/plugin.json"
+      - "contrib/systemd/**"
+      - "contrib/launchd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - "scripts/changelog.sh"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
+      - "install.sh"
+      - ".github/actions/**"
+      - "CHANGELOG.md"
+      - "changes/**"
   workflow_dispatch:
 
 permissions:
