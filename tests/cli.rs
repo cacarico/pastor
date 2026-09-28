@@ -3063,8 +3063,8 @@ fn a_task_done_with_a_summary_shows_it() {
 }
 
 /// A person starts an orchestrator with `task run --role orchestrator`; from
-/// its pane it may run tasks, but not close one or make another
-/// orchestrator, and no plain agent may make one either. `task describe` and
+/// its pane it may run and close tasks, but not prune them or make another
+/// orchestrator, and no plain agent may do any of these. `task describe` and
 /// `task list --json` name the role.
 #[test]
 fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
@@ -3112,16 +3112,23 @@ fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
     }
     // t-1's guard runs before the head is ever asked, so it must still know
     // t-1 is an orchestrator: its refusal names the role, not "agent".
-    let closed = from("t-1", &["task", "close", "t-2"]);
-    assert_eq!(error_code(&closed), "agent_refused");
-    let err = String::from_utf8_lossy(&closed.stderr);
+    let pruned = from("t-1", &["task", "prune", "--done", "--older-than", "1d"]);
+    assert_eq!(error_code(&pruned), "agent_refused");
+    let err = String::from_utf8_lossy(&pruned.stderr);
     assert!(err.contains("orchestrator"), "{err}");
     assert!(!err.contains("is an agent pastor started"), "{err}");
     assert_eq!(
         error_code(&from("t-2", &["task", "run", "go", "--repo", "/tmp"])),
         "agent_refused"
     );
-    let listed = env.json(&["task", "list", "--json"]);
+    assert_eq!(
+        error_code(&from("t-2", &["task", "close", "t-2"])),
+        "agent_refused"
+    );
+    let closed: serde_json::Value =
+        serde_json::from_str(&ok(from("t-1", &["task", "close", "t-2", "--json"]))).unwrap();
+    assert_eq!(closed["state"], "closed", "{closed}");
+    let listed = env.json(&["task", "list", "--all", "--json"]);
     let roles: Vec<&str> = listed
         .as_array()
         .unwrap()
@@ -5881,4 +5888,47 @@ fn a_shepherd_lists_and_drives_its_jobs_and_the_head_s() {
     let text = ok(c.edit(&editor, &["job", "edit", "sweep"]));
     assert!(text.contains("picked it up"), "{text}");
     assert!(serve.child.try_wait().unwrap().is_none(), "{}", serve.log());
+}
+
+/// `job enable|disable` on a shepherd's own job (`local_job`) never reaches
+/// the head, so a task caller is refused there too: the head is the only
+/// place that knows a task's role, and this machine's shepherd keeps no
+/// task store to check it. `agents_change_fleet` still lets it through.
+#[test]
+fn an_agent_task_may_not_toggle_this_machine_s_own_job() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let c = client(Some(&env));
+    ok(c.head_set("head-up", &[]));
+    std::fs::create_dir_all(c.config.join("jobs")).unwrap();
+    let here_job = c.config.join("jobs/sweep.toml");
+    std::fs::write(&here_job, SWEEP).unwrap();
+
+    let as_agent = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &c.config)
+            .env("PASTOR_STATE_DIR", &c.state)
+            .env("PASTOR_DATA_DIR", &c.data)
+            .env("PATH", &c.path)
+            .env_remove("PASTOR_HEAD")
+            .env("PASTOR_TASK", "t-3")
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["job", "enable", "sweep"][..],
+        &["job", "disable", "sweep"],
+    ] {
+        let out = as_agent(args);
+        assert_eq!(error_code(&out), "agent_refused", "{args:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&here_job).unwrap(),
+        SWEEP,
+        "an agent's refused enable/disable must not touch the file"
+    );
+
+    std::fs::write(c.config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();
+    let text = ok(as_agent(&["job", "enable", "sweep"]));
+    assert!(text.contains("enabled sweep"), "{text}");
 }

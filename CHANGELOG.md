@@ -48,6 +48,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   flock's number included. Needs a head speaking IPC protocol 18 once
   flock.toml gives a flock's machines a number.
 
+### Changed
+
+- An orchestrator task may also close tasks (`pastor task close`) and enable
+  a job (`pastor job enable`), so it can clean up tasks it sent wrong and turn
+  back on a job it disabled without waiting for a person. A plain agent is
+  still refused both.
+
 ### Fixed
 
 - A Claude agent that ended its turn waiting on a background shell (its

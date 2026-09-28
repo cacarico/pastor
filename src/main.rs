@@ -255,8 +255,9 @@ struct RunArgs {
     #[arg(long, value_name = "PLACE")]
     place: Option<Place>,
     /// What the agent may change through the head: agent (read, and end
-    /// its own task) or orchestrator (also run, retry and send to tasks and
-    /// disable jobs). Only a person may start an orchestrator, never a task
+    /// its own task) or orchestrator (also run, retry, send to and close
+    /// tasks and enable and disable jobs). Only a person may start an
+    /// orchestrator, never a task
     #[arg(long, value_enum, value_name = "ROLE", default_value_t = TaskRole::Agent)]
     role: TaskRole,
     /// One line on what the task is about, for `task list --wide` and
@@ -1034,14 +1035,19 @@ fn makes_orchestrator(command: &Command) -> bool {
 /// Whether `command` is one an orchestrator task may make
 /// (`IpcRequest::orchestrator_may`). The CLI does not know the caller's
 /// role, so from a task's pane it leaves these to the head, which does:
-/// `task run|retry|send` only ever go through it, and `job disable` with no
-/// head is refused in `toggle`.
+/// `task run|retry|send|close` only ever go through it, and `job
+/// enable|disable` is refused for a task caller in `toggle` (no head) and
+/// in `local_toggle` (a head elsewhere, but the job is this machine's own,
+/// which never reaches it either).
 fn orchestrator_may(command: &Command) -> bool {
     match command {
         Command::Task { cmd } => {
-            matches!(cmd, TaskCmd::Run(_) | TaskCmd::Retry(_) | TaskCmd::Send(_))
+            matches!(
+                cmd,
+                TaskCmd::Run(_) | TaskCmd::Retry(_) | TaskCmd::Send(_) | TaskCmd::Close(_)
+            )
         }
-        Command::Job { cmd } => matches!(cmd, JobCmd::Disable { .. }),
+        Command::Job { cmd } => matches!(cmd, JobCmd::Enable { .. } | JobCmd::Disable { .. }),
         _ => false,
     }
 }
@@ -2663,7 +2669,22 @@ async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `toggle`'s own guard: `job enable|disable` reaches this machine's serve
+/// with no head to ask about the caller's role (the shepherd keeps no task
+/// store, `shepherd.rs`), so a task caller is refused unless
+/// `agents_change_fleet` is on, orchestrator or not.
 async fn local_toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> {
+    if let Some(task) = pastor::ipc::caller_task()
+        && !agents_change_fleet(paths)
+    {
+        return Err(CliError::err(
+            "agent_refused",
+            format!(
+                "{task} is an agent pastor started; this machine's own jobs have no head to check its role, so it may not {} a job",
+                if enabled { "enable" } else { "disable" }
+            ),
+        ));
+    }
     set_enabled(&ConfigFile::Job(name.to_string()).path(paths)?, enabled)?;
     let verb = if enabled { "enabled" } else { "disabled" };
     println!("{verb} {name}; {}", reload_here(paths).await?);
@@ -2878,7 +2899,8 @@ async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow:
         return Err(CliError::err(
             "agent_refused",
             format!(
-                "{task} is an agent pastor started; with no pastor serve running to check its role, it may not disable a job"
+                "{task} is an agent pastor started; with no pastor serve running to check its role, it may not {} a job",
+                if enabled { "enable" } else { "disable" }
             ),
         ));
     }
@@ -2939,12 +2961,13 @@ mod tests {
             &["pastor", "task", "retry", "t-1"],
             &["pastor", "task", "send", "t-1", "go"],
             &["pastor", "job", "disable", "j"],
+            &["pastor", "task", "close", "t-1"],
+            &["pastor", "job", "enable", "j"],
         ] {
             assert!(orchestrator_may(&parse(argv)), "{argv:?}");
         }
         for argv in [
-            &["pastor", "task", "close", "t-1"][..],
-            &["pastor", "job", "enable", "j"],
+            &["pastor", "task", "prune", "--done", "--older-than", "1d"][..],
             &["pastor", "job", "run", "j"],
             &["pastor", "machine", "add", "m", "--local"],
         ] {
