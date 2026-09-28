@@ -254,7 +254,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand completions" -l head -d 'U
 complete -c pastor -n "__fish_pastor_using_subcommand completions" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand events" -l task -d 'Only events about this task, like t-12 or 12' -r
 complete -c pastor -n "__fish_pastor_using_subcommand events" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
-complete -c pastor -n "__fish_pastor_using_subcommand events" -l follow -d 'Keep printing new events as they are written (reads the file; works with the daemon down)'
+complete -c pastor -n "__fish_pastor_using_subcommand events" -l follow -d 'Keep printing new events as they are written (reads the file, and works with the daemon down; with a remote head, asks it every second)'
 complete -c pastor -n "__fish_pastor_using_subcommand events" -l json -d 'Print one JSON record per line, the same shape hooks get on stdin'
 complete -c pastor -n "__fish_pastor_using_subcommand events" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand setup; and not __fish_seen_subcommand_from systemd launchd help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r

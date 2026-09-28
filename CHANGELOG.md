@@ -80,6 +80,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`head_running`), and a head refuses to start beside it
   (`shepherd_running`), as does `head set` pointed at it, even with
   `--force`. `pastor setup systemd` installs it the same way.
+- With a remote head, `pastor events` (with `--follow`, `--task` and
+  `--json`) reads the head's log through `events_since`: a page at a time
+  from the start, then a poll every second with `--follow`. Records rotated
+  out before they were read get one warning line on stderr.
 
 ### Changed
 
