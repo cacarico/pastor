@@ -39,7 +39,7 @@ best effort, and things may change a lot while pastor finds its shape.
 
 It uses [herdr](https://herdr.dev) for the terminals, so every agent runs in a
 real terminal you can attach to, on a machine you control. Nothing runs in
-someone else's cloud. The longer story is in [the blog post](https://cacari.co/pastor/).
+someone else's cloud. The longer story is in [the blog post](https://cacari.co/posts/pastor/).
 
 ## How it works
 

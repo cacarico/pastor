@@ -1,6 +1,10 @@
 # The pastor website: a homepage and short docs pages, one topic each, drawn
 # like a small TUI. docs/manual.md is mounted as the last docs page, so the
 # full reference stays one file in the repo, not a copy.
+#
+# For now it is served at https://cacari.co/pastor/: the blog repo copies a
+# build into its static/pastor/ with scripts/sync-pastor-site.sh. Relative
+# URLs keep it working under that subpath.
 
 baseURL = "/"
 relativeURLs = true
@@ -9,7 +13,7 @@ disableKinds = ["taxonomy", "term", "rss", "sitemap"]
 
 [params]
 repo = "https://github.com/cacarico/pastor"
-blog = "https://cacari.co/pastor/"
+blog = "https://cacari.co/posts/pastor/"
 
 [markup.tableOfContents]
 startLevel = 2
