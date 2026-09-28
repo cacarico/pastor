@@ -1661,7 +1661,14 @@ impl Daemon {
                 }
                 let task = match self
                     .fleet
-                    .queue_run_as(prompt, spec, flock.as_deref(), agent.as_ref(), priority, role)
+                    .queue_run_as(
+                        prompt,
+                        spec,
+                        flock.as_deref(),
+                        agent.as_ref(),
+                        priority,
+                        role,
+                    )
                     .await
                 {
                     Ok(t) => t,

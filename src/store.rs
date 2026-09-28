@@ -2164,7 +2164,12 @@ mod tests {
         let plain = s.insert_task(new_task("run")).unwrap();
         assert_eq!(plain.role, TaskRole::Agent);
         let o = s
-            .insert_task_at(new_task("run"), Priority::Normal, None, TaskRole::Orchestrator)
+            .insert_task_at(
+                new_task("run"),
+                Priority::Normal,
+                None,
+                TaskRole::Orchestrator,
+            )
             .unwrap();
         assert_eq!(o.role, TaskRole::Orchestrator);
         let mut o = s.get_task(o.id).unwrap().unwrap();
