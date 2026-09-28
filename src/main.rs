@@ -2347,6 +2347,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                     ask_text(paths, IpcRequest::MachineRemove { name: name.clone() }).await?
                 );
             } else {
+                let _lock = offline_fleet_lock(paths)?;
                 let done = fleet_edit::remove_machine(&path, &name).map_err(edit_error)?;
                 println!("{done}; {}", reload_running_head(paths, head).await);
             }
@@ -2411,6 +2412,22 @@ fn edit_error(err: impl Into<anyhow::Error>) -> anyhow::Error {
     }
 }
 
+/// The fleet lock for an edit made with no head, held until dropped: from
+/// the edit's store check to its save of flock.toml, so a head starting
+/// meanwhile waits and then reads the edited file. A head that started
+/// listening before the lock came free could already have taken a task the
+/// check would not see, so the edit stops with `head_started` instead.
+fn offline_fleet_lock(paths: &Paths) -> anyhow::Result<std::fs::File> {
+    let lock = fleet_edit::lock_fleet(paths, fleet_edit::FLEET_LOCK_WAIT)?;
+    if std::os::unix::net::UnixStream::connect(paths.socket_file()).is_ok() {
+        return Err(pastor::cli::CliError::err(
+            "head_started",
+            "pastor serve started while this edit waited for it; run the command again to make the edit through the head",
+        ));
+    }
+    Ok(lock)
+}
+
 /// `ask`, for a request the head answers with `Text`.
 async fn ask_text(paths: &Paths, req: IpcRequest) -> anyhow::Result<String> {
     let resp = ask(paths, req).await?;
@@ -2455,9 +2472,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            // As with `flock remove` without a head, a task queued between
-            // this read and the save is not seen; `pastor task close`
-            // recovers it.
+            let _lock = offline_fleet_lock(paths)?;
             let queued = || -> anyhow::Result<Vec<String>> {
                 Ok(open_store(paths)?
                     .list_tasks(&TaskFilter {
@@ -2499,6 +2514,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
+            let _lock = offline_fleet_lock(paths)?;
             fleet_edit::join_flock(&path, &flock, &machine, max).map_err(edit_error)?
         }
         FlockCmd::Leave { flock, machine } => {
@@ -2509,9 +2525,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            // As with `flock add` without a head, a task queued between this
-            // read and the save is not named; it waits with a note all the
-            // same.
+            let _lock = offline_fleet_lock(paths)?;
             let queued = || -> anyhow::Result<Vec<Task>> {
                 open_store(paths)?.list_tasks(&TaskFilter {
                     states: Some(vec![TaskState::Queued, TaskState::Paused]),
@@ -2531,14 +2545,11 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                 println!("{done}");
                 return Ok(());
             }
-            // With no head, the store check and the file edit are not atomic
-            // against a head that starts in between. That head could accept
-            // `task run --flock <name>` after the check and before the save;
-            // the reload then drops the flock and the task stays queued with
-            // no machine to take it (`pastor task close` recovers it). It
-            // needs one user to start a head and submit to this flock while
-            // removing it, so it is left open; closing it would take a file
-            // lock shared by this edit and daemon startup.
+            // With no head, the fleet lock covers the store check and the
+            // file edit: a head starting meanwhile waits for the save and
+            // reads the file without the flock, so it never queues a task in
+            // it, and one that already listens stops the edit.
+            let _lock = offline_fleet_lock(paths)?;
             let queued: Vec<String> = open_store(paths)?
                 .list_tasks(&TaskFilter {
                     states: Some(vec![TaskState::Queued]),

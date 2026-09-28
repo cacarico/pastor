@@ -3775,6 +3775,16 @@ fn stopped_or(err: anyhow::Error, code: &str) -> IpcResponse {
 }
 
 pub async fn serve(paths: Paths) -> anyhow::Result<()> {
+    // Held from before flock.toml is read until the socket listens, so an
+    // edit made with no head either lands before the load or sees this head
+    // listening and stops (`fleet_edit::lock_fleet`).
+    let fleet_lock = {
+        let paths = paths.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::fleet_edit::lock_fleet(&paths, crate::fleet_edit::FLEET_LOCK_WAIT)
+        })
+        .await??
+    };
     // Before the loads: an edit that lands after them must still read as a
     // change on the scheduler's first pass.
     let on_disk = ConfigFingerprint::sample(&paths);
@@ -3786,6 +3796,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
         "flock is empty; add a machine with `pastor machine add`"
     );
     let (daemon, listener) = Daemon::bind_and_start(paths, config, flock, on_disk, None).await?;
+    drop(fleet_lock);
     tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.fleet.machines().len(), "pastor serve");
     daemon.run_with_listener(listener).await
 }

@@ -83,6 +83,12 @@ impl Paths {
         self.state_dir.join("pastor.sock")
     }
 
+    /// The lock an offline fleet edit and a starting head take in turns
+    /// (`fleet_edit::lock_fleet`).
+    pub fn fleet_lock_file(&self) -> PathBuf {
+        self.state_dir.join("fleet.lock")
+    }
+
     /// A background `pastor serve`'s log (`serve_cli`), rotated to
     /// `serve.log.1` .. `serve.log.3`. A head in the foreground or under a
     /// service logs to stderr instead.

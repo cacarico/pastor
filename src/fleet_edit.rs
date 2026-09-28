@@ -5,9 +5,53 @@
 //! for the caller to print with what it knows about the reload.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
+use crate::cli::CliError;
+use crate::config::Paths;
 use crate::config::flock::{Flock, FlockDoc, MachineConfig};
 use crate::task::Task;
+
+/// How long an offline fleet edit, or a starting head, waits for the other
+/// to let go of the fleet lock.
+pub const FLEET_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// The fleet lock, held until the file is dropped. An edit made with no head
+/// holds it from its store check to its save of flock.toml; `pastor serve`
+/// holds it from before it reads flock.toml until it listens on its socket.
+/// So a head that starts meanwhile reads the edited file, and a head cannot
+/// take a task the check did not see, as long as the edit, once it has the
+/// lock, makes sure no head listens yet. After `wait` it is `fleet_locked`.
+pub fn lock_fleet(paths: &Paths, wait: Duration) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    paths.ensure()?;
+    let path = paths.fleet_lock_file();
+    let f = crate::edit::open_lock(&path)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(f);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::io::ErrorKind::WouldBlock => {
+                return Err(CliError::err(
+                    "fleet_locked",
+                    format!(
+                        "another pastor held {} for {wait:?}: a head starting or a fleet edit made with no head; try again",
+                        path.display()
+                    ),
+                ));
+            }
+            _ => return Err(anyhow::Error::from(e).context(format!("lock {}", path.display()))),
+        }
+    }
+}
 
 /// A machine's flocks as `machine list` writes them: `pastor:2,life:1`, a
 /// flock with no number (the old `flock` key) by its name alone.
@@ -194,6 +238,17 @@ pub fn move_machine(file: &Path, name: &str, flock: &str) -> anyhow::Result<Stri
 mod tests {
     use super::*;
     use crate::task::TaskState;
+
+    #[test]
+    fn a_held_fleet_lock_times_out_as_fleet_locked_and_frees_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        let held = lock_fleet(&paths, Duration::ZERO).unwrap();
+        let err = lock_fleet(&paths, Duration::from_millis(100)).unwrap_err();
+        assert_eq!(err.downcast_ref::<CliError>().unwrap().code, "fleet_locked");
+        drop(held);
+        lock_fleet(&paths, Duration::ZERO).unwrap();
+    }
 
     const FILE: &str = "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"work\"\n\n[[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 3\nflock = \"work\"  # the old way\n";
 
