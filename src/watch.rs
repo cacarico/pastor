@@ -416,10 +416,11 @@ pub fn now_connector_lines(id: &str, ran: Result<Vec<String>, String>) -> Vec<Li
 }
 
 /// Run connector `id`'s `[watch]` command once, in its directory with its
-/// env and no job, and return the lines it printed (trimmed, empty ones
-/// dropped). `Err` says why there are none: no such connector, no `[watch]`
-/// command, or a run that failed. Its stderr goes to a run log under
-/// `runs/@<id>/`, as a hook's does.
+/// env and no job, and return the lines it printed (trimmed, empty and
+/// duplicate ones dropped, capped at `SEEN_MAX` so a flooding connector
+/// can't grow this without bound). `Err` says why there are none: no such
+/// connector, no `[watch]` command, or a run that failed. Its stderr goes
+/// to a run log under `runs/@<id>/`, as a hook's does.
 pub async fn run_connector(paths: &Paths, id: &str) -> Result<Vec<String>, String> {
     let found = discover(paths)
         .map_err(|e| format!("{e:#}"))?
@@ -453,6 +454,7 @@ pub async fn run_connector(paths: &Paths, id: &str) -> Result<Vec<String>, Strin
         timeout: Some(watch.timeout),
     };
     let mut lines = Vec::new();
+    let mut seen = BTreeSet::new();
     let out_log = log.clone();
     let done = exec::run(inv, log, |line| {
         out_log
@@ -460,7 +462,7 @@ pub async fn run_connector(paths: &Paths, id: &str) -> Result<Vec<String>, Strin
             .unwrap_or_else(|p| p.into_inner())
             .line(&format!("stdout: {line}"));
         let line = line.trim();
-        if !line.is_empty() {
+        if !line.is_empty() && lines.len() < SEEN_MAX && seen.insert(line.to_string()) {
             lines.push(line.to_string());
         }
     })
