@@ -1469,7 +1469,8 @@ A record, which is also what connector event hooks get on stdin:
   `task.input` (`pastor task send`), `task.trusted` (the head answered a
   trust prompt), `job.failed`, `connector.finish_failed` (a connector's
   `[finish]` command failed), `machine.connected`, `machine.lost`, and
-  `orchestrator.started|skipped|held|quota|failed` (see Orchestrators).
+  `orchestrator.started|skipped|held|quota|failed|restarted|stopping|stopped`
+  (see Orchestrators).
 - `task`: the full task row (the same object as `pastor task describe --json`) at
   that moment, on `task.*` events; `null` otherwise or if the row is gone.
   `task.flock` is the task's flock, so a hook can route work and personal
@@ -1487,11 +1488,15 @@ A record, which is also what connector event hooks get on stdin:
   `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
   turn on a question, `question`; on `connector.finish_failed`, `connector`
   (its id) and `reason` (why: the exit status and stderr tail, or a timeout);
-  on `orchestrator.*`, `orchestrator` (its name) and: `lines` on `started`
+  on `orchestrator.*`, `orchestrator` (its name) and: `lines` on a scheduled
+  run's `started` and `by` (`hours` or `hand`) and `until` on a session's
   (whose task is the record's `task`), `reason` on `skipped` (`busy` or
-  `post_pending`) and `held` (`max_orchestrators`, with `max`, or `quota`,
-  with `until`), `until` on `quota`, and `stage` (`pre`, `agent` or `post`)
-  and `error` on `failed`.
+  `post_pending`) and `held` (`max_orchestrators`, with `max`; `quota`, with
+  `until`; or a session's `restarts`, with `max` and `until`), `until` on
+  `quota`, `after` (the agent it replaces) and `restarts` (in the last hour)
+  on `restarted`, `reason` (`hours` or `hand`) on `stopping` and `stopped`
+  and `grace` on `stopping`, and `stage` (`pre`, `agent` or `post`) and
+  `error` on `failed`.
 - `summary`: on `task.done` and `task.failed`, how the round that just ended
   ended (see Task summaries): `round`, `outcome` (`done`, `partial`,
   `blocked`, `nothing to do`, `unknown`, or `no summary`), `text`, `source`
@@ -1611,16 +1616,18 @@ Each file names its `kind`, required and with no default:
   mechanical itself; the head starts an agent only when the script prints
   lines that need judgment, and gives it every line. Most runs start no
   agent, and each agent is short.
-- `session`: one agent kept running through set hours. This version checks
-  session files (so a mistake shows before they run) but does not run them.
+- `session`: one agent kept running through set hours, restarted when it
+  dies, stopped when the hours end (see [Session
+  orchestrators](#session-orchestrators)).
 
 Keys: both kinds take `kind`, `model` (a `[models]` name), `skill` (a skill
 the agent is told to use), `prompt` (required), and optionally `enabled`
 (default true), `description` and `repo` (the repo its agents work in, each
 in a worktree of its own; without it the agent starts in the home
 directory). `scheduled` adds `every` or `cron` (exactly one), `pre`
-(required), `post` and `timeout`; `session` adds `hours` (`{ start =
-"22:00", stop = "08:00" }`, local time) and `stop_grace`. A file without
+(required), `post` and `timeout`; `session` adds `hours` (required, `{
+start = "22:00", stop = "08:00" }`, local time, the two different) and
+`stop_grace` (default `5m`). A file without
 `kind`, with a key of the other kind (`pre` in a session, `hours` in a
 scheduled one), or with an unknown key is invalid, and the error names the
 key. There is no `machine` key: everything an orchestrator runs, its scripts,
@@ -1731,7 +1738,8 @@ determined script. `agents_change_fleet = true` lifts it for scripts too.
 **The limit.** `max_orchestrators` in pastor.toml (default 1) is how many
 orchestrator agents the head runs at once, of both kinds and hand-started
 ones (`task run --role orchestrator`) too, outside `max_agents` and job
-slots. A run that starts no agent counts nothing.
+slots. A run that starts no agent counts nothing; a session counts from its
+start to its stop, between agents too.
 
 **The handover note.** `pastor orchestrator note <text>` keeps one short
 note per orchestrator (4 KiB at most, the last one wins, empty removes it)
@@ -1744,34 +1752,93 @@ person names it with `--name`. `-` reads the note from stdin.
 lines of its pane say `usage limit`, `limit reached`, `hit your limit` or
 `quota exceeded`), the head reads the reset time from the message
 (`|<unix time>`, or `resets 3am` or `resets at 15:30`, the next such time in
-local time), or waits an hour when it finds none, emits `orchestrator.quota`
-with `until`, and starts no agent for that orchestrator before then. The pre
-script keeps running, so the mechanical work goes on.
+local time; Claude's messages, for now), or waits an hour when it finds none,
+emits `orchestrator.quota` with `until`, and starts no agent for that
+orchestrator before then. The pre script keeps running, so the mechanical work
+goes on; a session waits, holding its slot, and restarts at the reset.
+
+### Session orchestrators
+
+For nights you want an agent watching all the time, not only when a script
+finds something:
+
+```toml
+# ~/.config/pastor/orchestrators/night.toml
+kind = "session"
+hours = { start = "22:00", stop = "08:00" }   # local time; may cross midnight
+stop_grace = "5m"                             # the default
+model = "opus"
+skill = "orchestrating-pastor"
+prompt = "You are the night orchestrator: merge what is ready, unblock what waits."
+```
+
+- **Start.** The head starts the session at `hours.start`, or at once when it
+  starts (or the file appears) inside the hours, if the file is enabled: one
+  task with `role = "orchestrator"` on the head's machine, with the file's
+  `prompt`, the skill, the handover note, and the ask to begin with `pastor
+  watch --now` and keep watching with `pastor watch`. Its description is
+  `orchestrator <name>: session until <stop>`, and its timeout reaches to the
+  stop plus `stop_grace`. `orchestrator.started` carries `by: "hours"` and
+  `until`.
+- **Stop.** At `hours.stop` the agent gets a last message typed into its pane
+  (keep a handover note, end the turn), `orchestrator.stopping`; `stop_grace`
+  later, or as soon as it stops working, the head closes it,
+  `orchestrator.stopped`.
+- **Restart.** When the agent ends before the hours do (its pane died, it
+  went stale or failed, it ended its turn, or someone closed it), the head
+  closes what is left of its pane and starts another with the same prompt,
+  the note as it is now and the name of the agent it replaces,
+  `orchestrator.restarted`. At most three restarts in any hour: past that it
+  emits `orchestrator.held` (`reason: "restarts"`) once and waits until the
+  oldest is an hour old.
+- **Quota.** An agent that ended on a quota error is not restarted until the
+  reset read from its message (see Quota above), with `orchestrator.quota`.
+- **The limit.** A session holds its `max_orchestrators` slot from start to
+  stop, restarts and quota waits included. A scheduled run while it runs does
+  its pre script and is held (`orchestrator.held`); a session due while a
+  scheduled agent works is held (`orchestrator.held` once, `list` shows
+  `held`) and starts on the first tick with a free slot.
+- **By hand.** `pastor orchestrator start <name>` starts the session now,
+  inside its hours or not and whatever `enabled` says, but not past the limit
+  (`orchestrator_held`); it runs to the next `hours.stop`. `pastor
+  orchestrator stop <name>` sends the last message and closes the agent after
+  the grace, and the session does not start on its hours again before they
+  next end; inside the hours with no session (held, say) it only keeps it from
+  starting. `run` on a session, or `start` or `stop` on a scheduled one, is
+  `orchestrator_kind`; `stop` with nothing to stop is
+  `orchestrator_not_running`.
+- Disabling a running session's file stops no agent; it runs to its stop.
 
 ```bash
 pastor orchestrator list                 # kind, state, schedule, last and next run, agent
 pastor orchestrator describe merge       # settings, note, last runs with their lines, events
 pastor orchestrator run merge            # one run now, whatever the schedule and enabled
+pastor orchestrator start night          # a session now, to its next hours.stop
+pastor orchestrator stop night           # last message, grace, close; not again tonight
 pastor orchestrator disable merge        # its agent keeps running; no more runs
 pastor orchestrator note --name merge "merged #31; #32 waits on review"
 ```
 
-`list` shows each file's state: `idle`, `running` (its agent works),
-`waiting for quota`, `off` (disabled) or `invalid` (the file never parsed).
+`list` shows each file's state: `idle`, `running` (its agent works, or its
+session runs), `stopping` (a session in its grace), `held` (a session due but
+held by the limit), `waiting for quota`, `off` (disabled) or `invalid` (the
+file never parsed); a session's next run is its next start.
 `run` ignores the schedule and `enabled`, waits for a run or post script of
 the same orchestrator already going, and is still skipped while the last
 agent works; it returns at once, and `describe` shows how it went. Orchestrator
 tasks appear in `pastor task list` in a table of their own above the others;
 `--json` keeps one array with `role`. With no head running, `list` and
 `describe` read the files and the state the head left, `enable`, `disable`
-and `note --name` edit them, and `run` is refused (`no_head`). With a head on
+and `note --name` edit them, and `run`, `start` and `stop` are refused
+(`no_head`). With a head on
 another machine, every command goes to it. The commands need a head of IPC
-protocol 23 (`head_too_old`).
+protocol 23, and `start` and `stop` one of protocol 25 (`head_too_old`).
 
 What the head keeps per orchestrator lives in
 `~/.local/state/pastor/orchestrators/<name>/`: `state.json` (last run,
 failures and backoff, its last agent, the lines it was started with, a quota
-wait, the last ten runs), `note`, `scratch/` and `runs/`.
+wait, a running session with its restarts, the last ten runs), `note`,
+`scratch/` and `runs/`.
 
 ## Try it
 

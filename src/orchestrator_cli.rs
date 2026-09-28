@@ -1,8 +1,9 @@
-//! `pastor orchestrator list|describe|run|enable|disable|note`. Orchestrators
+//! `pastor orchestrator list|describe|run|start|stop|enable|disable|note`. Orchestrators
 //! run on the head, so with one running every command goes through it
 //! (`IpcRequest::Orchestrator*`). With none, `list` and `describe` read the
 //! files and the state the head left, `enable`, `disable` and a person's
-//! `note --name` edit them, and `run` is refused: nothing would run it.
+//! `note --name` edit them, and `run`, `start` and `stop` are refused:
+//! nothing would run them.
 use std::io::Read;
 
 use clap::Subcommand;
@@ -34,6 +35,16 @@ pub enum OrchestratorCmd {
     },
     /// Run a scheduled orchestrator now, ignoring its schedule and `enabled`; it starts once a run already going has finished, and is skipped while its last agent works
     Run {
+        /// The orchestrator: its file name without .toml
+        name: String,
+    },
+    /// Start a session orchestrator now, inside its hours or not, `enabled` or not; it stops at the next hours.stop
+    Start {
+        /// The orchestrator: its file name without .toml
+        name: String,
+    },
+    /// Stop a session orchestrator: its agent gets a last message and is closed after stop_grace; it does not start on its hours again before they next end
+    Stop {
         /// The orchestrator: its file name without .toml
         name: String,
     },
@@ -99,7 +110,9 @@ pub async fn run(paths: &Paths, cmd: OrchestratorCmd, head: Head) -> anyhow::Res
                 .map_err(|(code, message)| CliError::err(&code, message))?;
             print_description(&d, json)
         }
-        OrchestratorCmd::Run { name } => Err(CliError::err(
+        OrchestratorCmd::Run { name }
+        | OrchestratorCmd::Start { name }
+        | OrchestratorCmd::Stop { name } => Err(CliError::err(
             "no_head",
             format!(
                 "orchestrators run on the head, and pastor serve is not running; start it to run {name}"
@@ -139,6 +152,8 @@ async fn on_head(paths: &Paths, cmd: OrchestratorCmd) -> anyhow::Result<()> {
             (IpcRequest::OrchestratorDescribe { name }, false, json)
         }
         OrchestratorCmd::Run { name } => (IpcRequest::OrchestratorRun { name }, false, false),
+        OrchestratorCmd::Start { name } => (IpcRequest::OrchestratorStart { name }, false, false),
+        OrchestratorCmd::Stop { name } => (IpcRequest::OrchestratorStop { name }, false, false),
         OrchestratorCmd::Enable { name } => (
             IpcRequest::OrchestratorSetEnabled {
                 name,

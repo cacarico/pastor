@@ -3160,6 +3160,26 @@ impl Daemon {
                 Ok(said) => IpcResponse::Text(said),
                 Err((code, message)) => IpcResponse::error(&code, message),
             },
+            IpcRequest::OrchestratorStart { name } => {
+                match self
+                    .orchestrators
+                    .start_by_hand(&name, chrono::Utc::now())
+                    .await
+                {
+                    Ok(said) => IpcResponse::Text(said),
+                    Err((code, message)) => IpcResponse::error(&code, message),
+                }
+            }
+            IpcRequest::OrchestratorStop { name } => {
+                match self
+                    .orchestrators
+                    .stop_by_hand(&name, chrono::Utc::now())
+                    .await
+                {
+                    Ok(said) => IpcResponse::Text(said),
+                    Err((code, message)) => IpcResponse::error(&code, message),
+                }
+            }
             IpcRequest::OrchestratorSetEnabled { name, enabled } => {
                 match crate::orchestrator::set_enabled(&self.paths, &name, enabled) {
                     Ok(said) => IpcResponse::Text(said),

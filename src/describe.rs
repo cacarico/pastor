@@ -496,6 +496,23 @@ pub fn orchestrator_text(d: &crate::orchestrator::OrchestratorDescription) -> St
         rows.push(("post", dash(d.post.as_deref().map(words))));
         rows.push(("timeout", dash(d.timeout.clone())));
     }
+    if s.kind == Some(crate::orchestrator::Kind::Session) {
+        rows.push(("stop grace", dash(d.stop_grace.clone())));
+        if let Some(run) = &d.session {
+            rows.push((
+                "session",
+                format!(
+                    "started {} by {}, until {} ({}), {} restart{} in the last hour",
+                    ago(Some(run.started_at)),
+                    run.started_by,
+                    run.until.format("%Y-%m-%d %H:%M:%S UTC"),
+                    in_(run.until),
+                    run.restarts.len(),
+                    if run.restarts.len() == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+    }
     rows.extend([
         ("model", dash(d.model.clone())),
         ("skill", dash(d.skill.clone())),

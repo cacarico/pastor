@@ -3228,6 +3228,70 @@ fn orchestrator_files_list_run_disable_and_note() {
     assert!(text.contains("no lines"), "{text}");
 }
 
+/// A session orchestrator end to end, outside its hours: nothing starts on
+/// its own, `run` is for the scheduled kind and `start` for the session
+/// one, `start` starts it by hand, and `stop` ends it.
+#[test]
+fn a_session_orchestrator_starts_and_stops_by_hand() {
+    use chrono::Timelike;
+    let env = start();
+    write_orchestrator(&env, "merge", MERGE, "");
+    let hour = |ahead: u32| format!("{:02}:00", (chrono::Local::now().hour() + ahead) % 24);
+    std::fs::write(
+        env.config.join("orchestrators/night.toml"),
+        format!(
+            "kind = \"session\"\nhours = {{ start = \"{}\", stop = \"{}\" }}\nstop_grace = \"1s\"\nprompt = \"Watch the night.\"\n",
+            hour(2),
+            hour(3)
+        ),
+    )
+    .unwrap();
+    let list = env.json(&["orchestrator", "list", "--json"]);
+    assert_eq!(list[1]["kind"], "session", "{list}");
+    assert_eq!(list[1]["state"], "idle", "{list}");
+    assert!(list[1]["next_run"].is_string(), "{list}");
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "run", "night"])),
+        "orchestrator_kind"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "start", "merge"])),
+        "orchestrator_kind"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "stop", "night"])),
+        "orchestrator_not_running"
+    );
+    // This flock has no machine of the head's own, where an orchestrator's
+    // agent runs: the session starts and holds its slot, and says why its
+    // agent waits.
+    let out = env.cmd(&["orchestrator", "start", "night"]);
+    assert_eq!(error_code(&out), "runtime_error");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("local = true"),
+        "{out:?}"
+    );
+    let d = env.json(&["orchestrator", "describe", "night", "--json"]);
+    assert_eq!(d["state"], "running", "{d}");
+    assert_eq!(d["session"]["started_by"], "hand", "{d}");
+    let text = ok(env.cmd(&["orchestrator", "describe", "night"]));
+    assert!(
+        text.contains("session:") && text.contains("by hand"),
+        "{text}"
+    );
+    let said = ok(env.cmd(&["orchestrator", "start", "night"]));
+    assert!(said.contains("already runs"), "{said}");
+    let said = ok(env.cmd(&["orchestrator", "stop", "night"]));
+    assert!(said.contains("stopped"), "{said}");
+    let d = env.json(&["orchestrator", "describe", "night", "--json"]);
+    assert!(d["session"].is_null(), "{d}");
+    assert_eq!(
+        d["runs"].as_array().unwrap().last().unwrap()["outcome"],
+        "stopped",
+        "{d}"
+    );
+}
+
 /// A pre or post script runs with `PASTOR_ORCHESTRATOR`, and its `pastor`
 /// calls get the orchestrator role: `task run` passes, `machine add` is
 /// refused before it reaches anything, a name the head does not know is

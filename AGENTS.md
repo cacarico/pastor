@@ -174,8 +174,10 @@ Still open as of the last review; none of them blocks normal use.
   refuses the item (`job_task_refused`).
 - Cron minutes that do not exist on a spring-forward day are skipped;
   Vixie cron runs them instead.
-- Session orchestrators (`kind = "session"`) are checked but not run:
-  hours, restarts, `orchestrator start` and `stop` are the next card.
+- A session orchestrator's restart closes the old agent's pane even when
+  it only ended its turn, so whatever it left on screen is gone; the
+  handover note is what carries over. Its quota wait reads Claude's
+  messages only.
 - The orchestrator runner ticks at pastor.toml's `tick` as the head started
   with; a later edit of `tick` reaches it only on a restart
   (`max_orchestrators` is read on each run).

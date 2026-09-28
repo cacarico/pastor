@@ -2,13 +2,13 @@
 //! run by the head. A file names its `kind`: a `scheduled` orchestrator runs
 //! a pre script on a schedule and starts one agent, with the role
 //! `orchestrator`, only when the script prints lines that need judgment; a
-//! `session` orchestrator is one agent kept running through set hours. This
-//! version checks both kinds' files and runs the scheduled kind.
+//! `session` orchestrator is one agent kept running through set hours.
 //!
 //! `Orchestrator::parse` is the file; `State` is what the head keeps between
 //! runs under `state/orchestrators/<name>/` (no table in the store); `Runner`
-//! is the head's loop that reads the files, runs what is due, and runs the
-//! post script once a run's agent has ended.
+//! is the head's loop that reads the files, runs what is due, runs the post
+//! script once a run's agent has ended, and starts, restarts and stops
+//! sessions (`Runner::session_step`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -56,6 +56,10 @@ pub const LINES_MAX_BYTES: usize = 64 * 1024;
 /// How long the head waits after a quota error whose message names no reset
 /// time.
 pub const QUOTA_WAIT: Duration = Duration::from_secs(3600);
+
+/// How many times a session's agent is restarted in any hour; past that the
+/// session waits for the oldest restart to be an hour old.
+pub const RESTARTS_PER_HOUR: usize = 3;
 
 /// Runs kept in `State::runs` for `orchestrator describe`.
 const RUNS_KEPT: usize = 10;
@@ -242,8 +246,14 @@ impl Orchestrator {
                 let hours = file
                     .hours
                     .ok_or("hours is required: { start = \"22:00\", stop = \"08:00\" }")?;
+                let mut clocks = Vec::new();
                 for (key, value) in [("start", &hours.start), ("stop", &hours.stop)] {
-                    parse_clock(value).ok_or(format!("hours.{key}: {value:?} is not HH:MM"))?;
+                    clocks.push(
+                        parse_clock(value).ok_or(format!("hours.{key}: {value:?} is not HH:MM"))?,
+                    );
+                }
+                if clocks[0] == clocks[1] {
+                    return Err("hours.start and hours.stop must differ".into());
                 }
                 let stop_grace = match file.stop_grace.as_deref() {
                     Some(t) => parse_duration(t).map_err(|e| format!("stop_grace: {e}"))?,
@@ -316,6 +326,25 @@ impl Orchestrator {
     }
 }
 
+impl Orchestrator {
+    /// The prompt of a session's agent, at its start and at each restart:
+    /// the file's prompt, the skill, the handover note, and where to begin
+    /// (`pastor watch --now`). `restart_of` is the agent it replaces.
+    pub fn session_prompt(&self, note: Option<&str>, restart_of: Option<i64>) -> String {
+        let mut out = self.agent_prompt(note, &[]);
+        if let Some(id) = restart_of {
+            out.push_str(&format!(
+                "\n\nThis session's last agent, {}, ended before its hours did; you take over from it.",
+                Task::agent_name_for(id)
+            ));
+        }
+        out.push_str(
+            "\n\nStart with `pastor watch --now`, which prints what needs attention at this moment, then keep watching with `pastor watch` until pastor tells you your hours are over.",
+        );
+        out
+    }
+}
+
 /// `HH:MM` (or `H:MM`) as a time of day.
 fn parse_clock(s: &str) -> Option<NaiveTime> {
     let (h, m) = s.trim().split_once(':')?;
@@ -323,6 +352,51 @@ fn parse_clock(s: &str) -> Option<NaiveTime> {
         return None;
     }
     NaiveTime::from_hms_opt(h.parse().ok()?, m.parse().ok()?, 0)
+}
+
+/// The first local time of day `clock` after `now`. A time a clock change
+/// skips that day is skipped with it; one it repeats counts once, at its
+/// first occurrence. Counting the second too would start a session again
+/// an hour after it stopped at a repeated `hours.stop`, and `in_hours`
+/// already starts a head that comes up between the two at once.
+fn next_clock(clock: NaiveTime, now: DateTime<Utc>) -> DateTime<Utc> {
+    let mut day = now.with_timezone(&Local).date_naive();
+    for _ in 0..4 {
+        if let Some(t) = Local
+            .from_local_datetime(&day.and_time(clock))
+            .earliest()
+            .map(|t| t.with_timezone(&Utc))
+            && t > now
+        {
+            return t;
+        }
+        let Some(next) = day.succ_opt() else { break };
+        day = next;
+    }
+    now + chrono::Duration::days(1)
+}
+
+impl Session {
+    fn clock(value: &str) -> NaiveTime {
+        parse_clock(value).expect("hours were checked when the file was read")
+    }
+
+    /// The next `hours.start` after `now`.
+    pub fn next_start(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        next_clock(Self::clock(&self.hours.start), now)
+    }
+
+    /// The next `hours.stop` after `now`: when a session started at `now`
+    /// stops.
+    pub fn next_stop(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        next_clock(Self::clock(&self.hours.stop), now)
+    }
+
+    /// Whether `now` falls inside the hours: the next stop comes before the
+    /// next start. Hours across midnight need nothing more.
+    pub fn in_hours(&self, now: DateTime<Utc>) -> bool {
+        self.next_stop(now) < self.next_start(now)
+    }
 }
 
 fn check_command(key: &str, argv: &[String]) -> Result<(), String> {
@@ -448,6 +522,10 @@ pub enum RunOutcome {
     Held,
     /// The pre script failed, or the agent could not be queued.
     Failed,
+    /// A session's agent ended before its hours did and a new one took over.
+    Restarted,
+    /// A session stopped.
+    Stopped,
 }
 
 impl std::fmt::Display for RunOutcome {
@@ -458,6 +536,8 @@ impl std::fmt::Display for RunOutcome {
             RunOutcome::Skipped => "skipped",
             RunOutcome::Held => "held",
             RunOutcome::Failed => "failed",
+            RunOutcome::Restarted => "restarted",
+            RunOutcome::Stopped => "stopped",
         })
     }
 }
@@ -500,6 +580,36 @@ pub struct State {
     pub quota_until: Option<DateTime<Utc>>,
     /// The last runs, oldest first.
     pub runs: Vec<RunRecord>,
+    /// A session orchestrator's session, from its start to its stop.
+    pub session: Option<SessionRun>,
+    /// A session stopped by hand does not start on its hours before this.
+    pub stopped_until: Option<DateTime<Utc>>,
+    /// A session due on its hours has been held by `max_orchestrators`
+    /// since then (`orchestrator.held` goes out once).
+    pub held_since: Option<DateTime<Utc>>,
+}
+
+/// One session, kept from its start to its stop, restarts and quota waits
+/// included: all that time it holds a `max_orchestrators` slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRun {
+    pub started_at: DateTime<Utc>,
+    /// `hours` or `hand`.
+    pub started_by: String,
+    /// When it stops: the first `hours.stop` after its start.
+    pub until: DateTime<Utc>,
+    /// Its restarts in the last hour, oldest first.
+    #[serde(default)]
+    pub restarts: Vec<DateTime<Utc>>,
+    /// The restart cap held it (`orchestrator.held` went out).
+    #[serde(default)]
+    pub capped: bool,
+    /// When its agent got its last message; it is closed `stop_grace` after.
+    #[serde(default)]
+    pub stopping_since: Option<DateTime<Utc>>,
+    /// Why it stops: `hours` or `hand`.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
 }
 
 impl State {
@@ -708,7 +818,8 @@ pub struct OrchestratorStatus {
     pub name: String,
     /// `None` when the file never parsed.
     pub kind: Option<Kind>,
-    /// `idle`, `running`, `waiting for quota`, `off` or `invalid`.
+    /// `idle`, `running`, `stopping`, `held`, `waiting for quota`, `off` or
+    /// `invalid`.
     pub state: String,
     pub enabled: bool,
     /// `every 5m`, `cron ...`, or a session's `hours 22:00-08:00`.
@@ -723,6 +834,9 @@ pub struct OrchestratorStatus {
     pub task: Option<i64>,
     pub quota_until: Option<DateTime<Utc>>,
     pub description: Option<String>,
+    /// A session's stop, while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
 }
 
 /// `orchestrator describe`: the status, the file, the note, the last runs
@@ -741,6 +855,11 @@ pub struct OrchestratorDescription {
     pub post: Option<Vec<String>>,
     pub timeout: Option<String>,
     pub hours: Option<Hours>,
+    #[serde(default)]
+    pub stop_grace: Option<String>,
+    /// The session running now.
+    #[serde(default)]
+    pub session: Option<SessionRun>,
     pub note: Option<String>,
     #[serde(default)]
     pub runs: Vec<RunRecord>,
@@ -766,12 +885,29 @@ fn status_of(
         .and_then(|(id, s)| s.get_task(id).ok().flatten())
         .is_some_and(|t| works(&t));
     let quota = state.quota_until.filter(|u| *u > now);
+    let session = state.session.as_ref();
     let label = match orch {
         None => "invalid",
+        Some(_) if session.is_some_and(|s| s.stopping_since.is_some()) => "stopping",
+        Some(_) if session.is_some() && quota.is_some() => "waiting for quota",
+        Some(_) if session.is_some() => "running",
         Some(o) if !o.enabled => "off",
         Some(_) if quota.is_some() => "waiting for quota",
         Some(_) if at_work => "running",
+        Some(_) if state.held_since.is_some() => "held",
         Some(_) => "idle",
+    };
+    let next_run = match orch.map(|o| (o, &o.plan)) {
+        Some((o, Plan::Session(s))) if o.enabled && session.is_none() => {
+            let after = state.stopped_until.filter(|u| *u > now).unwrap_or(now);
+            Some(if after == now && s.in_hours(now) {
+                now
+            } else {
+                s.next_start(after)
+            })
+        }
+        Some((_, Plan::Session(_))) => None,
+        _ => orch.and_then(|o| o.next_run(&state, first_seen, now)),
     };
     OrchestratorStatus {
         name: name.to_string(),
@@ -785,10 +921,11 @@ fn status_of(
         error,
         last_run_at: state.last_run_at,
         last_result: state.last_result.clone(),
-        next_run: orch.and_then(|o| o.next_run(&state, first_seen, now)),
+        next_run,
         task: state.task,
         quota_until: quota,
         description: orch.and_then(|o| o.description.clone()),
+        until: session.map(|s| s.until),
     }
 }
 
@@ -811,15 +948,22 @@ fn describe_of(
         })
         .collect::<Vec<_>>();
     let skip = events.len().saturating_sub(EVENTS_SHOWN);
-    let (pre, post, timeout, hours) = match orch.map(|o| &o.plan) {
+    let (pre, post, timeout, hours, stop_grace) = match orch.map(|o| &o.plan) {
         Some(Plan::Scheduled(s)) => (
             s.pre.clone(),
             s.post.clone(),
             Some(crate::schedule::describe_duration(s.timeout)),
             None,
+            None,
         ),
-        Some(Plan::Session(s)) => (Vec::new(), None, None, Some(s.hours.clone())),
-        None => (Vec::new(), None, None, None),
+        Some(Plan::Session(s)) => (
+            Vec::new(),
+            None,
+            None,
+            Some(s.hours.clone()),
+            Some(crate::schedule::describe_duration(s.stop_grace)),
+        ),
+        None => (Vec::new(), None, None, None, None),
     };
     OrchestratorDescription {
         file: paths.orchestrators_dir().join(format!("{name}.toml")),
@@ -831,6 +975,8 @@ fn describe_of(
         post,
         timeout,
         hours,
+        stop_grace,
+        session: state.session.clone(),
         note: read_note(paths, &name),
         runs: state.runs,
         events: events.into_iter().skip(skip).collect(),
@@ -1067,6 +1213,25 @@ impl Runner {
         for (name, e) in entries {
             let Some(orch) = e.orch else { continue };
             let state = load_state(&self.paths, &name);
+            if let Plan::Session(s) = &orch.plan {
+                let due = state.session.is_some()
+                    || state.held_since.is_some()
+                    || (orch.enabled
+                        && s.in_hours(now)
+                        && state.stopped_until.is_none_or(|u| u <= now));
+                if !due {
+                    continue;
+                }
+                let Ok(guard) = self.lock_of(&name).try_lock_owned() else {
+                    continue;
+                };
+                let runner = self.clone();
+                tokio::spawn(async move {
+                    runner.session_step(&orch, now).await;
+                    drop(guard);
+                });
+                continue;
+            }
             let ended = state.post_pending && !self.agent_works(&state);
             let due = orch
                 .next_run(&state, e.first_seen, now)
@@ -1108,6 +1273,33 @@ impl Runner {
     }
 
     fn runnable(&self, name: &str) -> Result<Orchestrator, (String, String)> {
+        let orch = self.valid(name)?;
+        if orch.kind() == Kind::Session {
+            return Err((
+                "orchestrator_kind".into(),
+                format!(
+                    "{name} is a session orchestrator; `pastor orchestrator start {name}` starts it"
+                ),
+            ));
+        }
+        Ok(orch)
+    }
+
+    /// Orchestrator `name`'s last good version, if it is a session one.
+    fn session_of(&self, name: &str) -> Result<Orchestrator, (String, String)> {
+        let orch = self.valid(name)?;
+        if orch.kind() != Kind::Session {
+            return Err((
+                "orchestrator_kind".into(),
+                format!(
+                    "{name} is a scheduled orchestrator; only a session one starts and stops (`pastor orchestrator run {name}` runs it now)"
+                ),
+            ));
+        }
+        Ok(orch)
+    }
+
+    fn valid(&self, name: &str) -> Result<Orchestrator, (String, String)> {
         let entry = self.entry(name).ok_or_else(|| {
             file_of(&self.paths, name).err().unwrap_or((
                 "orchestrator_not_found".into(),
@@ -1123,14 +1315,6 @@ impl Runner {
                 ),
             )
         })?;
-        if orch.kind() == Kind::Session {
-            return Err((
-                "orchestrator_kind".into(),
-                format!(
-                    "{name} is a session orchestrator; this version checks session files but does not run them"
-                ),
-            ));
-        }
         Ok(orch)
     }
 
@@ -1284,13 +1468,10 @@ impl Runner {
         }
         let _admit = self.admit.lock().await;
         let max = self.fleet.max_orchestrators() as usize;
-        match working_orchestrators(&self.store) {
+        match self.slots_taken() {
             Ok(n) if n >= max => {
                 run.outcome = RunOutcome::Held;
-                run.detail = Some(format!(
-                    "max_orchestrators = {max}, and {n} orchestrator agent{} already work",
-                    if n == 1 { "" } else { "s" }
-                ));
+                run.detail = Some(limit_detail(max, n));
                 self.emit(
                     "held",
                     name,
@@ -1312,7 +1493,22 @@ impl Runner {
                 return self.save_run(name, state, run);
             }
         }
-        match self.start_agent(orch, &lines).await {
+        let note = read_note(&self.paths, &orch.name);
+        let description = format!(
+            "orchestrator {}: {} line{}",
+            orch.name,
+            lines.len(),
+            if lines.len() == 1 { "" } else { "s" }
+        );
+        match self
+            .start_agent(
+                orch,
+                orch.agent_prompt(note.as_deref(), &lines),
+                description,
+                None,
+            )
+            .await
+        {
             Ok(task) => {
                 tracing::info!(orchestrator = name, task = %task.display_id(), lines = lines.len(), "orchestrator agent queued");
                 run.outcome = RunOutcome::Started;
@@ -1348,9 +1544,16 @@ impl Runner {
         run
     }
 
-    /// Queue the run's agent on the head's own machine, with the role, the
-    /// file's model and repo, and the prompt with every line.
-    async fn start_agent(&self, orch: &Orchestrator, lines: &[String]) -> Result<Task, String> {
+    /// Queue an agent of `orch` on the head's own machine, with the role,
+    /// the file's model and repo, `prompt` and `description`. `timeout` is
+    /// the task's own, else the defaults'.
+    async fn start_agent(
+        &self,
+        orch: &Orchestrator,
+        prompt: String,
+        description: String,
+        timeout: Option<Duration>,
+    ) -> Result<Task, String> {
         let flock = self.fleet.flock();
         let head = flock
             .machines
@@ -1364,8 +1567,10 @@ impl Runner {
             ..Default::default()
         };
         let pick = defaults.resolve_agent(&ask, None);
-        let timeout = parse_duration(&defaults.timeout)
-            .unwrap_or(Duration::from_secs(2 * 60 * 60))
+        let timeout = timeout
+            .unwrap_or_else(|| {
+                parse_duration(&defaults.timeout).unwrap_or(Duration::from_secs(2 * 60 * 60))
+            })
             .as_secs();
         let spec = DispatchSpec {
             agent: pick.agent,
@@ -1386,14 +1591,6 @@ impl Runner {
             label: Default::default(),
             summary: Default::default(),
         };
-        let note = read_note(&self.paths, &orch.name);
-        let prompt = orch.agent_prompt(note.as_deref(), lines);
-        let description = format!(
-            "orchestrator {}: {} line{}",
-            orch.name,
-            lines.len(),
-            if lines.len() == 1 { "" } else { "s" }
-        );
         let task = self
             .fleet
             .queue_run_as(
@@ -1425,6 +1622,525 @@ impl Runner {
         let fleet = self.fleet.clone();
         tokio::spawn(async move { fleet.dispatch_queued().await });
         Ok(task)
+    }
+
+    /// The `max_orchestrators` slots taken: every orchestrator agent at
+    /// work, and every session between agents (a restart due, a quota
+    /// wait), which holds its slot from start to stop.
+    fn slots_taken(&self) -> anyhow::Result<usize> {
+        let names: Vec<String> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let idle_sessions = names
+            .iter()
+            .map(|n| load_state(&self.paths, n))
+            .filter(|s| s.session.is_some() && !self.agent_works(s))
+            .count();
+        Ok(working_orchestrators(&self.store)? + idle_sessions)
+    }
+
+    /// `pastor orchestrator start`: start session `name` now, inside its
+    /// hours or not, `enabled` or not; it stops at the next `hours.stop`.
+    pub async fn start_by_hand(
+        &self,
+        name: &str,
+        now: DateTime<Utc>,
+    ) -> Result<String, (String, String)> {
+        self.reload(now);
+        let orch = self.session_of(name)?;
+        let lock = self.lock_of(name);
+        let _turn = lock.lock().await;
+        let mut state = load_state(&self.paths, name);
+        if let Some(run) = &state.session {
+            return Ok(format!(
+                "orchestrator {name} already runs, until {}",
+                local_clock(run.until)
+            ));
+        }
+        let started = self.start_session(&orch, &mut state, now, "hand").await;
+        save_state(&self.paths, name, &state);
+        match started {
+            Started::Agent(t) => Ok(format!(
+                "started orchestrator {name}: {}, until {}",
+                t.display_id(),
+                local_clock(state.session.as_ref().map_or(now, |s| s.until))
+            )),
+            Started::Waiting(until) => Ok(format!(
+                "started orchestrator {name}; its agent waits for the quota until {}",
+                local_clock(until)
+            )),
+            Started::Held(detail) => Err(("orchestrator_held".into(), detail)),
+            Started::Failed(reason) => Err((
+                "runtime_error".into(),
+                format!(
+                    "orchestrator {name} started, but its agent was not queued: {reason}; the head tries again"
+                ),
+            )),
+        }
+    }
+
+    /// `pastor orchestrator stop`: send session `name`'s agent its last
+    /// message and close it after `stop_grace`; the session does not start
+    /// on its hours again before their next stop. Inside its hours with no
+    /// session (held, say), it only keeps it from starting.
+    pub async fn stop_by_hand(
+        &self,
+        name: &str,
+        now: DateTime<Utc>,
+    ) -> Result<String, (String, String)> {
+        self.reload(now);
+        let orch = self.session_of(name)?;
+        let Plan::Session(sess) = &orch.plan else {
+            unreachable!("session_of checked the kind");
+        };
+        let lock = self.lock_of(name);
+        let _turn = lock.lock().await;
+        let mut state = load_state(&self.paths, name);
+        let Some(mut run) = state.session.clone() else {
+            if sess.in_hours(now) {
+                let until = sess.next_stop(now);
+                state.stopped_until = Some(until);
+                state.held_since = None;
+                save_state(&self.paths, name, &state);
+                return Ok(format!(
+                    "orchestrator {name} is not running, and will not start before {}",
+                    local_clock(sess.next_start(until))
+                ));
+            }
+            return Err((
+                "orchestrator_not_running".into(),
+                format!("orchestrator {name} is not running"),
+            ));
+        };
+        if run.stopping_since.is_some() {
+            return Ok(format!("orchestrator {name} is already stopping"));
+        }
+        run.stop_reason = Some("hand".into());
+        state.stopped_until = Some(run.until);
+        let said = self.begin_stop(&orch, sess, &mut state, run, now).await;
+        save_state(&self.paths, name, &state);
+        Ok(said)
+    }
+
+    /// Start a session of `orch` at `now`, `by` its hours or by hand, if a
+    /// `max_orchestrators` slot is free: the session, then its first agent
+    /// (none while a quota wait lasts; the session holds its slot anyway).
+    async fn start_session(
+        &self,
+        orch: &Orchestrator,
+        state: &mut State,
+        now: DateTime<Utc>,
+        by: &str,
+    ) -> Started {
+        let name = orch.name.as_str();
+        let Plan::Session(sess) = &orch.plan else {
+            unreachable!("only a session orchestrator starts a session");
+        };
+        let _admit = self.admit.lock().await;
+        let max = self.fleet.max_orchestrators() as usize;
+        match self.slots_taken() {
+            Ok(n) if n >= max => {
+                let detail = limit_detail(max, n);
+                if state.held_since.is_none() {
+                    tracing::info!(orchestrator = name, "session held: max_orchestrators");
+                    self.emit(
+                        "held",
+                        name,
+                        None,
+                        serde_json::json!({"reason": "max_orchestrators", "max": max}),
+                    );
+                    state.record(RunRecord {
+                        at: now,
+                        outcome: RunOutcome::Held,
+                        detail: Some(detail.clone()),
+                        lines: Vec::new(),
+                        task: None,
+                        log: None,
+                    });
+                }
+                state.held_since.get_or_insert(now);
+                return Started::Held(detail);
+            }
+            Ok(_) => {}
+            Err(err) => return Started::Failed(format!("count orchestrators: {err:#}")),
+        }
+        let until = sess.next_stop(now);
+        state.session = Some(SessionRun {
+            started_at: now,
+            started_by: by.to_string(),
+            until,
+            restarts: Vec::new(),
+            capped: false,
+            stopping_since: None,
+            stop_reason: None,
+        });
+        state.task = None;
+        state.stopped_until = None;
+        state.held_since = None;
+        state.last_run_at = Some(now);
+        if let Some(wait) = state.quota_until.filter(|u| *u > now) {
+            state.record(RunRecord {
+                at: now,
+                outcome: RunOutcome::Held,
+                detail: Some(format!("waiting for the quota until {}", wait.to_rfc3339())),
+                lines: Vec::new(),
+                task: None,
+                log: None,
+            });
+            self.emit(
+                "held",
+                name,
+                None,
+                serde_json::json!({"reason": "quota", "until": wait}),
+            );
+            return Started::Waiting(wait);
+        }
+        match self.start_session_agent(orch, sess, state, now, None).await {
+            Ok(t) => {
+                self.emit(
+                    "started",
+                    name,
+                    Some(t.id),
+                    serde_json::json!({"by": by, "until": until}),
+                );
+                state.record(RunRecord {
+                    at: now,
+                    outcome: RunOutcome::Started,
+                    detail: None,
+                    lines: Vec::new(),
+                    task: Some(t.id),
+                    log: None,
+                });
+                Started::Agent(Box::new(t))
+            }
+            Err(reason) => Started::Failed(reason),
+        }
+    }
+
+    /// Queue a session's agent, the first (`restart_of` none) or one that
+    /// takes over. Its timeout reaches past the session's stop and grace,
+    /// so only an agent stuck that long goes stale. A failure is recorded
+    /// and emitted; the next pass tries again as a restart, under the cap.
+    async fn start_session_agent(
+        &self,
+        orch: &Orchestrator,
+        sess: &Session,
+        state: &mut State,
+        now: DateTime<Utc>,
+        restart_of: Option<i64>,
+    ) -> Result<Task, String> {
+        let name = orch.name.as_str();
+        let until = state.session.as_ref().expect("a session is running").until;
+        let left = (until - now).to_std().unwrap_or_default() + sess.stop_grace;
+        let note = read_note(&self.paths, name);
+        let description = format!("orchestrator {name}: session until {}", local_clock(until));
+        let queued = self
+            .start_agent(
+                orch,
+                orch.session_prompt(note.as_deref(), restart_of),
+                description,
+                Some(left.max(Duration::from_secs(60))),
+            )
+            .await;
+        match queued {
+            Ok(t) => {
+                tracing::info!(orchestrator = name, task = %t.display_id(), "session agent queued");
+                state.task = Some(t.id);
+                state.quota_until = None;
+                Ok(t)
+            }
+            Err(reason) => {
+                tracing::warn!(orchestrator = name, %reason, "session agent not queued");
+                state.record(RunRecord {
+                    at: now,
+                    outcome: RunOutcome::Failed,
+                    detail: Some(format!("agent: {reason}")),
+                    lines: Vec::new(),
+                    task: None,
+                    log: None,
+                });
+                self.emit(
+                    "failed",
+                    name,
+                    None,
+                    serde_json::json!({"stage": "agent", "error": reason}),
+                );
+                Err(reason)
+            }
+        }
+    }
+
+    /// Send the session's agent its last message and start its grace; with
+    /// no agent at work, stop the session now. Answers what it did.
+    async fn begin_stop(
+        &self,
+        orch: &Orchestrator,
+        sess: &Session,
+        state: &mut State,
+        mut run: SessionRun,
+        now: DateTime<Utc>,
+    ) -> String {
+        let name = orch.name.as_str();
+        let task = state
+            .task
+            .and_then(|id| self.store.get_task(id).ok().flatten());
+        let Some(task) = task.filter(works) else {
+            state.session = Some(run);
+            self.end_session(orch, state, now).await;
+            return format!("orchestrator {name} stopped");
+        };
+        let grace = crate::schedule::describe_duration(sess.stop_grace);
+        let text = format!(
+            "pastor: this orchestrator session ends now. Keep a handover note for the next agent with `pastor orchestrator note`, then end your turn; pastor closes this agent in {grace}."
+        );
+        if let Some(handle) = task.machine.as_deref().and_then(|m| self.fleet.get(m))
+            && task.state.occupies_pane()
+        {
+            let input = crate::machine::SendInput {
+                text: Some(text),
+                enter: true,
+                ..Default::default()
+            };
+            if let Err(err) = handle.send(task.id, input).await {
+                tracing::warn!(orchestrator = name, task = %task.display_id(), err = %format!("{err:#}"), "send the last message");
+            }
+        }
+        let reason = run.stop_reason.clone().unwrap_or_else(|| "hours".into());
+        run.stopping_since = Some(now);
+        state.session = Some(run);
+        self.emit(
+            "stopping",
+            name,
+            Some(task.id),
+            serde_json::json!({"reason": reason, "grace": grace}),
+        );
+        format!(
+            "sent orchestrator {name}'s agent {} its last message; it is closed within {grace}",
+            task.display_id()
+        )
+    }
+
+    /// Close the session's agent if it still has a pane or a queue slot,
+    /// and end the session.
+    async fn end_session(&self, orch: &Orchestrator, state: &mut State, now: DateTime<Utc>) {
+        let name = orch.name.as_str();
+        let Some(run) = state.session.take() else {
+            return;
+        };
+        if let Some(t) = state
+            .task
+            .and_then(|id| self.store.get_task(id).ok().flatten())
+            && !self.close_agent(name, &t).await
+        {
+            // Its agent may still run: keep the session, and try again.
+            state.session = Some(run);
+            return;
+        }
+        let reason = run.stop_reason.unwrap_or_else(|| "hours".into());
+        tracing::info!(orchestrator = name, %reason, "session stopped");
+        self.emit(
+            "stopped",
+            name,
+            state.task,
+            serde_json::json!({"reason": reason}),
+        );
+        state.record(RunRecord {
+            at: now,
+            outcome: RunOutcome::Stopped,
+            detail: Some(format!("by {reason}")),
+            lines: Vec::new(),
+            task: None,
+            log: None,
+        });
+    }
+
+    /// Close task `t` of orchestrator `name`: through its machine when it
+    /// holds a pane there, else its row. A closed or ended-without-pane task
+    /// is left as it is. A queued one a dispatch claims in between is read
+    /// again and closed through its machine. Whether it is closed now: on
+    /// `false` it may still run, so the caller must not start another agent
+    /// and tries again on its next pass.
+    async fn close_agent(&self, name: &str, t: &Task) -> bool {
+        let mut t = t.clone();
+        // A claim moves a task out of `queued` once; two reads settle it.
+        for _ in 0..3 {
+            let result = match t.state {
+                TaskState::Queued | TaskState::Paused => match self.store.close_queued(t.id) {
+                    Ok(Some(_)) => return true,
+                    Ok(None) => match self.store.get_task(t.id) {
+                        Ok(Some(fresh)) => {
+                            t = fresh;
+                            continue;
+                        }
+                        Ok(None) => return true,
+                        Err(err) => Err(err),
+                    },
+                    Err(err) => Err(err),
+                },
+                s if s.occupies_pane() => {
+                    match t.machine.as_deref().and_then(|m| self.fleet.get(m)) {
+                        Some(h) => h.close(t.id, false).await.map(|_| ()),
+                        None => self.store.close_task(t.id).map(|_| ()),
+                    }
+                }
+                _ => return true,
+            };
+            return match result {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(orchestrator = name, task = %t.display_id(), err = %format!("{err:#}"), "close the session's agent");
+                    false
+                }
+            };
+        }
+        tracing::warn!(orchestrator = name, task = %t.display_id(), "the session's agent kept changing state while closing it");
+        false
+    }
+
+    /// One pass of session `orch` at `now`, under its lock: start it on its
+    /// hours (or wait for a free slot), stop it at `hours.stop` with its last
+    /// message and grace, and restart its agent when it ended early, after a
+    /// quota wait, at most `RESTARTS_PER_HOUR` times an hour.
+    pub async fn session_step(&self, orch: &Orchestrator, now: DateTime<Utc>) {
+        let name = orch.name.as_str();
+        let Plan::Session(sess) = &orch.plan else {
+            return;
+        };
+        let mut state = load_state(&self.paths, name);
+        let before = state.clone();
+        self.session_step_state(orch, sess, &mut state, now).await;
+        if state != before {
+            save_state(&self.paths, name, &state);
+        }
+    }
+
+    async fn session_step_state(
+        &self,
+        orch: &Orchestrator,
+        sess: &Session,
+        state: &mut State,
+        now: DateTime<Utc>,
+    ) {
+        let name = orch.name.as_str();
+        let Some(mut run) = state.session.clone() else {
+            let due =
+                orch.enabled && sess.in_hours(now) && state.stopped_until.is_none_or(|u| u <= now);
+            if due {
+                self.start_session(orch, state, now, "hours").await;
+            } else {
+                state.held_since = None;
+            }
+            return;
+        };
+        let task = state
+            .task
+            .and_then(|id| self.store.get_task(id).ok().flatten());
+        let at_work = task.as_ref().is_some_and(works);
+        if let Some(since) = run.stopping_since {
+            let grace = chrono::Duration::from_std(sess.stop_grace).unwrap_or_default();
+            if !at_work || now >= since + grace {
+                self.end_session(orch, state, now).await;
+            }
+            return;
+        }
+        if now >= run.until {
+            run.stop_reason.get_or_insert_with(|| "hours".into());
+            self.begin_stop(orch, sess, state, run, now).await;
+            return;
+        }
+        if at_work {
+            return;
+        }
+        // Its agent ended (or never started) before the hours did.
+        match state.quota_until {
+            Some(until) if until > now => return,
+            Some(_) => {}
+            None => {
+                if let Some(t) = &task {
+                    let said = format!(
+                        "{}\n{}",
+                        t.error.as_deref().unwrap_or(""),
+                        self.store.pane_tail(t.id).unwrap_or_default()
+                    );
+                    if let Some(until) = quota_reset(&said, now) {
+                        tracing::warn!(orchestrator = name, task = %t.display_id(), until = %until, "session agent stopped on a quota; restarting at the reset");
+                        state.quota_until = Some(until);
+                        // A failed close is tried again before the restart.
+                        self.close_agent(name, t).await;
+                        self.emit(
+                            "quota",
+                            name,
+                            Some(t.id),
+                            serde_json::json!({"until": until}),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        let hour_ago = now - chrono::Duration::hours(1);
+        run.restarts.retain(|t| *t > hour_ago);
+        if run.restarts.len() >= RESTARTS_PER_HOUR {
+            if !run.capped {
+                run.capped = true;
+                let next = run.restarts[0] + chrono::Duration::hours(1);
+                tracing::warn!(
+                    orchestrator = name,
+                    "session agent restarted {RESTARTS_PER_HOUR} times this hour; waiting"
+                );
+                self.emit(
+                    "held",
+                    name,
+                    state.task,
+                    serde_json::json!({"reason": "restarts", "max": RESTARTS_PER_HOUR, "until": next}),
+                );
+                state.record(RunRecord {
+                    at: now,
+                    outcome: RunOutcome::Held,
+                    detail: Some(format!(
+                        "restarted {RESTARTS_PER_HOUR} times in the last hour; the next restart waits until {}",
+                        next.to_rfc3339()
+                    )),
+                    lines: Vec::new(),
+                    task: None,
+                    log: None,
+                });
+            }
+            state.session = Some(run);
+            return;
+        }
+        run.capped = false;
+        let old = task.as_ref().map(|t| t.id);
+        if let Some(t) = &task
+            && !self.close_agent(name, t).await
+        {
+            // The old agent may still run: no second one beside it.
+            state.session = Some(run);
+            return;
+        }
+        run.restarts.push(now);
+        let restarts = run.restarts.len();
+        state.session = Some(run);
+        if let Ok(t) = self.start_session_agent(orch, sess, state, now, old).await {
+            self.emit(
+                "restarted",
+                name,
+                Some(t.id),
+                serde_json::json!({"after": old, "restarts": restarts}),
+            );
+            state.record(RunRecord {
+                at: now,
+                outcome: RunOutcome::Restarted,
+                detail: old.map(|id| format!("after {}", Task::agent_name_for(id))),
+                lines: Vec::new(),
+                task: Some(t.id),
+                log: None,
+            });
+        }
     }
 
     /// The agent `orch`'s last run started has ended: note a quota error,
@@ -1601,6 +2317,29 @@ impl Runner {
             log: Some(path),
         })
     }
+}
+
+/// How `Runner::start_session` went.
+enum Started {
+    Agent(Box<Task>),
+    /// The session started, and its agent waits for a quota reset.
+    Waiting(DateTime<Utc>),
+    /// `max_orchestrators` held it back, and why.
+    Held(String),
+    /// The session started, but its agent was not queued.
+    Failed(String),
+}
+
+fn limit_detail(max: usize, n: usize) -> String {
+    format!(
+        "max_orchestrators = {max}, and {n} orchestrator slot{} already taken",
+        if n == 1 { " is" } else { "s are" }
+    )
+}
+
+/// `t` as local `HH:MM`, for messages.
+fn local_clock(t: DateTime<Utc>) -> String {
+    t.with_timezone(&Local).format("%H:%M").to_string()
 }
 
 struct ScriptRun {
@@ -2141,5 +2880,341 @@ prompt = "You are the night orchestrator."
         assert_eq!(st[0].state, "off");
         assert_eq!(st[0].next_run, None);
         assert!(set_enabled(&head.paths, "nope", true).is_err());
+    }
+
+    /// Local `HH:MM` on 2026-09-`day`.
+    fn at(day: u32, h: u32, m: u32) -> DateTime<Utc> {
+        Local
+            .with_ymd_and_hms(2026, 9, day, h, m, 0)
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn hours_across_midnight_hold_both_sides_of_it() {
+        let Plan::Session(s) = parse(SESSION).unwrap().plan else {
+            panic!()
+        };
+        assert!(!s.in_hours(at(28, 21, 59)));
+        assert!(s.in_hours(at(28, 22, 0)));
+        assert!(s.in_hours(at(29, 3, 0)));
+        assert!(!s.in_hours(at(29, 8, 0)));
+        assert_eq!(s.next_stop(at(28, 22, 0)), at(29, 8, 0));
+        assert_eq!(s.next_start(at(29, 8, 0)), at(29, 22, 0));
+        let day = parse(&SESSION.replace("22:00", "09:00").replace("08:00", "17:00")).unwrap();
+        let Plan::Session(d) = day.plan else { panic!() };
+        assert!(d.in_hours(at(28, 12, 0)) && !d.in_hours(at(28, 18, 0)));
+        let err = parse(&SESSION.replace("08:00", "22:00")).unwrap_err();
+        assert!(err.contains("differ"), "{err}");
+    }
+
+    impl Head {
+        async fn step(&self, now: DateTime<Utc>) {
+            let orch = self.runner.session_of("merge").unwrap();
+            self.runner.session_step(&orch, now).await;
+        }
+
+        fn agent(&self) -> Task {
+            let id = self.state().task.expect("a session agent");
+            self.store.get_task(id).unwrap().unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_starts_on_its_hours_with_the_prompt_and_watch() {
+        let mut head = Head::new(SESSION, "", "");
+        head.step(at(28, 21, 0)).await;
+        assert!(head.tasks().is_empty());
+        assert_eq!(
+            head.runner.statuses(at(28, 21, 0))[0].next_run,
+            Some(at(28, 22, 0))
+        );
+        head.step(at(28, 22, 0)).await;
+        let t = head.agent();
+        assert_eq!(t.role, TaskRole::Orchestrator);
+        assert_eq!(t.spec.machine.as_deref(), Some("head"));
+        assert!(
+            t.prompt.starts_with("You are the night orchestrator."),
+            "{}",
+            t.prompt
+        );
+        assert!(t.prompt.contains("`pastor watch --now`"), "{}", t.prompt);
+        assert!(
+            t.spec.timeout_secs >= 10 * 3600,
+            "a session agent outlasts the defaults' timeout: {}",
+            t.spec.timeout_secs
+        );
+        assert_eq!(head.kinds(), ["orchestrator.started"]);
+        let run = head.state().session.unwrap();
+        assert_eq!(run.until, at(29, 8, 0));
+        assert_eq!(run.started_by, "hours");
+        // Its agent at work: nothing more.
+        head.step(at(28, 23, 0)).await;
+        assert_eq!(head.tasks().len(), 1);
+        assert!(head.kinds().is_empty());
+        assert_eq!(head.runner.statuses(at(28, 23, 0))[0].state, "running");
+        // `run` is for the scheduled kind.
+        let err = head.runner.fire("merge").unwrap_err();
+        assert_eq!(err.0, "orchestrator_kind");
+    }
+
+    #[tokio::test]
+    async fn a_head_started_inside_the_hours_starts_the_session_at_once() {
+        let head = Head::new(SESSION, "", "");
+        head.step(at(29, 3, 0)).await;
+        assert_eq!(head.state().session.unwrap().until, at(29, 8, 0));
+        assert_eq!(head.tasks().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_started_early_by_hand_runs_to_the_stop() {
+        let mut head = Head::new(SESSION, "", "");
+        let said = head
+            .runner
+            .start_by_hand("merge", at(28, 20, 0))
+            .await
+            .unwrap();
+        assert!(said.contains("t-") && said.contains("08:00"), "{said}");
+        let run = head.state().session.unwrap();
+        assert_eq!((run.started_by.as_str(), run.until), ("hand", at(29, 8, 0)));
+        // Starting its hours does not start a second one.
+        head.step(at(28, 22, 0)).await;
+        assert_eq!(head.tasks().len(), 1);
+        assert_eq!(head.kinds(), ["orchestrator.started"]);
+        let again = head
+            .runner
+            .start_by_hand("merge", at(28, 22, 5))
+            .await
+            .unwrap();
+        assert!(again.contains("already runs"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn a_session_stops_with_a_last_message_and_a_grace() {
+        let mut head = Head::new(SESSION, "", "");
+        head.step(at(28, 22, 0)).await;
+        let id = head.agent().id;
+        head.set_state(id, TaskState::Running);
+        head.kinds();
+        head.step(at(29, 8, 0)).await;
+        assert_eq!(head.kinds(), ["orchestrator.stopping"]);
+        assert_eq!(head.runner.statuses(at(29, 8, 0))[0].state, "stopping");
+        head.step(at(29, 8, 4)).await;
+        assert_eq!(head.agent().state, TaskState::Running, "within its grace");
+        head.step(at(29, 8, 5)).await;
+        assert_eq!(head.agent().state, TaskState::Closed);
+        assert_eq!(head.kinds(), ["orchestrator.stopped"]);
+        assert_eq!(head.state().session, None);
+        // Out of hours: nothing starts until the next night.
+        head.step(at(29, 12, 0)).await;
+        assert_eq!(head.tasks().len(), 1);
+        head.step(at(29, 22, 0)).await;
+        assert_eq!(head.tasks().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_ends_in_its_grace_is_closed_at_once() {
+        let mut head = Head::new(SESSION, "", "");
+        head.step(at(28, 22, 0)).await;
+        let id = head.agent().id;
+        head.step(at(29, 8, 0)).await;
+        head.set_state(id, TaskState::Done);
+        head.kinds();
+        head.step(at(29, 8, 1)).await;
+        assert_eq!(head.agent().state, TaskState::Closed);
+        assert_eq!(head.kinds(), ["orchestrator.stopped"]);
+    }
+
+    #[tokio::test]
+    async fn an_agent_claimed_while_closing_is_closed_on_its_machine() {
+        let head = Head::new(SESSION, "", "");
+        head.step(at(28, 22, 0)).await;
+        let read = head.agent();
+        assert_eq!(read.state, TaskState::Queued);
+        // A dispatch claims it between that read and the close.
+        let mut claimed = head.store.claim_task(read.id, "head").unwrap().unwrap();
+        claimed.state = TaskState::Running;
+        head.store.update_task(&mut claimed).unwrap();
+        assert!(head.runner.close_agent("merge", &read).await);
+        assert_eq!(head.agent().state, TaskState::Closed);
+    }
+
+    #[tokio::test]
+    async fn a_session_stopped_by_hand_waits_for_its_next_hours() {
+        let mut head = Head::new(SESSION, "", "");
+        head.step(at(28, 22, 0)).await;
+        head.kinds();
+        let said = head
+            .runner
+            .stop_by_hand("merge", at(28, 22, 30))
+            .await
+            .unwrap();
+        assert!(said.contains("last message"), "{said}");
+        assert_eq!(head.kinds(), ["orchestrator.stopping"]);
+        let since = head.state().session.unwrap().stopping_since.unwrap();
+        head.step(since + chrono::Duration::minutes(6)).await;
+        assert_eq!(head.agent().state, TaskState::Closed);
+        assert_eq!(head.state().stopped_until, Some(at(29, 8, 0)));
+        head.step(at(28, 23, 0)).await;
+        assert_eq!(head.tasks().len(), 1, "not again this night");
+        head.step(at(29, 22, 0)).await;
+        assert_eq!(head.tasks().len(), 2);
+        let err = head
+            .runner
+            .stop_by_hand("other", at(29, 22, 30))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "orchestrator_not_found");
+    }
+
+    #[tokio::test]
+    async fn a_dead_agent_restarts_with_the_note() {
+        let mut head = Head::new(SESSION, "", "");
+        head.step(at(28, 22, 0)).await;
+        let first = head.agent().id;
+        head.set_state(first, TaskState::Done);
+        write_note(&head.paths, "merge", "merged #31; #32 waits on review").unwrap();
+        head.kinds();
+        head.step(at(28, 23, 0)).await;
+        assert_eq!(
+            head.store.get_task(first).unwrap().unwrap().state,
+            TaskState::Closed
+        );
+        let t = head.agent();
+        assert_ne!(t.id, first);
+        assert!(
+            t.prompt.contains("merged #31; #32 waits on review"),
+            "{}",
+            t.prompt
+        );
+        assert!(
+            t.prompt.contains(&Task::agent_name_for(first)),
+            "{}",
+            t.prompt
+        );
+        assert!(t.prompt.contains("`pastor watch --now`"), "{}", t.prompt);
+        assert_eq!(head.kinds(), ["orchestrator.restarted"]);
+        assert_eq!(
+            head.state().last_result,
+            Some(format!("restarted: after {}", Task::agent_name_for(first)))
+        );
+    }
+
+    #[tokio::test]
+    async fn restarts_are_capped_at_three_an_hour() {
+        let mut head = Head::new(SESSION, "", "");
+        head.step(at(28, 22, 0)).await;
+        for m in [1, 2, 3] {
+            head.set_state(head.agent().id, TaskState::Failed);
+            head.step(at(28, 22, m)).await;
+        }
+        assert_eq!(head.tasks().len(), 4);
+        head.kinds();
+        head.set_state(head.agent().id, TaskState::Stale);
+        head.step(at(28, 22, 30)).await;
+        head.step(at(28, 22, 40)).await;
+        assert_eq!(head.tasks().len(), 4);
+        assert_eq!(head.kinds(), ["orchestrator.held"], "held once");
+        head.step(at(28, 23, 0)).await;
+        assert_eq!(
+            head.tasks().len(),
+            4,
+            "the first restart is not an hour old yet"
+        );
+        head.step(at(28, 23, 1)).await;
+        assert_eq!(head.tasks().len(), 5);
+        assert_eq!(head.kinds(), ["orchestrator.restarted"]);
+    }
+
+    #[tokio::test]
+    async fn a_quota_error_waits_for_the_reset_then_restarts() {
+        let mut head = Head::new(SESSION, "", "");
+        head.step(at(28, 22, 0)).await;
+        let id = head.agent().id;
+        let reset = at(29, 1, 0);
+        head.store.note_pane_tail(
+            id,
+            &format!(
+                "watching...\nClaude AI usage limit reached|{}\n",
+                reset.timestamp()
+            ),
+        );
+        head.set_state(id, TaskState::Done);
+        head.kinds();
+        head.step(at(28, 23, 0)).await;
+        assert_eq!(head.kinds(), ["orchestrator.quota"]);
+        assert_eq!(head.state().quota_until, Some(reset));
+        assert_eq!(head.tasks().len(), 1);
+        assert_eq!(
+            head.runner.statuses(at(28, 23, 0))[0].state,
+            "waiting for quota"
+        );
+        head.step(at(29, 0, 59)).await;
+        assert_eq!(head.tasks().len(), 1);
+        head.step(at(29, 1, 0)).await;
+        assert_eq!(head.tasks().len(), 2);
+        assert_eq!(head.kinds(), ["orchestrator.restarted"]);
+        assert_eq!(head.state().quota_until, None);
+    }
+
+    #[tokio::test]
+    async fn a_session_and_a_scheduled_orchestrator_share_the_limit() {
+        let head = Head::new(SESSION, "", "");
+        std::fs::write(head.dir.join("other.toml"), scheduled()).unwrap();
+        std::fs::write(head.dir.join("pre.sh"), "#!/bin/sh\necho 'PR #31'\n").unwrap();
+        head.runner.reload(Utc::now());
+        let other = head.runner.runnable("other").unwrap();
+        let mut events = head.runner.events.subscribe();
+        // A scheduled agent works: the session due on its hours is held.
+        let started = head.runner.run_now(&other).await;
+        assert_eq!(started.outcome, RunOutcome::Started, "{started:?}");
+        head.step(at(28, 22, 0)).await;
+        head.step(at(28, 22, 1)).await;
+        assert!(head.state().session.is_none());
+        assert_eq!(head.runner.statuses(at(28, 22, 1))[0].state, "held");
+        let err = head
+            .runner
+            .start_by_hand("merge", at(28, 22, 2))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "orchestrator_held");
+        // It ends: the session starts on the next tick.
+        head.set_state(started.task.unwrap(), TaskState::Done);
+        head.runner.finish_now(&other).await;
+        head.step(at(28, 22, 5)).await;
+        assert!(head.state().session.is_some());
+        let mut seen = Vec::new();
+        while let Ok(e) = events.try_recv() {
+            if !e.kind.starts_with("orchestrator.") {
+                continue;
+            }
+            let who = e.detail.as_ref().unwrap()["orchestrator"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            seen.push(format!("{who} {}", e.kind));
+        }
+        assert_eq!(
+            seen,
+            [
+                "other orchestrator.started",
+                "merge orchestrator.held",
+                "merge orchestrator.started"
+            ]
+        );
+        // The session runs: a scheduled run does its pre script and is held.
+        let held = head.runner.run_now(&other).await;
+        assert_eq!(held.outcome, RunOutcome::Held, "{held:?}");
+        assert_eq!(held.lines, ["PR #31"]);
+        // Between agents, on a quota wait, it keeps its slot.
+        let id = head.agent().id;
+        head.store
+            .note_pane_tail(id, "You've hit your limit · resets 3am (Europe/Lisbon)");
+        head.set_state(id, TaskState::Done);
+        head.step(at(28, 23, 0)).await;
+        assert!(head.state().quota_until.is_some());
+        let held = head.runner.run_now(&other).await;
+        assert_eq!(held.outcome, RunOutcome::Held, "{held:?}");
     }
 }
