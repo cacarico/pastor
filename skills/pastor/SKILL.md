@@ -31,7 +31,7 @@ Runtime errors are one JSON object on stderr, `{"code": ..., "message": ...}`, w
 pastor machine list
 ```
 
-With a head running, it opens with a line about the head (its pastor and herdr versions, its host, how many machines follow), then one row per machine: `NAME`, `HOST`, `FLOCK`, `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `PASTOR` (the pastor installed there, `-` when unknown), `AGENTS` (live tasks over the machine's room: `max_agents`, then `+1j` for job slots and `+1b` for burst when set), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head running, it says so on stderr and probes each machine directly instead: CHANNEL is then `probed` (herdr answered), `server down` (a local socket with no server), `unreachable` (ssh or transport failed) or `error` (herdr answered the ping with an error), and HERDR, PASTOR and AGENTS come from that probe. Report what it shows rather than starting `pastor serve` yourself, which starts a long-running daemon; `pastor serve status` (`--json`) says whether one runs on this machine, with its pid, version and service.
+With a head running, it opens with a line about the head (its pastor and herdr versions, its host, how many machines follow), then one row per machine: `NAME`, `HOST`, `FLOCKS` (each flock with the machine's number there, `work:2,home:1`), `CHANNEL` (`connected`, `polling`, `connecting`, `reconnecting`, `incompatible`), `HERDR` (the herdr version), `PASTOR` (the pastor installed there, `-` when unknown), `AGENTS` (live tasks over the machine's room: `max_agents`, then `+1j` for job slots and `+1b` for burst when set), `TAGS`, `ERROR`. Only `connected` and `polling` machines take tasks. With no head running, it says so on stderr and probes each machine directly instead: CHANNEL is then `probed` (herdr answered), `server down` (a local socket with no server), `unreachable` (ssh or transport failed) or `error` (herdr answered the ping with an error), and HERDR, PASTOR and AGENTS come from that probe. Report what it shows rather than starting `pastor serve` yourself, which starts a long-running daemon; `pastor serve status` (`--json`) says whether one runs on this machine, with its pid, version and service.
 
 ```bash
 pastor task list          # live tasks: queued, starting, running, blocked
@@ -158,11 +158,13 @@ The head picks up job file edits by itself. A file that stops parsing keeps its 
 pastor machine add pi-3 user@pi-3 --max-agents 2 --tag arm --herdr
 pastor machine add here --local
 pastor machine add pi-5 user@pi-5 --flock work
-pastor machine move pi-3 work   # new tasks only; tasks already on it stay
+pastor machine move pi-3 work   # leave every flock, join work; new tasks only, tasks already on it stay
 pastor machine remove pi-3 --herdr
 pastor machine list        # connects to each machine now: ssh, herdr version, agents
-pastor flock list          # each flock: default, machines, live agents, queued tasks
-pastor flock add work [--default]
+pastor flock list          # each flock: default, machines as `pi-3 1/2` (live/number), live agents, queued tasks
+pastor flock add work [pi-3 ...] [--default]   # the machines named join it
+pastor flock join work pi-3 --max 2   # pi-3 also in work, at most 2 of its tasks; again with --max changes it
+pastor flock leave work pi-3   # out of its last flock, pi-3 is back in the default one
 pastor flock default show      # print the default flock
 pastor flock default set work  # new tasks and jobs go there; machines stay put
 pastor flock remove work   # refused while it has machines or queued tasks, or is the default
@@ -210,7 +212,7 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 
 ## When something goes wrong
 
-- A task stays `queued`: no connected machine of its flock carries all its tags or has a free slot, or its flock is at its number on each machine with room (its error then says `flock <name> is at N of N on <machine>`). Compare `pastor machine list` (FLOCK, TAGS) with the task's flock and tags. The head logs a warning after an hour, and at once for a task pinned to a machine that has moved to another flock.
+- A task stays `queued`: no connected machine of its flock carries all its tags or has a free slot, or its flock is at its number on each machine with room (its error then says `flock <name> is at N of N on <machine>`). Compare `pastor machine list` (FLOCKS, TAGS) with the task's flock and tags. The head logs a warning after an hour, and at once for a task pinned to a machine that has moved to another flock.
 - `failed` with `agent_pane_busy`: herdr refused to start the agent because the pane was not at an idle shell prompt.
 - `failed` with "agent t-N not found": the agent's pane vanished before it was done (closed by hand, herdr restarted, or the agent crashed).
 - `failed` soon after start: the agent is usually not installed, or not on the PATH herdr sees on that machine.

@@ -1197,7 +1197,7 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A checkout recorded before `already_open` existed is pastor's own,

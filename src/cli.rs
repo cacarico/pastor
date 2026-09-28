@@ -489,10 +489,31 @@ pub struct FlockRow {
     pub name: String,
     pub default: bool,
     pub machines: Vec<String>,
+    /// Each of `machines` with the flock's number there and its live tasks
+    /// of the flock, known only from a running head.
+    pub members: Vec<FlockMember>,
     pub agents: Option<usize>,
     pub queued: usize,
     /// Its `[[flock]]` entry's `description`.
     pub description: Option<String>,
+}
+
+/// A machine in `FlockRow::members`. `max` is the flock's number there, or
+/// for a machine with none written (the old `flock` key, or the default
+/// flock of a machine no flock lists) its `max_agents`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FlockMember {
+    pub name: String,
+    pub max: u32,
+    pub live: Option<usize>,
+}
+
+impl FlockMember {
+    /// `desk 1/2`, or `desk -/2` with no head to count.
+    pub fn label(&self) -> String {
+        let live = self.live.map_or_else(|| "-".into(), |n| n.to_string());
+        format!("{} {live}/{}", self.name, self.max)
+    }
 }
 
 pub const FLOCK_HEADER: [&str; 5] = ["NAME", "DEFAULT", "MACHINES", "AGENTS", "QUEUED"];
@@ -506,25 +527,39 @@ pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]
         .into_iter()
         .map(|name| {
             let machines: Vec<String> = flock.members(name).into_iter().map(String::from).collect();
-            // The flock's own tasks on each machine; a head from before many
+            // The flock's own tasks on a machine; a head from before many
             // flocks reports only the machine's.
-            let agents = live.map(|ms| {
-                ms.iter()
-                    .filter(|s| machines.contains(&s.name))
-                    .map(|s| match s.flocks.iter().find(|f| f.name == name) {
-                        Some(seat) => seat.live,
-                        // A head that reports only its single `flock` (or none, before
-                        // flocks): count its live agents under that one flock, not
-                        // under every local flock the machine is configured into.
-                        None if s.flocks.is_empty()
-                            && name == s.flock.as_deref().unwrap_or(flock.default_flock()) =>
-                        {
-                            s.live
-                        }
-                        None => 0,
-                    })
-                    .sum()
-            });
+            let live_on = |s: &MachineStatus| match s.flocks.iter().find(|f| f.name == name) {
+                Some(seat) => seat.live,
+                // A head that reports only its single `flock` (or none, before
+                // flocks): count its live agents under that one flock, not
+                // under every local flock the machine is configured into.
+                None if s.flocks.is_empty()
+                    && name == s.flock.as_deref().unwrap_or(flock.default_flock()) =>
+                {
+                    s.live
+                }
+                None => 0,
+            };
+            let members: Vec<FlockMember> = machines
+                .iter()
+                .map(|m| {
+                    let max = flock
+                        .machine_flocks(m)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|(f, _)| *f == name)
+                        .and_then(|(_, n)| n)
+                        .or_else(|| flock.get(m).map(|c| c.max_agents))
+                        .unwrap_or_default();
+                    FlockMember {
+                        name: m.clone(),
+                        max,
+                        live: live.map(|ms| ms.iter().find(|s| &s.name == m).map_or(0, live_on)),
+                    }
+                })
+                .collect();
+            let agents = live.map(|_| members.iter().filter_map(|m| m.live).sum());
             let queued = queued
                 .iter()
                 .filter(|t| t.flock.as_deref().unwrap_or(flock.default_flock()) == name)
@@ -533,6 +568,7 @@ pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]
                 name: name.to_string(),
                 default: name == flock.default_flock(),
                 machines,
+                members,
                 agents,
                 queued,
                 description: flock
@@ -549,10 +585,14 @@ pub fn flock_rows(rows: &[FlockRow]) -> Vec<Vec<String>> {
             vec![
                 f.name.clone(),
                 if f.default { "yes" } else { "no" }.into(),
-                if f.machines.is_empty() {
+                if f.members.is_empty() {
                     "-".into()
                 } else {
-                    f.machines.join(",")
+                    f.members
+                        .iter()
+                        .map(FlockMember::label)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 },
                 f.agents.map_or_else(|| "-".into(), |n| n.to_string()),
                 f.queued.to_string(),
@@ -674,7 +714,7 @@ impl MachineRow {
         }
     }
 
-    /// The FLOCK column: every flock, with its number where it has one
+    /// The FLOCKS column: every flock, with its number where it has one
     /// (`home,work:2`).
     pub fn flock_label(&self) -> String {
         if self.flocks.is_empty() {
@@ -720,7 +760,7 @@ impl From<&MachineStatus> for MachineRow {
 
 /// AGENTS counts orphans too; ORPHANS names them (see `MachineStatus::orphans`).
 pub const MACHINE_HEADER: [&str; 11] = [
-    "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
+    "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
     "ERROR",
 ];
 
@@ -994,7 +1034,7 @@ mod tests {
     }
 
     /// The head's own machine (the `local` one) comes first; the others
-    /// keep flock order. FLOCK follows HOST, and PROFILE follows FLOCK.
+    /// keep flock order. FLOCKS follows HOST, and PROFILE follows FLOCKS.
     #[test]
     fn machine_table_puts_the_heads_machine_first_with_its_flock() {
         let mut rows = vec![
@@ -1013,7 +1053,7 @@ mod tests {
         assert_eq!(
             cells(0),
             [
-                "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS",
+                "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS",
                 "ORPHANS", "TAGS", "ERROR"
             ]
         );
@@ -1787,6 +1827,43 @@ mod tests {
         assert_eq!(rows[0][8], "t-4,t-9");
         assert_eq!(rows[1][8], "-");
         assert_eq!(rows[0].len(), MACHINE_HEADER.len());
+    }
+
+    /// `flock list` gives each machine of a flock with the flock's number
+    /// there and its live tasks of the flock: `desk 1/2`; without a head,
+    /// `desk -/2`. A machine with no number written shows its max_agents.
+    #[test]
+    fn a_flock_row_shows_each_machine_with_its_number_and_live_count() {
+        let f: Flock = toml::from_str(
+            "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"work\"\nmachines = { desk = 2 }\n\n\
+             [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 4\n\n\
+             [[machine]]\nname = \"lab\"\nssh = \"user@lab\"\nflock = \"work\"\n",
+        )
+        .unwrap();
+        let seat = |name: &str, max: Option<u32>, live: usize| crate::machine::FlockSeat {
+            name: name.into(),
+            max,
+            live,
+        };
+        let desk = MachineStatus {
+            flocks: vec![seat("work", Some(2), 1)],
+            ..status("desk", "local")
+        };
+        let rows = flock_list(&f, Some(&[desk]), &[]);
+        assert_eq!(rows[1].machines, ["desk", "lab"]);
+        assert_eq!(flock_rows(&rows)[1][2], "desk 1/2, lab 0/2");
+        assert_eq!(rows[1].agents, Some(1));
+        assert_eq!(flock_rows(&rows)[0][2], "-");
+        let rows = flock_list(&f, None, &[]);
+        assert_eq!(flock_rows(&rows)[1][2], "desk -/2, lab -/2");
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        assert_eq!(
+            json["members"],
+            serde_json::json!([
+                {"name": "desk", "max": 2, "live": null},
+                {"name": "lab", "max": 2, "live": null}
+            ])
+        );
     }
 
     /// A status carries every flock of the machine; one from a head before

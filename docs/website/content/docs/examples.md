@@ -142,7 +142,7 @@ pastor machine list
 ```text
 pastor 0.5.0 on desk (herdr 0.9.1), 2 machines, desk is the head of the flock
 
-NAME      HOST           FLOCK     PROFILE  CHANNEL    HERDR  PASTOR  AGENTS     ORPHANS  TAGS  ERROR
+NAME      HOST           FLOCKS    PROFILE  CHANNEL    HERDR  PASTOR  AGENTS     ORPHANS  TAGS  ERROR
 desk      local          personal  -        connected  0.9.1  0.5.0   1/2+1j+1b  -        -
 server-1  user@server-1  personal  -        connected  0.9.1  0.5.0   2/3+1j+1b  -        -
 ```

@@ -1403,7 +1403,7 @@ fn machine_list_opens_with_a_line_about_the_head() {
     assert_eq!(
         lines[0],
         [
-            "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS",
+            "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS",
             "TAGS", "ERROR"
         ],
         "{stdout}"
@@ -1516,7 +1516,7 @@ fn machine_list_without_daemon_probes_each_machine() {
     // No head, no line about it: the stderr notice says so instead.
     assert_eq!(
         lines[0][..5],
-        ["NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL"],
+        ["NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL"],
         "{stdout}"
     );
     assert_eq!(
@@ -4176,6 +4176,8 @@ fn complete_offers_flock_names() {
         &["flock", "describe", ""][..],
         &["flock", "default", "set", ""],
         &["machine", "move", "pi-1", ""],
+        &["flock", "join", ""],
+        &["flock", "leave", ""],
         &["task", "run", "fix it", "--flock", ""],
     ] {
         let (ok, out) = complete(&config, &state, words);
@@ -4194,6 +4196,11 @@ fn complete_offers_machine_names() {
         &["machine", "describe", ""][..],
         &["machine", "move", ""],
         &["machine", "open", ""],
+        &["flock", "join", "lab", ""],
+        &["flock", "join", "lab", "--max", "2", ""],
+        &["flock", "leave", "home", ""],
+        &["flock", "add", "new", ""],
+        &["flock", "add", "new", "pi-1", ""],
         &["task", "list", "--machine", ""],
     ] {
         let (ok, out) = complete(&config, &state, words);
@@ -6127,4 +6134,178 @@ fn an_agent_task_may_not_toggle_this_machine_s_own_job() {
     std::fs::write(c.config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();
     let text = ok(as_agent(&["job", "enable", "sweep"]));
     assert!(text.contains("enabled sweep"), "{text}");
+}
+
+/// `flock join` and `flock leave` without a head: join, join again with
+/// `--max`, leave, leave the last flock, `machine move`, and the old `flock`
+/// key moved into the flock's `machines` on the first edit, comments kept.
+/// `machine list` and `flock list` show where each machine is.
+#[test]
+fn flock_join_and_leave_edit_membership() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "# the fleet\n\n[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"work\"\n\n\
+         [[machine]]\nname = \"desk\"\ncommand = [\"false\"]\nmax_agents = 4\nflock = \"work\"   # for now\n\n\
+         # the spare one\n[[machine]]\nname = \"lab\"\ncommand = [\"false\"]\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let file = || std::fs::read_to_string(config.join("flock.toml")).unwrap();
+    let list = || -> serde_json::Value {
+        serde_json::from_str(&ok(run(&["flock", "list", "--json"]))).unwrap()
+    };
+
+    let out = ok(run(&["flock", "join", "home", "desk", "--max", "2"]));
+    assert!(
+        out.starts_with("desk is in flock home with 2; its flocks: home:2,work:4; "),
+        "{out}"
+    );
+    let text = file();
+    assert!(!text.contains("flock = \"work\""), "{text}");
+    assert!(text.contains("machines = { desk = 4 }"), "{text}");
+    assert!(text.starts_with("# the fleet\n"), "{text}");
+    assert!(text.contains("# the spare one\n"), "{text}");
+
+    ok(run(&["flock", "join", "home", "desk", "--max", "3"]));
+    let l = list();
+    assert_eq!(
+        l[0]["members"],
+        serde_json::json!([
+            {"name": "desk", "max": 3, "live": null},
+            {"name": "lab", "max": 2, "live": null}
+        ])
+    );
+    let table = ok(run(&["flock", "list"]));
+    assert!(table.contains("desk -/3, lab -/2"), "{table}");
+
+    let out = ok(run(&["flock", "leave", "work", "desk"]));
+    assert!(
+        out.starts_with("desk left flock work; its flocks: home:3; "),
+        "{out}"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "leave", "work", "desk"])),
+        "not_in_flock"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "leave", "home", "lab"])),
+        "not_in_flock"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "join", "nope", "desk"])),
+        "unknown_flock"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "join", "home", "nope"])),
+        "unknown_machine"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "join", "home", "desk", "--max", "0"])),
+        "config_error"
+    );
+
+    let out = ok(run(&["machine", "move", "lab", "work"]));
+    assert!(out.starts_with("moved lab to flock work (work:2)"), "{out}");
+    let out = ok(run(&["flock", "leave", "work", "lab"]));
+    assert!(
+        out.starts_with("lab left flock work; it is back in the default flock home; "),
+        "{out}"
+    );
+    let out = ok(run(&["flock", "add", "play", "desk", "lab"]));
+    assert!(
+        out.starts_with("added flock play; joined: desk (home:3,play:4), lab (play:2); "),
+        "{out}"
+    );
+
+    let ms: serde_json::Value =
+        serde_json::from_str(&ok(run(&["machine", "list", "--json"]))).unwrap();
+    let desk = &ms["machines"][0];
+    assert_eq!(desk["flock"], "home");
+    assert_eq!(
+        desk["flocks"],
+        serde_json::json!([
+            {"name": "home", "max": 3, "live": 0},
+            {"name": "play", "max": 4, "live": 0}
+        ])
+    );
+    let table = ok(run(&["machine", "list"]));
+    assert!(table.contains("home:3,play:4"), "{table}");
+}
+
+/// `flock join|leave` and `flock add` with machines go to a head of
+/// `JOIN_PROTOCOL` or later; an older one would refuse the first two and add
+/// the flock without its machines, so it is refused before anything is sent.
+#[test]
+fn flock_join_and_leave_go_through_the_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let flock_file = config.join("flock.toml");
+    std::fs::write(&flock_file, NAMED_FLOCKS).unwrap();
+    let socket = state.join("pastor.sock");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let cases: [(&[&str], serde_json::Value); 4] = [
+        (
+            &["flock", "join", "work", "pi-1"],
+            serde_json::json!({"op": "flock_join", "flock": "work", "machine": "pi-1"}),
+        ),
+        (
+            &["flock", "join", "work", "pi-1", "--max", "3"],
+            serde_json::json!({"op": "flock_join", "flock": "work", "machine": "pi-1", "max": 3}),
+        ),
+        (
+            &["flock", "leave", "work", "pi-1"],
+            serde_json::json!({"op": "flock_leave", "flock": "work", "machine": "pi-1"}),
+        ),
+        (
+            &["flock", "add", "spare", "pi-1"],
+            serde_json::json!({"op": "flock_add", "name": "spare", "default": false, "machines": ["pi-1"]}),
+        ),
+    ];
+    let reqs = text_head(&socket, pastor::ipc::JOIN_PROTOCOL);
+    for (args, want) in &cases {
+        assert_eq!(ok(run(args)), "said by the head\n", "{args:?}");
+        let sent = reqs.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(&sent, want, "{args:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), NAMED_FLOCKS);
+
+    std::fs::remove_file(&socket).unwrap();
+    let reqs = text_head(&socket, pastor::ipc::JOIN_PROTOCOL - 1);
+    for (args, _) in &cases {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+    }
+    // `flock add` with no machines is older than join.
+    ok(run(&["flock", "add", "spare"]));
+    let sent: Vec<serde_json::Value> = reqs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r["op"] != "ping")
+        .cloned()
+        .collect();
+    assert_eq!(
+        sent,
+        [serde_json::json!({"op": "flock_add", "name": "spare", "default": false})]
+    );
 }

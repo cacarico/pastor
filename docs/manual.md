@@ -88,9 +88,9 @@ machines:
 ```text
 pastor 0.4.0 on desk (herdr 0.9.1), 2 machines, desk is the head of the flock
 
-NAME  HOST       FLOCK     PROFILE  CHANNEL    HERDR  PASTOR  AGENTS  ORPHANS  TAGS  ERROR
-desk  local      personal  -        connected  0.9.1  0.4.0   0/2     -        -
-pi-3  user@pi-3  work      develop  connected  0.9.1  0.4.0   1/2     -        fast
+NAME  HOST       FLOCKS      PROFILE  CHANNEL    HERDR  PASTOR  AGENTS  ORPHANS  TAGS  ERROR
+desk  local      personal:2  -        connected  0.9.1  0.4.0   0/2     -        -
+pi-3  user@pi-3  work        develop  connected  0.9.1  0.4.0   1/2     -        fast
 ```
 
 The line names the head's pastor version, its hostname, the version of the
@@ -101,7 +101,7 @@ that ending. With no head running, the line is replaced by the notice on
 stderr that the machines were probed directly. `--flock F` lists only that
 flock's machines, and the line counts those.
 HOST is the ssh target, `local`, or the program a `command` machine runs.
-FLOCK is the flock the machine is in (see Flocks). PROFILE is the
+FLOCKS are the flocks the machine is in, with its number in each (see Flocks). PROFILE is the
 permission profile a task there runs under when it names none: the
 machine's own, else its flock's, else `[defaults]` (see [Permission
 profiles](#permission-profiles)); `profile` in `--json`. PASTOR is the pastor
@@ -589,11 +589,11 @@ with no number but the machine's own limits (`max_agents`, job slots and
 burst), as before. A machine that neither a `machines` table nor its own
 `flock` key places is in the default flock the same way. A machine is in
 every flock that places it, in file order; where one flock has to stand for
-it (a task pinned to it that names no flock, the machine's profile, FLOCK in
-older clients) that is the default flock if it is in it, else its first.
-`pastor machine list` shows every flock under FLOCK, with its number where
-it has one (`personal:2,work:1`), and `--json` carries them as `flocks`
-(`name`, `max`, `live`) next to `flock`. A flock's `machines` naming a
+it (a task pinned to it that names no flock, the machine's profile, `flock`
+in `--json` for older scripts) that is the default flock if it is in it, else
+its first. `pastor machine list` shows every flock under FLOCKS, with its
+number where it has one (`personal:2,work:1`), and `--json` carries them as
+`flocks` (`name`, `max`, `live`) next to `flock`. A flock's `machines` naming a
 machine the file lacks, a number of 0, or a machine placed in the same flock
 by both its `flock` key and the flock's `machines` fails the load. `pastor
 machine remove` takes the machine out of every flock's `machines` too.
@@ -612,12 +612,14 @@ ports, keys and jump hosts in `~/.ssh/config` under a host alias instead.
 
 ```
 pastor flock list                       NAME, DEFAULT, MACHINES, AGENTS, QUEUED (--json; --wide adds DESCRIPTION)
-pastor flock add <name> [--default] [--description TEXT]
+pastor flock add <name> [machines...] [--default] [--description TEXT]
+pastor flock join <flock> <machine> [--max N]   put a machine in a flock, or change its number there
+pastor flock leave <flock> <machine>    take a machine out of a flock
 pastor flock remove <name>              refused while it has machines or queued tasks, or is the default
 pastor flock default show               print the default flock
 pastor flock default set <name>         new tasks and jobs go to <name>
 pastor machine add ... [--flock F]      default: the default flock
-pastor machine move <name> <flock>
+pastor machine move <name> <flock>     leave every flock, join this one
 pastor machine list [--flock F]
 pastor machine describe <name>          one machine in full (--json)
 pastor flock describe <name>            one flock in full (--json)
@@ -635,12 +637,42 @@ tasks are queued in the implicit flock the machines stay there, so those
 tasks keep somewhere to run, and the output names the tasks. `flock add` says
 which flock those machines are in afterwards. `flock default set` writes the old
 default flock onto every machine that named none, so changing where new work goes moves no machine.
-`machine move` sets the machine's `flock` key and leaves the flocks' `machines`
-tables alone, so a machine they list stays in those flocks too; moving it into
-a flock whose `machines` table already lists it is a no-op, since it is
-already a member there and the `flock` key would only duplicate it.
-AGENTS in `flock list` counts the flock's own live tasks on its machines; it
-needs a running head and is `-` without one.
+
+`flock join <flock> <machine>` lists the machine in the flock's `machines`
+with `--max N`, by default the number it has there already, else its
+`max_agents`; it stays in its other flocks. Joining again with `--max`
+changes the number, and `--max 0` is refused (leave the flock instead). A
+machine nothing placed was in the default flock only for that, so once a flock
+lists it, it is in that flock alone; the output ends with the machine's
+flocks afterwards (`its flocks: home:2,work:4`). `flock add <name>
+[machines...]` joins the named machines to the new flock the same way.
+`flock leave <flock> <machine>` takes it out; out of its last flock it is back
+in the default flock, as a machine no flock lists, and a machine in the
+default only for that has nothing to leave (`not_in_flock`, as for a flock it
+is not in). Tasks already running keep running; a queued task of that flock
+pinned to the machine stays queued with a note, and the output names it.
+`machine move <name> <flock>` leaves every flock and joins that one with the
+machine's `max_agents`, for setups with one flock per machine, so it stays
+there whichever flock is the default later. A machine whose only membership
+is already that flock's `machines` table is left as it is.
+
+pastor never rewrites a machine's old `flock` key on its own. The first of
+`flock join`, `flock leave` or `machine move` on that machine (a move even to
+the flock the key names) moves the key into that flock's `machines`, with the
+machine's `max_agents` as the number, and keeps the file's comments. That number caps the machine's job
+slots and burst for the flock, as any flock number does; join with a higher
+`--max` to let them through.
+
+`flock list` shows each flock's machines with the flock's number and live
+tasks there: `desk 1/2, pi-3 0/1`. A machine with no number written (the old
+key, or the default flock of a machine no flock lists) shows its
+`max_agents`. The live count needs a running head and is `-` without one
+(`desk -/2`), and so is AGENTS, the flock's live tasks over all its
+machines. `--json` keeps `machines` as the names and adds `members`
+(`name`, `max`, `live`). The flock commands go through a running head like
+the other edits, need a head of IPC protocol 22 or later for `join`,
+`leave` and `add` with machines, and an agent pastor started may not run them
+unless `agents_change_fleet` is on.
 
 A task's flock is fixed when it is created: `--flock` on `pastor task run`, or
 `flock` under a job's `[dispatch]`; else the flock that stands for the machine it is pinned
@@ -656,8 +688,8 @@ started from a pastor before flocks would ignore `--flock` and read
 `flock.toml` as one flock, so while flocks are in play every command that
 talks to or reloads the head asks its protocol first and refuses an old one
 (`head_too_old`): restart `pastor serve` after an upgrade. Flocks are in play
-when the command takes `--flock`, edits `flock.toml` (`flock add|default|remove`,
-`machine add|remove|move`), or `flock.toml` declares named flocks, since then
+when the command takes `--flock`, edits `flock.toml` (`flock
+add|join|leave|default|remove`, `machine add|remove|move`), or `flock.toml` declares named flocks, since then
 no `--flock` means the default flock rather than every machine. A head that
 is listening but does not answer is refused whether flocks are in play or not
 (`head_unresponsive`); only a head that is not running at all is passed by.
@@ -841,8 +873,8 @@ task that is not pinned, the agent each machine of its flock would run), and
 `pastor task run` makes the head apply an edit of pastor.toml or flock.toml
 first, so a definition you have just added is the one its machine starts.
 
-`pastor machine move` changes the flock of tasks dispatched after it; tasks
-already on the machine keep running there, and its connection stays up. A
+`pastor machine move`, `pastor flock join` and `pastor flock leave` change the flocks of tasks
+dispatched after them; tasks already on the machine keep running there, and its connection stays up. A
 queued task pinned to a machine that has moved to another flock stays queued
 for its own flock, and the head logs a warning once.
 
@@ -1497,7 +1529,7 @@ make install                         # pastor into ~/.cargo/bin
 pastor machine add pi-3 user@pi-3 --max-agents 2 --herdr   # --herdr also saves it in herdr's sidebar
 pastor machine add here --local
 pastor flock add work                # a second flock; the machines above stay in `default`
-pastor machine move pi-3 work
+pastor flock join work pi-3 --max 1  # pi-3 also runs at most 1 of work's tasks
 pastor machine list                  # a line about the head, then each machine: host, flock, channel, herdr, pastor, agents
 pastor setup systemd                 # confirm, then install and enable --now; or just `pastor serve`
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3

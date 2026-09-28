@@ -417,7 +417,7 @@ enum MachineCmd {
         #[arg(long)]
         herdr: bool,
     },
-    /// Put a machine in another flock; tasks already on it stay there
+    /// Take a machine out of every flock and put it in this one; tasks already on it stay there
     Move {
         /// The machine, as flock.toml names it
         name: String,
@@ -485,12 +485,31 @@ enum FlockCmd {
     Add {
         /// The new flock's name
         name: String,
+        /// Machines that join it, each with its max_agents
+        machines: Vec<String>,
         /// Make it the default flock too
         #[arg(long)]
         default: bool,
         /// One line on what the flock is for, for `flock list --wide`
         #[arg(long, value_name = "TEXT")]
         description: Option<String>,
+    },
+    /// Put a machine in a flock, or change its number there; it stays in its other flocks
+    Join {
+        /// The flock
+        flock: String,
+        /// The machine, as flock.toml names it
+        machine: String,
+        /// At most this many of the flock's tasks on the machine (default: its max_agents, or its number there already)
+        #[arg(long, value_name = "N")]
+        max: Option<u32>,
+    },
+    /// Take a machine out of a flock; out of its last one it is in the default flock
+    Leave {
+        /// The flock
+        flock: String,
+        /// The machine, as flock.toml names it
+        machine: String,
     },
     /// Remove a flock; refused while it has machines or queued tasks, or is the default
     Remove {
@@ -1202,7 +1221,13 @@ fn needs_agent_protocol(command: &Command) -> bool {
 /// edit` are not: the first is older, the second edits here and reloads.
 fn needs_fleet_edit_protocol(command: &Command) -> bool {
     match command {
-        Command::Flock { cmd } => matches!(cmd, FlockCmd::Add { .. } | FlockCmd::Default { .. }),
+        Command::Flock { cmd } => matches!(
+            cmd,
+            FlockCmd::Add { .. }
+                | FlockCmd::Join { .. }
+                | FlockCmd::Leave { .. }
+                | FlockCmd::Default { .. }
+        ),
         Command::Machine { cmd } => matches!(
             cmd,
             MachineCmd::Add { .. } | MachineCmd::Remove { .. } | MachineCmd::Move { .. }
@@ -1320,6 +1345,19 @@ fn needs_file_protocol(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` sends a request only a head of `JOIN_PROTOCOL` or later
+/// knows or honours: `flock join|leave`, and `flock add` with machines.
+fn needs_join_protocol(command: &Command) -> bool {
+    match command {
+        Command::Flock { cmd } => match cmd {
+            FlockCmd::Join { .. } | FlockCmd::Leave { .. } => true,
+            FlockCmd::Add { machines, .. } => !machines.is_empty(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether `command` asks the head a request only a head of
 /// `HEAD_READS_PROTOCOL` or later knows: the trust commands and `flock|machine
 /// describe`.
@@ -1338,7 +1376,12 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_summary_mode_protocol(command) {
+    if needs_join_protocol(command) {
+        Some((
+            pastor::ipc::JOIN_PROTOCOL,
+            "predates `flock join` and `flock leave`, and would refuse them or add the flock without its machines",
+        ))
+    } else if needs_summary_mode_protocol(command) {
         Some((
             pastor::ipc::SUMMARY_MODE_PROTOCOL,
             "predates the summary setting, and would queue the task without --summary",
@@ -2231,6 +2274,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
         FlockCmd::Edit => return edit_file(paths, ConfigFile::Flock, head).await,
         FlockCmd::Add {
             name,
+            machines,
             default,
             description,
         } => {
@@ -2243,6 +2287,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                             name,
                             default,
                             description,
+                            machines,
                         }
                     )
                     .await?
@@ -2263,8 +2308,56 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                     .map(|t| t.display_id())
                     .collect())
             };
-            fleet_edit::add_flock(&path, &name, default, description.as_deref(), queued)
-                .map_err(edit_error)?
+            fleet_edit::add_flock(
+                &path,
+                &name,
+                default,
+                description.as_deref(),
+                &machines,
+                queued,
+            )
+            .map_err(edit_error)?
+        }
+        FlockCmd::Join {
+            flock,
+            machine,
+            max,
+        } => {
+            if head.is_live() {
+                println!(
+                    "{}",
+                    ask_text(
+                        paths,
+                        IpcRequest::FlockJoin {
+                            flock,
+                            machine,
+                            max
+                        }
+                    )
+                    .await?
+                );
+                return Ok(());
+            }
+            fleet_edit::join_flock(&path, &flock, &machine, max).map_err(edit_error)?
+        }
+        FlockCmd::Leave { flock, machine } => {
+            if head.is_live() {
+                println!(
+                    "{}",
+                    ask_text(paths, IpcRequest::FlockLeave { flock, machine }).await?
+                );
+                return Ok(());
+            }
+            // As with `flock add` without a head, a task queued between this
+            // read and the save is not named; it waits with a note all the
+            // same.
+            let queued = || -> anyhow::Result<Vec<Task>> {
+                open_store(paths)?.list_tasks(&TaskFilter {
+                    states: Some(vec![TaskState::Queued, TaskState::Paused]),
+                    ..Default::default()
+                })
+            };
+            fleet_edit::leave_flock(&path, &flock, &machine, queued).map_err(edit_error)?
         }
         FlockCmd::Remove { name } => {
             // With a head, the head checks and edits under the lock `task
@@ -3268,6 +3361,30 @@ mod tests {
         assert!(changes_fleet(&parse(&[
             "pastor", "queue", "move", "t-1", "--to", "2"
         ])));
+    }
+
+    /// `flock join|leave` are fleet edits: an agent pastor started may not
+    /// run them, and they need a head that knows them.
+    #[test]
+    fn flock_join_and_leave_change_the_fleet() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        for argv in [
+            &["pastor", "flock", "join", "work", "desk"][..],
+            &["pastor", "flock", "join", "work", "desk", "--max", "2"],
+            &["pastor", "flock", "leave", "work", "desk"],
+            &["pastor", "flock", "add", "work", "desk"],
+        ] {
+            assert!(changes_fleet(&parse(argv)), "{argv:?}");
+            assert_eq!(
+                protocol_need(&parse(argv)).map(|n| n.0),
+                Some(pastor::ipc::JOIN_PROTOCOL),
+                "{argv:?}"
+            );
+        }
+        assert_ne!(
+            protocol_need(&parse(&["pastor", "flock", "add", "work"])).map(|n| n.0),
+            Some(pastor::ipc::JOIN_PROTOCOL)
+        );
     }
 
     /// `--preempt` needs a head that knows pausing; without it the task

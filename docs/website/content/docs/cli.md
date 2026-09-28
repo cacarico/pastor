@@ -52,7 +52,7 @@ and so on. This page lists them; `--help` after any command lists its flags.
 |---|---|
 | `pastor machine add` | add a machine to flock.toml: over ssh, local or by a command |
 | `pastor machine remove` | remove a machine; tasks on it keep their rows |
-| `pastor machine move` | put a machine in another flock |
+| `pastor machine move` | take a machine out of every flock and put it in one |
 | `pastor machine list` | a line about the head, then each machine |
 | `pastor machine describe` | one machine in full: versions, agents, recent errors |
 | `pastor machine open` | open the full herdr UI on a machine |
@@ -62,8 +62,10 @@ and so on. This page lists them; `--help` after any command lists its flags.
 
 | command | does |
 |---|---|
-| `pastor flock list` | every flock: default or not, machines, live agents, queued tasks |
-| `pastor flock add` | declare a flock; `--default` makes new work go to it |
+| `pastor flock list` | every flock: default or not, machines with their numbers and live tasks, queued tasks |
+| `pastor flock add` | declare a flock, with the machines named; `--default` makes new work go to it |
+| `pastor flock join` | put a machine in a flock, or change its number there with `--max` |
+| `pastor flock leave` | take a machine out of a flock; out of its last, it is in the default |
 | `pastor flock remove` | remove a flock; refused while it has machines or queued tasks |
 | `pastor flock default` | the flock new tasks and jobs go to |
 | `pastor flock describe` | one flock in full |

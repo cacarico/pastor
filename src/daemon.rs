@@ -2745,6 +2745,7 @@ impl Daemon {
                 name,
                 default,
                 description,
+                machines,
             } => {
                 let store = &self.store;
                 self.edit_flock_file("; ", |file| {
@@ -2753,6 +2754,7 @@ impl Daemon {
                         &name,
                         default,
                         description.as_deref(),
+                        &machines,
                         || {
                             Ok(store
                                 .queued_tasks()?
@@ -2762,6 +2764,23 @@ impl Daemon {
                                 .collect())
                         },
                     )
+                })
+                .await
+            }
+            IpcRequest::FlockJoin {
+                flock,
+                machine,
+                max,
+            } => {
+                self.edit_flock_file("; ", |file| {
+                    crate::fleet_edit::join_flock(file, &flock, &machine, max)
+                })
+                .await
+            }
+            IpcRequest::FlockLeave { flock, machine } => {
+                let store = &self.store;
+                self.edit_flock_file("; ", |file| {
+                    crate::fleet_edit::leave_flock(file, &flock, &machine, || store.queued_tasks())
                 })
                 .await
             }
@@ -6322,6 +6341,7 @@ mod tests {
                 description: None,
                 name: "spare".into(),
                 default: false,
+                machines: vec![],
             })
             .await,
         );
@@ -6368,6 +6388,36 @@ mod tests {
         assert_eq!(fleet_flock_of(&d, "h").as_deref(), Some("spare"));
 
         let said = text(
+            d.handle(IpcRequest::FlockJoin {
+                flock: "work".into(),
+                machine: "h".into(),
+                max: Some(1),
+            })
+            .await,
+        );
+        assert!(
+            said.starts_with("h is in flock work with 1; its flocks: work:1,spare:2; "),
+            "{said}"
+        );
+        assert!(said.contains("picked it up"), "{said}");
+        assert_eq!(
+            d.fleet().flock().machine_flocks("h").unwrap(),
+            [("work", Some(1)), ("spare", Some(2))]
+        );
+        let said = text(
+            d.handle(IpcRequest::FlockLeave {
+                flock: "work".into(),
+                machine: "h".into(),
+            })
+            .await,
+        );
+        assert!(
+            said.starts_with("h left flock work; its flocks: spare:2"),
+            "{said}"
+        );
+        assert_eq!(on_disk().machine_flocks("h").unwrap(), [("spare", Some(2))]);
+
+        let said = text(
             d.handle(IpcRequest::MachineRemove { name: "w".into() })
                 .await,
         );
@@ -6383,8 +6433,24 @@ mod tests {
                     description: None,
                     name: "spare".into(),
                     default: false,
+                    machines: vec![],
                 },
                 "flock_exists",
+            ),
+            (
+                IpcRequest::FlockJoin {
+                    flock: "work".into(),
+                    machine: "nope".into(),
+                    max: None,
+                },
+                "unknown_machine",
+            ),
+            (
+                IpcRequest::FlockLeave {
+                    flock: "work".into(),
+                    machine: "h".into(),
+                },
+                "not_in_flock",
             ),
             (
                 IpcRequest::FlockSetDefault {
@@ -6449,6 +6515,7 @@ mod tests {
                 description: None,
                 name: "work".into(),
                 default: true,
+                machines: vec![],
             })
             .await
         else {
