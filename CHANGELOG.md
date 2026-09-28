@@ -38,6 +38,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A Claude agent that ended its turn waiting on a background shell (its
+  footer says `1 shell still running`) is no longer read as `done`: herdr
+  shows it idle, so pastor closed its pane after `settle` and the work it
+  would have finished when the shell ended was lost. Its task now stays
+  `running` until the shell ends and the agent goes idle again.
 - A task with no repo (no `--repo`, no `repo` in its job) opened its pane
   wherever herdr's focused pane was, so it could start in an unrelated
   checkout. It now starts in the machine's home directory; a machine that

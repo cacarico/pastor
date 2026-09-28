@@ -48,6 +48,11 @@ down here because getting them wrong cost a day.
   `task::trailing_question` looks for a last `●` message ending in `?`; if so
   the task goes `blocked` with its baseline moved to that idle, and
   `next_state` keeps a blocked task at that same sequence where it is.
+- herdr also shows Claude idle while it waits on a background shell it
+  left running at the end of its turn (footer: `1 shell still running`);
+  Claude picks the turn up when the shell ends. The same pane read
+  (`task::background_shell_running`) keeps such a task pending and running,
+  and looks again after the next settle window.
 - A herdr error reply is an API error with a code, never a dead connection.
   Only EOF before a reply, spawn failure or a non-zero exit with no reply are
   transport failures, and only those make a machine `lost`.
