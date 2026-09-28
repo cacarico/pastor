@@ -2564,6 +2564,7 @@ mod tests {
                 let pong = IpcResponse::Pong {
                     version: "0.6.0".into(),
                     protocol: pastor::ipc::PLACE_PROTOCOL,
+                    role: None,
                 };
                 let mut out = serde_json::to_string(&pong).unwrap();
                 out.push('\n');
