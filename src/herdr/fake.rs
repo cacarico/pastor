@@ -85,6 +85,8 @@ struct State {
     unpushed: HashSet<String>,
     /// What `Connector::pastor_version` reports.
     pastor_version: Option<String>,
+    /// What `Connector::opencode_permission_rules` reports.
+    opencode_permissions: Option<bool>,
     /// Branches `Connector::restore_worktree` finds gone.
     gone_branches: HashSet<String>,
     /// Every `Connector::restore_worktree` call, as (repo, path, branch).
@@ -203,6 +205,7 @@ impl FakeHerdr {
                 protocol: 22,
                 home: Some("/home/fake".into()),
                 pastor_version: Some("fake".into()),
+                opencode_permissions: Some(false),
                 ..Default::default()
             })),
             events,
@@ -216,6 +219,10 @@ impl FakeHerdr {
     }
     pub fn set_home(&self, home: Option<&str>) {
         self.state.lock().unwrap().home = home.map(str::to_string);
+    }
+    /// What the machine's own opencode config says about permission rules.
+    pub fn set_opencode_permissions(&self, rules: Option<bool>) {
+        self.state.lock().unwrap().opencode_permissions = rules;
     }
     pub fn set_pastor_version(&self, version: Option<&str>) {
         self.state.lock().unwrap().pastor_version = version.map(str::to_string);
@@ -1200,6 +1207,10 @@ impl super::transport::Connector for FakeHerdr {
             st.missing_dirs.remove(path);
         }
         Box::pin(async move { Ok(Some(added)) })
+    }
+    fn opencode_permission_rules(&self) -> super::transport::DirFuture<'_> {
+        let rules = self.state.lock().unwrap().opencode_permissions;
+        Box::pin(async move { Ok(rules) })
     }
     fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
         let version = self.state.lock().unwrap().pastor_version.clone();

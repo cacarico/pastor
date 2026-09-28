@@ -5275,6 +5275,71 @@ fn a_profile_reaches_herdr_and_bad_ones_are_refused() {
     }
 }
 
+/// opencode has no flags for tool lists, so a profiled opencode task is
+/// taken, and its agent starts with no permission args: its rules go in the
+/// pane's env (`OPENCODE_PERMISSION`, checked in `dispatch`'s tests).
+#[test]
+fn a_profile_reaches_opencode_without_flags() {
+    let env = start();
+    let t = env.json(&[
+        "task",
+        "run",
+        "hi",
+        "--agent",
+        "opencode",
+        "--profile",
+        "review",
+        "--json",
+    ]);
+    assert_eq!(t["profile"], "review", "{t}");
+    let start = env.agent_start_params("t-1");
+    assert_eq!(start["kind"], "opencode", "{start}");
+    assert_eq!(start["args"], serde_json::json!([]), "{start}");
+}
+
+/// `make smoke-profiles`'s script, against the fake herdr: a review task
+/// per agent that ends done passes, and the tasks are closed after; with no
+/// machine named it refuses to start.
+#[test]
+fn the_profile_smoke_script_passes_tasks_that_end_done() {
+    let env = start();
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/smoke-profiles.sh");
+    let run = |vars: &[(&str, &str)]| {
+        let mut c = Command::new("sh");
+        c.arg(script)
+            .env("PASTOR", env!("CARGO_BIN_EXE_pastor"))
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("POLL", "1")
+            .env("TIMEOUT", "30")
+            .env_remove("PASTOR_TASK")
+            .env_remove("CLAUDE")
+            .env_remove("OPENCODE");
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    let out = run(&[("REPO", "/srv/app")]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+
+    let out = run(&[
+        ("REPO", "/srv/app"),
+        ("CLAUDE", "fake"),
+        ("OPENCODE", "fake"),
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text.contains("PASS claude on fake: t-1 done"), "{text}");
+    assert!(text.contains("PASS opencode on fake: t-2 done"), "{text}");
+    for (t, agent) in [("t-1", "claude"), ("t-2", "opencode")] {
+        let got = env.json(&["task", "describe", t, "--json"]);
+        assert_eq!(got["state"], "closed", "{got}");
+        assert_eq!(got["profile"], "review", "{got}");
+        assert_eq!(got["spec"]["agent"], agent, "{got}");
+    }
+}
+
 /// `task attach` on a task whose pane is gone: one of a kind with no
 /// session keeps the old error with a hint that only Claude tasks reopen; a
 /// Claude task goes on to its machine to reopen the session, which a

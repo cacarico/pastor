@@ -86,7 +86,9 @@ down here because getting them wrong cost a day.
   reporting are repository settings. Its pull requests pass CI like any other.
 - Nothing in the suite talks to a real herdr. `make smoke SESSION=s` runs the
   opt-in test against one on the same host; do it on a fleet machine before
-  trusting a change to the transport or dispatch.
+  trusting a change to the transport or dispatch. `make smoke-profiles`
+  runs a live review task per agent through a head running the build under
+  test; do it before trusting a change to permission profiles.
 - Work on a branch, open a pull request, never push `main`.
 - Commit messages: conventional prefix, plain subject, a body that explains
   the why. No `Co-Authored-By` or other trailers.

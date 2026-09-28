@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check fmt lint test test-machine leaks smoke install install-completions completions demo site site-serve clean
+.PHONY: help build release check fmt lint test test-machine leaks smoke smoke-profiles install install-completions completions demo site site-serve clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -54,6 +54,11 @@ leaks: ## scan the whole git history for secrets, as CI does
 # fleet machine before trusting it.
 smoke: ## opt-in test against a real herdr: make smoke SESSION=default
 	PASTOR_REAL_HERDR_SESSION=$(or $(SESSION),default) cargo test --test real_herdr -- --ignored --nocapture
+
+# Needs a running head that runs this pastor, and the machines named in its
+# flock.toml; see scripts/smoke-profiles.sh. Starts real agents on them.
+smoke-profiles: ## live review task per agent: make smoke-profiles REPO='~/src/x' CLAUDE=m1 OPENCODE=m2
+	REPO="$(REPO)" CLAUDE="$(CLAUDE)" OPENCODE="$(OPENCODE)" scripts/smoke-profiles.sh
 
 install: ## install pastor into ~/.cargo/bin, with bash and fish completions
 	cargo install --path . --force --bin pastor

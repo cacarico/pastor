@@ -1,5 +1,6 @@
 pub mod flock;
 pub mod job;
+pub mod opencode;
 pub mod profile;
 
 use std::path::{Path, PathBuf};
@@ -978,22 +979,46 @@ impl Agents {
 
     /// How to start `spec`'s agent: its kind, `launch_args` and the env of
     /// its definition. Refused as `launch_args` is.
+    /// An opencode agent under a profile gets its lists in the env instead
+    /// (`opencode::permission_json`), over its definition's, with the
+    /// variables that would load another config emptied.
     pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, AgentRefusal> {
+        let mut env = self
+            .0
+            .get(&spec.agent)
+            .map(|d| d.env.clone())
+            .unwrap_or_default();
+        if self.opencode_profile(spec) {
+            for key in opencode::CONFIG_ENV {
+                env.insert(key.into(), String::new());
+            }
+            env.insert(
+                opencode::PERMISSION_ENV.into(),
+                opencode::permission_json(
+                    &spec.allow,
+                    &spec.deny,
+                    spec.profile() == Some(profile::UNRESTRICTED),
+                ),
+            );
+        }
         Ok(Launch {
             kind: self.kind(&spec.agent).to_string(),
             args: self.launch_args(spec)?,
-            env: self
-                .0
-                .get(&spec.agent)
-                .map(|d| d.env.clone())
-                .unwrap_or_default(),
+            env,
         })
+    }
+
+    /// Does `spec` run an opencode agent under a permission profile? Its
+    /// lists then go in `OPENCODE_PERMISSION`, not in flags.
+    pub fn opencode_profile(&self, spec: &crate::task::DispatchSpec) -> bool {
+        spec.profile().is_some() && self.kind(&spec.agent) == opencode::KIND
     }
 
     /// The argv after the agent's name for `spec`: its `agent_args`, then,
     /// under a permission profile, the args that stop a Claude agent from
     /// asking (`--permission-mode dontAsk`), then the flag and pattern of
-    /// each `allow`, then of each `deny`. Refused when a list is not empty
+    /// each `allow`, then of each `deny`; an opencode agent under a profile
+    /// gets no tool flags, its lists going in `launch`'s env. Refused when a list is not empty
     /// and the agent has no flag for it (`agent_tools_unsupported`):
     /// dropping a deny list without a word would be worse than not
     /// starting. Refused too when a profile applies and the args already
@@ -1020,6 +1045,9 @@ impl Agents {
                 });
             }
             args.extend(CLAUDE_NO_ASK.map(str::to_string));
+        }
+        if self.opencode_profile(spec) {
+            return Ok(args);
         }
         for (list, flag, key) in [
             (&spec.allow, allow_flag, "allow_flag"),
@@ -2230,6 +2258,58 @@ mod tests {
                 "Bash(sudo:*)"
             ]
         );
+    }
+
+    /// Under a profile an opencode agent gets its lists as
+    /// `OPENCODE_PERMISSION`, not as flags, whatever flags it defines, and
+    /// the variables that point it at another config emptied, over its own
+    /// env. Without a profile its lists still need flags.
+    #[test]
+    fn a_profile_reaches_opencode_through_its_env() {
+        let mut spec = spec_with("opencode", &["Edit"], &["Bash(sudo:*)"]);
+        spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            ask: AgentChoice::default(),
+            agent: "defaults".into(),
+            agent_args: None,
+            model: None,
+            model_from: None,
+            profile: Some("develop".into()),
+            profile_from: Some("defaults".into()),
+        }));
+        let agents: Agents = toml::from_str(
+            "[opencode]\nallow_flag = \"--allow\"\n\
+             env = { OPENCODE_CONFIG = \"~/x.json\", OPENCODE_PERMISSION = \"{}\", KEEP = \"1\" }\n",
+        )
+        .unwrap();
+        let launch = agents.launch(&spec).unwrap();
+        assert_eq!(launch.kind, "opencode");
+        assert_eq!(launch.args, vec!["--model", "m"]);
+        assert_eq!(
+            launch.env["OPENCODE_PERMISSION"],
+            opencode::permission_json(&spec.allow, &spec.deny, false)
+        );
+        for key in opencode::CONFIG_ENV {
+            assert_eq!(launch.env[key], "", "{key}");
+        }
+        assert_eq!(launch.env["KEEP"], "1");
+
+        // A definition of kind opencode is opencode.
+        let mine: Agents = toml::from_str("[oc]\nkind = \"opencode\"\n").unwrap();
+        spec.agent = "oc".into();
+        assert!(
+            mine.launch(&spec)
+                .unwrap()
+                .env
+                .contains_key("OPENCODE_PERMISSION")
+        );
+
+        spec.agent = "opencode".into();
+        spec.agent_source = None;
+        let err = Agents::default().launch(&spec).unwrap_err();
+        assert_eq!(err.code, "agent_tools_unsupported");
+        spec.allow.clear();
+        spec.deny.clear();
+        assert!(Agents::default().launch(&spec).unwrap().env.is_empty());
     }
 
     /// A task's profile comes from the first layer that names one, like its
