@@ -378,6 +378,7 @@ pub async fn run_job(
                     task_id: Some(t.id),
                     machine: None,
                     job: Some(t.job.clone()),
+                    summary: None,
                 });
                 report.created.push(t.display_id());
             }
@@ -518,6 +519,7 @@ fn back_off(
         task_id: None,
         machine: None,
         job: Some(job.name.clone()),
+        summary: None,
     });
 }
 
@@ -589,6 +591,7 @@ pub async fn submit_items(
                     task_id: Some(t.id),
                     machine: None,
                     job: Some(t.job.clone()),
+                    summary: None,
                 });
                 out.tasks.push(t);
             }

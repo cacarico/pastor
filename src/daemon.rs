@@ -2020,6 +2020,7 @@ impl Daemon {
                     task_id: Some(task.id),
                     machine: None,
                     job: Some(task.job.clone()),
+                    summary: None,
                 });
                 self.fleet.dispatch_queued().await;
                 match self.store.get_task(task.id) {
@@ -2598,6 +2599,7 @@ impl Daemon {
             task_id: Some(task.id),
             machine: None,
             job: Some(task.job.clone()),
+            summary: None,
         });
         self.fleet.dispatch_queued().await;
         match self.store.get_task(task.id) {
@@ -2666,6 +2668,7 @@ impl Daemon {
             task_id: Some(task.id),
             machine: None,
             job: Some(task.job.clone()),
+            summary: None,
         });
         self.fleet.dispatch_queued().await;
         match self.store.get_task(task.id) {
@@ -2766,6 +2769,7 @@ impl Daemon {
                     task_id: Some(id),
                     machine: None,
                     job: Some(closed.job.clone()),
+                    summary: None,
                 });
             }
             return IpcResponse::Task(closed);
@@ -2799,6 +2803,7 @@ impl Daemon {
                 task_id: Some(id),
                 machine: Some(machine),
                 job: Some(closed.job.clone()),
+                summary: None,
             });
             return IpcResponse::Task(closed);
         };

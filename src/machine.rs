@@ -16,7 +16,7 @@ use crate::herdr::{
     subscription_agent_status, subscription_lifecycle,
 };
 use crate::store::Store;
-use crate::task::{Observed, Task, TaskState, next_state};
+use crate::task::{Observed, Task, TaskState, TaskSummary, next_state};
 
 /// A herdr request that got no answer within `request_timeout`.
 #[derive(Debug, thiserror::Error)]
@@ -265,6 +265,14 @@ pub struct PastorEvent {
     /// names sent and the length of any text, never the text itself.
     #[serde(default)]
     pub detail: Option<serde_json::Value>,
+    /// On `task.done` and `task.failed`: how the round that just ended
+    /// ended, taken at the moment the event was queued. The event log's
+    /// build step trusts this rather than re-reading the store, which by
+    /// then may hold a later round's summary (a reopen, or `task done
+    /// --summary` landing on an already-done task before this event was
+    /// processed).
+    #[serde(default)]
+    pub summary: Option<TaskSummary>,
 }
 
 pub enum MachineCommand {
@@ -1139,17 +1147,29 @@ impl Actor {
     /// round keeps the pane's last lines (`Store::end_round`); `end_task`
     /// ends its own with what the agent said.
     fn emit_with(&self, kind: &str, task_id: Option<i64>, detail: Option<serde_json::Value>) {
-        if let Some(id) = task_id
-            && matches!(kind, "task.done" | "task.failed")
-            && let Err(err) = self.store.end_round(id, None)
-        {
-            tracing::error!(machine = %self.name, %err, id, "save the task's summary");
-        }
-        self.send_event(kind, task_id, detail);
+        let summary = task_id.filter(|_| matches!(kind, "task.done" | "task.failed"));
+        let summary = summary.and_then(|id| match self.store.end_round(id, None) {
+            Ok(summary) => Some(summary),
+            Err(err) => {
+                tracing::error!(machine = %self.name, %err, id, "save the task's summary");
+                None
+            }
+        });
+        self.send_event(kind, task_id, detail, summary);
     }
 
-    /// Send the event as it is, the task's job read from its row.
-    fn send_event(&self, kind: &str, task_id: Option<i64>, detail: Option<serde_json::Value>) {
+    /// Send the event as it is, the task's job read from its row. `summary`
+    /// is the round's summary at the moment the event is queued
+    /// (`task.done`/`task.failed` only): it travels with the event rather
+    /// than being read back from the store when the record is built, since
+    /// by then the store may hold a later round's summary.
+    fn send_event(
+        &self,
+        kind: &str,
+        task_id: Option<i64>,
+        detail: Option<serde_json::Value>,
+        summary: Option<TaskSummary>,
+    ) {
         let job = task_id.and_then(|id| match self.store.get_task(id) {
             Ok(t) => t.map(|t| t.job),
             Err(err) => {
@@ -1164,6 +1184,7 @@ impl Actor {
             task_id,
             machine: Some(self.name.clone()),
             job,
+            summary,
         });
     }
 
@@ -1592,11 +1613,15 @@ impl Actor {
             .is_some_and(|t| !was_done && t.state == TaskState::Done);
         if ended_now {
             // The round ends here, with what the agent said or the pane.
-            if let Err(err) = self.store.end_round(task_id, summary.as_deref()) {
-                tracing::error!(machine = %self.name, %err, task_id, "save the task's summary");
-            }
+            let round = match self.store.end_round(task_id, summary.as_deref()) {
+                Ok(round) => Some(round),
+                Err(err) => {
+                    tracing::error!(machine = %self.name, %err, task_id, "save the task's summary");
+                    None
+                }
+            };
             self.idle_agents.remove(&task_id);
-            self.send_event("task.done", Some(task_id), None);
+            self.send_event("task.done", Some(task_id), None, round);
         } else {
             if written.is_some() {
                 self.idle_agents.remove(&task_id);

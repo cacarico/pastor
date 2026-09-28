@@ -283,6 +283,7 @@ async fn run_finish(
             machine: None,
             job: Some(task.job.clone()),
             detail: Some(serde_json::json!({"connector": connector.id, "reason": reason})),
+            summary: None,
         });
     }
 }
@@ -1267,6 +1268,7 @@ mod tests {
                 task_id: Some(rec.id),
                 machine: None,
                 job: None,
+                summary: None,
             })
             .unwrap();
         }
