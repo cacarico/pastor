@@ -65,6 +65,8 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 - Tool permissions: without a profile the agent keeps its own permission mode. `allow` and `deny` lists of tool patterns (`"Bash(git:*)"`) in `[defaults]`, a `[[flock]]` entry or a job's `[dispatch]` add up, and deny wins over allow; pastor passes them as the agent's own flags (`--allowedTools`, `--disallowedTools` for Claude). An agent with no such flags refuses tasks that carry a list (`agent_tools_unsupported`). Never add `--dangerously-skip-permissions` or similar to `--agent-arg` on your own: a prompt-injected agent would then act as the machine's user with nothing to stop it. Leave that decision to the user.
 - `--timeout` bounds the task; past it the task goes `stale`. Without it the task takes its job's `timeout`, then its flock's, then `[defaults]`.
 - `--description TEXT` gives the task one line on what it is about, shown by `pastor task list --wide`, `task describe` and in `--json`; without it the prompt's first line stands in. Jobs, flocks and machines carry one too (`description` in their files); `--wide` on any `list` adds the column.
+- `--summary MODE` (`ask`, `require`, `off`) says whether the prompt asks the agent for a summary at the end, and with `require` fails a task that stops without one. Without it the task takes its job's, then its flock's, then `[defaults]`, then `ask`. `pastor task describe` shows the summary, and `task list --wide` its first line as RESULT.
+- `--role orchestrator` starts a task that may also run, retry, send to and close tasks and enable and disable jobs. Only a person may start one: from a task's pane it is `role_refused`.
 - `--prompt-file PATH` takes the prompt from a file on the machine running the CLI (`-` is stdin) in place of the argument; give exactly one of the two. Use it for a long prompt: quotes, backticks and `$` need no escaping, and trailing newlines are dropped. An unreadable file fails with `prompt_file_unreadable`, an empty one with `prompt_file_empty`.
 
 pastor sends the prompt as is, and the agent knows nothing else. Write it so the agent can finish alone: say where it is (its own worktree and branch), what to change, what to commit and where to push, what report to write, and to print `DONE` as its last line.
@@ -86,7 +88,7 @@ States:
 - `running`: the agent is working.
 - `blocked`: the agent is waiting on a permission prompt or question, or ended its turn on a question (the task's error reads `agent asked: ...`). Nobody answers it unless someone sends input (`pastor task send`) or attaches.
 - `done`: the agent went idle after pastor saw it work, and stayed idle for `settle` (10s by default). It means the agent stopped, not that the work is good; read the output.
-- `stale`: the timeout passed without `done`. The agent is left running.
+- `stale`: the timeout passed without `done`, or the task's pull machine went silent for `pull_lost_after` (`pastor.toml`, default `10m`). The agent is left running.
 - `paused`: a critical `--preempt` task took its slot; its pane is gone, its worktree kept, and it resumes its session when its machine has room. `task send` and `task attach` refuse it (`task_not_live`, `task_paused`); `task close` closes the row (`--remove-worktree` removes the kept worktree too).
 - `failed`: dispatch failed or the agent exited before it was done. `task describe` has the error.
 - `closed`: finished for good, by pastor after the grace period or by `task close`. Usually the pane is gone, but a task that never reached a machine, or whose machine left the flock, is closed as a row only: no pane was closed and its worktree may still be on disk.
@@ -135,7 +137,7 @@ tags = ["arm"]
 prompt = "It is {{ item.key }}. Run the suite and fix what broke. Task {{ task.id }}."
 ```
 
-`[dispatch]` takes the same things as `pastor task run`, plus tool lists: `agent`, `agent_args`, `model` (a name, or a template like `"{{ item.model }}"`; empty falls through to the flock's), `priority` (a level, or a template like `"{{ item.priority }}"`; empty falls through), `preempt` (its tasks that settle at critical may pause a low one), `profile`, `allow`, `deny`, `repo`, `worktree`, `branch`, `tags`, `flock`, `machine`, `timeout`, `place`, `label`, plus `max_tasks_per_run`, the `prompt` template and a `description` template for each task (default `"{{ item.title }}"`).
+`[dispatch]` takes the same things as `pastor task run`, plus tool lists: `agent`, `agent_args`, `model` (a name, or a template like `"{{ item.model }}"`; empty falls through to the flock's), `priority` (a level, or a template like `"{{ item.priority }}"`; empty falls through), `preempt` (its tasks that settle at critical may pause a low one), `summary`, `profile`, `allow`, `deny`, `repo`, `worktree`, `branch`, `tags`, `flock`, `machine`, `timeout`, `place`, `label`, plus `max_tasks_per_run`, `backfill` (how far back the first run looks, such as `"7d"`; without it the first run sees only items from then on), the `prompt` template and a `description` template for each task (default `"{{ item.title }}"`).
 
 ```bash
 pastor job list            # schedule, enabled, last and next run, errors
@@ -194,7 +196,7 @@ pastor events --task t-12 --json
 timeout 60 pastor events --follow   # --follow never returns on its own; always bound it
 ```
 
-It reads the log file, so it works with the head down.
+On the head's machine it reads the log file, so it works with the head down; with a remote head set it asks the head.
 
 To wait on the fleet rather than read its history, use `pastor watch`: one line per change to act on (`TASK t-12 failed ...`, `JOB nightly failing: ...`, `HEAD down: ...`, and the lines of connectors with a `[watch]` command).
 
@@ -206,6 +208,10 @@ pastor watch --name night --json --interval 2m --connector prs
 
 A watcher keeps a cursor under its `--name`, so one started again repeats nothing; `--reset` starts it over at the end of the log. It only reads, so it works from a pastor task too.
 
+## A head on another machine
+
+The CLI can drive a head on another machine over ssh. `pastor head set user@pi-1` saves it in `~/.config/pastor/client.toml`, `PASTOR_HEAD=<dest>` overrides that for one shell, and `--head <dest>` for one command. Every command then goes to that head, except `machine authorized-key` (`remote_head_unsupported`) and the ones that stay local on purpose: `completions`, `setup`, `head`, `bridge`, `connector` and `config edit --local`. `pastor serve` on such a machine runs headless: this machine's jobs and hooks, and the tasks the head hands it when it is a `pull = true` machine there.
+
 ## When pastor dispatched you
 
 You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `HERDR_ENV=1` is set, your herdr agent is named `t-N`), and the prompt reads like a self-contained work order. Then:
@@ -215,7 +221,7 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - Do not ask questions. Nobody is watching; a permission prompt or a question leaves the task `blocked` until a human happens to attach. If something is missing, say so in your report and stop.
 - When finished, run `pastor task done --summary "<outcome>: <what you did>"` (it ends your own task, from `PASTOR_TASK`; `--summary-file -` reads a longer one from stdin), print `DONE` as your last line, then go idle. The summary's first line starts with the outcome: `done`, `partial`, `blocked` or `nothing to do`; say what you pushed or why you stopped. pastor marks the task `done` at once and closes your pane after `close_done_after`, freeing the machine's slot. If your prompt ends by saying pastor fails the task without a summary, a bare `pastor task done` is refused (`summary_required`) and stopping without one fails the task: send one, whatever the outcome.
 - Do not close your pane or exit to clean up; `pastor task done` is how you say you are finished.
-- Do not run, send to, attach to, retry, reprioritize, move in the queue, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor machine open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `queue`, `read`, `events`, `watch`, `serve status`, and `describe` for tasks, jobs, machines, flocks and connectors) is fine; `pastor serve stop` is refused like `pastor serve`.
+- Do not run, send to, attach to, retry, reprioritize, move in the queue, close or prune tasks, tick (not even `--dry-run`), run, reload, enable, disable or edit jobs, change orchestrators, add or remove trusted repos, install, link, uninstall or unlink connectors, edit machines, flocks or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor machine open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `queue`, `read`, `events`, `watch`, `serve status`, and `describe` for tasks, jobs, machines, flocks and connectors) is fine; `pastor serve stop` is refused like `pastor serve`.
 - If `pastor task describe $PASTOR_TASK` says `role: orchestrator`, a person started you to coordinate: you may also `pastor task run`, `task retry`, `task send` and `task close`, and `pastor job disable` a failing job and `pastor job enable` it again. Everything else above is still refused, `task prune` included, and you may never start another orchestrator (`--role orchestrator` is `role_refused` from any task).
 - If an orchestrator file started you (your prompt ends with the lines its pre script printed), handle each line, then leave the next run a short handover note with `pastor orchestrator note "<what you did, what waits>"` (4 KiB at most; it is your orchestrator's, so no `--name`), and end with `pastor task done --summary-file -`. `pastor orchestrator describe <name>` shows the last runs and their lines.
 - If a session orchestrator started you (your prompt asks you to begin with `pastor watch --now`), run it, act on each line, then keep watching with `pastor watch` in the foreground; ending your turn ends your agent, and pastor starts another in your place. Keep the handover note current as you go (`pastor orchestrator note "..."`). When pastor types that your session ends, write the note and end your turn: you are closed after the grace.
