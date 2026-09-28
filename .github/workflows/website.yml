@@ -1,14 +1,27 @@
-# Builds docs/website with Hugo and publishes it to GitHub Pages. It runs on
-# pushes to main that touch the docs (the site renders docs/manual.md and
-# the pages under docs/website) or Cargo.toml (the header shows the
-# version), and by hand. Hugo is a pinned release checked against its
-# published checksums, and every action is pinned to a commit, as in
-# release.yml. Pages must be set to "GitHub Actions" in the repo settings.
+# Builds docs/website with Hugo. It runs on pushes to main and on pull
+# requests that touch the docs (the site renders docs/manual.md and the
+# pages under docs/website) or Cargo.toml (the header shows the version),
+# and by hand. Hugo is a pinned release checked against its published
+# checksums, and every action is pinned to a commit, as in release.yml.
+#
+# The site deploys to GitHub Pages only from cacarico/pastor, where Pages
+# is set to "GitHub Actions". In any other copy of the repo (the private
+# one, forks) Pages is off: the build still runs, so a broken site shows,
+# but configure-pages (which fails where Pages is off) and the deploy are
+# skipped. On a pull request the built site is uploaded as the `website`
+# artifact: download it from the run, unzip it and serve the folder
+# (`python3 -m http.server` in it). Opening index.html from disk does not
+# work: the pretty URLs (docs/install/) show a folder listing there.
 name: website
 
 on:
   push:
     branches: [main]
+    paths:
+      - "docs/**"
+      - "Cargo.toml"
+      - ".github/workflows/website.yml"
+  pull_request:
     paths:
       - "docs/**"
       - "Cargo.toml"
@@ -19,9 +32,10 @@ permissions:
   contents: read
 
 # One deploy at a time; a newer push waits instead of cancelling a deploy
-# half way.
+# half way. Pull requests get a group of their own, so they never queue
+# behind a deploy.
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -47,13 +61,22 @@ jobs:
           tar -xzf "$tarball" -C "$RUNNER_TEMP/hugo" hugo
           echo "$RUNNER_TEMP/hugo" >> "$GITHUB_PATH"
       - run: make site
-      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: website
+          path: docs/website/public
+          retention-days: 7
+      - if: github.repository == 'cacarico/pastor' && github.event_name != 'pull_request'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - if: github.repository == 'cacarico/pastor' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: docs/website/public
 
   deploy:
     needs: build
+    if: github.repository == 'cacarico/pastor' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
       pages: write
