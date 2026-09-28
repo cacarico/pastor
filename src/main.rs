@@ -564,12 +564,23 @@ fn main() {
         };
         let head = match head_use {
             Some(flocky) => {
+                // A job whose file is here, with a head elsewhere, is driven
+                // by this machine's serve: the head only supplies its recent
+                // tasks, so a protocol need that is only about the file
+                // request (`needs_file_protocol`) does not apply to it.
+                let local_job_route = remote.is_some()
+                    && matches!(&command, Command::Job { cmd }
+                        if job_name(cmd).is_some_and(|name| is_local_job(&paths, name)));
                 probe_head(
                     &paths,
                     // A remote head's flock.toml is not here to read.
                     flocky || remote.is_some() || flocks_declared(&paths),
                     needs_fleet_edit_protocol(&command),
-                    protocol_need(&command),
+                    if local_job_route {
+                        None
+                    } else {
+                        protocol_need(&command)
+                    },
                 )
                 .await?
             }
@@ -2293,7 +2304,16 @@ async fn local_serve(paths: &Paths) -> anyhow::Result<bool> {
     let socket = paths.socket_file();
     match pastor::ipc::ping_head(&socket).await {
         HeadPing::NotRunning => Ok(false),
-        HeadPing::Pong { .. } => Ok(true),
+        HeadPing::Pong {
+            role: Some(role), ..
+        } if role == pastor::ipc::SHEPHERD_ROLE => Ok(true),
+        HeadPing::Pong { .. } => Err(CliError::err(
+            "shepherd_unexpected",
+            format!(
+                "{} is a normal pastor head, not this machine's shepherd serve; this machine's own jobs cannot be read",
+                socket.display()
+            ),
+        )),
         HeadPing::Unresponsive => Err(CliError::err(
             "shepherd_unresponsive",
             format!(
@@ -2323,6 +2343,12 @@ async fn ask_here(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse>
 async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
     match cmd {
         JobCmd::Run { name } => {
+            if !local_serve(paths).await? {
+                return Err(CliError::err(
+                    "shepherd_not_running",
+                    "this machine's pastor serve is not running; start it to run a job here",
+                ));
+            }
             let IpcResponse::Text(msg) = ask_here(paths, IpcRequest::JobRun { name }).await? else {
                 unreachable!()
             };
