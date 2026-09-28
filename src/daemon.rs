@@ -137,16 +137,17 @@ fn flock_of(flock: &Flock, name: &str) -> String {
         .to_string()
 }
 
-/// The part of a machine's entry its actor is built from. The flock and the
-/// agent are not: they only decide which tasks the machine is offered and
-/// what they run, which dispatch reads from the flock last applied, so
-/// moving a machine or changing its agent keeps its connection and the
-/// tasks already on it.
+/// The part of a machine's entry its actor is built from. The flock, the
+/// agent and its per-kind agents are not: they only decide which tasks the
+/// machine is offered and what they run, which dispatch reads from the flock
+/// last applied, so moving a machine or changing its agent keeps its
+/// connection and the tasks already on it.
 fn actor_config(m: &MachineConfig) -> MachineConfig {
     MachineConfig {
         flock: None,
         agent: None,
         agent_args: None,
+        agents: Default::default(),
         ..m.clone()
     }
 }
