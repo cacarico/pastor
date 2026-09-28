@@ -3335,7 +3335,7 @@ mod tests {
         let extra: &[&str] = match words {
             "task run" | "task describe" | "task read" | "task attach" | "task retry"
             | "task close" | "task done" | "job run" | "machine open" => &["x"],
-            "task send" => &["x", "y"],
+            "task send" | "task priority" => &["x", "y"],
             "task prune" => &["--older-than", "1d", "--done"],
             "completions" => &["bash"],
             "setup" => &["systemd"],
