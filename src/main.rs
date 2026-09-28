@@ -4659,6 +4659,7 @@ mod tests {
             "tasks.md",
             "flocks.md",
             "remote-head.md",
+            "orchestrators.md",
         ] {
             let text = std::fs::read_to_string(docs.join(page)).unwrap();
             assert!(text.contains("examples/"), "{page} does not link examples");
