@@ -8,5 +8,5 @@
   has work. The machine's own room still caps everything, and the plain
   `desk = 2` stays a hard ceiling. `flock list` shows `desk 1/2/4`,
   `machine list` `work:2/4`, and `--json` carries `share` and `max`. A head
-  needs IPC protocol 25 to read the form, and the CLI refuses an older one
+  needs IPC protocol 26 to read the form, and the CLI refuses an older one
   while flock.toml uses it.

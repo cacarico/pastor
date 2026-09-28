@@ -41,7 +41,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `failed` or `stale`), summary and lines. A run is skipped while the last
   agent works or its post script waits, a pre script that fails or prints more
   than 64 KiB of lines backs off as a failing job does, `max_orchestrators` in
-  pastor.toml (default 1, outside `max_agents`) holds agents back, and an
+  pastor.toml (default 1; each also takes a slot under `max_agents`) holds agents back, and an
   agent that stopped on a quota error holds the next until the reset.
   `session` files are checked (a key of the other kind makes a file invalid)
   but not run yet. New commands: `pastor orchestrator list | describe | run |
@@ -114,7 +114,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `task describe` shows the label and where it came from. `task run --label`
   needs a head of IPC protocol 19.
 - `pastor serve` starts the head in the background and returns once it
-  answers, logging to `~/.local/state/pastor/serve.log` (rotated at 10 MB,
+  answers, logging to `~/.local/state/pastor/serve.log` (rotated at 10 MiB,
   three old files kept). `pastor serve --foreground` (`-f`) keeps it in the
   terminal, as `pastor serve` did before. `pastor serve status` (with
   `--json`) says whether a head or headless serve runs here, its pid,
@@ -142,7 +142,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   none is skipped for the flock's tasks, with a note while they wait, or
   refuses a task pinned to it (`agent_kind_missing`). A machine's own
   profile still decides whether `unrestricted` may run there; a flock's
-  never lifts it.
+  never lifts it. A head needs IPC protocol 24 to read a flock's `timeout`
+  and `place`, and the CLI refuses an older one while flock.toml sets
+  them.
 - The agent skill (`pastor --skill`) has a checklist for bringing a new
   machine into a flock: herdr, pastor and the agent on the PATH of a
   non-interactive ssh command, every repo cloned at the same path, `pastor
