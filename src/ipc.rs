@@ -24,8 +24,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// descriptions (`Run::description`, `FlockAdd::description`,
 /// `JobTask::description`). 16: pausing (`Run::preempt`,
 /// `TaskPriority::preempt`). 17: task summaries (`TaskDone::summary`,
-/// `TaskSummaries`).
-pub const IPC_PROTOCOL: u32 = 17;
+/// `TaskSummaries`). 18: a machine in many flocks, each with its own number
+/// (`FlockEntry::machines`).
+pub const IPC_PROTOCOL: u32 = 18;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -68,6 +69,13 @@ pub const FILE_PROTOCOL: u32 = 6;
 /// The first protocol whose head takes `JobTask`, what a headless serve
 /// sends for each item its jobs find. An older one refuses it as unknown.
 pub const SHEPHERD_PROTOCOL: u32 = 9;
+
+/// The first protocol whose head's `FlockEntry` knows `machines`, a flock's
+/// per-machine number. An older head's `FlockEntry` (`deny_unknown_fields`)
+/// rejects the field on reload and keeps its previous, single-flock
+/// membership instead, so a CLI new enough to write `machines` refuses to
+/// send it work (see `multi_flock_declared` in `main.rs`).
+pub const MULTI_FLOCK_PROTOCOL: u32 = 18;
 
 /// `Pong::role` of a headless `pastor serve`: it runs this machine's jobs
 /// and hooks against a head elsewhere, and is not a head itself.

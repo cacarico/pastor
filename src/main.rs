@@ -615,6 +615,21 @@ fn main() {
                     needs_fleet_edit_protocol(&command),
                     if local_job_route {
                         None
+                    } else if remote.is_none() && multi_flock_declared(&paths) {
+                        // Per-flock `machines` is a field an older head's
+                        // `FlockEntry` (`deny_unknown_fields`) does not know;
+                        // its reload fails and it silently keeps the old,
+                        // single-flock membership, so refuse rather than let
+                        // the CLI dispatch, list or reload on that stale view.
+                        protocol_need(&command).map_or(
+                            Some((
+                                pastor::ipc::MULTI_FLOCK_PROTOCOL,
+                                "predates per-flock machine limits, and would silently drop flock.toml's `machines` on reload, keeping its old membership",
+                            )),
+                            |(p, why)| {
+                                Some((p.max(pastor::ipc::MULTI_FLOCK_PROTOCOL), why))
+                            },
+                        )
                     } else {
                         protocol_need(&command)
                     },
@@ -1259,6 +1274,15 @@ fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
 /// not load counts as declaring them.
 fn flocks_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).map_or(true, |f| !f.flocks.is_empty())
+}
+
+/// Whether flock.toml puts any machine in a flock with a number
+/// (`[[flock]] machines = { desk = 2 }`), the schema an older head's
+/// `FlockEntry` does not know (see `probe_head`'s `need` above). A
+/// flock.toml that does not load counts as not declaring it: a head that
+/// cannot read the file either is refused for other reasons first.
+fn multi_flock_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| !e.machines.is_empty()))
 }
 
 /// The prompt of `pastor task run`: the positional one as given, or the

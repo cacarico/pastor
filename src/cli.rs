@@ -489,7 +489,14 @@ pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]
                     .filter(|s| machines.contains(&s.name))
                     .map(|s| match s.flocks.iter().find(|f| f.name == name) {
                         Some(seat) => seat.live,
-                        None if s.flocks.is_empty() => s.live,
+                        // A head that reports only its single `flock` (or none, before
+                        // flocks): count its live agents under that one flock, not
+                        // under every local flock the machine is configured into.
+                        None if s.flocks.is_empty()
+                            && name == s.flock.as_deref().unwrap_or(flock.default_flock()) =>
+                        {
+                            s.live
+                        }
                         None => 0,
                     })
                     .sum()
