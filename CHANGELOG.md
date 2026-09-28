@@ -17,7 +17,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The first `join`, `leave` or `machine move` on a machine with the old
   `flock = "..."` key moves it into the flock's `machines` with the
   machine's `max_agents`, keeping comments. They go through the head like
-  the other fleet edits (IPC protocol 20; the CLI refuses an older head
+  the other fleet edits (IPC protocol 22; the CLI refuses an older head
   with `head_too_old`), an agent pastor started may not run them, and tab
   completion offers flocks and machines. A machine that is not in the flock
   is `not_in_flock`.

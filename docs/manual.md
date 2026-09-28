@@ -670,7 +670,7 @@ key, or the default flock of a machine no flock lists) shows its
 (`desk -/2`), and so is AGENTS, the flock's live tasks over all its
 machines. `--json` keeps `machines` as the names and adds `members`
 (`name`, `max`, `live`). The flock commands go through a running head like
-the other edits, need a head of IPC protocol 20 or later for `join`,
+the other edits, need a head of IPC protocol 22 or later for `join`,
 `leave` and `add` with machines, and an agent pastor started may not run them
 unless `agents_change_fleet` is on.
 
