@@ -1514,7 +1514,7 @@ pub fn refusal(task: &str, role: TaskRole) -> String {
     match role {
         TaskRole::Agent => agent_refusal(task),
         TaskRole::Orchestrator => format!(
-            "{task} is an orchestrator, and an orchestrator may only run, retry and send to tasks and disable jobs besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
+            "{task} is an orchestrator, and an orchestrator may only run, retry, send to and close tasks and enable and disable jobs besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
         ),
     }
 }
@@ -5835,10 +5835,11 @@ mod tests {
         file
     }
 
-    /// An orchestrator may run, retry and send to tasks and disable a job,
-    /// all from its own pane with `agents_change_fleet` off.
+    /// An orchestrator may run, retry, send to and close tasks and enable
+    /// and disable a job, all from its own pane with `agents_change_fleet`
+    /// off.
     #[tokio::test]
-    async fn an_orchestrator_may_run_retry_send_and_disable() {
+    async fn an_orchestrator_may_run_retry_send_close_enable_and_disable() {
         let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         assert!(!d.fleet().agents_change_fleet());
         let me = orchestrator(&d).await;
@@ -5894,6 +5895,35 @@ mod tests {
                 .unwrap()
                 .contains("enabled = false")
         );
+        let resp = d
+            .handle_from(
+                IpcRequest::JobSetEnabled {
+                    name: "clock".into(),
+                    enabled: true,
+                },
+                Some(own),
+            )
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("enabled = true")
+        );
+
+        let resp = d
+            .handle_from(
+                IpcRequest::TaskClose {
+                    id: retry.id,
+                    remove_worktree: false,
+                },
+                Some(own),
+            )
+            .await;
+        let IpcResponse::Task(closed) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(closed.state, TaskState::Closed);
     }
 
     /// Everything else that changes the fleet is refused an orchestrator,
@@ -5934,13 +5964,9 @@ mod tests {
                     description: None,
                 },
             },
-            IpcRequest::TaskClose {
-                id: worker.id,
-                remove_worktree: false,
-            },
-            IpcRequest::JobSetEnabled {
-                name: "clock".into(),
-                enabled: true,
+            IpcRequest::TaskPrune {
+                states: vec![TaskState::Done],
+                older_than_secs: 0,
             },
             IpcRequest::JobRun {
                 name: "clock".into(),
@@ -5965,16 +5991,32 @@ mod tests {
         let agent = worker.display_id();
         let resp = d.handle_from(run_hi(), Some(&agent)).await;
         assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        for enabled in [false, true] {
+            let resp = d
+                .handle_from(
+                    IpcRequest::JobSetEnabled {
+                        name: "clock".into(),
+                        enabled,
+                    },
+                    Some(&agent),
+                )
+                .await;
+            assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        }
         let resp = d
             .handle_from(
-                IpcRequest::JobSetEnabled {
-                    name: "clock".into(),
-                    enabled: false,
+                IpcRequest::TaskClose {
+                    id: worker.id,
+                    remove_worktree: false,
                 },
                 Some(&agent),
             )
             .await;
         assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        assert_eq!(
+            d.store.get_task(worker.id).unwrap().unwrap().state,
+            worker.state
+        );
         // A task the head does not know is a plain agent.
         let resp = d.handle_from(run_hi(), Some("t-999")).await;
         assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");

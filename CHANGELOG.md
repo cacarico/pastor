@@ -36,6 +36,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   connector's `[finish]` stdin has `summary`. Needs a head speaking IPC
   protocol 17.
 
+### Changed
+
+- An orchestrator task may also close tasks (`pastor task close`) and enable
+  a job (`pastor job enable`), so it can clean up tasks it sent wrong and turn
+  back on a job it disabled without waiting for a person. A plain agent is
+  still refused both.
+
 ### Fixed
 
 - A task with no repo (no `--repo`, no `repo` in its job) opened its pane

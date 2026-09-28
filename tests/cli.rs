@@ -3063,8 +3063,8 @@ fn a_task_done_with_a_summary_shows_it() {
 }
 
 /// A person starts an orchestrator with `task run --role orchestrator`; from
-/// its pane it may run tasks, but not close one or make another
-/// orchestrator, and no plain agent may make one either. `task describe` and
+/// its pane it may run and close tasks, but not prune them or make another
+/// orchestrator, and no plain agent may do any of these. `task describe` and
 /// `task list --json` name the role.
 #[test]
 fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
@@ -3112,16 +3112,23 @@ fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
     }
     // t-1's guard runs before the head is ever asked, so it must still know
     // t-1 is an orchestrator: its refusal names the role, not "agent".
-    let closed = from("t-1", &["task", "close", "t-2"]);
-    assert_eq!(error_code(&closed), "agent_refused");
-    let err = String::from_utf8_lossy(&closed.stderr);
+    let pruned = from("t-1", &["task", "prune", "--done", "--older-than", "1d"]);
+    assert_eq!(error_code(&pruned), "agent_refused");
+    let err = String::from_utf8_lossy(&pruned.stderr);
     assert!(err.contains("orchestrator"), "{err}");
     assert!(!err.contains("is an agent pastor started"), "{err}");
     assert_eq!(
         error_code(&from("t-2", &["task", "run", "go", "--repo", "/tmp"])),
         "agent_refused"
     );
-    let listed = env.json(&["task", "list", "--json"]);
+    assert_eq!(
+        error_code(&from("t-2", &["task", "close", "t-2"])),
+        "agent_refused"
+    );
+    let closed: serde_json::Value =
+        serde_json::from_str(&ok(from("t-1", &["task", "close", "t-2", "--json"]))).unwrap();
+    assert_eq!(closed["state"], "closed", "{closed}");
+    let listed = env.json(&["task", "list", "--all", "--json"]);
     let roles: Vec<&str> = listed
         .as_array()
         .unwrap()

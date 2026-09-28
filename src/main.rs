@@ -255,8 +255,9 @@ struct RunArgs {
     #[arg(long, value_name = "PLACE")]
     place: Option<Place>,
     /// What the agent may change through the head: agent (read, and end
-    /// its own task) or orchestrator (also run, retry and send to tasks and
-    /// disable jobs). Only a person may start an orchestrator, never a task
+    /// its own task) or orchestrator (also run, retry, send to and close
+    /// tasks and enable and disable jobs). Only a person may start an
+    /// orchestrator, never a task
     #[arg(long, value_enum, value_name = "ROLE", default_value_t = TaskRole::Agent)]
     role: TaskRole,
     /// One line on what the task is about, for `task list --wide` and
@@ -1019,14 +1020,17 @@ fn makes_orchestrator(command: &Command) -> bool {
 /// Whether `command` is one an orchestrator task may make
 /// (`IpcRequest::orchestrator_may`). The CLI does not know the caller's
 /// role, so from a task's pane it leaves these to the head, which does:
-/// `task run|retry|send` only ever go through it, and `job disable` with no
-/// head is refused in `toggle`.
+/// `task run|retry|send|close` only ever go through it, and `job
+/// enable|disable` with no head is refused in `toggle`.
 fn orchestrator_may(command: &Command) -> bool {
     match command {
         Command::Task { cmd } => {
-            matches!(cmd, TaskCmd::Run(_) | TaskCmd::Retry(_) | TaskCmd::Send(_))
+            matches!(
+                cmd,
+                TaskCmd::Run(_) | TaskCmd::Retry(_) | TaskCmd::Send(_) | TaskCmd::Close(_)
+            )
         }
-        Command::Job { cmd } => matches!(cmd, JobCmd::Disable { .. }),
+        Command::Job { cmd } => matches!(cmd, JobCmd::Enable { .. } | JobCmd::Disable { .. }),
         _ => false,
     }
 }
@@ -2836,7 +2840,8 @@ async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow:
         return Err(CliError::err(
             "agent_refused",
             format!(
-                "{task} is an agent pastor started; with no pastor serve running to check its role, it may not disable a job"
+                "{task} is an agent pastor started; with no pastor serve running to check its role, it may not {} a job",
+                if enabled { "enable" } else { "disable" }
             ),
         ));
     }
@@ -2897,12 +2902,13 @@ mod tests {
             &["pastor", "task", "retry", "t-1"],
             &["pastor", "task", "send", "t-1", "go"],
             &["pastor", "job", "disable", "j"],
+            &["pastor", "task", "close", "t-1"],
+            &["pastor", "job", "enable", "j"],
         ] {
             assert!(orchestrator_may(&parse(argv)), "{argv:?}");
         }
         for argv in [
-            &["pastor", "task", "close", "t-1"][..],
-            &["pastor", "job", "enable", "j"],
+            &["pastor", "task", "prune", "--done", "--older-than", "1d"][..],
             &["pastor", "job", "run", "j"],
             &["pastor", "machine", "add", "m", "--local"],
         ] {

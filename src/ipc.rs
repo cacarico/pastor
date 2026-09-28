@@ -441,18 +441,19 @@ impl IpcRequest {
     }
 
     /// Whether an orchestrator task (`TaskRole::Orchestrator`) may make this
-    /// change without `agents_change_fleet`: run, retry and type into tasks,
-    /// and disable a job. One arm per request, so adding one is one line.
+    /// change without `agents_change_fleet`: run, retry, type into and close
+    /// tasks, and enable or disable a job.
     /// Making another orchestrator is refused apart from this, whoever asks
     /// from inside a task (`Daemon::handle_from`).
     pub fn orchestrator_may(&self) -> bool {
-        match self {
-            IpcRequest::Run { .. } => true,
-            IpcRequest::TaskRetry { .. } => true,
-            IpcRequest::TaskSend { .. } => true,
-            IpcRequest::JobSetEnabled { enabled, .. } => !enabled,
-            _ => false,
-        }
+        matches!(
+            self,
+            IpcRequest::Run { .. }
+                | IpcRequest::TaskRetry { .. }
+                | IpcRequest::TaskSend { .. }
+                | IpcRequest::TaskClose { .. }
+                | IpcRequest::JobSetEnabled { .. }
+        )
     }
 
     /// Whether the request only ends `task`, the task the caller runs in
@@ -1228,9 +1229,9 @@ mod tests {
         ]
     }
 
-    /// An orchestrator may run, retry and type into tasks and disable a job,
-    /// and nothing else that changes the fleet: not `task close`, not a job
-    /// enabled, not a file or machine edit.
+    /// An orchestrator may run, retry, type into and close tasks and enable
+    /// or disable a job, and nothing else that changes the fleet: not a
+    /// prune, not a file or machine edit.
     #[test]
     fn an_orchestrator_may_make_exactly_the_specs_changes() {
         for req in fleet_changes() {
@@ -1239,21 +1240,31 @@ mod tests {
                 IpcRequest::Run { .. }
                     | IpcRequest::TaskRetry { .. }
                     | IpcRequest::TaskSend { .. }
-                    | IpcRequest::JobSetEnabled { enabled: false, .. }
+                    | IpcRequest::TaskClose { .. }
+                    | IpcRequest::JobSetEnabled { .. }
             );
             assert_eq!(req.orchestrator_may(), allowed, "{req:?}");
         }
+        for enabled in [true, false] {
+            assert!(
+                IpcRequest::JobSetEnabled {
+                    name: "j".into(),
+                    enabled
+                }
+                .orchestrator_may()
+            );
+        }
         assert!(
-            !IpcRequest::JobSetEnabled {
-                name: "j".into(),
-                enabled: true
+            IpcRequest::TaskClose {
+                id: 1,
+                remove_worktree: false
             }
             .orchestrator_may()
         );
         assert!(
-            !IpcRequest::TaskClose {
-                id: 1,
-                remove_worktree: false
+            !IpcRequest::TaskPrune {
+                states: vec![TaskState::Done],
+                older_than_secs: 60,
             }
             .orchestrator_may()
         );
