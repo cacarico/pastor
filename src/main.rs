@@ -47,7 +47,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the daemon in the background: scheduler, machine channels, dispatch. With a head set on another machine, run headless: only this machine's jobs and hooks
+    /// Run the daemon in the background: scheduler, machine channels, dispatch. With a head set on another machine, run headless: this machine's jobs and hooks, and the head's tasks for it as a pull machine
     ///
     /// A bare `pastor serve` starts the head in the background, logging to
     /// serve.log in the state dir, and returns once it answers; --foreground
