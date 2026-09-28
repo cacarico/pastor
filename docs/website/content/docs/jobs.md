@@ -74,4 +74,5 @@ pastor job reload  # re-read the files now, not at the next tick
 A file that stops parsing keeps its last good version, and `job list` shows
 the error. `job edit` saves the file only once it is valid.
 
+A job that hands Kanban cards to agents is in the [examples](../examples/).
 More in the [manual](../manual/#how-it-works).

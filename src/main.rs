@@ -3814,6 +3814,32 @@ mod tests {
         assert!(check_commands(SKILL).0 > 20);
     }
 
+    /// The website's examples page is reached from the docs index, from the
+    /// pages its examples belong to, and from the home's "how I use it" pane,
+    /// so a rename or a lost link shows here rather than as a dead page.
+    #[test]
+    fn website_examples_page_is_linked() {
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let docs = site.join("content/docs");
+        assert!(docs.join("examples.md").is_file(), "no examples.md");
+        for page in [
+            "_index.md",
+            "jobs.md",
+            "tasks.md",
+            "flocks.md",
+            "remote-head.md",
+        ] {
+            let text = std::fs::read_to_string(docs.join(page)).unwrap();
+            assert!(text.contains("examples/"), "{page} does not link examples");
+        }
+        let home = std::fs::read_to_string(site.join("layouts/home.html")).unwrap();
+        assert!(home.contains("how I use it"), "no \"how I use it\" pane");
+        assert!(
+            home.contains("docs/examples/"),
+            "home does not link examples"
+        );
+    }
+
     /// The manual's remote head section lists which commands go to the head,
     /// which stay here, and names the ones refused; each list must be what
     /// `remote_route` does.

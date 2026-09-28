@@ -74,4 +74,5 @@ Append the line to the head user's `~/.ssh/authorized_keys`. It forces
 `pastor bridge --agent --machine pi-1`, which answers anything else with
 `not_allowed_for_agent`. Give each machine its own key.
 
+Adding a machine over ssh and reading its load is in the [examples](../examples/).
 More in the [manual](../manual/#a-head-on-another-machine).

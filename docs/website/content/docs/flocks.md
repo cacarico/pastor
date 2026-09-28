@@ -97,4 +97,5 @@ goes only to a machine that carries every tag it asks for.
 pastor task run "Build the image" --repo '~/work/api' --flock work --tag arm
 ```
 
+Two accounts on one head, with a flock each, is in the [examples](../examples/).
 More in the [manual](../manual/#flocks).

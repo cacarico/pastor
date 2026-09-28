@@ -70,6 +70,8 @@ pastor task describe t-1
 pastor events --follow
 ```
 
+A PR fix round, run and followed this way, is in the [examples](../examples/).
+
 ## answer it
 
 A blocked agent is waiting for you. Read what it asked, then answer, or
