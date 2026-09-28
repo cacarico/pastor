@@ -4758,7 +4758,7 @@ mod tests {
         for words in spans(&between("Local on purpose, as with no head set:", "\n\n")) {
             assert_eq!(route(&words), RemoteRoute::Here, "{words}");
         }
-        let refused = between("Every other command runs on the head only.", "\n\n");
+        let refused = between("Only one command is refused with a remote head:", "\n\n");
         let refused = spans(&refused);
         assert_eq!(refused[0], "machine authorized-key");
         assert!(matches!(route(&refused[0]), RemoteRoute::Unsupported(_)));
@@ -4810,15 +4810,14 @@ mod tests {
             "machine add" => &["x", "--local"],
             "machine authorized-key" => &["x", "--key", "-"],
             "flock default" => &["show"],
-            "task send" | "task priority" | "machine move" | "trust add" | "trust remove" => {
-                &["x", "y"]
-            }
+            "task send" | "task priority" | "machine move" | "trust add" | "trust remove"
+            | "flock join" | "flock leave" => &["x", "y"],
             "queue move" => &["x", "--top"],
             "task prune" => &["--older-than", "1d", "--done"],
             "completions" => &["bash"],
             "setup" => &["systemd"],
             "head" => &["show"],
-            "connector" => &["list"],
+            "connector" | "orchestrator" => &["list"],
             _ => &[],
         };
         let argv = std::iter::once("pastor")
