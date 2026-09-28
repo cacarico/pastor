@@ -52,10 +52,10 @@ b, strong { font-weight: 700; color: var(--hot); }
 .cursor { background: var(--ink); color: var(--bg); }
 
 /* home */
-.home { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); grid-template-areas: "what install" "how first" "not first" "use use"; }
-.steps { margin: 0; padding: 0; list-style: none; counter-reset: step; }
-.steps li { counter-increment: step; display: grid; grid-template-columns: 3ch 1fr; margin-bottom: 4px; }
-.steps li::before { content: counter(step); color: var(--accent); }
+.home { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); grid-template-areas: "pastor install" "live live" "can why" "can not"; }
+.pitch { font-size: 1.1em; }
+.pitch b { color: var(--accent); }
+.feats b { display: inline-block; min-width: 7ch; }
 .not { margin: 0; padding: 0; list-style: none; }
 .not li { display: grid; grid-template-columns: 2ch 1fr; margin-bottom: 4px; }
 .not li::before { content: "×"; color: var(--bad); }
@@ -64,6 +64,19 @@ b, strong { font-weight: 700; color: var(--hot); }
 .uses li { display: grid; grid-template-columns: 2ch 1fr; margin-bottom: 4px; }
 .uses li::before { content: "›"; color: var(--accent); }
 .uses b { color: var(--ink); }
+
+/* the live terminal: term.js types the transcript into it */
+.term { background: var(--code); padding: 8px 10px; margin: 6px 0 8px; font-size: 13px; line-height: 1.45; }
+.term .p { color: var(--dim); user-select: none; }
+.term .lbl { color: var(--accent); }
+.term .in { color: var(--sel-ink); }
+.term .ask { color: var(--hot); }
+.term .out { color: var(--dim); }
+.term .rep { color: var(--ok); }
+.term-bar { color: var(--dim); }
+.term-bar button { font: inherit; color: var(--link); background: none; border: 0; padding: 0; cursor: pointer; }
+.term-bar button:hover, .term-bar button:focus-visible { text-decoration: underline; outline: none; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 /* docs */
 .docs { grid-template-columns: 22ch minmax(0, 1fr); }
@@ -117,7 +130,8 @@ h2:hover .anchor, h3:hover .anchor, h4:hover .anchor, .anchor:focus { opacity: 1
 .status .right { margin-left: auto; padding-right: 1ch; color: var(--dim); }
 
 @media (max-width: 760px) {
-  .home { grid-template-columns: minmax(0, 1fr); grid-template-areas: "what" "install" "first" "how" "use" "not"; }
+  .home { grid-template-columns: minmax(0, 1fr); grid-template-areas: "pastor" "live" "install" "can" "why" "not"; }
+  .term { font-size: 12px; }
   .docs { grid-template-columns: minmax(0, 1fr); }
   .list { position: relative; top: 0; display: flex; flex-wrap: wrap; gap: 0 1ch; }
   .list .grp { width: 100%; margin: 6px 0 0; }

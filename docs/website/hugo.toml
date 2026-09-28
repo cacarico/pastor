@@ -43,6 +43,11 @@ target = "content/docs/manual.md"
 source = "static"
 target = "static"
 
+# The homepage's terminal transcript.
+[[module.mounts]]
+source = "data"
+target = "data"
+
 # The version in the header comes from Cargo.toml, so it cannot go stale.
 [[module.mounts]]
 source = "../../Cargo.toml"

@@ -1,12 +1,17 @@
 # website
 
 The pastor website: a homepage and short docs pages, drawn like a small TUI
-(panes, tabs, a status bar). It is a Hugo site with no theme. The only
-script, `static/keys.js`, adds keys: 1-4 for tabs, and Vimium's j/k, h/l,
-d/u, gg/G to scroll. Every tab is also a plain link.
+(panes, tabs, a status bar). It is a Hugo site with no theme. `static/keys.js`
+adds keys: 1-4 for tabs, and Vimium's j/k, h/l, d/u, gg/G to scroll. Every
+tab is also a plain link.
 
-- `layouts/home.html` is the homepage. Its commands mirror the README's
-  Install and Quick start; keep them in step when those change.
+- `layouts/home.html` is the homepage. Its install command mirrors the
+  README's Install; keep them in step when it changes.
+- `data/demo.toml` is the homepage's live terminal: two acts of commands and
+  their output, copied from pastor's own tables with placeholder names.
+  `static/term.js` types it out; without scripts, or with reduced motion, it
+  reads as a plain transcript. The unit test `website_demo_commands_are_real`
+  fails when one of its commands or flags does not exist.
 - `content/docs/*.md` are the docs pages, one topic each. Front matter:
   `title`, `summary` (shown in the index), `group` (start, use, run,
   reference), `weight` (order: 1x start, 2x use, 3x run, 4x reference) and
