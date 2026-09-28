@@ -22,6 +22,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   shows and `connector try <id> watch` runs. The head's `events_since`
   answers `newest` too, so a new watcher starts at the end without reading
   the whole log.
+- Profiles reach opencode tasks: an opencode agent under a profile gets the
+  lists as `OPENCODE_PERMISSION` in its pane, in opencode's terms and denying
+  what they do not allow, with `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and
+  `OPENCODE_CONFIG_CONTENT` set empty, so it never stops at a permission
+  prompt (a profiled opencode task was `agent_tools_unsupported` before).
+  A machine whose own opencode config has permission rules fails such a task
+  before anything is made there (`opencode_permissions_conflict`).
 - Profiles reach Claude tasks: `profile` on a `[[flock]]`, a `[[machine]]`,
   a job's `[dispatch]`, `[defaults]` and `pastor task run --profile`, settled
   like the model (run or job, machine, flock, `[defaults]`). The profile's

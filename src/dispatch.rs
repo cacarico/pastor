@@ -217,6 +217,24 @@ async fn dispatch_steps(
     let mut launch = agents
         .launch(&spec)
         .map_err(|e| DispatchError::Task(e.message))?;
+    // opencode merges `OPENCODE_PERMISSION` over its own config's rules, so a
+    // machine with rules of its own would run the task under both. A machine
+    // that cannot tell (a `command` one) goes ahead.
+    if agents.opencode_profile(&spec)
+        && conn
+            .opencode_permission_rules()
+            .await
+            .map_err(CallError::from)?
+            == Some(true)
+    {
+        return Err(DispatchError::Task(format!(
+            "{}: the opencode config on {} has permission rules of its own, which opencode would \
+             merge with profile {}'s; move them out of ~/.config/opencode, or run without a profile",
+            crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
+            task.machine.as_deref().unwrap_or("this machine"),
+            spec.profile().unwrap_or_default(),
+        )));
+    }
     // A Claude agent starts on a session pastor names, so `task attach` can
     // resume it once the pane is gone; last, after the tool flags. The task
     // records it only once `agent.start` succeeds (`finish_dispatch`): a
@@ -1257,6 +1275,81 @@ mod tests {
                 ])
             )
         );
+    }
+
+    fn opencode_under(profile: Option<&str>) -> DispatchSpec {
+        DispatchSpec {
+            agent: "opencode".into(),
+            agent_args: vec![],
+            allow: vec!["Read".into()],
+            deny: vec!["Edit".into()],
+            agent_source: Some(Box::new(crate::task::AgentSource {
+                ask: Default::default(),
+                agent: "defaults".into(),
+                agent_args: None,
+                model: None,
+                model_from: None,
+                profile: profile.map(str::to_string),
+                profile_from: Some("defaults".into()),
+            })),
+            ..spec()
+        }
+    }
+
+    /// A profiled opencode task starts with its rules in the pane's env.
+    /// On a machine whose own opencode config has permission rules it fails
+    /// before anything is made there: opencode would merge them with the
+    /// profile's. A machine that cannot tell goes ahead, and a task with no
+    /// profile never asks.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_refuses_a_machine_with_its_own_rules() {
+        let fake = FakeHerdr::new();
+        let mut t = task(opencode_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(
+            env["OPENCODE_PERMISSION"],
+            crate::config::opencode::permission_json(&t.spec.allow, &t.spec.deny)
+        );
+        assert_eq!(env["OPENCODE_CONFIG"], "");
+        let start = fake.requests();
+        let start = start.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "opencode");
+        assert_eq!(start.params["args"], serde_json::json!([]));
+
+        let fake = FakeHerdr::new();
+        fake.set_opencode_permissions(Some(true));
+        let mut t = task(opencode_under(Some("review")));
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("opencode_permissions_conflict"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("pi-1"), "{err}");
+        assert!(!err.is_transport());
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+
+        fake.set_opencode_permissions(None);
+        let mut t = task(opencode_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+
+        let fake = FakeHerdr::new();
+        fake.set_opencode_permissions(Some(true));
+        let mut t = task(DispatchSpec {
+            allow: vec![],
+            deny: vec![],
+            ..opencode_under(None)
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
     }
 
     /// An agent that cannot take a list it was given fails the task before

@@ -4881,6 +4881,28 @@ fn a_profile_reaches_herdr_and_bad_ones_are_refused() {
     }
 }
 
+/// opencode has no flags for tool lists, so a profiled opencode task is
+/// taken, and its agent starts with no permission args: its rules go in the
+/// pane's env (`OPENCODE_PERMISSION`, checked in `dispatch`'s tests).
+#[test]
+fn a_profile_reaches_opencode_without_flags() {
+    let env = start();
+    let t = env.json(&[
+        "task",
+        "run",
+        "hi",
+        "--agent",
+        "opencode",
+        "--profile",
+        "review",
+        "--json",
+    ]);
+    assert_eq!(t["profile"], "review", "{t}");
+    let start = env.agent_start_params("t-1");
+    assert_eq!(start["kind"], "opencode", "{start}");
+    assert_eq!(start["args"], serde_json::json!([]), "{start}");
+}
+
 /// `task attach` on a task whose pane is gone: one of a kind with no
 /// session keeps the old error with a hint that only Claude tasks reopen; a
 /// Claude task goes on to its machine to reopen the session, which a

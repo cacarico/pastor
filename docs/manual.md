@@ -943,8 +943,36 @@ starts as `claude ... --permission-mode dontAsk --allowedTools Read ...
 --disallowedTools 'Bash(rm -rf:*)' ...`. Agent args that pick a permission
 mode themselves (`--permission-mode`, `--dangerously-skip-permissions`, in
 `agent_args` or a model's `args`) are refused while a profile applies
-(`profile_args_conflict`), since Claude would take only one of the two. An
-agent of another kind gets the lists through its `allow_flag` and
+(`profile_args_conflict`), since Claude would take only one of the two.
+
+An opencode agent (kind `opencode`) has no flags for tool lists, so it gets
+the lists in its pane's env instead, as `OPENCODE_PERMISSION`, the JSON
+opencode merges over its config's `permission`, and starts with no
+permission args. pastor writes the patterns in opencode's terms: everything
+is denied first (`"*": "deny"`), so a tool the lists do not allow is refused,
+not asked about; then each allowed tool, then each denied one, since opencode
+takes the last rule that matches. `Read` is opencode's `read` and `list`,
+`Glob` `glob`, `Grep` `grep`, `Edit`, `Write` and `NotebookEdit` `edit`,
+`Bash` `bash`, `WebFetch` `webfetch`, `WebSearch` `websearch` and `Task`
+`task`; `Bash(git log:*)` is `bash` on `git log` and `git log *`, and any
+other argument goes as written. A tool opencode has no permission for adds
+nothing, and the agent's to-do list (`todoread`, `todowrite`) is always
+allowed. The pane also gets `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and
+`OPENCODE_CONFIG_CONTENT` set empty, over an `[agents]` env that sets them,
+so no other config file adds rules around the profile's.
+
+Before it makes anything on the machine, pastor checks the machine's own
+opencode config (`config.json`, `opencode.json` and `opencode.jsonc` in
+`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`): a `"permission"` key
+anywhere in them, even under an agent, fails the task
+(`opencode_permissions_conflict` in its `error`), since opencode would merge
+those rules with the profile's. Move them out, or run the task without a
+profile. A `command` machine cannot be checked, and goes ahead. The repo's
+own opencode config (an `opencode.json` in the checkout) is still read, and
+its rules would merge with the profile's too; keep permission rules out of
+repos that profiled opencode tasks run in.
+
+An agent of any other kind gets the lists through its `allow_flag` and
 `deny_flag`, as any list, and keeps its own permission mode.
 
 Patterns are passed as written. Claude reads a `~/` path in a pattern

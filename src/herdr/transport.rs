@@ -412,6 +412,12 @@ pub trait Connector: Send + Sync {
     fn restore_worktree(&self, _repo: &str, _path: &str, _branch: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// Whether the machine's own opencode config sets permission rules,
+    /// which opencode would merge with a profile's (`config::opencode`).
+    /// `None` when it cannot be known.
+    fn opencode_permission_rules(&self) -> DirFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// The version of pastor installed on the machine, for `machine list`: a
     /// fleet runs whatever each machine last installed, and a skill or CLI
     /// that an agent there calls is that version's. `None` when there is no
@@ -445,6 +451,9 @@ impl Connector for Endpoint {
     fn restore_worktree(&self, repo: &str, path: &str, branch: &str) -> DirFuture<'_> {
         let command = remote_restore_command(repo, path, branch);
         Box::pin(async move { restore_worktree(self, command).await })
+    }
+    fn opencode_permission_rules(&self) -> DirFuture<'_> {
+        Box::pin(opencode_permission_rules(self))
     }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
@@ -623,6 +632,31 @@ fn remote_unpushed_answer(
     }
 }
 
+async fn opencode_permission_rules(ep: &Endpoint) -> Result<Option<bool>, ConnectError> {
+    let command = crate::config::opencode::CONFIG_CHECK_COMMAND.to_string();
+    let (target, argv) = match ep {
+        // The head and this herdr share a machine, and so a config.
+        Endpoint::Local { .. } => (
+            "local".to_string(),
+            vec!["sh".to_string(), "-c".into(), command],
+        ),
+        Endpoint::Ssh {
+            target,
+            control_path,
+            ..
+        } => {
+            ensure_control_dir(control_path.as_deref())?;
+            let argv = ssh_argv_running(target, control_path.as_deref(), command);
+            (target.clone(), argv)
+        }
+        // An arbitrary bridge command says nothing about what else is there.
+        Endpoint::Command { .. } => return Ok(None),
+    };
+    let out = probe_output(&argv).await?;
+    // The same one-word answer as the repo check.
+    remote_dir_answer(&target, &out)
+}
+
 async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
     match ep {
         // The head and this herdr share a machine, so the pastor there is
@@ -721,7 +755,7 @@ fn remote_dir_answer(
     } else if out.status.success() && text.ends_with("no") {
         Ok(Some(false))
     } else {
-        tracing::warn!(%target, status = %out.status, stdout = ?text, "no answer to the repo check from the remote shell");
+        tracing::warn!(%target, status = %out.status, stdout = ?text, "no yes or no from the remote shell");
         Ok(None)
     }
 }
