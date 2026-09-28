@@ -112,7 +112,7 @@ Give it something to do, then check on it:
 
 ```sh
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --worktree
-pastor task list                       # queued, running, blocked, done ...
+pastor task list                       # live tasks: queued, running, blocked ...
 pastor task read t-1                   # the agent's recent output
 pastor task attach t-1                 # sit in its terminal; ctrl+b q detaches
 pastor task send t-1 "yes, go ahead"   # answer it without attaching
@@ -281,7 +281,8 @@ machine names.
 
 | Platform | Support |
 |---|---|
-| Linux x86_64, aarch64 | built, tested in CI and released |
+| Linux x86_64 | built, tested in CI and released |
+| Linux aarch64 | built, smoke-run and released |
 | Linux armv7, riscv64 | built and released |
 | macOS arm64, x86_64 | built and released; `pastor setup launchd` for the service |
 | FreeBSD x86_64 | compiled on every pull request, no binaries |

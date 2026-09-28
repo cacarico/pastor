@@ -69,7 +69,7 @@ Expected: FAIL, the code is `unknown_machine`, not `nested_herdr`.
 
 - [ ] **Step 3: Implement**
 
-At the top of `async fn open` in `src/main.rs`, before `Flock::load`:
+At the top of `async fn open` in `src/main.rs`, before `head_flock`:
 
 ```rust
     // herdr refuses to start inside one of its own panes, and says so only

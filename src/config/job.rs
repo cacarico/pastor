@@ -54,11 +54,11 @@ pub struct DispatchTable {
     /// Added to the flock's and `[defaults]` deny list.
     pub deny: Vec<String>,
     /// A `[models]` name, or a template of one (`{{ item.model }}`) rendered
-    /// per item; rendered empty, the machine's, flock's or `[defaults]` model.
+    /// per item; rendered empty, the flock's, machine's or `[defaults]` model.
     pub model: Option<String>,
     /// A level (`low`, `normal`, `high`, `critical`), or a template of one
-    /// (`{{ item.priority }}`) rendered per item; rendered empty, the pinned
-    /// machine's, flock's or `[defaults]` level.
+    /// (`{{ item.priority }}`) rendered per item; rendered empty, the flock's,
+    /// pinned machine's or `[defaults]` level.
     pub priority: Option<String>,
     /// Let the job's critical tasks pause a `low` Claude task on a full
     /// machine to start (see `Task::pause`); tasks it queues below critical
@@ -395,7 +395,7 @@ impl Job {
     }
 
     /// The job's `priority` rendered for `item`: `None` when the job sets
-    /// none, or its template renders empty, so the pinned machine's, flock's
+    /// none, or its template renders empty, so the flock's, pinned machine's
     /// or `[defaults]` level applies. A rendered value that is not a level
     /// is refused (`unknown_priority`), and the item with it.
     pub fn priority_for(&self, item: &Value) -> Result<Option<Priority>, String> {
@@ -430,7 +430,7 @@ impl Job {
     }
 
     /// The job's `model` rendered for `item`: `None` when the job names
-    /// none, or its template renders empty, so the machine's, flock's or
+    /// none, or its template renders empty, so the flock's, machine's or
     /// `[defaults]` model applies. A rendered value that is not a model name
     /// is refused; whether `[models]` has it is checked when the task is
     /// queued.

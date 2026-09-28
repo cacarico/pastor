@@ -61,12 +61,12 @@ pub struct MachineConfig {
     /// Like `agent`, for the agent's args; `[]` means none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_args: Option<Vec<String>>,
-    /// The `[models]` name for tasks on this machine that name none, before
-    /// its flock's and `[defaults]`.
+    /// The `[models]` name for tasks on this machine that name none, after
+    /// its flock's and before `[defaults]` (`Defaults::resolve_agent_on`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The level of tasks pinned to this machine that name none, before
-    /// its flock's and `[defaults]` (see `Defaults::resolve_priority`).
+    /// The level of tasks pinned to this machine that name none, after
+    /// its flock's and before `[defaults]` (see `Defaults::resolve_priority`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::task::Priority>,
     /// The agent that runs a model of another kind than `agent`'s here, by
@@ -74,7 +74,7 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "crate::config::KindAgents::is_empty")]
     pub agents: crate::config::KindAgents,
     /// The permission profile for tasks on this machine that name none,
-    /// before its flock's and `[defaults]`. Also what decides whether a task
+    /// after its flock's and before `[defaults]`. Also what decides whether a task
     /// may ask for `unrestricted` here (`Profiles::apply`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
