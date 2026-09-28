@@ -180,6 +180,16 @@ timeout 60 pastor events --follow   # --follow never returns on its own; always 
 
 It reads the log file, so it works with the head down.
 
+To wait on the fleet rather than read its history, use `pastor watch`: one line per change to act on (`TASK t-12 failed ...`, `JOB nightly failing: ...`, `HEAD down: ...`, and the lines of connectors with a `[watch]` command).
+
+```bash
+pastor watch --now                         # what needs attention now: blocked, done, failed, stale tasks, failing jobs
+timeout 1800 pastor watch --name night     # never returns on its own; bound it and run it again with the same --name
+pastor watch --name night --json --interval 2m --connector prs
+```
+
+A watcher keeps a cursor under its `--name`, so one started again repeats nothing; `--reset` starts it over at the end of the log. It only reads, so it works from a pastor task too.
+
 ## When pastor dispatched you
 
 You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `HERDR_ENV=1` is set, your herdr agent and workspace are named `t-N`), and the prompt reads like a self-contained work order. Then:
@@ -189,7 +199,7 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - Do not ask questions. Nobody is watching; a permission prompt or a question leaves the task `blocked` until a human happens to attach. If something is missing, say so in your report and stop.
 - When finished, run `pastor task done` (it ends your own task, from `PASTOR_TASK`), print `DONE` as your last line, then go idle. pastor marks the task `done` at once and closes your pane after `close_done_after`, freeing the machine's slot.
 - Do not close your pane or exit to clean up; `pastor task done` is how you say you are finished.
-- Do not run, send to, attach to, retry, reprioritize, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor machine open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `read`, and `describe` for tasks, jobs, machines, flocks and connectors) is fine.
+- Do not run, send to, attach to, retry, reprioritize, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor machine open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `read`, `events`, `watch`, and `describe` for tasks, jobs, machines, flocks and connectors) is fine.
 
 ## When something goes wrong
 

@@ -1001,6 +1001,31 @@ pub struct PastorConfig {
     /// `[profiles.<name>]`: permission profiles beside the built-in ones.
     #[serde(skip_serializing_if = "profile::Profiles::is_empty")]
     pub profiles: profile::Profiles,
+    /// What `pastor watch` runs besides the head's events.
+    #[serde(skip_serializing_if = "WatchConfig::is_empty")]
+    pub watch: WatchConfig,
+}
+
+/// `[watch]` in pastor.toml.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WatchConfig {
+    /// `[[watch.connector]]`: the connectors whose `[watch]` command `pastor
+    /// watch` runs each interval, unless `--connector` names others.
+    pub connector: Vec<WatchConnector>,
+}
+
+impl WatchConfig {
+    pub fn is_empty(&self) -> bool {
+        self.connector.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchConnector {
+    /// The connector's id, as `connector list` shows it.
+    pub name: String,
 }
 
 fn is_empty_agents(a: &Agents) -> bool {
@@ -1022,6 +1047,7 @@ impl Default for PastorConfig {
             agents: Agents::default(),
             models: Models::default(),
             profiles: profile::Profiles::default(),
+            watch: WatchConfig::default(),
         }
     }
 }

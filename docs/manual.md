@@ -883,8 +883,85 @@ A client can read the log through the head by number: the IPC request
 `events_since` (`{"op":"events_since","after":N,"limit":L,"task":ID}`, head
 protocol 4 or newer) answers the records whose `seq` is past `N`, oldest
 first, at most `L`, only those about task `ID` if given, with `oldest`, the
-oldest number the two log files still hold, and `gap: true` when records after
-`N` were already rotated out of both. It is a read, so an agent may send it.
+oldest number the two log files still hold, `newest`, the newest number they
+hold (whatever `N`, `L` and `ID`, so a limit of 0 asks only where the log
+ends), and `gap: true` when records after `N` were already rotated out of both.
+It is a read, so an agent may send it.
+
+## Watch
+
+`pastor watch` is the events log cut down to what someone watching the fleet
+acts on, one line per change, for an orchestrator to wait on:
+
+```bash
+pastor watch --name night            # every minute, what changed; never returns
+pastor watch --now                   # what needs attention right now, then exit
+pastor watch --interval 2m --all --json --connector prs
+```
+
+```
+TASK t-12 failed pi-3 nightly: agent exited
+TASK t-14 blocked pi-1 run
+JOB nightly failing: failed (2x): exit 1: gh: rate limited
+JOB nightly ok
+HEAD down: pastor serve is not running (...); start it with `pastor serve`
+HEAD up
+HEAD gap: events 41..57 were rotated out of the log before this watcher read them
+CONNECTOR prs failing: exit 1: gh: not logged in
+CONNECTOR prs ok
+PR 31 reviewed, 2 open threads
+```
+
+- `TASK <id> <state> <machine> <job>[: <error>]`, from the head's numbered
+  events: a task that reached `blocked`, `done`, `failed` or `stale`
+  (`--all`: every state change, `queued` and `running` too). `-` stands for
+  a machine or job it has none of. The error is only there for `failed` and
+  `stale`.
+- `JOB <name> failing: <last result>` when an enabled job's last run failed,
+  again when that result changes (`failed (1x)` becomes `failed (2x)`), and
+  `JOB <name> ok` when it runs fine after that, from `job list`. A job that is
+  disabled or removed is dropped without a line.
+- `HEAD down: <why>` when the head stops answering, once, and `HEAD up` when
+  it answers again. `HEAD gap` says the log rotated events out before the
+  watcher read them; `pastor watch --now` shows where things stand.
+- A connector's lines, as it printed them, and `CONNECTOR <id> failing: <why>`
+  / `CONNECTOR <id> ok` around a spell of failed runs (see [The watch
+  command](#the-watch-command)).
+
+Each interval (`--interval`, `1m` by default) the watcher asks the head for
+the events after the last one it read, then `job list`, then runs its
+connectors. A watcher keeps a cursor in
+`~/.local/state/pastor/watch/<name>.json` (`--name`, `default` by default):
+the last event number it read, the failing jobs and connectors, whether the
+head was down, and the connector lines it has printed (the last 1000 per
+connector). Started again with the same name it carries on where it stopped
+and repeats nothing, so an orchestrator can re-arm it as often as it likes. A
+new name, or `--reset`, starts at the end of the log: the past is what `--now`
+is for.
+
+`--now` reads no cursor and writes none. It prints every task that is
+`blocked`, `done`, `failed` or `stale` (`--all`: the live ones too), every
+failing job, `HEAD down` if the head does not answer, and every line each
+connector prints now, then exits 0.
+
+The connectors are those `--connector` names (repeatable), or else
+`[[watch.connector]]` in pastor.toml:
+
+```toml
+[[watch.connector]]
+name = "prs"                         # a connector id with a [watch] command
+```
+
+`--json` prints one object per line: `kind` (`TASK`, `JOB`, `HEAD`,
+`CONNECTOR` or `OUTPUT` for a connector's line), the fields of the line
+(`task`, `state`, `machine`, `job`, `reason`, `connector`, `text`) and
+`line`, the text form. With a head on another machine (`pastor head set`) the
+events, tasks and jobs are that head's, and the connectors run here. The
+watcher only reads, so an agent pastor started may run it; through a bridge
+that limits an agent to its own tasks (`bridge --agent`) the head refuses the
+events, and the watcher stops with the head's error. So does one whose head
+predates `events_since`. A head that answers with any other error stops it
+too; one that does not answer at all is `HEAD down`.
 
 Runtime errors print JSON on stderr with a stable `code` and exit 1; a
 malformed command line gets clap's plain usage text and exit 2.
@@ -937,6 +1014,7 @@ pastor task attach t-1               # lands in the agent's pane; ctrl+b q detac
                                      # (a closed Claude task: its session, reopened)
 pastor machine open pi-3             # the full herdr UI on that machine
 pastor events --follow               # task, job and machine events as they happen
+pastor watch --now                   # what needs attention: blocked, done, failed tasks, failing jobs
 ```
 
 `--repo` and a job's `repo` are paths on the machine that runs the agent. A
@@ -1150,11 +1228,15 @@ timeout = "60s"                      # the default
 [finish]                             # optional: runs when a task of its jobs ends
 command = ["bash", "close-issue.sh"]
 timeout = "60s"                      # the default
+
+[watch]                              # optional: lines for `pastor watch`
+command = ["bash", "prs.sh"]
+timeout = "60s"                      # the default
 ```
 
 The manifest is checked when pastor discovers the connector, and a key it does
 not know is an error. A connector needs a `[connector]`, at least one `[[events]]`
-hook, or both. Each `command` is an argv array with a program in its first
+hook or a `[watch]` command, and may have any mix of them. Each `command` is an argv array with a program in its first
 place; a relative program with a slash (`./poll`) means the connector's own file.
 An `on` entry is an event type like `task.done`, and timeouts may not be
 zero. `[finish]` needs a `[connector]`: only a connector's own jobs have tasks
@@ -1275,6 +1357,7 @@ pastor connector link ~/src/my-connector                 # use a working copy in
 pastor connector list [--json]                           # version, mode, hooks, missing secrets
 pastor connector describe slack [--json]                 # one connector in full, and the jobs that use it
 pastor connector try slack --job support --since 1h      # run its command once, print its items
+pastor connector try prs watch                           # run its [watch] command once, print its lines
 pastor connector uninstall slack                         # or unlink, for a linked one
 ```
 
@@ -1299,7 +1382,8 @@ it is invalid.
 `describe` shows one connector in full: its manifest (name, description,
 version, `min_pastor_version`, authors, homepage, repository, license); how it
 got here; its connector command's mode, argv and timeout and each hook's
-events, `only_own` and argv; its `[finish]` command and timeout; its config keys, required ones marked; its
+events, `only_own` and argv; its `[finish]` and `[watch]` commands and
+timeouts; its config keys, required ones marked; its
 secrets, each `set` or `missing` in the `.env` (names only, never values);
 the jobs whose `[connector] use` names it, with their last run and result as
 `job list` has them (from the head when one runs); and its status, `ok`, the
@@ -1322,7 +1406,9 @@ names a different connector, or that is invalid, is an error. The cursor is `nul
 default the job's `backfill`, or zero. Items are printed to stdout as JSON
 lines; logs and the summary go to stderr, and the run log is written as for any
 run. Nothing is saved: no cursor, no tasks. A stream connector is collected for
-its `timeout` and then stopped.
+its `timeout` and then stopped. `try <id> watch` runs the connector's `[watch]`
+command instead, as `pastor watch` does, and prints its lines; a failed run is
+`connector_failed`.
 
 `install`, `link`, `uninstall` and `unlink` tell a running daemon to reload,
 so a connector is usable without a restart (this also restarts stream
@@ -1442,6 +1528,24 @@ restarts. A failure never changes the task: an exit status other than 0, a
 timeout, or a command that could not start is logged and sent as a
 `connector.finish_failed` event (`detail.connector` and `detail.reason`), and
 not retried.
+
+### The watch command
+
+`[watch]` feeds [`pastor watch`](#watch) what the head cannot know, like the
+state of the pull requests the agents opened, without pastor itself calling
+`gh`. The table is `[watch]` rather than `[events]` because `[[events]]` is
+the hooks' array, and TOML cannot hold both under one name.
+
+Each interval, every watcher that lists the connector runs `command` in the
+connector's directory with its environment and no job: the `.env` and its
+secrets, `PASTOR_CONNECTOR_ID`, and `~/.local/state/pastor/connectors/@<id>/`
+as `PASTOR_CONNECTOR_STATE_DIR`, as its hooks get. Stdin is empty. Each line it prints on stdout is
+one line for the watcher, trimmed, with empty ones dropped; print the state as
+it is now (`PR 31 reviewed, 2 open threads`) every time, and the watcher prints
+a line only the first time it sees it. A run that exits other than 0, times
+out or cannot start prints nothing of its output: the watcher says `CONNECTOR
+<id> failing: <why>` once, and `CONNECTOR <id> ok` when a run works again.
+Stderr goes to the `runs/@<id>/` log, redacted.
 
 ## The bridge
 
@@ -1731,7 +1835,7 @@ sends nothing. A head from before these requests is refused
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, head_address, defaults, agents, models, profiles (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, head_address, defaults, agents, models, profiles, watch (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
@@ -1739,6 +1843,7 @@ sends nothing. A head from before these requests is refused
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
+~/.local/state/pastor/watch/<name>.json   a `pastor watch` cursor
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host, and one (`head-<hash>`) for a remote head
 ~/.config/systemd/user/{pastor,herdr}.service   written by `pastor setup systemd`
 ~/Library/LaunchAgents/pastor.{serve,herdr}.plist   written by `pastor setup launchd` (macOS)
@@ -1789,6 +1894,8 @@ description = "develop, plus docker"  # one line for `pastor profile list`
 extends = "develop"              # its lists come first; default: none
 allow = ["Bash(docker:*)"]       # added to what it extends
 deny = []                        # added too; wins over any allow
+[[watch.connector]]          # connectors `pastor watch` runs; none by default
+name = "prs"
 ```
 
 `head_address` is the ssh destination other machines reach the head by. When

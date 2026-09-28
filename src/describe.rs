@@ -169,6 +169,8 @@ pub struct ConnectorDescription {
     pub hooks: Vec<ConnectorHook>,
     /// Run when a task of one of its jobs is done or failed.
     pub finish: Option<ConnectorFinish>,
+    /// Run by `pastor watch` each interval.
+    pub watch: Option<ConnectorWatch>,
     pub env_file: String,
     /// Declared secrets and whether the `.env` sets them; never their values.
     pub secrets: Vec<ConnectorSecret>,
@@ -202,6 +204,12 @@ pub struct ConnectorHook {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectorFinish {
+    pub command: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorWatch {
     pub command: Vec<String>,
     pub timeout_secs: u64,
 }
@@ -598,6 +606,12 @@ pub fn connector_text(c: &ConnectorDescription) -> String {
         .map(|f| format!("{} [timeout {}s]", argv(&f.command), f.timeout_secs))
         .collect();
     section(&mut out, "finish", finish);
+    let watch = c
+        .watch
+        .iter()
+        .map(|w| format!("{} [timeout {}s]", argv(&w.command), w.timeout_secs))
+        .collect();
+    section(&mut out, "watch", watch);
     let secrets = c
         .secrets
         .iter()

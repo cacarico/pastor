@@ -81,6 +81,8 @@ enum Command {
     },
     /// Show the events log (task, job and machine events)
     Events(pastor::events::EventsArgs),
+    /// Print one line per change to act on: tasks, failing jobs, the head, connector lines
+    Watch(pastor::watch::WatchArgs),
     /// Install pastor or herdr as a user service (systemd, or launchd on macOS)
     Setup {
         #[command(subcommand)]
@@ -571,6 +573,7 @@ fn main() {
                 Ok(())
             }
             Command::Events(args) => pastor::events::cli(&paths, args).await,
+            Command::Watch(args) => pastor::watch::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
             Command::Profile { cmd } => pastor::profile_cli::run(&paths, cmd),
@@ -841,7 +844,10 @@ fn remote_route(command: &Command) -> RemoteRoute {
         Command::Task {
             cmd: TaskCmd::Attach { .. },
         } => RemoteRoute::Here,
+        // Watch asks the head for its events, tasks and jobs; its connectors
+        // are this machine's.
         Command::Task { .. }
+        | Command::Watch(_)
         | Command::Machine {
             cmd: MachineCmd::List { .. },
         }

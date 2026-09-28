@@ -3870,6 +3870,8 @@ fn complete_offers_connector_ids() {
         &["connector", "uninstall", ""][..],
         &["connector", "unlink", ""],
         &["connector", "try", ""],
+        &["watch", "--connector", ""],
+        &["watch", "--now", "--connector=g"],
     ] {
         let (ok, out) = complete(&config, &state, words);
         assert!(ok, "{words:?}");

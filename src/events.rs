@@ -394,6 +394,12 @@ pub struct EventsPage {
     /// The oldest sequence number still in the log; `None` when it holds no
     /// numbered record.
     pub oldest: Option<u64>,
+    /// The newest sequence number in the log, whatever the cursor, limit and
+    /// task: where a reader that wants only what comes next starts (`pastor
+    /// watch`). `None` when it holds no numbered record, and from a head
+    /// that predates it.
+    #[serde(default)]
+    pub newest: Option<u64>,
 }
 
 /// The records numbered after `after`, oldest first, at most `limit`, only
@@ -403,6 +409,7 @@ pub struct EventsPage {
 pub fn since(path: &Path, after: u64, limit: u32, task: Option<i64>) -> anyhow::Result<EventsPage> {
     let all = read(path, None)?;
     let oldest = all.iter().map(|r| r.seq).filter(|&s| s > 0).min();
+    let newest = all.iter().map(|r| r.seq).max().filter(|&s| s > 0);
     let gap = oldest.is_some_and(|o| o > after.saturating_add(1));
     let events = all
         .into_iter()
@@ -413,6 +420,7 @@ pub fn since(path: &Path, after: u64, limit: u32, task: Option<i64>) -> anyhow::
         events,
         gap,
         oldest,
+        newest,
     })
 }
 
@@ -1291,6 +1299,11 @@ mod tests {
         let page = since(&path, 5, 100, None).unwrap();
         assert!(page.events.is_empty());
         assert!(!page.gap);
+        // A limit of 0 answers where the log ends, for a reader that starts
+        // there, whatever the cursor and the filter.
+        let page = since(&path, 0, 0, Some(t2.id)).unwrap();
+        assert!(page.events.is_empty());
+        assert_eq!(page.newest, Some(5));
 
         // Two rotations push 1..=5 out of both files.
         let w = LogWriter::new(path.clone(), line_len * 2 + 10);

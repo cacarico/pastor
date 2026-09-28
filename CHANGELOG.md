@@ -7,6 +7,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `pastor watch`: one line per change an orchestrator acts on, so it stops
+  building its own polling. `TASK t-N <state> <machine> <job>` for a task that
+  is blocked, done, failed or stale (`--all`: every state change), from the
+  head's numbered events; `JOB <name> failing: ...` and `JOB <name> ok` from
+  `job list`; `HEAD down`, `HEAD up` and `HEAD gap`; and the lines of each
+  connector with a `[watch]` command, each printed once, with `CONNECTOR <id>
+  failing` and `ok` around failed runs. A watcher keeps a cursor under
+  `--name` in the state dir, so one started again repeats nothing; `--reset`
+  starts at the end of the log. `--now` prints what needs attention and
+  exits. `--json`, `--interval` and `--connector` (else `[[watch.connector]]`
+  in pastor.toml). It only reads, so an agent may run it. A connector's
+  manifest takes `[watch]` (`command`, `timeout`), which `connector describe`
+  shows and `connector try <id> watch` runs. The head's `events_since`
+  answers `newest` too, so a new watcher starts at the end without reading
+  the whole log.
 - Permission profiles: `[profiles.<name>]` in pastor.toml, each an optional
   `description`, `extends`, `allow` and `deny`, beside the built-in `review`,
   `develop` and `unrestricted`. A profile's lists add up along its `extends`
