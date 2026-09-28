@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::age;
-use crate::dispatch::{Claim, MachineView, pick_machine_where};
+use crate::dispatch::{
+    Claim, MachineView, flock_held, mark_waiting_under_share, pick_machine_where,
+};
 use crate::task::Task;
 
 /// Where `pastor queue move` puts a task. Positions count from 1 over the
@@ -112,20 +114,21 @@ pub fn entries(
     accepts: &dyn Fn(&Task, &str) -> bool,
 ) -> Vec<QueueEntry> {
     let mut views = machines.to_vec();
-    queue
-        .into_iter()
-        .enumerate()
-        .map(|(i, task)| {
+    (0..queue.len())
+        .map(|i| {
+            let task = &queue[i];
             let flock = task
                 .flock
                 .clone()
                 .unwrap_or_else(|| default_flock.to_string());
-            let why = why_waiting(&task, &flock, &mut views, accepts);
+            let later = &queue[i + 1..];
+            mark_waiting_under_share(&mut views, &flock, later, default_flock, accepts);
+            let why = why_waiting(task, &flock, &mut views, accepts);
             QueueEntry {
                 pos: i + 1,
                 flock,
                 why,
-                task,
+                task: task.clone(),
             }
         })
         .collect()
@@ -171,15 +174,9 @@ fn why_waiting(
     }
     let tags = &task.spec.tags;
     let has_tags = |v: &MachineView| tags.iter().all(|t| v.tags.contains(t));
-    // The flock at its number on `v`, as `dispatch_queued` notes it.
-    let at_number = |v: &MachineView| {
-        let seat = v.seat(flock)?;
-        let max = seat.max.filter(|_| !seat.has_room())?;
-        Some(format!(
-            "flock {flock} is at {} of {max} on {}",
-            seat.live, v.name
-        ))
-    };
+    // The flock at its number on `v`, or past its share while another
+    // waits, as `dispatch_queued` notes it.
+    let at_number = |v: &MachineView| flock_held(v, flock);
     if let Some(pinned) = &task.spec.machine {
         return match views.iter().find(|v| &v.name == pinned) {
             None => format!("machine {pinned} is not in the flock"),
@@ -290,9 +287,11 @@ mod tests {
             healthy,
             flocks: vec![crate::dispatch::FlockSeat {
                 name: flock.into(),
+                share: None,
                 max: None,
                 live,
             }],
+            waiting_under_share: vec![],
         }
     }
 
@@ -399,6 +398,7 @@ mod tests {
     fn a_flock_at_its_number_says_so_and_the_next_task_goes() {
         let seat = |name: &str, max: u32, live: usize| crate::dispatch::FlockSeat {
             name: name.into(),
+            share: None,
             max: Some(max),
             live,
         };
@@ -421,6 +421,38 @@ mod tests {
                 "flock work is at 2 of 2 on desk",
                 "flock work is at 2 of 2 on desk",
                 "next pass: desk has room",
+            ]
+        );
+    }
+
+    /// A flock past its share waits while a flock under its share has a
+    /// task behind it; once that one has its slot, the next reads the
+    /// machine as idle enough. At its max it reads so.
+    #[test]
+    fn a_flock_past_its_share_waits_for_one_under_it() {
+        use crate::config::flock::FlockNumber;
+        let views = [MachineView {
+            flocks: vec![
+                crate::dispatch::FlockSeat::new("work", Some(FlockNumber::split(1, 3)), 1),
+                crate::dispatch::FlockSeat::new("home", Some(FlockNumber::plain(2)), 1),
+            ],
+            ..view("desk", "default", 2, 4, true)
+        }];
+        assert_eq!(
+            whys(
+                vec![
+                    task(1, Some("work"), None),
+                    task(2, Some("home"), None),
+                    task(3, Some("work"), None),
+                    task(4, Some("work"), None),
+                ],
+                &views
+            ),
+            [
+                "flock work is past its share on desk, at 1 of 1/3, while flock home waits under its share",
+                "next pass: desk has room",
+                "next pass: desk has room",
+                "flock work is full",
             ]
         );
     }

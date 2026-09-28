@@ -1,7 +1,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::config::flock::{DEFAULT_FLOCK, Flock};
+use crate::config::flock::{DEFAULT_FLOCK, Flock, FlockNumber};
 use crate::ipc::{RequestError, connect_error_means_no_daemon};
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
@@ -512,21 +512,28 @@ pub struct FlockRow {
     pub description: Option<String>,
 }
 
-/// A machine in `FlockRow::members`. `max` is the flock's number there, or
-/// for a machine with none written (the old `flock` key, or the default
-/// flock of a machine no flock lists) its `max_agents`.
+/// A machine in `FlockRow::members`. `share` and `max` are the flock's
+/// number there (equal for a plain number), or for a machine with none
+/// written (the old `flock` key, or the default flock of a machine no flock
+/// lists) its `max_agents`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FlockMember {
     pub name: String,
+    pub share: u32,
     pub max: u32,
     pub live: Option<usize>,
 }
 
 impl FlockMember {
-    /// `desk 1/2`, or `desk -/2` with no head to count.
+    /// `desk 1/2`, or `desk -/2` with no head to count; with a share and a
+    /// max, `desk 1/2/4`.
     pub fn label(&self) -> String {
         let live = self.live.map_or_else(|| "-".into(), |n| n.to_string());
-        format!("{} {live}/{}", self.name, self.max)
+        if self.share == self.max {
+            format!("{} {live}/{}", self.name, self.max)
+        } else {
+            format!("{} {live}/{}/{}", self.name, self.share, self.max)
+        }
     }
 }
 
@@ -558,17 +565,18 @@ pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]
             let members: Vec<FlockMember> = machines
                 .iter()
                 .map(|m| {
-                    let max = flock
+                    let number = flock
                         .machine_flocks(m)
                         .unwrap_or_default()
                         .into_iter()
                         .find(|(f, _)| *f == name)
                         .and_then(|(_, n)| n)
-                        .or_else(|| flock.get(m).map(|c| c.max_agents))
-                        .unwrap_or_default();
+                        .or_else(|| flock.get(m).map(|c| FlockNumber::plain(c.max_agents)))
+                        .unwrap_or(FlockNumber::plain(0));
                     FlockMember {
                         name: m.clone(),
-                        max,
+                        share: number.share(),
+                        max: number.max(),
                         live: live.map(|ms| ms.iter().find(|s| &s.name == m).map_or(0, live_on)),
                     }
                 })
@@ -729,7 +737,7 @@ impl MachineRow {
     }
 
     /// The FLOCKS column: every flock, with its number where it has one
-    /// (`home,work:2`).
+    /// (`home,work:2`, `work:2/4` for a share and a max).
     pub fn flock_label(&self) -> String {
         if self.flocks.is_empty() {
             return self.flock.clone();
@@ -737,7 +745,7 @@ impl MachineRow {
         let names: Vec<String> = self
             .flocks
             .iter()
-            .map(|f| match f.max {
+            .map(|f| match f.number_label() {
                 Some(n) => format!("{}:{n}", f.name),
                 None => f.name.clone(),
             })
@@ -1895,6 +1903,7 @@ mod tests {
         .unwrap();
         let seat = |name: &str, max: Option<u32>, live: usize| crate::machine::FlockSeat {
             name: name.into(),
+            share: None,
             max,
             live,
         };
@@ -1913,10 +1922,51 @@ mod tests {
         assert_eq!(
             json["members"],
             serde_json::json!([
-                {"name": "desk", "max": 2, "live": null},
-                {"name": "lab", "max": 2, "live": null}
+                {"name": "desk", "share": 2, "max": 2, "live": null},
+                {"name": "lab", "share": 2, "max": 2, "live": null}
             ])
         );
+    }
+
+    /// A share and a max read `2/4`: `desk 1/2/4` in `flock list` (live,
+    /// share, max), `work:2/4` in `machine list`, and both numbers in JSON.
+    #[test]
+    fn a_share_and_a_max_show_as_two_numbers() {
+        let f: Flock = toml::from_str(
+            "[[flock]]\nname = \"work\"\ndefault = true\nmachines = { desk = { share = 2, max = 4 } }\n\n\
+             [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 4\n",
+        )
+        .unwrap();
+        let seat = crate::machine::FlockSeat::new(
+            "work",
+            Some(crate::config::flock::FlockNumber::split(2, 4)),
+            1,
+        );
+        let desk = MachineStatus {
+            flock: Some("work".into()),
+            flocks: vec![seat.clone()],
+            ..status("desk", "local")
+        };
+        let rows = flock_list(&f, Some(std::slice::from_ref(&desk)), &[]);
+        assert_eq!(flock_rows(&rows)[0][2], "desk 1/2/4");
+        assert_eq!(
+            serde_json::to_value(&rows[0]).unwrap()["members"],
+            serde_json::json!([{"name": "desk", "share": 2, "max": 4, "live": 1}])
+        );
+        let row = MachineRow::from(&desk);
+        assert_eq!(row.flock_label(), "work:2/4");
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            json["flocks"],
+            serde_json::json!([{"name": "work", "share": 2, "max": 4, "live": 1}])
+        );
+        // A head from before shares sends only `max`: its number was a
+        // plain ceiling.
+        let old: crate::machine::FlockSeat =
+            serde_json::from_value(serde_json::json!({"name": "work", "max": 2, "live": 2}))
+                .unwrap();
+        assert_eq!(old.number_label().as_deref(), Some("2"));
+        assert!(!old.has_room() && !old.under_share());
     }
 
     /// A status carries every flock of the machine; one from a head before
@@ -1925,6 +1975,7 @@ mod tests {
     fn a_machine_row_carries_its_flocks_and_an_old_head_reads_as_one() {
         let seat = |name: &str, max: Option<u32>, live: usize| crate::machine::FlockSeat {
             name: name.into(),
+            share: None,
             max,
             live,
         };

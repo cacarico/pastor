@@ -590,6 +590,29 @@ flock past its number. A task whose flock is full everywhere waits, with
 `pastor task list` and `pastor queue`, and the next task in the queue goes.
 Live tasks count by the flock each was created in.
 
+A plain number is a hard ceiling. A flock can instead have a share and a max
+on a machine, so a busy project uses slots the quiet ones leave idle:
+
+```toml
+[[flock]]
+name = "code"
+machines = { desk = { share = 2, max = 4 } }
+```
+
+Under its share the flock takes a free slot as usual. From its share up to
+its max it takes one only while no task of a flock still under its share on
+that machine is waiting for it: queued behind it, not pinned elsewhere, with
+its tags and an agent for its model there. So a quiet project gets its share
+back as soon as it has work, and nothing is reserved while it has none. A
+flock past its share that waits says `waiting for a machine: flock code is
+past its share on desk, at 2 of 2/4, while flock life waits under its share`;
+one at its max says `waiting for a machine: flock code is at 4 of 2/4 on
+desk`. Nothing passes the machine's own room,
+and job slots and burst never take a flock past its max. `max` below `share`,
+`max` alone (the plain number is that), a share alone and a share of 0 fail
+the load. A head needs IPC protocol 26 to read this form; the CLI refuses an
+older one while flock.toml uses it.
+
 The `flock` key on a machine still works: it puts the machine in that flock
 with no number but the machine's own limits (`max_agents`, job slots and
 burst), as before. A machine that neither a `machines` table nor its own
@@ -598,8 +621,9 @@ every flock that places it, in file order; where one flock has to stand for
 it (a task pinned to it that names no flock, the machine's profile, `flock`
 in `--json` for older scripts) that is the default flock if it is in it, else
 its first. `pastor machine list` shows every flock under FLOCKS, with its
-number where it has one (`personal:2,work:1`), and `--json` carries them as
-`flocks` (`name`, `max`, `live`) next to `flock`. A flock's `machines` naming a
+number where it has one (`personal:2,work:1`, `code:2/4` for a share and a
+max), and `--json` carries them as `flocks` (`name`, `share`, `max`, `live`;
+a plain number has `share` equal to `max`) next to `flock`. A flock's `machines` naming a
 machine the file lacks, a number of 0, or a machine placed in the same flock
 by both its `flock` key and the flock's `machines` fails the load. `pastor
 machine remove` takes the machine out of every flock's `machines` too.
@@ -645,8 +669,10 @@ which flock those machines are in afterwards. `flock default set` writes the old
 default flock onto every machine that named none, so changing where new work goes moves no machine.
 
 `flock join <flock> <machine>` lists the machine in the flock's `machines`
-with `--max N`, by default the number it has there already, else its
-`max_agents`; it stays in its other flocks. Joining again with `--max`
+with `--max N`, by default the number it has there already (a share and a
+max stay as written), else its `max_agents`; it stays in its other flocks.
+`--max N` writes a plain number; a share and a max are set by editing the
+file (`flock edit`). Joining again with `--max`
 changes the number, and `--max 0` is refused (leave the flock instead). A
 machine nothing placed was in the default flock only for that, so once a flock
 lists it, it is in that flock alone; the output ends with the machine's
@@ -670,12 +696,13 @@ slots and burst for the flock, as any flock number does; join with a higher
 `--max` to let them through.
 
 `flock list` shows each flock's machines with the flock's number and live
-tasks there: `desk 1/2, pi-3 0/1`. A machine with no number written (the old
+tasks there: `desk 1/2, pi-3 0/1`, and with a share and a max live, share
+and max: `desk 1/2/4`. A machine with no number written (the old
 key, or the default flock of a machine no flock lists) shows its
 `max_agents`. The live count needs a running head and is `-` without one
 (`desk -/2`), and so is AGENTS, the flock's live tasks over all its
 machines. `--json` keeps `machines` as the names and adds `members`
-(`name`, `max`, `live`). The flock commands go through a running head like
+(`name`, `share`, `max`, `live`). The flock commands go through a running head like
 the other edits, need a head of IPC protocol 22 or later for `join`,
 `leave` and `add` with machines, and an agent pastor started may not run them
 unless `agents_change_fleet` is on.

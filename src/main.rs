@@ -698,41 +698,26 @@ fn main() {
                     needs_fleet_edit_protocol(&command),
                     if local_job_route {
                         None
-                    } else if remote.is_none() && multi_flock_declared(&paths) {
-                        // Per-flock `machines` is a field an older head's
-                        // `FlockEntry` (`deny_unknown_fields`) does not know;
-                        // its reload fails and it silently keeps the old,
-                        // single-flock membership, so refuse rather than let
-                        // the CLI dispatch, list or reload on that stale view.
-                        protocol_need(&command).map_or(
-                            Some((
-                                pastor::ipc::MULTI_FLOCK_PROTOCOL,
-                                "predates per-flock machine limits, and would silently drop flock.toml's `machines` on reload, keeping its old membership",
-                            )),
-                            |(p, why)| {
-                                Some((p.max(pastor::ipc::MULTI_FLOCK_PROTOCOL), why))
-                            },
-                        )
+                    } else if remote.is_none()
+                        && let Some(file_need) = flock_file_need(&paths)
+                    {
+                        // flock.toml uses a field an older head's
+                        // `FlockEntry` (`deny_unknown_fields`) does not
+                        // know; its reload fails and it silently keeps the
+                        // old flocks, so refuse rather than let the CLI
+                        // dispatch, list or reload on that stale view.
+                        Some(protocol_need(&command).map_or(file_need, |(p, why)| {
+                            if p >= file_need.0 {
+                                (p, why)
+                            } else {
+                                file_need
+                            }
+                        }))
                     } else if remote.is_some() && reads_head_files(&command) {
                         protocol_need(&command).or(Some((
                             pastor::ipc::FILE_PROTOCOL,
                             "predates reading its files through the head",
                         )))
-                    } else if remote.is_none() && flock_timeout_or_place_declared(&paths) {
-                        // Per-flock `timeout`/`place` are fields an older
-                        // head's `FlockEntry` (`deny_unknown_fields`) does
-                        // not know; its reload fails and it silently keeps
-                        // its old flock settings, so refuse rather than let
-                        // the CLI dispatch, list or reload on that stale view.
-                        protocol_need(&command).map_or(
-                            Some((
-                                pastor::ipc::FLOCK_TIMEOUT_PLACE_PROTOCOL,
-                                "predates per-flock timeout and place, and would silently drop flock.toml's `timeout`/`place` on reload, keeping its old settings",
-                            )),
-                            |(p, why)| {
-                                Some((p.max(pastor::ipc::FLOCK_TIMEOUT_PLACE_PROTOCOL), why))
-                            },
-                        )
                     } else {
                         protocol_need(&command)
                     },
@@ -766,9 +751,7 @@ fn main() {
             Command::Watch(args) => pastor::watch::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
-            Command::Profile { cmd } => {
-                pastor::profile_cli::run(&head_config(&paths).await?, cmd)
-            }
+            Command::Profile { cmd } => pastor::profile_cli::run(&head_config(&paths).await?, cmd),
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd, head).await,
             Command::Queue(args) => pastor::queue_cli::run(&paths, args, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
@@ -1594,6 +1577,47 @@ fn flocks_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).map_or(true, |f| !f.flocks.is_empty())
 }
 
+/// The protocol a head needs to read this machine's flock.toml without
+/// dropping part of it on reload, and why, when the file uses a field older
+/// heads' `FlockEntry` does not know: per-flock `machines`
+/// (`MULTI_FLOCK_PROTOCOL`), a flock's `timeout` or `place`
+/// (`FLOCK_TIMEOUT_PLACE_PROTOCOL`), a share and a max
+/// (`FLOCK_SHARE_PROTOCOL`). The newest one the file uses wins.
+fn flock_file_need(paths: &Paths) -> Option<(u32, &'static str)> {
+    if flock_share_declared(paths) {
+        Some((
+            pastor::ipc::FLOCK_SHARE_PROTOCOL,
+            "predates a flock's share and max on a machine, and would silently drop flock.toml's `machines` on reload, keeping its old membership",
+        ))
+    } else if flock_timeout_or_place_declared(paths) {
+        Some((
+            pastor::ipc::FLOCK_TIMEOUT_PLACE_PROTOCOL,
+            "predates per-flock timeout and place, and would silently drop flock.toml's `timeout`/`place` on reload, keeping its old settings",
+        ))
+    } else if multi_flock_declared(paths) {
+        Some((
+            pastor::ipc::MULTI_FLOCK_PROTOCOL,
+            "predates per-flock machine limits, and would silently drop flock.toml's `machines` on reload, keeping its old membership",
+        ))
+    } else {
+        None
+    }
+}
+
+/// Whether flock.toml gives any flock a share and a max on a machine
+/// (`machines = { desk = { share = 2, max = 4 } }`), the schema an older
+/// head's `FlockEntry` does not know (see `FLOCK_SHARE_PROTOCOL`). A
+/// flock.toml that does not load counts as not declaring it.
+fn flock_share_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| {
+        f.flocks.iter().any(|e| {
+            e.machines
+                .values()
+                .any(|n| matches!(n, pastor::config::flock::FlockNumber::Split(_)))
+        })
+    })
+}
+
 /// Whether flock.toml puts any machine in a flock with a number
 /// (`[[flock]] machines = { desk = 2 }`), the schema an older head's
 /// `FlockEntry` does not know (see `probe_head`'s `need` above). A
@@ -1856,13 +1880,12 @@ async fn probe_machine(
     let flocks = f
         .flocks_of(m)
         .into_iter()
-        .map(|(name, max)| pastor::machine::FlockSeat {
-            name: name.to_string(),
-            max,
-            live: on_machine
+        .map(|(name, number)| {
+            let live = on_machine
                 .iter()
                 .filter(|t| t.flock.as_deref().unwrap_or(f.default_flock()) == name)
-                .count(),
+                .count();
+            pastor::machine::FlockSeat::new(name, number, live)
         })
         .collect();
     // Nothing connects to a pull machine, and with no head running nobody

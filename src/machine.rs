@@ -160,11 +160,17 @@ impl std::fmt::Display for ChannelState {
 }
 
 /// One flock a machine is in: its number there (`None`: the machine's own
-/// limits, from the old `flock` key or the default) and how many of the
-/// flock's live tasks run on the machine.
+/// limits, from the old `flock` key or the default), as a share and a max
+/// (`FlockNumber`), and how many of the flock's live tasks run on the
+/// machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlockSeat {
     pub name: String,
+    /// Up to how many live tasks the flock takes a slot as usual; `None`
+    /// with a `max` is a head from before shares, whose number was a plain
+    /// ceiling, so the share is the max.
+    #[serde(default)]
+    pub share: Option<u32>,
     #[serde(default)]
     pub max: Option<u32>,
     #[serde(default)]
@@ -172,9 +178,43 @@ pub struct FlockSeat {
 }
 
 impl FlockSeat {
-    /// Is the flock under its number here?
+    /// `name`'s seat with `number` (`None`: the machine's own limits) and
+    /// `live` of its tasks.
+    pub fn new(
+        name: &str,
+        number: Option<crate::config::flock::FlockNumber>,
+        live: usize,
+    ) -> FlockSeat {
+        FlockSeat {
+            name: name.to_string(),
+            share: number.map(|n| n.share()),
+            max: number.map(|n| n.max()),
+            live,
+        }
+    }
+
+    /// Is the flock under its number here? Its max, which job slots and
+    /// burst never pass.
     pub fn has_room(&self) -> bool {
         self.max.is_none_or(|n| self.live < n as usize)
+    }
+
+    /// Is the flock under its share here, so it takes a free slot without
+    /// looking at who else waits? A seat with no number is.
+    pub fn under_share(&self) -> bool {
+        self.share
+            .or(self.max)
+            .is_none_or(|n| self.live < n as usize)
+    }
+
+    /// The number as `flock list` and `machine list` write it: `2`, or
+    /// `2/4` for a share of 2 and a max of 4. `None` with no number.
+    pub fn number_label(&self) -> Option<String> {
+        let max = self.max?;
+        Some(match self.share.filter(|s| *s != max) {
+            Some(share) => format!("{share}/{max}"),
+            None => max.to_string(),
+        })
     }
 }
 

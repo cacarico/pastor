@@ -40,6 +40,10 @@ pub struct MachineView {
     /// The flocks the machine is in now, each with its number and how many
     /// of its live tasks run here.
     pub flocks: Vec<FlockSeat>,
+    /// The flocks under their share here with a queued task waiting that
+    /// this machine could take. A flock past its share here takes a slot
+    /// only while this is empty (`MachineView::flock_may_take`).
+    pub waiting_under_share: Vec<String>,
 }
 
 /// What a task may take on a machine: a job slot if it comes from a job,
@@ -74,6 +78,15 @@ impl MachineView {
         self.seat(flock).is_some_and(FlockSeat::has_room)
     }
 
+    /// May a task of `flock` take a slot here, as far as the flock's number
+    /// goes? Under its share, yes; from its share up to its max, only while
+    /// no flock under its share here has a task waiting; at its max, no.
+    pub fn flock_may_take(&self, flock: &str) -> bool {
+        self.seat(flock).is_some_and(|s| {
+            s.has_room() && (s.under_share() || self.waiting_under_share.is_empty())
+        })
+    }
+
     /// Count one more live task of `flock` here, as a dispatch would.
     pub fn take(&mut self, flock: &str, claim: Claim) {
         self.live += 1;
@@ -101,8 +114,9 @@ impl MachineView {
 
 /// Only machines in `flock`, the task's, qualify. Of those the pinned machine
 /// wins. Otherwise: healthy, has every required tag, has room for `claim`
-/// (`MachineView::has_room`) with `flock` under its number there
-/// (`MachineView::flock_has_room`), fewest live tasks. Ties keep flock order.
+/// (`MachineView::has_room`) with `flock` under its number there, and past
+/// its share only while no flock under its share waits there
+/// (`MachineView::flock_may_take`), fewest live tasks. Ties keep flock order.
 pub fn pick_machine(
     machines: &[MachineView],
     flock: &str,
@@ -124,7 +138,7 @@ pub fn pick_machine_where(
     let fits = |m: &MachineView| {
         m.healthy
             && m.has_room(claim)
-            && m.flock_has_room(flock)
+            && m.flock_may_take(flock)
             && spec.tags.iter().all(|t| m.tags.contains(t))
             && accepts(&m.name)
     };
@@ -140,6 +154,78 @@ pub fn pick_machine_where(
         .filter(|m| fits(m))
         .min_by_key(|m| m.live)
         .map(|m| m.name.clone())
+}
+
+/// Fill each view's `waiting_under_share` for placing a task of `flock`: on
+/// a machine where `flock` is past its share and under its max, the other
+/// flocks under their share there that have a task in `later` the machine
+/// could take (queued, not pinned elsewhere, with its tags, room for its
+/// claim, one `accepts`). `later` is the queue behind the task being
+/// placed: those tasks still get their turn in this pass, while one ahead
+/// of it already had its turn and did not take the machine. Elsewhere the
+/// list is left empty, since it only matters past a share.
+pub fn mark_waiting_under_share(
+    views: &mut [MachineView],
+    flock: &str,
+    later: &[Task],
+    default_flock: &str,
+    accepts: &dyn Fn(&Task, &str) -> bool,
+) {
+    for v in views.iter_mut() {
+        v.waiting_under_share.clear();
+        if !v
+            .seat(flock)
+            .is_some_and(|s| s.has_room() && !s.under_share())
+        {
+            continue;
+        }
+        let mut waiting: Vec<String> = Vec::new();
+        for t in later {
+            let theirs = t.flock.as_deref().unwrap_or(default_flock);
+            if t.state != TaskState::Queued
+                || theirs == flock
+                || waiting.iter().any(|w| w == theirs)
+                || !v.seat(theirs).is_some_and(FlockSeat::under_share)
+                || t.spec.machine.as_ref().is_some_and(|m| *m != v.name)
+                || !t.spec.tags.iter().all(|tag| v.tags.contains(tag))
+                || !v.has_room(Claim::of(t))
+                || !accepts(t, &v.name)
+            {
+                continue;
+            }
+            waiting.push(theirs.to_string());
+        }
+        v.waiting_under_share = waiting;
+    }
+}
+
+/// Why `flock`'s number holds its task off `v`, as the waiting note says
+/// it: at its max, or past its share while another flock waits under its
+/// share there. `None` when the number lets it take a slot.
+pub fn flock_held(v: &MachineView, flock: &str) -> Option<String> {
+    let seat = v.seat(flock)?;
+    let max = seat.max?;
+    if !seat.has_room() {
+        let of = seat.number_label().unwrap_or_else(|| max.to_string());
+        return Some(format!(
+            "flock {flock} is at {} of {of} on {}",
+            seat.live, v.name
+        ));
+    }
+    if seat.under_share() || v.waiting_under_share.is_empty() {
+        return None;
+    }
+    let others = &v.waiting_under_share;
+    let noun = if others.len() == 1 { "flock" } else { "flocks" };
+    Some(format!(
+        "flock {flock} is past its share on {}, at {} of {}, while {noun} {} wait{} under {} share",
+        v.name,
+        seat.live,
+        seat.number_label().unwrap_or_default(),
+        others.join(", "),
+        if others.len() == 1 { "s" } else { "" },
+        if others.len() == 1 { "its" } else { "their" },
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -909,6 +995,7 @@ async fn prompt_when_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::flock::FlockNumber;
     use crate::herdr::AgentStatus;
     use crate::herdr::fake::{FakeHerdr, StartBehaviour};
     use crate::task::WorkspaceLabel;
@@ -929,12 +1016,14 @@ mod tests {
             live_jobs: 0,
             healthy,
             flocks: vec![seat("default", None, live)],
+            waiting_under_share: vec![],
         }
     }
 
     fn seat(name: &str, max: Option<u32>, live: usize) -> FlockSeat {
         FlockSeat {
             name: name.into(),
+            share: None,
             max,
             live,
         }
@@ -1017,6 +1106,53 @@ mod tests {
             pick_machine(&old, "default", &spec(), JOB).as_deref(),
             Some("old")
         );
+    }
+
+    /// A flock with a share and a max: under its share it takes a slot as
+    /// usual; past it, only while no flock under its share waits there; at
+    /// its max, never. The machine's own room holds all of them.
+    #[test]
+    fn pick_machine_lets_a_flock_past_its_share_only_on_an_idle_machine() {
+        let split = |live| FlockSeat::new("work", Some(FlockNumber::split(1, 3)), live);
+        let desk = |work_live: usize, waiting: &[&str]| MachineView {
+            flocks: vec![seat("home", Some(2), 0), split(work_live)],
+            waiting_under_share: waiting.iter().map(|w| w.to_string()).collect(),
+            ..mv("desk", 4, work_live, &[], true)
+        };
+        let pick = |m: MachineView| pick_machine(&[m], "work", &spec(), Claim::default());
+        // Under its share, a waiting task of another flock does not stop it.
+        assert_eq!(pick(desk(0, &["home"])).as_deref(), Some("desk"));
+        // Past its share on an idle machine it takes the slot.
+        assert_eq!(pick(desk(1, &[])).as_deref(), Some("desk"));
+        assert_eq!(pick(desk(2, &[])).as_deref(), Some("desk"));
+        // Past its share while home waits under its share, it does not.
+        assert_eq!(pick(desk(1, &["home"])), None);
+        // Held at its max, however idle the machine.
+        assert_eq!(pick(desk(3, &[])), None);
+        // The machine's own room caps everything.
+        let full = MachineView {
+            max_agents: 2,
+            ..desk(2, &[])
+        };
+        assert_eq!(pick(full), None);
+        // Job slots and burst never pass the max.
+        let slack = MachineView {
+            job_slots: 2,
+            burst: 2,
+            ..desk(3, &[])
+        };
+        for claim in [JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert_eq!(
+                pick_machine(std::slice::from_ref(&slack), "work", &spec(), claim),
+                None
+            );
+        }
+        // The plain number stays a hard ceiling.
+        let plain = MachineView {
+            flocks: vec![seat("work", Some(1), 1)],
+            ..mv("desk", 4, 1, &[], true)
+        };
+        assert_eq!(pick(plain), None);
     }
 
     fn spec() -> DispatchSpec {

@@ -84,6 +84,95 @@ pub struct MachineConfig {
     pub description: Option<String>,
 }
 
+/// A flock's number on a machine: a plain ceiling (`desk = 2`), or a share
+/// and a max (`desk = { share = 2, max = 4 }`). Under its share the flock
+/// takes a free slot as usual; from its share up to its max it takes one
+/// only while no task of a flock under its share there is waiting. The
+/// plain form is a share equal to the max.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FlockNumber {
+    Plain(u32),
+    Split(SplitNumber),
+}
+
+/// The table form of `FlockNumber`, as written. Both keys must be there;
+/// `Flock::validate` says so, with the flock and machine in the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitNumber {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u32>,
+}
+
+impl FlockNumber {
+    pub fn plain(n: u32) -> FlockNumber {
+        FlockNumber::Plain(n)
+    }
+
+    pub fn split(share: u32, max: u32) -> FlockNumber {
+        FlockNumber::Split(SplitNumber {
+            share: Some(share),
+            max: Some(max),
+        })
+    }
+
+    /// Up to how many live tasks the flock takes a free slot as usual.
+    pub fn share(&self) -> u32 {
+        match self {
+            FlockNumber::Plain(n) => *n,
+            FlockNumber::Split(s) => s.share.or(s.max).unwrap_or(0),
+        }
+    }
+
+    /// The hard ceiling: never more of the flock's live tasks than this.
+    pub fn max(&self) -> u32 {
+        match self {
+            FlockNumber::Plain(n) => *n,
+            FlockNumber::Split(s) => s.max.or(s.share).unwrap_or(0),
+        }
+    }
+
+    /// Why the number does not load, if it does not.
+    fn problem(&self) -> Option<String> {
+        match *self {
+            FlockNumber::Plain(0) => Some("the number must be at least 1".into()),
+            FlockNumber::Plain(_) => None,
+            FlockNumber::Split(SplitNumber { share: None, .. }) => {
+                Some("max alone is not allowed; a plain number (`= N`) is the hard ceiling".into())
+            }
+            FlockNumber::Split(SplitNumber { max: None, .. }) => {
+                Some("a share needs a max; a plain number (`= N`) is the hard ceiling".into())
+            }
+            FlockNumber::Split(SplitNumber {
+                share: Some(share),
+                max: Some(max),
+            }) => {
+                if share == 0 {
+                    Some("the share must be at least 1".into())
+                } else if max < share {
+                    Some(format!("max {max} is below share {share}"))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// `2`, or `2/4` for a share of 2 and a max of 4.
+impl std::fmt::Display for FlockNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.share() == self.max() {
+            write!(f, "{}", self.max())
+        } else {
+            write!(f, "{}/{}", self.share(), self.max())
+        }
+    }
+}
+
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
 pub const DEFAULT_FLOCK: &str = "default";
 
@@ -98,10 +187,11 @@ pub struct FlockEntry {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
     /// The machines this flock may use, each with at most how many of the
-    /// flock's live tasks it runs: `machines = { desk = 2 }`. Job slots and
-    /// burst never take a machine past it.
+    /// flock's live tasks it runs: `machines = { desk = 2 }`, or a share and
+    /// a max (`FlockNumber`). Job slots and burst never take a machine past
+    /// its max.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub machines: BTreeMap<String, u32>,
+    pub machines: BTreeMap<String, FlockNumber>,
     /// The agent for this flock's tasks that name none; `None` falls through
     /// to `[defaults] agent` (see `Defaults::resolve_agent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,11 +434,8 @@ impl Flock {
                 if self.get(name).is_none() {
                     return Err(format!("flock {}: machine {name} is not declared", f.name));
                 }
-                if *n == 0 {
-                    return Err(format!(
-                        "flock {}: machine {name}: the number must be at least 1",
-                        f.name
-                    ));
+                if let Some(why) = n.problem() {
+                    return Err(format!("flock {}: machine {name}: {why}", f.name));
                 }
             }
         }
@@ -426,8 +513,8 @@ impl Flock {
     /// limits, `max_agents` and on top of it the job slots and burst. A
     /// machine neither places is in the default flock the same way, as
     /// every machine was before flocks.
-    pub fn flocks_of<'a>(&'a self, m: &MachineConfig) -> Vec<(&'a str, Option<u32>)> {
-        let mut out: Vec<(&str, Option<u32>)> = self
+    pub fn flocks_of<'a>(&'a self, m: &MachineConfig) -> Vec<(&'a str, Option<FlockNumber>)> {
+        let mut out: Vec<(&str, Option<FlockNumber>)> = self
             .flocks
             .iter()
             .filter_map(|f| {
@@ -448,7 +535,7 @@ impl Flock {
 
     /// `flocks_of` the machine named `name`, `None` when there is no such
     /// machine.
-    pub fn machine_flocks(&self, name: &str) -> Option<Vec<(&str, Option<u32>)>> {
+    pub fn machine_flocks(&self, name: &str) -> Option<Vec<(&str, Option<FlockNumber>)>> {
         self.get(name).map(|m| self.flocks_of(m))
     }
 
@@ -830,14 +917,23 @@ impl FlockDoc {
 
     /// Set `machine`'s number in `flock`'s `machines`, writing the table
     /// inline (`machines = { desk = 2 }`) when the flock has none.
-    fn set_number(&mut self, flock: &str, machine: &str, n: u32) {
+    fn set_number(&mut self, flock: &str, machine: &str, n: FlockNumber) {
         let t = self.flock_mut(flock).expect("declared by the caller");
         let ms = t
             .entry("machines")
             .or_insert_with(|| toml_edit::value(toml_edit::InlineTable::new()));
+        let value = match n {
+            FlockNumber::Plain(n) => toml_edit::value(i64::from(n)),
+            FlockNumber::Split(_) => {
+                let mut split = toml_edit::InlineTable::new();
+                split.insert("share", i64::from(n.share()).into());
+                split.insert("max", i64::from(n.max()).into());
+                toml_edit::value(split)
+            }
+        };
         ms.as_table_like_mut()
             .expect("checked by flock(): machines is a table")
-            .insert(machine, toml_edit::value(i64::from(n)));
+            .insert(machine, value);
     }
 
     /// Take `machine` out of `flock`'s `machines`, and the table with it
@@ -868,18 +964,18 @@ impl FlockDoc {
         self.declare_implicit();
         let t = self.machine_mut(&m.name).expect("listed by current()");
         t.remove("flock");
-        self.set_number(old, &m.name, m.max_agents);
+        self.set_number(old, &m.name, FlockNumber::plain(m.max_agents));
     }
 
-    /// `flock join`: list `machine` in `flock` with `max`, by default the
-    /// number it has there already, else its `max_agents`. Returns the
-    /// number written.
+    /// `flock join`: list `machine` in `flock` with `max`, a plain number,
+    /// by default the number it has there already (a share and a max
+    /// stay), else its `max_agents`. Returns the number written.
     pub fn join_flock(
         &mut self,
         machine: &str,
         flock: &str,
         max: Option<u32>,
-    ) -> Result<u32, EditError> {
+    ) -> Result<FlockNumber, EditError> {
         let f = self.current()?;
         let m = f
             .get(machine)
@@ -896,7 +992,10 @@ impl FlockDoc {
         let listed = f
             .entry(flock)
             .and_then(|e| e.machines.get(machine).copied());
-        let n = max.or(listed).unwrap_or(m.max_agents);
+        let n = max
+            .map(FlockNumber::plain)
+            .or(listed)
+            .unwrap_or(FlockNumber::plain(m.max_agents));
         self.declare_implicit();
         self.lift_flock_key(&m);
         self.set_number(flock, machine, n);
@@ -957,7 +1056,7 @@ impl FlockDoc {
         for (other, _) in &now {
             self.unset_number(other, name);
         }
-        self.set_number(flock, name, m.max_agents);
+        self.set_number(flock, name, FlockNumber::plain(m.max_agents));
         Ok(())
     }
 
@@ -1342,11 +1441,14 @@ ssh = "user@spare"
         let f = flocks(MANY).unwrap();
         assert_eq!(
             f.machine_flocks("desk").unwrap(),
-            [("home", Some(3)), ("work", Some(2))]
+            [
+                ("home", Some(FlockNumber::plain(3))),
+                ("work", Some(FlockNumber::plain(2)))
+            ]
         );
         assert_eq!(
             f.machine_flocks("lab").unwrap(),
-            [("home", Some(1)), ("play", None)]
+            [("home", Some(FlockNumber::plain(1))), ("play", None)]
         );
         assert_eq!(f.machine_flocks("spare").unwrap(), [("home", None)]);
         assert_eq!(f.machine_flocks("gone"), None);
@@ -1387,6 +1489,72 @@ ssh = "user@spare"
             "machine lab: in flock play twice, by its flock key and by the flock's machines"
         );
         assert!(flocks(&MANY.replace("desk = 2", "desk = \"two\"")).is_err());
+    }
+
+    /// A flock's number on a machine can be a share and a max. The plain
+    /// number is both; `max` below `share`, `max` alone, a share alone and
+    /// a share of 0 fail the load. The file saves back as it was written.
+    #[test]
+    fn a_number_can_be_a_share_and_a_max() {
+        let f = flocks(&MANY.replace("desk = 2", "desk = { share = 2, max = 4 }")).unwrap();
+        let work = f.entry("work").unwrap().machines["desk"];
+        assert_eq!((work.share(), work.max()), (2, 4));
+        assert_eq!(work.to_string(), "2/4");
+        let home = f.entry("home").unwrap().machines["desk"];
+        assert_eq!((home.share(), home.max()), (3, 3));
+        assert_eq!(home.to_string(), "3");
+        assert_eq!(
+            f.machine_flocks("desk").unwrap(),
+            [
+                ("home", Some(FlockNumber::plain(3))),
+                ("work", Some(FlockNumber::split(2, 4)))
+            ]
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flock.toml");
+        f.save(&path).unwrap();
+        assert_eq!(Flock::load(&path).unwrap(), f);
+
+        let err = |number: &str| flocks(&MANY.replace("desk = 2", number)).unwrap_err();
+        assert_eq!(
+            err("desk = { share = 3, max = 2 }"),
+            "flock work: machine desk: max 2 is below share 3"
+        );
+        assert_eq!(
+            err("desk = { max = 4 }"),
+            "flock work: machine desk: max alone is not allowed; a plain number (`= N`) is the hard ceiling"
+        );
+        assert_eq!(
+            err("desk = { share = 2 }"),
+            "flock work: machine desk: a share needs a max; a plain number (`= N`) is the hard ceiling"
+        );
+        assert_eq!(
+            err("desk = { share = 0, max = 2 }"),
+            "flock work: machine desk: the share must be at least 1"
+        );
+        assert!(flocks(&MANY.replace("desk = 2", "desk = { share = 2, most = 4 }")).is_err());
+        // Joining again keeps a share and a max; `--max` makes it plain.
+        let mut d =
+            FlockDoc::parse(&MANY.replace("desk = 2", "desk = { share = 2, max = 4 }")).unwrap();
+        assert_eq!(
+            d.join_flock("desk", "work", None).unwrap(),
+            FlockNumber::split(2, 4)
+        );
+        assert!(
+            d.to_string().contains("desk = { share = 2, max = 4 }"),
+            "{d}"
+        );
+        assert_eq!(
+            d.join_flock("desk", "work", Some(3)).unwrap(),
+            FlockNumber::plain(3)
+        );
+        assert!(d.to_string().contains("machines = { desk = 3 }"), "{d}");
+        // Equal share and max load, as the plain number.
+        let same = flocks(&MANY.replace("desk = 2", "desk = { share = 2, max = 2 }")).unwrap();
+        assert_eq!(
+            same.entry("work").unwrap().machines["desk"].to_string(),
+            "2"
+        );
     }
 
     /// A pinned machine in many flocks: a named flock must be one of them,
@@ -1689,27 +1857,34 @@ ssh = "user@spare"
         let mut d = FlockDoc::parse(MANY).unwrap();
         d.join_flock("desk", "play", None).unwrap();
         let f = d.flock().unwrap();
-        assert_eq!(f.entry("play").unwrap().machines["desk"], 4);
+        assert_eq!(
+            f.entry("play").unwrap().machines["desk"],
+            FlockNumber::plain(4)
+        );
         assert_eq!(
             f.machine_flocks("desk").unwrap(),
-            [("home", Some(3)), ("work", Some(2)), ("play", Some(4))]
+            [
+                ("home", Some(FlockNumber::plain(3))),
+                ("work", Some(FlockNumber::plain(2))),
+                ("play", Some(FlockNumber::plain(4)))
+            ]
         );
         d.join_flock("desk", "work", Some(1)).unwrap();
         assert_eq!(
             d.flock().unwrap().entry("work").unwrap().machines["desk"],
-            1
+            FlockNumber::plain(1)
         );
         d.join_flock("desk", "work", None).unwrap();
         assert_eq!(
             d.flock().unwrap().entry("work").unwrap().machines["desk"],
-            1
+            FlockNumber::plain(1)
         );
         assert!(d.to_string().contains("machines = { desk = 1 }"), "{d}");
         // A machine nothing placed leaves the default once a flock lists it.
         d.join_flock("spare", "work", Some(2)).unwrap();
         assert_eq!(
             d.flock().unwrap().machine_flocks("spare").unwrap(),
-            [("work", Some(2))]
+            [("work", Some(FlockNumber::plain(2)))]
         );
         assert_eq!(
             d.join_flock("nope", "work", None).unwrap_err(),
@@ -1745,7 +1920,10 @@ ssh = "user@spare"
         assert!(out.contains("machines = { pi-3 = 2 }"), "{out}");
         assert_eq!(
             d.flock().unwrap().machine_flocks("pi-3").unwrap(),
-            [("default", Some(1)), ("work", Some(2))]
+            [
+                ("default", Some(FlockNumber::plain(1))),
+                ("work", Some(FlockNumber::plain(2)))
+            ]
         );
 
         // Joining the flock the key names takes the number given.
@@ -1753,7 +1931,7 @@ ssh = "user@spare"
         d.join_flock("pi-3", "work", Some(3)).unwrap();
         assert_eq!(
             d.flock().unwrap().machine_flocks("pi-3").unwrap(),
-            [("work", Some(3))]
+            [("work", Some(FlockNumber::plain(3)))]
         );
 
         // So does moving it to the flock the key already names.
@@ -1764,7 +1942,7 @@ ssh = "user@spare"
         assert!(out.contains("machines = { pi-3 = 2 }"), "{out}");
         assert_eq!(
             d.flock().unwrap().machine_flocks("pi-3").unwrap(),
-            [("work", Some(2))]
+            [("work", Some(FlockNumber::plain(2)))]
         );
 
         // A file with no `[[flock]]` gets its implicit flock declared.
@@ -1783,7 +1961,10 @@ ssh = "user@spare"
         let mut d = FlockDoc::parse(MANY).unwrap();
         d.leave_flock("desk", "work").unwrap();
         let f = d.flock().unwrap();
-        assert_eq!(f.machine_flocks("desk").unwrap(), [("home", Some(3))]);
+        assert_eq!(
+            f.machine_flocks("desk").unwrap(),
+            [("home", Some(FlockNumber::plain(3)))]
+        );
         assert!(!d.to_string().contains("machines = {}"), "{d}");
         assert!(f.entry("work").unwrap().machines.is_empty());
         // lab is in home by the table and in play by its old key, which
@@ -1791,7 +1972,7 @@ ssh = "user@spare"
         d.leave_flock("lab", "home").unwrap();
         assert_eq!(
             d.flock().unwrap().machine_flocks("lab").unwrap(),
-            [("play", Some(2))]
+            [("play", Some(FlockNumber::plain(2)))]
         );
         d.leave_flock("lab", "play").unwrap();
         let f = d.flock().unwrap();
@@ -1823,8 +2004,14 @@ ssh = "user@spare"
         d.move_machine("desk", "play").unwrap();
         d.move_machine("lab", "work").unwrap();
         let f = d.flock().unwrap();
-        assert_eq!(f.machine_flocks("desk").unwrap(), [("play", Some(4))]);
-        assert_eq!(f.machine_flocks("lab").unwrap(), [("work", Some(2))]);
+        assert_eq!(
+            f.machine_flocks("desk").unwrap(),
+            [("play", Some(FlockNumber::plain(4)))]
+        );
+        assert_eq!(
+            f.machine_flocks("lab").unwrap(),
+            [("work", Some(FlockNumber::plain(2)))]
+        );
         assert!(f.get("lab").unwrap().flock.is_none());
         assert!(f.entry("home").unwrap().machines.is_empty());
     }

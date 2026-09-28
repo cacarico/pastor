@@ -6575,8 +6575,8 @@ fn flock_join_and_leave_edit_membership() {
     assert_eq!(
         l[0]["members"],
         serde_json::json!([
-            {"name": "desk", "max": 3, "live": null},
-            {"name": "lab", "max": 2, "live": null}
+            {"name": "desk", "share": 3, "max": 3, "live": null},
+            {"name": "lab", "share": 2, "max": 2, "live": null}
         ])
     );
     let table = ok(run(&["flock", "list"]));
@@ -6628,8 +6628,8 @@ fn flock_join_and_leave_edit_membership() {
     assert_eq!(
         desk["flocks"],
         serde_json::json!([
-            {"name": "home", "max": 3, "live": 0},
-            {"name": "play", "max": 4, "live": 0}
+            {"name": "home", "share": 3, "max": 3, "live": 0},
+            {"name": "play", "share": 4, "max": 4, "live": 0}
         ])
     );
     let table = ok(run(&["machine", "list"]));
@@ -6701,4 +6701,44 @@ fn flock_join_and_leave_go_through_the_head() {
         sent,
         [serde_json::json!({"op": "flock_add", "name": "spare", "default": false})]
     );
+}
+
+/// A flock.toml that gives a flock a share and a max on a machine needs a
+/// head that reads them: an older one would fail to reload the file and
+/// keep its old flocks, so the CLI refuses it before sending anything.
+#[test]
+fn a_share_and_a_max_refuse_a_head_from_before_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"work\"\ndefault = true\nmachines = { pi-1 = { share = 1, max = 2 } }\n\n\
+         [[machine]]\nname = \"pi-1\"\nlocal = true\n",
+    )
+    .unwrap();
+    let socket = state.join("pastor.sock");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let reqs = text_head(&socket, pastor::ipc::FLOCK_SHARE_PROTOCOL - 1);
+    let out = run(&["flock", "add", "spare"]);
+    assert_eq!(error_code(&out), "head_too_old");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("share and max"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(reqs.lock().unwrap().iter().all(|r| r["op"] == "ping"));
+
+    std::fs::remove_file(&socket).unwrap();
+    text_head(&socket, pastor::ipc::FLOCK_SHARE_PROTOCOL);
+    assert_eq!(ok(run(&["flock", "add", "spare"])), "said by the head\n");
 }

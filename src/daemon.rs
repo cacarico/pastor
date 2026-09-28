@@ -13,7 +13,10 @@ use crate::config::{
     AGENT_KIND_MISSING, AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer,
     MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
 };
-use crate::dispatch::{Claim, FlockSeat, MachineView, pick_machine, pick_machine_where};
+use crate::dispatch::{
+    Claim, FlockSeat, MachineView, flock_held, mark_waiting_under_share, pick_machine,
+    pick_machine_where,
+};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{HeadPing, IpcRequest, IpcResponse, MODEL_PROTOCOL, check_protocol};
 use crate::machine::{
@@ -150,15 +153,14 @@ fn seats(flock: &Flock, status: &crate::machine::MachineStatus) -> Vec<FlockSeat
         .unwrap_or_else(|| vec![(default, None)]);
     flocks
         .into_iter()
-        .map(|(name, max)| FlockSeat {
-            name: name.to_string(),
-            max,
-            live: status
+        .map(|(name, number)| {
+            let live = status
                 .live_by_flock
                 .iter()
                 .filter(|(f, _)| f.as_deref().unwrap_or(default) == name)
                 .map(|(_, n)| n)
-                .sum(),
+                .sum();
+            FlockSeat::new(name, number, live)
         })
         .collect()
 }
@@ -967,6 +969,7 @@ impl Fleet {
                     // machine takes its tasks itself (`claim`).
                     healthy: !m.pull && !m.shutting_down && s.channel.accepts_dispatch(),
                     flocks: seats(&wanted, &s),
+                    waiting_under_share: Vec::new(),
                 }
             })
             .collect()
@@ -1605,6 +1608,7 @@ impl Fleet {
             live_jobs: s.live_jobs,
             healthy: true,
             flocks: seats(&flock, &s),
+            waiting_under_share: Vec::new(),
         };
         let queued = self.store.queued_tasks()?;
         let pinned = queued
@@ -1613,18 +1617,33 @@ impl Fleet {
         let loose = queued
             .iter()
             .filter(|t| flock_work && t.spec.machine.is_none());
+        let order: Vec<Task> = pinned.chain(loose).cloned().collect();
+        let default = flock.default_flock();
+        let takes = |task: &Task, machine: &str| {
+            let theirs = task.flock.as_deref().unwrap_or(default);
+            self.settled_on(task, theirs, machine)
+                .is_none_or(|r| r.is_ok())
+        };
         let mut claimed = Vec::new();
-        for task in pinned.chain(loose) {
+        for (i, task) in order.iter().enumerate() {
             if claimed.len() >= free_slots as usize {
                 break;
             }
             if task.state != TaskState::Queued {
                 continue;
             }
-            let target = task.flock.as_deref().unwrap_or(flock.default_flock());
+            let target = task.flock.as_deref().unwrap_or(default);
             let settled = self.settled_on(task, target, machine);
             let claim = Claim::of(task);
             let accepts = |_: &str| settled.as_ref().is_none_or(|r| r.is_ok());
+            let later = &order[i + 1..];
+            mark_waiting_under_share(
+                std::slice::from_mut(&mut view),
+                target,
+                later,
+                default,
+                &takes,
+            );
             let views = std::slice::from_ref(&view);
             if pick_machine_where(views, target, &task.spec, claim, &accepts).is_none() {
                 continue;
@@ -1892,21 +1911,31 @@ impl Fleet {
             }
         };
         let flock = self.flock();
-        for task in queued {
+        // Would `machine` take `task` as far as its agent goes? For the
+        // tasks behind the one being placed (`mark_waiting_under_share`).
+        let takes = |task: &Task, machine: &str| {
+            let theirs = task.flock.as_deref().unwrap_or(flock.default_flock());
+            self.settled_on(task, theirs, machine)
+                .is_none_or(|r| r.is_ok())
+        };
+        for (i, task) in queued.iter().enumerate() {
+            let later = &queued[i + 1..];
             if task.state == TaskState::Paused {
-                self.resume_paused(&task).await;
+                self.resume_paused(task, later, &takes).await;
                 continue;
             }
             let target = task.flock.as_deref().unwrap_or(flock.default_flock());
+            let default = flock.default_flock();
             let mut views = self.views();
+            mark_waiting_under_share(&mut views, target, later, default, &takes);
             // The agent can depend on the machine: a machine whose agent
             // cannot run the task's model does not take it. A task from
             // before `agent_source` keeps the agent it was queued with.
             // A profile it inherited (from a machine or flock, not its own
             // ask) is pinned onto the ask here, so a re-settle that can no
             // longer resolve it refuses instead of quietly dropping it.
-            let settled_on = |machine: &str| self.settled_on(&task, target, machine);
-            let claim = Claim::of(&task);
+            let settled_on = |machine: &str| self.settled_on(task, target, machine);
+            let claim = Claim::of(task);
             let accepts = |m: &str| settled_on(m).is_none_or(|r| r.is_ok());
             let mut picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
             // A critical task with `preempt` that finds no room pauses the
@@ -1916,13 +1945,14 @@ impl Fleet {
                 && task.pause.preempt
                 && task.priority == Priority::Critical
                 && let Some((machine, victim)) =
-                    self.pausable_for(&views, target, &task, claim, &accepts)
+                    self.pausable_for(&views, target, task, claim, &accepts, later, &takes)
                 && let Some(handle) = self.get(&machine)
             {
                 match handle.pause(victim, task.id).await {
                     Ok(_) => {
                         tracing::info!(task = %task.display_id(), paused = %Task::agent_name_for(victim), machine = %machine, "paused a low task");
                         views = self.views();
+                        mark_waiting_under_share(&mut views, target, later, default, &takes);
                         picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
                     }
                     Err(err) => {
@@ -1962,7 +1992,7 @@ impl Fleet {
                     })
                 };
                 // Or a machine would take it but its flock is at its
-                // number there.
+                // number there, or past its share while another waits.
                 let flock_full = || {
                     views
                         .iter()
@@ -1973,14 +2003,7 @@ impl Fleet {
                                 && task.spec.tags.iter().all(|t| v.tags.contains(t))
                                 && settled_on(&v.name).is_none_or(|r| r.is_ok())
                         })
-                        .find_map(|v| {
-                            let seat = v.seat(target)?;
-                            let max = seat.max.filter(|_| !seat.has_room())?;
-                            Some(format!(
-                                "flock {target} is at {} of {max} on {}",
-                                seat.live, v.name
-                            ))
-                        })
+                        .find_map(|v| flock_held(v, target))
                 };
                 let why = none_has()
                     .or_else(|| {
@@ -2040,7 +2063,11 @@ impl Fleet {
     /// (`Task::pausable`) is gone, the newest such, the machine with the
     /// fewest live tasks first. Pausing another flock's task frees a slot,
     /// not a seat in `flock`, so it only helps a machine short of slots.
-    /// Answers the machine and that task's id.
+    /// Past its share, `flock` may take the freed slot only while no flock
+    /// under its share there has a task in `later` waiting for it, the same
+    /// rule dispatch applies, so a pause never frees a slot the task then
+    /// may not take. Answers the machine and that task's id.
+    #[allow(clippy::too_many_arguments)]
     fn pausable_for(
         &self,
         views: &[MachineView],
@@ -2048,6 +2075,8 @@ impl Fleet {
         task: &Task,
         claim: Claim,
         accepts: &dyn Fn(&str) -> bool,
+        later: &[Task],
+        takes: &dyn Fn(&Task, &str) -> bool,
     ) -> Option<(String, i64)> {
         let agents = self.agents.read().unwrap().clone();
         let default = self.flock().default_flock().to_string();
@@ -2057,7 +2086,7 @@ impl Fleet {
             .filter(|m| {
                 m.in_flock(flock)
                     && m.healthy
-                    && !(m.has_room(claim) && m.flock_has_room(flock))
+                    && !(m.has_room(claim) && m.flock_may_take(flock))
                     && task.spec.machine.as_ref().is_none_or(|p| *p == m.name)
                     && task.spec.tags.iter().all(|t| m.tags.contains(t))
                     && accepts(&m.name)
@@ -2079,7 +2108,16 @@ impl Fleet {
                         if let Some(s) = after.flocks.iter_mut().find(|s| s.name == freed) {
                             s.live = s.live.saturating_sub(1);
                         }
-                        after.has_room(claim) && after.flock_has_room(flock)
+                        // The pause can bring `flock` from its max to
+                        // past its share, where waiters matter again.
+                        mark_waiting_under_share(
+                            std::slice::from_mut(&mut after),
+                            flock,
+                            later,
+                            &default,
+                            takes,
+                        );
+                        after.has_room(claim) && after.flock_may_take(flock)
                     })
                     .max_by_key(|t| t.id)?;
                 Some((m.live, m.name.clone(), victim.id))
@@ -2090,19 +2128,27 @@ impl Fleet {
 
     /// Resume paused task `task` on the machine it was paused on, once that
     /// machine is healthy, still in the flock and has room for it, its own
-    /// flock under its number there. It is not settled again: it goes back
-    /// to the agent and session it had.
-    async fn resume_paused(&self, task: &Task) {
+    /// flock under its number there. Past its share, it also waits while a
+    /// flock under its share there has a task in `later` for that slot, as
+    /// a queued task would (`MachineView::flock_may_take`). It is not
+    /// settled again: it goes back to the agent and session it had.
+    async fn resume_paused(
+        &self,
+        task: &Task,
+        later: &[Task],
+        takes: &(dyn Fn(&Task, &str) -> bool + Sync),
+    ) {
         let Some(machine) = task.pinned_machine() else {
             return;
         };
         let flock = self.flock();
         let target = task.flock.as_deref().unwrap_or(flock.default_flock());
-        let views = self.views();
+        let mut views = self.views();
+        mark_waiting_under_share(&mut views, target, later, flock.default_flock(), takes);
         let fits = views
             .iter()
             .find(|m| m.name == machine)
-            .is_some_and(|m| m.healthy && m.has_room(Claim::of(task)) && m.flock_has_room(target));
+            .is_some_and(|m| m.healthy && m.has_room(Claim::of(task)) && m.flock_may_take(target));
         if !fits || !self.in_flock(machine) {
             return;
         }
@@ -6782,7 +6828,10 @@ mod tests {
         assert!(said.contains("picked it up"), "{said}");
         assert_eq!(
             d.fleet().flock().machine_flocks("h").unwrap(),
-            [("work", Some(1)), ("spare", Some(2))]
+            [
+                ("work", Some(crate::config::flock::FlockNumber::plain(1))),
+                ("spare", Some(crate::config::flock::FlockNumber::plain(2)))
+            ]
         );
         let said = text(
             d.handle(IpcRequest::FlockLeave {
@@ -6795,7 +6844,10 @@ mod tests {
             said.starts_with("h left flock work; its flocks: spare:2"),
             "{said}"
         );
-        assert_eq!(on_disk().machine_flocks("h").unwrap(), [("spare", Some(2))]);
+        assert_eq!(
+            on_disk().machine_flocks("h").unwrap(),
+            [("spare", Some(crate::config::flock::FlockNumber::plain(2)))]
+        );
 
         let said = text(
             d.handle(IpcRequest::MachineRemove { name: "w".into() })
@@ -8396,6 +8448,87 @@ mod tests {
         assert_eq!(task(second.id).error, None);
     }
 
+    /// A flock with a share and a max: past its share it waits while a
+    /// flock under its share has a task for the machine, even one behind it
+    /// in the queue, and takes the idle slot once nobody else wants it; at
+    /// its max it waits however idle the machine is.
+    #[tokio::test]
+    async fn dispatch_lets_a_flock_past_its_share_only_into_idle_slots() {
+        let fake = FakeHerdr::new();
+        let flock: Flock = toml::from_str(
+            "[[flock]]\nname = \"pastor\"\ndefault = true\nmachines = { desk = { share = 1, max = 2 } }\n\n\
+             [[flock]]\nname = \"life\"\nmachines = { desk = 2 }\n\n\
+             [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 4\n",
+        )
+        .unwrap();
+        flock.validate().unwrap();
+        let (d, _tmp) = daemon_with_flock(flock, &[("desk", 4, fake.clone())]).await;
+        let insert = |flock: &str| {
+            d.store()
+                .insert_task(NewTask {
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                    flock: flock.into(),
+                    description: None,
+                })
+                .unwrap()
+        };
+        let task = |id: i64| d.store().get_task(id).unwrap().unwrap();
+        let fleet = d.fleet();
+
+        // Two flocks want the same slot: the one under its share goes first.
+        let first = insert("pastor");
+        let second = insert("pastor");
+        let life = insert("life");
+        fleet.dispatch_queued().await;
+        assert_eq!(task(first.id).state, TaskState::Running, "under its share");
+        assert_eq!(task(life.id).state, TaskState::Running, "under its share");
+        assert_eq!(task(second.id).state, TaskState::Queued);
+        assert_eq!(
+            task(second.id).error.as_deref(),
+            Some(
+                "waiting for a machine: flock pastor is past its share on desk, at 1 of 1/2, \
+                 while flock life waits under its share"
+            )
+        );
+
+        // Nobody under its share waits: the idle slot is pastor's.
+        fleet.dispatch_queued().await;
+        assert_eq!(task(second.id).state, TaskState::Running, "past its share");
+        assert_eq!(task(second.id).error, None);
+
+        // At its max it waits though the machine has room; life still goes.
+        let third = insert("pastor");
+        let more_life = insert("life");
+        fleet.dispatch_queued().await;
+        assert_eq!(task(third.id).state, TaskState::Queued, "held at its max");
+        assert_eq!(
+            task(third.id).error.as_deref(),
+            Some("waiting for a machine: flock pastor is at 2 of 1/2 on desk")
+        );
+        assert_eq!(task(more_life.id).state, TaskState::Running);
+        let status = fleet
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == "desk")
+            .unwrap();
+        let seats: Vec<(String, Option<u32>, Option<u32>, usize)> = status
+            .flocks
+            .iter()
+            .map(|f| (f.name.clone(), f.share, f.max, f.live))
+            .collect();
+        assert_eq!(
+            seats,
+            [
+                ("pastor".into(), Some(1), Some(2), 2),
+                ("life".into(), Some(2), Some(2), 2)
+            ]
+        );
+        assert_eq!(fake.agents().len(), 4);
+    }
+
     /// `FileGet` and `FilePut` act on the head's own files, named only as
     /// `flock`, `config` or `job:<name>`, and write only a valid edit made
     /// from the file as it is now.
@@ -9590,6 +9723,60 @@ mod tests {
             let paused = states.iter().filter(|s| **s == TaskState::Paused).count();
             assert_eq!(running, 1, "only one freed slot, only one may resume");
             assert_eq!(paused, 1, "the other stays paused");
+        }
+
+        /// A paused task past its flock's share waits, as a queued one
+        /// would, while a flock under its share there has a task for the
+        /// freed slot; it resumes once nobody under a share wants it.
+        #[tokio::test]
+        async fn a_paused_task_past_its_share_leaves_the_slot_to_a_flock_under_its_share() {
+            let fake = FakeHerdr::new();
+            let flock: Flock = toml::from_str(
+                "[[flock]]\nname = \"pastor\"\ndefault = true\nmachines = { desk = { share = 1, max = 2 } }\n\n\
+                 [[flock]]\nname = \"life\"\nmachines = { desk = 2 }\n\n\
+                 [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 2\n",
+            )
+            .unwrap();
+            flock.validate().unwrap();
+            let (d, _tmp) = daemon_with_flock(flock, &[("desk", 2, fake.clone())]).await;
+            let first = start(&d, run("first", spec(), Priority::Low, false)).await;
+            let second = start(&d, run("second", spec(), Priority::Low, false)).await;
+            assert_eq!(first.state, TaskState::Running);
+            assert_eq!(
+                second.state,
+                TaskState::Running,
+                "past its share, nobody waits"
+            );
+            let crit = start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit.state, TaskState::Running);
+            assert_eq!(get(&d, second.id).state, TaskState::Paused);
+
+            let mut req = run("life", spec(), Priority::Low, false);
+            if let IpcRequest::Run { flock, .. } = &mut req {
+                *flock = Some("life".into());
+            }
+            let life = start(&d, req).await;
+            assert_eq!(life.state, TaskState::Queued);
+
+            // One slot frees: pastor is at its share again, life is under
+            // its own and waits, so life takes it.
+            d.handle(IpcRequest::TaskClose {
+                id: crit.id,
+                remove_worktree: false,
+            })
+            .await;
+            d.fleet().dispatch_queued().await;
+            assert_eq!(get(&d, life.id).state, TaskState::Running);
+            assert_eq!(get(&d, second.id).state, TaskState::Paused);
+
+            // Nobody under a share waits now: the paused task resumes.
+            d.handle(IpcRequest::TaskClose {
+                id: life.id,
+                remove_worktree: false,
+            })
+            .await;
+            d.fleet().dispatch_queued().await;
+            assert_eq!(get(&d, second.id).state, TaskState::Running);
         }
 
         /// A resume whose agent does not come up fails the task, as any

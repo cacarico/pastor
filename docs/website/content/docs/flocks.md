@@ -55,6 +55,19 @@ is under its number there; job slots and burst never pass it. A task whose
 flock is full waits, saying `flock work is at 1 of 1 on here`, and the next
 task in the queue goes.
 
+A plain number is a hard ceiling. To let a busy project use slots the quiet
+ones leave idle, give its flock a share and a max:
+
+```toml
+machines = { here = { share = 2, max = 4 } }
+```
+
+Under its share the flock takes a free slot as usual. Between its share and
+its max it takes one only while no task of a flock under its share on that
+machine is waiting, so a quiet project gets its share back as soon as it has
+work. The machine's own room still caps everything. `flock list` shows it as
+`here 1/2/4` (live, share, max) and `machine list` as `work:2/4`.
+
 ## what a flock sets
 
 A flock carries every per-task setting `[defaults]` has: `agent`,
