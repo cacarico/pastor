@@ -900,6 +900,33 @@ pub fn trailing_question(pane: &str) -> Option<String> {
         .then_some(last)
 }
 
+/// Whether the agent's footer says a background shell it started is still
+/// running. Claude Code can end its turn with a command (`make check`) left
+/// running in the background, draws "1 shell still running" in its footer,
+/// and takes the turn up again when the shell ends; herdr reads it as idle
+/// all the while. Only the lines after the last input prompt (`❯`) are the
+/// footer, so a message that quotes the phrase does not count; a pane with
+/// no prompt is read whole.
+pub fn background_shell_running(pane: &str) -> bool {
+    let lines: Vec<&str> = pane.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|l| l.trim_start_matches(['\u{a0}', ' ']).starts_with('❯'))
+        .map_or(0, |i| i + 1);
+    lines[start..].iter().any(|line| {
+        let line = line.replace('\u{a0}', " ");
+        ["shell still running", "shells still running"]
+            .iter()
+            .any(|phrase| {
+                line.match_indices(phrase).any(|(at, _)| {
+                    line[..at]
+                        .trim_end()
+                        .ends_with(|c: char| c.is_ascii_digit())
+                })
+            })
+    })
+}
+
 /// Pure transition. `None` means no change. The settle window for `Done` is the
 /// caller's job: it should confirm the agent is still idle after the window.
 pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
@@ -1527,6 +1554,28 @@ mod tests {
         assert_eq!(trailing_question("● Bash(git push)\n  ⎿  done?\n"), None);
         assert_eq!(trailing_question(&claude_pane("")), None);
         assert_eq!(trailing_question("fake output\nready?\n"), None);
+    }
+
+    #[test]
+    fn a_footer_with_a_background_shell_is_still_running() {
+        let pane = claude_pane("● Running make check in the background.")
+            .replace("← for agents", "← for agents · 1 shell still running");
+        assert!(background_shell_running(&pane));
+        let pane = claude_pane("● Waiting.")
+            .replace("auto mode on", "auto mode on · 2 shells still running");
+        assert!(background_shell_running(&pane));
+        assert!(background_shell_running("1 shell still running\n"));
+    }
+
+    #[test]
+    fn a_footer_without_a_background_shell_is_not_running() {
+        assert!(!background_shell_running(&claude_pane(
+            "● Pushed the branch."
+        )));
+        // The phrase in a message above the input box is not the footer.
+        let pane = claude_pane("● It said 1 shell still running, now ended.");
+        assert!(!background_shell_running(&pane));
+        assert!(!background_shell_running("fake output\n"));
     }
 
     /// A task marked blocked on a question moves its baseline to the idle

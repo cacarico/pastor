@@ -48,7 +48,11 @@ task `done` pastor reads the last 100 lines of the pane: when the agent's last
 message (Claude's `●` block) ends in `?`, the task goes `blocked` instead, with
 `agent asked: <question>` as its error, and stays there until the agent moves
 again; answer it with `pastor task send`. Agents that draw their messages
-without that marker are never read as asking. An agent whose process exits while it sits idle
+without that marker are never read as asking. Claude can also end its turn
+with a command still running in the background (`make check`), and takes the
+turn up again when it ends; while the pane's footer, below the input prompt,
+says `1 shell still running` (or `N shells`), the task stays `running` and
+pastor looks again after each settle window. An agent whose process exits while it sits idle
 between turns (someone typed `/exit` after the work) leaves its task `done`;
 one that exits while starting, blocked or working fails it with "agent process
 exited". Task state lives in SQLite under

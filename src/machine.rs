@@ -774,6 +774,14 @@ fn task_id_of_agent(name: &str) -> Option<i64> {
     (id > 0 && Task::agent_name_for(id) == name).then_some(id)
 }
 
+/// How an idle agent ended its turn, read from its pane before a task is
+/// settled `done` (`Actor::pane_end`).
+enum PaneEnd {
+    Finished,
+    Question(String),
+    ShellRunning,
+}
+
 /// Who asked for a close. `pastor task close` refuses what herdr refuses;
 /// auto-close of a done task closes the pane anyway when the worktree cannot
 /// go without force, and writes the row only while it is still `Done`.
@@ -2709,9 +2717,9 @@ impl Actor {
                 continue;
             }
             let observed = observed_from(agent);
-            let question = if next_state(&task, &observed) == Some(TaskState::Done) {
-                match self.question_in_pane(&task).await {
-                    Ok(q) => q,
+            let end = if next_state(&task, &observed) == Some(TaskState::Done) {
+                match self.pane_end(&task).await {
+                    Ok(end) => end,
                     Err(err) => {
                         // Not done yet: the pane could not be read because the
                         // machine is out of reach. Keep the task pending for the
@@ -2721,41 +2729,55 @@ impl Actor {
                     }
                 }
             } else {
-                None
+                PaneEnd::Finished
             };
-            if let Some(question) = question {
-                self.block_on_question(task, &observed, question);
-                continue;
+            match end {
+                PaneEnd::Question(question) => self.block_on_question(task, &observed, question),
+                PaneEnd::ShellRunning => {
+                    // The agent ended its turn waiting on a background shell
+                    // and takes it up again when the shell ends: not done.
+                    // The window starts over at this sequence, so the next
+                    // settle check looks again.
+                    tracing::debug!(machine = %self.name, task = %task.display_id(), "background shell still running");
+                    self.pending_done.insert(id, (seen_seq, Instant::now()));
+                }
+                PaneEnd::Finished => self.apply(task, &observed),
             }
-            self.apply(task, &observed);
         }
         Ok(())
     }
 
-    /// The question the task's agent ended its turn with, read from the tail
-    /// of its pane (`task::trailing_question`). A pane herdr cannot read has
-    /// no question, so the task is done as it would have been without this
-    /// check. A lost connection or a read that never answers is an outage
-    /// (`is_outage`): the task is not settled on it, and the caller reconnects.
-    async fn question_in_pane(&self, task: &Task) -> anyhow::Result<Option<String>> {
+    /// How the task's agent ended its turn, read from the tail of its pane:
+    /// on a question (`task::trailing_question`), waiting on a background
+    /// shell (`task::background_shell_running`), or finished. A pane herdr
+    /// cannot read is finished, so the task is done as it would have been
+    /// without this check. A lost connection or a read that never answers is
+    /// an outage (`is_outage`): the task is not settled on it, and the caller
+    /// reconnects.
+    async fn pane_end(&self, task: &Task) -> anyhow::Result<PaneEnd> {
         let Some(target) = task.agent_name.as_deref() else {
-            return Ok(None);
+            return Ok(PaneEnd::Finished);
         };
         let timeout = self.settings.request_timeout;
         match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
             Ok(Ok(text)) => {
+                if crate::task::background_shell_running(&text) {
+                    return Ok(PaneEnd::ShellRunning);
+                }
                 // Kept only when the task really is done: a tail left by a
                 // question would reach a later failed task's finish command.
-                let question = crate::task::trailing_question(&text);
-                if question.is_none() {
-                    self.store.note_pane_tail(task.id, &text);
-                }
-                Ok(question)
+                Ok(match crate::task::trailing_question(&text) {
+                    Some(question) => PaneEnd::Question(question),
+                    None => {
+                        self.store.note_pane_tail(task.id, &text);
+                        PaneEnd::Finished
+                    }
+                })
             }
             Ok(Err(err)) if err.is_transport() => Err(err.into()),
             Ok(Err(err)) => {
                 tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a question");
-                Ok(None)
+                Ok(PaneEnd::Finished)
             }
             Err(_) => Err(TimedOut("agent.read", timeout).into()),
         }
@@ -3646,6 +3668,46 @@ mod tests {
         wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
         assert_eq!(store.get_task(t.id).unwrap().unwrap().error, None);
         fake.set_pane_text(&pane, "● Kept it. Pushed the branch.\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// Claude can end its turn with a command left running in the
+    /// background; its footer says "1 shell still running" and it takes the
+    /// turn up again when the shell ends. herdr reads it idle all the while,
+    /// but the task is not done: it stays running through settle windows
+    /// until the shell has ended and the agent went idle again.
+    #[tokio::test]
+    async fn an_agent_waiting_on_a_background_shell_is_not_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(
+            &pane,
+            "● Running make check in the background.\n\n❯\n  ⏵⏵ auto mode on · 1 shell still running\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 6).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "a background shell keeps the task running"
+        );
+
+        // The shell ended: the agent takes the turn up, pushes, goes idle.
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● make check passed. Pushed the branch.\n\n❯\n");
         fake.set_status(&pane, AgentStatus::Idle);
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
     }
