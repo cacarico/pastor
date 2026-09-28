@@ -189,7 +189,9 @@ Work test first, commit, and push the branch.
 ```
 
 Each piece of work has a stable key, so pastor never starts the same issue
-twice. Without `backfill`, the first run only sees issues updated from then on. Connectors in [pastor-connectors](https://github.com/cacarico/pastor-connectors):
+twice. Without `backfill`, the first run only sees issues updated from then on.
+
+Connectors in [pastor-connectors](https://github.com/cacarico/pastor-connectors):
 
 | Connector | Turns into tasks |
 |---|---|
@@ -230,20 +232,20 @@ Put machines in flocks, and give a flock or a single machine its own agent:
 [[flock]]
 name = "personal"
 default = true
+machines = { laptop = 2 }   # laptop runs at most 2 personal tasks
 
 [[flock]]
 name = "work"
+machines = { pi-1 = 2 }
 
 [[machine]]
 name = "laptop"
 local = true
-flock = "personal"
 agent = "claude-personal"   # this machine's plain `claude` is a work login
 
 [[machine]]
 name = "pi-1"
 ssh = "pi-1"
-flock = "work"
 ```
 
 ```toml
@@ -267,9 +269,10 @@ machine names.
   retry, send to and close tasks, enable or disable a job and keep its
   handover note, and nothing more; no task can start one. An orchestrator's
   scripts get the same rights.
-- **Agents keep their permission prompts.** pastor passes the allow and deny
-  lists you set for each flock. Turning the prompts off is your decision, and
-  [the manual](docs/manual.md#trust-model) says when not to.
+- **Permission prompts stay on unless you pick a profile.** pastor passes the
+  allow and deny lists you set. A profile (`review`, `develop`,
+  `unrestricted`) turns Claude's prompts off and refuses whatever its lists
+  don't allow. [The manual](docs/manual.md#trust-model) says when not to.
 - **Nothing is closed that pastor didn't open.** pastor closes only the panes
   and workspaces it created, and keeps a worktree with unpushed commits or
   another agent in it.
@@ -306,8 +309,8 @@ Issues and pull requests are welcome, especially when they fit the direction
 above. pastor is still my personal workflow tool first, so I may decline good
 ideas that would pull it away from that shape.
 
-`make check` runs formatting, clippy and the whole test suite against a fake
-herdr, so you don't need a fleet to work on pastor; `make help` lists the rest.
+`make check` runs the changelog check, formatting, clippy and the whole test
+suite against a fake herdr, so you don't need a fleet to work on pastor; `make help` lists the rest.
 Start with [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Rules
 for AI contributors are in [docs/AI_GOVERNANCE.md](docs/AI_GOVERNANCE.md).
 
