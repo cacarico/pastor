@@ -1160,6 +1160,7 @@ mod tests {
             spec: minimal_task().spec,
             flock: None,
             agent: None,
+            priority: None,
             role,
         };
         let v = serde_json::to_value(run(TaskRole::Agent)).unwrap();

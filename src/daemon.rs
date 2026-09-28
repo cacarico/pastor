@@ -3239,6 +3239,7 @@ mod tests {
             flock: None,
             agent: None,
             priority,
+            role: TaskRole::Agent,
         }
     }
 
@@ -3332,6 +3333,7 @@ mod tests {
             flock: None,
             agent: None,
             priority,
+            role: TaskRole::Agent,
         };
         let level = |resp: IpcResponse| match resp {
             IpcResponse::Task(t) => (t.priority, t.priority_from.unwrap_or_default()),
@@ -4962,11 +4964,14 @@ mod tests {
                     command: None,
                     session: "default".into(),
                     max_agents: 1,
+                    job_slots: 1,
+                    burst: 1,
                     tags: vec![],
                     flock: None,
                     agent: None,
                     agent_args: None,
                     model: None,
+                    priority: None,
                 },
             },
             IpcRequest::TaskClose {
