@@ -1410,7 +1410,7 @@ fn machine_list_opens_with_a_line_about_the_head() {
         "{stdout}"
     );
     // A command bridge cannot say which pastor is behind it.
-    assert_eq!(lines[1][5..7], ["-", "0/2"], "{stdout}");
+    assert_eq!(lines[1][5..7], ["-", "0/2+1j+1b"], "{stdout}");
     assert_eq!(lines.len(), 2, "{stdout}");
 
     let out = env.cmd(&["machine", "list", "--json"]);
@@ -1520,13 +1520,13 @@ fn machine_list_without_daemon_probes_each_machine() {
         ["fake", "fake-herdr", "default", "probed"],
         "{stdout}"
     );
-    assert_eq!(&lines[1][5..], ["-", "0/2", "-", "arm"], "{stdout}");
+    assert_eq!(&lines[1][5..], ["-", "0/2+1j+1b", "-", "arm"], "{stdout}");
     assert_eq!(
         lines[2][..4],
         ["gone", "no-such-bridge", "default", "unreachable"],
         "{stdout}"
     );
-    assert_eq!(lines[2][4..7], ["-", "-", "-/1"], "{stdout}");
+    assert_eq!(lines[2][4..7], ["-", "-", "-/1+1j+1b"], "{stdout}");
     assert!(lines[2].len() > 9, "ERROR should say why: {stdout}");
 
     // The same JSON shape as with a head.
@@ -1541,6 +1541,8 @@ fn machine_list_without_daemon_probes_each_machine() {
     assert!(ms[1]["error"].is_string(), "{v}");
     assert_eq!(ms[0]["channel"], "probed");
     assert_eq!(ms[0]["live"], 0);
+    assert_eq!(ms[0]["job_slots"], 1, "{v}");
+    assert_eq!(ms[0]["burst"], 1, "{v}");
 
     std::fs::write(config.join("flock.toml"), "[[machine]\n").unwrap();
     let out = run(&["machine", "list"]);

@@ -9,6 +9,12 @@ fn default_session() -> String {
 fn default_max_agents() -> u32 {
     2
 }
+fn default_one() -> u32 {
+    1
+}
+fn is_one(n: &u32) -> bool {
+    *n == 1
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineConfig {
@@ -24,6 +30,14 @@ pub struct MachineConfig {
     pub session: String,
     #[serde(default = "default_max_agents")]
     pub max_agents: u32,
+    /// Slots on top of `max_agents` that only tasks from jobs take; `0`
+    /// turns them off (see `dispatch::MachineView::has_room`).
+    #[serde(default = "default_one", skip_serializing_if = "is_one")]
+    pub job_slots: u32,
+    /// How many tasks past `max_agents` a `critical` task may start; `0`
+    /// turns it off.
+    #[serde(default = "default_one", skip_serializing_if = "is_one")]
+    pub burst: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     /// The flock this machine belongs to; `None` is the default flock.
@@ -777,6 +791,8 @@ mod tests {
             command: None,
             session: "default".into(),
             max_agents: 2,
+            job_slots: 1,
+            burst: 1,
             tags: vec![],
             flock: None,
             agent: None,
@@ -790,6 +806,25 @@ mod tests {
         let f: Flock = toml::from_str(text).map_err(|e| e.to_string())?;
         f.validate()?;
         Ok(f)
+    }
+
+    /// `job_slots` and `burst` default to 1, `0` is allowed, and a file
+    /// that leaves them at 1 does not write them.
+    #[test]
+    fn job_slots_and_burst_default_to_one() {
+        let f: Flock = toml::from_str(
+            "[[machine]]\nname = \"a\"\nlocal = true\n\n[[machine]]\nname = \"b\"\nlocal = true\njob_slots = 0\nburst = 2\n",
+        )
+        .unwrap();
+        f.validate().unwrap();
+        assert_eq!((f.machines[0].job_slots, f.machines[0].burst), (1, 1));
+        assert_eq!((f.machines[1].job_slots, f.machines[1].burst), (0, 2));
+        let out = toml::to_string(&f).unwrap();
+        assert!(
+            out.contains("job_slots = 0") && out.contains("burst = 2"),
+            "{out}"
+        );
+        assert_eq!(out.matches("burst").count(), 1, "{out}");
     }
 
     #[test]

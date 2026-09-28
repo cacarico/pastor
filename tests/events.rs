@@ -189,6 +189,8 @@ async fn the_daemon_writes_the_events_log() {
             command: Some(vec!["fake".into()]),
             session: "default".into(),
             max_agents: 1,
+            job_slots: 1,
+            burst: 1,
             tags: vec![],
             flock: None,
             agent: None,

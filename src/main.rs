@@ -332,6 +332,12 @@ enum MachineCmd {
         /// How many tasks it runs at once
         #[arg(long, default_value_t = 2)]
         max_agents: u32,
+        /// Extra slots only tasks from jobs take, on top of --max-agents; 0 for none
+        #[arg(long, default_value_t = 1)]
+        job_slots: u32,
+        /// How many past --max-agents a critical task may start; 0 for none
+        #[arg(long, default_value_t = 1)]
+        burst: u32,
         /// A label a task's --tag can ask for; repeat for more
         #[arg(long = "tag")]
         tags: Vec<String>,
@@ -1310,6 +1316,8 @@ async fn probe_machine(
         error,
         live,
         max_agents: m.max_agents,
+        job_slots: m.job_slots,
+        burst: m.burst,
         tags: m.tags.clone(),
         orphans,
     })
@@ -1595,6 +1603,8 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             command,
             session,
             max_agents,
+            job_slots,
+            burst,
             tags,
             flock,
             herdr,
@@ -1606,6 +1616,8 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 command: command.as_deref().map(command_argv),
                 session,
                 max_agents,
+                job_slots,
+                burst,
                 tags,
                 flock,
                 agent: None,
