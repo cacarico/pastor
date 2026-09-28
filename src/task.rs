@@ -703,9 +703,9 @@ pub enum TaskRole {
     /// unless `agents_change_fleet` is on.
     #[default]
     Agent,
-    /// Also runs, retries and types into tasks and disables jobs
-    /// (`IpcRequest::orchestrator_may`). Only a person makes one: `task run
-    /// --role orchestrator` from outside any task.
+    /// Also runs, retries, types into and closes tasks and enables and
+    /// disables jobs (`IpcRequest::orchestrator_may`). Only a person makes
+    /// one: `task run --role orchestrator` from outside any task.
     Orchestrator,
 }
 
