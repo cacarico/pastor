@@ -29,8 +29,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// 20: the `summary` setting (`Run::summary`, a job's `[dispatch]
 /// summary`). 21: pull machines (`TaskClaim`, `TaskReport`). 22:
 /// `FlockJoin`, `FlockLeave` and `FlockAdd::machines`. 23: orchestrators
-/// (`Orchestrator*` requests, and `FROM_ORCHESTRATOR_FIELD`).
-pub const IPC_PROTOCOL: u32 = 23;
+/// (`Orchestrator*` requests, and `FROM_ORCHESTRATOR_FIELD`). 24: a flock's
+/// own `timeout` and `place` (`FlockEntry::timeout`, `FlockEntry::place`).
+pub const IPC_PROTOCOL: u32 = 24;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -111,6 +112,13 @@ pub const PULL_PROTOCOL: u32 = 21;
 /// honours `FlockAdd::machines`. An older one refuses the first two as
 /// unknown requests and adds the flock without its machines.
 pub const JOIN_PROTOCOL: u32 = 22;
+
+/// The first protocol whose head's `FlockEntry` knows `timeout` and
+/// `place`. An older head's `FlockEntry` (`deny_unknown_fields`) rejects
+/// both fields on reload and keeps its previous flock settings instead, so
+/// a CLI new enough to write them refuses to send it work (see
+/// `flock_timeout_or_place_declared` in `main.rs`).
+pub const FLOCK_TIMEOUT_PLACE_PROTOCOL: u32 = 24;
 
 /// `Pong::role` of a headless `pastor serve`: it runs this machine's jobs
 /// and hooks against a head elsewhere, and is not a head itself.

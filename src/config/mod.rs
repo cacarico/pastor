@@ -463,11 +463,11 @@ pub struct Defaults {
     pub allow: Vec<String>,
     /// Tool patterns every task's agent must never use; wins over `allow`.
     pub deny: Vec<String>,
-    /// The `[models]` entry tasks run when their run flags, job, machine and
-    /// flock name none. See `resolve_agent`.
+    /// The `[models]` entry tasks run when their run flags, job, flock and
+    /// machine name none. See `resolve_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The level of tasks whose run flags, job, pinned machine and flock
+    /// The level of tasks whose run flags, job, flock and pinned machine
     /// name none; unset, `normal`. See `resolve_priority`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::task::Priority>,
@@ -476,7 +476,7 @@ pub struct Defaults {
     #[serde(skip_serializing_if = "KindAgents::is_empty")]
     pub agents: KindAgents,
     /// The permission profile tasks run under when their run flags, job,
-    /// machine and flock name none. See `resolve_agent`.
+    /// flock and machine name none. See `resolve_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     pub max_tasks_per_run: u32,

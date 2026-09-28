@@ -718,6 +718,21 @@ fn main() {
                             pastor::ipc::FILE_PROTOCOL,
                             "predates reading its files through the head",
                         )))
+                    } else if remote.is_none() && flock_timeout_or_place_declared(&paths) {
+                        // Per-flock `timeout`/`place` are fields an older
+                        // head's `FlockEntry` (`deny_unknown_fields`) does
+                        // not know; its reload fails and it silently keeps
+                        // its old flock settings, so refuse rather than let
+                        // the CLI dispatch, list or reload on that stale view.
+                        protocol_need(&command).map_or(
+                            Some((
+                                pastor::ipc::FLOCK_TIMEOUT_PLACE_PROTOCOL,
+                                "predates per-flock timeout and place, and would silently drop flock.toml's `timeout`/`place` on reload, keeping its old settings",
+                            )),
+                            |(p, why)| {
+                                Some((p.max(pastor::ipc::FLOCK_TIMEOUT_PLACE_PROTOCOL), why))
+                            },
+                        )
                     } else {
                         protocol_need(&command)
                     },
@@ -1575,6 +1590,19 @@ fn flocks_declared(paths: &Paths) -> bool {
 /// cannot read the file either is refused for other reasons first.
 fn multi_flock_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| !e.machines.is_empty()))
+}
+
+/// Whether flock.toml gives any flock its own `timeout` or `place`, the
+/// schema an older head's `FlockEntry` does not know (see
+/// `FLOCK_TIMEOUT_PLACE_PROTOCOL`). A flock.toml that does not load counts
+/// as not declaring it: a head that cannot read the file either is refused
+/// for other reasons first.
+fn flock_timeout_or_place_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| {
+        f.flocks
+            .iter()
+            .any(|e| e.timeout.is_some() || e.place.is_some())
+    })
 }
 
 /// The prompt of `pastor task run`: the positional one as given, or the
