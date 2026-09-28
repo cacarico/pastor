@@ -32,8 +32,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// (`Orchestrator*` requests, and `FROM_ORCHESTRATOR_FIELD`). 24: a
 /// flock's own `timeout` and `place` (`FlockEntry::timeout`,
 /// `FlockEntry::place`). 25: session orchestrators (`OrchestratorStart`,
-/// `OrchestratorStop`).
-pub const IPC_PROTOCOL: u32 = 25;
+/// `OrchestratorStop`). 26: a flock's share and max on a machine
+/// (`FlockNumber::Split`, `FlockSeat::share`).
+pub const IPC_PROTOCOL: u32 = 26;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -121,6 +122,13 @@ pub const JOIN_PROTOCOL: u32 = 22;
 /// a CLI new enough to write them refuses to send it work (see
 /// `flock_timeout_or_place_declared` in `main.rs`).
 pub const FLOCK_TIMEOUT_PLACE_PROTOCOL: u32 = 24;
+
+/// The first protocol whose head's `FlockEntry` knows a share and a max
+/// (`machines = { desk = { share = 2, max = 4 } }`). An older head's reads
+/// only a plain number, rejects the file on reload and keeps its previous
+/// flocks instead, so a CLI new enough to write one refuses to send it work
+/// (see `flock_share_declared` in `main.rs`).
+pub const FLOCK_SHARE_PROTOCOL: u32 = 26;
 
 /// `Pong::role` of a headless `pastor serve`: it runs this machine's jobs
 /// and hooks against a head elsewhere, and is not a head itself.
