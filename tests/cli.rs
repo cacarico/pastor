@@ -5889,3 +5889,46 @@ fn a_shepherd_lists_and_drives_its_jobs_and_the_head_s() {
     assert!(text.contains("picked it up"), "{text}");
     assert!(serve.child.try_wait().unwrap().is_none(), "{}", serve.log());
 }
+
+/// `job enable|disable` on a shepherd's own job (`local_job`) never reaches
+/// the head, so a task caller is refused there too: the head is the only
+/// place that knows a task's role, and this machine's shepherd keeps no
+/// task store to check it. `agents_change_fleet` still lets it through.
+#[test]
+fn an_agent_task_may_not_toggle_this_machine_s_own_job() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let c = client(Some(&env));
+    ok(c.head_set("head-up", &[]));
+    std::fs::create_dir_all(c.config.join("jobs")).unwrap();
+    let here_job = c.config.join("jobs/sweep.toml");
+    std::fs::write(&here_job, SWEEP).unwrap();
+
+    let as_agent = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &c.config)
+            .env("PASTOR_STATE_DIR", &c.state)
+            .env("PASTOR_DATA_DIR", &c.data)
+            .env("PATH", &c.path)
+            .env_remove("PASTOR_HEAD")
+            .env("PASTOR_TASK", "t-3")
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["job", "enable", "sweep"][..],
+        &["job", "disable", "sweep"],
+    ] {
+        let out = as_agent(args);
+        assert_eq!(error_code(&out), "agent_refused", "{args:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&here_job).unwrap(),
+        SWEEP,
+        "an agent's refused enable/disable must not touch the file"
+    );
+
+    std::fs::write(c.config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();
+    let text = ok(as_agent(&["job", "enable", "sweep"]));
+    assert!(text.contains("enabled sweep"), "{text}");
+}

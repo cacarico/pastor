@@ -1021,7 +1021,9 @@ fn makes_orchestrator(command: &Command) -> bool {
 /// (`IpcRequest::orchestrator_may`). The CLI does not know the caller's
 /// role, so from a task's pane it leaves these to the head, which does:
 /// `task run|retry|send|close` only ever go through it, and `job
-/// enable|disable` with no head is refused in `toggle`.
+/// enable|disable` is refused for a task caller in `toggle` (no head) and
+/// in `local_toggle` (a head elsewhere, but the job is this machine's own,
+/// which never reaches it either).
 fn orchestrator_may(command: &Command) -> bool {
     match command {
         Command::Task { cmd } => {
@@ -2625,7 +2627,22 @@ async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `toggle`'s own guard: `job enable|disable` reaches this machine's serve
+/// with no head to ask about the caller's role (the shepherd keeps no task
+/// store, `shepherd.rs`), so a task caller is refused unless
+/// `agents_change_fleet` is on, orchestrator or not.
 async fn local_toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> {
+    if let Some(task) = pastor::ipc::caller_task()
+        && !agents_change_fleet(paths)
+    {
+        return Err(CliError::err(
+            "agent_refused",
+            format!(
+                "{task} is an agent pastor started; this machine's own jobs have no head to check its role, so it may not {} a job",
+                if enabled { "enable" } else { "disable" }
+            ),
+        ));
+    }
     set_enabled(&ConfigFile::Job(name.to_string()).path(paths)?, enabled)?;
     let verb = if enabled { "enabled" } else { "disabled" };
     println!("{verb} {name}; {}", reload_here(paths).await?);
