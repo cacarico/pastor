@@ -177,6 +177,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
+~/.local/state/pastor/watch/<name>.json `pastor watch` cursors
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
 ~/.config/systemd/user/*.service  from `pastor setup systemd [--herdr]`
 ~/.config/pastor/connectors/<id>/.env   connector secrets and settings

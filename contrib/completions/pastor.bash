@@ -64,6 +64,9 @@ _pastor() {
             pastor,trust)
                 cmd="pastor__subcmd__trust"
                 ;;
+            pastor,watch)
+                cmd="pastor__subcmd__watch"
+                ;;
             pastor__subcmd__config,edit)
                 cmd="pastor__subcmd__config__subcmd__edit"
                 ;;
@@ -261,6 +264,9 @@ _pastor() {
                 ;;
             pastor__subcmd__help,trust)
                 cmd="pastor__subcmd__help__subcmd__trust"
+                ;;
+            pastor__subcmd__help,watch)
+                cmd="pastor__subcmd__help__subcmd__watch"
                 ;;
             pastor__subcmd__help__subcmd__config,edit)
                 cmd="pastor__subcmd__help__subcmd__config__subcmd__edit"
@@ -650,7 +656,7 @@ _pastor() {
 
     case "${cmd}" in
         pastor)
-            opts="-h -V --skill --head --help --version serve task machine flock tick job config completions events setup connector profile trust bridge head help"
+            opts="-h -V --skill --head --help --version serve task machine flock tick job config completions events watch setup connector profile trust bridge head help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1006,7 +1012,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__connector__subcmd__try)
-            opts="-h --job --since --head --help"
+            opts="-h --job --since --head --help watch"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1594,7 +1600,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help)
-            opts="serve task machine flock tick job config completions events setup connector profile trust bridge head help"
+            opts="serve task machine flock tick job config completions events watch setup connector profile trust bridge head help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2534,6 +2540,20 @@ _pastor() {
         pastor__subcmd__help__subcmd__trust__subcmd__remove)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__watch)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -3978,6 +3998,36 @@ _pastor() {
                 return 0
             fi
             case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__watch)
+            opts="-h --now --name --reset --all --json --interval --connector --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --name)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --interval)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --connector)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --head)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0

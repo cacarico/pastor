@@ -61,17 +61,28 @@ pub enum ConnectorCmd {
         json: bool,
     },
     /// Try a connector: run its command once for a job and print its items;
-    /// creates no tasks and saves no cursor
+    /// creates no tasks and saves no cursor. `watch` runs its [watch]
+    /// command instead and prints its lines
     Try {
         /// The connector's id, as `connector list` shows it
         id: String,
+        /// `watch`: run the [watch] command `pastor watch` runs
+        #[arg(value_enum)]
+        part: Option<TryPart>,
         /// The job whose [connector] config to use; need not exist yet
-        #[arg(long)]
-        job: String,
+        #[arg(long, required_unless_present = "part", conflicts_with = "part")]
+        job: Option<String>,
         /// How far back `since` points (default: the job's backfill, or 0s)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "part")]
         since: Option<String>,
     },
+}
+
+/// What `connector try` runs besides the connector command.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TryPart {
+    /// The [watch] command, as `pastor watch` runs it
+    Watch,
 }
 
 /// `head` is what the CLI's one ping found before the command ran; a head
@@ -146,7 +157,24 @@ pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result
             }
             Ok(())
         }
-        ConnectorCmd::Try { id, job, since } => run_once(paths, &id, &job, since.as_deref()).await,
+        ConnectorCmd::Try {
+            id,
+            part: Some(TryPart::Watch),
+            ..
+        } => {
+            let lines = crate::watch::run_connector(paths, &id)
+                .await
+                .map_err(|e| crate::cli::CliError::err("connector_failed", e))?;
+            for line in &lines {
+                println!("{line}");
+            }
+            eprintln!("{} lines", lines.len());
+            Ok(())
+        }
+        ConnectorCmd::Try { id, job, since, .. } => {
+            let job = job.expect("clap requires --job without a part");
+            run_once(paths, &id, &job, since.as_deref()).await
+        }
     }
 }
 
@@ -180,6 +208,12 @@ fn describe(m: &Manifest) -> String {
         out.push_str(&format!(
             "  finish (when a task ends): {}\n",
             argv(&f.command)
+        ));
+    }
+    if let Some(w) = &m.watch {
+        out.push_str(&format!(
+            "  watch (for pastor watch): {}\n",
+            argv(&w.command)
         ));
     }
     if !m.secrets.is_empty() {
@@ -252,7 +286,7 @@ async fn describe_connector(
 ) -> anyhow::Result<crate::describe::ConnectorDescription> {
     use crate::describe::{
         ConfigKey, ConnectorCommand, ConnectorDescription, ConnectorFinish, ConnectorHook,
-        ConnectorSecret,
+        ConnectorSecret, ConnectorWatch,
     };
     let Some(found) = discover(paths)?.into_iter().find(|d| d.id() == id) else {
         return Err(crate::cli::CliError::err(
@@ -297,6 +331,7 @@ async fn describe_connector(
         connector: None,
         hooks: Vec::new(),
         finish: None,
+        watch: None,
         env_file,
         secrets: Vec::new(),
         missing_secrets: Vec::new(),
@@ -329,6 +364,10 @@ async fn describe_connector(
     d.finish = m.finish.as_ref().map(|f| ConnectorFinish {
         command: f.command.clone(),
         timeout_secs: f.timeout.as_secs(),
+    });
+    d.watch = m.watch.as_ref().map(|w| ConnectorWatch {
+        command: w.command.clone(),
+        timeout_secs: w.timeout.as_secs(),
     });
     d.hooks = m
         .events

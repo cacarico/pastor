@@ -43,6 +43,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         (_, "profile") => Some(Kind::Profile),
         (_, "priority") | (["task", "priority"], "level") => Some(Kind::Priority),
         (["connector", ..], "id") => Some(Kind::Connector),
+        (["watch"], "connectors") => Some(Kind::Connector),
         (["job", _], "name") => Some(Kind::Job),
         (["flock", _], "name") => Some(Kind::Flock),
         (["flock", "default", "set"], "name") => Some(Kind::Flock),

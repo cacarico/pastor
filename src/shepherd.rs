@@ -283,9 +283,9 @@ mod tests {
                 let IpcRequest::EventsSince { after, limit, .. } = req else {
                     panic!("{req:?}")
                 };
+                let log = log.lock().unwrap();
+                let newest = log.iter().map(|r| r.seq).max();
                 let events: Vec<EventRecord> = log
-                    .lock()
-                    .unwrap()
                     .iter()
                     .filter(|r| r.seq > after)
                     .take(limit as usize)
@@ -295,6 +295,7 @@ mod tests {
                     events,
                     gap: false,
                     oldest: None,
+                    newest,
                 }))
             })
         })

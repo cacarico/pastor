@@ -854,6 +854,7 @@ mod tests {
                 }],
                 gap: false,
                 oldest: Some(812),
+                newest: Some(812),
             }),
             IpcResponse::File(FileText {
                 path: "/c/flock.toml".into(),
