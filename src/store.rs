@@ -8,9 +8,9 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::task::{DispatchSpec, PANE_OWNING_STATES, Task, TaskState};
+use crate::task::{DispatchSpec, PANE_OWNING_STATES, Priority, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -103,6 +103,23 @@ pub enum RetryError {
     NotRetryable { id: i64, state: TaskState },
     #[error(transparent)]
     Store(#[from] anyhow::Error),
+}
+
+/// Why `set_priority` changed nothing, each with its own IPC code.
+#[derive(Debug, thiserror::Error)]
+pub enum PriorityError {
+    #[error("task t-{0} not found")]
+    NotFound(i64),
+    #[error("t-{id} is {state}; only a queued task's priority can change")]
+    NotQueued { id: i64, state: TaskState },
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
+impl From<rusqlite::Error> for PriorityError {
+    fn from(err: rusqlite::Error) -> Self {
+        PriorityError::Store(err.into())
+    }
 }
 
 impl From<rusqlite::Error> for RetryError {
@@ -264,6 +281,9 @@ impl Store {
                         trust_sent INTEGER NOT NULL DEFAULT 0,
                         activity_seen INTEGER NOT NULL DEFAULT 0,
                         ended INTEGER NOT NULL DEFAULT 0,
+                        priority TEXT NOT NULL DEFAULT 'normal',
+                        priority_from TEXT,
+                        queue_pos INTEGER,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -339,6 +359,18 @@ impl Store {
                 if v < 8 {
                     tx.execute_batch(V8_TABLES)?;
                 }
+                // A task's level and its place in the queue
+                // (`queued_tasks`). Rows from before are `normal`, placed
+                // by id: the order they had.
+                if v < 9 {
+                    add_column(&tx, "priority", "priority TEXT NOT NULL DEFAULT 'normal'")?;
+                    add_column(&tx, "priority_from", "priority_from TEXT")?;
+                    add_column(&tx, "queue_pos", "queue_pos INTEGER")?;
+                    tx.execute(
+                        "UPDATE tasks SET queue_pos = id WHERE queue_pos IS NULL",
+                        [],
+                    )?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -356,13 +388,28 @@ impl Store {
     }
 
     pub fn insert_task(&self, t: NewTask) -> anyhow::Result<Task> {
+        self.insert_task_at(t, Priority::Normal, None)
+    }
+
+    /// `insert_task` at `priority`, which `from` set (`Task::priority_from`).
+    /// The task goes last among its level's queued tasks: its position is
+    /// its id.
+    pub fn insert_task_at(
+        &self,
+        t: NewTask,
+        priority: Priority,
+        from: Option<&str>,
+    ) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)",
-            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, now],
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?8)",
+            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, now],
         )?;
-        let id = conn.last_insert_rowid();
+        let id = tx.last_insert_rowid();
+        place_last(&tx, id)?;
+        tx.commit()?;
         drop(conn);
         self.get_task(id)?.context("task vanished after insert")
     }
@@ -523,11 +570,13 @@ impl Store {
             None => serde_json::json!({}),
         }
         .to_string();
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         // Check and copy in one statement, so a task closed, pruned or
-        // finished by another writer in between is not retried.
-        let n = conn.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, retry_of, created_at, updated_at)
+        // finished by another writer in between is not retried. The copy
+        // keeps the level, and where it came from, but queues last in it.
+        let n = tx.execute(
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, retry_of, priority, priority_from, created_at, updated_at)
              SELECT job, item, prompt,
                     json_patch(json_remove(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
                          THEN json_remove(spec, '$.checkout', '$.reopen')
@@ -538,12 +587,12 @@ impl Store {
                                                    'agent', COALESCE(agent_name, 't-' || id)))
                          ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
                          '$.session_id'), ?3),
-                    flock, 'queued', id, ?2, ?2 FROM tasks
+                    flock, 'queued', id, priority, priority_from, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
         )?;
         if n == 0 {
-            let state: Option<String> = conn
+            let state: Option<String> = tx
                 .query_row("SELECT state FROM tasks WHERE id = ?1", params![of], |r| {
                     r.get(0)
                 })
@@ -556,7 +605,9 @@ impl Store {
                 },
             });
         }
-        let id = conn.last_insert_rowid();
+        let id = tx.last_insert_rowid();
+        place_last(&tx, id)?;
+        tx.commit()?;
         drop(conn);
         Ok(self.get_task(id)?.context("task vanished after insert")?)
     }
@@ -730,13 +781,53 @@ impl Store {
             .collect())
     }
 
+    /// Queued tasks in the order dispatch takes them: by level, highest
+    /// first, then by position, then oldest first.
     pub fn queued_tasks(&self) -> anyhow::Result<Vec<Task>> {
-        let mut v = self.list_tasks(&TaskFilter {
-            states: Some(vec![TaskState::Queued]),
-            ..Default::default()
-        })?;
-        v.reverse();
-        Ok(v)
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM tasks WHERE state = 'queued'
+             ORDER BY CASE priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2
+                                    WHEN 'normal' THEN 1 ELSE 0 END DESC,
+                      COALESCE(queue_pos, id), created_at, id",
+        )?;
+        let rows = stmt.query_map([], row_to_task)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Put queued task `id` at `priority`, set by `from`. Refused unless the
+    /// task is queued: one a machine took has left the queue. It keeps its
+    /// position, so among its new level's tasks it goes by when it was
+    /// queued.
+    pub fn set_priority(
+        &self,
+        id: i64,
+        priority: Priority,
+        from: &str,
+    ) -> Result<Task, PriorityError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE tasks SET priority = ?2, priority_from = ?3, updated_at = ?4
+             WHERE id = ?1 AND state = 'queued'",
+            params![id, priority.as_str(), from, now],
+        )?;
+        if n == 0 {
+            let state: Option<String> = conn
+                .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            return Err(match state {
+                None => PriorityError::NotFound(id),
+                Some(state) => PriorityError::NotQueued {
+                    id,
+                    state: state.parse().map_err(anyhow::Error::msg)?,
+                },
+            });
+        }
+        drop(conn);
+        Ok(self.get_task(id)?.context("task vanished after update")?)
     }
 
     /// Put every task that has no flock, a row from before flocks, in
@@ -831,6 +922,18 @@ impl Store {
         item: &Value,
         render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
+        self.insert_job_task_at(job, flock, item, (Priority::Normal, None), render)
+    }
+
+    /// `insert_job_task` at a level, and what set it (`Task::priority_from`).
+    pub fn insert_job_task_at(
+        &self,
+        job: &str,
+        flock: &str,
+        item: &Value,
+        (priority, from): (Priority, Option<&str>),
+        render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
+    ) -> anyhow::Result<Task> {
         let key = item
             .get("key")
             .and_then(Value::as_str)
@@ -840,10 +943,11 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, 'queued', ?4, ?4)",
-            params![job, serde_json::to_string(item)?, flock, now],
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, 'queued', ?5, ?6, ?4, ?4)",
+            params![job, serde_json::to_string(item)?, flock, now, priority.as_str(), from],
         )?;
         let id = tx.last_insert_rowid();
+        place_last(&tx, id)?;
         let (prompt, spec) =
             render(id).map_err(|e| anyhow::anyhow!("render task t-{id} for job {job}: {e}"))?;
         tx.execute(
@@ -973,6 +1077,13 @@ impl Store {
     }
 }
 
+/// Give new task `id` its position: its id, so it queues after every task
+/// of its level already there.
+fn place_last(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("UPDATE tasks SET queue_pos = id WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 /// `ALTER TABLE tasks ADD COLUMN <definition>` unless `tasks` already has
 /// `name`, so a migration step can run again on a file it half changed.
 fn add_column(conn: &Connection, name: &str, definition: &str) -> anyhow::Result<()> {
@@ -1006,6 +1117,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let item: String = row.get("item")?;
     let spec: String = row.get("spec")?;
     let state: String = row.get("state")?;
+    let priority: String = row.get("priority")?;
     let created_at: String = row.get("created_at")?;
     let updated_at: String = row.get("updated_at")?;
     let started_at: Option<String> = row.get("started_at")?;
@@ -1034,6 +1146,13 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         ended: row.get("ended")?,
         retry_of: row.get("retry_of")?,
         flock: row.get("flock")?,
+        priority: priority
+            .parse()
+            .map_err(|_| conversion_failure(format!("unknown task priority {priority:?}")))?,
+        priority_from: row.get("priority_from")?,
+        queue_pos: row
+            .get::<_, Option<i64>>("queue_pos")?
+            .unwrap_or(row.get("id")?),
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -2005,6 +2124,133 @@ mod tests {
         assert!(s.get_task(1).unwrap().unwrap().ended);
     }
 
+    /// A v8 database has no levels or positions: its rows become `normal`,
+    /// placed by id, so the queue keeps the order it had.
+    #[test]
+    fn a_v8_database_gains_priority_and_queue_pos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN priority;
+                 ALTER TABLE tasks DROP COLUMN priority_from;
+                 ALTER TABLE tasks DROP COLUMN queue_pos;
+                 UPDATE meta SET value = '8' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let q = s.queued_tasks().unwrap();
+        assert_eq!(q.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 2]);
+        for t in &q {
+            assert_eq!(t.priority, Priority::Normal);
+            assert_eq!(t.priority_from, None);
+            assert_eq!(t.queue_pos, t.id);
+        }
+        let conn = Connection::open(&path).unwrap();
+        let unset: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE queue_pos IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unset, 0);
+    }
+
+    /// Dispatch takes queued tasks by level, highest first, then by
+    /// position, then oldest first; a task that left the queue is not in it.
+    #[test]
+    fn queued_tasks_go_by_level_then_position_then_age() {
+        let s = Store::open_in_memory().unwrap();
+        let at = |p: Priority| s.insert_task_at(new_task("run"), p, None).unwrap().id;
+        let low = at(Priority::Low);
+        let normal = at(Priority::Normal);
+        let high = at(Priority::High);
+        let critical = at(Priority::Critical);
+        let high2 = at(Priority::High);
+        let normal2 = at(Priority::Normal);
+        let taken = at(Priority::Critical);
+        s.claim_task(taken, "m").unwrap().unwrap();
+        let order = |s: &Store| {
+            s.queued_tasks()
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&s), vec![critical, high, high2, normal, normal2, low]);
+        // Position before age: a task moved ahead of its level goes first.
+        s.execute_raw(&format!(
+            "UPDATE tasks SET queue_pos = 0 WHERE id = {high2}"
+        ));
+        assert_eq!(order(&s), vec![critical, high2, high, normal, normal2, low]);
+        // Age breaks a tie in position.
+        s.execute_raw(&format!(
+            "UPDATE tasks SET queue_pos = 5, created_at = '2000-01-01T00:00:00+00:00' WHERE id = {normal2};
+             UPDATE tasks SET queue_pos = 5 WHERE id = {normal}"
+        ));
+        assert_eq!(order(&s), vec![critical, high2, high, normal2, normal, low]);
+    }
+
+    /// A job's task and a retry keep the level they are given, and each new
+    /// task is placed by its id.
+    #[test]
+    fn job_tasks_and_retries_keep_their_level() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_job_task_at(
+                "j",
+                "default",
+                &serde_json::json!({"key": "k"}),
+                (Priority::High, Some("job j")),
+                |_| Ok(("p".into(), spec())),
+            )
+            .unwrap();
+        assert_eq!(t.priority, Priority::High);
+        assert_eq!(t.priority_from.as_deref(), Some("job j"));
+        assert_eq!(t.queue_pos, t.id);
+        set_state(&s, t.id, TaskState::Failed);
+        let r = s.insert_retry(t.id).unwrap();
+        assert_eq!(r.priority, Priority::High);
+        assert_eq!(r.priority_from.as_deref(), Some("job j"));
+        assert_eq!(r.queue_pos, r.id);
+    }
+
+    /// Only a queued task's level changes; the refusal names the state.
+    #[test]
+    fn set_priority_changes_only_a_queued_task() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s.insert_task(new_task("run")).unwrap();
+        let b = s.insert_task(new_task("run")).unwrap();
+        let t = s
+            .set_priority(b.id, Priority::Critical, "task priority")
+            .unwrap();
+        assert_eq!(t.priority, Priority::Critical);
+        assert_eq!(t.priority_from.as_deref(), Some("task priority"));
+        assert_eq!(t.queue_pos, b.id);
+        assert_eq!(s.queued_tasks().unwrap()[0].id, b.id);
+        s.claim_task(a.id, "m").unwrap().unwrap();
+        match s.set_priority(a.id, Priority::Low, "task priority") {
+            Err(PriorityError::NotQueued { state, .. }) => assert_eq!(state, TaskState::Starting),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            s.set_priority(99, Priority::Low, "task priority"),
+            Err(PriorityError::NotFound(99))
+        ));
+        assert_eq!(
+            s.get_task(a.id).unwrap().unwrap().priority,
+            Priority::Normal
+        );
+    }
+
     /// Event sequence numbers keep growing across a restart of the store,
     /// and a v7 database, which has none, starts them at 1.
     #[test]
@@ -2093,11 +2339,14 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN trust_sent;
                  ALTER TABLE tasks DROP COLUMN activity_seen;
                  ALTER TABLE tasks DROP COLUMN ended;
+                 ALTER TABLE tasks DROP COLUMN priority;
+                 ALTER TABLE tasks DROP COLUMN priority_from;
+                 ALTER TABLE tasks DROP COLUMN queue_pos;
                  DROP TABLE trusted_repos;
                  DROP TABLE event_seq;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '8' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '9' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -2123,7 +2372,9 @@ mod tests {
                 || c == "flock"
                 || c == "trust_sent"
                 || c == "activity_seen"
-                || c == "ended"),
+                || c == "ended"
+                || c == "priority"
+                || c == "queue_pos"),
             "rolled back: {cols:?}"
         );
         drop(conn);

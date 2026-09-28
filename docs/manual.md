@@ -387,6 +387,7 @@ name = "work"
 agent = "claude"          # optional: the agent for this flock's tasks
 agent_args = ["--model", "claude-sonnet-5"]
 # model = "sonnet"        # optional: a [models] name, see Models below
+# priority = "high"       # optional: see Priority and queue order below
 
 [[machine]]
 name = "desk"
@@ -755,6 +756,60 @@ with it down; with a remote head set they are refused
 (`remote_head_unsupported`). A name that is not a profile is
 `unknown_profile`.
 
+### Priority and queue order
+
+A task that no machine can take yet waits in the queue. Each task has a
+level, `low`, `normal`, `high` or `critical`, and each dispatch pass takes
+queued tasks by level, highest first, then by position, then oldest first.
+A task that does not fit anywhere (its machines are full, or none has its
+tags) is skipped and the pass goes on to the next, so a lower task can
+still start where a higher one cannot.
+
+A task settles its level when it is queued, from the first of these that
+sets one: `--priority` on `pastor task run` (or `priority` under a job's
+`[dispatch]`), `priority` under the `[[machine]]` entry it is pinned to
+(`--machine` or a job's `machine`; an unpinned task never takes a
+machine's, since no machine is picked yet), `priority` under its
+`[[flock]]` entry, `[defaults] priority`; with none it is `normal`.
+
+```toml
+# pastor.toml
+[defaults]
+priority = "low"            # tasks that set none
+
+# flock.toml
+[[flock]]
+name = "work"
+priority = "high"           # this flock's tasks, before [defaults]
+
+[[machine]]
+name = "pi-3"
+flock = "work"
+priority = "critical"       # tasks pinned to pi-3, before the flock's
+```
+
+A job's `priority` is a template, rendered for each item, so `priority =
+"{{ item.priority }}"` takes the level the item names; rendered empty, it
+falls through to the machine, flock and `[defaults]`. A value that is not
+one of the four levels is refused: `unknown_priority` from `task run
+--priority` and `task priority`, an error for that item in a job (the
+cursor holds, as for any item error), and a load failure in pastor.toml,
+flock.toml or the job file.
+
+`pastor task priority t-4 critical` puts a queued task at another level; it
+keeps its position, so among the tasks of its new level it goes by when it
+was queued. A task a machine has taken has left the queue, and is refused
+with `not_queued`; an agent pastor started is refused, as for any change to
+the fleet (`agent_refused`). `pastor task retry` keeps the level of the task
+it copies, and the copy queues last in it.
+
+`pastor task describe` prints the level and the layer that set it, such as
+`priority: high (from flock work)` (`task priority` when set by hand);
+`task list` has a PRIORITY column, and `--json` has `priority`,
+`priority_from` and `queue_pos`, the task's position. A head from before
+levels would queue the task at its own level without a word, so `task run
+--priority` and `task priority` refuse one (`head_too_old`).
+
 ## Events
 
 `pastor serve` appends every task, job and machine event to
@@ -874,6 +929,7 @@ pastor job disable hourly
 pastor task list --all               # finished tasks too
 pastor task read t-1                 # recent pane output, without attaching
 pastor task retry t-4                # a failed or stale task again, as a new task
+pastor task priority t-5 high        # a queued task goes ahead of normal ones
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
 pastor task done t-1                 # mark it done; its pane closes after close_done_after
 pastor task prune --done --closed --older-than 7d
@@ -893,7 +949,8 @@ paths.
 
 `pastor task run` takes the prompt as its argument or, instead, `--prompt-file
 PATH`, and `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
-`--model` (a name from `[models]`, see [Models](#models)), `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
+`--model` (a name from `[models]`, see [Models](#models)), `--priority` (see
+[Priority and queue order](#priority-and-queue-order)), `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
 `--timeout`, `--place` (see [Where a task's pane goes](#where-a-tasks-pane-goes))
 and `--json`. `--agent-arg` hands one argument to the agent,
 through herdr's `agent.start`; repeat it for more, in order. It always takes the
@@ -1444,7 +1501,7 @@ It needs:
 `bridge` or speaks an older protocol. Any command fails the same way later;
 it never falls back to this machine's files.
 
-These commands go to a remote head: `task run|list|show|read|retry|close|prune|send|done`,
+These commands go to a remote head: `task run|list|show|read|retry|priority|close|prune|send|done`,
 `machine list`, `tick`, `job list|run|reload`, `events`. `machine list`'s first line
 names the head by its ssh destination and shows its herdr as `-`. `task run`
 fills what its flags leave out from the built-in defaults, not from the
@@ -1570,7 +1627,7 @@ So:
   `pastor.sock`, an agent on the head included. pastor sets `PASTOR_TASK=t-N`
   in the pane of every agent it starts, and refuses a command from such a pane
   that changes the fleet: `task run`, `send`, `attach` (herdr's agent terminal
-  types into any task's pane), `retry`, `close` and `prune`, `tick`
+  types into any task's pane), `retry`, `priority`, `close` and `prune`, `tick`
   (`--dry-run` too), `job run` and `job reload`, `connector install`, `link`,
   `uninstall` and `unlink`, edits of machines, flocks, jobs and `pastor.toml`
   (`config edit`), `serve` and `setup` (a head started from the pane would
@@ -1678,7 +1735,7 @@ sends nothing. A head from before these requests is refused
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
-~/.local/state/pastor/pastor.db   tasks (schema 8, with retry_of, flock, trust_sent, activity_seen and ended), seen keys, job state, trusted repos, the last event seq
+~/.local/state/pastor/pastor.db   tasks (schema 9, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from and queue_pos), seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
@@ -1716,6 +1773,7 @@ max_tasks_per_run = 5
 timeout = "2h"
 place = "repo"               # where a task's pane goes: repo, own, pastor or pane:<workspace>
 # model = "sonnet"           # a [models] name for tasks that name none; unset: no model
+# priority = "normal"        # the level of tasks that set none: low, normal, high or critical
 [agents.claude]              # one table per agent that needs one
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
@@ -1750,8 +1808,9 @@ In bash and fish the script also offers the names a command takes: job names
 after `job describe`, `--job` and the like, flock and machine names after
 `--flock`, `--machine` and the flock and machine commands, task ids after the
 task commands, connector ids after `connector uninstall|unlink|try`, and
-the `[models]` names of pastor.toml after `--model`, and profile names
-after `profile describe`. A
+the `[models]` names of pastor.toml after `--model`, profile names
+after `profile describe`, and the levels after `--priority` and
+`task priority`. A
 static script cannot know them, so at TAB it runs `pastor __complete <shell>
 -- <words>`, which reads the job files, `flock.toml`, the connectors
 directory and the task store directly, never the head, and prints nothing

@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::config::{AgentChoice, Defaults, check_tools, parse_duration};
 use crate::connector::Catalog;
 use crate::schedule::Schedule;
-use crate::task::{DispatchSpec, Place};
+use crate::task::{DispatchSpec, Place, Priority};
 use crate::template;
 
 fn default_true() -> bool {
@@ -54,6 +54,10 @@ pub struct DispatchTable {
     /// A `[models]` name, or a template of one (`{{ item.model }}`) rendered
     /// per item; rendered empty, the machine's, flock's or `[defaults]` model.
     pub model: Option<String>,
+    /// A level (`low`, `normal`, `high`, `critical`), or a template of one
+    /// (`{{ item.priority }}`) rendered per item; rendered empty, the pinned
+    /// machine's, flock's or `[defaults]` level.
+    pub priority: Option<String>,
     pub repo: Option<String>,
     pub worktree: bool,
     pub branch: Option<String>,
@@ -93,6 +97,9 @@ pub struct Job {
     /// `dispatch.flock`, checked against flock.toml at each run (see
     /// `Flock::task_flock`): the job file does not know the flocks.
     pub flock: Option<String>,
+    /// `dispatch.priority`, still a template: `priority_for` renders it for
+    /// one item.
+    pub priority: Option<String>,
 }
 
 impl Job {
@@ -192,6 +199,23 @@ impl Job {
                     .map_err(|e| format!("dispatch.model: {e}"))?;
             }
         }
+        if let Some(priority) = &d.priority {
+            for path in
+                template::placeholders(priority).map_err(|e| format!("dispatch.priority: {e}"))?
+            {
+                if !(path.starts_with("item.") || path == "job.name") {
+                    return Err(format!(
+                        "dispatch.priority: unknown placeholder {{{{ {path} }}}}; use item.* or job.name"
+                    ));
+                }
+            }
+            if !priority.contains("{{") && !priority.trim().is_empty() {
+                priority
+                    .trim()
+                    .parse::<Priority>()
+                    .map_err(|e| format!("dispatch.priority: {e}"))?;
+            }
+        }
         for (field, text) in [
             ("prompt", Some(d.prompt.as_str())),
             ("branch", d.branch.as_deref()),
@@ -259,6 +283,7 @@ impl Job {
             max_tasks_per_run,
             backfill,
             flock: d.flock,
+            priority: d.priority,
             agent,
             spec: DispatchSpec {
                 agent: pick.agent,
@@ -278,6 +303,27 @@ impl Job {
                 session_id: None,
             },
         })
+    }
+
+    /// The job's `priority` rendered for `item`: `None` when the job sets
+    /// none, or its template renders empty, so the pinned machine's, flock's
+    /// or `[defaults]` level applies. A rendered value that is not a level
+    /// is refused (`unknown_priority`), and the item with it.
+    pub fn priority_for(&self, item: &Value) -> Result<Option<Priority>, String> {
+        let Some(priority) = &self.priority else {
+            return Ok(None);
+        };
+        let ctx = serde_json::json!({"item": item, "job": {"name": self.name}});
+        let text = template::render(priority, &ctx)
+            .map_err(|e| format!("dispatch.priority: {e}"))?
+            .text;
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        text.parse()
+            .map(Some)
+            .map_err(|e| format!("dispatch.priority: {} ({e})", crate::task::UNKNOWN_PRIORITY))
     }
 
     /// The job's `model` rendered for `item`: `None` when the job names
@@ -549,6 +595,53 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert!(job("Sonnet").unwrap_err().contains("dispatch.model"));
     }
 
+    /// A job's `priority` is a template rendered per item: empty falls
+    /// through to the next layer, and what it renders must be a level.
+    #[test]
+    fn a_jobs_priority_renders_per_item() {
+        let job = |priority: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\npriority = {priority:?}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &defaults(),
+                &Builtins,
+            )
+        };
+        let j = job("{{ item.priority }}").unwrap();
+        let item = |v: serde_json::Value| j.priority_for(&v);
+        assert_eq!(
+            item(serde_json::json!({"priority": "critical"})).unwrap(),
+            Some(Priority::Critical)
+        );
+        assert_eq!(item(serde_json::json!({})).unwrap(), None);
+        assert_eq!(item(serde_json::json!({"priority": " "})).unwrap(), None);
+        let err = item(serde_json::json!({"priority": "urgent"})).unwrap_err();
+        assert!(err.contains("unknown_priority"), "{err}");
+        assert!(err.contains("urgent"), "{err}");
+        assert_eq!(
+            job("high")
+                .unwrap()
+                .priority_for(&serde_json::json!({}))
+                .unwrap(),
+            Some(Priority::High)
+        );
+        assert_eq!(
+            job("")
+                .unwrap()
+                .priority_for(&serde_json::json!({}))
+                .unwrap(),
+            None
+        );
+        assert!(
+            job("{{ task.id }}")
+                .unwrap_err()
+                .contains("dispatch.priority")
+        );
+        assert!(job("urgent").unwrap_err().contains("dispatch.priority"));
+    }
+
     /// `[defaults] agent_args` fills in for a job file that has no
     /// `agent_args` key; a key that is there, even `[]`, is the job's choice.
     #[test]
@@ -697,6 +790,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             timeout: "30m".into(),
             place: Default::default(),
             model: None,
+            priority: None,
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");

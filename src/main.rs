@@ -213,6 +213,11 @@ struct RunArgs {
     /// `[defaults] model`, else none)
     #[arg(long, value_name = "NAME")]
     model: Option<String>,
+    /// Queue at this level: low, normal, high or critical; dispatch takes
+    /// higher levels first (default: the pinned machine's, else its
+    /// flock's, else `[defaults] priority`, else normal)
+    #[arg(long, value_name = "LEVEL")]
+    priority: Option<String>,
     /// A git worktree per task, branched from --repo (so it needs --repo)
     #[arg(long, requires = "repo")]
     worktree: bool,
@@ -290,6 +295,8 @@ enum TaskCmd {
     },
     /// Re-dispatch a failed or stale task as a new task (retry_of points back)
     Retry(pastor::task_cli::RetryArgs),
+    /// Put a queued task at another level: low, normal, high or critical
+    Priority(pastor::task_cli::PriorityArgs),
     /// Close a task's pane (and with --remove-worktree its worktree), or an orphaned agent
     Close(pastor::task_cli::CloseArgs),
     /// Delete old finished tasks; their items stay seen
@@ -881,6 +888,7 @@ fn changes_fleet(command: &Command) -> bool {
             cmd,
             TaskCmd::Run(_)
                 | TaskCmd::Retry(_)
+                | TaskCmd::Priority(_)
                 | TaskCmd::Close(_)
                 | TaskCmd::Prune(_)
                 | TaskCmd::Send(_)
@@ -958,6 +966,19 @@ fn needs_fleet_edit_protocol(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` sends a request only a head of `PRIORITY_PROTOCOL` or
+/// later honours: `task run --priority` and `task priority`.
+fn needs_priority_protocol(command: &Command) -> bool {
+    match command {
+        Command::Task { cmd } => match cmd {
+            TaskCmd::Run(a) => a.priority.is_some(),
+            TaskCmd::Priority(_) => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether `command` sends a request only a head of `PLACE_PROTOCOL` or later
 /// honours: `task retry --place`.
 fn needs_place_protocol(command: &Command) -> bool {
@@ -1004,7 +1025,12 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `MODEL_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_agent_protocol(command) {
+    if needs_priority_protocol(command) {
+        Some((
+            pastor::ipc::PRIORITY_PROTOCOL,
+            "predates task priority, and would queue the task at its own level or refuse the request",
+        ))
+    } else if needs_agent_protocol(command) {
         Some((
             pastor::ipc::MODEL_PROTOCOL,
             if needs_place_protocol(command) {
@@ -1084,6 +1110,11 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
             )
         })?;
     }
+    let priority = a
+        .priority
+        .as_deref()
+        .map(pastor::task_cli::parse_priority)
+        .transpose()?;
     let prompt = run_prompt(&a)?;
     // With a remote head, pastor.toml is the head's and not here: the built-in
     // defaults fill the spec, and the head resolves the agent again with its own.
@@ -1100,6 +1131,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
             prompt,
             spec,
             flock: a.flock,
+            priority,
         },
     )
     .await?
@@ -1538,6 +1570,7 @@ async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
         }
         TaskCmd::Attach { task } => attach(paths, &task).await?,
         TaskCmd::Retry(a) => pastor::task_cli::retry(paths, a).await?,
+        TaskCmd::Priority(a) => pastor::task_cli::priority(paths, a).await?,
         TaskCmd::Close(a) => pastor::task_cli::close(paths, a).await?,
         TaskCmd::Prune(a) => pastor::task_cli::prune(paths, a, head).await?,
         TaskCmd::Send(a) => pastor::task_cli::send(paths, a).await?,
@@ -1572,6 +1605,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 agent: None,
                 agent_args: None,
                 model: None,
+                priority: None,
             };
             // With a head the reload line comes with its answer, before the
             // herdr lines; without one it follows them.
@@ -2434,6 +2468,30 @@ mod tests {
         ])));
         assert!(!needs_agent_protocol(&parse(&["pastor", "job", "list"])));
         assert!(!needs_agent_protocol(&parse(&["pastor", "job", "reload"])));
+    }
+
+    /// `task run --priority` and `task priority` need a head that knows
+    /// levels: an older one would queue at its own level, or refuse the
+    /// request as unreadable. A run without the flag does not.
+    #[test]
+    fn a_priority_needs_a_head_that_knows_it() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
+        assert_eq!(
+            need(&["pastor", "task", "run", "hi", "--priority", "high"]),
+            Some(pastor::ipc::PRIORITY_PROTOCOL)
+        );
+        assert_eq!(
+            need(&["pastor", "task", "priority", "t-1", "low"]),
+            Some(pastor::ipc::PRIORITY_PROTOCOL)
+        );
+        assert_eq!(
+            need(&["pastor", "task", "run", "hi"]),
+            Some(pastor::ipc::MODEL_PROTOCOL)
+        );
+        assert!(changes_fleet(&parse(&[
+            "pastor", "task", "priority", "t-1", "low"
+        ])));
     }
 
     /// A head from before `PLACE_PROTOCOL` reads `task retry --place`

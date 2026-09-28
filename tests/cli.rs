@@ -2602,7 +2602,11 @@ fn a_task_waits_for_its_flock_end_to_end() {
     assert!(listed("default").is_empty());
     let table = ok(env.cmd(&["task", "list"]));
     let header: Vec<&str> = table.lines().next().unwrap().split_whitespace().collect();
-    assert_eq!(header[..4], ["ID", "STATE", "MACHINE", "FLOCK"], "{table}");
+    assert_eq!(
+        header[..5],
+        ["ID", "STATE", "PRIORITY", "MACHINE", "FLOCK"],
+        "{table}"
+    );
     assert!(
         ok(env.cmd(&["task", "describe", &format!("t-{id}")])).contains("flock:      work"),
         "task describe names the flock"
@@ -4588,6 +4592,61 @@ fn complete_offers_model_names_after_model() {
     let (ok, out) = complete(&config, &state, &["task", "run", "--model", ""]);
     assert!(ok);
     assert_eq!(out, "gpt\tcodex\nsonnet\tclaude\n");
+}
+
+/// `--priority` and `task priority` offer the levels.
+#[test]
+fn complete_offers_the_levels() {
+    let (_tmp, config, state) = completion_config();
+    let levels = "low\nnormal\nhigh\ncritical\n";
+    let (ok, out) = complete(&config, &state, &["task", "run", "--priority", ""]);
+    assert!(ok);
+    assert_eq!(out, levels);
+    let (ok, out) = complete(&config, &state, &["task", "priority", "t-1", ""]);
+    assert!(ok);
+    assert_eq!(out, levels);
+}
+
+/// `--priority` queues the task at that level, which list, describe and
+/// the JSON show; `task priority` moves a queued task and refuses one that
+/// left the queue; a word that is not a level is `unknown_priority`.
+#[test]
+fn a_tasks_priority_is_set_shown_and_changed() {
+    let env = start();
+    let out = env.cmd(&["task", "run", "hi", "--priority", "high", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["priority"], "high", "{task}");
+    assert_eq!(task["priority_from"], "task run", "{task}");
+    let out = env.cmd(&["task", "describe", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("priority:   high (from task run)\n"),
+        "{text}"
+    );
+    let out = env.cmd(&["task", "list", "--all"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines().next().unwrap().contains("STATE    PRIORITY"),
+        "{text}"
+    );
+    // t-1 went to a machine at once: it has left the queue.
+    let out = env.cmd(&["task", "priority", "t-1", "low"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(last_error(&out).0, "not_queued");
+
+    for args in [
+        &["task", "run", "x", "--priority", "urgent"][..],
+        &["task", "priority", "t-1", "urgent"],
+    ] {
+        let out = env.cmd(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(last_error(&out).0, "unknown_priority", "{args:?}");
+    }
 }
 
 /// `--model sonnet` starts the agent with the model's args before its own,

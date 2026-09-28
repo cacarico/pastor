@@ -388,6 +388,9 @@ _pastor() {
             pastor__subcmd__help__subcmd__task,list)
                 cmd="pastor__subcmd__help__subcmd__task__subcmd__list"
                 ;;
+            pastor__subcmd__help__subcmd__task,priority)
+                cmd="pastor__subcmd__help__subcmd__task__subcmd__priority"
+                ;;
             pastor__subcmd__help__subcmd__task,prune)
                 cmd="pastor__subcmd__help__subcmd__task__subcmd__prune"
                 ;;
@@ -562,6 +565,9 @@ _pastor() {
             pastor__subcmd__task,list)
                 cmd="pastor__subcmd__task__subcmd__list"
                 ;;
+            pastor__subcmd__task,priority)
+                cmd="pastor__subcmd__task__subcmd__priority"
+                ;;
             pastor__subcmd__task,prune)
                 cmd="pastor__subcmd__task__subcmd__prune"
                 ;;
@@ -594,6 +600,9 @@ _pastor() {
                 ;;
             pastor__subcmd__task__subcmd__help,list)
                 cmd="pastor__subcmd__task__subcmd__help__subcmd__list"
+                ;;
+            pastor__subcmd__task__subcmd__help,priority)
+                cmd="pastor__subcmd__task__subcmd__help__subcmd__priority"
                 ;;
             pastor__subcmd__task__subcmd__help,prune)
                 cmd="pastor__subcmd__task__subcmd__help__subcmd__prune"
@@ -2299,7 +2308,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help__subcmd__task)
-            opts="run list describe read attach retry close prune send done"
+            opts="run list describe read attach retry priority close prune send done"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2369,6 +2378,20 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help__subcmd__task__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__task__subcmd__priority)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3329,7 +3352,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task)
-            opts="-h --head --help run list describe read attach retry close prune send done help"
+            opts="-h --head --help run list describe read attach retry priority close prune send done help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3419,7 +3442,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__help)
-            opts="run list describe read attach retry close prune send done help"
+            opts="run list describe read attach retry priority close prune send done help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3503,6 +3526,20 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__help__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__task__subcmd__help__subcmd__priority)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3616,6 +3653,24 @@ _pastor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        pastor__subcmd__task__subcmd__priority)
+            opts="-h --json --head --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         pastor__subcmd__task__subcmd__prune)
             opts="-h --done --failed --closed --older-than --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -3683,7 +3738,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__run)
-            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --worktree --branch --tag --timeout --place --json --head --help"
+            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --priority --worktree --branch --tag --timeout --place --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3714,6 +3769,10 @@ _pastor() {
                     return 0
                     ;;
                 --model)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --priority)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

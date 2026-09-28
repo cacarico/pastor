@@ -1793,6 +1793,7 @@ mod tests {
             },
             agent: Default::default(),
             flock: None,
+            priority: None,
         }
     }
 
