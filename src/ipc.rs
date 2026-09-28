@@ -28,8 +28,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// (`FlockEntry::machines`). 19: workspace labels (`DispatchSpec::label`).
 /// 20: the `summary` setting (`Run::summary`, a job's `[dispatch]
 /// summary`). 21: pull machines (`TaskClaim`, `TaskReport`). 22:
-/// `FlockJoin`, `FlockLeave` and `FlockAdd::machines`.
-pub const IPC_PROTOCOL: u32 = 22;
+/// `FlockJoin`, `FlockLeave` and `FlockAdd::machines`. 23: orchestrators
+/// (`Orchestrator*` requests, and `FROM_ORCHESTRATOR_FIELD`).
+pub const IPC_PROTOCOL: u32 = 23;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -45,6 +46,28 @@ pub const HEAD_ENV: &str = "PASTOR_HEAD";
 
 /// The field beside a request's own that names the task it comes from.
 pub const FROM_TASK_FIELD: &str = "from_task";
+
+/// The field beside a request's own that names the orchestrator whose pre
+/// or post script sent it (`orchestrator::ORCHESTRATOR_ENV`). Never sent
+/// beside `FROM_TASK_FIELD`, and a head that gets both reads the task.
+pub const FROM_ORCHESTRATOR_FIELD: &str = "from_orchestrator";
+
+/// Who a request says it comes from: an agent's task, an orchestrator's
+/// script, or neither (a person).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Caller {
+    pub task: Option<String>,
+    pub orchestrator: Option<String>,
+}
+
+impl Caller {
+    pub fn task(task: Option<&str>) -> Caller {
+        Caller {
+            task: task.map(str::to_string),
+            orchestrator: None,
+        }
+    }
+}
 
 /// The first protocol whose head honours `flock` in a request.
 pub const FLOCK_PROTOCOL: u32 = 1;
@@ -156,6 +179,10 @@ pub const SUMMARY_PROTOCOL: u32 = 17;
 /// `[dispatch] summary`. An older one would ask for a summary on its own
 /// terms, or refuse the job's dispatch table as unreadable.
 pub const SUMMARY_MODE_PROTOCOL: u32 = 20;
+
+/// The first protocol whose head runs orchestrator files and answers the
+/// `Orchestrator*` requests; an older one refuses them as unreadable.
+pub const ORCHESTRATOR_PROTOCOL: u32 = 23;
 
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.
@@ -471,6 +498,29 @@ pub enum IpcRequest {
         #[serde(default)]
         detail: Option<String>,
     },
+    /// Every orchestrator file the head reads. Answers `Orchestrators`.
+    OrchestratorList,
+    /// One orchestrator in full. Answers `Orchestrator`.
+    OrchestratorDescribe {
+        name: String,
+    },
+    /// Run a scheduled orchestrator now, whatever its schedule and
+    /// `enabled`, after a run of it already going. Answers `Text`.
+    OrchestratorRun {
+        name: String,
+    },
+    /// `orchestrator enable|disable` on the head's file. Answers `Text`.
+    OrchestratorSetEnabled {
+        name: String,
+        enabled: bool,
+    },
+    /// Replace an orchestrator's handover note; `name` may be left out by
+    /// its own agent or script, which the head knows. Answers `Text`.
+    OrchestratorNote {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        text: String,
+    },
 }
 
 impl IpcRequest {
@@ -491,6 +541,8 @@ impl IpcRequest {
             | IpcRequest::TrustList
             | IpcRequest::FlockDescribe { .. }
             | IpcRequest::MachineDescribe { .. }
+            | IpcRequest::OrchestratorList
+            | IpcRequest::OrchestratorDescribe { .. }
             | IpcRequest::Queue { .. } => false,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
@@ -519,13 +571,18 @@ impl IpcRequest {
             | IpcRequest::TrustAdd { .. }
             | IpcRequest::TrustRemove { .. }
             | IpcRequest::TaskClaim { .. }
-            | IpcRequest::TaskReport { .. } => true,
+            | IpcRequest::TaskReport { .. }
+            | IpcRequest::OrchestratorRun { .. }
+            | IpcRequest::OrchestratorSetEnabled { .. }
+            | IpcRequest::OrchestratorNote { .. } => true,
         }
     }
 
     /// Whether an orchestrator task (`TaskRole::Orchestrator`) may make this
     /// change without `agents_change_fleet`: run, retry, type into and close
-    /// tasks, and enable or disable a job.
+    /// tasks, enable or disable a job, and keep its own handover note (the
+    /// head checks whose). An orchestrator's pre and post scripts get the
+    /// same table.
     /// Making another orchestrator is refused apart from this, whoever asks
     /// from inside a task (`Daemon::handle_from`).
     pub fn orchestrator_may(&self) -> bool {
@@ -536,6 +593,7 @@ impl IpcRequest {
                 | IpcRequest::TaskSend { .. }
                 | IpcRequest::TaskClose { .. }
                 | IpcRequest::JobSetEnabled { .. }
+                | IpcRequest::OrchestratorNote { .. }
         )
     }
 
@@ -551,24 +609,39 @@ impl IpcRequest {
 /// `FROM_TASK_FIELD` when the caller runs in a task's pane. A head that
 /// predates the field skips it, as serde skips any unknown field.
 pub fn request_line(req: &IpcRequest, from_task: Option<&str>) -> anyhow::Result<String> {
+    request_line_as(req, &Caller::task(from_task))
+}
+
+/// `request_line` for any `caller`: `FROM_TASK_FIELD` for a task, else
+/// `FROM_ORCHESTRATOR_FIELD` for an orchestrator's script.
+pub fn request_line_as(req: &IpcRequest, caller: &Caller) -> anyhow::Result<String> {
     let mut v = serde_json::to_value(req)?;
-    if let (Some(task), Some(obj)) = (from_task, v.as_object_mut()) {
-        obj.insert(FROM_TASK_FIELD.into(), task.into());
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(task) = &caller.task {
+            obj.insert(FROM_TASK_FIELD.into(), task.as_str().into());
+        } else if let Some(o) = &caller.orchestrator {
+            obj.insert(FROM_ORCHESTRATOR_FIELD.into(), o.as_str().into());
+        }
     }
     let mut line = serde_json::to_string(&v)?;
     line.push('\n');
     Ok(line)
 }
 
-/// The head's side of `request_line`: the request, and the task it says it
+/// The head's side of `request_line_as`: the request, and who it says it
 /// comes from.
-pub fn parse_request_line(line: &str) -> serde_json::Result<(IpcRequest, Option<String>)> {
+pub fn parse_request_line(line: &str) -> serde_json::Result<(IpcRequest, Caller)> {
     let mut v: serde_json::Value = serde_json::from_str(line)?;
-    let from_task = v
-        .as_object_mut()
-        .and_then(|obj| obj.remove(FROM_TASK_FIELD))
-        .and_then(|t| t.as_str().map(str::to_string));
-    Ok((serde_json::from_value(v)?, from_task))
+    let mut take = |field: &str| {
+        v.as_object_mut()
+            .and_then(|obj| obj.remove(field))
+            .and_then(|t| t.as_str().map(str::to_string))
+    };
+    let caller = Caller {
+        task: take(FROM_TASK_FIELD),
+        orchestrator: take(FROM_ORCHESTRATOR_FIELD),
+    };
+    Ok((serde_json::from_value(v)?, caller))
 }
 
 static CALLER_TASK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -590,6 +663,35 @@ pub fn set_caller_task(task: Option<String>) {
 /// The task this process's requests carry, as `set_caller_task` left it.
 pub fn caller_task() -> Option<String> {
     CALLER_TASK.get().cloned().flatten()
+}
+
+static CALLER_ORCHESTRATOR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The orchestrator `orchestrator::ORCHESTRATOR_ENV` names: `None` outside
+/// its pre and post scripts, or when the variable is empty.
+pub fn orchestrator_from_env() -> Option<String> {
+    std::env::var(crate::orchestrator::ORCHESTRATOR_ENV)
+        .ok()
+        .filter(|o| !o.is_empty())
+}
+
+/// Sets the orchestrator this process's requests carry when they carry no
+/// task (`PASTOR_TASK` wins). Only the `pastor` binary calls it, as for
+/// `set_caller_task`.
+pub fn set_caller_orchestrator(orchestrator: Option<String>) {
+    let _ = CALLER_ORCHESTRATOR.set(orchestrator);
+}
+
+/// Who this process's requests say they come from.
+pub fn caller() -> Caller {
+    let task = caller_task();
+    Caller {
+        orchestrator: task
+            .is_none()
+            .then(|| CALLER_ORCHESTRATOR.get().cloned().flatten())
+            .flatten(),
+        task,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,6 +741,8 @@ pub enum IpcResponse {
     Queue(Vec<crate::queue::QueueEntry>),
     Moved(crate::store::Moved),
     Summaries(Vec<crate::task::TaskSummary>),
+    Orchestrators(Vec<crate::orchestrator::OrchestratorStatus>),
+    Orchestrator(crate::orchestrator::OrchestratorDescription),
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -730,8 +834,7 @@ pub async fn request_head_with_timeout(
 ) -> Result<IpcResponse, RequestError> {
     match remote_head() {
         Some(head) => {
-            let line =
-                request_line(req, caller_task().as_deref()).map_err(RequestError::Exchange)?;
+            let line = request_line_as(req, &caller()).map_err(RequestError::Exchange)?;
             head.request(&line, timeout).await
         }
         None => request_with_timeout(&paths.socket_file(), req, timeout).await,
@@ -808,7 +911,7 @@ async fn round_trip(
     req: &IpcRequest,
 ) -> anyhow::Result<IpcResponse> {
     let (r, mut w) = stream.into_split();
-    let line = request_line(req, caller_task().as_deref())?;
+    let line = request_line_as(req, &caller())?;
     w.write_all(line.as_bytes()).await?;
     w.flush().await?;
     let mut reply = String::new();
@@ -1209,6 +1312,8 @@ mod tests {
                 flock: Some("work".into()),
                 machine: None,
             },
+            IpcRequest::OrchestratorList,
+            IpcRequest::OrchestratorDescribe { name: "o".into() },
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -1335,6 +1440,15 @@ mod tests {
                 machine: "m".into(),
                 repo: "/r".into(),
             },
+            IpcRequest::OrchestratorRun { name: "o".into() },
+            IpcRequest::OrchestratorSetEnabled {
+                name: "o".into(),
+                enabled: true,
+            },
+            IpcRequest::OrchestratorNote {
+                name: None,
+                text: "n".into(),
+            },
         ]
     }
 
@@ -1351,6 +1465,7 @@ mod tests {
                     | IpcRequest::TaskSend { .. }
                     | IpcRequest::TaskClose { .. }
                     | IpcRequest::JobSetEnabled { .. }
+                    | IpcRequest::OrchestratorNote { .. }
             );
             assert_eq!(req.orchestrator_may(), allowed, "{req:?}");
         }
@@ -1419,14 +1534,42 @@ mod tests {
         assert_eq!(v[FROM_TASK_FIELD], "t-4");
         let (req, from) = parse_request_line(line.trim()).unwrap();
         assert!(matches!(req, IpcRequest::FlockList));
-        assert_eq!(from.as_deref(), Some("t-4"));
+        assert_eq!(from, Caller::task(Some("t-4")));
 
         let line = request_line(&IpcRequest::FlockList, None).unwrap();
         let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert!(v.get(FROM_TASK_FIELD).is_none(), "{v}");
         let (_, from) = parse_request_line(line.trim()).unwrap();
-        assert_eq!(from, None);
+        assert_eq!(from, Caller::default());
         assert!(parse_request_line("not json").is_err());
+    }
+
+    /// An orchestrator's script names its orchestrator; a caller that is
+    /// both sends only the task, and a head that reads both keeps both for
+    /// `Daemon::handle_as`, which takes the task.
+    #[test]
+    fn a_request_line_carries_the_orchestrator_unless_it_carries_a_task() {
+        let script = Caller {
+            task: None,
+            orchestrator: Some("merge".into()),
+        };
+        let line = request_line_as(&IpcRequest::FlockList, &script).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v[FROM_ORCHESTRATOR_FIELD], "merge");
+        assert_eq!(parse_request_line(line.trim()).unwrap().1, script);
+        let both = Caller {
+            task: Some("t-4".into()),
+            orchestrator: Some("merge".into()),
+        };
+        let line = request_line_as(&IpcRequest::FlockList, &both).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v[FROM_TASK_FIELD], "t-4");
+        assert!(v.get(FROM_ORCHESTRATOR_FIELD).is_none(), "{v}");
+        let (_, from) = parse_request_line(
+            r#"{"op":"flock_list","from_task":"t-4","from_orchestrator":"merge"}"#,
+        )
+        .unwrap();
+        assert_eq!(from, both);
     }
 
     /// A client refuses to send `JobSubmit` to a head older than

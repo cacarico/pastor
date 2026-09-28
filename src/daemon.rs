@@ -2116,9 +2116,17 @@ pub fn refusal(task: &str, role: TaskRole) -> String {
     match role {
         TaskRole::Agent => agent_refusal(task),
         TaskRole::Orchestrator => format!(
-            "{task} is an orchestrator, and an orchestrator may only run, retry, send to and close tasks and enable and disable jobs besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
+            "{task} is an orchestrator, and an orchestrator may only run, retry, send to and close tasks, enable and disable jobs and keep its note besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
         ),
     }
+}
+
+/// What the head says when it refuses orchestrator `name`'s pre or post
+/// script a change outside the role's table.
+pub fn script_refusal(name: &str) -> String {
+    format!(
+        "this is orchestrator {name}'s script, and an orchestrator may only run, retry, send to and close tasks, enable and disable jobs and keep its note besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
+    )
 }
 
 pub fn agent_refusal(task: &str) -> String {
@@ -2133,6 +2141,7 @@ pub struct Daemon {
     fleet: Arc<Fleet>,
     scheduler: SchedulerHandle,
     events: broadcast::Sender<PastorEvent>,
+    orchestrators: Arc<crate::orchestrator::Runner>,
 }
 
 /// The longest IPC request line, newline excluded. The largest real one is a
@@ -2264,13 +2273,13 @@ pub(crate) trait Answer: Send + Sync + 'static {
     fn answer(
         &self,
         req: IpcRequest,
-        from_task: Option<String>,
+        from: crate::ipc::Caller,
     ) -> impl std::future::Future<Output = IpcResponse> + Send;
 }
 
 impl Answer for Daemon {
-    async fn answer(&self, req: IpcRequest, from_task: Option<String>) -> IpcResponse {
-        self.handle_from(req, from_task.as_deref()).await
+    async fn answer(&self, req: IpcRequest, from: crate::ipc::Caller) -> IpcResponse {
+        self.handle_as(req, &from).await
     }
 }
 
@@ -2302,7 +2311,7 @@ pub(crate) async fn answer_on<A: Answer>(
                     let (r, mut w) = stream.into_split();
                     let resp = match read_request(r, MAX_IPC_REQUEST, IPC_READ_TIMEOUT).await {
                         Ok(line) => match crate::ipc::parse_request_line(line.trim()) {
-                            Ok((req, from_task)) => d.answer(req, from_task).await,
+                            Ok((req, from)) => d.answer(req, from).await,
                             Err(err) => IpcResponse::error("invalid_request", err),
                         },
                         Err(RequestReadError::TooLarge) => IpcResponse::error(
@@ -2382,12 +2391,20 @@ impl Daemon {
         .with_connectors()
         .with_config_baseline(on_disk)
         .spawn();
+        let orchestrators = crate::orchestrator::Runner::new(
+            paths.clone(),
+            store.clone(),
+            fleet.clone(),
+            events.clone(),
+        );
+        orchestrators.spawn(config.tick_duration());
         Ok(Daemon {
             paths,
             store,
             fleet,
             scheduler,
             events,
+            orchestrators,
         })
     }
 
@@ -2472,26 +2489,101 @@ impl Daemon {
     /// `IpcRequest::orchestrator_may` lists. No caller in a task may make an
     /// orchestrator, `agents_change_fleet` or not: only a person does.
     pub async fn handle_from(&self, req: IpcRequest, from_task: Option<&str>) -> IpcResponse {
-        let Some(task) = from_task else {
+        self.handle_as(req, &crate::ipc::Caller::task(from_task))
+            .await
+    }
+
+    /// `handle` for `caller`: a task's agent as `handle_from` says, an
+    /// orchestrator's pre or post script (`orchestrator::ORCHESTRATOR_ENV`)
+    /// under the orchestrator role's table, which must name an orchestrator
+    /// the head has a file for, or a person. A caller that names both a
+    /// task and an orchestrator is the task: an agent cannot widen its
+    /// rights by setting the other.
+    pub async fn handle_as(&self, req: IpcRequest, caller: &crate::ipc::Caller) -> IpcResponse {
+        if let Some(task) = caller.task.as_deref() {
+            if let Some(why) = self.makes_orchestrator(&req) {
+                return IpcResponse::error("role_refused", format!("{task} is a task, and {why}"));
+            }
+            if req.changes_fleet() && !req.ends_own_task(task) && !self.fleet.agents_change_fleet()
+            {
+                let role = self.caller_role(task);
+                if !(role == TaskRole::Orchestrator && req.orchestrator_may()) {
+                    return IpcResponse::error("agent_refused", refusal(task, role));
+                }
+            }
+            if let IpcRequest::OrchestratorNote { name, text } = req {
+                return self.note_from_task(task, name, &text);
+            }
+            // The agent ending its own task: one that must say what it did is
+            // held to it (`SummaryMode::Require`).
+            if req.ends_own_task(task)
+                && let IpcRequest::TaskDone { id, summary } = req
+            {
+                return self.end(id, summary, crate::machine::EndBy::Agent).await;
+            }
             return self.handle(req).await;
-        };
-        if let Some(why) = self.makes_orchestrator(&req) {
-            return IpcResponse::error("role_refused", format!("{task} is a task, and {why}"));
         }
-        if req.changes_fleet() && !req.ends_own_task(task) && !self.fleet.agents_change_fleet() {
-            let role = self.caller_role(task);
-            if !(role == TaskRole::Orchestrator && req.orchestrator_may()) {
-                return IpcResponse::error("agent_refused", refusal(task, role));
+        if let Some(o) = caller.orchestrator.as_deref() {
+            if let Some(why) = self.makes_orchestrator(&req) {
+                return IpcResponse::error(
+                    "role_refused",
+                    format!("orchestrator {o}'s script is not a person, and {why}"),
+                );
+            }
+            if req.changes_fleet() {
+                if !self.orchestrators.knows(o) {
+                    return IpcResponse::error(
+                        "agent_refused",
+                        format!(
+                            "{} names {o:?}, but the head has no orchestrator of that name",
+                            crate::orchestrator::ORCHESTRATOR_ENV
+                        ),
+                    );
+                }
+                if !req.orchestrator_may() && !self.fleet.agents_change_fleet() {
+                    return IpcResponse::error("agent_refused", script_refusal(o));
+                }
+            }
+            if let IpcRequest::OrchestratorNote { name, text } = req {
+                if name.as_deref().is_some_and(|n| n != o) {
+                    return IpcResponse::error(
+                        "agent_refused",
+                        format!("orchestrator {o}'s script may keep only its own note"),
+                    );
+                }
+                return self.note(o, &text);
             }
         }
-        // The agent ending its own task: one that must say what it did is
-        // held to it (`SummaryMode::Require`).
-        if req.ends_own_task(task)
-            && let IpcRequest::TaskDone { id, summary } = req
-        {
-            return self.end(id, summary, crate::machine::EndBy::Agent).await;
-        }
         self.handle(req).await
+    }
+
+    /// `orchestrator note` from task `task`'s agent: the note of the
+    /// orchestrator that started it, and no other.
+    fn note_from_task(&self, task: &str, name: Option<String>, text: &str) -> IpcResponse {
+        let own = crate::task::parse_task_id(task).and_then(|id| self.orchestrators.of_task(id));
+        match (own, name) {
+            (Some(own), Some(name)) if name != own => IpcResponse::error(
+                "agent_refused",
+                format!("{task} is orchestrator {own}'s agent, and may keep only its note"),
+            ),
+            (Some(own), _) => self.note(&own, text),
+            (None, _) => IpcResponse::error(
+                "not_an_orchestrator",
+                format!(
+                    "{task} was not started by an orchestrator file, so it has no note to keep"
+                ),
+            ),
+        }
+    }
+
+    fn note(&self, name: &str, text: &str) -> IpcResponse {
+        if let Err((code, message)) = crate::orchestrator::file_of(&self.paths, name) {
+            return IpcResponse::error(&code, message);
+        }
+        match crate::orchestrator::write_note(&self.paths, name, text) {
+            Ok(said) => IpcResponse::Text(said),
+            Err(err) => IpcResponse::error("runtime_error", format!("{err:#}")),
+        }
     }
 
     /// Why `req` would make an orchestrator, which only a person may do:
@@ -2992,6 +3084,32 @@ impl Daemon {
             } => match self.fleet.report(&machine, id, state, pane, detail).await {
                 Ok(task) => IpcResponse::Task(task),
                 Err(err) => cli_error(err),
+            },
+            IpcRequest::OrchestratorList => {
+                IpcResponse::Orchestrators(self.orchestrators.statuses(chrono::Utc::now()))
+            }
+            IpcRequest::OrchestratorDescribe { name } => {
+                match self.orchestrators.describe(&name, chrono::Utc::now()) {
+                    Ok(d) => IpcResponse::Orchestrator(d),
+                    Err((code, message)) => IpcResponse::error(&code, message),
+                }
+            }
+            IpcRequest::OrchestratorRun { name } => match self.orchestrators.fire(&name) {
+                Ok(said) => IpcResponse::Text(said),
+                Err((code, message)) => IpcResponse::error(&code, message),
+            },
+            IpcRequest::OrchestratorSetEnabled { name, enabled } => {
+                match crate::orchestrator::set_enabled(&self.paths, &name, enabled) {
+                    Ok(said) => IpcResponse::Text(said),
+                    Err((code, message)) => IpcResponse::error(&code, message),
+                }
+            }
+            IpcRequest::OrchestratorNote { name, text } => match name {
+                Some(name) => self.note(&name, &text),
+                None => IpcResponse::error(
+                    "orchestrator_not_found",
+                    "name the orchestrator whose note this is (--name)",
+                ),
             },
         }
     }
@@ -7325,6 +7443,150 @@ mod tests {
             panic!("{resp:?}")
         };
         assert_eq!(closed.state, TaskState::Closed);
+    }
+
+    /// An orchestrator file `name` in the head's orchestrators directory.
+    fn write_orchestrator(tmp: &tempfile::TempDir, name: &str) -> Paths {
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.orchestrators_dir()).unwrap();
+        std::fs::write(
+            paths.orchestrators_dir().join(format!("{name}.toml")),
+            "kind = \"scheduled\"\nevery = \"1h\"\npre = [\"./pre.sh\"]\nprompt = \"p\"\n",
+        )
+        .unwrap();
+        paths
+    }
+
+    fn script(name: &str) -> crate::ipc::Caller {
+        crate::ipc::Caller {
+            task: None,
+            orchestrator: Some(name.into()),
+        }
+    }
+
+    /// A pre or post script (`PASTOR_ORCHESTRATOR`) gets the orchestrator
+    /// role's table: `task run` passes, `machine add` and making an
+    /// orchestrator do not, and a name the head has no file for is refused
+    /// every change.
+    #[tokio::test]
+    async fn an_orchestrators_script_gets_the_roles_table() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        write_orchestrator(&tmp, "merge");
+        let resp = d.handle_as(run_hi(), &script("merge")).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.role, TaskRole::Agent);
+        let add = IpcRequest::MachineAdd {
+            machine: machine("x", 1),
+        };
+        let resp = d.handle_as(add, &script("merge")).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "agent_refused");
+        assert!(message.contains("orchestrator merge"), "{message}");
+        assert!(d.fleet().flock().get("x").is_none());
+        let resp = d
+            .handle_as(run_hi_as(TaskRole::Orchestrator), &script("merge"))
+            .await;
+        assert_eq!(code_of(&resp), Some("role_refused"), "{resp:?}");
+        let resp = d.handle_as(run_hi(), &script("ghost")).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "agent_refused");
+        assert!(message.contains("ghost"), "{message}");
+        let list = IpcRequest::List {
+            filter: TaskFilter::default(),
+        };
+        assert!(matches!(
+            d.handle_as(list, &script("ghost")).await,
+            IpcResponse::Tasks(_)
+        ));
+    }
+
+    /// A request that names both a task and an orchestrator is the task's:
+    /// a plain agent that sets `PASTOR_ORCHESTRATOR` gains nothing.
+    #[tokio::test]
+    async fn a_caller_with_both_variables_gets_the_tasks_rights() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        write_orchestrator(&tmp, "merge");
+        let IpcResponse::Task(agent) = d.handle(run_hi()).await else {
+            panic!("run failed")
+        };
+        let both = crate::ipc::Caller {
+            task: Some(agent.display_id()),
+            orchestrator: Some("merge".into()),
+        };
+        let resp = d.handle_as(run_hi(), &both).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "agent_refused");
+        assert!(message.contains("is an agent pastor started"), "{message}");
+        let note = IpcRequest::OrchestratorNote {
+            name: Some("merge".into()),
+            text: "x".into(),
+        };
+        assert_eq!(
+            code_of(&d.handle_as(note, &both).await),
+            Some("agent_refused")
+        );
+    }
+
+    /// The handover note: a script keeps its own orchestrator's only, the
+    /// agent an orchestrator file started keeps that one's, a hand-started
+    /// orchestrator has none, and a person names it.
+    #[tokio::test]
+    async fn each_orchestrator_keeps_only_its_own_note() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let paths = write_orchestrator(&tmp, "merge");
+        write_orchestrator(&tmp, "night");
+        let note = |name: Option<&str>, text: &str| IpcRequest::OrchestratorNote {
+            name: name.map(str::to_string),
+            text: text.into(),
+        };
+        let resp = d.handle_as(note(None, "from pre"), &script("merge")).await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            crate::orchestrator::read_note(&paths, "merge").as_deref(),
+            Some("from pre")
+        );
+        let resp = d
+            .handle_as(note(Some("night"), "x"), &script("merge"))
+            .await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+
+        let me = orchestrator(&d).await;
+        let resp = d.handle_from(note(None, "x"), Some(&me)).await;
+        assert_eq!(code_of(&resp), Some("not_an_orchestrator"), "{resp:?}");
+        // As if merge's last run had started it.
+        let id = crate::task::parse_task_id(&me).unwrap();
+        std::fs::create_dir_all(paths.orchestrator_state_dir("merge")).unwrap();
+        std::fs::write(
+            paths.orchestrator_state_dir("merge").join("state.json"),
+            serde_json::json!({ "task": id }).to_string(),
+        )
+        .unwrap();
+        d.handle(IpcRequest::OrchestratorList).await;
+        let resp = d.handle_from(note(None, "from the agent"), Some(&me)).await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            crate::orchestrator::read_note(&paths, "merge").as_deref(),
+            Some("from the agent")
+        );
+        let resp = d.handle_from(note(Some("night"), "x"), Some(&me)).await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+
+        let resp = d.handle(note(None, "x")).await;
+        assert!(code_of(&resp).is_some(), "{resp:?}");
+        let resp = d.handle(note(Some("night"), "by hand")).await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            crate::orchestrator::read_note(&paths, "night").as_deref(),
+            Some("by hand")
+        );
     }
 
     /// Everything else that changes the fleet is refused an orchestrator,

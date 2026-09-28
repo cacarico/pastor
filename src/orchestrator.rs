@@ -57,9 +57,6 @@ const RUNS_KEPT: usize = 10;
 /// Recent events `orchestrator describe` shows.
 const EVENTS_SHOWN: usize = 10;
 
-/// What pastor asks of every orchestrator agent at the end of its prompt.
-pub const SUMMARY_ASK: &str = "When you finish, run `pastor task done --summary-file -` with a short summary on stdin: first line `done`, `partial`, `blocked` or `nothing to do`; then up to five short lines: what changed, where (branch, PR, files or notes), what is left.";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -289,8 +286,9 @@ impl Orchestrator {
     }
 
     /// The prompt of the agent a run starts: the file's prompt, the skill,
-    /// the handover note, every line the pre script printed, then the ask
-    /// for a summary.
+    /// the handover note, then every line the pre script printed. pastor adds
+    /// the ask for a summary when it sends it (`task::prompt_to_send`), as for
+    /// every task.
     pub fn agent_prompt(&self, note: Option<&str>, lines: &[String]) -> String {
         let mut out = self.prompt.trim_end().to_string();
         if let Some(skill) = &self.skill {
@@ -308,8 +306,6 @@ impl Orchestrator {
             );
             out.push_str(&lines.join("\n"));
         }
-        out.push_str("\n\n");
-        out.push_str(SUMMARY_ASK);
         out
     }
 }
@@ -1351,6 +1347,8 @@ impl Runner {
             agent_source: None,
             place: defaults.place.clone(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         };
         let note = read_note(&self.paths, &orch.name);
         let prompt = orch.agent_prompt(note.as_deref(), lines);
@@ -1371,6 +1369,7 @@ impl Runner {
                 TaskRole::Orchestrator,
                 Some(description),
                 false,
+                None,
             )
             .await
             .map_err(|e| match e {
@@ -1634,7 +1633,7 @@ prompt = "You are the night orchestrator."
     }
 
     #[test]
-    fn the_agents_prompt_is_the_prompt_skill_note_lines_and_summary_ask() {
+    fn the_agents_prompt_is_the_prompt_skill_note_then_lines() {
         let o = parse(SCHEDULED).unwrap();
         let p = o.agent_prompt(
             Some("merged #31\n"),
@@ -1644,11 +1643,8 @@ prompt = "You are the night orchestrator."
         let skill = p.find("Use your orchestrating-pastor skill.").unwrap();
         let note = p.find("merged #31").unwrap();
         let line = p.find("PR #32 x\nTASK t-4 blocked").unwrap();
-        let ask = p.find("pastor task done --summary-file -").unwrap();
-        assert!(
-            prompt < skill && skill < note && note < line && line < ask,
-            "{p}"
-        );
+        assert!(prompt < skill && skill < note && note < line, "{p}");
+        assert!(p.ends_with("TASK t-4 blocked"), "{p}");
         assert!(!o.agent_prompt(None, &[]).contains("handover"));
     }
 
@@ -1952,6 +1948,8 @@ prompt = "You are the night orchestrator."
                         agent_source: None,
                         place: Default::default(),
                         session_id: None,
+                        label: Default::default(),
+                        summary: Default::default(),
                     },
                     flock: "default".into(),
                 },
