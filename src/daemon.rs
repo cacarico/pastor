@@ -1828,6 +1828,9 @@ impl Daemon {
                     spec,
                     agent,
                     flock,
+                    // A headless serve resolves priority itself before
+                    // sending the item; the head does not re-render it.
+                    priority: None,
                 };
                 self.job_task(job, item).await
             }
