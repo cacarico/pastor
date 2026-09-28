@@ -6,26 +6,12 @@ use std::process::Stdio;
 use super::Connection;
 use crate::config::Paths;
 use crate::config::flock::MachineConfig;
+use crate::ssh::fitting_control_path;
 
 /// How long an ssh `ControlMaster` sticks around with no channels open. Every
 /// request opens a connection, so the master is what makes them cheap: the same
 /// value herdr's own remote transport uses (`src/remote/attach.rs`).
-const CONTROL_PERSIST_SECS: u32 = 600;
-
-/// OpenSSH creates the master socket at `<path>.XXXXXXXXXXXXXXXX` and renames it
-/// into place, so the staged name is 17 bytes longer than the ControlPath.
-const CONTROL_PATH_STAGING: usize = 17;
-
-/// `sun_path` is 108 bytes on Linux and 104 on macOS and the BSDs, including
-/// the terminating NUL.
-pub(crate) const UNIX_PATH_MAX: usize = unix_path_max(cfg!(target_os = "linux"));
-
-const fn unix_path_max(linux: bool) -> usize {
-    if linux { 108 } else { 104 }
-}
-
-/// `%C` expands to a hex SHA-1 of the connection parameters.
-const EXPANDED_C: usize = 40;
+const CONTROL_PERSIST: &str = "600";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
@@ -144,63 +130,7 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
-/// The length of `path` as ssh will have expanded it: `%%` is one byte, `%C` is
-/// a 40-byte hash. Other `%` tokens do not appear in paths pastor builds.
-fn expanded_len(path: &Path) -> usize {
-    let s = path.to_string_lossy();
-    let mut len = 0usize;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            len += c.len_utf8();
-            continue;
-        }
-        match chars.next() {
-            Some('%') => len += 1,
-            Some('C') => len += EXPANDED_C,
-            Some(other) => len += 1 + other.len_utf8(),
-            None => len += 1,
-        }
-    }
-    len
-}
-
-/// The ControlPath for `machine`, with the name shortened until ssh's staged
-/// socket name fits in `sun_path`. The name is only there to make the socket
-/// recognisable in `ls`; `%C` (a hash of the destination) is what keeps
-/// machines apart, so cutting the name loses nothing. `None` only when even a
-/// bare `-%C` does not fit, which takes an unusually deep state dir.
-/// ssh options that turn multiplexing off whatever the user's ssh config says.
-pub(crate) fn no_multiplexing() -> [String; 4] {
-    [
-        "-o".into(),
-        "ControlMaster=no".into(),
-        "-o".into(),
-        "ControlPath=none".into(),
-    ]
-}
-
-pub(crate) fn fitting_control_path(paths: &Paths, machine: &str) -> Option<PathBuf> {
-    let chars = machine.chars().count();
-    (0..=chars).rev().find_map(|keep| {
-        let short: String = machine.chars().take(keep).collect();
-        let path = paths.ssh_control_path(&short);
-        control_path_fits(&path).then_some(path)
-    })
-}
-
-/// Would ssh's staged socket name fit in `sun_path`? A ControlPath that does not
-/// makes every connection fail, so an endpoint whose path is too long drops the
-/// multiplexing options instead.
-fn control_path_fits(path: &Path) -> bool {
-    // `+ 1` for the NUL would read better, but clippy prefers the strict form.
-    expanded_len(path) + CONTROL_PATH_STAGING < UNIX_PATH_MAX
-}
-
-/// ssh argv for a bridge, over the shared master when there is one. Nothing here
-/// goes through a shell: `target` and `control_path` are separate argv elements,
-/// and only the remote command (which a remote shell does parse) is quoted, by
-/// `bridge_command`.
+/// ssh argv for a bridge, over the shared master when there is one.
 fn ssh_argv(target: &str, session: &str, control_path: Option<&Path>) -> Vec<String> {
     ssh_argv_running(target, control_path, bridge_command(session))
 }
@@ -219,41 +149,24 @@ pub fn posix_command(command: &str) -> String {
 /// ssh argv that runs `remote` (a POSIX shell command, run through
 /// `posix_command`) over the shared master when there is one.
 fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -> Vec<String> {
-    let mut argv = vec![
-        "ssh".to_string(),
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ServerAliveInterval=15".into(),
-        "-o".into(),
-        "ServerAliveCountMax=3".into(),
-    ];
-    if let Some(control_path) = control_path {
-        // One authenticated master per machine and destination, reused by every
-        // request connection: without it each request would pay a full ssh
-        // handshake.
-        argv.extend([
-            "-o".to_string(),
-            "ControlMaster=auto".into(),
-            "-o".into(),
-            format!("ControlPath={}", control_path.display()),
-            "-o".into(),
-            format!("ControlPersist={CONTROL_PERSIST_SECS}"),
-        ]);
-    } else {
-        // Said outright, so a `ControlMaster` in the user's ssh config cannot
-        // bring back the socket that did not fit.
-        argv.extend(no_multiplexing());
-    }
-    // `--` so a target is never read as an option; `Flock::validate` also
-    // refuses one that starts with `-`.
-    argv.extend([
-        "-T".to_string(),
-        "--".into(),
-        target.to_string(),
-        posix_command(&remote),
-    ]);
+    let ssh = crate::ssh::Ssh {
+        target,
+        control_path,
+        control_persist: CONTROL_PERSIST,
+        keepalive: true,
+        no_tty: true,
+    };
+    let mut argv = vec!["ssh".to_string()];
+    argv.extend(ssh.args(&remote));
     argv
+}
+
+/// Every ssh that carries a ControlPath can be the one that starts the
+/// master, so each of them makes its directory first (`ssh::ensure_control_dir`).
+fn ensure_control_dir(control_path: Option<&Path>) -> Result<(), ConnectError> {
+    crate::ssh::ensure_control_dir(control_path).map_err(|e| ConnectError {
+        message: e.to_string(),
+    })
 }
 
 /// The most a probe may write to stdout, and to stderr. Its answer is a
@@ -843,22 +756,6 @@ pub async fn connect(ep: &Endpoint) -> Result<Connection, ConnectError> {
     }
 }
 
-/// The master socket lives in the ControlPath's directory; ssh creates the
-/// socket itself but not the directory, and it must not be world-readable.
-/// Every ssh that carries a ControlPath can be the one that starts the master,
-/// so each of them calls this first. The path is in ssh's escaped form (`%%`
-/// for a literal `%`), so undo that before touching the filesystem or a `%` in
-/// the state dir would create one directory while ssh looks for another.
-fn ensure_control_dir(control_path: Option<&Path>) -> Result<(), ConnectError> {
-    let Some(parent) = control_path.and_then(|p| p.parent()) else {
-        return Ok(());
-    };
-    let literal = PathBuf::from(parent.to_string_lossy().replace("%%", "%"));
-    crate::config::create_private_dir(&literal).map_err(|e| ConnectError {
-        message: e.to_string(),
-    })
-}
-
 /// Spawn argv with piped stdio. The bridge is not proven alive here: that is the
 /// first request's job, and `Connection` reports the child's exit status and
 /// stderr if it died before replying (see `Connection::diagnose`).
@@ -962,7 +859,7 @@ mod tests {
             panic!("ssh machine")
         };
         let path = control_path.expect("a shortened path must still multiplex");
-        assert!(control_path_fits(&path), "{}", path.display());
+        assert!(crate::ssh::control_path_fits(&path), "{}", path.display());
         let text = path.to_string_lossy();
         assert!(
             text.starts_with("/home/exampleuser/.local/state/pastor/ssh/pastor"),
@@ -1537,21 +1434,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_state_dir_gets_a_private_ssh_dir() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        // A `%` in the state dir is escaped in the ControlPath; the directory
-        // made must be the literal one ssh will look in.
-        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s%1"));
-        ensure_control_dir(Some(&paths.ssh_control_path("pi-3"))).unwrap();
-        let md = std::fs::metadata(paths.ssh_dir()).unwrap();
-        assert!(md.is_dir());
-        assert_eq!(md.permissions().mode() & 0o777, 0o700);
-        assert!(!tmp.path().join("s%%1").exists());
-        ensure_control_dir(None).unwrap();
-    }
-
-    #[test]
     fn a_control_path_that_cannot_fit_drops_multiplexing() {
         // 40 bytes for %C, 17 for ssh's staging and a NUL leave about 50 for the
         // directory and the name, so a deep state dir runs out.
@@ -1601,21 +1483,6 @@ mod tests {
             argv.last().unwrap(),
             "sh -c 'herdr --session default remote-api-bridge'"
         );
-    }
-
-    #[test]
-    fn expanded_len_counts_ssh_escapes() {
-        assert_eq!(expanded_len(Path::new("/a/b")), 4);
-        assert_eq!(expanded_len(Path::new("%%")), 1);
-        assert_eq!(expanded_len(Path::new("/a-%C")), 3 + EXPANDED_C);
-        assert_eq!(unix_path_max(true), 108);
-        assert_eq!(unix_path_max(false), 104);
-        let expected = if cfg!(target_os = "linux") { 108 } else { 104 };
-        assert_eq!(UNIX_PATH_MAX, expected);
-        // The guard's boundary: exactly `UNIX_PATH_MAX` staged bytes is fine.
-        let fits = "x".repeat(UNIX_PATH_MAX - CONTROL_PATH_STAGING - 1);
-        assert!(control_path_fits(Path::new(&fits)));
-        assert!(!control_path_fits(Path::new(&format!("{fits}x"))));
     }
 
     #[tokio::test]
