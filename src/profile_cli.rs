@@ -1,10 +1,11 @@
 //! `pastor profile list|describe`: the permission profiles, built in and
 //! from pastor.toml. Read straight from the file, so they work with the head
-//! down, and change nothing.
+//! down, and change nothing; with a head on another machine the file is the
+//! head's, fetched with `FileGet`.
 use clap::Subcommand;
 
 use crate::cli::{CliError, printable, table};
-use crate::config::{PastorConfig, Paths};
+use crate::config::PastorConfig;
 
 #[derive(Subcommand, Debug)]
 pub enum ProfileCmd {
@@ -24,8 +25,8 @@ pub enum ProfileCmd {
     },
 }
 
-pub fn run(paths: &Paths, cmd: ProfileCmd) -> anyhow::Result<()> {
-    let config = PastorConfig::load(&paths.config_file())?;
+/// `cmd` against `config`, the head's pastor.toml.
+pub fn run(config: &PastorConfig, cmd: ProfileCmd) -> anyhow::Result<()> {
     let profiles = &config.profiles;
     match cmd {
         ProfileCmd::List { json } => {

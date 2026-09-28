@@ -990,9 +990,8 @@ pastor profile describe ci        # the chain (ci -> develop) and the allow and 
 ```
 
 Both read pastor.toml on this machine and never ask the head, so they work
-with it down; with a remote head set they are refused
-(`remote_head_unsupported`). A name that is not a profile is
-`unknown_profile`.
+with it down; with a remote head set they read the head's pastor.toml
+through it. A name that is not a profile is `unknown_profile`.
 
 ### Priority and queue order
 
@@ -2218,19 +2217,34 @@ It needs:
 it never falls back to this machine's files.
 
 These commands go to a remote head: `task run|list|describe|read|retry|priority|close|prune|send|done`,
-`queue` and `queue move`, `machine list`, `tick`, `job reload`, `events`, and job commands for
+`queue` and `queue move`, `machine list|add|remove|move|describe`, `flock list|add|remove|describe|default|edit`,
+`trust list|add|remove`, `profile list|describe`, `config edit`, `tick`, `job reload`, `events`, and job commands for
 the head's jobs (see [Jobs on a shepherd](#jobs-on-a-shepherd)). `machine list`'s first line
 names the head by its ssh destination and shows its herdr as `-`. `task run`
 fills what its flags leave out from the built-in defaults, not from the
 head's `[defaults]` (the head still resolves the agent with its own).
 
-Local on purpose, as with no head set: `completions`, `setup`, `head`,
-`bridge`, `connector` (connectors are this machine's) and `task attach`
-(it goes to the machine directly, reading this machine's `flock.toml`).
+They print and exit as they would on the head's own machine. The edits
+are the head's own requests, so the head checks and reloads them;
+`flock edit` and `config edit` fetch the head's file, open it here and send
+it back. `flock list`, `flock default show` and `profile` read the head's
+`flock.toml` and `pastor.toml` with the same request (IPC protocol 6 or
+later). `machine add|remove --herdr` still changes this machine's herdr
+sidebar, which is where you look at the machines from.
 
-Every other command would read or edit this machine's files instead of the
-head's, so it fails with `remote_head_unsupported` until it is moved behind
-the head; run it on the head. `machine open` is one of them.
+Local on purpose, as with no head set: `completions`, `setup`, `head`,
+`bridge`, `connector` (connectors are this machine's), `config edit --local`
+(this machine's pastor.toml, which its headless serve reads), and
+`task attach` and `machine open`: they go to the machine directly, but ask
+the head for the task, its flock.toml and its pastor.toml instead of
+reading this machine's, so they need the head up and at IPC protocol 6 or
+later. The head's own machine, the local one in its
+flock.toml, is reached at the head's ssh destination.
+
+Every other command runs on the head only. `machine authorized-key` prints a
+line naming the head's pastor for the head's own `authorized_keys`, so with a
+remote head it fails with `remote_head_unsupported`, naming the head to run it
+on.
 
 ### A headless serve
 
@@ -2355,6 +2369,47 @@ To set it up for machine `pi-1`:
 Give each machine its own key: the machine named in the line is the only one
 whose tasks that key reaches. A work flock's machine then cannot even list a
 personal flock's tasks.
+
+### Moving the head
+
+To move the head from `laptop` to `pi-1`, so that `laptop` keeps the CLI and
+runs its tasks as a pull machine. Every step names the machine it runs on.
+
+1. On `laptop`, stop the head, so nothing changes while it is copied:
+   `pastor serve stop` (or stop its systemd or launchd unit).
+2. Copy the head's files to the same places on `pi-1`: `flock.toml`,
+   `pastor.toml` and `jobs/` from `~/.config/pastor/`, and `pastor.db` from
+   `~/.local/state/pastor/`. The tasks, the trust table, the seen keys and
+   the jobs' state travel in `pastor.db`. Install the connectors the jobs
+   use on `pi-1` too (`pastor connector install`); they are per machine.
+   Delete the copied job files from `laptop`'s `jobs/`: a job file left there
+   is `laptop`'s own and would run there as well.
+3. On `pi-1`, edit the copied `flock.toml`. `pi-1`'s own entry becomes
+   `local = true` in place of its `ssh`; `laptop`'s becomes `pull = true`
+   in place of its `local = true`. Each machine sets exactly one of `local`,
+   `ssh`, `command` and `pull`. In `pastor.toml` set
+   `head_address = "user@head.example"`, the destination the other machines
+   reach `pi-1` by, so their agents know where to send `task done`.
+4. On `pi-1`, run `pastor setup systemd` (or `launchd`). It starts the head.
+   `pi-1` needs key-based ssh to every `ssh` machine in the file, as `laptop`
+   had.
+5. On `laptop`, run `pastor head set user@head.example`, then
+   `pastor setup systemd` again: with a head set, its unit runs a headless
+   serve, which claims `laptop`'s tasks from the head. If `laptop`'s name in
+   the flock is not its hostname, set it first with `pastor config edit
+   --local`: `[shepherd]` with `machine = "laptop"`.
+6. For every machine other than `pi-1` whose agents report back, `laptop`
+   included, give it a locked key: make it there, then on `pi-1` run
+   `pastor machine authorized-key <name> --key <file>` and append the line
+   to `~/.ssh/authorized_keys` (see [Agents on other
+   machines](#agents-on-other-machines)). `laptop`'s CLI keeps its own,
+   unlocked key.
+7. From `laptop`, `pastor machine list` names `user@head.example` as the
+   head and lists `laptop` as a pull machine; `pastor task list --all` shows
+   the tasks copied in `pastor.db`.
+
+`laptop`'s own `pastor.db` is left alone by a headless serve; delete it once
+the move works.
 
 ## Trust model
 

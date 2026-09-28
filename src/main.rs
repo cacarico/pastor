@@ -199,7 +199,11 @@ enum JobCmd {
 #[derive(Subcommand, Debug)]
 enum ConfigCmd {
     /// Open pastor.toml in $VISUAL or $EDITOR; save it only once it is valid
-    Edit,
+    Edit {
+        /// This machine's pastor.toml, even with a head on another machine
+        #[arg(long)]
+        local: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -608,10 +612,10 @@ fn main() {
         match remote_route(&command) {
             // With a head elsewhere, serve runs headless (`shepherd`).
             RemoteRoute::Head | RemoteRoute::Here | RemoteRoute::Serve => {}
-            RemoteRoute::Unsupported => fail(
+            RemoteRoute::Unsupported(why) => fail(
                 "remote_head_unsupported",
                 &format!(
-                    "`pastor {}` does not work with a remote head yet: it would act on this machine's files; run it on {}, or `pastor head unset`",
+                    "`pastor {}` runs on the head only: {why}; run it on {}",
                     command_path(),
                     r.ssh
                 ),
@@ -629,7 +633,8 @@ fn main() {
                 ),
             );
         }
-        if changes_fleet(&command)
+        if !head_decides(&paths, &command, remote.is_some())
+            && changes_fleet(&command)
             && !ends_own_task(&command, &task)
             && !orchestrator_may(&command)
             && !agents_change_fleet(&paths)
@@ -645,7 +650,14 @@ fn main() {
         // Commands that never talk to the head do not read `head`, and with a
         // remote head, commands that stay here on purpose do not ask it.
         let head_use = match remote_route(&command) {
-            RemoteRoute::Here if remote.is_some() => None,
+            RemoteRoute::Here if remote.is_some() && !reads_head_files(&command) => None,
+            // Attach and open go to the machine directly, but ask a remote
+            // head for the task and its files, so it must answer.
+            RemoteRoute::Here if remote.is_some() => Some(false),
+            // What a local head leaves to the files here (`flock default
+            // show`, `profile`) is fetched from a remote head, so it must
+            // answer.
+            RemoteRoute::Head if remote.is_some() => Some(head_use(&command).unwrap_or(false)),
             // Here `events` reads the log file, head or no head; a remote
             // head is asked for it, so it must be up and new enough.
             _ if remote.is_some() && matches!(command, Command::Events(_)) => Some(false),
@@ -657,9 +669,7 @@ fn main() {
                 // by this machine's serve: the head only supplies its recent
                 // tasks, so a protocol need that is only about the file
                 // request (`needs_file_protocol`) does not apply to it.
-                let local_job_route = remote.is_some()
-                    && matches!(&command, Command::Job { cmd }
-                        if job_name(cmd).is_some_and(|name| is_local_job(&paths, name)));
+                let local_job_route = remote.is_some() && names_local_job(&paths, &command);
                 probe_head(
                     &paths,
                     // A remote head's flock.toml is not here to read.
@@ -682,6 +692,11 @@ fn main() {
                                 Some((p.max(pastor::ipc::MULTI_FLOCK_PROTOCOL), why))
                             },
                         )
+                    } else if remote.is_some() && reads_head_files(&command) {
+                        protocol_need(&command).or(Some((
+                            pastor::ipc::FILE_PROTOCOL,
+                            "predates reading its files through the head",
+                        )))
                     } else {
                         protocol_need(&command)
                     },
@@ -698,8 +713,8 @@ fn main() {
             Command::Tick(args) => tick(&paths, args, head).await,
             Command::Job { cmd } => job(&paths, cmd, head).await,
             Command::Config {
-                cmd: ConfigCmd::Edit,
-            } => config_edit(&paths, head).await,
+                cmd: ConfigCmd::Edit { local },
+            } => config_edit(&paths, local, head).await,
             Command::Completions { shell } => {
                 let mut cmd = completion_tree();
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
@@ -714,7 +729,9 @@ fn main() {
             Command::Watch(args) => pastor::watch::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
-            Command::Profile { cmd } => pastor::profile_cli::run(&paths, cmd),
+            Command::Profile { cmd } => {
+                pastor::profile_cli::run(&head_config(&paths).await?, cmd)
+            }
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd, head).await,
             Command::Queue(args) => pastor::queue_cli::run(&paths, args, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
@@ -1043,9 +1060,9 @@ enum RemoteRoute {
     /// `pastor serve`: headless, running this machine's jobs and hooks for
     /// the head.
     Serve,
-    /// Not moved behind the head yet: it would read or edit this machine's
-    /// files, so it is refused rather than act on the wrong ones.
-    Unsupported,
+    /// Only on the head's own machine, for the reason given: run here it
+    /// would act on this machine's files instead of the head's.
+    Unsupported(&'static str),
 }
 
 fn remote_route(command: &Command) -> RemoteRoute {
@@ -1053,14 +1070,31 @@ fn remote_route(command: &Command) -> RemoteRoute {
         Command::Task {
             cmd: TaskCmd::Attach { .. },
         } => RemoteRoute::Here,
+        // The line names the pastor binary on the machine it is printed
+        // on, and goes in that machine's authorized_keys.
+        Command::Machine {
+            cmd: MachineCmd::AuthorizedKey { .. },
+        } => RemoteRoute::Unsupported(
+            "the line it prints names the head's pastor and goes in the head's authorized_keys",
+        ),
+        // Open, like attach, goes to the machine directly; the head only
+        // says how to reach it.
+        Command::Machine {
+            cmd: MachineCmd::Open { .. },
+        } => RemoteRoute::Here,
+        Command::Config {
+            cmd: ConfigCmd::Edit { local: true },
+        } => RemoteRoute::Here,
         // Watch asks the head for its events, tasks and jobs; its connectors
         // are this machine's.
         Command::Task { .. }
         | Command::Watch(_)
         | Command::Queue(_)
-        | Command::Machine {
-            cmd: MachineCmd::List { .. },
-        }
+        | Command::Machine { .. }
+        | Command::Flock { .. }
+        | Command::Trust { .. }
+        | Command::Profile { .. }
+        | Command::Config { .. }
         | Command::Events(_)
         | Command::Tick(_)
         // The head's jobs through it, this machine's own here (`job`).
@@ -1073,8 +1107,48 @@ fn remote_route(command: &Command) -> RemoteRoute {
         // Stop and status act on this machine's serve, head or headless.
         Command::Serve(ServeArgs { cmd: Some(_), .. }) => RemoteRoute::Here,
         Command::Serve(_) => RemoteRoute::Serve,
-        _ => RemoteRoute::Unsupported,
     }
+}
+
+/// Whether a remote head, not this machine, judges whether the task
+/// calling may run `command`: the head refuses what its own
+/// `agents_change_fleet` and the task's role forbid, and this machine's
+/// pastor.toml and store have no say in it. A job whose file is here is
+/// not the head's: `job()` runs and edits it here, so the guard here
+/// applies.
+fn head_decides(paths: &Paths, command: &Command, remote: bool) -> bool {
+    remote && remote_route(command) == RemoteRoute::Head && !names_local_job(paths, command)
+}
+
+/// Whether `command` is a `job` command naming a job whose file is on this
+/// machine (`is_local_job`), which `job()` hands to `local_job` when the
+/// head is elsewhere.
+fn names_local_job(paths: &Paths, command: &Command) -> bool {
+    matches!(command, Command::Job { cmd }
+        if job_name(cmd).is_some_and(|name| is_local_job(paths, name)))
+}
+
+/// Whether `command`, sent to a remote head, fetches one of its files
+/// (`head_file`) or its task where a local head's CLI would read them
+/// here: it needs `FILE_PROTOCOL`. Attach and open stay here, but still
+/// ask the head.
+fn reads_head_files(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Profile { .. }
+            | Command::Task {
+                cmd: TaskCmd::Attach { .. }
+            }
+            | Command::Machine {
+                cmd: MachineCmd::Open { .. }
+            }
+            | Command::Flock {
+                cmd: FlockCmd::List { .. }
+                    | FlockCmd::Default {
+                        cmd: FlockDefaultCmd::Show
+                    }
+            }
+    )
 }
 
 /// The subcommand words the command line named (`machine add`), for a
@@ -2175,12 +2249,16 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             }
         }
         MachineCmd::Remove { name, herdr } => {
-            // Only for the herdr hint below, read before the machine goes. A
-            // head's file is this machine's file for now; a file that does
-            // not load gives no hint.
-            let target = Flock::load(&path)
-                .ok()
-                .and_then(|f| f.get(&name).and_then(|m| m.ssh.clone()));
+            // Only for the herdr hint below, read before the machine goes,
+            // from the head's file; a file that does not load gives no hint.
+            let target = if herdr {
+                head_flock(paths)
+                    .await
+                    .ok()
+                    .and_then(|f| f.get(&name).and_then(|m| m.ssh.clone()))
+            } else {
+                None
+            };
             if head.is_live() {
                 println!(
                     "{}",
@@ -2393,7 +2471,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
         FlockCmd::Default {
             cmd: FlockDefaultCmd::Show,
         } => {
-            println!("{}", Flock::load(&path)?.default_flock());
+            println!("{}", head_flock(paths).await?.default_flock());
             return Ok(());
         }
         FlockCmd::Default {
@@ -2416,7 +2494,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
 /// `flock list`: the flock file, the queued tasks, and with a head running
 /// the live agents on each flock's machines.
 async fn flock_list(paths: &Paths, wide: bool, json: bool, head: Head) -> anyhow::Result<()> {
-    let f = Flock::load(&paths.flock_file())?;
+    let f = head_flock(paths).await?;
     let live = if head.is_live() {
         let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
             unreachable!()
@@ -2444,6 +2522,59 @@ async fn flock_list(paths: &Paths, wide: bool, json: bool, head: Head) -> anyhow
         );
     }
     Ok(())
+}
+
+/// The head's copy of `file` when the head is on another machine, fetched
+/// with `FileGet`, with the path it has there; `None` with the head here,
+/// whose files are this machine's.
+async fn head_file(
+    paths: &Paths,
+    file: ConfigFile,
+) -> anyhow::Result<Option<(std::path::PathBuf, String)>> {
+    if pastor::ipc::remote_head().is_none() {
+        return Ok(None);
+    }
+    let IpcResponse::File(got) = ask(
+        paths,
+        IpcRequest::FileGet {
+            file: file.to_string(),
+        },
+    )
+    .await?
+    else {
+        unreachable!()
+    };
+    Ok(Some((got.path.into(), got.text)))
+}
+
+/// flock.toml as the head reads it: the remote head's, else this machine's.
+async fn head_flock(paths: &Paths) -> anyhow::Result<Flock> {
+    match head_file(paths, ConfigFile::Flock).await? {
+        Some((path, text)) => Flock::parse(&path, &text),
+        None => Flock::load(&paths.flock_file()),
+    }
+}
+
+/// pastor.toml as the head reads it: the remote head's, else this
+/// machine's.
+async fn head_config(paths: &Paths) -> anyhow::Result<PastorConfig> {
+    match head_file(paths, ConfigFile::Config).await? {
+        Some((path, text)) => PastorConfig::parse(&path, &text),
+        None => PastorConfig::load(&paths.config_file()),
+    }
+}
+
+/// `m` as this machine reaches it. The head's own machine (`local`) is,
+/// seen from a CLI with a remote head, the head's ssh destination.
+fn reach_from_here(m: &MachineConfig) -> MachineConfig {
+    let mut m = m.clone();
+    if m.local
+        && let Some(r) = pastor::ipc::remote_head()
+    {
+        m.local = false;
+        m.ssh = Some(r.ssh.clone());
+    }
+    m
 }
 
 /// The queued tasks, from the head when one runs, else from the store.
@@ -2554,23 +2685,34 @@ fn paused_attach_refusal(t: &Task) -> Option<String> {
 
 async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     let id = task_id(task);
-    let t = open_store(paths)?
-        .get_task(id)?
-        .unwrap_or_else(|| fail("task_not_found", task));
+    // A remote head's task, its flock.toml and its pastor.toml; the pane
+    // itself is reached from here.
+    let t = if pastor::ipc::remote_head().is_some() {
+        let IpcResponse::Task(t) = ask(paths, IpcRequest::TaskShow { id }).await? else {
+            unreachable!()
+        };
+        t
+    } else {
+        open_store(paths)?
+            .get_task(id)?
+            .unwrap_or_else(|| fail("task_not_found", task))
+    };
     let (Some(machine), Some(mut agent)) = (t.machine.clone(), t.agent_name.clone()) else {
         fail("no_agent", &format!("{} has no agent yet", t.display_id()))
     };
     if let Some(why) = paused_attach_refusal(&t) {
         fail(TASK_PAUSED, &why);
     }
-    let f = Flock::load(&paths.flock_file())?;
-    let m = f
-        .get(&machine)
-        .unwrap_or_else(|| fail("unknown_machine", &machine));
+    let f = head_flock(paths).await?;
+    let m = reach_from_here(
+        f.get(&machine)
+            .unwrap_or_else(|| fail("unknown_machine", &machine)),
+    );
+    let m = &m;
     // Its pane is gone: a Claude task's own session opens again in a new
     // pane, and the task stays as it is.
     if !t.state.occupies_pane() {
-        let agents = PastorConfig::load(&paths.config_file())?.agents;
+        let agents = head_config(paths).await?.agents;
         if let Some(why) = pastor::reopen::why_not(&t, &agents) {
             fail(
                 "no_agent",
@@ -2641,10 +2783,11 @@ fn authorized_key(flock: &std::path::Path, machine: &str, key: &str) -> anyhow::
 }
 
 async fn open(paths: &Paths, machine: &str) -> anyhow::Result<()> {
-    let f = Flock::load(&paths.flock_file())?;
-    let m = f
-        .get(machine)
-        .unwrap_or_else(|| fail("unknown_machine", machine));
+    let f = head_flock(paths).await?;
+    let m = reach_from_here(
+        f.get(machine)
+            .unwrap_or_else(|| fail("unknown_machine", machine)),
+    );
     let err = if let Some(target) = &m.ssh {
         std::process::Command::new("herdr")
             .args(["--remote", target, "--session", &m.session])
@@ -3022,8 +3165,21 @@ fn ask_reopen() -> bool {
     }
 }
 
-async fn config_edit(paths: &Paths, head: Head) -> anyhow::Result<()> {
-    edit_file(paths, ConfigFile::Config, head).await
+/// `config edit`: the head's pastor.toml. With `--local` and a head on
+/// another machine, this machine's, which its headless serve reads; with the
+/// head here the two are the same file.
+async fn config_edit(paths: &Paths, local: bool, head: Head) -> anyhow::Result<()> {
+    if !(local && pastor::ipc::remote_head().is_some()) {
+        return edit_file(paths, ConfigFile::Config, head).await;
+    }
+    let path = paths.config_file();
+    let check = ConfigFile::Config.checker(paths)?;
+    let editor = pastor::edit::editor();
+    match pastor::edit::edit_here(&path, &editor, &check, &mut |_| ask_reopen()).await? {
+        Outcome::Unchanged => println!("no changes to {}", path.display()),
+        Outcome::Saved => println!("saved {}; {}", path.display(), reload_here(paths).await?),
+    }
+    Ok(())
 }
 
 /// Tasks matching `filter`, from the head when one runs, else the store.
@@ -4439,13 +4595,49 @@ mod tests {
         )) {
             assert_eq!(route(&words), RemoteRoute::Head, "{words}");
         }
-        let local = between("Local on purpose, as with no head set:", "\n\n");
-        for words in spans(&local).into_iter().filter(|w| w != "flock.toml") {
+        for words in spans(&between("Local on purpose, as with no head set:", "\n\n")) {
             assert_eq!(route(&words), RemoteRoute::Here, "{words}");
         }
-        let refused = between("Every other command", "\n\n");
-        assert!(refused.contains("`machine open`"), "{refused}");
-        assert_eq!(route("machine open"), RemoteRoute::Unsupported);
+        let refused = between("Every other command runs on the head only.", "\n\n");
+        let refused = spans(&refused);
+        assert_eq!(refused[0], "machine authorized-key");
+        assert!(matches!(route(&refused[0]), RemoteRoute::Unsupported(_)));
+    }
+
+    /// A job whose file is here runs and is edited here, not by the remote
+    /// head, so the caller's guard here applies to it; the head's own jobs
+    /// are the head's to judge.
+    #[test]
+    fn a_local_job_is_not_the_remote_heads_to_judge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        std::fs::write(paths.jobs_dir().join("here.toml"), "").unwrap();
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        for verb in ["run", "edit", "enable", "disable"] {
+            let here = parse(&["pastor", "job", verb, "here"]);
+            assert!(!head_decides(&paths, &here, true), "{verb}");
+            let theirs = parse(&["pastor", "job", verb, "theirs"]);
+            assert!(head_decides(&paths, &theirs, true), "{verb}");
+            assert!(!head_decides(&paths, &theirs, false), "{verb}");
+        }
+        assert!(head_decides(
+            &paths,
+            &parse(&["pastor", "job", "list"]),
+            true
+        ));
+    }
+
+    /// Attach and open stay here with a remote head, but ask it for the
+    /// task and its files, so they are probed for `FILE_PROTOCOL`.
+    #[test]
+    fn attach_and_open_read_the_remote_heads_files() {
+        for words in ["task attach", "machine open"] {
+            let command = sample_command(words);
+            assert_eq!(remote_route(&command), RemoteRoute::Here, "{words}");
+            assert!(reads_head_files(&command), "{words}");
+        }
+        assert!(!reads_head_files(&sample_command("completions")));
     }
 
     /// A parsed command for `words`, with what its required arguments need.
@@ -4453,7 +4645,14 @@ mod tests {
         let extra: &[&str] = match words {
             "task run" | "task describe" | "task read" | "task attach" | "task retry"
             | "task close" | "task done" | "job run" | "machine open" => &["x"],
-            "task send" | "task priority" => &["x", "y"],
+            "flock add" | "flock remove" | "flock describe" | "machine remove"
+            | "machine describe" | "profile describe" => &["x"],
+            "machine add" => &["x", "--local"],
+            "machine authorized-key" => &["x", "--key", "-"],
+            "flock default" => &["show"],
+            "task send" | "task priority" | "machine move" | "trust add" | "trust remove" => {
+                &["x", "y"]
+            }
             "queue move" => &["x", "--top"],
             "task prune" => &["--older-than", "1d", "--done"],
             "completions" => &["bash"],

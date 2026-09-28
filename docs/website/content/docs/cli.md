@@ -111,7 +111,7 @@ and so on. This page lists them; `--help` after any command lists its flags.
 |---|---|
 | `pastor setup systemd` | install a systemd user unit for pastor, or herdr with `--herdr` |
 | `pastor setup launchd` | install a launchd user agent on macOS |
-| `pastor config edit` | open pastor.toml in your editor; saved only once valid |
+| `pastor config edit` | open pastor.toml in your editor; saved only once valid; the head's, or this machine's with `--local` |
 
 ## single commands
 
