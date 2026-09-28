@@ -405,6 +405,13 @@ pub trait Connector: Send + Sync {
     fn unpushed_commits(&self, _path: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// Put back a removed git worktree: `git worktree add <path> <branch>`
+    /// in the checkout at `repo`, so `task attach` can resume a session
+    /// Claude stored under that path. `Some(false)` when the branch is gone,
+    /// `None` when it cannot be known or git failed.
+    fn restore_worktree(&self, _repo: &str, _path: &str, _branch: &str) -> DirFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// The version of pastor installed on the machine, for `machine list`: a
     /// fleet runs whatever each machine last installed, and a skill or CLI
     /// that an agent there calls is that version's. `None` when there is no
@@ -434,6 +441,10 @@ impl Connector for Endpoint {
     fn unpushed_commits(&self, path: &str) -> DirFuture<'_> {
         let path = path.to_string();
         Box::pin(async move { unpushed_commits(self, &path).await })
+    }
+    fn restore_worktree(&self, repo: &str, path: &str, branch: &str) -> DirFuture<'_> {
+        let command = remote_restore_command(repo, path, branch);
+        Box::pin(async move { restore_worktree(self, command).await })
     }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
@@ -510,6 +521,68 @@ async fn unpushed_commits(ep: &Endpoint, path: &str) -> Result<Option<bool>, Con
     };
     let out = probe_output(&argv).await?;
     remote_unpushed_answer(&target, &out)
+}
+
+async fn restore_worktree(ep: &Endpoint, command: String) -> Result<Option<bool>, ConnectError> {
+    let (target, argv) = match ep {
+        Endpoint::Local { .. } => (
+            "local".to_string(),
+            vec!["sh".to_string(), "-c".into(), command],
+        ),
+        Endpoint::Ssh {
+            target,
+            control_path,
+            ..
+        } => {
+            ensure_control_dir(control_path.as_deref())?;
+            let argv = ssh_argv_running(target, control_path.as_deref(), command);
+            (target.clone(), argv)
+        }
+        Endpoint::Command { .. } => return Ok(None),
+    };
+    let out = probe_output(&argv).await?;
+    remote_restore_answer(&target, &out)
+}
+
+/// Re-adds the worktree at `path` on `branch` in `repo`, answering `added`,
+/// or `no-branch` when the branch no longer exists. `git worktree prune`
+/// first drops what git still remembers of a checkout deleted by hand.
+fn remote_restore_command(repo: &str, path: &str, branch: &str) -> String {
+    let (repo, path) = (shell_quote(repo), shell_quote(path));
+    let branch_ref = shell_quote(&format!("refs/heads/{branch}"));
+    let branch = shell_quote(branch);
+    format!(
+        "cd {repo} && git worktree prune && \
+         if git rev-parse --verify --quiet {branch_ref} >/dev/null; \
+         then git worktree add {path} {branch} >&2 && echo added; \
+         else echo no-branch; fi"
+    )
+}
+
+/// Reads the answer to `remote_restore_command`, the last line, as
+/// `remote_unpushed_answer` does.
+fn remote_restore_answer(
+    target: &str,
+    out: &std::process::Output,
+) -> Result<Option<bool>, ConnectError> {
+    if matches!(out.status.code(), Some(255) | None) {
+        return Err(ConnectError {
+            message: format!(
+                "ssh {target}: {} ({})",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                out.status
+            ),
+        });
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    match raw.trim_end().lines().last().unwrap_or("").trim() {
+        "added" if out.status.success() => Ok(Some(true)),
+        "no-branch" if out.status.success() => Ok(Some(false)),
+        _ => {
+            tracing::warn!(%target, status = %out.status, stdout = ?raw, stderr = %String::from_utf8_lossy(&out.stderr).trim(), "git did not re-create the worktree");
+            Ok(None)
+        }
+    }
 }
 
 /// Counts the commits of the checkout's HEAD that no remote-tracking branch
@@ -1111,6 +1184,41 @@ mod tests {
         assert_eq!(remote_dir_answer("t", &out(0, "")).unwrap(), None);
         assert_eq!(remote_dir_answer("t", &out(1, "")).unwrap(), None);
         assert!(remote_dir_answer("t", &out(255, "")).is_err());
+    }
+
+    #[test]
+    fn remote_restore_answer_reads_the_outcome() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"boom".to_vec(),
+        };
+        assert_eq!(
+            remote_restore_answer("t", &out(0, "welcome\nadded\n")).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            remote_restore_answer("t", &out(0, "no-branch\n")).unwrap(),
+            Some(false)
+        );
+        assert_eq!(remote_restore_answer("t", &out(128, "")).unwrap(), None);
+        assert!(remote_restore_answer("t", &out(255, "")).is_err());
+    }
+
+    /// Everything that reaches the remote shell is quoted.
+    #[test]
+    fn remote_restore_command_quotes_what_it_is_given() {
+        let c = remote_restore_command("/r/my repo", "/w/t 1", "pastor/t-1;rm");
+        assert!(
+            c.starts_with("cd '/r/my repo' && git worktree prune"),
+            "{c}"
+        );
+        assert!(c.contains("--quiet 'refs/heads/pastor/t-1;rm'"), "{c}");
+        assert!(
+            c.contains("git worktree add '/w/t 1' 'pastor/t-1;rm' >&2"),
+            "{c}"
+        );
     }
 
     #[test]

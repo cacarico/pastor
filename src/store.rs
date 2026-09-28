@@ -529,14 +529,15 @@ impl Store {
         let n = conn.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, state, retry_of, created_at, updated_at)
              SELECT job, item, prompt,
-                    json_patch(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
+                    json_patch(json_remove(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
                          THEN json_remove(spec, '$.checkout', '$.reopen')
                          WHEN state = 'failed' AND json_extract(spec, '$.checkout') IS NOT NULL
                          THEN json_set(json_remove(spec, '$.branch', '$.checkout'), '$.reopen',
                                        json_object('branch', json_extract(spec, '$.checkout.branch'),
                                                    'path', json_extract(spec, '$.checkout.path'),
                                                    'agent', COALESCE(agent_name, 't-' || id)))
-                         ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END, ?3),
+                         ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
+                         '$.session_id'), ?3),
                     flock, 'queued', id, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
@@ -1086,6 +1087,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         }
     }
 
@@ -1788,10 +1790,12 @@ mod tests {
             if owned {
                 t.agent_name = Some(Task::agent_name_for(t.id));
                 t.spec.checkout = Some(Box::new(checkout.clone()));
+                t.spec.session_id = Some("0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21".into());
                 s.update_task(&mut t).unwrap();
             }
             let r = s.insert_retry(t.id).unwrap();
             assert_eq!(r.spec.checkout, None, "a retry owns no checkout yet");
+            assert_eq!(r.spec.session_id, None, "nor a session");
             (t.id, r.spec.branch, r.spec.reopen)
         };
         let (id, branch, reopen) = task(true, true, TaskState::Failed);
