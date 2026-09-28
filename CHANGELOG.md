@@ -24,6 +24,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   goes to schema 12 (`preempt`, `paused_at`, `paused_for`, `resumed_at`) and
   the head's IPC protocol to 16; the CLI refuses `--preempt` to an older
   head (`head_too_old`).
+- Task summaries: `pastor task done --summary <text>` (or `--summary-file
+  <path|->`, through the bridge too) says how a task ended, its first line
+  the outcome: `done`, `partial`, `blocked` or `nothing to do`, up to 2,000
+  characters. Each round of a task keeps one, in a new `task_summaries`
+  table (schema 13, created on first open); a round that ends without one
+  keeps `no summary` and the pane's last lines. `task describe` shows it
+  (`--all-summaries` every round's), `task list --wide` adds RESULT,
+  `--json` has `summary`, the `task.done` and `task.failed` events carry
+  it, `pastor watch` prints `outcome=` on their TASK lines, and a
+  connector's `[finish]` stdin has `summary`. Needs a head speaking IPC
+  protocol 17.
 
 ### Fixed
 

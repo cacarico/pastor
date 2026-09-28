@@ -177,8 +177,9 @@ and paused (see [Pausing a low task](#pausing-a-low-task)).
 Finished ones (done, failed, stale, closed) appear with `--all`, and an empty
 default list says so on stderr. `--blocked` and `--done` narrow to just that
 state, `--job`, `--flock` and `--machine` narrow whichever set is shown, and
-`--json` prints the same selection. `--wide` adds each task's description
-(see Descriptions). FLOCK is the flock the task targets. `pastor task read t-1` fetches recent output from the
+`--json` prints the same selection. `--wide` adds RESULT, how each task's
+last round ended (see Task summaries), and each task's description (see
+Descriptions). FLOCK is the flock the task targets. `pastor task read t-1` fetches recent output from the
 task's pane over the machine channel. Text that came from an item or a pane is
 printed with its control characters escaped (`\x1b`, `\r`, ...), so none of
 it can move the cursor, retitle the terminal or set the clipboard: the NOTE
@@ -220,6 +221,53 @@ completion sequence check does not hold its close. Auto-close then closes its
 pane once the agent is idle and `close_done_after` has passed, which frees the
 machine's slot. `pastor task send` to such a task gives it more to do, and it
 runs again as any done task does. `task describe --json` prints `"ended": true`.
+
+### Task summaries
+
+An agent says how its work ended as it finishes:
+
+```bash
+pastor task done --summary "done: pushed pastor/t-4, PR #31"
+pastor task done --summary-file notes.md      # or - for stdin
+```
+
+The first line names the outcome: `done`, `partial`, `blocked` or `nothing
+to do`, in any case, alone or followed by something that is not a letter
+(`Partial - tests left`). A first line that names none is stored as
+`unknown`. A summary keeps its first 2,000 characters; a blank one is
+refused (`summary_empty`), and an unreadable file too
+(`summary_file_unreadable`). The summary goes through `pastor bridge` like
+the rest of `task done`, so an agent on a remote machine can send one.
+
+Each round of a task (from its prompt, or from the `task send` that
+reopened it, to `done` or `failed`) keeps one summary, numbered from 1. A
+round that ends with none, because pastor found the task done or failed on
+its own or the agent ran `task done` bare, stores `no summary` with the
+last lines pastor read from the pane (up to 2,000 characters, empty when it
+read none), marked `source: pane`. `task done --summary` on a task pastor
+already found done replaces that round's summary rather than starting
+another.
+
+Where it shows:
+
+- `pastor task describe t-4` prints a `summary:` line (outcome, round, who
+  wrote it, when) and the text below it; `--all-summaries` prints every
+  round's.
+- `pastor task list --wide` has a RESULT column, the outcome, `-` for a task
+  with none.
+- `--json` of `task list` and `task describe` carries `summary`
+  (`round`, `outcome`, `text`, `source`, `at`), absent when there is none;
+  `task describe --all-summaries --json` adds `summaries`, every round's.
+- The `task.done` and `task.failed` event records carry `summary` (see
+  Events), `pastor watch` prints `outcome=` on their TASK lines, and a
+  connector's `[finish]` command gets `summary` on stdin.
+
+A task shows its last round's summary only while it is done, failed or
+closed; a running one has none yet. `task done --summary` and
+`--all-summaries` need a head speaking protocol 17 or newer (`head_too_old`
+otherwise). Summaries are in the store's `task_summaries` table (schema 13),
+created when the new pastor first opens an older store; its tasks show
+none.
 
 `pastor task send t-3 "yes, go on"` types into the pane of a live task
 (starting, running, blocked, or done with its pane still open) and presses
@@ -1155,7 +1203,9 @@ A record, which is also what connector event hooks get on stdin:
            "prompt": "...", "spec": {"agent": "claude", "...": "..."},
            "machine": "pi-3", "state": "done", "error": null, "...": "..."},
   "job": "triage",
-  "machine": null
+  "machine": null,
+  "summary": {"round": 1, "outcome": "done", "text": "done: PR #31",
+              "source": "agent", "at": "2026-09-24T10:15:01.900Z"}
 }
 ```
 
@@ -1187,6 +1237,12 @@ A record, which is also what connector event hooks get on stdin:
   `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
   turn on a question, `question`; on `connector.finish_failed`, `connector`
   (its id) and `reason` (why: the exit status and stderr tail, or a timeout).
+- `summary`: on `task.done` and `task.failed`, how the round that just ended
+  ended (see Task summaries): `round`, `outcome` (`done`, `partial`,
+  `blocked`, `nothing to do`, `unknown`, or `no summary`), `text`, `source`
+  (`agent` or `pane`) and `at`. Absent on other events. A hook of a connector
+  that does not own the task's job gets it with an empty `text`, as it gets
+  no item or prompt.
 
 Fields may be added; none will be renamed or removed. Unreadable lines (a
 torn write, a hand edit) are skipped.
@@ -1212,7 +1268,8 @@ pastor watch --interval 2m --all --json --connector prs
 ```
 
 ```
-TASK t-12 failed pi-3 nightly: agent exited
+TASK t-12 failed pi-3 nightly outcome="no summary": agent exited
+TASK t-13 done pi-2 nightly outcome=partial
 TASK t-14 blocked pi-1 run
 JOB nightly failing: failed (2x): exit 1: gh: rate limited
 JOB nightly ok
@@ -1224,11 +1281,13 @@ CONNECTOR prs ok
 PR 31 reviewed, 2 open threads
 ```
 
-- `TASK <id> <state> <machine> <job>[: <error>]`, from the head's numbered
-  events: a task that reached `blocked`, `done`, `failed` or `stale`
-  (`--all`: every state change, `queued` and `running` too). `-` stands for
-  a machine or job it has none of. The error is only there for `failed` and
-  `stale`.
+- `TASK <id> <state> <machine> <job>[ outcome=<outcome>][: <error>]`, from
+  the head's numbered events: a task that reached `blocked`, `done`, `failed`
+  or `stale` (`--all`: every state change, `queued` and `running` too). `-`
+  stands for a machine or job it has none of. `outcome=` is on `done` and
+  `failed`, how the round ended (see Task summaries), quoted when it is more
+  than a word (`outcome="nothing to do"`). The error is only there for
+  `failed` and `stale`.
 - `JOB <name> failing: <last result>` when an enabled job's last run failed,
   again when that result changes (`failed (1x)` becomes `failed (2x)`), and
   `JOB <name> ok` when it runs fine after that, from `job list`. A job that is
@@ -1325,6 +1384,7 @@ pastor queue                         # the queue in the order it runs, and why e
 pastor queue move t-6 --before t-5   # take t-5's place, and its level
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
 pastor task done t-1                 # mark it done; its pane closes after close_done_after
+pastor task done --summary "done: PR #31"   # from its own pane: how it ended
 pastor task prune --done --closed --older-than 7d
 pastor task attach t-1               # lands in the agent's pane; ctrl+b q detaches
                                      # (a closed Claude task: its session, reopened)
@@ -1831,7 +1891,8 @@ Stdin is one JSON object on one line:
   "state": "done",
   "job": "support",
   "branch": "fix/issue-12",
-  "last_output": "...the last lines of the agent's pane..."
+  "last_output": "...the last lines of the agent's pane...",
+  "summary": {"round": 1, "outcome": "done", "text": "done: pushed fix/issue-12", "source": "agent", "at": "..."}
 }
 ```
 
@@ -1844,6 +1905,9 @@ Stdin is one JSON object on one line:
   when it judged the task done (pastor reads the pane then to see whether the
   agent ended on a question). It is `""` when pastor read none, as for a task
   that failed, and after a restart of the head.
+- `summary` is how the round ended (see Task summaries): what the agent said
+  with `task done --summary`, or `no summary` and the pane's last lines;
+  `null` when pastor has none.
 
 It runs once per task, the first time pastor sees it `done` or `failed`. A task
 that goes on to `closed`, or that is reopened and ends again, does not run it
@@ -2226,7 +2290,8 @@ a very wide table can still wrap. The width comes from the terminal itself,
 else `$COLUMNS`. Piped or saved to a file, nothing is cut. A newline in a
 description shows escaped, as `\n`. `task list` keeps its NOTE column as it
 was (the error, else the item's title, else the prompt's first line), since
-NOTE also carries errors and "retry of"; DESCRIPTION comes after it.
+NOTE also carries errors and "retry of"; RESULT (see Task summaries) and
+then DESCRIPTION come after it.
 
 Every `describe` prints a `description:` line near the top, `-` when there
 is none, whole and with its newlines. A task's also says where it came from:
@@ -2258,7 +2323,7 @@ pastor job describe <name>       schedule, connector and its config, dispatch, l
 pastor machine describe <name>   host, flock, session, model, profile, channel, herdr, protocol and pastor versions, agents, orphans, tags, its tasks, recent errors
 pastor flock describe <name>     default or not, its agent, agent args, allow and deny, model, profile, machines, live agents, queued and running tasks
 pastor connector describe <id>   manifest, origin, commands, config, secrets set or missing, jobs using it, status
-pastor task describe <id>        state, machine, agent and where it came from, prompt, error
+pastor task describe <id>        state, machine, agent and where it came from, prompt, error, summary (--all-summaries: every round's)
 pastor job edit <name>           ~/.config/pastor/jobs/<name>.toml
 pastor flock edit                ~/.config/pastor/flock.toml
 pastor config edit               ~/.config/pastor/pastor.toml
@@ -2313,7 +2378,7 @@ sends nothing. A head from before these requests is refused
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
-~/.local/state/pastor/pastor.db   tasks (schema 12, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role, description, preempt, paused_at, paused_for and resumed_at), seen keys, job state, trusted repos, the last event seq
+~/.local/state/pastor/pastor.db   tasks (schema 13, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role, description, preempt, paused_at, paused_for and resumed_at), task summaries, seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)

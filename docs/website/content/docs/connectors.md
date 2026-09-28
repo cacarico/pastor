@@ -61,6 +61,8 @@ A connector can ship event hooks: commands the head runs on events such as
 `task.done` or `task.blocked`, to comment somewhere or send a notification.
 A `[finish]` command, if it has one, runs once when a task of its jobs ends
 `done` or `failed`, to close the loop at the source: comment on the issue.
+It gets the task, its branch, the pane's last lines and the task's
+`summary` on stdin, so the comment can say how the work ended.
 
 ## secrets
 

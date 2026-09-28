@@ -77,7 +77,7 @@ pastor task run --priority critical --preempt "prod is down: find out why"
 
 ```sh
 pastor task list
-pastor task list --wide  # adds each task's description
+pastor task list --wide  # adds each task's RESULT and description
 pastor task describe t-1
 pastor events --follow
 ```
@@ -94,6 +94,25 @@ pastor task read t-1
 pastor task send t-1 "yes, push it"
 pastor task attach t-1  # ctrl+b q to leave
 ```
+
+## how it ended
+
+An agent says how its work went as it finishes. The first line of the
+summary is the outcome: `done`, `partial`, `blocked` or `nothing to do`.
+
+```sh
+pastor task done --summary "done: pushed pastor/t-4, PR #31"
+pastor task done --summary-file notes.md   # - reads stdin
+```
+
+Each round (the prompt, or a `task send` that reopened the task, up to
+`done` or `failed`) keeps one summary, up to 2,000 characters. A round that
+ends without one keeps `no summary` and the last lines of the pane instead.
+`pastor task describe` shows the last round's, `--all-summaries` every
+round's; `task list --wide` shows the outcome as RESULT, and `--json` has
+`summary`. The `task.done` and `task.failed` events carry it, `pastor watch`
+prints `outcome=` on their lines, and a connector's finish command gets it
+on stdin.
 
 ## end it
 
