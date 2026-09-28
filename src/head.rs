@@ -63,13 +63,10 @@ pub struct RemoteHead {
     /// ssh's `ControlPath` for this head, under the state dir. Built by
     /// `Paths::ssh_control_path`, which escapes a `%` in the state dir so ssh
     /// does not expand it as one of its own tokens, and shortened as the
-    /// machine transport's is (`fitting_control_path`): a socket name longer
+    /// machine transport's is (`ssh::fitting_control_path`): a socket name longer
     /// than `sun_path` (104 bytes on macOS) fails every request. `None` when
     /// even a bare `-%C` does not fit; ssh then runs without multiplexing.
     control_path: Option<PathBuf>,
-    /// The directory the control socket lives in, created private before ssh
-    /// runs.
-    control_dir: PathBuf,
 }
 
 pub fn client_file(paths: &Paths) -> PathBuf {
@@ -164,37 +161,22 @@ impl RemoteHead {
             ssh: ssh.to_string(),
             pastor: pastor.unwrap_or_else(|| DEFAULT_PASTOR.to_string()),
             source,
-            control_path: crate::herdr::transport::fitting_control_path(paths, "head"),
-            control_dir: paths.ssh_dir(),
+            control_path: crate::ssh::fitting_control_path(paths, "head"),
         }
     }
 
-    /// The ssh command line, after `ssh`. `--` keeps `self.ssh` from ever being
-    /// read as an option (a `PASTOR_HEAD` or `client.toml` value starting with
-    /// `-`), and the remote command is quoted for the login shell that parses
-    /// it, the same way the machine transport does.
+    /// The ssh command line, after `ssh`, built by `ssh::Ssh` as the machine
+    /// transport's is, with the remote command quoted for the login shell
+    /// that parses it.
     pub fn ssh_args(&self) -> Vec<String> {
-        let mut opts = vec!["BatchMode=yes".to_string()];
-        if let Some(path) = &self.control_path {
-            opts.push("ControlMaster=auto".to_string());
-            opts.push("ControlPersist=60s".to_string());
-            opts.push(format!("ControlPath={}", path.display()));
+        crate::ssh::Ssh {
+            target: &self.ssh,
+            control_path: self.control_path.as_deref(),
+            control_persist: "60s",
+            keepalive: false,
+            no_tty: false,
         }
-        let mut args = Vec::new();
-        for opt in opts {
-            args.push("-o".to_string());
-            args.push(opt);
-        }
-        if self.control_path.is_none() {
-            args.extend(crate::herdr::transport::no_multiplexing());
-        }
-        args.push("--".to_string());
-        args.push(self.ssh.clone());
-        args.push(crate::herdr::transport::posix_command(&format!(
-            "{} bridge",
-            self.pastor
-        )));
-        args
+        .args(&format!("{} bridge", self.pastor))
     }
 
     /// One request, one reply, over ssh to `pastor bridge` on the head.
@@ -206,8 +188,7 @@ impl RemoteHead {
         line: &str,
         timeout: Duration,
     ) -> Result<IpcResponse, RequestError> {
-        // ssh creates the ControlPath socket there, and the dir must be private.
-        crate::config::create_private_dir(&self.control_dir)
+        crate::ssh::ensure_control_dir(self.control_path.as_deref())
             .map_err(|e| RequestError::Unreachable(format!("{e:#}")))?;
         let mut child = tokio::process::Command::new("ssh")
             .args(self.ssh_args())
@@ -516,7 +497,7 @@ mod tests {
     /// cut until it does; deeper still, multiplexing goes too.
     #[test]
     fn a_control_path_too_long_for_a_socket_is_shortened_then_dropped() {
-        use crate::herdr::transport::UNIX_PATH_MAX;
+        use crate::ssh::UNIX_PATH_MAX;
         let tmp = tempfile::tempdir().unwrap();
         // `<state>/ssh/` is `base` bytes: `head-%C` (5 + 40) with the staging
         // suffix is over the limit, a shorter name is under it.

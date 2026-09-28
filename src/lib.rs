@@ -25,6 +25,7 @@ pub mod scheduler;
 pub mod serve_cli;
 pub mod setup;
 pub mod shepherd;
+pub mod ssh;
 pub mod store;
 pub mod task;
 pub mod task_cli;
