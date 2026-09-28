@@ -10,7 +10,7 @@ The user that runs `pastor serve` on the head is the fleet's trust boundary.
 Any process running as that user on the head controls every machine pastor
 drives: it can send any request to `pastor.sock` (queue tasks with any
 prompt and agent arguments, type into live tasks, edit the flock), rewrite
-`flock.toml`, the job files and the plugins, and reuse the ssh ControlMaster
+`flock.toml`, the job files and the connectors, and reuse the ssh ControlMaster
 sockets under the state directory to reach every ssh machine. The socket's
 0600 mode keeps other users out; it does not keep out other processes of the
 same user.
@@ -18,21 +18,23 @@ same user.
 That includes agents on a `local = true` machine, which run on the head as
 that user. Do not give a `local = true` machine untrusted work, such as jobs
 fed by issues or chat messages from outside your team; run herdr for that
-work as a separate user and add it as an ssh machine instead. Plugins also
+work as a separate user and add it as an ssh machine instead. Connectors also
 run as that user, so installing one grants it control of the fleet.
 
-## What plugins inherit
+## What connectors inherit
 
-A plugin command (connector or hook) runs on the head as the head's user and
-inherits the full environment of the pastor process that starts it, plus its
+A connector command (a connector's run or one of its hooks) runs on the head,
+or on the machine whose headless serve owns the job, as that machine's user.
+It inherits the full environment of the pastor process that starts it, plus its
 own `.env` and the `PASTOR_*` variables. It is not limited to its `.env`:
 `SSH_AUTH_SOCK`, API tokens and cloud credentials in that environment reach
-every plugin, and only the secrets its manifest declares are redacted from
-its run logs. It can read the head user's files, including other plugins'
+every connector, and only the secrets its manifest declares are redacted from
+its run logs. It can read the head user's files, including other connectors'
 `.env` files, and `PASTOR_STATE_DIR` points it at `pastor.sock` and the ssh
-ControlMaster sockets. Hooks that do not set `only_own = true` receive every
-task's item and prompt. Start `pastor serve` from a minimal environment, and
-review a plugin as you would any program you run with your own account.
+ControlMaster sockets. Hooks that do not set `only_own = true` hear every
+task's events, but get another connector's items, prompts and summaries
+blanked. Start `pastor serve` from a minimal environment, and
+review a connector as you would any program you run with your own account.
 
 Reports that need the head user's own access (writing its config, or running
 code as it) are in scope only where pastor makes that access easier to get
