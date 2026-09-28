@@ -117,6 +117,7 @@ fn answer(s: &Served, req: IpcRequest) -> IpcResponse {
         IpcRequest::Ping => IpcResponse::Pong {
             version: "test".into(),
             protocol: pastor::ipc::IPC_PROTOCOL,
+            role: None,
         },
         IpcRequest::EventsSince { after, limit, .. } => IpcResponse::Events(EventsPage {
             events: s
@@ -172,6 +173,7 @@ fn task(id: i64, state: TaskState) -> Task {
                 reopen: None,
                 agent_source: None,
                 place: Default::default(),
+                session_id: None,
             },
             flock: "default".into(),
         })

@@ -714,6 +714,7 @@ mod tests {
                     reopen: None,
                     agent_source: None,
                     place: Default::default(),
+                    session_id: None,
                 },
                 flock: "default".into(),
             })
