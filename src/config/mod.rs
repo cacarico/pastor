@@ -1568,7 +1568,7 @@ impl Default for PastorConfig {
             reconcile_every: "60s".into(),
             request_timeout: "60s".into(),
             agent_ready_timeout: "30s".into(),
-            close_done_after: "15m".into(),
+            close_done_after: "5s".into(),
             pull_lost_after: "10m".into(),
             agents_change_fleet: false,
             max_orchestrators: 1,
@@ -3576,13 +3576,10 @@ mod tests {
     }
 
     #[test]
-    fn close_done_after_defaults_to_fifteen_minutes_and_never_disables() {
+    fn close_done_after_defaults_to_five_seconds_and_never_disables() {
         let d = PastorConfig::default();
-        assert_eq!(d.close_done_after, "15m");
-        assert_eq!(
-            d.close_done_after_duration(),
-            Some(Duration::from_secs(15 * 60))
-        );
+        assert_eq!(d.close_done_after, "5s");
+        assert_eq!(d.close_done_after_duration(), Some(Duration::from_secs(5)));
         let c = PastorConfig {
             close_done_after: "never".into(),
             ..Default::default()

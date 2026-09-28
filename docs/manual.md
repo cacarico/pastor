@@ -202,7 +202,7 @@ saved under another label, it prints that entry's remove command rather than
 guessing.
 
 A task that reaches `done` is closed by pastor after `close_done_after`
-(`pastor.toml`, default `15m`; `never` disables it): the pane closes, a
+(`pastor.toml`, default `5s`; `never` disables it): the pane closes, a
 worktree pastor created is removed if it is clean, and the task shows as
 `closed`. Clean means no uncommitted changes and no commits that are on no
 remote (`git rev-list HEAD --not --remotes` is empty; a repo with no remote
@@ -3048,7 +3048,7 @@ settle = "10s"               # a finished agent stays idle this long before its 
 reconcile_every = "60s"
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
-close_done_after = "15m"     # a done task's pane closes after this; "never" keeps it
+close_done_after = "5s"      # a done task's pane closes after this; "never" keeps it
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
 max_orchestrators = 1        # orchestrator agents at once, outside max_agents
 # head_address = "user@head.example"  # unset by default; see below

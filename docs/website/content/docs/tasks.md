@@ -148,7 +148,7 @@ got.
 
 ## end it
 
-pastor closes a done task's pane after 15 minutes (`close_done_after`).
+pastor closes a done task's pane after 5 seconds (`close_done_after`).
 Failed, stale and blocked tasks stay until you act.
 
 ```sh
