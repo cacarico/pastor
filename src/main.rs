@@ -151,7 +151,7 @@ enum JobCmd {
         /// The job: its file name without .toml
         name: String,
     },
-    /// Fire a job now, ignoring its schedule, the overlap rule and `enabled`
+    /// Fire a job now, ignoring its schedule and `enabled`; it starts once a run already going has finished
     Run {
         /// The job: its file name without .toml
         name: String,
@@ -3289,6 +3289,68 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
         // The binary prints the copy it was built with; it is the same file.
         assert!(check_commands(SKILL).0 > 20);
+    }
+
+    /// The manual's remote head section lists which commands go to the head,
+    /// which stay here, and names the ones refused; each list must be what
+    /// `remote_route` does.
+    #[test]
+    fn manual_remote_head_lists_match_remote_route() {
+        let path = skills_dir().parent().unwrap().join("docs/manual.md");
+        let text = std::fs::read_to_string(path).unwrap();
+        let between = |start: &str, end: &str| {
+            let from = text.find(start).unwrap_or_else(|| panic!("no {start:?}"));
+            let rest = &text[from + start.len()..];
+            rest[..rest.find(end).unwrap_or_else(|| panic!("no {end:?}"))].to_string()
+        };
+        let spans = |part: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            for span in part.split('`').skip(1).step_by(2) {
+                // `task run|list|read` is three commands.
+                let (group, alts) = span.rsplit_once(' ').unwrap_or(("", span));
+                for alt in alts.split('|') {
+                    out.push(format!("{group} {alt}").trim().to_string());
+                }
+            }
+            out
+        };
+        let route = |words: &str| remote_route(&sample_command(words));
+        for words in spans(&between(
+            "These commands go to a remote head:",
+            ". `machine list`'s",
+        )) {
+            assert_eq!(route(&words), RemoteRoute::Head, "{words}");
+        }
+        let local = between("Local on purpose, as with no head set:", "\n\n");
+        for words in spans(&local).into_iter().filter(|w| w != "flock.toml") {
+            assert_eq!(route(&words), RemoteRoute::Here, "{words}");
+        }
+        let refused = between("Every other command", "\n\n");
+        assert!(refused.contains("`machine open`"), "{refused}");
+        assert_eq!(route("machine open"), RemoteRoute::Unsupported);
+    }
+
+    /// A parsed command for `words`, with what its required arguments need.
+    fn sample_command(words: &str) -> Command {
+        let extra: &[&str] = match words {
+            "task run" | "task describe" | "task read" | "task attach" | "task retry"
+            | "task close" | "task done" | "job run" | "machine open" => &["x"],
+            "task send" | "task priority" => &["x", "y"],
+            "task prune" => &["--older-than", "1d", "--done"],
+            "completions" => &["bash"],
+            "setup" => &["systemd"],
+            "head" => &["show"],
+            "connector" => &["list"],
+            _ => &[],
+        };
+        let argv = std::iter::once("pastor")
+            .chain(words.split_whitespace())
+            .chain(extra.iter().copied())
+            .collect::<Vec<_>>();
+        Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+            .command
+            .unwrap()
     }
 
     /// Each skill is loaded by its frontmatter alone until it triggers, so a

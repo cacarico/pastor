@@ -1260,7 +1260,7 @@ impl Scheduler {
         self.warn_long_queued(now);
     }
 
-    /// `pastor job run`: now, regardless of schedule, overlap and `enabled`.
+    /// `pastor job run`: now, regardless of schedule and `enabled`.
     /// A fire while a run is going queues behind it (see `Turn`), so the
     /// second run starts from the state the first one saved.
     pub fn fire(&mut self, name: &str, now: DateTime<Utc>) -> Result<String, String> {
