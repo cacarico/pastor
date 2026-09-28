@@ -42,15 +42,25 @@ function play(term) {
   let run = 0; // bumped by replay: an older loop sees it and stops
 
   // Waits `ms` of playing time: the clock stops while paused, scrolled away
-  // or in a hidden tab.
+  // or in a hidden tab. A stopped wait parks in `parked` with no timer
+  // running, and `wake` restarts it when playing resumes.
+  const active = () => !paused && seen && !document.hidden;
+  let parked = [];
+  const wake = () => {
+    if (!active()) return;
+    const ready = parked;
+    parked = [];
+    for (const go of ready) go();
+  };
   const wait = (ms, mine) => new Promise((done) => {
     let left = ms;
     const tick = () => {
       if (mine !== run) return done(false);
       if (left <= 0) return done(true);
+      if (!active()) return parked.push(tick);
       const step = Math.min(left, 50);
       setTimeout(() => {
-        if (!paused && seen && !document.hidden) left -= step;
+        if (active()) left -= step;
         tick();
       }, step);
     };
@@ -107,13 +117,20 @@ function play(term) {
   pauseBtn?.addEventListener('click', () => {
     paused = !paused;
     pauseBtn.textContent = paused ? 'play' : 'pause';
+    wake();
   });
   replayBtn?.addEventListener('click', () => {
     paused = false;
     if (pauseBtn) pauseBtn.textContent = 'pause';
-    loop(++run);
+    run++;
+    wake(); // the old loop's parked wait sees the new run and ends
+    loop(run);
   });
 
-  new IntersectionObserver(([entry]) => { seen = entry.isIntersecting; }).observe(term);
+  new IntersectionObserver(([entry]) => {
+    seen = entry.isIntersecting;
+    wake();
+  }).observe(term);
+  document.addEventListener('visibilitychange', wake);
   loop(run);
 }

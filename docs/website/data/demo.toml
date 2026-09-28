@@ -88,7 +88,7 @@ cmd = '''
 pastor task send t-13 "label them as bugs"'''
 
 [[act.step]]
-out = "sent text to t-13"
+out = "sent text and 1 key to t-13"
 
 [[act.step]]
 cmd = '''
