@@ -266,11 +266,11 @@ pastor machine list
 ```
 
 ```text
-pastor 0.5.0 on desk (herdr 0.9.1), 2 machines, desk is the head of the flock
+pastor 0.8.0 on desk (herdr 0.9.1), 2 machines, desk is the head of the flock
 
 NAME      HOST           FLOCKS    PROFILE  CHANNEL    HERDR  PASTOR  AGENTS     ORPHANS  TAGS  ERROR
-desk      local          personal  -        connected  0.9.1  0.5.0   1/2+1j+1b  -        -
-server-1  user@server-1  personal  -        connected  0.9.1  0.5.0   2/3+1j+1b  -        -
+desk      local          personal  -        connected  0.9.1  0.8.0   1/2+1j+1b  -        -
+server-1  user@server-1  personal  -        connected  0.9.1  0.8.0   2/3+1j+1b  -        -
 ```
 
 AGENTS is the load: live tasks against the room each machine has. To run the

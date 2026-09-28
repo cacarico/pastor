@@ -19,8 +19,12 @@ text and the machine is the agent's own permission checks.
 
 ## permission prompts
 
-pastor leaves the agent's permission mode alone. When the agent asks before
-a tool, the task goes `blocked` until you answer. `allow` and `deny` lists
+Without a permission profile, pastor leaves the agent's permission mode
+alone: when the agent asks before a tool, the task goes `blocked` until you
+answer. Under a profile (`--profile`, or `profile` on a job, flock, machine
+or `[defaults]`), a Claude agent starts with `--permission-mode dontAsk` and
+the profile's lists, so it never asks; agent args that set a permission mode
+of their own are refused with `profile_args_conflict`. `allow` and `deny` lists
 answer some of those questions in advance, and deny always wins.
 
 ```toml

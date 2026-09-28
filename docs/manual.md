@@ -1765,8 +1765,9 @@ determined script. `agents_change_fleet = true` lifts it for scripts too.
 
 **The limit.** `max_orchestrators` in pastor.toml (default 1) is how many
 orchestrator agents the head runs at once, of both kinds and hand-started
-ones (`task run --role orchestrator`) too, outside `max_agents` and job
-slots. A run that starts no agent counts nothing; a session counts from its
+ones (`task run --role orchestrator`) too, a limit on top of `max_agents`:
+each orchestrator agent also takes a slot on its machine like any other task,
+but never a job slot. A run that starts no agent counts nothing; a session counts from its
 start to its stop, between agents too.
 
 **The handover note.** `pastor orchestrator note <text>` keeps one short
@@ -2217,9 +2218,9 @@ names must look like environment variables (`[A-Z_][A-Z0-9_]*`).
 
 `authors`, `homepage`, `repository` and `license` are for people reading
 `connector describe`; pastor shows them and checks nothing about them. They
-are new in the release after 0.5.0. pastor 0.5.0 reads a manifest strictly and
+are new in 0.6.0. pastor 0.5.0 reads a manifest strictly and
 rejects these fields as unknown keys, naming the key; that can't be changed in
-a release already out. From this release on, pastor checks
+a release already out. From 0.6.0 on, pastor checks
 `min_pastor_version` before the strict read, so a connector that adds fields a
 future pastor introduces, and raises its `min_pastor_version` to match, gets
 "needs pastor X or later" on an older one instead of an unknown key.
@@ -2555,7 +2556,7 @@ With a head set, each request goes through
 
 ```
 ssh -o BatchMode=yes -o ControlMaster=auto -o ControlPersist=60s \
-    -o ControlPath=<state dir>/ssh-%C <dest> <pastor> bridge
+    -o ControlPath=<state dir>/ssh/head-%C -- <dest> <pastor> bridge
 ```
 
 one request line in, one reply line back (see [The bridge](#the-bridge)).
@@ -2574,8 +2575,8 @@ It needs:
 it never falls back to this machine's files.
 
 These commands go to a remote head: `task run|list|describe|read|retry|priority|close|prune|send|done`,
-`queue` and `queue move`, `machine list|add|remove|move|describe`, `flock list|add|remove|describe|default|edit`,
-`trust list|add|remove`, `profile list|describe`, `config edit`, `tick`, `job reload`, `events`, and job commands for
+`queue` and `queue move`, `machine list|add|remove|move|describe`, `flock list|add|join|leave|remove|describe|default|edit`,
+`trust list|add|remove`, `profile list|describe`, `config edit`, `tick`, `job reload`, `events`, `watch`, `orchestrator`, and job commands for
 the head's jobs (see [Jobs on a shepherd](#jobs-on-a-shepherd)). `machine list`'s first line
 names the head by its ssh destination and shows its herdr as `-`. `task run`
 fills what its flags leave out from the built-in defaults, not from the
@@ -2598,7 +2599,7 @@ reading this machine's, so they need the head up and at IPC protocol 6 or
 later. The head's own machine, the local one in its
 flock.toml, is reached at the head's ssh destination.
 
-Every other command runs on the head only. `machine authorized-key` prints a
+Only one command is refused with a remote head: `machine authorized-key` prints a
 line naming the head's pastor for the head's own `authorized_keys`, so with a
 remote head it fails with `remote_head_unsupported`, naming the head to run it
 on.
@@ -2606,9 +2607,10 @@ on.
 ### A headless serve
 
 With a head set, `pastor serve` runs headless, as this machine's shepherd:
-it runs the jobs in this machine's `jobs/` and this machine's connector
-hooks, and nothing else. It has no queue, no machine actors and no task
-store, and never reads `flock.toml`.
+it runs the jobs in this machine's `jobs/`, this machine's connector hooks
+and, when the head's flock.toml has this machine as `pull = true`, the tasks
+the head hands it, on this machine's herdr. It has no queue and never reads
+`flock.toml`.
 
 - The new items a job run finds (not seen here, within `max_tasks_per_run`)
   go to the head together, in one `job_submit` request with the job's
@@ -2637,7 +2639,8 @@ store, and never reads `flock.toml`.
   lost to the hooks: it logs a `head_events_gap` warning and goes on from
   the oldest record the head still has.
 - Its database is `shepherd.db` in the state dir: the jobs' state and seen
-  keys, and the event cursor. `pastor.db` is left alone.
+  keys, the event cursor, and the rows of the tasks it runs. `pastor.db` is
+  left alone.
 - On `pastor.sock` it answers `ping` (with `role: "shepherd"`), `tick` and
   `job list|run|reload` for its own jobs; anything else is
   `shepherd_unsupported`. The CLI's `job` commands ask it for this machine's
@@ -2698,12 +2701,12 @@ The head must answer for all of these, since `job list` shows its side too.
 
 An agent on another machine reaches the head the same way, but with a key
 that can do no more than an agent should: ping, list the tasks of its
-machine's flock, and `describe`, read or end (`task done`) the tasks placed on
+machine's flocks, and `describe`, read or end (`task done`) the tasks placed on
 its machine. `pastor bridge --agent --machine <name>` is that locked bridge.
 It reads each request and passes on only those; anything else, a task on
 another machine included, it answers `not_allowed_for_agent` without asking
-the head. It learns a task's machine and a machine's flock from the head,
-never from local files, cuts a task list down to the flock, and names the
+the head. It learns a task's machine and a machine's flocks from the head,
+never from local files, cuts a task list down to those flocks, and names the
 task a request comes from itself, whatever the caller said.
 
 To set it up for machine `pi-1`:
@@ -2832,7 +2835,7 @@ So:
   `job disable` from a task's pane are refused. Like the rest of the guard, a role is a guard
   against an agent's mistakes, not a boundary: an orchestrator runs as the
   same user as pastor and can do anything that user can. `--role
-  orchestrator` needs a head of IPC protocol 10 (`head_too_old`).
+  orchestrator` needs a head of IPC protocol 12 (`head_too_old`).
 
 The head's user is the fleet's trust boundary. Anything that runs as that
 user on the head controls every machine in the flock file, because it can:
@@ -2842,7 +2845,8 @@ user on the head controls every machine in the flock file, because it can:
   task with `task send`, run a job, or edit the flock. The socket is 0600, so
   it keeps other users out, not other processes of the same user;
 - write `flock.toml`, where a `command = [...]` machine is any argv, and the
-  job files and the plugins directory;
+  job files and the connectors (`~/.config/pastor/connectors/`,
+  `~/.local/share/pastor/connectors/`);
 - use the ssh ControlMaster sockets under `~/.local/state/pastor/ssh/`, which
   reach every ssh machine without authenticating again.
 
@@ -2943,9 +2947,9 @@ task's is always a string, the one it resolved to, with `description_from`
 beside it. `--wide` with `--json` changes nothing.
 
 `task run --description`, `flock add --description` and `machine add
---description` need a head from this release or later; an older one would
+--description` need a head of 0.7.0 or later; an older one would
 drop the line, so the CLI refuses it (`head_too_old`). The tasks table gains
-a `description` column (schema 9), added in place when the new pastor first
+a `description` column (schema 11), added in place when the new pastor first
 opens the store.
 
 ## Describe and edit
@@ -3051,7 +3055,7 @@ request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "5s"      # a done task's pane closes after this; "never" keeps it
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
-max_orchestrators = 1        # orchestrator agents at once, outside max_agents
+max_orchestrators = 1        # orchestrator agents at once; each also takes a max_agents slot
 # head_address = "user@head.example"  # unset by default; see below
 [defaults]                   # for run flags, job keys and flock keys that are left out
 agent = "claude"
@@ -3172,12 +3176,12 @@ linked like the one above, it is `/spec`.
 The Makefile is the list of things you can run here; `make help` prints it.
 
 ```bash
-make check            # fmt check, clippy with warnings as errors, full test suite
+make check            # changelog entry check, fmt check, clippy with warnings as errors, full test suite
 make test             # unit tests plus an end-to-end run against fake-herdr
 make test-machine     # the machine actor tests five times, to catch timing flakes
 make smoke SESSION=s  # opt-in test against a real herdr running session s on this host
 make smoke-profiles REPO='~/src/app' CLAUDE=pi-1 OPENCODE=pi-2  # a live review task per agent through the head
-make build            # debug build of both binaries; cargo run -- --help works from there
+make build            # debug build of both binaries; cargo run --bin pastor -- --help works from there
 ```
 
 `make check` is what a pull request has to pass. Nothing in the suite talks to

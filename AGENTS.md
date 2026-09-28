@@ -185,9 +185,9 @@ Still open as of the last review; none of them blocks normal use.
   spec's `orchestrator/<name>-<n>`.
 - With a remote head (`pastor head set`), `task run` fills what its flags
   leave out from the built-in defaults, not the head's `[defaults]` timeout
-  and place, and most commands that read or edit files (machine and flock
-  edits, job edits, `events`, `trust`, describes) fail with
-  `remote_head_unsupported` until they move behind the head.
+  and place. Every other command that reads the fleet goes to the head
+  (`remote_route` in `main.rs`); only `machine authorized-key` fails with
+  `remote_head_unsupported`.
 
 ## Where things live
 

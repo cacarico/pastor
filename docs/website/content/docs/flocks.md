@@ -74,8 +74,11 @@ A flock carries every per-task setting `[defaults]` has: `agent`,
 `agent_args`, `agents`, `model`, `profile`, `priority`, `allow`, `deny`,
 `timeout`, `place`, `label` and `summary`. A task gets its own flock's. For
 everything but the agent the flock comes before the machine: a task takes
-each from its own flags or job, then its flock, then the machine, then
-`[defaults]`. So on a machine shared by several projects, each project's flock
+`model`, `profile` and `priority` from its own flags or job, then its flock,
+then the machine, then `[defaults]`. `timeout`, `place`, `label` and
+`summary` have no machine layer. `allow` and `deny` add up instead:
+`[defaults]`, then the flock, then the task, and a pattern in any `deny` is
+dropped from every `allow`. So on a machine shared by several projects, each project's flock
 sets its model, permissions, priority and timeout. A machine's own `profile`
 still decides whether a task may ask for `unrestricted` there.
 
