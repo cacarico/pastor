@@ -51,13 +51,31 @@ machine's files.
 
 ## what goes to it
 
-The `task` commands, `machine list`, `tick`, `job list`, `job run` and
-`job reload` go to the remote head. `completions`, `setup`, `head`, `bridge`,
-`connector` and `task attach` stay local: connectors are this machine's, and
-attach goes to the machine directly. Every other command would read this
-machine's files, so it fails with `remote_head_unsupported`; run it on the
-head.
-`pastor serve` refuses to start while a remote head is set.
+The `task` commands, `queue`, `events`, `tick`, `job reload` and the head's
+jobs go to the remote head, and so do the `flock` commands, `machine
+list|add|remove|move|describe`, `trust`, `profile` and `config edit`. They
+print what they would print on the head itself. `flock edit` and `config
+edit` open the head's file here and send it back to be checked and saved.
+
+`completions`, `setup`, `head`, `bridge` and `connector` stay local:
+connectors are this machine's. `task attach` and `machine open` go to the
+machine directly, but ask the head for the task and its flock.toml. `config
+edit --local` edits this machine's pastor.toml, which its headless serve
+reads. `machine authorized-key` runs on the head only; here it fails with
+`remote_head_unsupported`, naming the head.
+
+With a head set, `pastor serve` runs headless: it runs this machine's own jobs
+and hooks for the head.
+
+## move the head
+
+To move the head from `laptop` to `pi-1`: stop it on `laptop`; copy
+`flock.toml`, `pastor.toml`, `jobs/` and `pastor.db` to `pi-1`; there, make
+`pi-1` `local = true` and `laptop` `pull = true` in flock.toml and set
+`head_address`; run `pastor setup systemd` on `pi-1`, then `pastor head set
+user@head.example` and `pastor setup systemd` on `laptop`; give the other
+machines their locked keys. The steps in full are in the
+[manual](../manual/#moving-the-head).
 
 ## agents on other machines
 
