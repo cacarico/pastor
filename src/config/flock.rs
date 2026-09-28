@@ -784,7 +784,10 @@ impl FlockDoc {
     }
 
     /// `machine move`: put `name` in `flock`, by name, so it stays there
-    /// whichever flock is the default later.
+    /// whichever flock is the default later. A no-op when `flock`'s
+    /// `machines` table already lists `name`: it is already a member there,
+    /// and writing the `flock` key too would place it in the same flock
+    /// twice, which `validate` refuses.
     pub fn move_machine(&mut self, name: &str, flock: &str) -> Result<(), EditError> {
         let f = self.current()?;
         if f.get(name).is_none() {
@@ -792,6 +795,11 @@ impl FlockDoc {
         }
         if !f.has_flock(flock) {
             return Err(EditError::UnknownFlock(flock.into()));
+        }
+        if f.entry(flock)
+            .is_some_and(|e| e.machines.contains_key(name))
+        {
+            return Ok(());
         }
         let t = self.machine_mut(name).expect("checked above");
         t.insert("flock", toml_edit::value(flock));
@@ -1502,6 +1510,20 @@ ssh = "user@spare"
         m.flock = Some("work".into());
         d.add_machine(&m).unwrap();
         assert_eq!(d.flock().unwrap().machine_flock("pi-5"), Some("work"));
+    }
+
+    /// Moving a machine into a flock whose `machines` table already lists it
+    /// is a no-op: writing the `flock` key too would place it in the same
+    /// flock twice, by both means, which `validate` refuses.
+    #[test]
+    fn moving_a_machine_into_a_flock_that_already_lists_it_is_a_no_op() {
+        let text = format!(
+            "{COMMENTED}\n[[flock]]\nname = \"default\"\ndefault = true\n\n[[flock]]\nname = \"work\"\nmachines = {{ pi-3 = 2 }}\n"
+        );
+        let mut d = FlockDoc::parse(&text).unwrap();
+        d.move_machine("pi-3", "work").unwrap();
+        assert_eq!(d.to_string(), text);
+        assert_eq!(d.flock().unwrap().machine_flock("pi-3"), Some("work"));
     }
 
     /// Changing the default changes where new work goes, not where the

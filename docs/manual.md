@@ -525,7 +525,9 @@ tasks keep somewhere to run, and the output names the tasks. `flock add` says
 which flock those machines are in afterwards. `flock default set` writes the old
 default flock onto every machine that named none, so changing where new work goes moves no machine.
 `machine move` sets the machine's `flock` key and leaves the flocks' `machines`
-tables alone, so a machine they list stays in those flocks too.
+tables alone, so a machine they list stays in those flocks too; moving it into
+a flock whose `machines` table already lists it is a no-op, since it is
+already a member there and the `flock` key would only duplicate it.
 AGENTS in `flock list` counts the flock's own live tasks on its machines; it
 needs a running head and is `-` without one.
 
