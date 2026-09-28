@@ -172,6 +172,7 @@ mod tests {
     fn closed(agent: &str, session: Option<&str>) -> Task {
         let now = Utc::now();
         Task {
+            description: None,
             id: 4,
             job: "run".into(),
             item: serde_json::Value::Null,

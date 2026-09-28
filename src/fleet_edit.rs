@@ -15,6 +15,7 @@ pub fn add_flock(
     file: &Path,
     name: &str,
     default: bool,
+    description: Option<&str>,
     queued: impl FnOnce() -> anyhow::Result<Vec<String>>,
 ) -> anyhow::Result<String> {
     let mut doc = FlockDoc::open(file)?;
@@ -24,6 +25,9 @@ pub fn add_flock(
         Vec::new()
     };
     let added = doc.add_flock(name, default, &queued)?;
+    if let Some(text) = crate::config::clean_description(description) {
+        doc.describe_flock(name, &text)?;
+    }
     doc.save(file)?;
     let mut done = if default {
         format!("added flock {name}, now the default")

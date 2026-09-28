@@ -719,6 +719,7 @@ mod tests {
                     session_id: None,
                 },
                 flock: "default".into(),
+                description: None,
             })
             .unwrap();
         t.id = id;
@@ -761,6 +762,7 @@ mod tests {
             next_due: None,
             running: false,
             flock: None,
+            description: None,
         }
     }
 

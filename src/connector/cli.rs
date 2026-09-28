@@ -48,6 +48,9 @@ pub enum ConnectorCmd {
     },
     /// List connectors: version, connector, hooks, missing secrets
     List {
+        /// Add a DESCRIPTION column, cut to the terminal's width
+        #[arg(short, long)]
+        wide: bool,
         /// Print as a JSON array
         #[arg(long)]
         json: bool,
@@ -139,12 +142,12 @@ pub async fn run(paths: &Paths, cmd: ConnectorCmd, head: Head) -> anyhow::Result
             reload_daemon(paths, head).await;
             Ok(())
         }
-        ConnectorCmd::List { json } => {
+        ConnectorCmd::List { wide, json } => {
             let rows = list_rows(paths)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
-                println!("{}", table(&rows));
+                println!("{}", table(&rows, wide));
             }
             Ok(())
         }
@@ -461,6 +464,8 @@ pub struct ConnectorRow {
     pub missing_secrets: Vec<String>,
     /// Why the connector is unusable: a bad manifest, or an unreadable `.env`.
     pub error: Option<String>,
+    /// The manifest's `description`; `None` when it has none or does not load.
+    pub description: Option<String>,
 }
 
 pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<ConnectorRow>> {
@@ -481,6 +486,9 @@ pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<ConnectorRow>> {
                     dir: p.dir.clone(),
                     missing_secrets,
                     error,
+                    description: crate::config::clean_description(
+                        p.manifest.description.as_deref(),
+                    ),
                 }
             }
             Discovered::Invalid {
@@ -497,12 +505,13 @@ pub fn list_rows(paths: &Paths) -> anyhow::Result<Vec<ConnectorRow>> {
                 dir,
                 missing_secrets: Vec::new(),
                 error: Some(error),
+                description: None,
             },
         })
         .collect())
 }
 
-pub fn table(rows: &[ConnectorRow]) -> String {
+pub fn table(rows: &[ConnectorRow], wide: bool) -> String {
     let dash = || "-".to_string();
     let body: Vec<Vec<String>> = rows
         .iter()
@@ -522,9 +531,12 @@ pub fn table(rows: &[ConnectorRow]) -> String {
             ]
         })
         .collect();
-    crate::cli::table(
+    let descriptions: Vec<Option<String>> = rows.iter().map(|r| r.description.clone()).collect();
+    crate::cli::list_table(
         &["ID", "VERSION", "CONNECTOR", "HOOKS", "SOURCE", "STATUS"],
         &body,
+        wide,
+        &descriptions,
     )
 }
 

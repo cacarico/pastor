@@ -143,6 +143,9 @@ struct TickArgs {
 enum JobCmd {
     /// Every job file: schedule, enabled, last run, next run, last result. With a head elsewhere, the head's jobs, then this machine's
     List {
+        /// Add a DESCRIPTION column, cut to the terminal's width
+        #[arg(short, long)]
+        wide: bool,
         /// Print as a JSON array; with a head elsewhere, each job says `where` it lives (head or shepherd)
         #[arg(long)]
         json: bool,
@@ -252,6 +255,10 @@ struct RunArgs {
     /// disable jobs). Only a person may start an orchestrator, never a task
     #[arg(long, value_enum, value_name = "ROLE", default_value_t = TaskRole::Agent)]
     role: TaskRole,
+    /// One line on what the task is about, for `task list --wide` and
+    /// `describe` (default: the prompt's first line)
+    #[arg(long, value_name = "TEXT")]
+    description: Option<String>,
     /// Print as a JSON object
     #[arg(long)]
     json: bool,
@@ -277,6 +284,9 @@ struct ListArgs {
     /// Every task, finished ones too (done, failed, stale, closed)
     #[arg(long, group = "list_filter")]
     all: bool,
+    /// Add a DESCRIPTION column, cut to the terminal's width
+    #[arg(short, long)]
+    wide: bool,
     /// Print as a JSON array of full task records
     #[arg(long)]
     json: bool,
@@ -359,6 +369,9 @@ enum MachineCmd {
         /// The flock it joins (default: the default flock)
         #[arg(long)]
         flock: Option<String>,
+        /// One line on what the machine is for, for `machine list --wide`
+        #[arg(long, value_name = "TEXT")]
+        description: Option<String>,
         /// Also save it in herdr's sidebar (runs `herdr machine add`)
         #[arg(long, conflicts_with_all = ["local", "command"])]
         herdr: bool,
@@ -383,6 +396,9 @@ enum MachineCmd {
         /// Only the machines of this flock
         #[arg(long)]
         flock: Option<String>,
+        /// Add a DESCRIPTION column, cut to the terminal's width
+        #[arg(short, long)]
+        wide: bool,
         /// Print as a JSON object, {head, machines}: the head's row, then the machines
         #[arg(long)]
         json: bool,
@@ -425,6 +441,9 @@ enum FlockDefaultCmd {
 enum FlockCmd {
     /// Every flock: default or not, its machines, live agents, queued tasks
     List {
+        /// Add a DESCRIPTION column, cut to the terminal's width
+        #[arg(short, long)]
+        wide: bool,
         /// Print as a JSON array
         #[arg(long)]
         json: bool,
@@ -436,6 +455,9 @@ enum FlockCmd {
         /// Make it the default flock too
         #[arg(long)]
         default: bool,
+        /// One line on what the flock is for, for `flock list --wide`
+        #[arg(long, value_name = "TEXT")]
+        description: Option<String>,
     },
     /// Remove a flock; refused while it has machines or queued tasks, or is the default
     Remove {
@@ -1069,6 +1091,24 @@ fn needs_priority_protocol(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` sends a description only a head of
+/// `DESCRIPTION_PROTOCOL` or later keeps: `task run`, `flock add` or
+/// `machine add` with `--description`.
+fn needs_description_protocol(command: &Command) -> bool {
+    match command {
+        Command::Task {
+            cmd: TaskCmd::Run(a),
+        } => a.description.is_some(),
+        Command::Flock {
+            cmd: FlockCmd::Add { description, .. },
+        }
+        | Command::Machine {
+            cmd: MachineCmd::Add { description, .. },
+        } => description.is_some(),
+        _ => false,
+    }
+}
+
 /// Whether `command` sends a request only a head of `PLACE_PROTOCOL` or later
 /// honours: `task retry --place`.
 fn needs_place_protocol(command: &Command) -> bool {
@@ -1115,7 +1155,12 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_agent_protocol(command) {
+    if needs_description_protocol(command) {
+        Some((
+            pastor::ipc::DESCRIPTION_PROTOCOL,
+            "predates descriptions and would drop --description",
+        ))
+    } else if needs_agent_protocol(command) {
         Some((
             pastor::ipc::PROFILE_PROTOCOL,
             if needs_place_protocol(command) {
@@ -1241,6 +1286,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
             flock: a.flock,
             priority,
             role: a.role,
+            description: pastor::config::clean_description(a.description.as_deref()),
         },
     )
     .await?
@@ -1431,6 +1477,7 @@ async fn probe_machine(
         tags: m.tags.clone(),
         orphans,
         profile: own_profile(config, f, m),
+        description: pastor::config::clean_description(m.description.as_deref()),
     })
 }
 
@@ -1481,6 +1528,7 @@ async fn remote_head_row(paths: &Paths, ssh: &str) -> anyhow::Result<pastor::cli
 async fn machine_list(
     paths: &Paths,
     flock: Option<&str>,
+    wide: bool,
     json: bool,
     head: Head,
 ) -> anyhow::Result<()> {
@@ -1539,11 +1587,15 @@ async fn machine_list(
         if note.is_none() {
             println!("{}\n", pastor::cli::head_line(&head, &rows));
         }
+        let descriptions: Vec<Option<String>> =
+            rows.iter().map(|m| m.description.clone()).collect();
         println!(
             "{}",
-            pastor::cli::table(
+            pastor::cli::list_table(
                 &pastor::cli::MACHINE_HEADER,
-                &pastor::cli::machine_rows(&rows)
+                &pastor::cli::machine_rows(&rows),
+                wide,
+                &descriptions,
             )
         );
     }
@@ -1630,7 +1682,12 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
         } else if let Ok(flock) = Flock::load_existing(&paths.flock_file()) {
             pastor::cli::mark_removed(&mut rows, &tasks, |m| flock.get(m).is_some());
         }
-        println!("{}", pastor::cli::table(&pastor::cli::TASK_HEADER, &rows));
+        let descriptions: Vec<Option<String>> =
+            tasks.iter().map(|t| Some(t.description_text())).collect();
+        println!(
+            "{}",
+            pastor::cli::list_table(&pastor::cli::TASK_HEADER, &rows, a.wide, &descriptions)
+        );
     }
     // Orphans have no row to list, so they get a line each under the table.
     // Only a running head knows them (its last reconcile); `--json` stays a
@@ -1724,9 +1781,11 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             burst,
             tags,
             flock,
+            description,
             herdr,
         } => {
             let m = MachineConfig {
+                description: pastor::config::clean_description(description.as_deref()),
                 name: name.clone(),
                 local,
                 ssh,
@@ -1841,8 +1900,8 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 println!("{done}; {}", reload_running_head(paths, head).await);
             }
         }
-        MachineCmd::List { flock, json } => {
-            machine_list(paths, flock.as_deref(), json, head).await?
+        MachineCmd::List { flock, wide, json } => {
+            machine_list(paths, flock.as_deref(), wide, json, head).await?
         }
         MachineCmd::Describe { name, json } => machine_describe(paths, &name, json, head).await?,
         MachineCmd::Open { name } => open(paths, &name).await?,
@@ -1877,16 +1936,28 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
         doc.save(&path)
     };
     let done = match cmd {
-        FlockCmd::List { json } => return flock_list(paths, json, head).await,
+        FlockCmd::List { wide, json } => return flock_list(paths, wide, json, head).await,
         FlockCmd::Describe { name, json } => {
             return flock_describe(paths, &name, json, head).await;
         }
         FlockCmd::Edit => return edit_file(paths, ConfigFile::Flock, head).await,
-        FlockCmd::Add { name, default } => {
+        FlockCmd::Add {
+            name,
+            default,
+            description,
+        } => {
             if head.is_live() {
                 println!(
                     "{}",
-                    ask_text(paths, IpcRequest::FlockAdd { name, default }).await?
+                    ask_text(
+                        paths,
+                        IpcRequest::FlockAdd {
+                            name,
+                            default,
+                            description,
+                        }
+                    )
+                    .await?
                 );
                 return Ok(());
             }
@@ -1904,7 +1975,8 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                     .map(|t| t.display_id())
                     .collect())
             };
-            fleet_edit::add_flock(&path, &name, default, queued).map_err(edit_error)?
+            fleet_edit::add_flock(&path, &name, default, description.as_deref(), queued)
+                .map_err(edit_error)?
         }
         FlockCmd::Remove { name } => {
             // With a head, the head checks and edits under the lock `task
@@ -1962,7 +2034,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
 
 /// `flock list`: the flock file, the queued tasks, and with a head running
 /// the live agents on each flock's machines.
-async fn flock_list(paths: &Paths, json: bool, head: Head) -> anyhow::Result<()> {
+async fn flock_list(paths: &Paths, wide: bool, json: bool, head: Head) -> anyhow::Result<()> {
     let f = Flock::load(&paths.flock_file())?;
     let live = if head.is_live() {
         let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
@@ -1978,9 +2050,16 @@ async fn flock_list(paths: &Paths, json: bool, head: Head) -> anyhow::Result<()>
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else {
+        let descriptions: Vec<Option<String>> =
+            rows.iter().map(|f| f.description.clone()).collect();
         println!(
             "{}",
-            pastor::cli::table(&pastor::cli::FLOCK_HEADER, &pastor::cli::flock_rows(&rows))
+            pastor::cli::list_table(
+                &pastor::cli::FLOCK_HEADER,
+                &pastor::cli::flock_rows(&rows),
+                wide,
+                &descriptions,
+            )
         );
     }
     Ok(())
@@ -2187,15 +2266,22 @@ fn print_runs(runs: &[JobRunReport], json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_jobs(jobs: &[JobStatus], json: bool) -> anyhow::Result<()> {
+fn print_jobs(jobs: &[JobStatus], wide: bool, json: bool) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(jobs)?);
     } else if jobs.is_empty() {
         println!("no jobs");
     } else {
+        let descriptions: Vec<Option<String>> =
+            jobs.iter().map(|j| j.description.clone()).collect();
         println!(
             "{}",
-            pastor::cli::table(&pastor::cli::JOB_HEADER, &pastor::cli::job_rows(jobs))
+            pastor::cli::list_table(
+                &pastor::cli::JOB_HEADER,
+                &pastor::cli::job_rows(jobs),
+                wide,
+                &descriptions,
+            )
         );
     }
     Ok(())
@@ -2238,14 +2324,14 @@ async fn reload(paths: &Paths) -> anyhow::Result<()> {
     let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::Reload).await? else {
         unreachable!()
     };
-    print_jobs(&jobs, false)
+    print_jobs(&jobs, false, false)
 }
 
 async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
     // With a head elsewhere, this machine's own jobs run in its headless
     // serve: the list shows both, and a job whose file is here is driven here.
     if let Some(remote) = pastor::ipc::remote_head() {
-        if let JobCmd::List { json } = cmd {
+        if let JobCmd::List { json, .. } = cmd {
             return shepherd_job_list(paths, &remote.ssh, json).await;
         }
         if job_name(&cmd).is_some_and(|name| is_local_job(paths, name)) {
@@ -2253,7 +2339,7 @@ async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
         }
     }
     match cmd {
-        JobCmd::List { json } => {
+        JobCmd::List { wide, json } => {
             let jobs = if head.is_live() {
                 let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::JobList).await? else {
                     unreachable!()
@@ -2267,7 +2353,7 @@ async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
                 s.reload();
                 s.statuses(chrono::Utc::now())
             };
-            print_jobs(&jobs, json)?;
+            print_jobs(&jobs, wide, json)?;
         }
         JobCmd::Enable { name } => toggle(paths, &name, true, head).await?,
         JobCmd::Disable { name } => toggle(paths, &name, false, head).await?,

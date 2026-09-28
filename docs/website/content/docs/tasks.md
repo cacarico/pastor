@@ -27,6 +27,7 @@ the same checkout.
 | `--agent` | the agent command: `claude`, `codex`, ... |
 | `--timeout` | mark it stale after `30m`, `2h`, ... |
 | `--priority` | `low`, `normal`, `high` or `critical`: higher levels leave the queue first |
+| `--description` | one line on what it is about; default: the prompt's first line |
 
 ## states
 
@@ -64,6 +65,7 @@ it is lifted, behind a lower one it is lowered. Levels do not age, so a
 
 ```sh
 pastor task list
+pastor task list --wide  # adds each task's description
 pastor task describe t-1
 pastor events --follow
 ```

@@ -28,6 +28,9 @@ pub const RECENT: usize = 10;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobDescription {
     pub name: String,
+    /// The file's `description`.
+    #[serde(default)]
+    pub description: Option<String>,
     pub file: String,
     pub schedule: Option<String>,
     pub enabled: bool,
@@ -94,6 +97,7 @@ pub fn job(
     });
     Ok(JobDescription {
         name: name.to_string(),
+        description: status.description.clone(),
         file: path.display().to_string(),
         schedule: status.schedule,
         enabled: status.enabled,
@@ -135,6 +139,9 @@ pub struct MachineDescription {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlockDescription {
     pub name: String,
+    /// Its `[[flock]]` entry's `description`.
+    #[serde(default)]
+    pub description: Option<String>,
     pub default: bool,
     /// The flock's own agent settings; `None` falls through to `[defaults]`.
     pub agent: Option<String>,
@@ -302,6 +309,7 @@ pub fn flock_description(
     let entry = flock.entry(name).cloned().unwrap_or_default();
     Some(FlockDescription {
         name: row.name,
+        description: row.description,
         default: row.default,
         agent: entry.agent,
         agent_args: entry.agent_args,
@@ -322,6 +330,12 @@ fn fields(rows: &[(&str, String)]) -> Vec<String> {
     rows.iter()
         .map(|(k, v)| format!("{:<width$}{v}", format!("{k}:")))
         .collect()
+}
+
+/// A description as `describe` shows it: whole, newlines kept, other
+/// control characters escaped; `-` for none.
+fn description(v: &Option<String>) -> String {
+    dash(v.as_deref().map(crate::cli::printable))
 }
 
 fn dash(v: Option<String>) -> String {
@@ -407,6 +421,7 @@ pub fn job_text(j: &JobDescription) -> String {
         .map(str::to_string);
     let mut out = fields(&[
         ("name", j.name.clone()),
+        ("description", description(&j.description)),
         ("file", j.file.clone()),
         ("schedule", dash(j.schedule.clone())),
         ("enabled", yes(j.enabled)),
@@ -470,6 +485,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
     };
     let mut out = fields(&[
         ("name", r.name.clone()),
+        ("description", description(&r.description)),
         ("host", r.host.clone()),
         ("endpoint", r.endpoint.clone()),
         ("flock", r.flock.clone()),
@@ -503,6 +519,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
 pub fn flock_text(f: &FlockDescription) -> String {
     let mut out = fields(&[
         ("name", f.name.clone()),
+        ("description", description(&f.description)),
         ("default", yes(f.default)),
         (
             "agent",
@@ -550,7 +567,7 @@ pub fn connector_text(c: &ConnectorDescription) -> String {
         ("name", text(&c.name)),
         ("version", dash(c.version.clone())),
         ("min pastor", dash(c.min_pastor_version.clone())),
-        ("description", text(&c.description)),
+        ("description", description(&c.description)),
         ("authors", dash(Some(one_line(&c.authors.join(", "))))),
         ("homepage", text(&c.homepage)),
         ("repository", text(&c.repository)),
@@ -696,6 +713,7 @@ mod tests {
     #[test]
     fn a_flock_without_its_own_agent_says_where_it_comes_from() {
         let f = FlockDescription {
+            description: None,
             name: "work".into(),
             default: false,
             agent: None,
@@ -710,19 +728,28 @@ mod tests {
             tasks: vec![],
         };
         let text = flock_text(&f);
-        assert!(text.contains("agent:      - (from [defaults])"), "{text}");
-        assert!(text.contains("by kind:    - (from [defaults])"), "{text}");
+        assert!(text.contains("agent:       - (from [defaults])"), "{text}");
+        assert!(text.contains("by kind:     - (from [defaults])"), "{text}");
         let with = FlockDescription {
             agents_by_kind: [("opencode".to_string(), "opencode".to_string())].into(),
             ..f.clone()
         };
         let text = flock_text(&with);
-        assert!(text.contains("by kind:    opencode=opencode\n"), "{text}");
+        assert!(text.contains("by kind:     opencode=opencode\n"), "{text}");
         assert!(text.contains("--model 'a b'"), "{text}");
-        assert!(text.contains("model:      sonnet"), "{text}");
-        assert!(text.contains("profile:    develop"), "{text}");
+        assert!(text.contains("model:       sonnet"), "{text}");
+        assert!(text.contains("profile:     develop"), "{text}");
         assert!(text.contains("pi-1,pi-2"), "{text}");
         assert!(text.ends_with("tasks: none"), "{text}");
+        assert!(text.contains("\ndescription: -\n"), "{text}");
+        let described = flock_text(&FlockDescription {
+            description: Some("Paid work".into()),
+            ..f
+        });
+        assert!(
+            described.starts_with("name:        work\ndescription: Paid work\n"),
+            "{described}"
+        );
     }
 
     #[test]

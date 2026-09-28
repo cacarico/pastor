@@ -67,6 +67,10 @@ pub struct MachineConfig {
     /// may ask for `unrestricted` here (`Profiles::apply`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// One line on what the machine is for (`machine list --wide`,
+    /// `describe`); nothing reads it but people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
@@ -110,6 +114,9 @@ pub struct FlockEntry {
     /// `[defaults] profile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// One line on what the flock is for (`flock list --wide`, `describe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Why a task cannot have the flock it asked for (`Flock::task_flock`).
@@ -739,6 +746,17 @@ impl FlockDoc {
         })
     }
 
+    /// `flock add --description`: set the description of the declared flock
+    /// `name`.
+    pub fn describe_flock(&mut self, name: &str, text: &str) -> Result<(), EditError> {
+        let t = self
+            .tables_mut("flock")
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+            .ok_or_else(|| EditError::UnknownFlock(name.into()))?;
+        t.insert("description", toml_edit::value(text));
+        Ok(())
+    }
+
     /// `flock remove`: refused while machines are in it, while `queued`
     /// (the ids of the queued tasks that name it) is not empty, or while it
     /// is the default. Dispatch only looks in declared flocks, so a queued
@@ -834,6 +852,7 @@ mod tests {
 
     fn pi(name: &str) -> MachineConfig {
         MachineConfig {
+            description: None,
             name: name.into(),
             local: false,
             ssh: Some(format!("fleet@{name}")),
@@ -1069,6 +1088,49 @@ flock = "work"
             d.add_machine(&pi("pi-3")).unwrap_err(),
             EditError::MachineExists("pi-3".into())
         );
+    }
+
+    /// A flock and a machine may say what they are for; a file without
+    /// descriptions loads as before. `flock add` and `machine add` write
+    /// one when given.
+    #[test]
+    fn flocks_and_machines_take_a_description() {
+        let f: Flock = toml::from_str(
+            "[[flock]]\nname = \"life\"\ndefault = true\ndescription = \"Personal errands\"\n\n\
+             [[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\ndescription = \"The desk one\"\n\n\
+             [[machine]]\nname = \"pi-2\"\nssh = \"user@pi-2\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            f.entry("life").unwrap().description.as_deref(),
+            Some("Personal errands")
+        );
+        assert_eq!(
+            f.get("pi-1").unwrap().description.as_deref(),
+            Some("The desk one")
+        );
+        assert_eq!(f.get("pi-2").unwrap().description, None);
+        let old: Flock = toml::from_str(COMMENTED).unwrap();
+        assert!(old.machines.iter().all(|m| m.description.is_none()));
+
+        let mut d = FlockDoc::parse(COMMENTED).unwrap();
+        d.add_flock("work", false, &[]).unwrap();
+        d.describe_flock("work", "Paid work").unwrap();
+        d.add_machine(&MachineConfig {
+            description: Some("A spare".into()),
+            ..pi("pi-9")
+        })
+        .unwrap();
+        let f = d.flock().unwrap();
+        assert_eq!(
+            f.entry("work").unwrap().description.as_deref(),
+            Some("Paid work")
+        );
+        assert_eq!(
+            f.get("pi-9").unwrap().description.as_deref(),
+            Some("A spare")
+        );
+        assert!(d.describe_flock("nope", "x").is_err());
     }
 
     /// The first named flock puts the implicit one on paper, as the default,

@@ -1015,7 +1015,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__connector__subcmd__list)
-            opts="-h --json --head --help"
+            opts="-w -h --wide --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1135,12 +1135,16 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__flock__subcmd__add)
-            opts="-h --default --head --help"
+            opts="-h --default --description --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --description)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --head)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
@@ -1439,7 +1443,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__flock__subcmd__list)
-            opts="-h --json --head --help"
+            opts="-w -h --wide --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2831,7 +2835,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__job__subcmd__list)
-            opts="-h --json --head --help"
+            opts="-w -h --wide --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2903,7 +2907,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__machine__subcmd__add)
-            opts="-h --local --command --session --max-agents --job-slots --burst --tag --flock --herdr --head --help"
+            opts="-h --local --command --session --max-agents --job-slots --burst --tag --flock --description --herdr --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2934,6 +2938,10 @@ _pastor() {
                     return 0
                     ;;
                 --flock)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --description)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -3115,7 +3123,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__machine__subcmd__list)
-            opts="-h --flock --json --head --help"
+            opts="-w -h --flock --wide --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3799,7 +3807,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__list)
-            opts="-h --job --flock --machine --blocked --done --all --json --head --help"
+            opts="-w -h --job --flock --machine --blocked --done --all --wide --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3913,7 +3921,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__run)
-            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --priority --profile --worktree --branch --tag --timeout --place --role --json --head --help"
+            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --priority --profile --worktree --branch --tag --timeout --place --role --description --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3973,6 +3981,10 @@ _pastor() {
                     ;;
                 --role)
                     COMPREPLY=($(compgen -W "agent orchestrator" -- "${cur}"))
+                    return 0
+                    ;;
+                --description)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --head)

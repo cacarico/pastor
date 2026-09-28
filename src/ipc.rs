@@ -20,8 +20,10 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// 9: `JobTask`, and `Pong::role`. 10: `TrustList`, `TrustAdd`,
 /// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. 11: task priority
 /// (`Run::priority`, `TaskPriority`). 12: `Run::role`. 13: permission
-/// profiles (`AgentChoice::profile`). 14: `Queue` and `QueueMove`.
-pub const IPC_PROTOCOL: u32 = 14;
+/// profiles (`AgentChoice::profile`). 14: `Queue` and `QueueMove`. 15:
+/// descriptions (`Run::description`, `FlockAdd::description`,
+/// `JobTask::description`).
+pub const IPC_PROTOCOL: u32 = 15;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -83,6 +85,11 @@ pub const HEAD_READS_PROTOCOL: u32 = 10;
 /// The first protocol whose head honours `Run::role`. An older one would
 /// queue a plain agent and say it succeeded.
 pub const ROLE_PROTOCOL: u32 = 12;
+
+/// The first protocol whose head keeps what `task run --description`,
+/// `flock add --description` and `machine add --description` send. An older
+/// one would drop it without a word.
+pub const DESCRIPTION_PROTOCOL: u32 = 14;
 
 /// The first protocol whose head knows `JobSubmit`. An older one refuses the
 /// request as unreadable; `check_protocol` says why before it is sent.
@@ -148,6 +155,10 @@ pub enum IpcRequest {
         /// only to a head of `ROLE_PROTOCOL` or later.
         #[serde(default, skip_serializing_if = "TaskRole::is_agent")]
         role: TaskRole,
+        /// `task run --description`, trimmed; `None` reads as the prompt's
+        /// first line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     List {
         filter: TaskFilter,
@@ -170,6 +181,9 @@ pub enum IpcRequest {
     FlockAdd {
         name: String,
         default: bool,
+        /// `flock add --description`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     /// `flock default`. Answers `Text`.
     FlockSetDefault {
@@ -321,6 +335,10 @@ pub enum IpcRequest {
         prompt: String,
         spec: DispatchSpec,
         item: serde_json::Value,
+        /// The job's `[dispatch] description` template, rendered on the
+        /// head like `prompt`. A head that predates it gives the task none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     /// Every saved folder trust. Answers `Trusted`.
     TrustList,
@@ -829,6 +847,7 @@ mod tests {
     fn minimal_task() -> Task {
         let now = chrono::Utc::now();
         Task {
+            description: None,
             id: 1,
             job: "run".into(),
             item: serde_json::Value::Null,
@@ -1062,6 +1081,7 @@ mod tests {
     fn fleet_changes() -> Vec<IpcRequest> {
         vec![
             IpcRequest::Run {
+                description: None,
                 prompt: "p".into(),
                 spec: minimal_task().spec,
                 flock: None,
@@ -1092,12 +1112,14 @@ mod tests {
             },
             IpcRequest::FlockRemove { name: "f".into() },
             IpcRequest::FlockAdd {
+                description: None,
                 name: "f".into(),
                 default: false,
             },
             IpcRequest::FlockSetDefault { name: "f".into() },
             IpcRequest::MachineAdd {
                 machine: crate::config::flock::MachineConfig {
+                    description: None,
                     name: "m".into(),
                     local: true,
                     ssh: None,
@@ -1203,6 +1225,7 @@ mod tests {
             agent: None,
             priority: None,
             role,
+            description: None,
         };
         let v = serde_json::to_value(run(TaskRole::Agent)).unwrap();
         assert!(v.get("role").is_none(), "{v}");

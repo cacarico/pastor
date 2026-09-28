@@ -659,6 +659,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let t = store
             .insert_task(NewTask {
+                description: None,
                 job: job.into(),
                 item: serde_json::json!({"key": "k1", "title": "fix it"}),
                 prompt: "do it".into(),
@@ -720,6 +721,7 @@ mod tests {
             tags: vec![],
             tx,
             status: Arc::new(RwLock::new(MachineStatus {
+                description: None,
                 name: name.into(),
                 host: name.into(),
                 endpoint: format!("ssh {name}"),

@@ -1782,6 +1782,43 @@ fn flock_flags_refuse_a_head_from_before_flocks() {
     assert!(ops.iter().all(|op| op == "ping"), "only pings: {ops:?}");
 }
 
+/// A head from before descriptions would drop `--description` without a
+/// word, so the CLI refuses to send it one; without the flag it still goes.
+#[test]
+fn description_flags_refuse_a_head_from_before_descriptions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"pi-1\"\nlocal = true\n",
+    )
+    .unwrap();
+    let reqs = text_head(&state.join("pastor.sock"), 10);
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["task", "run", "hi", "--description", "d"][..],
+        &["flock", "add", "work", "--description", "d"],
+        &["machine", "add", "pi-2", "--local", "--description", "d"],
+    ] {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+    }
+    assert!(
+        reqs.lock().unwrap().iter().all(|r| r["op"] == "ping"),
+        "only pings"
+    );
+    ok(run(&["flock", "add", "work"]));
+}
+
 /// A head at `socket` that speaks IPC protocol `protocol`: it answers ping
 /// with a pong, and every other request with the text `said by the head`. It
 /// records each request whole.
@@ -3579,6 +3616,151 @@ fn describe_a_job_flock_and_task_without_a_head() {
     );
 }
 
+/// Without a head: descriptions of jobs, flocks, machines and tasks show
+/// in `--wide` lists (whole, since stdout is not a terminal), in
+/// `describe`, and always in `--json`; `flock add` and `machine add` write
+/// them.
+#[test]
+fn descriptions_show_in_lists_describe_and_json_without_a_head() {
+    let o = offline();
+    std::fs::write(
+        o.config.join("jobs/nightly.toml"),
+        format!("description = \"Sweep the repo every night\"\n{NIGHTLY}"),
+    )
+    .unwrap();
+    std::fs::write(
+        o.config.join("jobs/bare.toml"),
+        "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\ndescription = \"#{{ item.key }}\"\nprompt = \"p\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        o.config.join("flock.toml"),
+        "[[flock]]\nname = \"home\"\ndefault = true\ndescription = \"Personal errands\"\n\n\
+         [[machine]]\nname = \"pi-1\"\nlocal = true\ndescription = \"The desk one\"\n",
+    )
+    .unwrap();
+    ok(o.cmd(&["tick", "--job", "nightly"]));
+
+    let plain = ok(o.cmd(&["job", "list"]));
+    assert!(!plain.contains("DESCRIPTION"), "{plain}");
+    let wide = ok(o.cmd(&["job", "list", "--wide"]));
+    let header = wide.lines().next().unwrap();
+    assert!(header.ends_with("DESCRIPTION"), "{wide}");
+    assert!(wide.contains("Sweep the repo every night"), "{wide}");
+    let bare = wide.lines().find(|l| l.starts_with("bare")).unwrap();
+    assert!(bare.ends_with(" -"), "no description reads -: {wide}");
+    let jobs: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["job", "list", "--json", "-w"]))).unwrap();
+    assert_eq!(jobs[0]["name"], "bare");
+    assert_eq!(jobs[0]["description"], serde_json::Value::Null);
+    assert_eq!(jobs[1]["description"], "Sweep the repo every night");
+    let j: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["job", "describe", "nightly", "--json"]))).unwrap();
+    assert_eq!(j["description"], "Sweep the repo every night");
+    let text = ok(o.cmd(&["job", "describe", "bare"]));
+    assert!(text.contains("\ndescription:"), "{text}");
+
+    // The clock item's title is the task's description.
+    let tasks: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["task", "list", "--json"]))).unwrap();
+    let title = tasks[0]["item"]["title"].as_str().unwrap().to_string();
+    assert_eq!(tasks[0]["description"], title.as_str());
+    assert_eq!(tasks[0]["description_from"], "job nightly");
+    let wide = ok(o.cmd(&["task", "list", "-w"]));
+    assert!(
+        wide.lines().next().unwrap().ends_with("DESCRIPTION"),
+        "{wide}"
+    );
+    assert!(wide.lines().nth(1).unwrap().ends_with(&title), "{wide}");
+    let text = ok(o.cmd(&["task", "describe", "t-1"]));
+    assert!(
+        text.contains(&format!("description: {title} (from job nightly)")),
+        "{text}"
+    );
+
+    let wide = ok(o.cmd(&["flock", "list", "--wide"]));
+    assert!(wide.contains("Personal errands"), "{wide}");
+    let flocks: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["flock", "list", "--json"]))).unwrap();
+    assert_eq!(flocks[0]["description"], "Personal errands");
+    let f: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["flock", "describe", "home", "--json"]))).unwrap();
+    assert_eq!(f["description"], "Personal errands");
+
+    let wide = ok(o.cmd(&["machine", "list", "--wide"]));
+    assert!(wide.contains("The desk one"), "{wide}");
+    let ms: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["machine", "list", "--json"]))).unwrap();
+    assert_eq!(ms["machines"][0]["description"], "The desk one");
+    let m: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["machine", "describe", "pi-1", "--json"]))).unwrap();
+    assert_eq!(m["description"], "The desk one");
+    let text = ok(o.cmd(&["machine", "describe", "pi-1"]));
+    assert!(text.contains("description: The desk one"), "{text}");
+
+    let wide = ok(o.cmd(&["connector", "list", "--wide"]));
+    assert!(
+        wide.lines().next().unwrap().ends_with("DESCRIPTION"),
+        "{wide}"
+    );
+
+    ok(o.cmd(&["flock", "add", "work", "--description", " Paid work "]));
+    ok(o.cmd(&[
+        "machine",
+        "add",
+        "pi-2",
+        "user@pi-2",
+        "--flock",
+        "work",
+        "--description",
+        "A spare",
+    ]));
+    let file = std::fs::read_to_string(o.config.join("flock.toml")).unwrap();
+    assert!(file.contains("description = \"Paid work\""), "{file}");
+    assert!(file.contains("description = \"A spare\""), "{file}");
+}
+
+/// With a head: `task run --description` sets the task's; without it the
+/// prompt's first line stands in.
+#[test]
+fn task_run_takes_a_description_through_the_head() {
+    let env = start();
+    let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
+        "task",
+        "run",
+        "fix it\nthen stop",
+        "--description",
+        "Fix the flaky test",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(t["description"], "Fix the flaky test");
+    assert_eq!(t["description_from"], "--description");
+    let bare: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
+        "task",
+        "run",
+        "look around\nslowly",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(bare["description"], "look around");
+    assert_eq!(bare["description_from"], "the prompt");
+    let wide = ok(env.cmd(&["task", "list", "--all", "--wide"]));
+    assert!(wide.contains("Fix the flaky test"), "{wide}");
+    assert!(wide.contains("look around"), "{wide}");
+    let text = ok(env.cmd(&["task", "describe", &format!("t-{}", t["id"])]));
+    assert!(
+        text.contains("description: Fix the flaky test (from --description)"),
+        "{text}"
+    );
+    ok(env.cmd(&["flock", "add", "lab", "--description", "Test rigs"]));
+    let file = std::fs::read_to_string(env.config.join("flock.toml")).unwrap();
+    assert!(file.contains("description = \"Test rigs\""), "{file}");
+    let ms: serde_json::Value =
+        serde_json::from_str(&ok(env.cmd(&["machine", "list", "--json", "--wide"]))).unwrap();
+    assert_eq!(ms["machines"][0]["description"], serde_json::Value::Null);
+}
+
 #[test]
 fn describe_a_machine_and_its_flock_with_a_head() {
     let env = start();
@@ -3935,6 +4117,34 @@ fn complete_offers_machine_names() {
     }
     let (ok, _) = complete(&config, &state, &["machine", "add", ""]);
     assert!(!ok);
+}
+
+/// fish shows a job's, flock's or machine's description beside its name;
+/// one without keeps what it showed before.
+#[test]
+fn complete_shows_descriptions_beside_names() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("jobs/nightly.toml"),
+        "description = \"Run the suite at night\"\nevery = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"lab\"\ndescription = \"Test rigs\"\n\n\
+         [[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\nflock = \"home\"\ndescription = \"The desk one\"\n\n\
+         [[machine]]\nname = \"pi-2\"\nssh = \"user@pi-2\"\nflock = \"lab\"\n",
+    )
+    .unwrap();
+    let (ok, out) = complete(&config, &state, &["job", "describe", ""]);
+    assert!(ok);
+    assert_eq!(out, "nightly\tRun the suite at night\ntriage\n");
+    let (ok, out) = complete(&config, &state, &["flock", "describe", ""]);
+    assert!(ok);
+    assert_eq!(out, "home\tdefault\nlab\tTest rigs\n");
+    let (ok, out) = complete(&config, &state, &["machine", "describe", ""]);
+    assert!(ok);
+    assert_eq!(out, "pi-1\tThe desk one\npi-2\tlab\n");
 }
 
 #[test]

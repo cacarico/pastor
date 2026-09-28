@@ -13,6 +13,9 @@ and so on. This page lists them; `--help` after any command lists its flags.
 - Most read commands take `--json`: `pastor task list`, `pastor machine list`,
   `pastor job list`, `pastor events` and every `describe`. Scripts and agents
   should read ids and states from it rather than guess them.
+- `-w, --wide` on `task`, `job`, `machine`, `flock` and `connector list`
+  adds a DESCRIPTION column, cut to the terminal's width. `describe` and
+  `--json` always show descriptions.
 - `--head` uses the head at an ssh destination for one command (see
   [remote head](../remote-head/)).
 - A runtime error is one JSON object on stderr, `{"code": ..., "message": ...}`,

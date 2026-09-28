@@ -34,9 +34,22 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   waits for one). An unknown name is `unknown_profile`, and a profile dropped
   while a task waits keeps it queued and says why. `task describe` (with
   where it came from), the task's JSON, `machine list` (PROFILE),
-  `machine describe` and `flock describe` show it. The IPC protocol goes to
-  11, and every command that can make the head queue a task refuses an older
-  head (`head_too_old`).
+  `machine describe` and `flock describe` show it. Every command that can
+  make the head queue a task refuses an older head (`head_too_old`).
+- Descriptions: an optional one-line `description` at the top of a job
+  file and in each `[[flock]]` and `[[machine]]` entry of flock.toml
+  (`pastor flock add --description`, `pastor machine add --description`).
+  A task's is `pastor task run --description`, else its job's `[dispatch]
+  description` template (`{{ item.title }}` by default), else the prompt's
+  first line; `task retry` copies it. `-w, --wide` on `task`, `job`,
+  `machine`, `flock` and `connector list` adds a DESCRIPTION column, cut to
+  the terminal's width; every `describe` shows it, and every `list --json`
+  and `describe --json` has a `description` key. fish completion shows
+  descriptions beside job, flock and machine names. The tasks table gains a
+  `description` column (schema 11), so the release that carries this needs
+  an -rc first. `--description` is refused on an older head
+  (`head_too_old`). The IPC protocol goes to 14.
+
 - Permission profiles: `[profiles.<name>]` in pastor.toml, each an optional
   `description`, `extends`, `allow` and `deny`, beside the built-in `review`,
   `develop` and `unrestricted`. A profile's lists add up along its `extends`

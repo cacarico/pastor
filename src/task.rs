@@ -404,6 +404,13 @@ pub struct Task {
     /// every row from before roles.
     #[serde(default)]
     pub role: TaskRole,
+    /// One line on what the task is about, fixed when it was queued: `task
+    /// run --description`, or its job's `[dispatch] description` rendered
+    /// for its item. `None` when neither said anything, and on rows from
+    /// before it: those read as the prompt's first line
+    /// (`description_text`).
+    #[serde(default)]
+    pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -431,8 +438,25 @@ impl Task {
     pub fn profile(&self) -> Option<&str> {
         self.spec.profile()
     }
+    /// The task's description, else its prompt's first line, trimmed.
+    pub fn description_text(&self) -> String {
+        match &self.description {
+            Some(d) => d.clone(),
+            None => self.prompt.lines().next().unwrap_or("").trim().to_string(),
+        }
+    }
+    /// Where `description_text` came from: `--description` for a one-off
+    /// task, `job <name>` for a job's, else `the prompt`.
+    pub fn description_from(&self) -> String {
+        match (&self.description, self.job.as_str()) {
+            (None, _) => "the prompt".into(),
+            (Some(_), "run") => "--description".into(),
+            (Some(_), job) => format!("job {job}"),
+        }
+    }
     /// The task as `--json` prints it: its row, with `model` and `profile`
-    /// beside it.
+    /// beside it, and its description always a string, with where it came
+    /// from.
     pub fn to_json(&self) -> Value {
         let mut v = serde_json::to_value(self).unwrap_or(Value::Null);
         if let Value::Object(o) = &mut v {
@@ -444,6 +468,8 @@ impl Task {
                 "profile".into(),
                 self.profile().map_or(Value::Null, Value::from),
             );
+            o.insert("description".into(), self.description_text().into());
+            o.insert("description_from".into(), self.description_from().into());
         }
         v
     }
@@ -776,6 +802,7 @@ mod tests {
     pub fn task(state: TaskState, last_completion_seq: Option<u64>) -> Task {
         let now = Utc::now();
         Task {
+            description: None,
             id: 1,
             job: "run".into(),
             item: Value::Null,

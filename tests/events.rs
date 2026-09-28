@@ -25,6 +25,7 @@ fn task(id: i64) -> Task {
     let store = Store::open_in_memory().unwrap();
     let mut t = store
         .insert_task(NewTask {
+            description: None,
             job: "triage".into(),
             item: serde_json::json!({"key": "k"}),
             prompt: "p".into(),
@@ -183,6 +184,7 @@ async fn the_daemon_writes_the_events_log() {
     let flock = Flock {
         flocks: vec![],
         machines: vec![MachineConfig {
+            description: None,
             name: "m".into(),
             local: false,
             ssh: None,
@@ -248,6 +250,7 @@ async fn the_daemon_writes_the_events_log() {
         &socket,
         &IpcRequest::Run {
             role: Default::default(),
+            description: None,
             prompt: "hi".into(),
             spec: DispatchSpec {
                 agent: "claude".into(),

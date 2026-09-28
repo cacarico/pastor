@@ -24,6 +24,8 @@ fn default_true() -> bool {
 #[serde(deny_unknown_fields)]
 pub struct JobFile {
     pub name: Option<String>,
+    /// One line on what the job does, for `job list --wide` and `describe`.
+    pub description: Option<String>,
     pub every: Option<String>,
     pub cron: Option<String>,
     #[serde(default = "default_true")]
@@ -74,12 +76,24 @@ pub struct DispatchTable {
     pub place: Option<Place>,
     pub max_tasks_per_run: Option<u32>,
     pub backfill: Option<String>,
+    /// The template of each task's description; `None` is
+    /// `DEFAULT_TASK_DESCRIPTION`.
+    pub description: Option<String>,
     pub prompt: String,
 }
+
+/// A job task's description when `[dispatch]` names none: its item's title,
+/// so a board card's task reads as the card.
+pub const DEFAULT_TASK_DESCRIPTION: &str = "{{ item.title }}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub name: String,
+    /// The file's `description`, trimmed; `None` when it has none.
+    pub description: Option<String>,
+    /// `[dispatch] description`, unrendered: `task_description_for` renders
+    /// it for one item.
+    pub task_description: Option<String>,
     pub schedule: Schedule,
     pub enabled: bool,
     pub connector: String,
@@ -153,6 +167,7 @@ impl Job {
         )
         .map(|job| Job {
             dispatch: Value::Object(table_without_prompt(&dispatch)),
+            description: crate::config::clean_description(file.description.as_deref()),
             ..job
         })
     }
@@ -208,6 +223,17 @@ impl Job {
         }
         if d.worktree && d.repo.is_none() {
             return Err("dispatch.worktree = true needs dispatch.repo".into());
+        }
+        if let Some(text) = &d.description {
+            for path in
+                template::placeholders(text).map_err(|e| format!("dispatch.description: {e}"))?
+            {
+                if !(path.starts_with("item.") || path == "job.name") {
+                    return Err(format!(
+                        "dispatch.description: unknown placeholder {{{{ {path} }}}}; use item.* or job.name"
+                    ));
+                }
+            }
         }
         if let Some(model) = &d.model {
             for path in template::placeholders(model).map_err(|e| format!("dispatch.model: {e}"))? {
@@ -303,6 +329,8 @@ impl Job {
         let pick = defaults.resolve_agent(&agent, None);
         Ok(Job {
             name,
+            description: None,
+            task_description: d.description,
             schedule,
             enabled,
             connector,
@@ -353,6 +381,20 @@ impl Job {
         text.parse()
             .map(Some)
             .map_err(|e| format!("dispatch.priority: {} ({e})", crate::task::UNKNOWN_PRIORITY))
+    }
+
+    /// The description of this job's task for `item`: `[dispatch]
+    /// description` rendered, else its item's title, trimmed. `None` when
+    /// that is empty, or a path the item lacks leaves it so: the task then
+    /// reads as its prompt's first line.
+    pub fn task_description_for(&self, item: &Value) -> Option<String> {
+        let text = self
+            .task_description
+            .as_deref()
+            .unwrap_or(DEFAULT_TASK_DESCRIPTION);
+        let ctx = serde_json::json!({"item": item, "job": {"name": self.name}});
+        let rendered = template::render(text, &ctx).ok()?.text;
+        crate::config::clean_description(Some(&rendered))
     }
 
     /// The job's `model` rendered for `item`: `None` when the job names
@@ -591,6 +633,51 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert_eq!(job.max_tasks_per_run, 5);
         assert_eq!(job.backfill, Duration::ZERO);
         assert!(job.prompt.contains("{{ item.author }}"));
+    }
+
+    /// A job's own `description` is plain text, trimmed; none is fine. Its
+    /// `[dispatch] description` is rendered per item, `{{ item.title }}`
+    /// when left out, and one that renders empty gives the task none.
+    #[test]
+    fn a_job_and_its_tasks_have_descriptions() {
+        let old = Job::parse(SPEC_EXAMPLE, "support-slack", &defaults(), &Builtins).unwrap();
+        assert_eq!(old.description, None);
+        let item = serde_json::json!({"key": "k", "title": " Fix the login page \n", "n": 7});
+        assert_eq!(
+            old.task_description_for(&item).as_deref(),
+            Some("Fix the login page")
+        );
+        assert_eq!(
+            old.task_description_for(&serde_json::json!({"key": "k"})),
+            None
+        );
+
+        let job = |top: &str, dispatch: &str| {
+            Job::parse(
+                &format!(
+                    "{top}every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\n{dispatch}prompt = \"p\"\n"
+                ),
+                "j",
+                &defaults(),
+                &Builtins,
+            )
+        };
+        let j = job(
+            "description = \"  Carry out the answers  \"\n",
+            "description = \"#{{ item.n }} for {{ job.name }}\"\n",
+        )
+        .unwrap();
+        assert_eq!(j.description.as_deref(), Some("Carry out the answers"));
+        assert_eq!(j.task_description_for(&item).as_deref(), Some("#7 for j"));
+        let empty = job(
+            "description = \"\"\n",
+            "description = \"{{ item.nope }}\"\n",
+        )
+        .unwrap();
+        assert_eq!(empty.description, None);
+        assert_eq!(empty.task_description_for(&item), None);
+        let err = job("", "description = \"{{ task.id }}\"\n").unwrap_err();
+        assert!(err.contains("dispatch.description"), "{err}");
     }
 
     /// A job's `model` is a template rendered per item: empty means the job
@@ -1021,6 +1108,20 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         assert!(err.contains("prompt is required"), "{err}");
         let err = Job::submitted("ok", &serde_json::json!([1]), "p", &defaults()).unwrap_err();
         assert!(err.contains("must be a table"), "{err}");
+
+        // A shepherd sends `description` inside `[dispatch]` like any key.
+        let sub = Job::submitted(
+            "ok",
+            &serde_json::json!({"description": "#{{ item.key }}"}),
+            "p",
+            &defaults(),
+        )
+        .unwrap();
+        assert_eq!(
+            sub.task_description_for(&serde_json::json!({"key": "k1"}))
+                .as_deref(),
+            Some("#k1")
+        );
     }
 
     #[test]

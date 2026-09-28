@@ -1062,6 +1062,14 @@ pub struct ModelDef {
 #[serde(transparent)]
 pub struct Models(pub std::collections::BTreeMap<String, ModelDef>);
 
+/// A description as pastor keeps one: trimmed, and `None` when that leaves
+/// nothing. Jobs, flocks, machines and tasks all take theirs through it.
+pub fn clean_description(text: Option<&str>) -> Option<String> {
+    text.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
 /// Model names go in the store, in events and on the command line, so they
 /// keep to the job names' alphabet: `[a-z0-9][a-z0-9_.-]{0,63}`. That also
 /// keeps a raw agent arg such as `--model` from passing for one.
