@@ -27,6 +27,8 @@ pub enum Kind {
     Profile,
     /// A task's level; fixed, not read from any file.
     Priority,
+    /// A queued task, in the order dispatch takes them.
+    QueuedTask,
 }
 
 /// The kind of name the argument `id` of the subcommand at `path` (canonical
@@ -35,6 +37,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
     match (path, id) {
         // A new flock's or machine's name is the user's to choose.
         ([_, "add"], "name") => None,
+        (["queue", "move"], "task" | "before" | "after") => Some(Kind::QueuedTask),
         (_, "flock") => Some(Kind::Flock),
         (_, "machine") => Some(Kind::Machine),
         (_, "task") => Some(Kind::Task),
@@ -170,6 +173,7 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
                 .collect()
         }
         Kind::Task => tasks(paths),
+        Kind::QueuedTask => queued_tasks(paths),
         Kind::Priority => crate::task::Priority::ALL
             .iter()
             .map(|p| (p.to_string(), None))
@@ -212,6 +216,26 @@ fn tasks(paths: &Paths) -> Vec<(String, Option<String>)> {
     tasks
         .iter()
         .map(|t| (t.display_id(), Some(task_note(t))))
+        .collect()
+}
+
+/// The queued tasks in the order `pastor queue` lists them, each with its
+/// level and note.
+fn queued_tasks(paths: &Paths) -> Vec<(String, Option<String>)> {
+    let Ok(store) = Store::open_read_only(&paths.db_file()) else {
+        return Vec::new();
+    };
+    let Ok(tasks) = store.queued_tasks() else {
+        return Vec::new();
+    };
+    tasks
+        .iter()
+        .map(|t| {
+            (
+                t.display_id(),
+                Some(format!("{} {}", t.priority, task_note(t))),
+            )
+        })
         .collect()
 }
 

@@ -20,8 +20,9 @@ use crate::machine::{
     ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, SendInput,
     SendRefused, ShutdownOutcome, spawn_machine,
 };
+use crate::queue::{QueueEntry, QueueSpot};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
-use crate::store::{NewTask, PriorityError, RetryError, Store, TaskFilter};
+use crate::store::{MoveError, Moved, NewTask, PriorityError, RetryError, Store, TaskFilter};
 use crate::task::{AgentSource, PANE_OWNING_STATES, Priority, Task, TaskRole, TaskState};
 
 /// How a headless serve's fleet reaches the head with the items a job run
@@ -1111,6 +1112,46 @@ impl Fleet {
         self.store.set_priority(id, priority, from)
     }
 
+    /// Move a queued task (`Store::move_queued`), under the dispatch lock
+    /// for the reason `set_priority` is: a pass must not take the queue in
+    /// the old order after the move has answered.
+    pub async fn move_queued(&self, id: i64, to: QueueSpot) -> Result<Moved, MoveError> {
+        let _pass = self.dispatch_lock.lock().await;
+        self.store.move_queued(id, to)
+    }
+
+    /// The queue as `pastor queue` shows it: dispatch order, each task with
+    /// why it waits on the machines as they are now, then filtered.
+    pub fn queue(
+        &self,
+        flock: Option<&str>,
+        machine: Option<&str>,
+    ) -> anyhow::Result<Vec<QueueEntry>> {
+        let queued = self.store.queued_tasks()?;
+        let wanted = self.flock();
+        // Same model/agent compatibility check `dispatch_queued` applies: a
+        // machine whose agent cannot run the task's model does not take it.
+        let accepts = |task: &Task, machine: &str| {
+            let Some(source) = task.spec.agent_source.as_ref() else {
+                return true;
+            };
+            let target = task.flock.as_deref().unwrap_or(wanted.default_flock());
+            let mut spec = task.spec.clone();
+            self.settle(
+                &mut spec,
+                &source.ask,
+                target,
+                Some(machine),
+                &asked_by(task),
+            )
+            .is_ok()
+        };
+        let mut entries =
+            crate::queue::entries(queued, &self.views(), wanted.default_flock(), &accepts);
+        entries.retain(|e| e.matches(flock, machine));
+        Ok(entries)
+    }
+
     /// Try to place every queued task, oldest first. Serialised: a pass sees the
     /// live counts the previous pass left behind, because a machine actor
     /// refreshes its count before it answers a dispatch (see
@@ -1229,10 +1270,6 @@ impl Fleet {
     }
 }
 
-/// How a queued task's error starts while no machine in its flock runs an
-/// agent its model suits; cleared once one takes it.
-const WAITING_FOR_MODEL: &str = "waiting for a machine";
-
 /// How `AgentSource` and `Task::priority_from` name a layer: `asked_by`
 /// for the ask, else the machine, the flock or `defaults`.
 fn layer_label(layer: Layer, asked_by: &str, flock: &str, machine: Option<&str>) -> String {
@@ -1244,14 +1281,7 @@ fn layer_label(layer: Layer, asked_by: &str, flock: &str, machine: Option<&str>)
     }
 }
 
-/// Who asked for `task`'s agent, as `AgentSource` labels it.
-fn asked_by(task: &Task) -> String {
-    if !task.from_job() {
-        "task run".to_string()
-    } else {
-        format!("job {}", task.job)
-    }
-}
+use crate::queue::{WAITING_FOR_MODEL, asked_by};
 
 /// An error from code the CLI shares with the head, as a reply: its
 /// `CliError` code when it has one, else `runtime_error`.
@@ -1305,7 +1335,7 @@ pub fn refusal(task: &str, role: TaskRole) -> String {
 
 pub fn agent_refusal(task: &str) -> String {
     format!(
-        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, reprioritize, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, serve or set up a head, open herdr's UI; `pastor task done` may end only its own task); set agents_change_fleet = true in pastor.toml to allow it"
+        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, reprioritize, move in the queue, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, serve or set up a head, open herdr's UI; `pastor task done` may end only its own task); set agents_change_fleet = true in pastor.toml to allow it"
     )
 }
 
@@ -1826,6 +1856,18 @@ impl Daemon {
                     }
                 }
             }
+            IpcRequest::Queue { flock, machine } => {
+                match self.fleet.queue(flock.as_deref(), machine.as_deref()) {
+                    Ok(entries) => IpcResponse::Queue(entries),
+                    Err(err) => IpcResponse::error("store_error", format!("{err:#}")),
+                }
+            }
+            IpcRequest::QueueMove { id, to } => match self.fleet.move_queued(id, to).await {
+                Ok(moved) => IpcResponse::Moved(moved),
+                Err(err @ MoveError::NotFound(_)) => IpcResponse::error("task_not_found", err),
+                Err(err @ MoveError::NotQueued { .. }) => IpcResponse::error("not_queued", err),
+                Err(MoveError::Store(err)) => IpcResponse::error("store_error", format!("{err:#}")),
+            },
             IpcRequest::TaskShow { id } => match self.store.get_task(id) {
                 Ok(Some(t)) => IpcResponse::Task(t),
                 Ok(None) => IpcResponse::error("task_not_found", format!("t-{id}")),

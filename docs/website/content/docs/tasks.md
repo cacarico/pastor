@@ -26,6 +26,7 @@ the same checkout.
 | `--flock` | only machines in this flock take it |
 | `--agent` | the agent command: `claude`, `codex`, ... |
 | `--timeout` | mark it stale after `30m`, `2h`, ... |
+| `--priority` | `low`, `normal`, `high` or `critical`: higher levels leave the queue first |
 
 ## states
 
@@ -41,6 +42,23 @@ the same checkout.
 | `closed` | finished for good |
 
 `done` means the agent stopped, not that the work is right. Read the output.
+
+## wait your turn
+
+When every machine is full, tasks wait in the queue, by level and then in
+the order they came. `pastor queue` shows it in the order it will run, how
+long each task has waited and why it has not started yet.
+
+```sh
+pastor queue
+pastor queue move t-8 --top          # first, lifted to the first task's level
+pastor queue move t-8 --before t-5   # just ahead of t-5
+pastor task priority t-8 high        # another level, same place in it
+```
+
+A moved task takes the level of where it lands: in front of a higher task
+it is lifted, behind a lower one it is lowered. Levels do not age, so a
+`low` task can wait for ever; WAITED shows you.
 
 ## follow it
 

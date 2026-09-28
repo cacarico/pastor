@@ -54,6 +54,8 @@ enum Command {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// The queued tasks in the order they will start, and why each waits; move one
+    Queue(pastor::queue_cli::QueueArgs),
     /// Manage the machines and which flock each is in
     Machine {
         #[command(subcommand)]
@@ -621,6 +623,7 @@ fn main() {
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
             Command::Profile { cmd } => pastor::profile_cli::run(&paths, cmd),
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd, head).await,
+            Command::Queue(args) => pastor::queue_cli::run(&paths, args, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,
         }
@@ -859,6 +862,7 @@ fn head_use(command: &Command) -> Option<bool> {
         },
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
         Command::Trust { .. } => Some(false),
+        Command::Queue(a) => Some(a.flock.is_some()),
         Command::Connector { cmd } => {
             (!matches!(cmd, ConnectorCmd::List { .. } | ConnectorCmd::Try { .. })).then_some(false)
         }
@@ -891,6 +895,7 @@ fn remote_route(command: &Command) -> RemoteRoute {
         // are this machine's.
         Command::Task { .. }
         | Command::Watch(_)
+        | Command::Queue(_)
         | Command::Machine {
             cmd: MachineCmd::List { .. },
         }
@@ -971,6 +976,7 @@ fn changes_fleet(command: &Command) -> bool {
         // no request to refuse; setup installs one that starts on login.
         Command::Serve | Command::Setup { .. } => true,
         Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
+        Command::Queue(a) => pastor::queue_cli::changes_fleet(a),
         _ => false,
     }
 }
@@ -1122,6 +1128,11 @@ fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
         Some((
             pastor::ipc::ROLE_PROTOCOL,
             "predates task roles, and would start a plain agent instead of an orchestrator",
+        ))
+    } else if matches!(command, Command::Queue(_)) {
+        Some((
+            pastor::ipc::QUEUE_PROTOCOL,
+            "predates `pastor queue`, and would refuse the request",
         ))
     } else if needs_priority_protocol(command) {
         Some((
@@ -2821,6 +2832,27 @@ mod tests {
         assert!(!needs_agent_protocol(&parse(&["pastor", "job", "reload"])));
     }
 
+    /// `pastor queue` and `queue move` need a head that knows the queue;
+    /// only the move changes the fleet.
+    #[test]
+    fn the_queue_needs_a_head_that_knows_it() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        for argv in [
+            &["pastor", "queue"][..],
+            &["pastor", "queue", "move", "t-1", "--top"],
+        ] {
+            assert_eq!(
+                protocol_need(&parse(argv)).map(|n| n.0),
+                Some(pastor::ipc::QUEUE_PROTOCOL),
+                "{argv:?}"
+            );
+        }
+        assert!(!changes_fleet(&parse(&["pastor", "queue", "--flock", "w"])));
+        assert!(changes_fleet(&parse(&[
+            "pastor", "queue", "move", "t-1", "--to", "2"
+        ])));
+    }
+
     /// `task run --priority` and `task priority` need a head that knows
     /// levels: an older one would queue at its own level, or refuse the
     /// request as unreadable. A run without the flag does not.
@@ -3741,6 +3773,7 @@ mod tests {
             "task run" | "task describe" | "task read" | "task attach" | "task retry"
             | "task close" | "task done" | "job run" | "machine open" => &["x"],
             "task send" | "task priority" => &["x", "y"],
+            "queue move" => &["x", "--top"],
             "task prune" => &["--older-than", "1d", "--done"],
             "completions" => &["bash"],
             "setup" => &["systemd"],
