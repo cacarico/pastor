@@ -481,16 +481,17 @@ pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]
         .flock_names()
         .into_iter()
         .map(|name| {
-            let machines: Vec<String> = flock
-                .machines
-                .iter()
-                .filter(|m| flock.flock_of(m) == name)
-                .map(|m| m.name.clone())
-                .collect();
+            let machines: Vec<String> = flock.members(name).into_iter().map(String::from).collect();
+            // The flock's own tasks on each machine; a head from before many
+            // flocks reports only the machine's.
             let agents = live.map(|ms| {
                 ms.iter()
                     .filter(|s| machines.contains(&s.name))
-                    .map(|s| s.live)
+                    .map(|s| match s.flocks.iter().find(|f| f.name == name) {
+                        Some(seat) => seat.live,
+                        None if s.flocks.is_empty() => s.live,
+                        None => 0,
+                    })
                     .sum()
             });
             let queued = queued
@@ -540,7 +541,7 @@ pub fn orphan_lines(
 ) -> Vec<String> {
     ms.iter()
         .filter(|m| machine.is_none_or(|name| m.name == name))
-        .filter(|m| flock.is_none_or(|f| m.flock.as_deref().unwrap_or(DEFAULT_FLOCK) == f))
+        .filter(|m| flock.is_none_or(|f| m.in_flock(f)))
         .flat_map(|m| {
             m.orphans.iter().map(move |o| {
                 format!(
@@ -600,8 +601,12 @@ pub struct MachineRow {
     pub name: String,
     pub host: String,
     pub endpoint: String,
-    /// The flock the machine is in.
+    /// The flock that stands for the machine (`Flock::primary_flock`).
     pub flock: String,
+    /// Every flock it is in, with its number and live tasks there. Empty
+    /// from a head that predates it: then `flock` is the only one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flocks: Vec<crate::machine::FlockSeat>,
     pub channel: String,
     pub herdr_version: Option<String>,
     pub pastor_version: Option<String>,
@@ -629,6 +634,33 @@ pub struct MachineRow {
     pub description: Option<String>,
 }
 
+impl MachineRow {
+    pub fn in_flock(&self, flock: &str) -> bool {
+        if self.flocks.is_empty() {
+            self.flock == flock
+        } else {
+            self.flocks.iter().any(|f| f.name == flock)
+        }
+    }
+
+    /// The FLOCK column: every flock, with its number where it has one
+    /// (`home,work:2`).
+    pub fn flock_label(&self) -> String {
+        if self.flocks.is_empty() {
+            return self.flock.clone();
+        }
+        let names: Vec<String> = self
+            .flocks
+            .iter()
+            .map(|f| match f.max {
+                Some(n) => format!("{}:{n}", f.name),
+                None => f.name.clone(),
+            })
+            .collect();
+        names.join(",")
+    }
+}
+
 impl From<&MachineStatus> for MachineRow {
     fn from(m: &MachineStatus) -> MachineRow {
         MachineRow {
@@ -637,6 +669,7 @@ impl From<&MachineStatus> for MachineRow {
             endpoint: m.endpoint.clone(),
             // A head from before flocks has only the one.
             flock: m.flock.clone().unwrap_or_else(|| DEFAULT_FLOCK.into()),
+            flocks: m.flocks.clone(),
             channel: m.channel.to_string(),
             herdr_version: m.herdr_version.clone(),
             pastor_version: m.pastor_version.clone(),
@@ -713,7 +746,7 @@ pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
             vec![
                 m.name.clone(),
                 m.host.clone(),
-                m.flock.clone(),
+                m.flock_label(),
                 m.profile.clone().unwrap_or_else(dash),
                 m.channel.clone(),
                 m.herdr_version.clone().unwrap_or_else(dash),
@@ -914,6 +947,8 @@ mod tests {
             tags: vec!["fast".into(), "arm".into()],
             orphans: vec![],
             flock: None,
+            flocks: vec![],
+            live_by_flock: vec![],
             shutting_down: false,
             profile: None,
         }
@@ -1650,5 +1685,48 @@ mod tests {
         assert_eq!(rows[0][8], "t-4,t-9");
         assert_eq!(rows[1][8], "-");
         assert_eq!(rows[0].len(), MACHINE_HEADER.len());
+    }
+
+    /// A status carries every flock of the machine; one from a head before
+    /// many flocks has only `flock` and reads as that one flock.
+    #[test]
+    fn a_machine_row_carries_its_flocks_and_an_old_head_reads_as_one() {
+        let seat = |name: &str, max: Option<u32>, live: usize| crate::machine::FlockSeat {
+            name: name.into(),
+            max,
+            live,
+        };
+        let m = MachineStatus {
+            flock: Some("home".into()),
+            flocks: vec![seat("home", None, 1), seat("work", Some(2), 0)],
+            ..status("desk", "local")
+        };
+        let row = MachineRow::from(&m);
+        assert_eq!(row.flock_label(), "home,work:2");
+        assert!(row.in_flock("work") && row.in_flock("home") && !row.in_flock("play"));
+        assert_eq!(
+            orphan_lines(
+                &[MachineStatus {
+                    orphans: vec!["t-1".into()],
+                    ..m.clone()
+                }],
+                None,
+                Some("work")
+            )
+            .len(),
+            1
+        );
+        let back: MachineStatus =
+            serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert_eq!(back.flocks, m.flocks);
+
+        let mut old = serde_json::to_value(&m).unwrap();
+        old.as_object_mut().unwrap().remove("flocks");
+        old["flock"] = "work".into();
+        let old: MachineStatus = serde_json::from_value(old).unwrap();
+        assert_eq!(old.flock_names(), ["work"]);
+        let row = MachineRow::from(&old);
+        assert_eq!(row.flock_label(), "work");
+        assert!(row.in_flock("work") && !row.in_flock("home"));
     }
 }

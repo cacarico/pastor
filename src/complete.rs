@@ -183,7 +183,11 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
                 .iter()
                 .map(|m| {
                     let desc = crate::config::clean_description(m.description.as_deref())
-                        .unwrap_or_else(|| flock.flock_of(m).to_string());
+                        .unwrap_or_else(|| {
+                            let names: Vec<&str> =
+                                flock.flocks_of(m).into_iter().map(|(f, _)| f).collect();
+                            names.join(", ")
+                        });
                     (m.name.clone(), Some(desc))
                 })
                 .collect()

@@ -1471,7 +1471,11 @@ fn probe_fields(
 fn own_profile(config: &PastorConfig, f: &Flock, m: &MachineConfig) -> Option<String> {
     config
         .defaults
-        .resolve_agent_on(&AgentChoice::default(), Some(m), f.entry(f.flock_of(m)))
+        .resolve_agent_on(
+            &AgentChoice::default(),
+            Some(m),
+            f.entry(f.primary_flock(m)),
+        )
         .profile
         .map(|(name, _)| name)
 }
@@ -1483,7 +1487,20 @@ async fn probe_machine(
     paths: &Paths,
     store: &Store,
 ) -> anyhow::Result<pastor::cli::MachineRow> {
-    let flock = f.flock_of(m);
+    let flock = f.primary_flock(m);
+    let on_machine = store.tasks_on_machine(&m.name)?;
+    let flocks = f
+        .flocks_of(m)
+        .into_iter()
+        .map(|(name, max)| pastor::machine::FlockSeat {
+            name: name.to_string(),
+            max,
+            live: on_machine
+                .iter()
+                .filter(|t| t.flock.as_deref().unwrap_or(f.default_flock()) == name)
+                .count(),
+        })
+        .collect();
     let ep = Endpoint::from_machine(m, paths);
     let ping = ep.ping().await;
     let agents = match &ping {
@@ -1491,7 +1508,7 @@ async fn probe_machine(
         Err(_) => None,
     };
     let orphans: Vec<String> = match &agents {
-        Some(Ok(list)) => pastor::machine::orphan_agents(list, &store.tasks_on_machine(&m.name)?)
+        Some(Ok(list)) => pastor::machine::orphan_agents(list, &on_machine)
             .into_iter()
             .map(|(name, _)| name)
             .collect(),
@@ -1511,6 +1528,7 @@ async fn probe_machine(
         host: ep.host(),
         endpoint: ep.describe(),
         flock: flock.to_string(),
+        flocks,
         channel: channel.into(),
         herdr_version,
         pastor_version,
@@ -1601,7 +1619,7 @@ async fn machine_list(
             for m in f
                 .machines
                 .iter()
-                .filter(|m| flock.is_none_or(|n| f.flock_of(m) == n))
+                .filter(|m| flock.is_none_or(|n| f.in_flock(m, n)))
             {
                 rows.push(probe_machine(m, &f, &config, paths, &store).await?);
             }
@@ -1613,7 +1631,7 @@ async fn machine_list(
     };
     let mut rows: Vec<pastor::cli::MachineRow> = rows
         .into_iter()
-        .filter(|m| flock.is_none_or(|n| m.flock == n))
+        .filter(|m| flock.is_none_or(|n| m.in_flock(n)))
         .collect();
     pastor::cli::head_machine_first(&mut rows);
     let head = match pastor::ipc::remote_head() {

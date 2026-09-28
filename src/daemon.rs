@@ -13,7 +13,7 @@ use crate::config::{
     AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer, MODEL_KIND_MISMATCH, Models,
     PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
 };
-use crate::dispatch::{Claim, MachineView, pick_machine, pick_machine_where};
+use crate::dispatch::{Claim, FlockSeat, MachineView, pick_machine, pick_machine_where};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{HeadPing, IpcRequest, IpcResponse, MODEL_PROTOCOL, check_protocol};
 use crate::machine::{
@@ -128,14 +128,39 @@ pub fn warn_removed(store: &Store, flock: &Flock, warned: &mut HashSet<i64>) -> 
     }
 }
 
-/// The flock `name` is in according to `flock`; a machine the file does not
-/// have (a fixed fleet's, or one held until its actor ends) is in the default
-/// flock, the only one a fixed fleet has.
+/// The flock that stands for `name` according to `flock`
+/// (`Flock::primary_flock`); a machine the file does not have (a fixed
+/// fleet's, or one held until its actor ends) is in the default flock, the
+/// only one a fixed fleet has.
 fn flock_of(flock: &Flock, name: &str) -> String {
     flock
         .machine_flock(name)
         .unwrap_or(flock.default_flock())
         .to_string()
+}
+
+/// The flocks `status`'s machine is in according to `flock`, each with its
+/// number (`Flock::flocks_of`) and how many of its live tasks run there, by
+/// the flock stored on each task (`None`: the default). A machine the file
+/// does not have is in the default flock, as in `flock_of`.
+fn seats(flock: &Flock, status: &crate::machine::MachineStatus) -> Vec<FlockSeat> {
+    let default = flock.default_flock();
+    let flocks = flock
+        .machine_flocks(&status.name)
+        .unwrap_or_else(|| vec![(default, None)]);
+    flocks
+        .into_iter()
+        .map(|(name, max)| FlockSeat {
+            name: name.to_string(),
+            max,
+            live: status
+                .live_by_flock
+                .iter()
+                .filter(|(f, _)| f.as_deref().unwrap_or(default) == name)
+                .map(|(_, n)| n)
+                .sum(),
+        })
+        .collect()
 }
 
 /// The part of a machine's entry its actor is built from. The flock, the
@@ -334,7 +359,7 @@ impl Fleet {
     /// Every machine's status with the flock it is in (see `flock_of`) and
     /// whether it is `shutting_down`, in flock order: what `machine list`
     /// and `machine.*` events report, and what a caller granting access by
-    /// flock membership (`bridge::machine_flock`) must check before trusting
+    /// flock membership (`bridge::machine_flocks`) must check before trusting
     /// the flock it reports for a machine no longer in `wanted`.
     pub fn statuses(&self) -> Vec<crate::machine::MachineStatus> {
         let wanted = self.flock();
@@ -344,14 +369,16 @@ impl Fleet {
             .iter()
             .map(|m| {
                 let flock = flock_of(&wanted, &m.handle.name);
+                let s = m.handle.snapshot();
                 crate::machine::MachineStatus {
                     profile: self.own_profile(&flock, Some(&m.handle.name)),
                     flock: Some(flock),
+                    flocks: seats(&wanted, &s),
                     shutting_down: m.shutting_down,
                     description: wanted
                         .get(&m.handle.name)
                         .and_then(|c| crate::config::clean_description(c.description.as_deref())),
-                    ..m.handle.snapshot()
+                    ..s
                 }
             })
             .collect()
@@ -528,11 +555,7 @@ impl Fleet {
         }
         if pinned.is_none() {
             let wanted = self.flock();
-            for m in wanted
-                .machines
-                .iter()
-                .filter(|m| wanted.flock_of(m) == flock)
-            {
+            for m in wanted.machines.iter().filter(|m| wanted.in_flock(m, flock)) {
                 let mut s = spec.clone();
                 match self.settle(&mut s, ask, flock, Some(&m.name), asked_by) {
                     Ok(()) => landings.push(s),
@@ -787,7 +810,7 @@ impl Fleet {
                     // An aborted actor answers nothing, and a dispatch to
                     // it would wait for as long as it stays wedged.
                     healthy: !m.shutting_down && s.channel.accepts_dispatch(),
-                    flock: flock_of(&wanted, &m.handle.name),
+                    flocks: seats(&wanted, &s),
                 }
             })
             .collect()
@@ -1318,7 +1341,7 @@ impl Fleet {
                     let mut members = flock
                         .machines
                         .iter()
-                        .filter(|m| flock.flock_of(m) == target)
+                        .filter(|m| flock.in_flock(m, target))
                         .peekable();
                     let none = task.spec.machine.is_none()
                         && members.peek().is_some()
@@ -1334,18 +1357,43 @@ impl Fleet {
                         format!("no machine in flock {target} has {a} {kind} agent")
                     })
                 };
-                let why = none_has().or_else(|| {
-                    let m = pick_machine(&views, target, &task.spec, claim)?;
-                    Some(settled_on(&m)?.err()?.to_string())
-                });
-                if let Some(why) = why {
-                    let note = format!("{WAITING_FOR_MODEL}: {why}");
-                    if task.error.as_deref() != Some(note.as_str()) {
-                        let mut t = task.clone();
-                        t.error = Some(note);
-                        if let Err(err) = self.store.update_task(&mut t) {
-                            tracing::warn!(task = %task.display_id(), %err, "note why it waits");
-                        }
+                // Or a machine would take it but its flock is at its
+                // number there.
+                let flock_full = || {
+                    views
+                        .iter()
+                        .filter(|v| task.spec.machine.as_ref().is_none_or(|p| *p == v.name))
+                        .filter(|v| {
+                            v.healthy
+                                && v.has_room(claim)
+                                && task.spec.tags.iter().all(|t| v.tags.contains(t))
+                                && settled_on(&v.name).is_none_or(|r| r.is_ok())
+                        })
+                        .find_map(|v| {
+                            let seat = v.seat(target)?;
+                            let max = seat.max.filter(|_| !seat.has_room())?;
+                            Some(format!(
+                                "flock {target} is at {} of {max} on {}",
+                                seat.live, v.name
+                            ))
+                        })
+                };
+                let why = none_has()
+                    .or_else(|| {
+                        let m = pick_machine(&views, target, &task.spec, claim)?;
+                        Some(settled_on(&m)?.err()?.to_string())
+                    })
+                    .or_else(flock_full);
+                let note = why.map(|why| format!("{WAITING_FOR_MODEL}: {why}"));
+                let stale = task
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL));
+                if note.is_some() && task.error != note || note.is_none() && stale {
+                    let mut t = task.clone();
+                    t.error = note;
+                    if let Err(err) = self.store.update_task(&mut t) {
+                        tracing::warn!(task = %task.display_id(), %err, "note why it waits");
                     }
                 }
                 continue;
@@ -1353,22 +1401,22 @@ impl Fleet {
             let Some(handle) = self.get(&name) else {
                 continue;
             };
+            let mut on = task.clone();
             if let Some(Ok(spec)) = settled_on(&name) {
-                let mut on = task.clone();
                 on.spec = spec;
-                if on
-                    .error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
-                {
-                    on.error = None;
-                }
-                if (on.spec != task.spec || on.error != task.error)
-                    && let Err(err) = self.store.update_task(&mut on)
-                {
-                    tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
-                    continue;
-                }
+            }
+            if on
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
+            {
+                on.error = None;
+            }
+            if (on.spec != task.spec || on.error != task.error)
+                && let Err(err) = self.store.update_task(&mut on)
+            {
+                tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
+                continue;
             }
             match handle.dispatch(task.id).await {
                 Ok(t) => {
@@ -5495,7 +5543,7 @@ mod tests {
         assert!(diff.is_empty(), "{diff:?}");
         let views = d.fleet().views();
         let h = views.iter().find(|v| v.name == "h").unwrap();
-        assert_eq!(h.flock, "work");
+        assert!(h.in_flock("work") && !h.in_flock("home"), "{h:?}");
         let resp = d.handle(run_in(Some("home"), None)).await;
         let IpcResponse::Task(t) = resp else {
             panic!("{resp:?}")
@@ -6370,6 +6418,81 @@ mod tests {
         assert_eq!(state(critical.id), TaskState::Running, "on burst");
         assert_eq!(state(second.id), TaskState::Queued);
         assert_eq!(fake.agents().len(), 3);
+    }
+
+    /// One machine in two flocks: a flock at its number there waits with a
+    /// note saying so, the task behind it from the other flock goes, and
+    /// the machine's status carries both flocks with their live tasks.
+    #[tokio::test]
+    async fn dispatch_keeps_a_flock_to_its_number_on_a_machine() {
+        let fake = FakeHerdr::new();
+        let flock: Flock = toml::from_str(
+            "[[flock]]\nname = \"home\"\ndefault = true\nmachines = { desk = 3 }\n\n\
+             [[flock]]\nname = \"work\"\nmachines = { desk = 1 }\n\n\
+             [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 3\njob_slots = 1\nburst = 1\n",
+        )
+        .unwrap();
+        flock.validate().unwrap();
+        let (d, _tmp) = daemon_with_flock(flock, &[("desk", 3, fake.clone())]).await;
+        let insert = |job: &str, flock: &str| {
+            d.store()
+                .insert_task(NewTask {
+                    job: job.into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                    flock: flock.into(),
+                    description: None,
+                })
+                .unwrap()
+        };
+        let first = insert("run", "work");
+        let second = insert("nightly", "work");
+        let home = insert("run", "home");
+        let fleet = d.fleet();
+        fleet.dispatch_queued().await;
+        let task = |id: i64| d.store().get_task(id).unwrap().unwrap();
+        assert_eq!(task(first.id).state, TaskState::Running);
+        assert_eq!(
+            task(second.id).state,
+            TaskState::Queued,
+            "no job slot past the number"
+        );
+        assert_eq!(
+            task(second.id).error.as_deref(),
+            Some("waiting for a machine: flock work is at 1 of 1 on desk")
+        );
+        assert_eq!(
+            task(home.id).state,
+            TaskState::Running,
+            "the next task goes"
+        );
+        let status = fleet
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == "desk")
+            .unwrap();
+        assert_eq!(status.flock.as_deref(), Some("home"));
+        let seats: Vec<(String, Option<u32>, usize)> = status
+            .flocks
+            .iter()
+            .map(|f| (f.name.clone(), f.max, f.live))
+            .collect();
+        assert_eq!(
+            seats,
+            [("home".into(), Some(3), 1), ("work".into(), Some(1), 1)]
+        );
+
+        // The flock's task ends; the waiting one goes and its note clears.
+        fleet
+            .get("desk")
+            .unwrap()
+            .close(first.id, false)
+            .await
+            .unwrap();
+        fleet.dispatch_queued().await;
+        assert_eq!(task(second.id).state, TaskState::Running);
+        assert_eq!(task(second.id).error, None);
     }
 
     /// `FileGet` and `FilePut` act on the head's own files, named only as

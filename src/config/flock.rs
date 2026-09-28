@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use std::collections::BTreeMap;
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +42,10 @@ pub struct MachineConfig {
     pub burst: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// The flock this machine belongs to; `None` is the default flock.
+    /// The old way to put a machine in a flock: membership in it with the
+    /// machine's own limits (`max_agents`, job slots, burst) as the flock's
+    /// number here. Kept as written; `None` adds nothing (see
+    /// `Flock::flocks_of`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flock: Option<String>,
     /// The agent for tasks on this machine that name none, before its
@@ -76,9 +81,9 @@ pub struct MachineConfig {
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
 pub const DEFAULT_FLOCK: &str = "default";
 
-/// One `[[flock]]` entry: a name, and the agent its tasks get when the task
-/// or job says nothing. Which machines are in it is each machine's `flock`
-/// field, so a machine is in exactly one.
+/// One `[[flock]]` entry: a name, the machines it may use, and the agent its
+/// tasks get when the task or job says nothing. A machine can be in many
+/// flocks (see `Flock::flocks_of`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlockEntry {
@@ -86,6 +91,11 @@ pub struct FlockEntry {
     /// Where tasks and jobs that name no flock go. Exactly one entry has it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
+    /// The machines this flock may use, each with at most how many of the
+    /// flock's live tasks it runs: `machines = { desk = 2 }`. Job slots and
+    /// burst never take a machine past it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub machines: BTreeMap<String, u32>,
     /// The agent for this flock's tasks that name none; `None` falls through
     /// to `[defaults] agent` (see `Defaults::resolve_agent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,15 +134,24 @@ pub struct FlockEntry {
 pub enum TaskFlockError {
     #[error("flock {0} does not exist")]
     UnknownFlock(String),
-    #[error("machine {machine} is in flock {flock}, not {requested}")]
+    #[error("machine {machine} is in {}, not {requested}", flocks_phrase(flocks))]
     MachineElsewhere {
         machine: String,
-        flock: String,
+        flocks: Vec<String>,
         requested: String,
     },
 }
 
-/// `flock.toml`: the declared flocks and the machines, each in one of them.
+/// `flock a` or `flocks a, b`.
+fn flocks_phrase(flocks: &[String]) -> String {
+    match flocks {
+        [one] => format!("flock {one}"),
+        many => format!("flocks {}", many.join(", ")),
+    }
+}
+
+/// `flock.toml`: the declared flocks and the machines, each in one or more
+/// of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flock {
     /// Empty means one implicit flock, `DEFAULT_FLOCK`, holding every machine.
@@ -278,6 +297,29 @@ impl Flock {
             {
                 return Err(format!("machine {}: flock {f} is not declared", m.name));
             }
+            if let Some(f) = &m.flock
+                && self
+                    .entry(f)
+                    .is_some_and(|e| e.machines.contains_key(&m.name))
+            {
+                return Err(format!(
+                    "machine {}: in flock {f} twice, by its flock key and by the flock's machines",
+                    m.name
+                ));
+            }
+        }
+        for f in &self.flocks {
+            for (name, n) in &f.machines {
+                if self.get(name).is_none() {
+                    return Err(format!("flock {}: machine {name} is not declared", f.name));
+                }
+                if *n == 0 {
+                    return Err(format!(
+                        "flock {}: machine {name}: the number must be at least 1",
+                        f.name
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -346,20 +388,85 @@ impl Flock {
         self.flock_names().contains(&name)
     }
 
-    /// The flock `m` belongs to.
-    pub fn flock_of<'a>(&'a self, m: &'a MachineConfig) -> &'a str {
-        m.flock.as_deref().unwrap_or_else(|| self.default_flock())
+    /// The flocks `m` is in, in file order, each with its number there: at
+    /// most how many of that flock's live tasks `m` runs. A flock whose
+    /// `machines` lists `m` counts with the number it gives, and so does the
+    /// flock its old `flock` key names, with `None`: the machine's own
+    /// limits, `max_agents` and on top of it the job slots and burst. A
+    /// machine neither places is in the default flock the same way, as
+    /// every machine was before flocks.
+    pub fn flocks_of<'a>(&'a self, m: &MachineConfig) -> Vec<(&'a str, Option<u32>)> {
+        let mut out: Vec<(&str, Option<u32>)> = self
+            .flocks
+            .iter()
+            .filter_map(|f| {
+                if let Some(n) = f.machines.get(&m.name) {
+                    Some((f.name.as_str(), Some(*n)))
+                } else if m.flock.as_deref() == Some(f.name.as_str()) {
+                    Some((f.name.as_str(), None))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if out.is_empty() {
+            out.push((self.default_flock(), None));
+        }
+        out
     }
 
-    /// The flock of the machine named `name`, `None` when there is no such
+    /// `flocks_of` the machine named `name`, `None` when there is no such
     /// machine.
-    pub fn machine_flock(&self, name: &str) -> Option<&str> {
-        self.get(name).map(|m| self.flock_of(m))
+    pub fn machine_flocks(&self, name: &str) -> Option<Vec<(&str, Option<u32>)>> {
+        self.get(name).map(|m| self.flocks_of(m))
     }
 
-    /// The flock a new task targets: the one it names, else the flock of the
-    /// machine it is pinned to, else the default. A named flock must exist,
-    /// and a pinned machine must be in it. A pin to a machine this file does
+    /// Whether `m` is in `flock`.
+    pub fn in_flock(&self, m: &MachineConfig, flock: &str) -> bool {
+        self.flocks_of(m).iter().any(|(f, _)| *f == flock)
+    }
+
+    /// The machines in `flock`, in file order.
+    pub fn members(&self, flock: &str) -> Vec<&str> {
+        self.machines
+            .iter()
+            .filter(|m| self.in_flock(m, flock))
+            .map(|m| m.name.as_str())
+            .collect()
+    }
+
+    /// Whether nothing but the default puts `m` in a flock: no `flock` key
+    /// and no flock's `machines`. Such a machine follows the default.
+    pub fn unplaced(&self, m: &MachineConfig) -> bool {
+        m.flock.is_none()
+            && self
+                .flocks
+                .iter()
+                .all(|f| !f.machines.contains_key(&m.name))
+    }
+
+    /// The one flock that stands for `m` where one name is wanted (a task
+    /// pinned to it that names none, a machine's profile, an old reader):
+    /// the default flock when `m` is in it, else its first.
+    pub fn primary_flock<'a>(&'a self, m: &MachineConfig) -> &'a str {
+        let flocks = self.flocks_of(m);
+        let default = self.default_flock();
+        if flocks.iter().any(|(f, _)| *f == default) {
+            default
+        } else {
+            flocks[0].0
+        }
+    }
+
+    /// `primary_flock` of the machine named `name`, `None` when there is no
+    /// such machine.
+    pub fn machine_flock(&self, name: &str) -> Option<&str> {
+        self.get(name).map(|m| self.primary_flock(m))
+    }
+
+    /// The flock a new task targets: the one it names, else the primary
+    /// flock of the machine it is pinned to, else the default. A named flock
+    /// must exist, and a pinned machine must be in it. A pin to a machine this file does
     /// not have settles nothing: the caller refuses that machine itself.
     pub fn task_flock(
         &self,
@@ -371,17 +478,21 @@ impl Flock {
         {
             return Err(TaskFlockError::UnknownFlock(f.to_string()));
         }
-        let pinned = pinned.and_then(|m| Some((m, self.machine_flock(m)?)));
+        let pinned = pinned.and_then(|m| self.get(m));
         match (requested, pinned) {
-            (Some(want), Some((machine, flock))) if want != flock => {
+            (Some(want), Some(m)) if !self.in_flock(m, want) => {
                 Err(TaskFlockError::MachineElsewhere {
-                    machine: machine.to_string(),
-                    flock: flock.to_string(),
+                    machine: m.name.clone(),
+                    flocks: self
+                        .flocks_of(m)
+                        .into_iter()
+                        .map(|(f, _)| f.to_string())
+                        .collect(),
                     requested: want.to_string(),
                 })
             }
             (Some(want), _) => Ok(want.to_string()),
-            (None, Some((_, flock))) => Ok(flock.to_string()),
+            (None, Some(m)) => Ok(self.primary_flock(m).to_string()),
             (None, None) => Ok(self.default_flock().to_string()),
         }
     }
@@ -664,6 +775,11 @@ impl FlockDoc {
             return Err(EditError::UnknownMachine(name.into()));
         }
         self.remove_named("machine", name);
+        for t in self.tables_mut("flock") {
+            if let Some(ms) = t.get_mut("machines").and_then(|i| i.as_table_like_mut()) {
+                ms.remove(name);
+            }
+        }
         Ok(())
     }
 
@@ -706,7 +822,7 @@ impl FlockDoc {
         let machines: Vec<String> = f
             .machines
             .iter()
-            .filter(|m| m.flock.is_none())
+            .filter(|m| f.unplaced(m))
             .map(|m| m.name.clone())
             .collect();
         if default && f.flocks.is_empty() && queued.is_empty() {
@@ -771,12 +887,7 @@ impl FlockDoc {
         if f.default_flock() == name {
             return Err(EditError::RemovingDefault(name.into()));
         }
-        let machines: Vec<String> = f
-            .machines
-            .iter()
-            .filter(|m| f.flock_of(m) == name)
-            .map(|m| m.name.clone())
-            .collect();
+        let machines: Vec<String> = f.members(name).into_iter().map(String::from).collect();
         if !machines.is_empty() {
             return Err(EditError::FlockHasMachines {
                 flock: name.into(),
@@ -807,7 +918,7 @@ impl FlockDoc {
             return Ok(());
         }
         self.declare_implicit(&f);
-        for m in f.machines.iter().filter(|m| m.flock.is_none()) {
+        for m in f.machines.iter().filter(|m| f.unplaced(m)) {
             let t = self.machine_mut(&m.name).expect("listed by current()");
             t.insert("flock", toml_edit::value(old.as_str()));
         }
@@ -1012,7 +1123,7 @@ flock = "work"
             f.task_flock(Some("home"), Some("w")).unwrap_err(),
             TaskFlockError::MachineElsewhere {
                 machine: "w".into(),
-                flock: "work".into(),
+                flocks: vec!["work".into()],
                 requested: "home".into(),
             }
         );
@@ -1029,6 +1140,125 @@ flock = "work"
         // A pin to a machine the file does not have settles nothing; the
         // caller refuses the machine on its own terms.
         assert_eq!(f.task_flock(None, Some("gone")).unwrap(), "home");
+    }
+
+    const MANY: &str = r#"
+[[flock]]
+name = "home"
+default = true
+machines = { desk = 3, lab = 1 }
+
+[[flock]]
+name = "work"
+machines = { desk = 2 }
+
+[[flock]]
+name = "play"
+
+[[machine]]
+name = "desk"
+local = true
+max_agents = 4
+
+[[machine]]
+name = "lab"
+ssh = "user@lab"
+flock = "play"
+
+[[machine]]
+name = "spare"
+ssh = "user@spare"
+"#;
+
+    /// A flock's `machines` lists the machines it may use with its number
+    /// on each; a machine can be in many. The old `flock` key is membership
+    /// with no number but the machine's own limits, and a machine nothing
+    /// places is in the default flock the same way.
+    #[test]
+    fn a_machine_can_be_in_many_flocks_each_with_its_number() {
+        let f = flocks(MANY).unwrap();
+        assert_eq!(
+            f.machine_flocks("desk").unwrap(),
+            [("home", Some(3)), ("work", Some(2))]
+        );
+        assert_eq!(
+            f.machine_flocks("lab").unwrap(),
+            [("home", Some(1)), ("play", None)]
+        );
+        assert_eq!(f.machine_flocks("spare").unwrap(), [("home", None)]);
+        assert_eq!(f.machine_flocks("gone"), None);
+        assert!(f.in_flock(f.get("desk").unwrap(), "work"));
+        assert!(!f.in_flock(f.get("desk").unwrap(), "play"));
+        assert_eq!(f.members("home"), ["desk", "lab", "spare"]);
+        assert_eq!(f.members("work"), ["desk"]);
+        assert_eq!(f.members("play"), ["lab"]);
+        // One flock stands for the machine where one name is wanted: the
+        // default when it is in it, else its first.
+        assert_eq!(f.machine_flock("desk"), Some("home"));
+        let only_work = flocks(&MANY.replace("desk = 3, ", "")).unwrap();
+        assert_eq!(only_work.machine_flock("desk"), Some("work"));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flock.toml");
+        f.save(&path).unwrap();
+        assert_eq!(Flock::load(&path).unwrap(), f);
+    }
+
+    #[test]
+    fn membership_errors_fail_the_load() {
+        let unknown = MANY.replace("desk = 2", "nope = 2");
+        assert_eq!(
+            flocks(&unknown).unwrap_err(),
+            "flock work: machine nope is not declared"
+        );
+        let zero = MANY.replace("desk = 2", "desk = 0");
+        assert_eq!(
+            flocks(&zero).unwrap_err(),
+            "flock work: machine desk: the number must be at least 1"
+        );
+        let twice = MANY.replace(
+            "name = \"play\"\n",
+            "name = \"play\"\nmachines = { lab = 1 }\n",
+        );
+        assert_eq!(
+            flocks(&twice).unwrap_err(),
+            "machine lab: in flock play twice, by its flock key and by the flock's machines"
+        );
+        assert!(flocks(&MANY.replace("desk = 2", "desk = \"two\"")).is_err());
+    }
+
+    /// A pinned machine in many flocks: a named flock must be one of them,
+    /// and none named is the one that stands for the machine.
+    #[test]
+    fn task_flock_with_a_machine_in_many_flocks() {
+        let f = flocks(MANY).unwrap();
+        assert_eq!(f.task_flock(Some("work"), Some("desk")).unwrap(), "work");
+        assert_eq!(f.task_flock(None, Some("desk")).unwrap(), "home");
+        assert_eq!(
+            f.task_flock(Some("play"), Some("desk"))
+                .unwrap_err()
+                .to_string(),
+            "machine desk is in flocks home, work, not play"
+        );
+    }
+
+    /// Removing a machine takes it out of every flock's `machines`, and a
+    /// flock that lists a machine has it for `flock remove`.
+    #[test]
+    fn machine_remove_leaves_the_flocks_and_listed_machines_hold_a_flock() {
+        let mut d = FlockDoc::parse(MANY).unwrap();
+        assert_eq!(
+            d.remove_flock("work", &[]).unwrap_err(),
+            EditError::FlockHasMachines {
+                flock: "work".into(),
+                machines: vec!["desk".into()],
+            }
+        );
+        d.remove_machine("desk").unwrap();
+        let f = d.flock().unwrap();
+        assert!(f.entry("work").unwrap().machines.is_empty());
+        assert_eq!(f.members("home"), ["lab", "spare"]);
+        assert!(d.to_string().contains("machines = { lab = 1 }"), "{d}");
+        d.remove_flock("work", &[]).unwrap();
     }
 
     #[test]

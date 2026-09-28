@@ -166,29 +166,52 @@ fn why_waiting(
     }
     if let Some(m) = pick_machine_where(views, flock, &task.spec, claim, &|m| accepts(task, m)) {
         let v = views.iter_mut().find(|v| v.name == m).expect("picked");
-        v.live += 1;
+        v.take(flock, claim);
         return format!("next pass: {m} has room");
     }
     let tags = &task.spec.tags;
     let has_tags = |v: &MachineView| tags.iter().all(|t| v.tags.contains(t));
+    // The flock at its number on `v`, as `dispatch_queued` notes it.
+    let at_number = |v: &MachineView| {
+        let seat = v.seat(flock)?;
+        let max = seat.max.filter(|_| !seat.has_room())?;
+        Some(format!(
+            "flock {flock} is at {} of {max} on {}",
+            seat.live, v.name
+        ))
+    };
     if let Some(pinned) = &task.spec.machine {
         return match views.iter().find(|v| &v.name == pinned) {
             None => format!("machine {pinned} is not in the flock"),
-            Some(v) if v.flock != flock => {
-                format!("machine {pinned} is in flock {}, not {flock}", v.flock)
+            Some(v) if !v.in_flock(flock) => {
+                let names: Vec<&str> = v.flocks.iter().map(|f| f.name.as_str()).collect();
+                let noun = if names.len() == 1 { "flock" } else { "flocks" };
+                format!(
+                    "machine {pinned} is in {noun} {}, not {flock}",
+                    names.join(", ")
+                )
             }
             Some(v) if !v.healthy => format!("machine {pinned} is not connected"),
             Some(v) if !has_tags(v) => format!("machine {pinned} lacks tags {}", tags.join(", ")),
+            Some(v) if v.has_room(claim) && at_number(v).is_some() => {
+                at_number(v).expect("checked")
+            }
             Some(v) => format!("machine {pinned} is full ({}/{})", v.live, v.max_agents),
         };
     }
-    let mine: Vec<&MachineView> = views.iter().filter(|v| v.flock == flock).collect();
+    let mine: Vec<&MachineView> = views.iter().filter(|v| v.in_flock(flock)).collect();
     if mine.is_empty() {
         format!("flock {flock} has no machines")
     } else if !mine.iter().any(|v| v.healthy) {
         format!("no machine in flock {flock} is connected")
     } else if !mine.iter().any(|v| v.healthy && has_tags(v)) {
         format!("no machine in flock {flock} has tags {}", tags.join(", "))
+    } else if let Some(why) = mine
+        .iter()
+        .filter(|v| v.healthy && has_tags(v) && v.has_room(claim))
+        .find_map(|v| at_number(v))
+    {
+        why
     } else {
         format!("flock {flock} is full")
     }
@@ -265,7 +288,11 @@ mod tests {
             live,
             live_jobs: 0,
             healthy,
-            flock: flock.into(),
+            flocks: vec![crate::dispatch::FlockSeat {
+                name: flock.into(),
+                max: None,
+                live,
+            }],
         }
     }
 
@@ -362,6 +389,38 @@ mod tests {
                 "no machine in flock lab has tags gpu",
                 "waiting for a machine: no agent runs gpt",
                 "machine b is not connected",
+            ]
+        );
+    }
+
+    /// A flock at its number on a machine with room waits with that as the
+    /// reason, and the task behind it in another flock goes.
+    #[test]
+    fn a_flock_at_its_number_says_so_and_the_next_task_goes() {
+        let seat = |name: &str, max: u32, live: usize| crate::dispatch::FlockSeat {
+            name: name.into(),
+            max: Some(max),
+            live,
+        };
+        let views = [MachineView {
+            flocks: vec![seat("default", 3, 0), seat("work", 2, 1)],
+            ..view("desk", "default", 1, 4, true)
+        }];
+        assert_eq!(
+            whys(
+                vec![
+                    task(1, Some("work"), None),
+                    task(2, Some("work"), Some("desk")),
+                    task(3, Some("work"), None),
+                    task(4, None, None),
+                ],
+                &views
+            ),
+            [
+                "next pass: desk has room",
+                "flock work is at 2 of 2 on desk",
+                "flock work is at 2 of 2 on desk",
+                "next pass: desk has room",
             ]
         );
     }

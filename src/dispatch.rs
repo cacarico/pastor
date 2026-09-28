@@ -7,6 +7,7 @@ use crate::config::Agents;
 use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
 };
+pub use crate::machine::FlockSeat;
 use crate::task::{Checkout, DispatchSpec, Place, Priority, Reopen, Task, TaskState};
 
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
@@ -36,8 +37,9 @@ pub struct MachineView {
     /// How many of `live` come from a job (`Task::from_job`).
     pub live_jobs: usize,
     pub healthy: bool,
-    /// The flock the machine is in now.
-    pub flock: String,
+    /// The flocks the machine is in now, each with its number and how many
+    /// of its live tasks run here.
+    pub flocks: Vec<FlockSeat>,
 }
 
 /// What a task may take on a machine: a job slot if it comes from a job,
@@ -58,6 +60,31 @@ impl Claim {
 }
 
 impl MachineView {
+    /// `flock`'s seat here, `None` when the machine is not in it.
+    pub fn seat(&self, flock: &str) -> Option<&FlockSeat> {
+        self.flocks.iter().find(|f| f.name == flock)
+    }
+
+    pub fn in_flock(&self, flock: &str) -> bool {
+        self.seat(flock).is_some()
+    }
+
+    /// Is `flock` under its number here? Job slots and burst never pass it.
+    pub fn flock_has_room(&self, flock: &str) -> bool {
+        self.seat(flock).is_some_and(FlockSeat::has_room)
+    }
+
+    /// Count one more live task of `flock` here, as a dispatch would.
+    pub fn take(&mut self, flock: &str, claim: Claim) {
+        self.live += 1;
+        if claim.from_job {
+            self.live_jobs += 1;
+        }
+        if let Some(s) = self.flocks.iter_mut().find(|f| f.name == flock) {
+            s.live += 1;
+        }
+    }
+
     /// Is there a slot for a task that claims `claim`? Up to `job_slots`
     /// live job tasks sit in job slots; every other live task counts
     /// against `max_agents`. A job task takes a free job slot, then a
@@ -74,7 +101,8 @@ impl MachineView {
 
 /// Only machines in `flock`, the task's, qualify. Of those the pinned machine
 /// wins. Otherwise: healthy, has every required tag, has room for `claim`
-/// (`MachineView::has_room`), fewest live tasks. Ties keep flock order.
+/// (`MachineView::has_room`) with `flock` under its number there
+/// (`MachineView::flock_has_room`), fewest live tasks. Ties keep flock order.
 pub fn pick_machine(
     machines: &[MachineView],
     flock: &str,
@@ -94,9 +122,9 @@ pub fn pick_machine_where(
     accepts: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
     let fits = |m: &MachineView| {
-        m.flock == flock
-            && m.healthy
+        m.healthy
             && m.has_room(claim)
+            && m.flock_has_room(flock)
             && spec.tags.iter().all(|t| m.tags.contains(t))
             && accepts(&m.name)
     };
@@ -826,7 +854,15 @@ mod tests {
             live,
             live_jobs: 0,
             healthy,
-            flock: "default".into(),
+            flocks: vec![seat("default", None, live)],
+        }
+    }
+
+    fn seat(name: &str, max: Option<u32>, live: usize) -> FlockSeat {
+        FlockSeat {
+            name: name.into(),
+            max,
+            live,
         }
     }
 
@@ -836,7 +872,7 @@ mod tests {
         let ms = vec![
             mv("home-1", 2, 1, &[], true),
             MachineView {
-                flock: "work".into(),
+                flocks: vec![seat("work", None, 0)],
                 ..mv("work-1", 2, 0, &[], true)
             },
         ];
@@ -857,6 +893,55 @@ mod tests {
             pick_machine(&ms, "default", &pinned_elsewhere, Claim::default()),
             None,
             "a pinned machine that moved to another flock takes nothing"
+        );
+    }
+
+    /// A machine in two flocks takes a flock's task only while that flock is
+    /// under its number there, whatever room the machine has; the other
+    /// flock is not held back by it.
+    #[test]
+    fn pick_machine_keeps_a_flock_to_its_number() {
+        let desk = MachineView {
+            flocks: vec![seat("home", Some(3), 1), seat("work", Some(1), 1)],
+            ..mv("desk", 4, 2, &[], true)
+        };
+        let ms = vec![desk.clone()];
+        assert_eq!(pick_machine(&ms, "work", &spec(), Claim::default()), None);
+        assert_eq!(
+            pick_machine(&ms, "home", &spec(), Claim::default()).as_deref(),
+            Some("desk")
+        );
+        let pinned = DispatchSpec {
+            machine: Some("desk".into()),
+            ..spec()
+        };
+        assert_eq!(pick_machine(&ms, "work", &pinned, Claim::default()), None);
+        // Job slots and burst never pass the flock's number.
+        let slack = vec![MachineView {
+            job_slots: 2,
+            burst: 2,
+            ..desk.clone()
+        }];
+        for claim in [JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert_eq!(pick_machine(&slack, "work", &spec(), claim), None);
+        }
+        // Under its number, the flock goes to whichever member has room.
+        let other = MachineView {
+            flocks: vec![seat("work", Some(2), 0)],
+            ..mv("lab", 2, 1, &[], true)
+        };
+        assert_eq!(
+            pick_machine(&[desk, other], "work", &spec(), Claim::default()).as_deref(),
+            Some("lab")
+        );
+        // With no number of its own, a flock has the machine's limits.
+        let old = vec![MachineView {
+            job_slots: 1,
+            ..mv("old", 1, 1, &[], true)
+        }];
+        assert_eq!(
+            pick_machine(&old, "default", &spec(), JOB).as_deref(),
+            Some("old")
         );
     }
 

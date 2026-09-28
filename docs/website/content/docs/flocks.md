@@ -8,7 +8,9 @@ manual: flocks
 
 A flock is a named group of machines. Every task and job targets one flock,
 and only its machines take the work, so work and personal machines, logged in
-to different accounts, never run each other's agents.
+to different accounts, never run each other's agents. A machine can be in many
+flocks, each with its own limit there, so one machine can be shared between
+projects without one taking every slot.
 
 ## flock.toml
 
@@ -17,26 +19,35 @@ to different accounts, never run each other's agents.
 [[flock]]
 name = "personal"
 default = true  # tasks and jobs that name no flock go here
+machines = { here = 2 }  # here runs at most 2 of personal's tasks
 
 [[flock]]
 name = "work"
+machines = { here = 1 }  # and at most 1 of work's
 description = "Paid work, on the work account"  # optional, for --wide and describe
 agent = "claude"
 agent_args = ["--model", "claude-sonnet-5"]
 
 [[machine]]
 name = "here"
-local = true  # no flock: the default one
+local = true
+max_agents = 3
 
 [[machine]]
 name = "pi-1"
 ssh = "user@pi-1"
-flock = "work"
+flock = "work"  # the old way: in work, with the machine's own limits
 tags = ["arm"]
 ```
 
 Exactly one flock has `default = true`. A file with no `[[flock]]` at all is
-one flock named `default` that holds every machine.
+one flock named `default` that holds every machine, and a machine nothing
+places is in the default flock.
+
+A task starts on a machine only when the machine has room and the task's flock
+is under its number there; job slots and burst never pass it. A task whose
+flock is full waits, saying `flock work is at 1 of 1 on here`, and the next
+task in the queue goes.
 
 ## which agent
 
