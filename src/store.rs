@@ -1883,7 +1883,7 @@ mod tests {
             );
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "12");
+        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "13");
         assert_eq!(s.get_task(1).unwrap().unwrap().summary, None);
         assert_eq!(s.end_round(1, Some("done")).unwrap().round, 1);
     }
@@ -3241,7 +3241,7 @@ mod tests {
                  DROP TABLE task_summaries;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '12' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '13' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
