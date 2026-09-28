@@ -375,7 +375,7 @@ impl Job {
 /// outside a full `Job::parse` (the CLI's `enable`/`disable`) can reject a
 /// name before joining it under the jobs directory: an unvalidated name like
 /// `"../pastor"` resolves outside it entirely.
-/// A `[dispatch]` table's keys but `prompt`, which travels beside it.
+/// A `[dispatch]` table with `prompt` removed, since it travels beside it.
 fn table_without_prompt(table: &Value) -> serde_json::Map<String, Value> {
     let mut map = table.as_object().cloned().unwrap_or_default();
     map.remove("prompt");

@@ -15,7 +15,7 @@ use crate::config::{
 };
 use crate::dispatch::{Claim, MachineView, pick_machine, pick_machine_where};
 use crate::herdr::{Connector, Endpoint};
-use crate::ipc::{HeadPing, IpcRequest, IpcResponse};
+use crate::ipc::{HeadPing, IpcRequest, IpcResponse, MODEL_PROTOCOL, check_protocol};
 use crate::machine::{
     ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, SendInput,
     SendRefused, ShutdownOutcome, spawn_machine,
@@ -884,6 +884,17 @@ impl Fleet {
         let Some(forward) = &self.forward else {
             anyhow::bail!("this pastor serve is the head; it queues its jobs' items itself");
         };
+        // A named model rides in `dispatch`, which only a head of
+        // `MODEL_PROTOCOL` or later reads; an older one would drop it and
+        // start the agent on its default model without a word.
+        if job.agent.model.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(&version, protocol, MODEL_PROTOCOL, "a job naming a model")?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
         let reply = forward(IpcRequest::JobSubmit {
             job: job.name.clone(),
             dispatch: job.dispatch.clone(),

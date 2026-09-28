@@ -348,7 +348,12 @@ pub async fn run_job(
             problems.push(format!("{}: rejected: {why}", item.key));
             continue;
         }
-        if (report.created.len() + to_head.len()) as u32 >= job.max_tasks_per_run {
+        // A headless serve's own `max_tasks_per_run` may differ from the
+        // head's `[defaults]` for this job; leave the cap to the head's
+        // `JobSubmit` handling (`Daemon::submit`) instead of pre-capping here.
+        if !fleet.submits_to_head()
+            && (report.created.len() + to_head.len()) as u32 >= job.max_tasks_per_run
+        {
             report.deferred += 1;
             continue;
         }
