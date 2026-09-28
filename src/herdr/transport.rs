@@ -18,7 +18,7 @@ const CONTROL_PATH_STAGING: usize = 17;
 
 /// `sun_path` is 108 bytes on Linux and 104 on macOS and the BSDs, including
 /// the terminating NUL.
-const UNIX_PATH_MAX: usize = unix_path_max(cfg!(target_os = "linux"));
+pub(crate) const UNIX_PATH_MAX: usize = unix_path_max(cfg!(target_os = "linux"));
 
 const fn unix_path_max(linux: bool) -> usize {
     if linux { 108 } else { 104 }
@@ -170,7 +170,7 @@ fn expanded_len(path: &Path) -> usize {
 /// recognisable in `ls`; `%C` (a hash of the destination) is what keeps
 /// machines apart, so cutting the name loses nothing. `None` only when even a
 /// bare `-%C` does not fit, which takes an unusually deep state dir.
-fn fitting_control_path(paths: &Paths, machine: &str) -> Option<PathBuf> {
+pub(crate) fn fitting_control_path(paths: &Paths, machine: &str) -> Option<PathBuf> {
     let chars = machine.chars().count();
     (0..=chars).rev().find_map(|keep| {
         let short: String = machine.chars().take(keep).collect();

@@ -62,8 +62,11 @@ pub struct RemoteHead {
     pub source: HeadSource,
     /// ssh's `ControlPath` for this head, under the state dir. Built by
     /// `Paths::ssh_control_path`, which escapes a `%` in the state dir so ssh
-    /// does not expand it as one of its own tokens.
-    control_path: PathBuf,
+    /// does not expand it as one of its own tokens, and shortened as the
+    /// machine transport's is (`fitting_control_path`): a socket name longer
+    /// than `sun_path` (104 bytes on macOS) fails every request. `None` when
+    /// even a bare `-%C` does not fit; ssh then runs without multiplexing.
+    control_path: Option<PathBuf>,
     /// The directory the control socket lives in, created private before ssh
     /// runs.
     control_dir: PathBuf,
@@ -161,7 +164,7 @@ impl RemoteHead {
             ssh: ssh.to_string(),
             pastor: pastor.unwrap_or_else(|| DEFAULT_PASTOR.to_string()),
             source,
-            control_path: paths.ssh_control_path("head"),
+            control_path: crate::herdr::transport::fitting_control_path(paths, "head"),
             control_dir: paths.ssh_dir(),
         }
     }
@@ -171,13 +174,14 @@ impl RemoteHead {
     /// `-`), and the remote command is quoted for the login shell that parses
     /// it, the same way the machine transport does.
     pub fn ssh_args(&self) -> Vec<String> {
+        let mut opts = vec!["BatchMode=yes".to_string()];
+        if let Some(path) = &self.control_path {
+            opts.push("ControlMaster=auto".to_string());
+            opts.push("ControlPersist=60s".to_string());
+            opts.push(format!("ControlPath={}", path.display()));
+        }
         let mut args = Vec::new();
-        for opt in [
-            "BatchMode=yes".to_string(),
-            "ControlMaster=auto".to_string(),
-            "ControlPersist=60s".to_string(),
-            format!("ControlPath={}", self.control_path.display()),
-        ] {
+        for opt in opts {
             args.push("-o".to_string());
             args.push(opt);
         }
@@ -498,6 +502,50 @@ mod tests {
                 "{opt}: {args:?}"
             );
         }
+        assert_eq!(
+            &args[args.len() - 3..],
+            ["--", "user@pi-1", "sh -c 'pastor bridge'"]
+        );
+    }
+
+    /// A state dir as deep as a long macOS home's: `head-%C` plus ssh's
+    /// 17-byte staging suffix no longer fits in `sun_path`, so the name is
+    /// cut until it does; deeper still, multiplexing goes too.
+    #[test]
+    fn a_control_path_too_long_for_a_socket_is_shortened_then_dropped() {
+        use crate::herdr::transport::UNIX_PATH_MAX;
+        let tmp = tempfile::tempdir().unwrap();
+        // `<state>/ssh/` is `base` bytes: `head-%C` (5 + 40) with the staging
+        // suffix is over the limit, a shorter name is under it.
+        let state = |base: usize| {
+            let fixed = tmp.path().as_os_str().len() + "/".len() + "/ssh/".len();
+            tmp.path().join("s".repeat(base - fixed))
+        };
+        let control = |h: &RemoteHead| {
+            h.ssh_args()
+                .into_iter()
+                .find_map(|a| a.strip_prefix("ControlPath=").map(str::to_string))
+        };
+
+        let p = Paths::new(tmp.path().join("c"), state(UNIX_PATH_MAX - 61));
+        let h = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File);
+        let path = control(&h).expect("a shorter ControlPath still fits");
+        let full = p.ssh_control_path("head").display().to_string();
+        assert!(path.len() < full.len() && path.ends_with("-%C"), "{path}");
+        // `%C` expands to 40 hex bytes, and ssh stages the socket 17 longer.
+        assert!(path.len() - 2 + 40 + 17 < UNIX_PATH_MAX, "{path}");
+        assert!(full.len() - 2 + 40 + 17 >= UNIX_PATH_MAX, "{full}");
+
+        let p = Paths::new(tmp.path().join("c"), state(UNIX_PATH_MAX - 50));
+        let args = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        assert!(
+            !args.iter().any(|a| a.starts_with("Control")),
+            "no multiplexing when nothing fits: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]),
+            "{args:?}"
+        );
         assert_eq!(
             &args[args.len() - 3..],
             ["--", "user@pi-1", "sh -c 'pastor bridge'"]

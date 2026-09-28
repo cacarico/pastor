@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- `pastor head set` and every command sent to a remote head failed with
+  `head_unreachable` ("path ... too long for Unix domain socket") when the
+  state dir was deep enough, as under a long macOS home: ssh's ControlPath
+  plus its 17-byte staging suffix went past `sun_path` (104 bytes on macOS).
+  The head's ControlPath is now shortened as the machine transport's is, and
+  ssh runs without multiplexing when even the shortest one does not fit.
+
 ## 0.7.0 - 2026-09-28
 
 ### Added
