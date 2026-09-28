@@ -27,8 +27,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `TaskSummaries`). 18: a machine in many flocks, each with its own number
 /// (`FlockEntry::machines`). 19: workspace labels (`DispatchSpec::label`).
 /// 20: the `summary` setting (`Run::summary`, a job's `[dispatch]
-/// summary`). 21: pull machines (`TaskClaim`, `TaskReport`).
-pub const IPC_PROTOCOL: u32 = 21;
+/// summary`). 21: pull machines (`TaskClaim`, `TaskReport`). 22:
+/// `FlockJoin`, `FlockLeave` and `FlockAdd::machines`.
+pub const IPC_PROTOCOL: u32 = 22;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -82,6 +83,11 @@ pub const MULTI_FLOCK_PROTOCOL: u32 = 18;
 /// The first protocol whose head knows pull machines: it answers
 /// `TaskClaim` and `TaskReport`. An older one refuses them as unreadable.
 pub const PULL_PROTOCOL: u32 = 21;
+
+/// The first protocol whose head takes `FlockJoin` and `FlockLeave` and
+/// honours `FlockAdd::machines`. An older one refuses the first two as
+/// unknown requests and adds the flock without its machines.
+pub const JOIN_PROTOCOL: u32 = 22;
 
 /// `Pong::role` of a headless `pastor serve`: it runs this machine's jobs
 /// and hooks against a head elsewhere, and is not a head itself.
@@ -237,6 +243,24 @@ pub enum IpcRequest {
         /// `flock add --description`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        /// Machines that join it, each with its `max_agents`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        machines: Vec<String>,
+    },
+    /// `flock join`: list a machine in a flock, or change its number there.
+    /// Answers `Text`.
+    FlockJoin {
+        flock: String,
+        machine: String,
+        /// `--max`; `None` keeps its number there, or gives a machine new
+        /// to the flock its `max_agents`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<u32>,
+    },
+    /// `flock leave`. Answers `Text`.
+    FlockLeave {
+        flock: String,
+        machine: String,
     },
     /// `flock default`. Answers `Text`.
     FlockSetDefault {
@@ -474,6 +498,8 @@ impl IpcRequest {
             | IpcRequest::Run { .. }
             | IpcRequest::FlockRemove { .. }
             | IpcRequest::FlockAdd { .. }
+            | IpcRequest::FlockJoin { .. }
+            | IpcRequest::FlockLeave { .. }
             | IpcRequest::FlockSetDefault { .. }
             | IpcRequest::MachineAdd { .. }
             | IpcRequest::MachineRemove { .. }
@@ -1233,6 +1259,16 @@ mod tests {
                 description: None,
                 name: "f".into(),
                 default: false,
+                machines: vec![],
+            },
+            IpcRequest::FlockJoin {
+                flock: "f".into(),
+                machine: "m".into(),
+                max: Some(2),
+            },
+            IpcRequest::FlockLeave {
+                flock: "f".into(),
+                machine: "m".into(),
             },
             IpcRequest::FlockSetDefault { name: "f".into() },
             IpcRequest::MachineAdd {

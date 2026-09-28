@@ -39,7 +39,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         ([_, "add"], "name") => None,
         (["queue", "move"], "task" | "before" | "after") => Some(Kind::QueuedTask),
         (_, "flock") => Some(Kind::Flock),
-        (_, "machine") => Some(Kind::Machine),
+        (_, "machine") | (["flock", "add"], "machines") => Some(Kind::Machine),
         (_, "task") => Some(Kind::Task),
         (_, "job") => Some(Kind::Job),
         (_, "model") => Some(Kind::Model),
@@ -103,7 +103,12 @@ pub fn slot(root: &Command, words: &[String]) -> Option<Kind> {
             let (flag, _) = current.split_once('=')?;
             option(node, flag).filter(|a| a.get_action().takes_values())?
         }
-        None => node.get_positionals().nth(positionals)?,
+        // Past the last positional, one that takes many values takes more.
+        None => node.get_positionals().nth(positionals).or_else(|| {
+            node.get_positionals()
+                .last()
+                .filter(|a| matches!(a.get_action(), clap::ArgAction::Append))
+        })?,
     };
     kind_of(&path, arg.get_id().as_str())
 }
