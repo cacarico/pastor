@@ -206,6 +206,7 @@ mod tests {
             job: "run".into(),
             item: serde_json::json!({}),
             prompt: "p".into(),
+            description: None,
             spec: DispatchSpec {
                 machine: machine.map(str::to_string),
                 ..serde_json::from_value(serde_json::json!({"agent": "claude"})).unwrap()
