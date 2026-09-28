@@ -83,8 +83,8 @@ impl SpotArgs {
     }
 }
 
-pub async fn run(paths: &Paths, a: QueueArgs, head: Head) -> anyhow::Result<()> {
-    match a.cmd {
+pub async fn run(paths: &Paths, mut a: QueueArgs, head: Head) -> anyhow::Result<()> {
+    match a.cmd.take() {
         Some(QueueCmd::Move(m)) => move_task(paths, m).await,
         None => list(paths, a, head).await,
     }
@@ -141,7 +141,7 @@ fn offline(
     let default = Flock::load(&paths.flock_file())
         .map(|f| f.default_flock().to_string())
         .unwrap_or_else(|_| "default".into());
-    let mut entries = crate::queue::entries(queued, &[], &default);
+    let mut entries = crate::queue::entries(queued, &[], &default, &|_, _| true);
     for e in &mut entries {
         e.why = "pastor serve is not running".into();
     }

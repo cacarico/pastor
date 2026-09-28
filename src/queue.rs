@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::age;
-use crate::dispatch::{MachineView, pick_machine};
+use crate::dispatch::{MachineView, pick_machine_where};
 use crate::task::Task;
 
 /// Where `pastor queue move` puts a task. Positions count from 1 over the
@@ -103,7 +103,14 @@ pub fn asked_by(task: &Task) -> String {
 /// `queue` (in dispatch order) as entries, each with why it waits on
 /// `machines`: a dispatch pass is played through, in order, each task that
 /// fits taking its slot, so a task behind them reads its flock as full.
-pub fn entries(queue: Vec<Task>, machines: &[MachineView], default_flock: &str) -> Vec<QueueEntry> {
+/// `accepts` is `dispatch_queued`'s model/agent compatibility check: a
+/// machine whose agent cannot run the task's model does not take it.
+pub fn entries(
+    queue: Vec<Task>,
+    machines: &[MachineView],
+    default_flock: &str,
+    accepts: &dyn Fn(&Task, &str) -> bool,
+) -> Vec<QueueEntry> {
     let mut views = machines.to_vec();
     queue
         .into_iter()
@@ -113,7 +120,7 @@ pub fn entries(queue: Vec<Task>, machines: &[MachineView], default_flock: &str) 
                 .flock
                 .clone()
                 .unwrap_or_else(|| default_flock.to_string());
-            let why = why_waiting(&task, &flock, &mut views);
+            let why = why_waiting(&task, &flock, &mut views, accepts);
             QueueEntry {
                 pos: i + 1,
                 flock,
@@ -126,13 +133,18 @@ pub fn entries(queue: Vec<Task>, machines: &[MachineView], default_flock: &str) 
 
 /// Why `task` waits in `flock` on `views`; a task that fits takes its slot
 /// in `views`, as the pass would.
-fn why_waiting(task: &Task, flock: &str, views: &mut [MachineView]) -> String {
+fn why_waiting(
+    task: &Task,
+    flock: &str,
+    views: &mut [MachineView],
+    accepts: &dyn Fn(&Task, &str) -> bool,
+) -> String {
     if let Some(note) = &task.error
         && note.starts_with(WAITING_FOR_MODEL)
     {
         return note.clone();
     }
-    if let Some(m) = pick_machine(views, flock, &task.spec) {
+    if let Some(m) = pick_machine_where(views, flock, &task.spec, &|m| accepts(task, m)) {
         let v = views.iter_mut().find(|v| v.name == m).expect("picked");
         v.live += 1;
         return format!("next pass: {m} has room");
@@ -231,7 +243,7 @@ mod tests {
     }
 
     fn whys(queue: Vec<Task>, views: &[MachineView]) -> Vec<String> {
-        entries(queue, views, "default")
+        entries(queue, views, "default", &|_, _| true)
             .into_iter()
             .map(|e| e.why)
             .collect()
@@ -295,7 +307,7 @@ mod tests {
         let mut job = task(2, Some("work"), Some("pi-1"));
         job.job = "nightly".into();
         job.priority = Priority::High;
-        let e = entries(vec![task(1, None, None), job], &[], "default");
+        let e = entries(vec![task(1, None, None), job], &[], "default", &|_, _| true);
         let rows = rows(&e);
         assert_eq!(QUEUE_HEADER.len(), rows[0].len());
         assert_eq!(

@@ -1129,7 +1129,25 @@ impl Fleet {
     ) -> anyhow::Result<Vec<QueueEntry>> {
         let queued = self.store.queued_tasks()?;
         let wanted = self.flock();
-        let mut entries = crate::queue::entries(queued, &self.views(), wanted.default_flock());
+        // Same model/agent compatibility check `dispatch_queued` applies: a
+        // machine whose agent cannot run the task's model does not take it.
+        let accepts = |task: &Task, machine: &str| {
+            let Some(source) = task.spec.agent_source.as_ref() else {
+                return true;
+            };
+            let target = task.flock.as_deref().unwrap_or(wanted.default_flock());
+            let mut spec = task.spec.clone();
+            self.settle(
+                &mut spec,
+                &source.ask,
+                target,
+                Some(machine),
+                &asked_by(task),
+            )
+            .is_ok()
+        };
+        let mut entries =
+            crate::queue::entries(queued, &self.views(), wanted.default_flock(), &accepts);
         entries.retain(|e| e.matches(flock, machine));
         Ok(entries)
     }
