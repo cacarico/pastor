@@ -454,8 +454,11 @@ pub struct MachineRow {
     pub live: Option<usize>,
     pub max_agents: u32,
     /// `MachineConfig::job_slots` and `burst`, shown after `max_agents` as
-    /// `2+1j+1b` when either is set.
+    /// `2+1j+1b` when either is set. Defaulted so a CLI can still read a
+    /// head that predates these fields.
+    #[serde(default)]
     pub job_slots: u32,
+    #[serde(default)]
     pub burst: u32,
     pub tags: Vec<String>,
     /// `MachineStatus::orphans`; a probe works them out itself from
