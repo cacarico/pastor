@@ -147,6 +147,9 @@ pub struct FlockDescription {
     /// head.
     #[serde(default)]
     pub agents_by_kind: crate::config::KindAgents,
+    /// The flock's own `profile`; `None` falls through to `[defaults]`.
+    #[serde(default)]
+    pub profile: Option<String>,
     pub machines: Vec<String>,
     /// Live agents on its machines; known only from a running head.
     pub agents: Option<usize>,
@@ -306,6 +309,7 @@ pub fn flock_description(
         deny: entry.deny,
         model: entry.model,
         agents_by_kind: entry.agents,
+        profile: entry.profile,
         machines: row.machines,
         agents: row.agents,
         tasks,
@@ -477,6 +481,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
                 .unwrap_or_else(|| "- (from its flock)".into()),
         ),
         ("by kind", by_kind(&m.agents_by_kind, "its flock")),
+        ("profile", dash(r.profile.clone())),
         ("channel", r.channel.clone()),
         ("herdr", dash(r.herdr_version.clone())),
         ("protocol", dash(r.protocol.map(|p| p.to_string()))),
@@ -520,6 +525,12 @@ pub fn flock_text(f: &FlockDescription) -> String {
                 .unwrap_or_else(|| "- (from [defaults])".into()),
         ),
         ("by kind", by_kind(&f.agents_by_kind, "[defaults]")),
+        (
+            "profile",
+            f.profile
+                .clone()
+                .unwrap_or_else(|| "- (from [defaults])".into()),
+        ),
         ("machines", dash(Some(f.machines.join(",")))),
         ("agents", dash(f.agents.map(|n| n.to_string()))),
     ]);
@@ -693,6 +704,7 @@ mod tests {
             deny: vec!["Bash(rm:*)".into()],
             model: Some("sonnet".into()),
             agents_by_kind: Default::default(),
+            profile: Some("develop".into()),
             machines: vec!["pi-1".into(), "pi-2".into()],
             agents: None,
             tasks: vec![],
@@ -708,6 +720,7 @@ mod tests {
         assert!(text.contains("by kind:    opencode=opencode\n"), "{text}");
         assert!(text.contains("--model 'a b'"), "{text}");
         assert!(text.contains("model:      sonnet"), "{text}");
+        assert!(text.contains("profile:    develop"), "{text}");
         assert!(text.contains("pi-1,pi-2"), "{text}");
         assert!(text.ends_with("tasks: none"), "{text}");
     }

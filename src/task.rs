@@ -296,6 +296,13 @@ pub struct AgentSource {
     /// Where `model` came from, labelled like `agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_from: Option<String>,
+    /// The permission profile the task runs under, whose lists are in the
+    /// spec's `allow` and `deny`; `None` when no layer names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Where `profile` came from, labelled like `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_from: Option<String>,
 }
 
 /// A worktree herdr made for a task: its branch and where it is on disk.
@@ -317,6 +324,13 @@ pub struct Reopen {
     pub branch: String,
     pub path: String,
     pub agent: String,
+}
+
+impl DispatchSpec {
+    /// The permission profile the task runs under, if it runs one.
+    pub fn profile(&self) -> Option<&str> {
+        self.agent_source.as_ref()?.profile.as_deref()
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -413,13 +427,22 @@ impl Task {
     pub fn model(&self) -> Option<&str> {
         self.spec.agent_source.as_ref()?.model.as_deref()
     }
-    /// The task as `--json` prints it: its row, with `model` beside it.
+    /// The permission profile the task runs under, if it runs one.
+    pub fn profile(&self) -> Option<&str> {
+        self.spec.profile()
+    }
+    /// The task as `--json` prints it: its row, with `model` and `profile`
+    /// beside it.
     pub fn to_json(&self) -> Value {
         let mut v = serde_json::to_value(self).unwrap_or(Value::Null);
         if let Value::Object(o) = &mut v {
             o.insert(
                 "model".into(),
                 self.model().map_or(Value::Null, Value::from),
+            );
+            o.insert(
+                "profile".into(),
+                self.profile().map_or(Value::Null, Value::from),
             );
         }
         v

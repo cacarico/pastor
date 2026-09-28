@@ -198,6 +198,7 @@ async fn the_daemon_writes_the_events_log() {
             model: None,
             priority: None,
             agents: Default::default(),
+            profile: None,
         }],
     };
     let fake: Arc<dyn Connector> = Arc::new(FakeHerdr::new());

@@ -737,6 +737,7 @@ mod tests {
                 orphans: vec![],
                 flock: None,
                 shutting_down: false,
+                profile: None,
             })),
             task: None,
         }

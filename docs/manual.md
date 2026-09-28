@@ -84,9 +84,9 @@ machines:
 ```text
 pastor 0.4.0 on desk (herdr 0.9.1), 2 machines, desk is the head of the flock
 
-NAME  HOST       FLOCK     CHANNEL    HERDR  PASTOR  AGENTS  ORPHANS  TAGS  ERROR
-desk  local      personal  connected  0.9.1  0.4.0   0/2     -        -
-pi-3  user@pi-3  work      connected  0.9.1  0.4.0   1/2     -        fast
+NAME  HOST       FLOCK     PROFILE  CHANNEL    HERDR  PASTOR  AGENTS  ORPHANS  TAGS  ERROR
+desk  local      personal  -        connected  0.9.1  0.4.0   0/2     -        -
+pi-3  user@pi-3  work      develop  connected  0.9.1  0.4.0   1/2     -        fast
 ```
 
 The line names the head's pastor version, its hostname, the version of the
@@ -97,7 +97,10 @@ that ending. With no head running, the line is replaced by the notice on
 stderr that the machines were probed directly. `--flock F` lists only that
 flock's machines, and the line counts those.
 HOST is the ssh target, `local`, or the program a `command` machine runs.
-FLOCK is the flock the machine is in (see Flocks). PASTOR is the pastor
+FLOCK is the flock the machine is in (see Flocks). PROFILE is the
+permission profile a task there runs under when it names none: the
+machine's own, else its flock's, else `[defaults]` (see [Permission
+profiles](#permission-profiles)); `profile` in `--json`. PASTOR is the pastor
 installed on the machine:
 over the ssh master, pastor runs `pastor --version` in a shell that has
 `~/.cargo/bin` and `~/.local/bin` on its PATH, since ssh's non-login shell
@@ -392,6 +395,7 @@ agent_args = ["--model", "claude-sonnet-5"]
 # model = "sonnet"        # optional: a [models] name, see Models below
 # priority = "high"       # optional: see Priority and queue order below
 # agents = { opencode = "opencode" }  # optional: the agent per kind, see Models
+# profile = "develop"     # optional: a permission profile, see Permission profiles below
 
 [[machine]]
 name = "desk"
@@ -523,8 +527,9 @@ Changing a machine's agent, like moving it, keeps its connection.
 
 ### Tool allow and deny lists
 
-pastor leaves the agent's own permission mode alone: Claude still asks before
-it runs a tool its settings do not already allow, and a task that waits on
+Unless a [permission profile](#permission-profiles) applies, pastor leaves
+the agent's own permission mode alone: Claude still asks before it runs a
+tool its settings do not already allow, and a task that waits on
 such a question goes `blocked` until someone answers it with `pastor task
 send`. To answer some of those questions in advance, give pastor lists of tool
 patterns, in the agent's own syntax:
@@ -592,7 +597,8 @@ repo or a web page can then steer an agent that runs every command it is told
 to, as the head's user on that machine, with that user's files, keys and
 network. See [Trust model](#trust-model) before you set one, prefer a narrow
 `allow` list, and keep such args in a flock of disposable machines rather than
-in `[defaults]`.
+in `[defaults]`. While a permission profile applies to a Claude task, args
+that pick a permission mode are refused instead (`profile_args_conflict`).
 
 ### Agent definitions
 
@@ -717,9 +723,8 @@ that can make it queue a task refuses one (`head_too_old`).
 
 A permission profile names a pair of tool pattern lists, `allow` and `deny`,
 in the syntax of [Tool allow and deny lists](#tool-allow-and-deny-lists), so
-a kind of work can be named once. Nothing reaches an agent yet: for now a
-profile is defined, checked and shown, and tasks still settle their lists
-from `[defaults]`, the flock and the job as above.
+a kind of work can be named once, and so that a Claude task under one never
+stops at a permission prompt.
 
 Three are built in, in Claude Code's patterns:
 
@@ -906,6 +911,75 @@ opencode (from machine desk agents.opencode)`; `machine describe` and
 `flock describe` list the entry's own `agents` as `by kind`. A pastor from
 before this refuses the key on a `[[flock]]`, so add it once every machine
 runs a release that knows it.
+
+#### A task's profile
+
+A task settles its profile like its model, from the first of these that
+names one: `--profile` on `pastor task run` (or `profile` under a job's
+`[dispatch]`), `profile` under the `[[machine]]` entry it runs on, `profile`
+under its `[[flock]]` entry, `[defaults] profile`; with none, it runs no
+profile and nothing changes. `--profile` and a job's `profile` take a name,
+not a template.
+
+```toml
+# pastor.toml
+[defaults]
+profile = "review"
+
+# flock.toml
+[[flock]]
+name = "work"
+profile = "develop"
+```
+
+The profile's `allow` and `deny` go before the task's own lists (from
+`[defaults]`, the flock and the job, as in [Tool allow and deny
+lists](#tool-allow-and-deny-lists)), each pattern once, and a deny from
+either side drops the pattern from `allow`. A Claude agent (an agent of kind
+`claude`) then starts with `--permission-mode dontAsk` after its args and
+before the tool flags: it does not ask about a tool the lists and its own
+settings do not allow, it is refused it. A task in the `work` flock above
+starts as `claude ... --permission-mode dontAsk --allowedTools Read ...
+--disallowedTools 'Bash(rm -rf:*)' ...`. Agent args that pick a permission
+mode themselves (`--permission-mode`, `--dangerously-skip-permissions`, in
+`agent_args` or a model's `args`) are refused while a profile applies
+(`profile_args_conflict`), since Claude would take only one of the two. An
+agent of another kind gets the lists through its `allow_flag` and
+`deny_flag`, as any list, and keeps its own permission mode.
+
+Patterns are passed as written. Claude reads a `~/` path in a pattern
+(`Read(~/.ssh/**)`) as the home of the machine it runs on, so pastor does not
+expand it, and a machine that cannot report its home (a `command` one) runs
+such a profile too.
+
+**The unrestricted rule.** A task may ask for `unrestricted` (with
+`--profile` or a job's `profile`) only on a machine whose own profile, the
+one its tasks get when they name none, is `unrestricted` as well: its
+`[[machine]]` entry says so, or its flock's, or `[defaults]`. Denying nothing
+is the choice of whoever owns the machine, made in flock.toml or
+pastor.toml, not one a run flag or a job file can make for it. A task pinned
+to another machine is refused (`profile_not_allowed`); one that is not
+pinned is offered only to such machines of its flock, and waits with the
+reason in its `error` while none has a free slot or none exists.
+
+The head checks the profile when it queues a task, and again when it places
+it on a machine. An unknown name is refused (`unknown_profile` from `pastor
+task run` and `pastor task retry`; the job records the error for that item),
+and a flock's or machine's unknown `profile` fails flock.toml's load (the
+head keeps the previous flock on a reload). A profile removed from
+pastor.toml while a task waits for a machine keeps the task queued, with
+`waiting for a machine: profile ... is not built in ...` in its `error`,
+rather than starting it without the profile; put it back, or close the task.
+A retry settles the profile again from pastor.toml as it stands.
+
+`pastor task describe` prints it and where it came from, such as `profile:
+develop (from flock work)`, and the task's `--json` has a `profile` field;
+`machine list` has a PROFILE column, `machine describe` a `profile` line with
+the profile the machine's tasks get, and `flock describe` the flock's own.
+Since a head from before profiles would start the agent without them, every
+command that can make it queue a task (`pastor task run`, `pastor task
+retry`, `pastor tick` without `--dry-run`, `pastor job run`) refuses one
+(`head_too_old`): restart `pastor serve` after an upgrade.
 
 ## Events
 
@@ -1126,7 +1200,8 @@ paths.
 `pastor task run` takes the prompt as its argument or, instead, `--prompt-file
 PATH`, and `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
 `--model` (a name from `[models]`, see [Models](#models)), `--priority` (see
-[Priority and queue order](#priority-and-queue-order)), `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
+[Priority and queue order](#priority-and-queue-order)), `--profile` (see
+[Permission profiles](#permission-profiles)), `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
 `--timeout`, `--place` (see [Where a task's pane goes](#where-a-tasks-pane-goes))
 and `--json`. `--agent-arg` hands one argument to the agent,
 through herdr's `agent.start`; repeat it for more, in order. It always takes the
@@ -1942,8 +2017,8 @@ many at once, chosen by state and age (`task prune`).
 
 ```text
 pastor job describe <name>       schedule, connector and its config, dispatch, last runs and errors, next run, recent tasks and job events
-pastor machine describe <name>   host, flock, session, channel, herdr, protocol and pastor versions, agents, orphans, tags, its tasks, recent errors
-pastor flock describe <name>     default or not, its agent, agent args, allow and deny, machines, live agents, queued and running tasks
+pastor machine describe <name>   host, flock, session, model, profile, channel, herdr, protocol and pastor versions, agents, orphans, tags, its tasks, recent errors
+pastor flock describe <name>     default or not, its agent, agent args, allow and deny, model, profile, machines, live agents, queued and running tasks
 pastor connector describe <id>   manifest, origin, commands, config, secrets set or missing, jobs using it, status
 pastor task describe <id>        state, machine, agent and where it came from, prompt, error
 pastor job edit <name>           ~/.config/pastor/jobs/<name>.toml
@@ -2041,6 +2116,7 @@ place = "repo"               # where a task's pane goes: repo, own, pastor or pa
 # model = "sonnet"           # a [models] name for tasks that name none; unset: no model
 # priority = "normal"        # the level of tasks that set none: low, normal, high or critical
 # agents = { opencode = "opencode" }  # the agent for a model of another kind than agent's
+# profile = "develop"        # a permission profile for tasks that name none; unset: none
 [agents.claude]              # one table per agent that needs one
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }

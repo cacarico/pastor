@@ -515,4 +515,41 @@ mod tests {
         );
         assert_eq!(c, "agent_refused");
     }
+
+    /// A headless `pastor serve`'s `submit_to_head` refuses a head older
+    /// than `PROFILE_PROTOCOL` before it ever sends the `JobSubmit`: such a
+    /// head's `serde` drops `AgentChoice.profile` from it instead of
+    /// refusing the request, so a job with a profile would start unenforced
+    /// rather than fail loudly.
+    #[tokio::test]
+    async fn submit_to_head_refuses_a_head_that_predates_profiles() {
+        let old_head: Ask = Arc::new(|req| {
+            Box::pin(async move {
+                assert!(matches!(req, IpcRequest::Ping), "{req:?}");
+                Ok(IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol: crate::ipc::PROFILE_PROTOCOL - 1,
+                    role: None,
+                })
+            })
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let fleet = Fleet::headless(store, old_head);
+        let job = crate::config::job::Job::parse(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprofile = \"ci\"\nprompt = \"p\"\n",
+            "x",
+            &crate::config::Defaults::default(),
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let err = fleet
+            .submit_to_head(&job, vec![serde_json::json!({})])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliError>().map(|e| e.code.as_str()),
+            Some("head_too_old"),
+            "{err}"
+        );
+    }
 }

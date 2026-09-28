@@ -11,7 +11,7 @@ use crate::config::flock::{
 };
 use crate::config::{
     AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer, MODEL_KIND_MISMATCH, Models,
-    PastorConfig, Paths,
+    PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
 };
 use crate::dispatch::{Claim, MachineView, pick_machine, pick_machine_where};
 use crate::herdr::{Connector, Endpoint};
@@ -239,6 +239,8 @@ pub struct Fleet {
     agents: RwLock<Agents>,
     /// `[models]` as last applied: what a task's `model` names.
     models: RwLock<Models>,
+    /// `[profiles]` as last applied: what a task's `profile` names.
+    profiles: RwLock<crate::config::profile::Profiles>,
     /// `agents_change_fleet` as last applied: whether the head takes a
     /// fleet-changing request from an agent it started.
     agents_change_fleet: std::sync::atomic::AtomicBool,
@@ -268,6 +270,7 @@ impl Fleet {
             defaults: RwLock::default(),
             agents: RwLock::default(),
             models: RwLock::default(),
+            profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             store,
             spawner: None,
@@ -307,6 +310,7 @@ impl Fleet {
             defaults: RwLock::default(),
             agents: RwLock::default(),
             models: RwLock::default(),
+            profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             store,
             spawner: Some(Spawner { connect, events }),
@@ -336,10 +340,14 @@ impl Fleet {
             .read()
             .unwrap()
             .iter()
-            .map(|m| crate::machine::MachineStatus {
-                flock: Some(flock_of(&wanted, &m.handle.name)),
-                shutting_down: m.shutting_down,
-                ..m.handle.snapshot()
+            .map(|m| {
+                let flock = flock_of(&wanted, &m.handle.name);
+                crate::machine::MachineStatus {
+                    profile: self.own_profile(&flock, Some(&m.handle.name)),
+                    flock: Some(flock),
+                    shutting_down: m.shutting_down,
+                    ..m.handle.snapshot()
+                }
             })
             .collect()
     }
@@ -367,6 +375,7 @@ impl Fleet {
         *self.defaults.write().unwrap() = config.defaults.clone();
         *self.agents.write().unwrap() = config.agents.clone();
         *self.models.write().unwrap() = config.models.clone();
+        *self.profiles.write().unwrap() = config.profiles.clone();
         self.agents_change_fleet.store(
             config.agents_change_fleet,
             std::sync::atomic::Ordering::Relaxed,
@@ -398,12 +407,21 @@ impl Fleet {
         )
     }
 
+    /// The profile a task in `flock` on `machine` runs under when it names
+    /// none: the machine's, else the flock's, else `[defaults]`.
+    pub fn own_profile(&self, flock: &str, machine: Option<&str>) -> Option<String> {
+        self.resolve_agent(&AgentChoice::default(), flock, machine)
+            .profile
+            .map(|(name, _)| name)
+    }
+
     /// `resolve_agent` written into `spec`, with the ask and where the agent
-    /// and its args came from (`DispatchSpec::agent_source`), and its model's
-    /// args put in front (`Models::apply`). `asked_by` names the ask: `task
-    /// run` or `job <name>`. Refused when the model is not in `[models]` or
-    /// not of the agent's kind; `spec` then has the agent without the model's
-    /// args.
+    /// and its args came from (`DispatchSpec::agent_source`), its model's
+    /// args put in front (`Models::apply`) and its profile's lists added
+    /// (`Profiles::apply`). `asked_by` names the ask: `task run` or `job
+    /// <name>`. Refused when the model is not in `[models]` or not of the
+    /// agent's kind, or the profile is unknown or `unrestricted` where the
+    /// machine's own is not; `spec` is then only partly settled.
     fn settle(
         &self,
         spec: &mut crate::task::DispatchSpec,
@@ -436,8 +454,16 @@ impl Fleet {
             agent_args: pick.args_from.map(label),
             model: pick.model.as_ref().map(|(name, _)| name.clone()),
             model_from: pick.model.as_ref().map(|&(_, layer)| label(layer)),
+            profile: pick.profile.as_ref().map(|(name, _)| name.clone()),
+            profile_from: pick.profile.as_ref().map(|&(_, layer)| label(layer)),
         }));
-        models.apply(&pick, &agents, spec)
+        models.apply(&pick, &agents, spec)?;
+        // What the machine's owner lets run there (the unrestricted rule).
+        let own = self.own_profile(flock, machine);
+        self.profiles
+            .read()
+            .unwrap()
+            .apply(&pick, own.as_deref(), spec)
     }
 
     /// The level of a task being queued in `flock`, pinned to `pinned` if it
@@ -481,9 +507,13 @@ impl Fleet {
     ) -> Result<(), AgentRefusal> {
         let pinned = spec.machine.clone();
         // Unpinned, with the agent left to the machine, its kind is known
-        // only on the machine: a mismatch here is not the task's to fix.
+        // only on the machine: a mismatch here is not the task's to fix. So
+        // is the machine's own profile, which decides where `unrestricted`
+        // may run.
         let per_machine = |e: &AgentRefusal| {
-            e.code == MODEL_KIND_MISMATCH && pinned.is_none() && ask.agent.is_none()
+            pinned.is_none()
+                && ((e.code == MODEL_KIND_MISMATCH && ask.agent.is_none())
+                    || e.code == PROFILE_NOT_ALLOWED)
         };
         let mut landings = Vec::new();
         match self.settle(spec, ask, flock, pinned.as_deref(), asked_by) {
@@ -507,15 +537,9 @@ impl Fleet {
             }
         }
         let agents = self.agents.read().unwrap();
-        landings.iter().try_for_each(|s| {
-            agents
-                .launch_args(s)
-                .map(drop)
-                .map_err(|message| AgentRefusal {
-                    code: "agent_tools_unsupported",
-                    message,
-                })
-        })
+        landings
+            .iter()
+            .try_for_each(|s| agents.launch_args(s).map(drop))
     }
 
     /// The store the fleet queues tasks in.
@@ -908,6 +932,22 @@ impl Fleet {
                 other => anyhow::bail!("the head answered a ping with {other:?}"),
             }
         }
+        // A permission profile rides in `dispatch` the same way; a head
+        // before `PROFILE_PROTOCOL` would drop it (serde skips the unknown
+        // field) and start the agent unenforced instead of refusing.
+        if job.agent.profile.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::PROFILE_PROTOCOL,
+                    "a job naming a permission profile",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
         let reply = forward(IpcRequest::JobSubmit {
             job: job.name.clone(),
             dispatch: job.dispatch.clone(),
@@ -990,7 +1030,11 @@ impl Fleet {
         if self.spawner.is_some()
             && let Ok(flock) = Flock::load_existing(file)
             && flock
-                .check_config(&self.models.read().unwrap(), &self.agents.read().unwrap())
+                .check_config(
+                    &self.models.read().unwrap(),
+                    &self.agents.read().unwrap(),
+                    &self.profiles.read().unwrap(),
+                )
                 .is_ok()
         {
             *self.wanted.write().unwrap() = flock;
@@ -1043,12 +1087,7 @@ impl Fleet {
                         .read()
                         .unwrap()
                         .launch_args(&t.spec)
-                        .map_err(|message| {
-                            QueueError::Agent(AgentRefusal {
-                                code: "agent_tools_unsupported",
-                                message,
-                            })
-                        })?;
+                        .map_err(QueueError::Agent)?;
                 }
             }
         }
@@ -1094,16 +1133,17 @@ impl Fleet {
             // The agent can depend on the machine: a machine whose agent
             // cannot run the task's model does not take it. A task from
             // before `agent_source` keeps the agent it was queued with.
+            // A profile it inherited (from a machine or flock, not its own
+            // ask) is pinned onto the ask here, so a re-settle that can no
+            // longer resolve it refuses instead of quietly dropping it.
             let settled_on = |machine: &str| {
                 let source = task.spec.agent_source.as_ref()?;
+                let mut ask = source.ask.clone();
+                if ask.profile.is_none() {
+                    ask.profile = source.profile.clone();
+                }
                 let mut spec = task.spec.clone();
-                let r = self.settle(
-                    &mut spec,
-                    &source.ask,
-                    target,
-                    Some(machine),
-                    &asked_by(&task),
-                );
+                let r = self.settle(&mut spec, &ask, target, Some(machine), &asked_by(&task));
                 Some(r.map(|()| spec))
             };
             let claim = Claim::of(&task);
@@ -2519,7 +2559,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     let on_disk = ConfigFingerprint::sample(&paths);
     let config = PastorConfig::load(&paths.config_file())?;
     let flock = Flock::load(&paths.flock_file())?;
-    flock.check_config(&config.models, &config.agents)?;
+    flock.check_config(&config.models, &config.agents, &config.profiles)?;
     anyhow::ensure!(
         !flock.machines.is_empty(),
         "flock is empty; add a machine with `pastor machine add`"
@@ -2559,6 +2599,7 @@ mod tests {
             model: None,
             priority: None,
             agents: Default::default(),
+            profile: None,
         }
     }
 
@@ -3621,6 +3662,7 @@ mod tests {
             allow: vec![],
             deny: vec![],
             model: None,
+            profile: None,
         });
         assert_eq!(
             queued(d.handle(run("work", own)).await),
@@ -4094,6 +4136,391 @@ mod tests {
             panic!()
         };
         assert_eq!(copy.model(), Some("sonnet"));
+    }
+
+    /// `models_config` with `[profiles.ci]`, develop plus make.
+    fn profiles_config() -> PastorConfig {
+        let mut c = models_config();
+        c.profiles.0.insert(
+            "ci".into(),
+            crate::config::profile::ProfileDef {
+                extends: Some("develop".into()),
+                allow: vec!["Bash(make:*)".into()],
+                ..Default::default()
+            },
+        );
+        c
+    }
+
+    /// `models_daemon` with `profiles_config` on disk and applied.
+    async fn profiles_daemon(
+        machines: Vec<MachineConfig>,
+        fakes: &[(&str, u32, FakeHerdr)],
+    ) -> (Daemon, tempfile::TempDir) {
+        let (d, tmp) = models_daemon(None, machines, fakes).await;
+        apply_config(&d, &profiles_config()).await;
+        (d, tmp)
+    }
+
+    /// Write `config` to pastor.toml and have the head reload it, as an
+    /// edit and `pastor job reload` would: the fleet and its actors both
+    /// take it.
+    async fn apply_config(d: &Daemon, config: &PastorConfig) {
+        std::fs::write(d.paths.config_file(), toml::to_string(config).unwrap()).unwrap();
+        let resp = d.handle(IpcRequest::Reload).await;
+        assert!(matches!(resp, IpcResponse::Jobs(_)), "{resp:?}");
+    }
+
+    fn run_profile(profile: Option<&str>, machine: Option<&str>) -> IpcRequest {
+        let IpcRequest::Run {
+            prompt,
+            spec,
+            flock,
+            agent,
+            priority,
+            role,
+        } = run_model(None, None, machine)
+        else {
+            unreachable!()
+        };
+        IpcRequest::Run {
+            prompt,
+            spec,
+            flock,
+            agent: agent.map(|a| AgentChoice {
+                profile: profile.map(Into::into),
+                ..a
+            }),
+            priority,
+            role,
+        }
+    }
+
+    /// `--profile` adds the profile's lists to the task's, the task keeps
+    /// its name and where it came from, and herdr starts Claude with
+    /// `--permission-mode dontAsk` and the lists as its flags.
+    #[tokio::test]
+    async fn a_task_runs_under_the_profile_it_names() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
+        let IpcResponse::Task(t) = d.handle(run_profile(Some("ci"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.profile(), Some("ci"));
+        let source = t.spec.agent_source.clone().unwrap();
+        assert_eq!(source.profile_from.as_deref(), Some("task run"));
+        assert!(t.spec.allow.contains(&"Edit".to_string()));
+        assert_eq!(
+            t.spec.allow.last().map(String::as_str),
+            Some("Bash(make:*)")
+        );
+        assert!(t.spec.deny.contains(&"Bash(sudo:*)".to_string()));
+        assert_eq!(t.to_json()["profile"], "ci");
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        let args: Vec<&str> = start.params["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(args[..3], ["-v", "--permission-mode", "dontAsk"]);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--disallowedTools", "Bash(sudo:*)"]),
+            "{args:?}"
+        );
+        let text = crate::cli::task_detail(&t);
+        assert!(text.contains("profile:    ci (from task run)"), "{text}");
+
+        // With no profile named anywhere, nothing changes.
+        let IpcResponse::Task(t) = d.handle(run_profile(None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.profile(), None);
+        assert!(t.spec.allow.is_empty());
+    }
+
+    /// A machine's profile reaches its tasks, before its flock's; a name
+    /// that is no profile is refused, and so are agent args that pick a
+    /// permission mode while a profile applies.
+    #[tokio::test]
+    async fn a_machines_profile_applies_and_bad_ones_are_refused() {
+        let pi = MachineConfig {
+            profile: Some("review".into()),
+            ..machine("pi", 2)
+        };
+        let (d, _tmp) = profiles_daemon(vec![pi], &[("pi", 2, FakeHerdr::new())]).await;
+        let IpcResponse::Task(t) = d.handle(run_profile(None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.profile(), Some("review"));
+        assert_eq!(
+            t.spec.agent_source.unwrap().profile_from.as_deref(),
+            Some("machine pi")
+        );
+        assert!(t.spec.deny.contains(&"Edit".to_string()));
+
+        assert_eq!(
+            error_code(d.handle(run_profile(Some("nope"), None)).await),
+            "unknown_profile"
+        );
+        let IpcRequest::Run {
+            prompt,
+            spec,
+            flock,
+            agent,
+            priority,
+            role,
+        } = run_profile(Some("ci"), None)
+        else {
+            unreachable!()
+        };
+        let conflict = IpcRequest::Run {
+            prompt,
+            spec,
+            flock,
+            agent: agent.map(|a| AgentChoice {
+                agent_args: Some(vec!["--permission-mode".into(), "bypassPermissions".into()]),
+                ..a
+            }),
+            priority,
+            role,
+        };
+        assert_eq!(
+            error_code(d.handle(conflict).await),
+            crate::config::PROFILE_ARGS_CONFLICT
+        );
+    }
+
+    /// The unrestricted rule: a task may ask for `unrestricted` only where
+    /// the machine's own profile is `unrestricted`. Pinned elsewhere it is
+    /// refused; unpinned it goes to such a machine, or waits and says why.
+    #[tokio::test]
+    async fn unrestricted_runs_only_on_a_machine_that_is_unrestricted() {
+        let box1 = MachineConfig {
+            profile: Some("unrestricted".into()),
+            ..machine("box", 1)
+        };
+        let (d, _tmp) = profiles_daemon(
+            vec![machine("pi", 2), box1],
+            &[("pi", 2, FakeHerdr::new()), ("box", 1, FakeHerdr::new())],
+        )
+        .await;
+        assert_eq!(
+            error_code(
+                d.handle(run_profile(Some("unrestricted"), Some("pi")))
+                    .await
+            ),
+            PROFILE_NOT_ALLOWED
+        );
+        let IpcResponse::Task(t) = d.handle(run_profile(Some("unrestricted"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.machine.as_deref(), Some("box"));
+        assert_eq!(t.profile(), Some("unrestricted"));
+        // box is full, and pi is not unrestricted.
+        let IpcResponse::Task(t) = d.handle(run_profile(Some("unrestricted"), None)).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.unwrap_or_default();
+        assert!(err.starts_with("waiting for a machine"), "{err}");
+        assert!(err.contains("runs only where"), "{err}");
+        // On pi, a task that names none runs without one.
+        let IpcResponse::Task(t) = d.handle(run_profile(None, Some("pi"))).await else {
+            panic!()
+        };
+        assert_eq!(t.profile(), None);
+        // `machine list` and `machine describe` show each machine's own.
+        let IpcResponse::Machines(ms) = d.handle(IpcRequest::FlockList).await else {
+            panic!()
+        };
+        let own: Vec<_> = ms
+            .iter()
+            .map(|m| (m.name.as_str(), m.profile.as_deref()))
+            .collect();
+        assert_eq!(own, [("pi", None), ("box", Some("unrestricted"))]);
+        let IpcResponse::MachineDescription(m) = d
+            .handle(IpcRequest::MachineDescribe { name: "box".into() })
+            .await
+        else {
+            panic!()
+        };
+        let text = crate::describe::machine_text(&m);
+        assert!(text.contains("profile:  unrestricted"), "{text}");
+    }
+
+    /// A profile dropped from pastor.toml while a task waits for a machine
+    /// keeps it waiting, with the reason in its error, rather than start
+    /// it without the profile; put back, the task runs under it.
+    #[tokio::test]
+    async fn a_profile_removed_while_queued_holds_the_task() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 1)], &[("pi", 1, fake.clone())]).await;
+        let ask = AgentChoice {
+            profile: Some("ci".into()),
+            ..Default::default()
+        };
+        let t = d
+            .fleet()
+            .queue_run("x".into(), spec(), None, Some(&ask), None)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Queued);
+        apply_config(&d, &models_config()).await;
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.clone().unwrap_or_default();
+        assert!(err.contains("profile ci is not built in"), "{err}");
+        assert!(!fake.requests().iter().any(|r| r.method == "agent.start"));
+
+        apply_config(&d, &profiles_config()).await;
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_ne!(t.state, TaskState::Queued);
+        assert_eq!(t.error, None);
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert!(
+            start.params["args"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("dontAsk"))
+        );
+    }
+
+    /// A task that inherited its profile from `[defaults]` (not its own
+    /// ask) while queued for a busy machine keeps that profile pinned: once
+    /// `[defaults].profile` moves on and the profile itself is gone too, the
+    /// re-settle at placement holds the task rather than start it with none
+    /// of the profile's lists, silently, because the ask itself never named
+    /// one.
+    #[tokio::test]
+    async fn a_profile_inherited_from_defaults_is_pinned_while_queued() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 1)], &[("pi", 1, fake.clone())]).await;
+        let mut with_default_profile = profiles_config();
+        with_default_profile.defaults.profile = Some("ci".into());
+        apply_config(&d, &with_default_profile).await;
+
+        // Occupy pi's one slot so the new task must wait.
+        let IpcResponse::Task(busy) = d
+            .handle(IpcRequest::Run {
+                prompt: "busy".into(),
+                spec: spec(),
+                flock: None,
+                agent: None,
+                priority: None,
+                role: Default::default(),
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(busy.state, TaskState::Running);
+
+        let mut pinned = spec();
+        pinned.machine = Some("pi".into());
+        let t = d
+            .fleet()
+            .queue_run(
+                "x".into(),
+                pinned,
+                None,
+                Some(&AgentChoice::default()),
+                None,
+            )
+            .await
+            .unwrap();
+        let source = t.spec.agent_source.clone().unwrap();
+        assert_eq!(source.profile.as_deref(), Some("ci"));
+        assert_eq!(source.profile_from.as_deref(), Some("defaults"));
+        assert!(source.ask.profile.is_none(), "the ask itself named none");
+
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued, "pi is still busy");
+
+        // `[defaults]` moves on, and the profile it named is dropped too.
+        let mut without = profiles_config();
+        without.profiles.0.remove("ci");
+        apply_config(&d, &without).await;
+
+        // Free pi's slot.
+        fake.close_pane(busy.pane_id.as_deref().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.store.get_task(busy.id).unwrap().unwrap().state != TaskState::Closed {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued, "held rather than started bare");
+        let err = t.error.clone().unwrap_or_default();
+        assert!(err.contains("profile ci is not built in"), "{err}");
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|r| r.method == "agent.start")
+                .count(),
+            1,
+            "only the busy task ever started"
+        );
+    }
+
+    /// A retry settles its profile again, so one since dropped is refused.
+    #[tokio::test]
+    async fn a_retry_of_a_dropped_profile_is_unknown() {
+        let (d, _tmp) =
+            profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, FakeHerdr::new())]).await;
+        let IpcResponse::Task(mut t) = d.handle(run_profile(Some("ci"), None)).await else {
+            panic!()
+        };
+        t.state = TaskState::Failed;
+        t.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut t).unwrap();
+        d.fleet().set_config(&models_config());
+        let retry = IpcRequest::TaskRetry {
+            id: t.id,
+            place: None,
+        };
+        assert_eq!(error_code(d.handle(retry).await), "unknown_profile");
+    }
+
+    /// Claude resolves `~` in a pattern itself, on its own machine, so a
+    /// profile's `~` is passed as written: a machine that cannot report a
+    /// home still runs it.
+    #[tokio::test]
+    async fn a_profiles_tilde_is_passed_as_written_without_a_home() {
+        let fake = FakeHerdr::new();
+        fake.set_home(None);
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 1)], &[("pi", 1, fake.clone())]).await;
+        let mut config = profiles_config();
+        config.profiles.0.get_mut("ci").unwrap().deny = vec!["Read(~/.ssh/**)".into()];
+        apply_config(&d, &config).await;
+        let ask = AgentChoice {
+            profile: Some("ci".into()),
+            ..Default::default()
+        };
+        let t = d
+            .fleet()
+            .queue_run("x".into(), spec(), None, Some(&ask), None)
+            .await
+            .unwrap();
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_ne!(t.state, TaskState::Failed, "{:?}", t.error);
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert!(
+            start.params["args"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("Read(~/.ssh/**)"))
+        );
     }
 
     /// A job's model is a template: the item's model when it has one, the
@@ -5140,6 +5567,7 @@ mod tests {
                     model: None,
                     priority: None,
                     agents: Default::default(),
+                    profile: None,
                 },
             },
             IpcRequest::TaskClose {

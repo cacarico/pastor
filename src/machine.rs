@@ -187,6 +187,12 @@ pub struct MachineStatus {
     /// a head that predates the field.
     #[serde(default)]
     pub shutting_down: bool,
+    /// The permission profile a task here runs under when it names none:
+    /// the machine's own, else its flock's, else `[defaults]`. The actor
+    /// does not know it; `Fleet::statuses` fills it in. `None` when no
+    /// layer names one, and from a head that predates profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -576,6 +582,7 @@ pub fn spawn_machine(
         orphans: vec![],
         flock: None,
         shutting_down: false,
+        profile: None,
     }));
     let actor = Actor {
         name: name.clone(),

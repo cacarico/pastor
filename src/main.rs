@@ -222,6 +222,12 @@ struct RunArgs {
     /// flock's, else `[defaults] priority`, else normal)
     #[arg(long, value_name = "LEVEL")]
     priority: Option<String>,
+    /// Run under this permission profile, built in or from `[profiles]` in
+    /// pastor.toml: a Claude agent gets its allow and deny lists and never
+    /// asks (default: the machine's, else its flock's, else `[defaults]
+    /// profile`, else none)
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
     /// A git worktree per task, branched from --repo (so it needs --repo)
     #[arg(long, requires = "repo")]
     worktree: bool,
@@ -1018,7 +1024,7 @@ fn local_caller_role(paths: &Paths, task: &str) -> TaskRole {
 }
 
 /// Whether `command` can make the head queue a task, whose agent and model
-/// the head resolves: it needs a head at `MODEL_PROTOCOL` or later. A tick or a job
+/// the head resolves: it needs a head at `PROFILE_PROTOCOL` or later. A tick or a job
 /// run queues through the head's own jobs, so they count too; a dry run
 /// writes nothing, and a reload only re-reads the job files.
 fn needs_agent_protocol(command: &Command) -> bool {
@@ -1100,10 +1106,19 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// The protocol `command` needs of the head, and what an older head would
 /// do with it, for `probe_head`'s refusal. Checked from the newest protocol
 /// down, so a command that needs two gets the higher: `task retry --place`
-/// needs `PLACE_PROTOCOL` for the flag and `MODEL_PROTOCOL` as a queueing
+/// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if makes_orchestrator(command) {
+    if needs_agent_protocol(command) {
+        Some((
+            pastor::ipc::PROFILE_PROTOCOL,
+            if needs_place_protocol(command) {
+                "predates permission profiles and `task retry --place`, and would retry the task where it was, without them"
+            } else {
+                "predates permission profiles (or named models, flock agents and tool allow and deny lists), and would start the agent without them"
+            },
+        ))
+    } else if makes_orchestrator(command) {
         Some((
             pastor::ipc::ROLE_PROTOCOL,
             "predates task roles, and would start a plain agent instead of an orchestrator",
@@ -1113,34 +1128,25 @@ fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
             pastor::ipc::PRIORITY_PROTOCOL,
             "predates task priority, and would queue the task at its own level or refuse the request",
         ))
-    } else if needs_agent_protocol(command) {
+    } else if needs_head_reads_protocol(command) {
         Some((
-            pastor::ipc::MODEL_PROTOCOL,
-            if needs_place_protocol(command) {
-                "predates named models and `task retry --place`, and would retry the task where it was, without them"
-            } else {
-                "predates named models (or flock agents and tool allow and deny lists), and would start the agent without them"
-            },
-        ))
-    } else if needs_place_protocol(command) {
-        Some((
-            pastor::ipc::PLACE_PROTOCOL,
-            "predates `task retry --place` and would retry the task where it was",
+            pastor::ipc::HEAD_READS_PROTOCOL,
+            "predates this request through the head",
         ))
     } else if needs_file_protocol(command) {
         Some((
             pastor::ipc::FILE_PROTOCOL,
             "predates edits and job requests through the head, and would refuse them",
         ))
-    } else if needs_head_reads_protocol(command) {
-        Some((
-            pastor::ipc::HEAD_READS_PROTOCOL,
-            "predates this request through the head",
-        ))
     } else if matches!(command, Command::Events(_)) {
         Some((
             pastor::ipc::EVENTS_PROTOCOL,
             "predates reading the events log through the head",
+        ))
+    } else if needs_place_protocol(command) {
+        Some((
+            pastor::ipc::PLACE_PROTOCOL,
+            "predates `task retry --place` and would retry the task where it was",
         ))
     } else {
         None
@@ -1198,6 +1204,14 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
         .as_deref()
         .map(pastor::task_cli::parse_priority)
         .transpose()?;
+    if let Some(p) = &a.profile {
+        pastor::config::check_profile_name(p).map_err(|e| {
+            CliError::err(
+                pastor::config::profile::UNKNOWN_PROFILE,
+                format!("{e}; --profile takes a profile name, see `pastor profile list`"),
+            )
+        })?;
+    }
     let prompt = run_prompt(&a)?;
     // With a remote head, pastor.toml is the head's and not here: the built-in
     // defaults fill the spec, and the head resolves the agent again with its own.
@@ -1233,6 +1247,7 @@ fn agent_choice(a: &RunArgs) -> AgentChoice {
         agent: a.agent.clone(),
         agent_args: (!a.agent_args.is_empty()).then(|| a.agent_args.clone()),
         model: a.model.clone(),
+        profile: a.profile.clone(),
         ..Default::default()
     }
 }
@@ -1348,12 +1363,24 @@ fn probe_fields(
 /// calls, each on its own connection, exactly as the head makes them: herdr
 /// answers one request per connection. Orphans are agents no open task owns;
 /// the rows live in the store here even with no head running.
+/// The profile a task on `m` runs under when it names none, from this
+/// machine's pastor.toml and flock.toml, as the head would settle it.
+fn own_profile(config: &PastorConfig, f: &Flock, m: &MachineConfig) -> Option<String> {
+    config
+        .defaults
+        .resolve_agent_on(&AgentChoice::default(), Some(m), f.entry(f.flock_of(m)))
+        .profile
+        .map(|(name, _)| name)
+}
+
 async fn probe_machine(
     m: &MachineConfig,
-    flock: &str,
+    f: &Flock,
+    config: &PastorConfig,
     paths: &Paths,
     store: &Store,
 ) -> anyhow::Result<pastor::cli::MachineRow> {
+    let flock = f.flock_of(m);
     let ep = Endpoint::from_machine(m, paths);
     let ping = ep.ping().await;
     let agents = match &ping {
@@ -1392,6 +1419,7 @@ async fn probe_machine(
         burst: m.burst,
         tags: m.tags.clone(),
         orphans,
+        profile: own_profile(config, f, m),
     })
 }
 
@@ -1458,6 +1486,7 @@ async fn machine_list(
         }
         Head::Absent => {
             let f = Flock::load(&paths.flock_file())?;
+            let config = PastorConfig::load(&paths.config_file())?;
             // Connects without the head, so the state dir the ssh master sockets
             // live under may not exist yet, and must be private.
             paths.ensure()?;
@@ -1469,7 +1498,7 @@ async fn machine_list(
                 .iter()
                 .filter(|m| flock.is_none_or(|n| f.flock_of(m) == n))
             {
-                rows.push(probe_machine(m, f.flock_of(m), paths, &store).await?);
+                rows.push(probe_machine(m, &f, &config, paths, &store).await?);
             }
             (
                 rows,
@@ -1702,6 +1731,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 model: None,
                 priority: None,
                 agents: Default::default(),
+                profile: None,
             };
             // With a head the reload line comes with its answer, before the
             // herdr lines; without one it follows them.
@@ -2558,7 +2588,8 @@ async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> 
     };
     paths.ensure()?;
     let store = Store::open(&paths.db_file())?;
-    let row = probe_machine(m, f.flock_of(m), paths, &store).await?;
+    let config = PastorConfig::load(&paths.config_file())?;
+    let row = probe_machine(m, &f, &config, paths, &store).await?;
     let tasks = store.list_tasks(&pastor::describe::machine_tasks(name))?;
     let d = pastor::describe::MachineDescription {
         row,
@@ -2649,13 +2680,13 @@ mod tests {
         assert!(makes_orchestrator(&orch));
         assert_eq!(
             protocol_need(&orch).map(|(p, _)| p),
-            Some(pastor::ipc::ROLE_PROTOCOL)
+            Some(pastor::ipc::PROFILE_PROTOCOL)
         );
         let plain = parse(&["pastor", "task", "run", "x"]);
         assert!(!makes_orchestrator(&plain));
         assert_eq!(
             protocol_need(&plain).map(|(p, _)| p),
-            Some(pastor::ipc::MODEL_PROTOCOL)
+            Some(pastor::ipc::PROFILE_PROTOCOL)
         );
         assert!(Cli::try_parse_from(["pastor", "task", "run", "x", "--role", "boss"]).is_err());
         for argv in [
@@ -2799,7 +2830,7 @@ mod tests {
         let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
         assert_eq!(
             need(&["pastor", "task", "run", "hi", "--priority", "high"]),
-            Some(pastor::ipc::PRIORITY_PROTOCOL)
+            Some(pastor::ipc::PROFILE_PROTOCOL)
         );
         assert_eq!(
             need(&["pastor", "task", "priority", "t-1", "low"]),
@@ -2807,11 +2838,65 @@ mod tests {
         );
         assert_eq!(
             need(&["pastor", "task", "run", "hi"]),
-            Some(pastor::ipc::MODEL_PROTOCOL)
+            Some(pastor::ipc::PROFILE_PROTOCOL)
         );
         assert!(changes_fleet(&parse(&[
             "pastor", "task", "priority", "t-1", "low"
         ])));
+    }
+
+    /// A head from just before `PROFILE_PROTOCOL` knows every other
+    /// request, but would read `--profile`, a job's or a flock's profile as
+    /// nothing and start the agent asking, or with fewer denies. Every
+    /// command that can make it queue a task refuses it; a read does not.
+    #[tokio::test]
+    async fn queueing_a_task_refuses_a_head_before_profiles() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.into_split();
+                let mut line = String::new();
+                tokio::io::BufReader::new(r)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let pong = IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol: pastor::ipc::PROFILE_PROTOCOL - 1,
+                    role: None,
+                };
+                let mut out = serde_json::to_string(&pong).unwrap();
+                out.push('\n');
+                w.write_all(out.as_bytes()).await.unwrap();
+            }
+        });
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        for argv in [
+            &["pastor", "task", "run", "hi", "--profile", "develop"][..],
+            &["pastor", "task", "run", "hi"],
+            &["pastor", "task", "retry", "t-1"],
+            &["pastor", "job", "run", "j"],
+        ] {
+            let need = protocol_need(&parse(argv));
+            let err = probe_head(&paths, false, false, need).await.unwrap_err();
+            let err = err.downcast::<pastor::cli::CliError>().unwrap();
+            assert_eq!(err.code, "head_too_old", "{argv:?}");
+            assert!(
+                err.message.contains("permission profiles"),
+                "{argv:?}: {}",
+                err.message
+            );
+        }
+        let list = protocol_need(&parse(&["pastor", "task", "list"]));
+        assert_eq!(
+            probe_head(&paths, false, false, list).await.unwrap(),
+            Head::Live
+        );
     }
 
     /// A head from before `PLACE_PROTOCOL` reads `task retry --place`
@@ -2849,16 +2934,16 @@ mod tests {
             "pastor", "task", "retry", "t-1", "--place", "pastor",
         ]));
         // --place needs less than any queueing command: the retry asks for
-        // `MODEL_PROTOCOL`, and the refusal still names the flag.
-        assert_eq!(place.map(|n| n.0), Some(pastor::ipc::MODEL_PROTOCOL));
+        // `PROFILE_PROTOCOL`, and the refusal still names the flag.
+        assert_eq!(place.map(|n| n.0), Some(pastor::ipc::PROFILE_PROTOCOL));
         let err = probe_head(&paths, false, false, place).await.unwrap_err();
         let err = err.downcast::<pastor::cli::CliError>().unwrap();
         assert_eq!(err.code, "head_too_old");
         assert!(err.message.contains("--place"), "{}", err.message);
         // A retry without it is refused only for what every queueing
-        // command needs (`MODEL_PROTOCOL`), not for --place.
+        // command needs (`PROFILE_PROTOCOL`), not for --place.
         let retry = protocol_need(&parse(&["pastor", "task", "retry", "t-1"]));
-        assert_eq!(retry.map(|n| n.0), Some(pastor::ipc::MODEL_PROTOCOL));
+        assert_eq!(retry.map(|n| n.0), Some(pastor::ipc::PROFILE_PROTOCOL));
         let err = probe_head(&paths, false, false, retry).await.unwrap_err();
         let err = err.downcast::<pastor::cli::CliError>().unwrap();
         assert!(!err.message.contains("--place"), "{}", err.message);
