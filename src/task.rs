@@ -15,6 +15,11 @@ pub enum TaskState {
     Stale,
     Failed,
     Closed,
+    /// A `low` Claude task a `critical` one with `preempt` took the slot of:
+    /// its pane is closed, its worktree kept, and it waits first among the
+    /// `low` tasks, pinned to its machine, to resume its session there
+    /// (`claude --resume`) when a slot frees.
+    Paused,
 }
 
 /// States whose task holds a pane on its machine. Kept next to
@@ -31,11 +36,12 @@ pub const PANE_OWNING_STATES: [TaskState; 5] = [
 /// The states a task can be in while it still needs pastor or a human:
 /// what `pastor task list` shows by default. Done, failed, stale and closed tasks
 /// are finished; they appear only with `--all` (or `--done` for done ones).
-pub const LIVE_STATES: [TaskState; 4] = [
+pub const LIVE_STATES: [TaskState; 5] = [
     TaskState::Queued,
     TaskState::Starting,
     TaskState::Running,
     TaskState::Blocked,
+    TaskState::Paused,
 ];
 
 impl TaskState {
@@ -75,6 +81,7 @@ impl TaskState {
             TaskState::Stale => "stale",
             TaskState::Failed => "failed",
             TaskState::Closed => "closed",
+            TaskState::Paused => "paused",
         }
     }
 }
@@ -411,13 +418,94 @@ pub struct Task {
     /// (`description_text`).
     #[serde(default)]
     pub description: Option<String>,
+    /// Whether the task may pause a `low` one to start, and whether it was
+    /// paused itself (`Preemption`).
+    #[serde(flatten, default)]
+    pub pause: Preemption,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }
 
+/// The code of `--preempt` (or a job's `preempt`) on a task below critical.
+pub const PREEMPT_NEEDS_CRITICAL: &str = "preempt_needs_critical";
+
+/// How long a task that resumed after a pause is safe from another: long
+/// enough for it to get back into its work before a second critical task
+/// takes its slot again.
+pub const RESUME_GRACE: chrono::Duration = chrono::Duration::minutes(10);
+
+/// What a paused task's agent is told once its session is open again: it
+/// was stopped mid-turn, and the prompt is already in its conversation.
+pub const RESUME_PROMPT: &str = "pastor paused this session for a critical task and has now resumed it; carry on where you left off.";
+
+/// A task's part in pausing: whether it may pause a `low` task to start
+/// (`task run --preempt`, a job's `[dispatch] preempt`), and, on a task that
+/// was paused, when, for which task, and when it last resumed. Flattened
+/// into the task's JSON; each field is left out while unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preemption {
+    /// Only ever set on a `critical` task: `task run` and `task priority`
+    /// refuse it below, and a job's tasks keep it only when they settle at
+    /// critical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preempt: bool,
+    /// When the task was last paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<DateTime<Utc>>,
+    /// The task that paused it last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_for: Option<i64>,
+    /// When it last resumed after a pause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<DateTime<Utc>>,
+}
+
+/// Why `Task::pausable` says no.
+pub fn why_not_pausable(task: &Task, kind: &str, now: DateTime<Utc>) -> Option<&'static str> {
+    if task.state != TaskState::Running {
+        return Some("only a running task can be paused");
+    }
+    if task.priority != Priority::Low {
+        return Some("only a low task can be paused");
+    }
+    if kind != "claude" {
+        return Some("only a Claude task can be paused");
+    }
+    if task.spec.session_id.is_none() {
+        return Some("it recorded no Claude session to resume");
+    }
+    if task.ended {
+        return Some("its agent said it is finished");
+    }
+    if task
+        .pause
+        .resumed_at
+        .is_some_and(|at| now - at < RESUME_GRACE)
+    {
+        return Some("it resumed from a pause a moment ago");
+    }
+    None
+}
+
 impl Task {
+    /// May a critical task with `preempt` pause this one? A running `low`
+    /// task of an agent of kind `kind` that is `claude`, with a recorded
+    /// session to resume, not ended, and not resumed within `RESUME_GRACE`.
+    pub fn pausable(&self, kind: &str, now: DateTime<Utc>) -> bool {
+        why_not_pausable(self, kind, now).is_none()
+    }
+
+    /// The machine the task must run on: the one it is paused on, else the
+    /// one its spec pins.
+    pub fn pinned_machine(&self) -> Option<&str> {
+        match self.state {
+            TaskState::Paused => self.machine.as_deref(),
+            _ => self.spec.machine.as_deref(),
+        }
+    }
+
     /// Whether a job made this task; `pastor task run` tasks carry the job
     /// name `run`. Only these take a machine's job slots.
     pub fn from_job(&self) -> bool {
@@ -838,6 +926,7 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            pause: Default::default(),
             created_at: now,
             started_at: Some(now),
             finished_at: None,

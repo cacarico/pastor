@@ -60,6 +60,10 @@ pub struct DispatchTable {
     /// (`{{ item.priority }}`) rendered per item; rendered empty, the pinned
     /// machine's, flock's or `[defaults]` level.
     pub priority: Option<String>,
+    /// Let the job's critical tasks pause a `low` Claude task on a full
+    /// machine to start (see `Task::pause`); tasks it queues below critical
+    /// ignore it.
+    pub preempt: bool,
     /// A permission profile, built in or in `[profiles]`, before the
     /// machine's, the flock's and `[defaults]`.
     pub profile: Option<String>,
@@ -117,6 +121,8 @@ pub struct Job {
     /// `dispatch.priority`, still a template: `priority_for` renders it for
     /// one item.
     pub priority: Option<String>,
+    /// `dispatch.preempt`: its tasks that settle at critical get `preempt`.
+    pub preempt: bool,
     /// The `[dispatch]` table as written, as JSON and without `prompt`: what
     /// a headless serve sends the head with its items (`IpcRequest::
     /// JobSubmit`), so the head applies its own `[defaults]` to what the
@@ -259,10 +265,15 @@ impl Job {
                 }
             }
             if !priority.contains("{{") && !priority.trim().is_empty() {
-                priority
+                let level = priority
                     .trim()
                     .parse::<Priority>()
                     .map_err(|e| format!("dispatch.priority: {e}"))?;
+                if d.preempt && level != Priority::Critical {
+                    return Err(format!(
+                        "dispatch.preempt: only a critical task may pause another, and priority is {level} (preempt_needs_critical)"
+                    ));
+                }
             }
         }
         if let Some(profile) = &d.profile {
@@ -340,6 +351,7 @@ impl Job {
             backfill,
             flock: d.flock,
             priority: d.priority,
+            preempt: d.preempt,
             agent,
             dispatch: Value::Null,
             spec: DispatchSpec {
@@ -716,6 +728,36 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         );
         assert!(job("{{ task.id }}").unwrap_err().contains("dispatch.model"));
         assert!(job("Sonnet").unwrap_err().contains("dispatch.model"));
+    }
+
+    /// `preempt` is read from `[dispatch]`, and refused beside a priority
+    /// written below critical; a template decides per item.
+    #[test]
+    fn a_jobs_preempt_needs_critical() {
+        let job = |extra: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\n{extra}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &Defaults::default(),
+                &Builtins,
+            )
+        };
+        assert!(!job("").unwrap().preempt);
+        assert!(
+            job("preempt = true\npriority = \"critical\"")
+                .unwrap()
+                .preempt
+        );
+        assert!(
+            job("preempt = true\npriority = \"{{ item.level }}\"")
+                .unwrap()
+                .preempt
+        );
+        assert!(job("preempt = true").unwrap().preempt);
+        let err = job("preempt = true\npriority = \"high\"").unwrap_err();
+        assert!(err.contains("preempt_needs_critical"), "{err}");
     }
 
     /// A job's `priority` is a template rendered per item: empty falls

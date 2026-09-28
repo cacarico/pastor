@@ -259,7 +259,10 @@ pub fn task_detail(t: &Task) -> String {
         Some(m) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
         None => "-".to_string(),
     };
-    let priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
+    let mut priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
+    if t.pause.preempt {
+        priority.push_str(", preempt: pauses a low task on a full machine");
+    }
     let profile = match t.profile() {
         Some(p) => format!("{p}{}", from(source.and_then(|s| s.profile_from.as_ref()))),
         None => "-".to_string(),
@@ -323,6 +326,17 @@ pub fn task_detail(t: &Task) -> String {
         ("started", when(t.started_at)),
         ("finished", when(t.finished_at)),
     ];
+    if let Some(at) = t.pause.paused_at {
+        let by = t
+            .pause
+            .paused_for
+            .map(|id| format!(" for {}", Task::agent_name_for(id)))
+            .unwrap_or_default();
+        fields.push(("paused", format!("{}{by}", when(Some(at)))));
+    }
+    if t.pause.resumed_at.is_some() {
+        fields.push(("resumed", when(t.pause.resumed_at)));
+    }
     if let Some(e) = &t.error {
         fields.push(("error", e.clone()));
     }
@@ -832,6 +846,7 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            pause: Default::default(),
             created_at: now,
             started_at: Some(now),
             finished_at: None,
@@ -1178,6 +1193,24 @@ mod tests {
             "{bare}"
         );
         assert!(bare.contains("agent args: -\n"), "{bare}");
+    }
+
+    /// `task describe` says when a paused task was paused and for which
+    /// task, and marks a task that may pause one.
+    #[test]
+    fn a_paused_task_says_when_and_for_whom() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        t.priority = crate::task::Priority::Low;
+        t.state = crate::task::TaskState::Paused;
+        t.pause.paused_at = Some(Utc::now());
+        t.pause.paused_for = Some(9);
+        let out = task_detail(&t);
+        assert!(out.contains("state:      paused\n"), "{out}");
+        assert!(out.contains(" for t-9\n"), "{out}");
+        assert!(!out.contains("resumed:"), "{out}");
+        t.pause.preempt = true;
+        t.priority = crate::task::Priority::Critical;
+        assert!(task_detail(&t).contains("critical, preempt: "));
     }
 
     /// `task describe` gives the level and the layer that set it, and

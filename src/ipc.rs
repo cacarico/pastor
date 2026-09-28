@@ -22,8 +22,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// (`Run::priority`, `TaskPriority`). 12: `Run::role`. 13: permission
 /// profiles (`AgentChoice::profile`). 14: `Queue` and `QueueMove`. 15:
 /// descriptions (`Run::description`, `FlockAdd::description`,
-/// `JobTask::description`).
-pub const IPC_PROTOCOL: u32 = 15;
+/// `JobTask::description`). 16: pausing (`Run::preempt`,
+/// `TaskPriority::preempt`).
+pub const IPC_PROTOCOL: u32 = 16;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -115,6 +116,11 @@ pub const PROFILE_PROTOCOL: u32 = 13;
 /// one refuses them as unreadable.
 pub const QUEUE_PROTOCOL: u32 = 14;
 
+/// The first protocol whose head honours `Run::preempt` and
+/// `TaskPriority::preempt`. An older one would queue the task without it,
+/// and it would wait behind low work, without a word.
+pub const PREEMPT_PROTOCOL: u32 = 16;
+
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.
 pub fn check_protocol(version: &str, protocol: u32, needed: u32, what: &str) -> anyhow::Result<()> {
@@ -159,6 +165,12 @@ pub enum IpcRequest {
         /// first line.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        /// `task run --preempt`: the task, critical, may pause a low one to
+        /// start. Left out when not given, so an older head still reads the
+        /// request; given, the CLI sends it only to a head of
+        /// `PREEMPT_PROTOCOL` or later.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        preempt: bool,
     },
     List {
         filter: TaskFilter,
@@ -233,6 +245,9 @@ pub enum IpcRequest {
     TaskPriority {
         id: i64,
         priority: crate::task::Priority,
+        /// `task priority --preempt`; without it the task's flag goes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        preempt: bool,
     },
     /// The queued tasks in dispatch order, each with why it waits
     /// (`pastor queue`); `flock` and `machine` keep a flock's tasks or the
@@ -883,6 +898,7 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            pause: Default::default(),
             created_at: now,
             started_at: None,
             finished_at: None,
@@ -1081,6 +1097,7 @@ mod tests {
     fn fleet_changes() -> Vec<IpcRequest> {
         vec![
             IpcRequest::Run {
+                preempt: false,
                 description: None,
                 prompt: "p".into(),
                 spec: minimal_task().spec,
@@ -1090,6 +1107,7 @@ mod tests {
                 role: TaskRole::Agent,
             },
             IpcRequest::TaskPriority {
+                preempt: false,
                 id: 1,
                 priority: crate::task::Priority::High,
             },
@@ -1219,6 +1237,7 @@ mod tests {
     #[test]
     fn run_names_its_role_only_when_not_a_plain_agent() {
         let run = |role| IpcRequest::Run {
+            preempt: false,
             prompt: "p".into(),
             spec: minimal_task().spec,
             flock: None,

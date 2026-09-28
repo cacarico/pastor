@@ -3837,7 +3837,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__priority)
-            opts="-h --json --head --help"
+            opts="-h --preempt --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3921,7 +3921,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__run)
-            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --priority --profile --worktree --branch --tag --timeout --place --role --description --json --head --help"
+            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --priority --preempt --profile --worktree --branch --tag --timeout --place --role --description --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

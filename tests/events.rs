@@ -250,6 +250,7 @@ async fn the_daemon_writes_the_events_log() {
         &socket,
         &IpcRequest::Run {
             role: Default::default(),
+            preempt: false,
             description: None,
             prompt: "hi".into(),
             spec: DispatchSpec {

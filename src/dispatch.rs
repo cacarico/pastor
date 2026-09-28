@@ -172,6 +172,34 @@ pub async fn dispatch(
     head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
+    start(conn, task, agents, head, ready_timeout, false).await
+}
+
+/// `dispatch` for a paused task (`TaskState::Paused`): the same steps, but
+/// the agent starts on the session it was paused in (`claude --resume
+/// <session>`, in place of a new `--session-id`), a worktree task goes back
+/// to its own checkout (`worktree.open`, never a new one: its session is
+/// filed under that directory) and the prompt is `RESUME_PROMPT`, since the
+/// task's own is already in the conversation. A checkout that is gone, or
+/// no session recorded, fails the task.
+pub async fn resume(
+    conn: &dyn Connector,
+    task: &mut Task,
+    agents: &Agents,
+    head: Option<&str>,
+    ready_timeout: Duration,
+) -> Result<DispatchOutcome, DispatchError> {
+    start(conn, task, agents, head, ready_timeout, true).await
+}
+
+async fn start(
+    conn: &dyn Connector,
+    task: &mut Task,
+    agents: &Agents,
+    head: Option<&str>,
+    ready_timeout: Duration,
+    resume: bool,
+) -> Result<DispatchOutcome, DispatchError> {
     let name = Task::agent_name_for(task.id);
     task.agent_name = Some(name.clone());
     task.state = TaskState::Starting;
@@ -179,7 +207,7 @@ pub async fn dispatch(
     task.prompt_pending = false;
     task.activity_seen = false;
 
-    let result = dispatch_steps(conn, task, &name, agents, head, ready_timeout).await;
+    let result = dispatch_steps(conn, task, &name, agents, head, ready_timeout, resume).await;
     match &result {
         Ok(DispatchOutcome::Running) => {
             task.state = TaskState::Running;
@@ -209,6 +237,7 @@ async fn dispatch_steps(
     agents: &Agents,
     head: Option<&str>,
     ready_timeout: Duration,
+    resume: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
     // Before anything is made on the machine: a task whose agent cannot take
@@ -239,14 +268,27 @@ async fn dispatch_steps(
     // resume it once the pane is gone; last, after the tool flags. The task
     // records it only once `agent.start` succeeds (`finish_dispatch`): a
     // task that failed before then never had that conversation to resume.
-    task.spec.session_id = None;
+    // A paused task goes back to the session it recorded instead.
     let mut session = None;
-    if launch.kind == "claude"
-        && !crate::task::picks_session(&launch.args)
-        && let Some(id) = crate::task::new_session_id()
-    {
-        launch.args.extend(["--session-id".to_string(), id.clone()]);
+    if resume {
+        let id = spec
+            .session_id
+            .clone()
+            .filter(|id| crate::task::is_session_id(id))
+            .ok_or_else(|| {
+                DispatchError::Task(format!("{name} has no Claude session recorded to resume"))
+            })?;
+        launch.args.extend(["--resume".to_string(), id.clone()]);
         session = Some(id);
+    } else {
+        task.spec.session_id = None;
+        if launch.kind == "claude"
+            && !crate::task::picks_session(&launch.args)
+            && let Some(id) = crate::task::new_session_id()
+        {
+            launch.args.extend(["--session-id".to_string(), id.clone()]);
+            session = Some(id);
+        }
     }
     let repo = match spec.repo.as_deref() {
         Some(repo) => Some(expand_home(conn, "repo", repo, task.machine.as_deref()).await?),
@@ -294,7 +336,7 @@ async fn dispatch_steps(
             if spec.worktree
                 && let Some(repo) = repo.as_deref()
             {
-                let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
+                let (created, branch) = open_worktree(conn, &spec, repo, name, resume).await?;
                 task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
                 worktree = Some(created);
             }
@@ -311,7 +353,7 @@ async fn dispatch_steps(
             pane.pane_id
         }
         (None, Some(repo)) if spec.worktree => {
-            let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
+            let (created, branch) = open_worktree(conn, &spec, repo, name, resume).await?;
             task.workspace_id = Some(created.workspace.workspace_id.clone());
             task.pane_id = Some(created.root_pane.pane_id.clone());
             task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
@@ -337,10 +379,26 @@ async fn dispatch_steps(
             created.root_pane.pane_id
         }
     };
-    finish_dispatch(conn, task, name, &launch, session, &pane_id, ready_timeout).await
+    let prompt = if resume {
+        crate::task::RESUME_PROMPT.to_string()
+    } else {
+        task.prompt.clone()
+    };
+    finish_dispatch(
+        conn,
+        task,
+        name,
+        &launch,
+        session,
+        &pane_id,
+        &prompt,
+        ready_timeout,
+    )
+    .await
 }
 
-/// Start the agent in its pane, wait for it to come up and prompt it.
+/// Start the agent in its pane, wait for it to come up and give it `prompt`.
+#[allow(clippy::too_many_arguments)]
 async fn finish_dispatch(
     conn: &dyn Connector,
     task: &mut Task,
@@ -348,6 +406,7 @@ async fn finish_dispatch(
     launch: &crate::config::Launch,
     session: Option<String>,
     pane_id: &str,
+    prompt: &str,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     // herdr's `agent.start` returns as soon as it has launched the agent in the
@@ -357,7 +416,7 @@ async fn finish_dispatch(
     start_agent(conn, name, &launch.kind, &launch.args, pane_id).await?;
     task.spec.session_id = session;
 
-    let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
+    let (outcome, prompted) = prompt_when_ready(conn, task, name, prompt, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
     // already at work when the prompt went in; see
     // `task::completed_since_prompt`.
@@ -485,7 +544,22 @@ async fn open_worktree(
     spec: &DispatchSpec,
     repo: &str,
     name: &str,
+    resume: bool,
 ) -> Result<(Created, String), DispatchError> {
+    // A paused task's own checkout, kept when it was paused: only it will
+    // do, since Claude files the session under that directory.
+    if resume && let Some(checkout) = spec.checkout.as_deref() {
+        return match conn.worktree_open(repo, &checkout.branch, name).await {
+            Ok(created) => Ok((created, checkout.branch.clone())),
+            Err(err) if err.code() == Some("worktree_not_found") => {
+                Err(DispatchError::Task(format!(
+                    "its worktree {} on branch {} is gone, so its session has nowhere to resume",
+                    checkout.path, checkout.branch
+                )))
+            }
+            Err(err) => Err(err.into()),
+        };
+    }
     if let Some(reopen) = reopenable(conn, spec, repo).await? {
         let created = conn.worktree_open(repo, &reopen.branch, name).await?;
         return Ok((created, reopen.branch.clone()));
@@ -669,6 +743,7 @@ async fn prompt_when_ready(
     conn: &dyn Connector,
     task: &Task,
     name: &str,
+    prompt: &str,
     ready_timeout: Duration,
 ) -> Result<(DispatchOutcome, Option<AgentInfo>), DispatchError> {
     let machine = task.machine.as_deref().unwrap_or("that machine");
@@ -700,7 +775,7 @@ async fn prompt_when_ready(
         if agent.launch_pending {
             // still launching: fall through to the wait below
         } else if can_prompt {
-            match conn.agent_prompt(name, &task.prompt).await {
+            match conn.agent_prompt(name, prompt).await {
                 // The reply carries the agent's `state_change_seq` and status
                 // as the prompt went in.
                 Ok(agent) => return Ok((DispatchOutcome::Running, Some(agent))),
@@ -888,6 +963,7 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            pause: Default::default(),
             created_at: now,
             started_at: None,
             finished_at: None,

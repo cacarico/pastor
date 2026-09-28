@@ -210,6 +210,7 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            pause: Default::default(),
             created_at: now,
             started_at: None,
             finished_at: None,
