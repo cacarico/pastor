@@ -60,10 +60,14 @@ check() {
 		bad=1
 	fi
 	if [ -d changes ]; then
-		while IFS= read -r f; do
+		for f in changes/*; do
+			[ -e "$f" ] || continue
+			case "$f" in
+			*.md) [ -d "$f" ] || continue ;;
+			esac
 			echo "changelog: $f: only changes/*.md files belong in changes/" >&2
 			bad=1
-		done < <(find changes -mindepth 1 \( -type d -o ! -name '*.md' \) -print | sort)
+		done
 	fi
 	while IFS= read -r f; do
 		awk -v f="$f" -v allowed=" $headings " '
@@ -94,8 +98,10 @@ check() {
 
 # The pending entries as one section body, without the "## " line.
 render() {
-	local files
-	mapfile -t files < <(ordered_files)
+	local files=() f
+	while IFS= read -r f; do
+		files+=("$f")
+	done < <(ordered_files)
 	[ "${#files[@]}" -gt 0 ] || return 0
 	awk -v order="$headings" '
 		function flush(   s) {
