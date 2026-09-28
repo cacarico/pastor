@@ -130,6 +130,14 @@ pub struct FlockEntry {
     /// `[defaults] profile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// How long this flock's tasks may run (`"2h"`) when the task or job
+    /// sets none, before `[defaults] timeout` (`Defaults::resolve_timeout`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// Where this flock's tasks put their pane when the task or job sets
+    /// none, before `[defaults] place` (`Defaults::resolve_place`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<crate::task::Place>,
     /// The label template of the workspace this flock's tasks make when
     /// the task or job sets none, before `[defaults] label`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,6 +255,10 @@ impl Flock {
             }
             if let Some(label) = &f.label {
                 crate::task::check_label(label).map_err(|e| format!("flock {}: {e}", f.name))?;
+            }
+            if let Some(t) = &f.timeout {
+                crate::config::parse_duration(t)
+                    .map_err(|e| format!("flock {}: timeout: {e}", f.name))?;
             }
         }
         if !self.flocks.is_empty() {

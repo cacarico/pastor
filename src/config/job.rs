@@ -348,6 +348,8 @@ impl Job {
             deny: d.deny,
             model: d.model,
             profile: d.profile,
+            timeout_secs: d.timeout.is_some().then_some(timeout.as_secs()),
+            place: d.place.clone(),
         };
         let pick = defaults.resolve_agent(&agent, None);
         Ok(Job {
