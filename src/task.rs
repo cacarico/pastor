@@ -393,6 +393,12 @@ pub struct Task {
 }
 
 impl Task {
+    /// Whether a job made this task; `pastor task run` tasks carry the job
+    /// name `run`. Only these take a machine's job slots.
+    pub fn from_job(&self) -> bool {
+        self.job != "run"
+    }
+
     pub fn display_id(&self) -> String {
         format!("t-{}", self.id)
     }

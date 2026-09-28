@@ -13,7 +13,7 @@ use crate::config::{
     AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer, MODEL_KIND_MISMATCH, Models,
     PastorConfig, Paths,
 };
-use crate::dispatch::{MachineView, pick_machine, pick_machine_where};
+use crate::dispatch::{Claim, MachineView, pick_machine, pick_machine_where};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{HeadPing, IpcRequest, IpcResponse};
 use crate::machine::{
@@ -723,7 +723,8 @@ impl Fleet {
             self.store.clone(),
             settings.clone(),
             spawner.events.clone(),
-        );
+        )
+        .with_slots(m.job_slots, m.burst);
         Member {
             handle,
             spawned_from: Some((actor_config(m), settings.clone())),
@@ -742,8 +743,11 @@ impl Fleet {
                 MachineView {
                     name: m.handle.name.clone(),
                     max_agents: m.handle.max_agents,
+                    job_slots: m.handle.job_slots,
+                    burst: m.handle.burst,
                     tags: m.handle.tags.clone(),
                     live: s.live,
+                    live_jobs: s.live_jobs,
                     // An aborted actor answers nothing, and a dispatch to
                     // it would wait for as long as it stays wedged.
                     healthy: !m.shutting_down && s.channel.accepts_dispatch(),
@@ -1055,12 +1059,13 @@ impl Fleet {
                 );
                 Some(r.map(|()| spec))
             };
-            let picked = pick_machine_where(&views, target, &task.spec, &|m| {
+            let claim = Claim::of(&task);
+            let picked = pick_machine_where(&views, target, &task.spec, claim, &|m| {
                 settled_on(m).is_none_or(|r| r.is_ok())
             });
             let Some(name) = picked else {
                 // Say why, when a machine would take it but for its model.
-                if let Some(m) = pick_machine(&views, target, &task.spec)
+                if let Some(m) = pick_machine(&views, target, &task.spec, claim)
                     && let Some(Err(err)) = settled_on(&m)
                 {
                     let note = format!("{WAITING_FOR_MODEL}: {err}");
@@ -1123,7 +1128,7 @@ fn layer_label(layer: Layer, asked_by: &str, flock: &str, machine: Option<&str>)
 
 /// Who asked for `task`'s agent, as `AgentSource` labels it.
 fn asked_by(task: &Task) -> String {
-    if task.job == "run" {
+    if !task.from_job() {
         "task run".to_string()
     } else {
         format!("job {}", task.job)
@@ -2404,6 +2409,9 @@ mod tests {
             command: Some(vec!["fake".into()]),
             session: "default".into(),
             max_agents: max,
+            // No job slots or burst: tests of max_agents alone.
+            job_slots: 0,
+            burst: 0,
             tags: vec![],
             flock: None,
             agent: None,
@@ -5035,6 +5043,52 @@ mod tests {
             1,
             "one agent on a max_agents = 1 machine"
         );
+    }
+
+    /// A machine with max_agents = 1, one job slot and one burst: a second
+    /// `task run` task waits, a job task takes the job slot, and a critical
+    /// task goes past the full shared slot on burst.
+    #[tokio::test]
+    async fn dispatch_uses_job_slots_and_burst() {
+        let fake = FakeHerdr::new();
+        let flock = Flock {
+            flocks: vec![],
+            machines: vec![MachineConfig {
+                job_slots: 1,
+                burst: 1,
+                ..machine("a", 1)
+            }],
+        };
+        let (d, _tmp) = daemon_with_flock(flock, &[("a", 1, fake.clone())]).await;
+        let insert = |job: &str, p: &str| {
+            d.store()
+                .insert_task(NewTask {
+                    job: job.into(),
+                    item: serde_json::Value::Null,
+                    prompt: p.into(),
+                    spec: spec(),
+                    flock: "default".into(),
+                })
+                .unwrap()
+        };
+        let first = insert("run", "1");
+        let second = insert("run", "2");
+        let job = insert("nightly", "3");
+        let fleet = d.fleet();
+        fleet.dispatch_queued().await;
+        let state = |id: i64| d.store().get_task(id).unwrap().unwrap().state;
+        assert_eq!(state(first.id), TaskState::Running);
+        assert_eq!(state(second.id), TaskState::Queued, "held at max_agents");
+        assert_eq!(state(job.id), TaskState::Running, "in the job slot");
+
+        let critical = insert("run", "4");
+        d.store()
+            .set_priority(critical.id, Priority::Critical, "test")
+            .unwrap();
+        fleet.dispatch_queued().await;
+        assert_eq!(state(critical.id), TaskState::Running, "on burst");
+        assert_eq!(state(second.id), TaskState::Queued);
+        assert_eq!(fake.agents().len(), 3);
     }
 
     /// `FileGet` and `FilePut` act on the head's own files, named only as

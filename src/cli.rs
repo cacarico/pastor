@@ -453,6 +453,10 @@ pub struct MachineRow {
     pub error: Option<String>,
     pub live: Option<usize>,
     pub max_agents: u32,
+    /// `MachineConfig::job_slots` and `burst`, shown after `max_agents` as
+    /// `2+1j+1b` when either is set.
+    pub job_slots: u32,
+    pub burst: u32,
     pub tags: Vec<String>,
     /// `MachineStatus::orphans`; a probe works them out itself from
     /// `agent.list` and the store, and leaves them empty when it cannot.
@@ -474,6 +478,8 @@ impl From<&MachineStatus> for MachineRow {
             error: m.error.clone(),
             live: Some(m.live),
             max_agents: m.max_agents,
+            job_slots: m.job_slots,
+            burst: m.burst,
             tags: m.tags.clone(),
             orphans: m.orphans.clone(),
         }
@@ -517,6 +523,19 @@ pub fn head_line(head: &HeadRow, rows: &[MachineRow]) -> String {
     line
 }
 
+/// A machine's room as `machine list` shows it: `max_agents`, then
+/// `+<n>j` for job slots and `+<n>b` for burst when they are set.
+pub fn capacity(max_agents: u32, job_slots: u32, burst: u32) -> String {
+    let mut out = max_agents.to_string();
+    if job_slots > 0 {
+        out.push_str(&format!("+{job_slots}j"));
+    }
+    if burst > 0 {
+        out.push_str(&format!("+{burst}b"));
+    }
+    out
+}
+
 /// One row per machine, in the order given.
 pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
     let dash = || "-".to_string();
@@ -532,7 +551,7 @@ pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
                 format!(
                     "{}/{}",
                     m.live.map_or_else(dash, |n| n.to_string()),
-                    m.max_agents
+                    capacity(m.max_agents, m.job_slots, m.burst)
                 ),
                 if m.orphans.is_empty() {
                     dash()
@@ -678,6 +697,9 @@ mod tests {
             error: None,
             live: 1,
             max_agents: 3,
+            live_jobs: 0,
+            job_slots: 0,
+            burst: 0,
             tags: vec!["fast".into(), "arm".into()],
             orphans: vec![],
             flock: None,
@@ -784,6 +806,27 @@ mod tests {
         );
     }
 
+    /// Job slots and burst show after max_agents only when set; the JSON
+    /// always has both.
+    #[test]
+    fn machine_list_shows_job_slots_and_burst() {
+        assert_eq!(capacity(2, 0, 0), "2");
+        assert_eq!(capacity(2, 1, 1), "2+1j+1b");
+        assert_eq!(capacity(3, 2, 0), "3+2j");
+        assert_eq!(capacity(3, 0, 1), "3+1b");
+        let m = MachineStatus {
+            job_slots: 1,
+            burst: 1,
+            max_agents: 2,
+            ..status("pi-3", "fleet@pi-3")
+        };
+        let row = MachineRow::from(&m);
+        assert_eq!(machine_rows(std::slice::from_ref(&row))[0][6], "1/2+1j+1b");
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["job_slots"], 1);
+        assert_eq!(v["burst"], 1);
+    }
+
     /// The head is not a machine: scripts that walk `machines` must not trip
     /// over it, so it sits under its own key.
     #[test]
@@ -856,6 +899,8 @@ mod tests {
                 command: None,
                 session: "default".into(),
                 max_agents: 2,
+                job_slots: 1,
+                burst: 1,
                 tags: vec![],
                 flock: None,
                 agent: None,

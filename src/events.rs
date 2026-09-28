@@ -707,6 +707,8 @@ mod tests {
         MachineHandle {
             name: name.into(),
             max_agents: 2,
+            job_slots: 0,
+            burst: 0,
             tags: vec![],
             tx,
             status: Arc::new(RwLock::new(MachineStatus {
@@ -720,6 +722,9 @@ mod tests {
                 error: Some("ssh: connection refused".into()),
                 live: 1,
                 max_agents: 2,
+                live_jobs: 0,
+                job_slots: 0,
+                burst: 0,
                 tags: vec![],
                 orphans: vec![],
                 flock: None,

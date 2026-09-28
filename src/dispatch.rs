@@ -7,7 +7,7 @@ use crate::config::Agents;
 use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
 };
-use crate::task::{Checkout, DispatchSpec, Place, Reopen, Task, TaskState};
+use crate::task::{Checkout, DispatchSpec, Place, Priority, Reopen, Task, TaskState};
 
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
 const READY_POLL: Duration = Duration::from_millis(500);
@@ -26,18 +26,62 @@ const PANE_BUSY_WAIT: Duration = Duration::from_millis(500);
 pub struct MachineView {
     pub name: String,
     pub max_agents: u32,
+    /// Slots only job tasks take, on top of `max_agents`.
+    pub job_slots: u32,
+    /// How far past `max_agents` a critical task may go.
+    pub burst: u32,
     pub tags: Vec<String>,
+    /// Every pane-owning task and orphan on the machine.
     pub live: usize,
+    /// How many of `live` come from a job (`Task::from_job`).
+    pub live_jobs: usize,
     pub healthy: bool,
     /// The flock the machine is in now.
     pub flock: String,
 }
 
+/// What a task may take on a machine: a job slot if it comes from a job,
+/// burst if it is critical.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Claim {
+    pub from_job: bool,
+    pub critical: bool,
+}
+
+impl Claim {
+    pub fn of(task: &Task) -> Claim {
+        Claim {
+            from_job: task.from_job(),
+            critical: task.priority == Priority::Critical,
+        }
+    }
+}
+
+impl MachineView {
+    /// Is there a slot for a task that claims `claim`? Up to `job_slots`
+    /// live job tasks sit in job slots; every other live task counts
+    /// against `max_agents`. A job task takes a free job slot, then a
+    /// shared one; a critical task that finds the shared slots full may go
+    /// up to `max_agents + burst`.
+    pub fn has_room(&self, claim: Claim) -> bool {
+        let in_job_slots = self.live_jobs.min(self.job_slots as usize);
+        let shared = (self.live - in_job_slots) as u64;
+        (claim.from_job && self.live_jobs < self.job_slots as usize)
+            || shared < self.max_agents as u64
+            || (claim.critical && shared < self.max_agents as u64 + self.burst as u64)
+    }
+}
+
 /// Only machines in `flock`, the task's, qualify. Of those the pinned machine
-/// wins. Otherwise: healthy, has every required tag, below capacity, fewest
-/// live tasks. Ties keep flock order.
-pub fn pick_machine(machines: &[MachineView], flock: &str, spec: &DispatchSpec) -> Option<String> {
-    pick_machine_where(machines, flock, spec, &|_| true)
+/// wins. Otherwise: healthy, has every required tag, has room for `claim`
+/// (`MachineView::has_room`), fewest live tasks. Ties keep flock order.
+pub fn pick_machine(
+    machines: &[MachineView],
+    flock: &str,
+    spec: &DispatchSpec,
+    claim: Claim,
+) -> Option<String> {
+    pick_machine_where(machines, flock, spec, claim, &|_| true)
 }
 
 /// `pick_machine` among the machines `accepts` takes by name, as a machine
@@ -46,12 +90,13 @@ pub fn pick_machine_where(
     machines: &[MachineView],
     flock: &str,
     spec: &DispatchSpec,
+    claim: Claim,
     accepts: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
     let fits = |m: &MachineView| {
         m.flock == flock
             && m.healthy
-            && (m.live as u64) < m.max_agents as u64
+            && m.has_room(claim)
             && spec.tags.iter().all(|t| m.tags.contains(t))
             && accepts(&m.name)
     };
@@ -672,8 +717,11 @@ mod tests {
         MachineView {
             name: name.into(),
             max_agents: max,
+            job_slots: 0,
+            burst: 0,
             tags: tags.iter().map(|s| s.to_string()).collect(),
             live,
+            live_jobs: 0,
             healthy,
             flock: "default".into(),
         }
@@ -690,20 +738,20 @@ mod tests {
             },
         ];
         assert_eq!(
-            pick_machine(&ms, "default", &spec()).as_deref(),
+            pick_machine(&ms, "default", &spec(), Claim::default()).as_deref(),
             Some("home-1")
         );
         assert_eq!(
-            pick_machine(&ms, "work", &spec()).as_deref(),
+            pick_machine(&ms, "work", &spec(), Claim::default()).as_deref(),
             Some("work-1")
         );
-        assert_eq!(pick_machine(&ms, "play", &spec()), None);
+        assert_eq!(pick_machine(&ms, "play", &spec(), Claim::default()), None);
         let pinned_elsewhere = DispatchSpec {
             machine: Some("work-1".into()),
             ..spec()
         };
         assert_eq!(
-            pick_machine(&ms, "default", &pinned_elsewhere),
+            pick_machine(&ms, "default", &pinned_elsewhere, Claim::default()),
             None,
             "a pinned machine that moved to another flock takes nothing"
         );
@@ -826,9 +874,157 @@ mod tests {
             mv("b", 2, 1, &[], true),
             mv("c", 2, 0, &[], true),
         ];
-        assert_eq!(pick_machine(&ms, "default", &spec()).as_deref(), Some("c"));
+        assert_eq!(
+            pick_machine(&ms, "default", &spec(), Claim::default()).as_deref(),
+            Some("c")
+        );
         let full = vec![mv("a", 1, 1, &[], true)];
-        assert_eq!(pick_machine(&full, "default", &spec()), None);
+        assert_eq!(
+            pick_machine(&full, "default", &spec(), Claim::default()),
+            None
+        );
+    }
+
+    /// `mv` with job slots and burst, and how many of `live` are job tasks.
+    fn slots(max: u32, job_slots: u32, burst: u32, live: usize, live_jobs: usize) -> MachineView {
+        MachineView {
+            job_slots,
+            burst,
+            live_jobs,
+            ..mv("m", max, live, &[], true)
+        }
+    }
+
+    const RUN: Claim = Claim {
+        from_job: false,
+        critical: false,
+    };
+    const JOB: Claim = Claim {
+        from_job: true,
+        critical: false,
+    };
+    const CRITICAL_RUN: Claim = Claim {
+        from_job: false,
+        critical: true,
+    };
+    const CRITICAL_JOB: Claim = Claim {
+        from_job: true,
+        critical: true,
+    };
+
+    #[test]
+    fn job_slots_alone_are_for_job_tasks() {
+        // Two `task run` tasks fill max_agents = 2; the job slot is free.
+        let m = slots(2, 1, 0, 2, 0);
+        assert!(m.has_room(JOB), "a job task takes the free job slot");
+        assert!(
+            !m.has_room(RUN),
+            "a normal task is still held at max_agents"
+        );
+        assert!(!m.has_room(CRITICAL_RUN), "no burst");
+        // The job slot taken, a second job task finds no room.
+        assert!(!slots(2, 1, 0, 3, 1).has_room(JOB));
+        // A job task in the job slot leaves the shared slots to others.
+        assert!(slots(2, 1, 0, 2, 1).has_room(RUN));
+        // Job tasks past the job slots count against max_agents.
+        assert!(!slots(2, 1, 0, 3, 3).has_room(RUN));
+        assert!(!slots(2, 1, 0, 3, 3).has_room(JOB));
+        assert!(slots(2, 1, 0, 2, 2).has_room(JOB), "a shared slot is free");
+    }
+
+    #[test]
+    fn burst_alone_is_for_critical_tasks() {
+        let m = slots(2, 0, 1, 2, 0);
+        assert!(
+            m.has_room(CRITICAL_RUN),
+            "critical goes one past max_agents"
+        );
+        assert!(
+            !m.has_room(RUN),
+            "a normal task is still held at max_agents"
+        );
+        assert!(!m.has_room(JOB), "no job slots");
+        assert!(m.has_room(CRITICAL_JOB), "a critical job task bursts too");
+        assert!(
+            !slots(2, 0, 1, 3, 0).has_room(CRITICAL_RUN),
+            "burst used up"
+        );
+        assert!(slots(2, 0, 2, 3, 0).has_room(CRITICAL_RUN));
+    }
+
+    #[test]
+    fn job_slots_and_burst_together() {
+        // Shared slots full, job slot free, burst free.
+        let m = slots(2, 1, 1, 2, 0);
+        assert!(m.has_room(JOB));
+        assert!(m.has_room(CRITICAL_RUN));
+        assert!(!m.has_room(RUN));
+        // A job task in its slot does not use up the burst.
+        let m = slots(2, 1, 1, 3, 1);
+        assert!(m.has_room(CRITICAL_RUN), "burst counts outside job slots");
+        assert!(!m.has_room(JOB), "job slot taken, shared slots full");
+        assert!(m.has_room(CRITICAL_JOB), "then burst");
+        // Everything taken.
+        let m = slots(2, 1, 1, 4, 1);
+        assert!(!m.has_room(CRITICAL_JOB));
+        assert!(!m.has_room(CRITICAL_RUN));
+    }
+
+    #[test]
+    fn zero_turns_job_slots_and_burst_off() {
+        let m = slots(2, 0, 0, 2, 0);
+        for claim in [RUN, JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert!(!m.has_room(claim), "{claim:?}");
+        }
+        let m = slots(2, 0, 0, 1, 1);
+        for claim in [RUN, JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert!(m.has_room(claim), "{claim:?}");
+        }
+    }
+
+    #[test]
+    fn critical_job_task_takes_a_job_slot_first() {
+        // Job slot free, shared slots free: the critical job task still
+        // fits without burst, and once it runs it sits in the job slot, so
+        // the shared slots stay open for a normal task.
+        let before = slots(1, 1, 1, 0, 0);
+        assert!(before.has_room(CRITICAL_JOB));
+        let after = slots(1, 1, 1, 1, 1);
+        assert!(after.has_room(RUN), "the shared slot is still free");
+        assert!(after.has_room(CRITICAL_RUN));
+        // Shared slot and job slot full: burst is the last step.
+        let full = slots(1, 1, 1, 2, 1);
+        assert!(!full.has_room(RUN));
+        assert!(!full.has_room(JOB));
+        assert!(full.has_room(CRITICAL_JOB));
+    }
+
+    #[test]
+    fn pick_machine_takes_the_fewest_live_among_those_with_room() {
+        let ms = vec![
+            // Fewest live, but full for a normal task.
+            MachineView {
+                name: "a".into(),
+                ..slots(1, 1, 0, 1, 0)
+            },
+            MachineView {
+                name: "b".into(),
+                ..slots(3, 0, 0, 2, 0)
+            },
+            MachineView {
+                name: "c".into(),
+                ..slots(3, 0, 0, 3, 0)
+            },
+        ];
+        assert_eq!(
+            pick_machine(&ms, "default", &spec(), RUN).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            pick_machine(&ms, "default", &spec(), JOB).as_deref(),
+            Some("a"),
+            "a's job slot is room for a job task, and a has fewest live"
+        );
     }
 
     #[test]
@@ -845,7 +1041,8 @@ mod tests {
                 &DispatchSpec {
                     machine: Some("c".into()),
                     ..spec()
-                }
+                },
+                Claim::default(),
             )
             .as_deref(),
             Some("c")
@@ -857,7 +1054,8 @@ mod tests {
                 &DispatchSpec {
                     machine: Some("b".into()),
                     ..spec()
-                }
+                },
+                Claim::default(),
             ),
             None,
             "pinned but unhealthy"
@@ -869,7 +1067,8 @@ mod tests {
                 &DispatchSpec {
                     machine: Some("zzz".into()),
                     ..spec()
-                }
+                },
+                Claim::default(),
             ),
             None,
             "pinned but unknown"
@@ -881,7 +1080,8 @@ mod tests {
                 &DispatchSpec {
                     tags: vec!["gpu".into()],
                     ..spec()
-                }
+                },
+                Claim::default(),
             )
             .as_deref(),
             Some("c")
@@ -893,7 +1093,8 @@ mod tests {
                 &DispatchSpec {
                     tags: vec!["fast".into()],
                     ..spec()
-                }
+                },
+                Claim::default(),
             )
             .as_deref(),
             Some("a"),
@@ -906,7 +1107,8 @@ mod tests {
                 &DispatchSpec {
                     tags: vec!["nope".into()],
                     ..spec()
-                }
+                },
+                Claim::default(),
             ),
             None
         );

@@ -157,7 +157,17 @@ pub struct MachineStatus {
     pub protocol: Option<u32>,
     pub error: Option<String>,
     pub live: usize,
+    /// How many of `live` are tasks from jobs (`Task::from_job`). Defaulted
+    /// so a CLI can still read a head that predates the field.
+    #[serde(default)]
+    pub live_jobs: usize,
     pub max_agents: u32,
+    /// `MachineConfig::job_slots` and `burst`. Defaulted to 0, none, so a
+    /// CLI reading a head that predates them shows none.
+    #[serde(default)]
+    pub job_slots: u32,
+    #[serde(default)]
+    pub burst: u32,
     pub tags: Vec<String>,
     /// Agents named like a task (`t-<id>`) that no open task on this machine
     /// owns: the row is failed, closed or gone (a dispatch that failed after
@@ -358,6 +368,9 @@ pub struct ActorStopped {
 pub struct MachineHandle {
     pub name: String,
     pub max_agents: u32,
+    /// Set by `with_slots`; 0 from `spawn_machine`.
+    pub job_slots: u32,
+    pub burst: u32,
     pub tags: Vec<String>,
     pub tx: mpsc::Sender<MachineCommand>,
     pub status: Arc<RwLock<MachineStatus>>,
@@ -397,6 +410,18 @@ pub enum ShutdownOutcome {
 }
 
 impl MachineHandle {
+    /// Give the machine `job_slots` and `burst` (`MachineConfig`), on the
+    /// handle for the picker and in the status for `machine list`.
+    pub fn with_slots(mut self, job_slots: u32, burst: u32) -> MachineHandle {
+        self.job_slots = job_slots;
+        self.burst = burst;
+        let mut s = self.status.write().unwrap();
+        s.job_slots = job_slots;
+        s.burst = burst;
+        drop(s);
+        self
+    }
+
     /// Stop the actor and wait until its task has ended. A flock reload calls
     /// this for a machine it removes or replaces, before it spawns the
     /// replacement, so a removed actor cannot write a row after removal and a
@@ -543,7 +568,10 @@ pub fn spawn_machine(
         protocol: None,
         error: None,
         live: 0,
+        live_jobs: 0,
         max_agents,
+        job_slots: 0,
+        burst: 0,
         tags: tags.clone(),
         orphans: vec![],
         flock: None,
@@ -570,6 +598,8 @@ pub fn spawn_machine(
     MachineHandle {
         name,
         max_agents,
+        job_slots: 0,
+        burst: 0,
         tags,
         tx,
         status,
@@ -1018,6 +1048,7 @@ impl Actor {
                 // leaving it out would let the picker over-dispatch.
                 let mut s = self.status.write().unwrap();
                 s.live = v.len() + self.orphans.len();
+                s.live_jobs = v.iter().filter(|t| t.from_job()).count();
                 s.orphans = self.orphans.iter().map(|(name, _)| name.clone()).collect();
             }
             Err(err) => {

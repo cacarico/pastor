@@ -112,7 +112,9 @@ reconcile past the ten minutes. A probe that gets no answer keeps the version
 last read. `machine list` itself never probes
 while the head is running.
 With `pastor serve` running, CHANNEL is the head's live channel state and
-AGENTS counts pastor's tasks and orphans (see below) against `max_agents`. Without it, the command
+AGENTS counts pastor's tasks and orphans (see below) against the machine's
+room, `max_agents` followed by `+<n>j` for job slots and `+<n>b` for burst
+when they are set (see Room on a machine). Without it, the command
 probes each machine itself (a ping and an `agent.list`, one at a time, with no
 time limit, plus the pastor version for a machine that answered); CHANNEL
 reads one of four values: `probed` (the ping answered — an old protocol or a
@@ -164,7 +166,8 @@ otherwise). No command sends it yet.
 A machine whose requests answer but whose event subscription will not open is
 `polling`: it still takes tasks and is reconciled every `tick`. Two dispatch
 passes never run at once, and a task moves from `queued` to `starting` with a
-conditional update, so a machine is never given more than `max_agents`.
+conditional update, so a machine is never given more than its room (see Room
+on a machine).
 
 `pastor task list` shows live tasks only: queued, starting, running and blocked.
 Finished ones (done, failed, stale, closed) appear with `--all`, and an empty
@@ -809,6 +812,38 @@ it copies, and the copy queues last in it.
 `priority_from` and `queue_pos`, the task's position. A head from before
 levels would queue the task at its own level without a word, so `task run
 --priority` and `task priority` refuse one (`head_too_old`).
+
+### Room on a machine
+
+`max_agents` on a `[[machine]]` (default 2) is how many tasks it runs at
+once: its shared slots. Two more keys make room past them:
+
+```toml
+# flock.toml
+[[machine]]
+name = "pi-3"
+ssh = "user@pi-3"
+max_agents = 2
+job_slots = 1       # default 1: extra slots only tasks from jobs take
+burst = 1           # default 1: how far past max_agents a critical task goes
+```
+
+A task is from a job unless `pastor task run` made it. Up to `job_slots` live
+job tasks count as in job slots; every other live task, and every orphan,
+counts against `max_agents`. A job task takes a free job slot, then a shared
+one. A `critical` task that finds the shared slots full may start while the
+live tasks outside job slots are fewer than `max_agents + burst`; a critical
+job task tries a job slot, then a shared slot, then burst. `0` turns either
+off, and a normal `task run` task is always held at `max_agents`. So two long
+`task run` tasks on a two-slot machine leave a job's task room to start, and
+a critical task still gets past a full machine.
+
+Among the machines with room for the task, the one with the fewest live tasks
+takes it; ties keep flock order. `machine add` takes `--job-slots` and
+`--burst` as it takes `--max-agents`. `machine list` shows the room as
+`2+1j+1b` (`2` alone when both are 0), `machine describe` as `1 of 2+1j+1b`,
+and `--json` has `job_slots` and `burst` on each machine. Changing either
+restarts the machine's actor on reload, as changing `max_agents` does.
 
 ## Events
 

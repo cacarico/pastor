@@ -29,6 +29,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `priority`, `priority_from` and `queue_pos`; existing rows become `normal`,
   placed by id), and the IPC protocol to 9: `task run --priority` and `task
   priority` refuse an older head (`head_too_old`).
+- Job slots and burst: two keys on a flock.toml `[[machine]]`, next to
+  `max_agents`. `job_slots` (default 1) are extra slots only tasks from jobs
+  take, a free one before a shared one, so long `task run` tasks no longer
+  keep a job's tasks from starting. `burst` (default 1) lets a `critical`
+  task start on a machine whose shared slots are full, while the live tasks
+  outside job slots are below `max_agents + burst`. `0` turns either off.
+  The picker takes the machine with the fewest live tasks among those with
+  room for the task. `machine add` takes `--job-slots` and `--burst`;
+  `machine list` shows the room as `2+1j+1b` and `--json` has `job_slots`
+  and `burst`.
 - Named models: `[models.<name>]` in pastor.toml, each with a herdr agent
   `kind` and the `args` that select it. A task runs one with `pastor task run
   --model <name>`, a job's `[dispatch] model` (a template, so

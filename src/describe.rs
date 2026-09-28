@@ -429,9 +429,10 @@ pub fn job_text(j: &JobDescription) -> String {
 
 pub fn machine_text(m: &MachineDescription) -> String {
     let r = &m.row;
+    let room = crate::cli::capacity(r.max_agents, r.job_slots, r.burst);
     let agents = match r.live {
-        Some(n) => format!("{n} of {}", r.max_agents),
-        None => format!("- of {}", r.max_agents),
+        Some(n) => format!("{n} of {room}"),
+        None => format!("- of {room}"),
     };
     let mut out = fields(&[
         ("name", r.name.clone()),

@@ -65,6 +65,27 @@ pastor machine move pi-1 work  # tasks already on it stay there
 pastor flock edit  # saved only once valid
 ```
 
+## room on a machine
+
+`max_agents` (default 2) is how many tasks a machine runs at once. Two more
+keys on a `[[machine]]` make room past it:
+
+```toml
+[[machine]]
+name = "pi-1"
+ssh = "user@pi-1"
+max_agents = 2
+job_slots = 1  # default 1: extra slots only tasks from jobs take
+burst = 1      # default 1: how far past max_agents a critical task may go
+```
+
+A task from a job takes a free job slot first, then a shared one, so a long
+`task run` cannot keep a job's tasks from starting. A `critical` task that
+finds the shared slots full may still start, up to `max_agents + burst`
+tasks outside job slots. `0` turns either off. Among the machines with room,
+the one with the fewest live tasks takes the task. `machine list` shows the
+room as `2+1j+1b`.
+
 ## tags
 
 A machine's `tags` pick machines inside a flock. A task run with `--tag`
