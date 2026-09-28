@@ -62,6 +62,11 @@ pub struct MachineConfig {
     /// kind (see `Defaults::resolve_agent_for`).
     #[serde(default, skip_serializing_if = "crate::config::KindAgents::is_empty")]
     pub agents: crate::config::KindAgents,
+    /// The permission profile for tasks on this machine that name none,
+    /// before its flock's and `[defaults]`. Also what decides whether a task
+    /// may ask for `unrestricted` here (`Profiles::apply`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
@@ -101,6 +106,10 @@ pub struct FlockEntry {
     /// Like the machine's `agents`, before `[defaults] agents`.
     #[serde(default, skip_serializing_if = "crate::config::KindAgents::is_empty")]
     pub agents: crate::config::KindAgents,
+    /// The permission profile for this flock's tasks that name none, before
+    /// `[defaults] profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// Why a task cannot have the flock it asked for (`Flock::task_flock`).
@@ -191,6 +200,10 @@ impl Flock {
             }
             crate::config::check_kind_agent_names(&f.agents)
                 .map_err(|e| format!("flock {}: {e}", f.name))?;
+            if let Some(p) = &f.profile {
+                crate::config::check_profile_name(p)
+                    .map_err(|e| format!("flock {}: {e}", f.name))?;
+            }
         }
         if !self.flocks.is_empty() {
             let defaults: Vec<&str> = self
@@ -246,6 +259,10 @@ impl Flock {
             }
             crate::config::check_kind_agent_names(&m.agents)
                 .map_err(|e| format!("machine {}: {e}", m.name))?;
+            if let Some(p) = &m.profile {
+                crate::config::check_profile_name(p)
+                    .map_err(|e| format!("machine {}: {e}", m.name))?;
+            }
             if m.max_agents == 0 {
                 return Err(format!("machine {}: max_agents must be at least 1", m.name));
             }
@@ -258,25 +275,27 @@ impl Flock {
         Ok(())
     }
 
-    /// Refuse a flock or machine `model` that `[models]` in pastor.toml
-    /// does not define, and an `agents` entry `check_kind_agents` refuses
-    /// by the kinds `[agents]` gives. Apart from `validate` because models
-    /// and agents live in the other file; every caller that loads both runs
-    /// it.
+    /// Refuse a flock or machine `model` that `[models]` in pastor.toml does
+    /// not define, an `agents` entry `check_kind_agents` refuses by the kinds
+    /// `[agents]` gives, or a `profile` that is neither built in nor in
+    /// `[profiles]`. Apart from `validate` because models, agents and
+    /// profiles live in the other file; every caller that loads both runs it.
     pub fn check_config(
         &self,
         models: &crate::config::Models,
         agents: &crate::config::Agents,
+        profiles: &crate::config::profile::Profiles,
     ) -> anyhow::Result<()> {
         let flocks = self
             .flocks
             .iter()
-            .map(|f| ("flock", &f.name, &f.model, &f.agent, &f.agents));
-        let machines = self
-            .machines
-            .iter()
-            .map(|m| ("machine", &m.name, &m.model, &m.agent, &m.agents));
-        for (what, name, model, agent, by_kind) in flocks.chain(machines) {
+            .map(|f| ("flock", &f.name, &f.model, &f.agent, &f.agents, &f.profile));
+        let machines = self.machines.iter().map(|m| {
+            (
+                "machine", &m.name, &m.model, &m.agent, &m.agents, &m.profile,
+            )
+        });
+        for (what, name, model, agent, by_kind, profile) in flocks.chain(machines) {
             if let Some(model) = model {
                 models
                     .check(model)
@@ -284,6 +303,11 @@ impl Flock {
             }
             crate::config::check_kind_agents(agent.as_deref(), by_kind, agents)
                 .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
+            if let Some(profile) = profile {
+                profiles
+                    .resolve(profile)
+                    .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
+            }
         }
         Ok(())
     }
@@ -825,6 +849,7 @@ mod tests {
             model: None,
             priority: None,
             agents: Default::default(),
+            profile: None,
         }
     }
 
@@ -1402,9 +1427,10 @@ tags = ["fast"]
         let f = flock("model = \"sonnet\"").unwrap();
         let models: crate::config::Models =
             toml::from_str("[sonnet]\nkind = \"claude\"\nargs = []\n").unwrap();
-        f.check_config(&models, &Default::default()).unwrap();
+        f.check_config(&models, &Default::default(), &Default::default())
+            .unwrap();
         let err = f
-            .check_config(&Default::default(), &Default::default())
+            .check_config(&Default::default(), &Default::default(), &Default::default())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1420,6 +1446,39 @@ tags = ["fast"]
             .unwrap_err()
         );
         assert!(err.contains("machine m: model name"), "{err}");
+    }
+
+    /// A flock's or a machine's `profile` must be a profile name, and one
+    /// that is built in or in pastor.toml's `[profiles]`.
+    #[test]
+    fn a_profile_must_be_built_in_or_in_profiles() {
+        let flock = |extra: &str, machine: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"p\"\n{machine}\n"
+                ),
+            )
+        };
+        let err = format!("{:#}", flock("profile = \"--yolo\"", "").unwrap_err());
+        assert!(err.contains("flock p: profile name"), "{err}");
+        let err = format!("{:#}", flock("", "profile = \"A\"").unwrap_err());
+        assert!(err.contains("machine m: profile name"), "{err}");
+        let none = crate::config::Models::default();
+        let f = flock("profile = \"develop\"", "profile = \"ci\"").unwrap();
+        assert_eq!(f.flocks[0].profile.as_deref(), Some("develop"));
+        let err = f
+            .check_config(&none, &Default::default(), &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("machine m: profile ci is not built in"),
+            "{err}"
+        );
+        let profiles: crate::config::profile::Profiles =
+            toml::from_str("[ci]\nextends = \"develop\"\n").unwrap();
+        f.check_config(&none, &Default::default(), &profiles)
+            .unwrap();
     }
 
     #[test]

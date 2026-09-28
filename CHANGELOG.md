@@ -22,13 +22,27 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   shows and `connector try <id> watch` runs. The head's `events_since`
   answers `newest` too, so a new watcher starts at the end without reading
   the whole log.
+- Profiles reach Claude tasks: `profile` on a `[[flock]]`, a `[[machine]]`,
+  a job's `[dispatch]`, `[defaults]` and `pastor task run --profile`, settled
+  like the model (run or job, machine, flock, `[defaults]`). The profile's
+  lists go before the task's own, a deny anywhere wins, and a Claude agent
+  starts with `--permission-mode dontAsk` and the lists as `--allowedTools`
+  and `--disallowedTools`, so it never stops at a permission prompt; args
+  that pick a permission mode are then `profile_args_conflict`. A task may
+  ask for `unrestricted` only on a machine whose own profile (machine, flock
+  or `[defaults]`) is `unrestricted` (`profile_not_allowed`; an unpinned task
+  waits for one). An unknown name is `unknown_profile`, and a profile dropped
+  while a task waits keeps it queued and says why. `task describe` (with
+  where it came from), the task's JSON, `machine list` (PROFILE),
+  `machine describe` and `flock describe` show it. The IPC protocol goes to
+  11, and every command that can make the head queue a task refuses an older
+  head (`head_too_old`).
 - Permission profiles: `[profiles.<name>]` in pastor.toml, each an optional
   `description`, `extends`, `allow` and `deny`, beside the built-in `review`,
   `develop` and `unrestricted`. A profile's lists add up along its `extends`
   chain, and a deny anywhere wins. `pastor profile list` and `pastor profile
   describe <name>` (both with `--json`) show them; an unknown name is
-  `unknown_profile`, and a bad profile fails pastor.toml's load. Nothing
-  reaches an agent yet.
+  `unknown_profile`, and a bad profile fails pastor.toml's load.
 - Task priority: a task has a level, `low`, `normal` (the default), `high`
   or `critical`, and each dispatch pass takes queued tasks by level, then
   position, then age, still skipping what does not fit. The level comes from

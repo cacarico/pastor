@@ -19,8 +19,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `JobSetEnabled`. 7: `JobSubmit`. 8: named models (`AgentChoice::model`).
 /// 9: `JobTask`, and `Pong::role`. 10: `TrustList`, `TrustAdd`,
 /// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. 11: task priority
-/// (`Run::priority`, `TaskPriority`). 12: `Run::role`.
-pub const IPC_PROTOCOL: u32 = 12;
+/// (`Run::priority`, `TaskPriority`). 12: `Run::role`. 13: permission
+/// profiles (`AgentChoice::profile`).
+pub const IPC_PROTOCOL: u32 = 13;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -96,6 +97,12 @@ pub const MODEL_PROTOCOL: u32 = 8;
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
 pub const PRIORITY_PROTOCOL: u32 = 11;
+
+/// The first protocol whose head runs a task under its permission profile
+/// (`--profile`, a job's, machine's or flock's `profile`). An older one
+/// would drop it and start the agent asking before every tool, or with
+/// fewer denies, without a word.
+pub const PROFILE_PROTOCOL: u32 = 13;
 
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.
@@ -1074,6 +1081,7 @@ mod tests {
                     model: None,
                     priority: None,
                     agents: Default::default(),
+                    profile: None,
                 },
             },
             IpcRequest::MachineRemove { name: "m".into() },

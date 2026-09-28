@@ -214,7 +214,9 @@ async fn dispatch_steps(
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
-    let mut launch = agents.launch(&spec).map_err(DispatchError::Task)?;
+    let mut launch = agents
+        .launch(&spec)
+        .map_err(|e| DispatchError::Task(e.message))?;
     // A Claude agent starts on a session pastor names, so `task attach` can
     // resume it once the pane is gone; last, after the tool flags. The task
     // records it only once `agent.start` succeeds (`finish_dispatch`): a

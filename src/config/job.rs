@@ -58,6 +58,9 @@ pub struct DispatchTable {
     /// (`{{ item.priority }}`) rendered per item; rendered empty, the pinned
     /// machine's, flock's or `[defaults]` level.
     pub priority: Option<String>,
+    /// A permission profile, built in or in `[profiles]`, before the
+    /// machine's, the flock's and `[defaults]`.
+    pub profile: Option<String>,
     pub repo: Option<String>,
     pub worktree: bool,
     pub branch: Option<String>,
@@ -236,6 +239,10 @@ impl Job {
                     .map_err(|e| format!("dispatch.priority: {e}"))?;
             }
         }
+        if let Some(profile) = &d.profile {
+            crate::config::check_profile_name(profile)
+                .map_err(|e| format!("dispatch.profile: {e}"))?;
+        }
         for (field, text) in [
             ("prompt", Some(d.prompt.as_str())),
             ("branch", d.branch.as_deref()),
@@ -291,6 +298,7 @@ impl Job {
             allow: d.allow,
             deny: d.deny,
             model: d.model,
+            profile: d.profile,
         };
         let pick = defaults.resolve_agent(&agent, None);
         Ok(Job {
@@ -670,6 +678,26 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert!(job("urgent").unwrap_err().contains("dispatch.priority"));
     }
 
+    /// A job's `profile` is a plain profile name, kept in its ask; whether
+    /// pastor.toml has it is checked when a task is queued.
+    #[test]
+    fn a_jobs_profile_is_a_name() {
+        let job = |profile: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprofile = {profile:?}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &defaults(),
+                &Builtins,
+            )
+        };
+        assert_eq!(job("ci").unwrap().agent.profile.as_deref(), Some("ci"));
+        for bad in ["Ci", "--permission-mode", "{{ item.profile }}"] {
+            assert!(job(bad).unwrap_err().contains("dispatch.profile"), "{bad}");
+        }
+    }
+
     /// `[defaults] agent_args` fills in for a job file that has no
     /// `agent_args` key; a key that is there, even `[]`, is the job's choice.
     #[test]
@@ -820,6 +848,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             model: None,
             priority: None,
             agents: Default::default(),
+            profile: None,
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");

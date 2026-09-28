@@ -921,7 +921,7 @@ impl Scheduler {
         store: Arc<Store>,
     ) -> anyhow::Result<Scheduler> {
         let flock = Flock::load(&paths.flock_file())?;
-        flock.check_config(&config.models, &config.agents)?;
+        flock.check_config(&config.models, &config.agents, &config.profiles)?;
         let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()).with_flock(flock));
         let (events, _) = broadcast::channel(1);
         Ok(Scheduler {
@@ -1175,7 +1175,7 @@ impl Scheduler {
             self.fleet.flock()
         } else {
             match Flock::load_existing(&files[1]).and_then(|f| {
-                f.check_config(&self.config.models, &self.config.agents)
+                f.check_config(&self.config.models, &self.config.agents, &self.config.profiles)
                     .map(|()| f)
             }) {
                 Ok(f) => f,

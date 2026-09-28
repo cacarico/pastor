@@ -1,14 +1,16 @@
 //! Permission profiles: `[profiles.<name>]` in `pastor.toml`, and the three
 //! built in, `review`, `develop` and `unrestricted`. A profile is a named
 //! pair of tool pattern lists, the `allow` and `deny` of `[defaults]`, that
-//! can extend another. Nothing reaches an agent yet: `pastor profile list`
-//! and `pastor profile describe` show them.
+//! can extend another. A task names one with `profile` like its model
+//! (`Defaults::resolve_agent_on`); `Profiles::apply` adds its lists to the
+//! task's, and `Agents::launch_args` starts a Claude agent under it so it
+//! never asks. `pastor profile list` and `pastor profile describe` show them.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{AgentRefusal, check_model_name, check_tools};
+use super::{AgentPick, AgentRefusal, check_profile_name, check_tools};
 
 /// One profile under `[profiles.<name>]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +71,14 @@ pub struct Profile {
 
 /// The code of a profile name no table defines and none is built in.
 pub const UNKNOWN_PROFILE: &str = "unknown_profile";
+
+/// The profile that denies nothing, which a task may ask for only on a
+/// machine whose own profile is this one (`Profiles::apply`).
+pub const UNRESTRICTED: &str = "unrestricted";
+
+/// The code of a task that asks for `unrestricted` on a machine whose own
+/// profile is not.
+pub const PROFILE_NOT_ALLOWED: &str = "profile_not_allowed";
 
 /// The tools that read and search, which every built-in profile allows.
 const READ_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
@@ -225,11 +235,62 @@ impl Profiles {
         })
     }
 
+    /// Settle `pick`'s profile's lists into `spec`: before the task's own,
+    /// a deny anywhere dropping the pattern from allow. The caller records
+    /// the name in `spec.agent_source`, which `Agents::launch_args` reads.
+    /// `own` is the profile the machine the
+    /// task lands on names for itself (its `[[machine]]` entry, else its
+    /// flock's, else `[defaults]`), or the flock's when no machine is
+    /// picked yet.
+    ///
+    /// Refused when the profile is not defined (`unknown_profile`), and,
+    /// the unrestricted rule, when it is `unrestricted` and `own` is not
+    /// (`profile_not_allowed`): what runs with nothing denied is the
+    /// machine's owner's choice, made in flock.toml or `[defaults]`, not
+    /// one a run flag or a job file can make for it.
+    pub fn apply(
+        &self,
+        pick: &AgentPick,
+        own: Option<&str>,
+        spec: &mut crate::task::DispatchSpec,
+    ) -> Result<(), AgentRefusal> {
+        let Some((name, _)) = &pick.profile else {
+            return Ok(());
+        };
+        let profile = self.resolve(name)?;
+        if name == UNRESTRICTED && own != Some(UNRESTRICTED) {
+            return Err(AgentRefusal {
+                code: PROFILE_NOT_ALLOWED,
+                message: format!(
+                    "profile {UNRESTRICTED} runs only where the machine's own profile is {UNRESTRICTED} \
+                     (its [[machine]] or [[flock]] entry, or [defaults]); here it is {}",
+                    own.unwrap_or("none")
+                ),
+            });
+        }
+        let mut deny = profile.deny;
+        for p in &spec.deny {
+            if !deny.contains(p) {
+                deny.push(p.clone());
+            }
+        }
+        let mut allow = profile.allow;
+        for p in &spec.allow {
+            if !allow.contains(p) {
+                allow.push(p.clone());
+            }
+        }
+        allow.retain(|p| !deny.contains(p));
+        spec.allow = allow;
+        spec.deny = deny;
+        Ok(())
+    }
+
     /// The load-time check: names in the job names' alphabet, tool patterns
     /// the agent's command line can take, and every `extends` resolving.
     pub fn validate(&self) -> Result<(), String> {
         for (name, def) in &self.0 {
-            check_model_name(name).map_err(|e| e.replacen("model name", "profile name", 1))?;
+            check_profile_name(name)?;
             check_tools(&format!("profiles.{name}.allow"), &def.allow)?;
             check_tools(&format!("profiles.{name}.deny"), &def.deny)?;
             if let Some(d) = &def.description
@@ -299,6 +360,62 @@ mod tests {
         assert!(!ci.allow.contains(&"WebFetch".into()));
         assert!(ci.deny.contains(&"WebFetch".into()));
         assert!(ci.deny.contains(&"Bash(sudo:*)".into()));
+    }
+
+    fn pick(profile: Option<&str>) -> AgentPick {
+        let mut pick = super::super::Defaults::default()
+            .resolve_agent(&super::super::AgentChoice::default(), None);
+        pick.profile = profile.map(|p| (p.to_string(), super::super::Layer::Ask));
+        pick
+    }
+
+    fn spec(allow: &[&str], deny: &[&str]) -> crate::task::DispatchSpec {
+        let mut spec: crate::task::DispatchSpec =
+            serde_json::from_value(serde_json::json!({"agent": "claude"})).unwrap();
+        spec.allow = allow.iter().map(|s| s.to_string()).collect();
+        spec.deny = deny.iter().map(|s| s.to_string()).collect();
+        spec
+    }
+
+    /// The profile's lists come first, the task's own after, and a deny
+    /// from either side drops the pattern from allow.
+    #[test]
+    fn apply_puts_the_profiles_lists_first_and_deny_wins() {
+        let p = profiles("[ci]\nallow = [\"Read\", \"Bash(make:*)\"]\ndeny = [\"WebFetch\"]\n");
+        let mut s = spec(&["Bash(make:*)", "WebFetch", "Edit"], &["Read"]);
+        p.apply(&pick(Some("ci")), None, &mut s).unwrap();
+        assert_eq!(s.allow, vec!["Bash(make:*)", "Edit"]);
+        assert_eq!(s.deny, vec!["WebFetch", "Read"]);
+
+        let mut s = spec(&["Edit"], &[]);
+        p.apply(&pick(None), None, &mut s).unwrap();
+        assert_eq!(s.allow, vec!["Edit"]);
+        let err = p.apply(&pick(Some("gone")), None, &mut s).unwrap_err();
+        assert_eq!(err.code, UNKNOWN_PROFILE);
+    }
+
+    /// `unrestricted` runs only where the machine's own profile is
+    /// `unrestricted`; any other profile runs anywhere.
+    #[test]
+    fn unrestricted_needs_a_machine_whose_own_profile_is_unrestricted() {
+        let none = Profiles::default();
+        for own in [None, Some("develop")] {
+            let err = none
+                .apply(&pick(Some(UNRESTRICTED)), own, &mut spec(&[], &[]))
+                .unwrap_err();
+            assert_eq!(err.code, PROFILE_NOT_ALLOWED, "{own:?}");
+            assert!(err.message.contains(own.unwrap_or("none")), "{err}");
+        }
+        let mut s = spec(&[], &[]);
+        none.apply(&pick(Some(UNRESTRICTED)), Some(UNRESTRICTED), &mut s)
+            .unwrap();
+        assert!(s.allow.contains(&"WebFetch".to_string()));
+        none.apply(
+            &pick(Some("review")),
+            Some(UNRESTRICTED),
+            &mut spec(&[], &[]),
+        )
+        .unwrap();
     }
 
     #[test]

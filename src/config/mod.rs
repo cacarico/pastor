@@ -449,6 +449,10 @@ pub struct Defaults {
     /// (`{ opencode = "opencode" }`). See `resolve_agent_for`.
     #[serde(skip_serializing_if = "KindAgents::is_empty")]
     pub agents: KindAgents,
+    /// The permission profile tasks run under when their run flags, job,
+    /// machine and flock name none. See `resolve_agent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
     /// Where a task's pane goes when its run flags and job say nothing
@@ -475,6 +479,10 @@ pub struct AgentChoice {
     /// A `[models]` name, before the machine's, the flock's and `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// A permission profile, before the machine's, the flock's and
+    /// `[defaults]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// Where a task's agent, or its args, came from (`Defaults::resolve_agent_on`).
@@ -508,6 +516,9 @@ pub struct AgentPick {
     /// The agent is `agent_from`'s `agents` entry for its kind, not its
     /// `agent` (`Defaults::resolve_agent_for`).
     pub by_kind: bool,
+    /// The permission profile the task runs under, and the layer that named
+    /// it; `None` when no layer names one. `Profiles::apply` adds its lists.
+    pub profile: Option<(String, Layer)>,
 }
 
 /// `agents = { <kind> = "<agent>" }` on a machine, a flock or `[defaults]`:
@@ -658,6 +669,14 @@ impl Defaults {
         ]
         .into_iter()
         .find_map(|(layer, name)| Some((name?.clone(), layer)));
+        let profile = [
+            (Layer::Ask, ask.profile.as_ref()),
+            (Layer::Machine, machine.and_then(|m| m.profile.as_ref())),
+            (Layer::Flock, flock.and_then(|f| f.profile.as_ref())),
+            (Layer::Defaults, self.profile.as_ref()),
+        ]
+        .into_iter()
+        .find_map(|(layer, name)| Some((name?.clone(), layer)));
         AgentPick {
             agent,
             agent_args,
@@ -667,6 +686,7 @@ impl Defaults {
             args_from,
             model,
             by_kind: false,
+            profile,
         }
     }
 
@@ -779,6 +799,7 @@ impl Default for Defaults {
             model: None,
             priority: None,
             agents: KindAgents::new(),
+            profile: None,
             max_tasks_per_run: 5,
             timeout: "2h".into(),
             place: crate::task::Place::Repo,
@@ -888,6 +909,23 @@ fn bottom_prompt(screen: &str) -> String {
     lines[start.min(lines.len())..].join("\n")
 }
 
+/// What a Claude agent under a permission profile starts with: it denies
+/// whatever its allow list and settings do not already allow, instead of
+/// asking, so the task never stops at a permission prompt.
+const CLAUDE_NO_ASK: [&str; 2] = ["--permission-mode", "dontAsk"];
+
+/// The code of a task whose profile meets agent args that pick a permission
+/// mode of their own.
+pub const PROFILE_ARGS_CONFLICT: &str = "profile_args_conflict";
+
+/// Does `arg` pick Claude's permission mode, or turn its permissions off?
+fn is_permission_arg(arg: &str) -> bool {
+    arg == "--permission-mode"
+        || arg.starts_with("--permission-mode=")
+        || arg == "--dangerously-skip-permissions"
+        || arg == "--allow-dangerously-skip-permissions"
+}
+
 /// Claude Code's own names for the allow and deny lists (`claude --help`).
 /// Both take several patterns and may repeat, so one flag per pattern works.
 const CLAUDE_TOOL_FLAGS: (&str, &str) = ("--allowedTools", "--disallowedTools");
@@ -940,7 +978,7 @@ impl Agents {
 
     /// How to start `spec`'s agent: its kind, `launch_args` and the env of
     /// its definition. Refused as `launch_args` is.
-    pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, String> {
+    pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, AgentRefusal> {
         Ok(Launch {
             kind: self.kind(&spec.agent).to_string(),
             args: self.launch_args(spec)?,
@@ -952,13 +990,37 @@ impl Agents {
         })
     }
 
-    /// The argv after the agent's name for `spec`: its `agent_args`, then
-    /// the flag and pattern of each `allow`, then of each `deny`. Refused
-    /// when a list is not empty and the agent has no flag for it: dropping
-    /// a deny list without a word would be worse than not starting.
-    pub fn launch_args(&self, spec: &crate::task::DispatchSpec) -> Result<Vec<String>, String> {
+    /// The argv after the agent's name for `spec`: its `agent_args`, then,
+    /// under a permission profile, the args that stop a Claude agent from
+    /// asking (`--permission-mode dontAsk`), then the flag and pattern of
+    /// each `allow`, then of each `deny`. Refused when a list is not empty
+    /// and the agent has no flag for it (`agent_tools_unsupported`):
+    /// dropping a deny list without a word would be worse than not
+    /// starting. Refused too when a profile applies and the args already
+    /// pick a permission mode (`profile_args_conflict`): the agent would
+    /// take the last one, and either the profile or the args would be
+    /// silently lost.
+    pub fn launch_args(
+        &self,
+        spec: &crate::task::DispatchSpec,
+    ) -> Result<Vec<String>, AgentRefusal> {
         let (allow_flag, deny_flag) = self.tool_flags(&spec.agent);
         let mut args = spec.agent_args.clone();
+        if let Some(profile) = spec.profile()
+            && self.kind(&spec.agent) == "claude"
+        {
+            if let Some(arg) = args.iter().find(|a| is_permission_arg(a)) {
+                return Err(AgentRefusal {
+                    code: PROFILE_ARGS_CONFLICT,
+                    message: format!(
+                        "task runs under profile {profile}, and agent {}'s args set {arg}; \
+                         drop it from agent_args or the model's args, or run without a profile",
+                        spec.agent
+                    ),
+                });
+            }
+            args.extend(CLAUDE_NO_ASK.map(str::to_string));
+        }
         for (list, flag, key) in [
             (&spec.allow, allow_flag, "allow_flag"),
             (&spec.deny, deny_flag, "deny_flag"),
@@ -967,10 +1029,13 @@ impl Agents {
                 continue;
             }
             let Some(flag) = flag else {
-                return Err(format!(
-                    "agent {} has no {key} to pass its tool list; set [agents.{}] {key} in pastor.toml",
-                    spec.agent, spec.agent
-                ));
+                return Err(AgentRefusal {
+                    code: "agent_tools_unsupported",
+                    message: format!(
+                        "agent {} has no {key} to pass its tool list; set [agents.{}] {key} in pastor.toml",
+                        spec.agent, spec.agent
+                    ),
+                });
             };
             for p in list {
                 args.push(flag.clone());
@@ -1017,6 +1082,12 @@ pub fn check_model_name(name: &str) -> Result<(), String> {
     }
 }
 
+/// Profile names go where model names go, so they keep to the same
+/// alphabet; a raw arg such as `--permission-mode` never passes for one.
+pub fn check_profile_name(name: &str) -> Result<(), String> {
+    check_model_name(name).map_err(|e| e.replacen("model name", "profile name", 1))
+}
+
 /// The code of a model whose kind is not the task's agent's.
 pub const MODEL_KIND_MISMATCH: &str = "model_kind_mismatch";
 
@@ -1024,7 +1095,8 @@ pub const MODEL_KIND_MISMATCH: &str = "model_kind_mismatch";
 /// error and a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRefusal {
-    /// `unknown_model`, `model_kind_mismatch` or `agent_tools_unsupported`.
+    /// `unknown_model`, `model_kind_mismatch`, `agent_tools_unsupported`,
+    /// `unknown_profile`, `profile_not_allowed` or `profile_args_conflict`.
     pub code: &'static str,
     pub message: String,
 }
@@ -1304,6 +1376,11 @@ impl PastorConfig {
         cfg.profiles
             .validate()
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        if let Some(p) = &cfg.defaults.profile {
+            cfg.profiles
+                .resolve(p)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.profile: {e}", path.display()))?;
+        }
         if cfg.agent_ready_timeout_duration() >= cfg.request_timeout_duration() {
             anyhow::bail!(
                 "{}: agent_ready_timeout must be shorter than request_timeout",
@@ -2051,7 +2128,7 @@ mod tests {
         let err = agents
             .launch_args(&spec_with("codex", &[], &["Bash(rm:*)"]))
             .unwrap_err();
-        assert!(err.contains("[agents.codex] deny_flag"), "{err}");
+        assert!(err.message.contains("[agents.codex] deny_flag"), "{err}");
 
         let mut own = Agents::default();
         own.0.insert(
@@ -2066,6 +2143,142 @@ mod tests {
             vec!["--model", "m", "--deny", "x"]
         );
         assert!(own.launch_args(&spec_with("codex", &["y"], &[])).is_err());
+    }
+
+    /// Under a profile a Claude agent starts with `--permission-mode
+    /// dontAsk` after its args and before its tool flags; args that pick a
+    /// permission mode of their own are refused. An agent of another kind
+    /// gets the lists only, through its own flags.
+    #[test]
+    fn a_profile_starts_claude_without_asking() {
+        let with_profile = |agent: &str, args: &[&str]| {
+            let mut spec = spec_with(agent, &["Edit"], &["Bash(sudo:*)"]);
+            spec.agent_args = args.iter().map(|s| s.to_string()).collect();
+            spec.agent_source = Some(Box::new(crate::task::AgentSource {
+                ask: AgentChoice::default(),
+                agent: "defaults".into(),
+                agent_args: None,
+                model: None,
+                model_from: None,
+                profile: Some("develop".into()),
+                profile_from: Some("defaults".into()),
+            }));
+            spec
+        };
+        let agents = Agents::default();
+        assert_eq!(
+            agents
+                .launch_args(&with_profile("claude", &["--model", "m"]))
+                .unwrap(),
+            vec![
+                "--model",
+                "m",
+                "--permission-mode",
+                "dontAsk",
+                "--allowedTools",
+                "Edit",
+                "--disallowedTools",
+                "Bash(sudo:*)"
+            ]
+        );
+        for arg in [
+            &["--permission-mode", "bypassPermissions"][..],
+            &["--permission-mode=acceptEdits"],
+            &["--dangerously-skip-permissions"],
+        ] {
+            let err = agents
+                .launch_args(&with_profile("claude", arg))
+                .unwrap_err();
+            assert_eq!(err.code, PROFILE_ARGS_CONFLICT, "{arg:?}");
+            assert!(err.message.contains("profile develop"), "{err}");
+        }
+        // Without a profile the same args pass as written.
+        let mut plain = with_profile("claude", &["--dangerously-skip-permissions"]);
+        plain.agent_source = None;
+        assert_eq!(
+            agents.launch_args(&plain).unwrap()[..1],
+            ["--dangerously-skip-permissions"]
+        );
+        // A definition of kind claude is claude.
+        let personal: Agents = toml::from_str("[claude-personal]\nkind = \"claude\"\n").unwrap();
+        assert!(
+            personal
+                .launch_args(&with_profile("claude-personal", &[]))
+                .unwrap()
+                .contains(&"dontAsk".to_string())
+        );
+        let codex: Agents =
+            toml::from_str("[codex]\nallow_flag = \"--allow\"\ndeny_flag = \"--deny\"\n").unwrap();
+        assert_eq!(
+            codex
+                .launch_args(&with_profile("codex", &["--permission-mode", "x"]))
+                .unwrap(),
+            vec![
+                "--permission-mode",
+                "x",
+                "--allow",
+                "Edit",
+                "--deny",
+                "Bash(sudo:*)"
+            ]
+        );
+    }
+
+    /// A task's profile comes from the first layer that names one, like its
+    /// model; `[defaults] profile` must be one there is.
+    #[test]
+    fn the_profile_comes_from_the_first_layer_that_names_one() {
+        let d = Defaults {
+            profile: Some("review".into()),
+            ..Defaults::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "f".into(),
+            profile: Some("develop".into()),
+            ..Default::default()
+        };
+        let machine: flock::MachineConfig =
+            toml::from_str("name = \"m\"\nlocal = true\nprofile = \"ci\"\n").unwrap();
+        let ask = |profile: Option<&str>| AgentChoice {
+            profile: profile.map(Into::into),
+            ..Default::default()
+        };
+        let profile = |p: AgentPick| p.profile.unwrap();
+        assert_eq!(
+            profile(d.resolve_agent_on(&ask(Some("x")), Some(&machine), Some(&flock))),
+            ("x".into(), Layer::Ask)
+        );
+        assert_eq!(
+            profile(d.resolve_agent_on(&ask(None), Some(&machine), Some(&flock))),
+            ("ci".into(), Layer::Machine)
+        );
+        assert_eq!(
+            profile(d.resolve_agent(&ask(None), Some(&flock))),
+            ("develop".into(), Layer::Flock)
+        );
+        assert_eq!(
+            profile(d.resolve_agent(&ask(None), None)),
+            ("review".into(), Layer::Defaults)
+        );
+        assert_eq!(
+            Defaults::default().resolve_agent(&ask(None), None).profile,
+            None
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "[defaults]\nprofile = \"ci\"\n[profiles.ci]\n").unwrap();
+        assert_eq!(
+            PastorConfig::load(&path)
+                .unwrap()
+                .defaults
+                .profile
+                .as_deref(),
+            Some("ci")
+        );
+        std::fs::write(&path, "[defaults]\nprofile = \"nope\"\n").unwrap();
+        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        assert!(err.contains("defaults.profile: profile nope"), "{err}");
     }
 
     #[test]
@@ -2314,6 +2527,7 @@ mod tests {
             allow: vec![],
             deny: vec![],
             model: None,
+            profile: None,
         };
         assert_eq!(pick(&own, Some(&work)), ("aider".into(), "-v".into()));
         // Args follow the agent they were written for: the flock's are for
@@ -2324,6 +2538,7 @@ mod tests {
             allow: vec![],
             deny: vec![],
             model: None,
+            profile: None,
         };
         assert_eq!(
             pick(&claude, Some(&work)),
@@ -2335,6 +2550,7 @@ mod tests {
             allow: vec![],
             deny: vec![],
             model: None,
+            profile: None,
         };
         assert_eq!(
             pick(&codex, Some(&work)),

@@ -1399,18 +1399,18 @@ fn machine_list_opens_with_a_line_about_the_head() {
     assert_eq!(
         lines[0],
         [
-            "NAME", "HOST", "FLOCK", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
-            "ERROR"
+            "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS",
+            "TAGS", "ERROR"
         ],
         "{stdout}"
     );
     assert_eq!(
-        lines[1][..4],
-        ["fake", "fake-herdr", "default", "connected"],
+        lines[1][..5],
+        ["fake", "fake-herdr", "default", "-", "connected"],
         "{stdout}"
     );
     // A command bridge cannot say which pastor is behind it.
-    assert_eq!(lines[1][5..7], ["-", "0/2+1j+1b"], "{stdout}");
+    assert_eq!(lines[1][6..8], ["-", "0/2+1j+1b"], "{stdout}");
     assert_eq!(lines.len(), 2, "{stdout}");
 
     let out = env.cmd(&["machine", "list", "--json"]);
@@ -1511,23 +1511,23 @@ fn machine_list_without_daemon_probes_each_machine() {
         .collect();
     // No head, no line about it: the stderr notice says so instead.
     assert_eq!(
-        lines[0][..4],
-        ["NAME", "HOST", "FLOCK", "CHANNEL"],
+        lines[0][..5],
+        ["NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL"],
         "{stdout}"
     );
     assert_eq!(
-        lines[1][..4],
-        ["fake", "fake-herdr", "default", "probed"],
+        lines[1][..5],
+        ["fake", "fake-herdr", "default", "-", "probed"],
         "{stdout}"
     );
-    assert_eq!(&lines[1][5..], ["-", "0/2+1j+1b", "-", "arm"], "{stdout}");
+    assert_eq!(&lines[1][6..], ["-", "0/2+1j+1b", "-", "arm"], "{stdout}");
     assert_eq!(
-        lines[2][..4],
-        ["gone", "no-such-bridge", "default", "unreachable"],
+        lines[2][..5],
+        ["gone", "no-such-bridge", "default", "-", "unreachable"],
         "{stdout}"
     );
-    assert_eq!(lines[2][4..7], ["-", "-", "-/1+1j+1b"], "{stdout}");
-    assert!(lines[2].len() > 9, "ERROR should say why: {stdout}");
+    assert_eq!(lines[2][5..8], ["-", "-", "-/1+1j+1b"], "{stdout}");
+    assert!(lines[2].len() > 10, "ERROR should say why: {stdout}");
 
     // The same JSON shape as with a head.
     let out = run(&["machine", "list", "--json"]);
@@ -1590,7 +1590,7 @@ fn machine_list_without_daemon_reads_a_local_machine_with_no_server_as_down() {
         .collect();
     assert_eq!(lines[1][..2], ["loopback", "local"], "{stdout}");
     // "server down" has a space, so it lands split across two columns.
-    assert_eq!(lines[1][3..5], ["server", "down"], "{stdout}");
+    assert_eq!(lines[1][4..6], ["server", "down"], "{stdout}");
 
     let out = pastor()
         .args(["machine", "list", "--json"])
@@ -1668,13 +1668,14 @@ fn machine_list_without_daemon_shows_a_local_machine_s_pastor_version() {
         .lines()
         .map(|l| l.split_whitespace().collect())
         .collect();
-    assert_eq!(lines[0][4..6], ["HERDR", "PASTOR"], "{stdout}");
+    assert_eq!(lines[0][5..7], ["HERDR", "PASTOR"], "{stdout}");
     assert_eq!(
-        lines[1][..6],
+        lines[1][..7],
         [
             "here",
             "local",
             "default",
+            "-",
             "probed",
             "fake",
             env!("CARGO_PKG_VERSION")
@@ -4823,6 +4824,61 @@ fn a_model_of_another_kind_runs_on_the_machines_agent_for_it() {
         &["task", "run", "x", "--model", "gpt", "--machine", "fake"],
         "model_kind_mismatch",
     );
+}
+
+/// `--profile ci` starts Claude with `--permission-mode dontAsk` and the
+/// profile's lists as its flags, and describe and the JSON name it; an
+/// unknown name, raw args in `--profile`, `unrestricted` pinned to a machine
+/// that is not, and args that pick a permission mode are refused.
+#[test]
+fn a_profile_reaches_herdr_and_bad_ones_are_refused() {
+    let env = start();
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [profiles.ci]\nallow = [\"Bash(make:*)\"]\ndeny = [\"WebFetch\"]\n",
+    )
+    .unwrap();
+    let t = env.json(&["task", "run", "hi", "--profile", "ci", "--json"]);
+    assert_eq!(t["profile"], "ci", "{t}");
+    let start = env.agent_start_params("t-1");
+    assert_eq!(
+        without_session(&start["args"]),
+        serde_json::json!([
+            "--permission-mode",
+            "dontAsk",
+            "--allowedTools",
+            "Bash(make:*)",
+            "--disallowedTools",
+            "WebFetch"
+        ]),
+        "{start}"
+    );
+    let out = env.cmd(&["task", "describe", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("profile:    ci (from task run)\n"), "{text}");
+
+    for (args, code) in [
+        (&["--profile", "nope"][..], "unknown_profile"),
+        (&["--profile=--permission-mode"], "unknown_profile"),
+        (
+            &["--profile", "unrestricted", "--machine", "fake"],
+            "profile_not_allowed",
+        ),
+        (
+            &[
+                "--profile",
+                "ci",
+                "--agent-arg",
+                "--dangerously-skip-permissions",
+            ],
+            "profile_args_conflict",
+        ),
+    ] {
+        let out = env.cmd(&[&["task", "run", "x"][..], args].concat());
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(last_error(&out).0, code, "{args:?}");
+    }
 }
 
 /// `task attach` on a task whose pane is gone: one of a kind with no

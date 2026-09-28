@@ -177,6 +177,10 @@ pub fn task_detail(t: &Task) -> String {
         None => "-".to_string(),
     };
     let priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
+    let profile = match t.profile() {
+        Some(p) => format!("{p}{}", from(source.and_then(|s| s.profile_from.as_ref()))),
+        None => "-".to_string(),
+    };
     let args = if t.spec.agent_args.is_empty() {
         "-".to_string()
     } else {
@@ -222,6 +226,7 @@ pub fn task_detail(t: &Task) -> String {
         ("machine", opt(&t.machine)),
         ("agent", agent),
         ("model", model),
+        ("profile", profile),
         ("agent args", args),
         ("allow", list(&t.spec.allow)),
         ("deny", list(&t.spec.deny)),
@@ -465,6 +470,10 @@ pub struct MachineRow {
     /// `MachineStatus::orphans`; a probe works them out itself from
     /// `agent.list` and the store, and leaves them empty when it cannot.
     pub orphans: Vec<String>,
+    /// `MachineStatus::profile`; a probe settles it from this machine's
+    /// pastor.toml and flock.toml.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl From<&MachineStatus> for MachineRow {
@@ -486,13 +495,15 @@ impl From<&MachineStatus> for MachineRow {
             burst: m.burst,
             tags: m.tags.clone(),
             orphans: m.orphans.clone(),
+            profile: m.profile.clone(),
         }
     }
 }
 
 /// AGENTS counts orphans too; ORPHANS names them (see `MachineStatus::orphans`).
-pub const MACHINE_HEADER: [&str; 10] = [
-    "NAME", "HOST", "FLOCK", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS", "ERROR",
+pub const MACHINE_HEADER: [&str; 11] = [
+    "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
+    "ERROR",
 ];
 
 /// The machine that is the head itself: the first `local` one, whose herdr
@@ -549,6 +560,7 @@ pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
                 m.name.clone(),
                 m.host.clone(),
                 m.flock.clone(),
+                m.profile.clone().unwrap_or_else(dash),
                 m.channel.clone(),
                 m.herdr_version.clone().unwrap_or_else(dash),
                 m.pastor_version.clone().unwrap_or_else(dash),
@@ -745,6 +757,7 @@ mod tests {
             orphans: vec![],
             flock: None,
             shutting_down: false,
+            profile: None,
         }
     }
 
@@ -757,12 +770,13 @@ mod tests {
     }
 
     /// The head's own machine (the `local` one) comes first; the others
-    /// keep flock order. FLOCK follows HOST.
+    /// keep flock order. FLOCK follows HOST, and PROFILE follows FLOCK.
     #[test]
     fn machine_table_puts_the_heads_machine_first_with_its_flock() {
         let mut rows = vec![
             MachineRow {
                 flock: "work".into(),
+                profile: Some("develop".into()),
                 ..row("pi-3", "user@pi-3")
             },
             row("here", "local"),
@@ -775,8 +789,8 @@ mod tests {
         assert_eq!(
             cells(0),
             [
-                "NAME", "HOST", "FLOCK", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
-                "ERROR"
+                "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS",
+                "ORPHANS", "TAGS", "ERROR"
             ]
         );
         assert_eq!(cells(1)[..3], ["here", "local", "default"]);
@@ -786,6 +800,7 @@ mod tests {
                 "pi-3",
                 "user@pi-3",
                 "work",
+                "develop",
                 "connected",
                 "0.9.1",
                 "0.2.0",
@@ -836,6 +851,7 @@ mod tests {
                 "pi-3",
                 "user@pi-3",
                 "default",
+                "-",
                 "unreachable",
                 "-",
                 "-",
@@ -949,6 +965,7 @@ mod tests {
                 model: None,
                 priority: None,
                 agents: Default::default(),
+                profile: None,
             }],
         };
         let mut rows = task_rows(&tasks);
@@ -1024,6 +1041,8 @@ mod tests {
                 agent_args: Some("flock personal".into()),
                 model: None,
                 model_from: None,
+                profile: None,
+                profile_from: None,
             })),
             ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
         };
@@ -1044,6 +1063,8 @@ mod tests {
                 agent_args: None,
                 model: None,
                 model_from: None,
+                profile: None,
+                profile_from: None,
             })),
             ..spec
         }));
@@ -1377,9 +1398,9 @@ mod tests {
         assert_eq!(orphan_lines(&three, None, Some(DEFAULT_FLOCK)).len(), 3);
         assert!(orphan_lines(&three, Some("pi-3"), Some(DEFAULT_FLOCK)).is_empty());
         let rows = machine_rows(&[MachineRow::from(&m), MachineRow::from(&none)]);
-        assert_eq!(rows[0][6], "3/4");
-        assert_eq!(rows[0][7], "t-4,t-9");
-        assert_eq!(rows[1][7], "-");
+        assert_eq!(rows[0][7], "3/4");
+        assert_eq!(rows[0][8], "t-4,t-9");
+        assert_eq!(rows[1][8], "-");
         assert_eq!(rows[0].len(), MACHINE_HEADER.len());
     }
 }
