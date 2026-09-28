@@ -161,6 +161,18 @@ impl Paths {
         self.config_dir.join("connectors").join(id).join(".env")
     }
 
+    /// One TOML file per orchestrator, next to `jobs/`. Read by the head on
+    /// each tick; `orchestrator enable|disable` rewrites one line of one.
+    pub fn orchestrators_dir(&self) -> PathBuf {
+        self.config_dir.join("orchestrators")
+    }
+
+    /// What the head keeps for one orchestrator: `state.json`, its handover
+    /// `note`, the scripts' `scratch/` dir and their run logs in `runs/`.
+    pub fn orchestrator_state_dir(&self, name: &str) -> PathBuf {
+        self.state_dir.join("orchestrators").join(name)
+    }
+
     /// Per-job scratch a connector may use; pastor owns the directory, the
     /// connector owns what is in it.
     pub fn connector_state_dir(&self, job: &str) -> PathBuf {
@@ -1292,6 +1304,11 @@ pub struct PastorConfig {
     /// refuses it. A guard against an agent acting on its own; the agent runs
     /// as the same user, so it is not a security boundary.
     pub agents_change_fleet: bool,
+    /// How many orchestrator agents (`role = "orchestrator"`) the head runs
+    /// at once, of both kinds, outside `max_agents` and job slots. A
+    /// scheduled orchestrator's run past it starts no agent
+    /// (`orchestrator.held`).
+    pub max_orchestrators: u32,
     /// The ssh destination other machines reach the head by. Agents on
     /// machines other than the head's own get it as `ipc::HEAD_ENV`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1409,6 +1426,7 @@ impl Default for PastorConfig {
             close_done_after: "15m".into(),
             pull_lost_after: "10m".into(),
             agents_change_fleet: false,
+            max_orchestrators: 1,
             head_address: None,
             defaults: Defaults::default(),
             agents: Agents::default(),

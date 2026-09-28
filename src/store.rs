@@ -703,8 +703,8 @@ impl Store {
     }
 
     /// The tail `note_pane_tail` kept for `task_id`, left for the finish
-    /// command to take.
-    fn pane_tail(&self, task_id: i64) -> Option<String> {
+    /// command to take (an orchestrator's post script reads it too).
+    pub fn pane_tail(&self, task_id: i64) -> Option<String> {
         let tails = self.pane_tails.lock().unwrap_or_else(|p| p.into_inner());
         tails
             .0

@@ -199,23 +199,34 @@ fn finish_input(
     last_output: &str,
     summary: Option<&crate::task::TaskSummary>,
 ) -> Vec<u8> {
+    let mut v = serde_json::to_vec(&task_end_object(task, state, last_output, summary))
+        .expect("a task-end object serializes");
+    v.push(b'\n');
+    v
+}
+
+/// The object `finish_input` writes, for a caller that adds to it (an
+/// orchestrator's post script).
+pub fn task_end_object(
+    task: &Task,
+    state: &str,
+    last_output: &str,
+    summary: Option<&crate::task::TaskSummary>,
+) -> serde_json::Value {
     let branch = task
         .spec
         .checkout
         .as_ref()
         .map(|c| c.branch.as_str())
         .or(task.spec.branch.as_deref());
-    let mut v = serde_json::to_vec(&serde_json::json!({
+    serde_json::json!({
         "task": task,
         "state": state,
         "job": task.job,
         "branch": branch,
         "last_output": last_output,
         "summary": summary,
-    }))
-    .expect("a task-end object serializes");
-    v.push(b'\n');
-    v
+    })
 }
 
 /// What a finish command needs beyond its manifest entry.

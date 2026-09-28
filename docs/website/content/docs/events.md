@@ -44,6 +44,8 @@ The log is `~/.local/state/pastor/events.jsonl`. Past 10 MiB it moves to
 | `job.failed` | a job run failed |
 | `connector.finish_failed` | a connector's finish command failed |
 | `machine.connected`, `machine.lost` | a machine's channel came up or went down |
+| `orchestrator.started`, `orchestrator.skipped`, `orchestrator.held` | an orchestrator's run started an agent, was skipped while its agent works, or was held back by `max_orchestrators` or a quota |
+| `orchestrator.quota`, `orchestrator.failed` | its agent stopped on a quota; its pre or post script failed |
 
 ## a record
 

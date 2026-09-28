@@ -10,8 +10,9 @@ const WAIT: Duration = Duration::from_secs(60);
 fn pastor() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
     // The suite may itself run in an agent's pane, which pastor marks; the
-    // tests that want the mark set it.
+    // tests that want the mark set it. So may an orchestrator's script.
     c.env_remove("PASTOR_TASK");
+    c.env_remove("PASTOR_ORCHESTRATOR");
     c
 }
 
@@ -3142,6 +3143,189 @@ fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
     assert_eq!(roles, ["agent", "orchestrator"], "{listed}");
     let text = ok(env.cmd(&["task", "describe", "t-1"]));
     assert!(text.contains("role:       orchestrator"), "{text}");
+}
+
+/// An orchestrator file `name` of `text` in the head's config, with a
+/// `pre.sh` of `pre` beside it.
+fn write_orchestrator(env: &Env, name: &str, text: &str, pre: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = env.config.join("orchestrators");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{name}.toml")), text).unwrap();
+    let script = dir.join("pre.sh");
+    std::fs::write(&script, format!("#!/bin/sh\n{pre}\n")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+const MERGE: &str =
+    "kind = \"scheduled\"\ncron = \"0 3 * * *\"\npre = [\"./pre.sh\"]\nprompt = \"Decide.\"\n";
+
+/// The noun end to end: `list` shows each file's kind and state, an
+/// invalid one with its error; `run` fires a run whose pre script printed
+/// nothing, so no agent starts; `disable` turns it off; a person keeps its
+/// note with `--name`; `describe` shows the run and the note.
+#[test]
+fn orchestrator_files_list_run_disable_and_note() {
+    let env = start();
+    write_orchestrator(&env, "merge", MERGE, "echo looked >&2");
+    std::fs::write(
+        env.config.join("orchestrators/night.toml"),
+        "hours = { start = \"22:00\", stop = \"08:00\" }\nprompt = \"p\"\n",
+    )
+    .unwrap();
+    let list = env.json(&["orchestrator", "list", "--json"]);
+    assert_eq!(list[0]["name"], "merge", "{list}");
+    assert_eq!(list[0]["kind"], "scheduled", "{list}");
+    assert_eq!(list[0]["state"], "idle", "{list}");
+    assert_eq!(list[1]["name"], "night", "{list}");
+    assert_eq!(list[1]["state"], "invalid", "{list}");
+    assert!(
+        list[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("kind is required"),
+        "{list}"
+    );
+    let text = ok(env.cmd(&["orchestrator", "list"]));
+    assert!(text.contains("NAME") && text.contains("merge"), "{text}");
+
+    ok(env.cmd(&["orchestrator", "run", "merge"]));
+    let deadline = Instant::now() + WAIT;
+    let d = loop {
+        let d = env.json(&["orchestrator", "describe", "merge", "--json"]);
+        if d["runs"].as_array().is_some_and(|r| !r.is_empty()) {
+            break d;
+        }
+        assert!(Instant::now() < deadline, "the run never finished: {d}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(d["runs"][0]["outcome"], "no_lines", "{d}");
+    assert_eq!(d["last_result"], "no lines", "{d}");
+    let listed = env.json(&["task", "list", "--all", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 0, "{listed}");
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "run", "night"])),
+        "orchestrator_invalid"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "run", "nope"])),
+        "orchestrator_not_found"
+    );
+
+    ok(env.cmd(&["orchestrator", "disable", "merge"]));
+    let list = env.json(&["orchestrator", "list", "--json"]);
+    assert_eq!(list[0]["state"], "off", "{list}");
+    assert!(list[0]["next_run"].is_null(), "{list}");
+    ok(env.cmd(&["orchestrator", "enable", "merge"]));
+
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "note", "x"])),
+        "orchestrator_not_found"
+    );
+    ok(env.cmd(&["orchestrator", "note", "--name", "merge", "merged #31"]));
+    let text = ok(env.cmd(&["orchestrator", "describe", "merge"]));
+    assert!(text.contains("merged #31"), "{text}");
+    assert!(text.contains("no lines"), "{text}");
+}
+
+/// A pre or post script runs with `PASTOR_ORCHESTRATOR`, and its `pastor`
+/// calls get the orchestrator role: `task run` passes, `machine add` is
+/// refused before it reaches anything, a name the head does not know is
+/// refused, and an agent that also sets the variable keeps its own rights.
+#[test]
+fn a_pre_scripts_pastor_calls_get_the_orchestrator_role() {
+    let env = start();
+    write_orchestrator(&env, "merge", MERGE, "");
+    let as_script = |name: &str, task: Option<&str>, args: &[&str]| {
+        let mut c = pastor();
+        c.args(args)
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("PASTOR_ORCHESTRATOR", name);
+        if let Some(task) = task {
+            c.env("PASTOR_TASK", task);
+        }
+        c.output().unwrap()
+    };
+    let t: serde_json::Value = serde_json::from_str(&ok(as_script(
+        "merge",
+        None,
+        &["task", "run", "fix ci", "--repo", "/tmp", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(t["role"], "agent", "{t}");
+    let before = std::fs::read_to_string(env.config.join("flock.toml")).unwrap();
+    let out = as_script("merge", None, &["machine", "add", "pi-9", "user@pi-9"]);
+    assert_eq!(error_code(&out), "agent_refused");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("orchestrator merge"));
+    assert_eq!(
+        std::fs::read_to_string(env.config.join("flock.toml")).unwrap(),
+        before
+    );
+    let out = as_script(
+        "merge",
+        None,
+        &[
+            "task",
+            "run",
+            "x",
+            "--repo",
+            "/tmp",
+            "--role",
+            "orchestrator",
+        ],
+    );
+    assert_eq!(error_code(&out), "role_refused");
+    let out = as_script("ghost", None, &["task", "run", "x", "--repo", "/tmp"]);
+    assert_eq!(error_code(&out), "agent_refused");
+    // t-1 is a plain agent: PASTOR_TASK wins over PASTOR_ORCHESTRATOR.
+    let out = as_script(
+        "merge",
+        Some("t-1"),
+        &["task", "run", "x", "--repo", "/tmp"],
+    );
+    assert_eq!(error_code(&out), "agent_refused");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is an agent pastor started"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ok(as_script(
+        "merge",
+        None,
+        &["orchestrator", "note", "from the script"],
+    ));
+    let d = env.json(&["orchestrator", "describe", "merge", "--json"]);
+    assert_eq!(d["note"], "from the script", "{d}");
+}
+
+/// `task list` puts orchestrator tasks in a table of their own, above the
+/// others; `--json` keeps one array.
+#[test]
+fn task_list_shows_orchestrators_in_their_own_table_first() {
+    let env = start();
+    ok(env.cmd(&["task", "run", "work", "--repo", "/tmp"]));
+    ok(env.cmd(&[
+        "task",
+        "run",
+        "plan",
+        "--repo",
+        "/tmp",
+        "--role",
+        "orchestrator",
+    ]));
+    let text = ok(env.cmd(&["task", "list", "--all"]));
+    let o = text.find("orchestrators:").expect(&text);
+    let t = text.find("tasks:").expect(&text);
+    assert!(o < t, "{text}");
+    let (orchestrators, tasks) = text.split_at(t);
+    assert!(
+        orchestrators.contains("t-2") && !orchestrators.contains("t-1 "),
+        "{text}"
+    );
+    assert!(tasks.contains("t-1"), "{text}");
+    let listed = env.json(&["task", "list", "--all", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 2, "{listed}");
 }
 
 /// Machine, flock and job edits need no head, so the CLI refuses them

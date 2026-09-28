@@ -79,14 +79,20 @@ pub struct Shepherd {
 }
 
 impl Answer for Shepherd {
-    async fn answer(&self, req: IpcRequest, from_task: Option<String>) -> IpcResponse {
-        // The rule the head applies (`Daemon::handle_from`), from this
-        // machine's pastor.toml.
-        if let Some(task) = &from_task
+    async fn answer(&self, req: IpcRequest, from: crate::ipc::Caller) -> IpcResponse {
+        // The rule the head applies (`Daemon::handle_as`), from this
+        // machine's pastor.toml. Nothing a headless serve answers is on the
+        // orchestrator role's table, and orchestrators run on the head.
+        let refusal = match (&from.task, &from.orchestrator) {
+            (Some(task), _) => Some(crate::daemon::agent_refusal(task)),
+            (None, Some(o)) => Some(crate::daemon::script_refusal(o)),
+            (None, None) => None,
+        };
+        if let Some(refusal) = refusal
             && req.changes_fleet()
             && !PastorConfig::load(&self.paths.config_file()).is_ok_and(|c| c.agents_change_fleet)
         {
-            return IpcResponse::error("agent_refused", crate::daemon::agent_refusal(task));
+            return IpcResponse::error("agent_refused", refusal);
         }
         if let IpcRequest::Ping = req {
             return IpcResponse::Pong {
@@ -963,14 +969,15 @@ mod tests {
             scheduler,
             head: "user@pi-1".into(),
         };
-        let IpcResponse::Pong { role, protocol, .. } = s.answer(IpcRequest::Ping, None).await
+        let IpcResponse::Pong { role, protocol, .. } =
+            s.answer(IpcRequest::Ping, Default::default()).await
         else {
             panic!()
         };
         assert_eq!(role.as_deref(), Some(SHEPHERD_ROLE));
         assert_eq!(protocol, IPC_PROTOCOL);
         assert!(matches!(
-            s.answer(IpcRequest::JobList, None).await,
+            s.answer(IpcRequest::JobList, Default::default()).await,
             IpcResponse::Jobs(j) if j.is_empty()
         ));
         let code = |r: IpcResponse| match r {
@@ -982,15 +989,18 @@ mod tests {
                 IpcRequest::List {
                     filter: Default::default(),
                 },
-                None,
+                Default::default(),
             )
             .await,
         );
         assert_eq!(c, "shepherd_unsupported");
         assert!(m.contains("user@pi-1"), "{m}");
         let (c, _) = code(
-            s.answer(IpcRequest::JobRun { name: "x".into() }, Some("t-3".into()))
-                .await,
+            s.answer(
+                IpcRequest::JobRun { name: "x".into() },
+                crate::ipc::Caller::task(Some("t-3")),
+            )
+            .await,
         );
         assert_eq!(c, "agent_refused");
     }

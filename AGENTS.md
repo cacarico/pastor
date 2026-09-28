@@ -167,6 +167,13 @@ Still open as of the last review; none of them blocks normal use.
   refuses the item (`job_task_refused`).
 - Cron minutes that do not exist on a spring-forward day are skipped;
   Vixie cron runs them instead.
+- Session orchestrators (`kind = "session"`) are checked but not run:
+  hours, restarts, `orchestrator start` and `stop` are the next card.
+- The orchestrator runner ticks at pastor.toml's `tick` as the head started
+  with; a later edit of `tick` reaches it only on a restart
+  (`max_orchestrators` is read on each run).
+- An orchestrator agent's branch is pastor's usual `pastor/t-<n>`, not the
+  spec's `orchestrator/<name>-<n>`.
 - With a remote head (`pastor head set`), `task run` fills what its flags
   leave out from the built-in defaults, not the head's `[defaults]` timeout
   and place, and most commands that read or edit files (machine and flock
@@ -179,6 +186,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
+~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
 ~/.local/state/pastor/pastor.db   tasks (schema 9), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
@@ -196,6 +204,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.local/state/pastor/connectors/@<id>/ connector scratch for hooks and runs with no job
 ~/.local/state/pastor/runs/<job>/       connector run logs, 256 KiB each, newest 20 kept
 ~/.local/state/pastor/runs/@<id>/       hook logs (and `connector` runs with no job)
+~/.local/state/pastor/orchestrators/<name>/ state.json, note, scripts' scratch/ and runs/
 skills/pastor/SKILL.md            agent skill, in the repo; `pastor --skill` prints it
 skills/spec/                      plan-for-the-flock skill, its plan format and example
 .claude-plugin/plugin.json        makes the repo a Claude Code plugin named pastor
@@ -215,3 +224,9 @@ own task, `IpcRequest::ends_own_task`); auto-close of done tasks after `close_do
 `run_close` (`CloseBy::AutoClose`); orphan detection is
 `machine::orphan_agents`, used by reconcile and by the head-less probe in
 `machine list`.
+
+Orchestrators are `src/orchestrator.rs` (files, state, `Runner`, which the
+head spawns beside the scheduler) and `src/orchestrator_cli.rs`; the guard
+for their scripts is `Daemon::handle_as` (`ipc::Caller`,
+`FROM_ORCHESTRATOR_FIELD`) and the `caller().orchestrator` branch of the
+CLI's own guard in `main`.

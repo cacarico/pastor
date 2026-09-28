@@ -868,6 +868,41 @@ pub fn in_(at: chrono::DateTime<Utc>) -> String {
     }
 }
 
+pub const ORCHESTRATOR_HEADER: [&str; 8] = [
+    "NAME",
+    "KIND",
+    "STATE",
+    "SCHEDULE",
+    "LAST RUN",
+    "NEXT RUN",
+    "AGENT",
+    "LAST RESULT",
+];
+
+/// `orchestrator list`'s rows, one per file.
+pub fn orchestrator_rows(list: &[crate::orchestrator::OrchestratorStatus]) -> Vec<Vec<String>> {
+    list.iter()
+        .map(|o| {
+            let result = match &o.error {
+                Some(e) => format!("invalid: {e}"),
+                None => o.last_result.clone().unwrap_or_default(),
+            };
+            vec![
+                o.name.clone(),
+                o.kind.map_or("-".into(), |k| k.to_string()),
+                o.state.clone(),
+                o.schedule.clone().unwrap_or_else(|| "-".into()),
+                o.last_run_at
+                    .map(|t| format!("{} ago", age(t)))
+                    .unwrap_or_else(|| "never".into()),
+                o.next_run.map(in_).unwrap_or_else(|| "-".into()),
+                o.task.map_or("-".into(), |t| format!("t-{t}")),
+                one_line(result.trim()),
+            ]
+        })
+        .collect()
+}
+
 pub const JOB_HEADER: [&str; 8] = [
     "NAME",
     "SCHEDULE",

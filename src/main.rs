@@ -78,6 +78,11 @@ enum Command {
         #[command(subcommand)]
         cmd: JobCmd,
     },
+    /// Manage orchestrators (files in ~/.config/pastor/orchestrators/): the head runs a pre script on a schedule and starts an agent with the orchestrator role for what it prints
+    Orchestrator {
+        #[command(subcommand)]
+        cmd: pastor::orchestrator_cli::OrchestratorCmd,
+    },
     /// pastor.toml: the head's settings and the task defaults
     Config {
         #[command(subcommand)]
@@ -624,6 +629,7 @@ fn main() {
     }
     pastor::ipc::set_remote_head(remote.clone());
     pastor::ipc::set_caller_task(pastor::ipc::task_from_env());
+    pastor::ipc::set_caller_orchestrator(pastor::ipc::orchestrator_from_env());
     if let Some(task) = pastor::ipc::caller_task() {
         if makes_orchestrator(&command) {
             fail(
@@ -643,6 +649,21 @@ fn main() {
                 "agent_refused",
                 &pastor::daemon::refusal(&task, local_caller_role(&paths, &task)),
             );
+        }
+    } else if let Some(o) = pastor::ipc::caller().orchestrator {
+        // An orchestrator's pre or post script: the role's table, as the
+        // head applies it (`Daemon::handle_as`), for what the CLI does
+        // without it.
+        if makes_orchestrator(&command) {
+            fail(
+                "role_refused",
+                &format!(
+                    "orchestrator {o}'s script is not a person, and only a person may run a task with --role orchestrator"
+                ),
+            );
+        }
+        if changes_fleet(&command) && !orchestrator_may(&command) && !agents_change_fleet(&paths) {
+            fail("agent_refused", &pastor::daemon::script_refusal(&o));
         }
     }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -712,6 +733,7 @@ fn main() {
             Command::Flock { cmd } => flock(&paths, cmd, head).await,
             Command::Tick(args) => tick(&paths, args, head).await,
             Command::Job { cmd } => job(&paths, cmd, head).await,
+            Command::Orchestrator { cmd } => pastor::orchestrator_cli::run(&paths, cmd, head).await,
             Command::Config {
                 cmd: ConfigCmd::Edit { local },
             } => config_edit(&paths, local, head).await,
@@ -1040,6 +1062,7 @@ fn head_use(command: &Command) -> Option<bool> {
             _ => Some(true),
         },
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
+        Command::Orchestrator { .. } => Some(false),
         Command::Trust { .. } => Some(false),
         Command::Queue(a) => Some(a.flock.is_some()),
         Command::Connector { cmd } => {
@@ -1098,7 +1121,9 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Events(_)
         | Command::Tick(_)
         // The head's jobs through it, this machine's own here (`job`).
-        | Command::Job { .. } => RemoteRoute::Head,
+        | Command::Job { .. }
+        // Orchestrators run only on the head.
+        | Command::Orchestrator { .. } => RemoteRoute::Head,
         Command::Completions { .. }
         | Command::Setup { .. }
         | Command::Head { .. }
@@ -1202,6 +1227,7 @@ fn changes_fleet(command: &Command) -> bool {
         ),
         Command::Tick(_) => true,
         Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. } | JobCmd::Describe { .. }),
+        Command::Orchestrator { cmd } => pastor::orchestrator_cli::changes_fleet(cmd),
         // pastor.toml holds agents_change_fleet itself.
         Command::Config { .. } => true,
         // Install, link, uninstall and unlink edit the catalog and reload the
@@ -1246,6 +1272,7 @@ fn orchestrator_may(command: &Command) -> bool {
             )
         }
         Command::Job { cmd } => matches!(cmd, JobCmd::Enable { .. } | JobCmd::Disable { .. }),
+        Command::Orchestrator { cmd } => pastor::orchestrator_cli::orchestrator_may(cmd),
         _ => false,
     }
 }
@@ -1450,7 +1477,12 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_join_protocol(command) {
+    if matches!(command, Command::Orchestrator { .. }) {
+        Some((
+            pastor::ipc::ORCHESTRATOR_PROTOCOL,
+            "predates orchestrator files, and would refuse the request",
+        ))
+    } else if needs_join_protocol(command) {
         Some((
             pastor::ipc::JOIN_PROTOCOL,
             "predates `flock join` and `flock leave`, and would refuse them or add the flock without its machines",
@@ -2035,37 +2067,28 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
             println!("no tasks");
         }
     } else {
-        let mut rows = pastor::cli::task_rows(&tasks);
-        // The flock file is the truth for "removed" whether or not a head
-        // runs (a running head re-reads it every tick). `load_existing`
-        // rather than `load`: a flock.toml that is momentarily missing (an
-        // editor's delete-and-rename, or a race with `machine add|remove`
-        // rewriting it) must mark nothing, not everything (Copilot
-        // 4103271200, 4103271289, 4103271156).
-        // A remote head's flock.toml is not here: its machines are what it
-        // reports.
-        if pastor::ipc::remote_head().is_some() {
-            let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
-                unreachable!()
-            };
-            pastor::cli::mark_removed(&mut rows, &tasks, |m| ms.iter().any(|s| s.name == m));
-        } else if let Ok(flock) = Flock::load_existing(&paths.flock_file()) {
-            pastor::cli::mark_removed(&mut rows, &tasks, |m| flock.get(m).is_some());
-        }
-        let descriptions: Vec<Option<String>> =
-            tasks.iter().map(|t| Some(t.description_text())).collect();
-        // `--wide` adds how each task's last round ended, before DESCRIPTION.
-        let mut header = pastor::cli::TASK_HEADER.to_vec();
-        if a.wide {
-            header.push("RESULT");
-            for (row, t) in rows.iter_mut().zip(&tasks) {
-                row.push(pastor::cli::task_result(t));
+        // Orchestrators first, in a table of their own; `--json` keeps one
+        // array, with `role`.
+        let (orchestrators, agents): (Vec<Task>, Vec<Task>) = tasks
+            .iter()
+            .cloned()
+            .partition(|t| t.role == TaskRole::Orchestrator);
+        // Titled only when there are orchestrators, so a plain list reads
+        // as it always has.
+        let titled = !orchestrators.is_empty();
+        let mut tables = Vec::new();
+        for (title, group) in [("orchestrators", &orchestrators), ("tasks", &agents)] {
+            if group.is_empty() {
+                continue;
             }
+            let table = task_table(paths, group, a.wide).await?;
+            tables.push(if titled {
+                format!("{title}:\n{table}")
+            } else {
+                table
+            });
         }
-        println!(
-            "{}",
-            pastor::cli::list_table(&header, &rows, a.wide, &descriptions)
-        );
+        println!("{}", tables.join("\n\n"));
     }
     // Orphans have no row to list, so they get a line each under the table.
     // Only a running head knows them (its last reconcile); `--json` stays a
@@ -2079,6 +2102,38 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `task list`'s table of `tasks`, with `--wide`'s RESULT and DESCRIPTION.
+async fn task_table(paths: &Paths, tasks: &[Task], wide: bool) -> anyhow::Result<String> {
+    let mut rows = pastor::cli::task_rows(tasks);
+    // The flock file is the truth for "removed" whether or not a head
+    // runs (a running head re-reads it every tick). `load_existing`
+    // rather than `load`: a flock.toml that is momentarily missing (an
+    // editor's delete-and-rename, or a race with `machine add|remove`
+    // rewriting it) must mark nothing, not everything (Copilot
+    // 4103271200, 4103271289, 4103271156).
+    // A remote head's flock.toml is not here: its machines are what it
+    // reports.
+    if pastor::ipc::remote_head().is_some() {
+        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
+            unreachable!()
+        };
+        pastor::cli::mark_removed(&mut rows, tasks, |m| ms.iter().any(|s| s.name == m));
+    } else if let Ok(flock) = Flock::load_existing(&paths.flock_file()) {
+        pastor::cli::mark_removed(&mut rows, tasks, |m| flock.get(m).is_some());
+    }
+    let descriptions: Vec<Option<String>> =
+        tasks.iter().map(|t| Some(t.description_text())).collect();
+    // `--wide` adds how each task's last round ended, before DESCRIPTION.
+    let mut header = pastor::cli::TASK_HEADER.to_vec();
+    if wide {
+        header.push("RESULT");
+        for (row, t) in rows.iter_mut().zip(tasks) {
+            row.push(pastor::cli::task_result(t));
+        }
+    }
+    Ok(pastor::cli::list_table(&header, &rows, wide, &descriptions))
 }
 
 /// The store, for a CLI path that reads it without the head. Rows from
