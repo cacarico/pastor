@@ -29,8 +29,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// 20: the `summary` setting (`Run::summary`, a job's `[dispatch]
 /// summary`). 21: pull machines (`TaskClaim`, `TaskReport`). 22:
 /// `FlockJoin`, `FlockLeave` and `FlockAdd::machines`. 23: orchestrators
-/// (`Orchestrator*` requests, and `FROM_ORCHESTRATOR_FIELD`). 24: a flock's
-/// own `timeout` and `place` (`FlockEntry::timeout`, `FlockEntry::place`).
+/// (`Orchestrator*` requests, session ones included, and
+/// `FROM_ORCHESTRATOR_FIELD`). 24: a flock's own `timeout` and `place`
+/// (`FlockEntry::timeout`, `FlockEntry::place`).
 pub const IPC_PROTOCOL: u32 = 24;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
@@ -517,6 +518,16 @@ pub enum IpcRequest {
     OrchestratorRun {
         name: String,
     },
+    /// Start a session orchestrator now, inside its hours or not. Answers
+    /// `Text`.
+    OrchestratorStart {
+        name: String,
+    },
+    /// Stop a session orchestrator: its last message, then its grace.
+    /// Answers `Text`.
+    OrchestratorStop {
+        name: String,
+    },
     /// `orchestrator enable|disable` on the head's file. Answers `Text`.
     OrchestratorSetEnabled {
         name: String,
@@ -581,6 +592,8 @@ impl IpcRequest {
             | IpcRequest::TaskClaim { .. }
             | IpcRequest::TaskReport { .. }
             | IpcRequest::OrchestratorRun { .. }
+            | IpcRequest::OrchestratorStart { .. }
+            | IpcRequest::OrchestratorStop { .. }
             | IpcRequest::OrchestratorSetEnabled { .. }
             | IpcRequest::OrchestratorNote { .. } => true,
         }
@@ -1449,6 +1462,8 @@ mod tests {
                 repo: "/r".into(),
             },
             IpcRequest::OrchestratorRun { name: "o".into() },
+            IpcRequest::OrchestratorStart { name: "o".into() },
+            IpcRequest::OrchestratorStop { name: "o".into() },
             IpcRequest::OrchestratorSetEnabled {
                 name: "o".into(),
                 enabled: true,

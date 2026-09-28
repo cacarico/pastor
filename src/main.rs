@@ -78,7 +78,7 @@ enum Command {
         #[command(subcommand)]
         cmd: JobCmd,
     },
-    /// Manage orchestrators (files in ~/.config/pastor/orchestrators/): the head runs a pre script on a schedule and starts an agent with the orchestrator role for what it prints
+    /// Manage orchestrators (files in ~/.config/pastor/orchestrators/): the head runs a pre script on a schedule and starts an agent with the orchestrator role for what it prints, or keeps one agent running through set hours
     Orchestrator {
         #[command(subcommand)]
         cmd: pastor::orchestrator_cli::OrchestratorCmd,
