@@ -1675,6 +1675,31 @@ async fn probe_machine(
                 .count(),
         })
         .collect();
+    // Nothing connects to a pull machine, and with no head running nobody
+    // has heard its claims: its row says so, with the tasks the store puts
+    // there, rather than probing whatever herdr runs here.
+    if m.pull {
+        return Ok(pastor::cli::MachineRow {
+            name: m.name.clone(),
+            host: "pull".into(),
+            endpoint: pastor::machine::PULL_ENDPOINT.into(),
+            flock: flock.to_string(),
+            flocks,
+            channel: "not probed".into(),
+            herdr_version: None,
+            pastor_version: None,
+            protocol: None,
+            error: None,
+            live: Some(on_machine.len()),
+            max_agents: m.max_agents,
+            job_slots: m.job_slots,
+            burst: m.burst,
+            tags: m.tags.clone(),
+            orphans: vec![],
+            profile: own_profile(config, f, m),
+            description: pastor::config::clean_description(m.description.as_deref()),
+        });
+    }
     let ep = Endpoint::from_machine(m, paths);
     let ping = ep.ping().await;
     let agents = match &ping {
@@ -1719,19 +1744,9 @@ async fn probe_machine(
     })
 }
 
-/// This machine's hostname, read from the kernel and files rather than a
-/// new dependency for `gethostname`; `-` when none says.
+/// This machine's hostname (`config::hostname`).
 fn hostname() -> String {
-    ["/proc/sys/kernel/hostname", "/etc/hostname"]
-        .iter()
-        .find_map(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "-".into())
+    pastor::config::hostname()
 }
 
 /// The head's row: this machine's hostname and the herdr it has, if any.
@@ -2057,6 +2072,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             herdr,
         } => {
             let m = MachineConfig {
+                pull: false,
                 description: pastor::config::clean_description(description.as_deref()),
                 name: name.clone(),
                 local,
@@ -3834,6 +3850,37 @@ mod tests {
         let (channel, _, _, _, error) = probe_fields(Err(err), None);
         assert_eq!(channel, "error");
         assert!(error.unwrap().contains("boom"));
+    }
+
+    /// With no head, `machine list` probes each machine, but a pull machine
+    /// is never connected to: its row comes from flock.toml and the store,
+    /// not from the herdr that happens to run here.
+    #[tokio::test]
+    async fn a_pull_machine_is_not_probed_without_a_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        let f = Flock::parse(
+            std::path::Path::new("flock.toml"),
+            "[[machine]]\nname = \"laptop\"\npull = true\nmax_agents = 2\n",
+        )
+        .unwrap();
+        let store = Store::open(&paths.db_file()).unwrap();
+        let row = probe_machine(
+            f.get("laptop").unwrap(),
+            &f,
+            &PastorConfig::default(),
+            &paths,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.host, "pull");
+        assert_eq!(row.endpoint, pastor::machine::PULL_ENDPOINT);
+        assert_eq!(row.channel, "not probed");
+        assert_eq!(row.error, None);
+        assert_eq!(row.live, Some(0));
+        assert_eq!(row.max_agents, 2);
     }
 
     #[test]

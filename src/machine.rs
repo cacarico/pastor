@@ -685,6 +685,66 @@ impl MachineHandle {
     }
 }
 
+/// `live`, `live_jobs` and `live_by_flock` of `status` from `tasks`, the
+/// pane-owning tasks on its machine (`Store::tasks_on_machine`).
+pub fn count_live(status: &mut MachineStatus, tasks: &[Task]) {
+    status.live = tasks.len();
+    status.live_jobs = tasks.iter().filter(|t| t.from_job()).count();
+    let mut by: Vec<(Option<String>, usize)> = Vec::new();
+    for t in tasks {
+        match by.iter_mut().find(|(f, _)| *f == t.flock) {
+            Some((_, n)) => *n += 1,
+            None => by.push((t.flock.clone(), 1)),
+        }
+    }
+    status.live_by_flock = by;
+}
+
+/// What `machine list` shows as a pull machine's endpoint.
+pub const PULL_ENDPOINT: &str = "pull: its own pastor serve asks the head for tasks";
+
+/// The handle of a pull machine (`pull = true` in flock.toml): no actor and
+/// no connection, since the head never reaches it. A request sent to it
+/// fails at once ("is gone"); the fleet answers for it instead
+/// (`Fleet::claim`, `Fleet::report`). Its status starts `connecting` until
+/// its first claim.
+pub fn pull_machine(name: String, max_agents: u32, tags: Vec<String>) -> MachineHandle {
+    let (tx, _) = mpsc::channel(1);
+    let status = Arc::new(RwLock::new(MachineStatus {
+        description: None,
+        name: name.clone(),
+        host: "pull".into(),
+        endpoint: PULL_ENDPOINT.into(),
+        channel: ChannelState::Connecting,
+        herdr_version: None,
+        pastor_version: None,
+        protocol: None,
+        error: None,
+        live: 0,
+        live_jobs: 0,
+        max_agents,
+        job_slots: 0,
+        burst: 0,
+        tags: tags.clone(),
+        orphans: vec![],
+        flock: None,
+        flocks: vec![],
+        live_by_flock: vec![],
+        shutting_down: false,
+        profile: None,
+    }));
+    MachineHandle {
+        name,
+        max_agents,
+        job_slots: 0,
+        burst: 0,
+        tags,
+        tx,
+        status,
+        task: None,
+    }
+}
+
 pub fn spawn_machine(
     name: String,
     max_agents: u32,
@@ -1218,16 +1278,8 @@ impl Actor {
                 // An orphan holds a pane and an agent just like a task does;
                 // leaving it out would let the picker over-dispatch.
                 let mut s = self.status.write().unwrap();
-                s.live = v.len() + self.orphans.len();
-                s.live_jobs = v.iter().filter(|t| t.from_job()).count();
-                let mut by: Vec<(Option<String>, usize)> = Vec::new();
-                for t in &v {
-                    match by.iter_mut().find(|(f, _)| *f == t.flock) {
-                        Some((_, n)) => *n += 1,
-                        None => by.push((t.flock.clone(), 1)),
-                    }
-                }
-                s.live_by_flock = by;
+                count_live(&mut s, &v);
+                s.live += self.orphans.len();
                 s.orphans = self.orphans.iter().map(|(name, _)| name.clone()).collect();
             }
             Err(err) => {

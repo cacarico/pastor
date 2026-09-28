@@ -1176,6 +1176,7 @@ mod tests {
         let flock = Flock {
             flocks: vec![],
             machines: vec![MachineConfig {
+                pull: false,
                 description: None,
                 name: "pi-1".into(),
                 local: true,
