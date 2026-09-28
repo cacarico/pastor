@@ -1191,7 +1191,7 @@ pub(crate) async fn jobs_answer(
 /// Why an agent pastor started, in task `task`, was refused a change to
 /// the fleet. The CLI says the same for a change it makes on its own.
 /// What the head says when it refuses `task`, of `role`, a fleet change.
-fn refusal(task: &str, role: TaskRole) -> String {
+pub fn refusal(task: &str, role: TaskRole) -> String {
     match role {
         TaskRole::Agent => agent_refusal(task),
         TaskRole::Orchestrator => format!(

@@ -2998,10 +2998,13 @@ fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
         );
         assert_eq!(error_code(&out), "role_refused", "{task}");
     }
-    assert_eq!(
-        error_code(&from("t-1", &["task", "close", "t-2"])),
-        "agent_refused"
-    );
+    // t-1's guard runs before the head is ever asked, so it must still know
+    // t-1 is an orchestrator: its refusal names the role, not "agent".
+    let closed = from("t-1", &["task", "close", "t-2"]);
+    assert_eq!(error_code(&closed), "agent_refused");
+    let err = String::from_utf8_lossy(&closed.stderr);
+    assert!(err.contains("orchestrator"), "{err}");
+    assert!(!err.contains("is an agent pastor started"), "{err}");
     assert_eq!(
         error_code(&from("t-2", &["task", "run", "go", "--repo", "/tmp"])),
         "agent_refused"

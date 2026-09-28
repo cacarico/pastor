@@ -545,7 +545,10 @@ fn main() {
             && !orchestrator_may(&command)
             && !agents_change_fleet(&paths)
         {
-            fail("agent_refused", &pastor::daemon::agent_refusal(&task));
+            fail(
+                "agent_refused",
+                &pastor::daemon::refusal(&task, local_caller_role(&paths, &task)),
+            );
         }
     }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -987,6 +990,21 @@ fn ends_own_task(command: &Command, task: &str) -> bool {
 /// as off: the refusal is the safe side.
 fn agents_change_fleet(paths: &Paths) -> bool {
     PastorConfig::load(&paths.config_file()).is_ok_and(|c| c.agents_change_fleet)
+}
+
+/// The role of `task`, read straight from the database for this local guard,
+/// which runs before the head is ever contacted. One the store does not know,
+/// or cannot read, is a plain agent: the refusal is the safe side, same as
+/// `Daemon::caller_role`.
+fn local_caller_role(paths: &Paths, task: &str) -> TaskRole {
+    parse_task_id(task)
+        .and_then(|id| {
+            Store::open_read_only(&paths.db_file())
+                .ok()?
+                .get_task(id)
+                .ok()?
+        })
+        .map_or(TaskRole::Agent, |t| t.role)
 }
 
 /// Whether `command` can make the head queue a task, whose agent and model
