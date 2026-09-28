@@ -1,0 +1,25 @@
+# `make check` runs `scripts/changelog.sh check` too, but ci.yml's `paths:`
+# skips a pull request that only touches the changelog, which is exactly the
+# one that might add a line under Unreleased instead of a changes/<branch>.md
+# file. This job is the same check with no Rust build, so it can run on
+# those pull requests for the cost of a checkout.
+name: changelog
+
+on:
+  pull_request:
+    paths:
+      - "CHANGELOG.md"
+      - "changes/**"
+      - "scripts/changelog.sh"
+      - ".github/workflows/changelog.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: make changelog-check

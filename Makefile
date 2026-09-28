@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check fmt lint test test-machine leaks smoke smoke-profiles install install-completions completions demo site site-serve clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine leaks smoke smoke-profiles install install-completions completions demo site site-serve clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -12,7 +12,16 @@ build: ## debug build of pastor and fake-herdr
 release: ## optimised build
 	cargo build --release
 
-check: fmt-check lint test ## what CI and the PR gate run
+check: changelog-check fmt-check lint test ## what CI and the PR gate run
+
+# A pull request's changelog entry is its own file, changes/<branch>.md, so
+# two pull requests never edit the same lines; see changes/README.md.
+changelog-check:
+	@scripts/changelog.sh check
+
+changelog: ## release PR: gather changes/*.md into CHANGELOG.md: make changelog VERSION=X.Y.Z
+	@test -n "$(VERSION)" || { echo 'make changelog: set VERSION=X.Y.Z' >&2; exit 1; }
+	scripts/changelog.sh gather $(VERSION)
 
 fmt: ## rewrite sources with rustfmt
 	cargo fmt
