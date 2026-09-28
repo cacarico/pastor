@@ -3,10 +3,14 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.7.0 - 2026-09-28
 
 ### Added
 
+- A website for pastor, a small terminal-style site built with Hugo from
+  `docs/manual.md` and short pages under `docs/website`. It deploys to
+  GitHub Pages from the public repo; `make site` builds it and `make
+  site-serve` serves it locally.
 - `pastor watch`: one line per change an orchestrator acts on, so it stops
   building its own polling. `TASK t-N <state> <machine> <job>` for a task that
   is blocked, done, failed or stale (`--all`: every state change), from the
@@ -220,6 +224,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Publishing a release's draft on GitHub publishes the crate to crates.io
+  (`pastor-cli`) from the tag; a prerelease is skipped. It was a manual
+  `cargo publish` before.
 - `pastor flock default` is split in two: `pastor flock default show` prints
   the default flock, and `pastor flock default set <name>` makes another flock
   the default. The old `pastor flock default <name>` is gone. `show` reads
