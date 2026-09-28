@@ -20,8 +20,8 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// 9: `JobTask`, and `Pong::role`. 10: `TrustList`, `TrustAdd`,
 /// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. 11: task priority
 /// (`Run::priority`, `TaskPriority`). 12: `Run::role`. 13: permission
-/// profiles (`AgentChoice::profile`).
-pub const IPC_PROTOCOL: u32 = 13;
+/// profiles (`AgentChoice::profile`). 14: `Queue` and `QueueMove`.
+pub const IPC_PROTOCOL: u32 = 14;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -103,6 +103,10 @@ pub const PRIORITY_PROTOCOL: u32 = 11;
 /// would drop it and start the agent asking before every tool, or with
 /// fewer denies, without a word.
 pub const PROFILE_PROTOCOL: u32 = 13;
+
+/// The first protocol whose head knows `Queue` and `QueueMove`; an older
+/// one refuses them as unreadable.
+pub const QUEUE_PROTOCOL: u32 = 14;
 
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.
@@ -215,6 +219,22 @@ pub enum IpcRequest {
     TaskPriority {
         id: i64,
         priority: crate::task::Priority,
+    },
+    /// The queued tasks in dispatch order, each with why it waits
+    /// (`pastor queue`); `flock` and `machine` keep a flock's tasks or the
+    /// ones pinned to a machine. Answers `Queue`.
+    Queue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flock: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<String>,
+    },
+    /// Put a queued task elsewhere in the queue (`pastor queue move`).
+    /// Refused `not_queued` when it, or the task it goes before or after,
+    /// has left the queue. Answers `Moved`.
+    QueueMove {
+        id: i64,
+        to: crate::queue::QueueSpot,
     },
     /// Close the task's pane (or, with `remove_worktree`, its worktree) and
     /// mark it closed. Answers `Task`, or `Text` for an orphaned agent with no
@@ -342,7 +362,8 @@ impl IpcRequest {
             | IpcRequest::EventsSince { .. }
             | IpcRequest::TrustList
             | IpcRequest::FlockDescribe { .. }
-            | IpcRequest::MachineDescribe { .. } => false,
+            | IpcRequest::MachineDescribe { .. }
+            | IpcRequest::Queue { .. } => false,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
             | IpcRequest::Tick { .. }
@@ -356,6 +377,7 @@ impl IpcRequest {
             | IpcRequest::JobRun { .. }
             | IpcRequest::TaskRetry { .. }
             | IpcRequest::TaskPriority { .. }
+            | IpcRequest::QueueMove { .. }
             | IpcRequest::TaskClose { .. }
             | IpcRequest::TaskSend { .. }
             | IpcRequest::TaskDone { .. }
@@ -481,6 +503,8 @@ pub enum IpcResponse {
     Trusted(Vec<crate::store::TrustedRepo>),
     FlockDescription(crate::describe::FlockDescription),
     MachineDescription(crate::describe::MachineDescription),
+    Queue(Vec<crate::queue::QueueEntry>),
+    Moved(crate::store::Moved),
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -1021,6 +1045,10 @@ mod tests {
             IpcRequest::TrustList,
             IpcRequest::FlockDescribe { name: "f".into() },
             IpcRequest::MachineDescribe { name: "m".into() },
+            IpcRequest::Queue {
+                flock: Some("work".into()),
+                machine: None,
+            },
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -1044,6 +1072,10 @@ mod tests {
             IpcRequest::TaskPriority {
                 id: 1,
                 priority: crate::task::Priority::High,
+            },
+            IpcRequest::QueueMove {
+                id: 1,
+                to: crate::queue::QueueSpot::Before(2),
             },
             IpcRequest::TaskSend {
                 id: 1,

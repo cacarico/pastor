@@ -126,7 +126,7 @@ fn task_id(s: &str) -> anyhow::Result<i64> {
 /// that says `runtime_error`, and only for a refused or missing socket: a
 /// timed-out retry may still land, and a connect denied for permissions may
 /// hide a live head.
-fn request_error(err: &RequestError) -> anyhow::Error {
+pub(crate) fn request_error(err: &RequestError) -> anyhow::Error {
     let (code, message) = request_failure(err);
     let code = match err {
         RequestError::Connect(e) if connect_error_means_no_daemon(e) => "daemon_not_running".into(),

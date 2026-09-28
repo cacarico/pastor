@@ -981,6 +981,59 @@ command that can make it queue a task (`pastor task run`, `pastor task
 retry`, `pastor tick` without `--dry-run`, `pastor job run`) refuses one
 (`head_too_old`): restart `pastor serve` after an upgrade.
 
+### The queue
+
+`pastor queue` lists the queued tasks in the order dispatch takes them:
+
+```
+POS  TASK  LEVEL   WHERE          FROM         WAITED  WHY NOT YET
+1    t-9   high    flock work     job triage   4m      flock work is full
+2    t-7   normal  machine pi-3   task run     1h      machine pi-3 is full (2/2)
+3    t-8   low     flock default  task run     2d      next pass: pi-1 has room
+```
+
+POS numbers the whole queue, WHERE is the machine the task is pinned to or
+else its flock, FROM is `task run` or `job <name>`, and WAITED is how long
+since it was queued. A level does not age, so a `low` task can wait for ever
+behind a steady stream of higher ones; WAITED is how you see it. WHY NOT YET
+plays a dispatch pass through on the machines as the head sees them, each
+task that fits taking its slot, so a task behind the last free slot reads its
+flock as full: `flock <f> has no machines`, `no machine in flock <f> is
+connected`, `no machine in flock <f> has tags ...`, `flock <f> is full`,
+`machine <m> is full (n/max)`, `is not connected`, `is not in the flock`, `is
+in flock <g>, not <f>` or `lacks tags ...`, the model note `task describe`
+shows (`waiting for a machine: ...`), or `next pass: <m> has room` for one
+the next pass will start. `--flock <f>` keeps the tasks waiting in a flock,
+`--machine <m>` the ones pinned to a machine, both keeping their POS in the
+whole queue; `--json` gives each as `pos`, `id`, `priority`, `where`,
+`flock`, `machine`, `from`, `waited_secs`, `why` and the whole `task`. With
+no head running it shows the store's queue, and each WHY NOT YET says so.
+
+`pastor queue move <task>` puts a queued task elsewhere, with one of
+`--top`, `--before <task>`, `--after <task>` or `--to <n>` (a POS; past the
+end is last). The task takes the level of where it lands: moved in front of
+a higher task it is lifted to that level, moved behind a lower one it is
+lowered to it, and between two of its own level it keeps its own. `--top`
+has no task in front, so it only lifts. The level's queued tasks then share
+out the positions they held between them in their new order, so the task
+sits between its new neighbours and a task queued later still goes last. The
+queue is one order across flocks: a task can go before a task of another
+flock, and it only matters against the tasks of its own. The answer says
+where the task is now, and when the level changed, from what to what:
+
+```
+$ pastor queue move t-8 --top
+t-8 is 1 of 3 in the queue; lifted from low to high
+```
+
+`task describe` then names `queue move` as what set the level. `--json`
+prints `pos`, `of`, `priority_was` and the `task`. A task that is not queued,
+or a `--before` or `--after` task that is not, is refused with `not_queued`,
+an unknown one with `task_not_found`, and an agent pastor started, as for
+`task priority`, with `agent_refused`; reading the queue is fine from
+anywhere. A head from before the queue refuses both as unreadable, so the
+CLI refuses one first (`head_too_old`).
+
 ## Events
 
 `pastor serve` appends every task, job and machine event to
@@ -1179,6 +1232,8 @@ pastor task list --all               # finished tasks too
 pastor task read t-1                 # recent pane output, without attaching
 pastor task retry t-4                # a failed or stale task again, as a new task
 pastor task priority t-5 high        # a queued task goes ahead of normal ones
+pastor queue                         # the queue in the order it runs, and why each waits
+pastor queue move t-6 --before t-5   # take t-5's place, and its level
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
 pastor task done t-1                 # mark it done; its pane closes after close_done_after
 pastor task prune --done --closed --older-than 7d
@@ -1779,7 +1834,7 @@ It needs:
 it never falls back to this machine's files.
 
 These commands go to a remote head: `task run|list|describe|read|retry|priority|close|prune|send|done`,
-`machine list`, `tick`, `job reload`, `events`, and job commands for
+`queue` and `queue move`, `machine list`, `tick`, `job reload`, `events`, and job commands for
 the head's jobs (see [Jobs on a shepherd](#jobs-on-a-shepherd)). `machine list`'s first line
 names the head by its ssh destination and shows its herdr as `-`. `task run`
 fills what its flags leave out from the built-in defaults, not from the
@@ -1952,7 +2007,7 @@ So:
   `pastor.sock`, an agent on the head included. pastor sets `PASTOR_TASK=t-N`
   in the pane of every agent it starts, and refuses a command from such a pane
   that changes the fleet: `task run`, `send`, `attach` (herdr's agent terminal
-  types into any task's pane), `retry`, `priority`, `close` and `prune`, `tick`
+  types into any task's pane), `retry`, `priority`, `queue move`, `close` and `prune`, `tick`
   (`--dry-run` too), `job run` and `job reload`, `connector install`, `link`,
   `uninstall` and `unlink`, edits of machines, flocks, jobs and `pastor.toml`
   (`config edit`), `serve` and `setup` (a head started from the pane would
@@ -2154,8 +2209,9 @@ after `job describe`, `--job` and the like, flock and machine names after
 `--flock`, `--machine` and the flock and machine commands, task ids after the
 task commands, connector ids after `connector uninstall|unlink|try`, and
 the `[models]` names of pastor.toml after `--model`, profile names
-after `profile describe`, and the levels after `--priority` and
-`task priority`. A
+after `profile describe`, the levels after `--priority` and
+`task priority`, and the queued tasks, in queue order with their level,
+after `queue move` and its `--before` and `--after`. A
 static script cannot know them, so at TAB it runs `pastor __complete <shell>
 -- <words>`, which reads the job files, `flock.toml`, the connectors
 directory and the task store directly, never the head, and prints nothing

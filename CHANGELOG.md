@@ -43,6 +43,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   chain, and a deny anywhere wins. `pastor profile list` and `pastor profile
   describe <name>` (both with `--json`) show them; an unknown name is
   `unknown_profile`, and a bad profile fails pastor.toml's load.
+- `pastor queue` lists the queued tasks in the order they will start: POS,
+  TASK, LEVEL, WHERE (the pinned machine or the flock), FROM (`task run` or
+  `job <name>`), WAITED and WHY NOT YET, from a dispatch pass played
+  through on the machines as they are; `--flock`, `--machine` and `--json`.
+  `pastor queue move <task>` with `--top`, `--before <task>`, `--after
+  <task>` or `--to <n>` puts a queued task there; it takes the level of
+  where it lands (lifted in front of a higher task, lowered behind a lower
+  one, `--top` only lifts), and the answer says when the level changed.
+  Refused with `not_queued` for a task, or an anchor, that is not queued,
+  and from an agent pastor started. The IPC protocol goes to 14 (`Queue`,
+  `QueueMove`); both commands refuse an older head (`head_too_old`).
+  Completion offers the queued tasks after `queue move`.
 - Task priority: a task has a level, `low`, `normal` (the default), `high`
   or `critical`, and each dispatch pass takes queued tasks by level, then
   position, then age, still skipping what does not fit. The level comes from

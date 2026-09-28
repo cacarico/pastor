@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::queue::QueueSpot;
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Priority, Task, TaskState};
 
 const SCHEMA_VERSION: i64 = 10;
@@ -104,6 +105,40 @@ pub enum RetryError {
     #[error(transparent)]
     Store(#[from] anyhow::Error),
 }
+
+/// Why `move_queued` changed nothing, each with its own IPC code. The id
+/// is the task moved or the one it was to go before or after.
+#[derive(Debug, thiserror::Error)]
+pub enum MoveError {
+    #[error("task t-{0} not found")]
+    NotFound(i64),
+    #[error("t-{id} is {state}; only queued tasks have a place in the queue")]
+    NotQueued { id: i64, state: TaskState },
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
+impl From<rusqlite::Error> for MoveError {
+    fn from(err: rusqlite::Error) -> Self {
+        MoveError::Store(err.into())
+    }
+}
+
+/// What `move_queued` did: the task, its level before, and where it is now
+/// (from 1) in a queue of `of` tasks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Moved {
+    pub task: Task,
+    pub was: Priority,
+    pub pos: usize,
+    pub of: usize,
+}
+
+/// The order dispatch takes queued tasks in: by level, highest first, then
+/// by position, then oldest first.
+const QUEUE_ORDER: &str = "CASE priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2
+                                  WHEN 'normal' THEN 1 ELSE 0 END DESC,
+                         COALESCE(queue_pos, id), created_at, id";
 
 /// Why `set_priority` changed nothing, each with its own IPC code.
 #[derive(Debug, thiserror::Error)]
@@ -793,12 +828,9 @@ impl Store {
     /// first, then by position, then oldest first.
     pub fn queued_tasks(&self) -> anyhow::Result<Vec<Task>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM tasks WHERE state = 'queued'
-             ORDER BY CASE priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2
-                                    WHEN 'normal' THEN 1 ELSE 0 END DESC,
-                      COALESCE(queue_pos, id), created_at, id",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM tasks WHERE state = 'queued' ORDER BY {QUEUE_ORDER}"
+        ))?;
         let rows = stmt.query_map([], row_to_task)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -836,6 +868,111 @@ impl Store {
         }
         drop(conn);
         Ok(self.get_task(id)?.context("task vanished after update")?)
+    }
+
+    /// Move queued task `id` to `spot` (`pastor queue move`). It takes the
+    /// level of where it lands: lifted when the task behind it is higher,
+    /// lowered when the one ahead is lower (at the top there is none ahead,
+    /// so `--top` only lifts). Its level's queued tasks then share out the
+    /// positions they held between them in their new order, so the moved
+    /// one sits between its neighbours and a new task, placed by its id,
+    /// still queues last. Refused unless both it and the task it is moved
+    /// before or after are queued.
+    pub fn move_queued(&self, id: i64, spot: QueueSpot) -> Result<Moved, MoveError> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut queue: Vec<(i64, Priority, i64)> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, priority, COALESCE(queue_pos, id) FROM tasks
+                 WHERE state = 'queued' ORDER BY {QUEUE_ORDER}"
+            ))?;
+            let rows = stmt.query_map([], |r| {
+                let p: String = r.get(1)?;
+                Ok((r.get(0)?, p.parse().unwrap_or_default(), r.get(2)?))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let refusal = |tx: &rusqlite::Transaction, id: i64| -> MoveError {
+            let state: rusqlite::Result<Option<String>> = tx
+                .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional();
+            match state {
+                Err(err) => err.into(),
+                Ok(None) => MoveError::NotFound(id),
+                Ok(Some(state)) => match state.parse() {
+                    Ok(state) => MoveError::NotQueued { id, state },
+                    Err(err) => MoveError::Store(anyhow::anyhow!(err)),
+                },
+            }
+        };
+        let index = |queue: &[(i64, Priority, i64)], id: i64| queue.iter().position(|q| q.0 == id);
+        let Some(at) = index(&queue, id) else {
+            return Err(refusal(&tx, id));
+        };
+        if let QueueSpot::Before(other) | QueueSpot::After(other) = spot
+            && index(&queue, other).is_none()
+        {
+            return Err(refusal(&tx, other));
+        }
+        let (_, was, own) = queue.remove(at);
+        let i = match spot {
+            QueueSpot::Top => 0,
+            QueueSpot::To(n) => n.saturating_sub(1).min(queue.len()),
+            QueueSpot::Before(other) | QueueSpot::After(other) if other == id => at,
+            QueueSpot::Before(other) => index(&queue, other).expect("checked"),
+            QueueSpot::After(other) => index(&queue, other).expect("checked") + 1,
+        };
+        let mut level = was;
+        if let Some(behind) = queue.get(i)
+            && behind.1 > level
+        {
+            level = behind.1;
+        }
+        if i > 0 && queue[i - 1].1 < level {
+            level = queue[i - 1].1;
+        }
+        queue.insert(i, (id, level, own));
+        let mine: Vec<(i64, i64)> = queue
+            .iter()
+            .filter(|q| q.1 == level)
+            .map(|q| (q.0, q.2))
+            .collect();
+        let mut slots: Vec<i64> = mine.iter().map(|m| m.1).collect();
+        slots.sort_unstable();
+        // Ties (a hand edit) would leave the order to age: make them strict.
+        for k in 1..slots.len() {
+            slots[k] = slots[k].max(slots[k - 1] + 1);
+        }
+        for ((task, pos), slot) in mine.iter().zip(slots) {
+            if *pos != slot {
+                tx.execute(
+                    "UPDATE tasks SET queue_pos = ?2 WHERE id = ?1",
+                    params![task, slot],
+                )?;
+            }
+        }
+        if level != was {
+            tx.execute(
+                "UPDATE tasks SET priority = ?2, priority_from = 'queue move' WHERE id = ?1",
+                params![id, level.as_str()],
+            )?;
+        }
+        tx.execute(
+            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        let task = self.get_task(id)?.context("task vanished after move")?;
+        Ok(Moved {
+            task,
+            was,
+            pos: i + 1,
+            of: queue.len(),
+        })
     }
 
     /// Put every task that has no flock, a row from before flocks, in
@@ -2281,6 +2418,160 @@ mod tests {
         assert_eq!(r.priority, Priority::High);
         assert_eq!(r.priority_from.as_deref(), Some("job j"));
         assert_eq!(r.queue_pos, r.id);
+    }
+
+    /// The queue as (id, level) pairs, in dispatch order.
+    fn queue_of(s: &Store) -> Vec<(i64, Priority)> {
+        s.queued_tasks()
+            .unwrap()
+            .iter()
+            .map(|t| (t.id, t.priority))
+            .collect()
+    }
+
+    /// `--before`, `--after` and `--to` put a task where they say within
+    /// its level, leaving its level alone, and the level's positions are
+    /// shared out again so a new task still queues last.
+    #[test]
+    fn move_queued_places_a_task_within_its_level() {
+        use crate::queue::QueueSpot::*;
+        use Priority::Normal as N;
+        let s = Store::open_in_memory().unwrap();
+        let ids: Vec<i64> = (0..4)
+            .map(|_| s.insert_task(new_task("run")).unwrap().id)
+            .collect();
+        let [a, b, c, d] = ids[..] else { panic!() };
+        let m = s.move_queued(d, Before(b)).unwrap();
+        assert_eq!((m.pos, m.of, m.was), (2, 4, N));
+        assert_eq!(m.task.priority, N);
+        assert_eq!(m.task.priority_from, None, "the level did not change");
+        assert_eq!(queue_of(&s), [(a, N), (d, N), (b, N), (c, N)]);
+        let m = s.move_queued(a, After(c)).unwrap();
+        assert_eq!(m.pos, 4);
+        assert_eq!(queue_of(&s), [(d, N), (b, N), (c, N), (a, N)]);
+        s.move_queued(c, To(1)).unwrap();
+        assert_eq!(queue_of(&s), [(c, N), (d, N), (b, N), (a, N)]);
+        let m = s.move_queued(c, To(99)).unwrap();
+        assert_eq!(m.pos, 4, "past the end is last");
+        assert_eq!(queue_of(&s), [(d, N), (b, N), (a, N), (c, N)]);
+        let m = s.move_queued(b, Before(b)).unwrap();
+        assert_eq!(m.pos, 2, "before itself stays put");
+        assert_eq!(queue_of(&s), [(d, N), (b, N), (a, N), (c, N)]);
+        let e = s.insert_task(new_task("run")).unwrap().id;
+        assert_eq!(queue_of(&s).last(), Some(&(e, N)));
+        let pos: Vec<i64> = s
+            .queued_tasks()
+            .unwrap()
+            .iter()
+            .map(|t| t.queue_pos)
+            .collect();
+        assert!(pos.windows(2).all(|w| w[0] < w[1]), "{pos:?}");
+    }
+
+    /// A task moved in front of a higher one is lifted to its level, and
+    /// one moved behind a lower one lowered to it; the move is what set
+    /// the level. `--top` on a high task in front of a critical one lifts it,
+    /// and on the first task changes nothing.
+    #[test]
+    fn move_queued_lifts_and_lowers() {
+        use crate::queue::QueueSpot::*;
+        use Priority::*;
+        let s = Store::open_in_memory().unwrap();
+        let at = |p: Priority| {
+            s.insert_task_at(new_task("run"), p, Some("task run"))
+                .unwrap()
+                .id
+        };
+        let crit = at(Critical);
+        let high = at(High);
+        let normal = at(Normal);
+        let low = at(Low);
+        let m = s.move_queued(normal, Before(high)).unwrap();
+        assert_eq!((m.was, m.task.priority, m.pos), (Normal, High, 2));
+        assert_eq!(m.task.priority_from.as_deref(), Some("queue move"));
+        assert_eq!(
+            queue_of(&s),
+            [(crit, Critical), (normal, High), (high, High), (low, Low)]
+        );
+        let m = s.move_queued(high, After(low)).unwrap();
+        assert_eq!((m.was, m.task.priority, m.pos), (High, Low, 4));
+        assert_eq!(
+            queue_of(&s),
+            [(crit, Critical), (normal, High), (low, Low), (high, Low)]
+        );
+        let m = s.move_queued(low, Top).unwrap();
+        assert_eq!((m.was, m.task.priority, m.pos), (Low, Critical, 1));
+        assert_eq!(
+            queue_of(&s),
+            [
+                (low, Critical),
+                (crit, Critical),
+                (normal, High),
+                (high, Low)
+            ]
+        );
+        let m = s.move_queued(low, Top).unwrap();
+        assert_eq!((m.was, m.task.priority, m.pos), (Critical, Critical, 1));
+        // Behind a lower task at the very end lowers too, but between two
+        // of its own level it stays.
+        let m = s.move_queued(crit, To(4)).unwrap();
+        assert_eq!((m.was, m.task.priority), (Critical, Low));
+        assert_eq!(
+            queue_of(&s),
+            [(low, Critical), (normal, High), (high, Low), (crit, Low)]
+        );
+    }
+
+    /// The queue is one order across flocks: a task can go before a task
+    /// of another flock, and keeps its own flock.
+    #[test]
+    fn move_queued_crosses_flocks() {
+        use crate::queue::QueueSpot::*;
+        let s = Store::open_in_memory().unwrap();
+        let home = s.insert_task(new_task("run")).unwrap().id;
+        let work = s
+            .insert_task(NewTask {
+                flock: "work".into(),
+                ..new_task("run")
+            })
+            .unwrap()
+            .id;
+        let m = s.move_queued(work, Before(home)).unwrap();
+        assert_eq!(m.pos, 1);
+        assert_eq!(m.task.flock.as_deref(), Some("work"));
+        assert_eq!(
+            queue_of(&s),
+            [(work, Priority::Normal), (home, Priority::Normal)]
+        );
+    }
+
+    /// Only a queued task moves, and only before or after a queued one;
+    /// a refusal names the task at fault and changes nothing.
+    #[test]
+    fn move_queued_refuses_what_is_not_queued() {
+        use crate::queue::QueueSpot::*;
+        let s = Store::open_in_memory().unwrap();
+        let taken = s.insert_task(new_task("run")).unwrap().id;
+        let q = s.insert_task(new_task("run")).unwrap().id;
+        s.claim_task(taken, "m").unwrap().unwrap();
+        match s.move_queued(taken, Top) {
+            Err(MoveError::NotQueued { id, state }) => {
+                assert_eq!((id, state), (taken, TaskState::Starting))
+            }
+            other => panic!("{other:?}"),
+        }
+        match s.move_queued(q, Before(taken)) {
+            Err(MoveError::NotQueued { id, .. }) => assert_eq!(id, taken),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            s.move_queued(99, Top),
+            Err(MoveError::NotFound(99))
+        ));
+        assert!(matches!(
+            s.move_queued(q, After(98)),
+            Err(MoveError::NotFound(98))
+        ));
     }
 
     /// Only a queued task's level changes; the refusal names the state.
