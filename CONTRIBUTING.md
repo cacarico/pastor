@@ -28,7 +28,9 @@ make smoke SESSION=s
 ```
 
 The normal test suite must not require a real herdr. Use `make smoke` only when
-you intentionally test against a real herdr instance.
+you intentionally test against a real herdr instance, and `make
+smoke-profiles` (a live review task per agent through a head running your
+build) before trusting a change to permission profiles.
 
 ## Pull requests
 

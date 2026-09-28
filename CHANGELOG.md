@@ -29,6 +29,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prompt (a profiled opencode task was `agent_tools_unsupported` before).
   A machine whose own opencode config has permission rules fails such a task
   before anything is made there (`opencode_permissions_conflict`).
+  `make smoke-profiles` runs a live review task per agent through a head.
 - Profiles reach Claude tasks: `profile` on a `[[flock]]`, a `[[machine]]`,
   a job's `[dispatch]`, `[defaults]` and `pastor task run --profile`, settled
   like the model (run or job, machine, flock, `[defaults]`). The profile's

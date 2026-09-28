@@ -2252,8 +2252,19 @@ make check            # fmt check, clippy with warnings as errors, full test sui
 make test             # unit tests plus an end-to-end run against fake-herdr
 make test-machine     # the machine actor tests five times, to catch timing flakes
 make smoke SESSION=s  # opt-in test against a real herdr running session s on this host
+make smoke-profiles REPO='~/src/app' CLAUDE=pi-1 OPENCODE=pi-2  # a live review task per agent through the head
 make build            # debug build of both binaries; cargo run -- --help works from there
 ```
 
 `make check` is what a pull request has to pass. Nothing in the suite talks to
 a real herdr, so run `make smoke` on a fleet machine before trusting it there.
+
+`make smoke-profiles` starts real agents: through the running head, a task
+under the `review` profile for each agent named (`CLAUDE` and `OPENCODE` take
+a machine from flock.toml, `CLAUDE_AGENT` and `OPENCODE_AGENT` another agent
+of that kind), in the checkout `REPO` on that machine. Each is asked to read,
+then to write a file it must be refused, and passes when it ends `done`
+without ever going `blocked`. It prints the end of each pane, to paste in a
+pull request, and closes the tasks. The head must run the pastor under test,
+since the head is what hands the agent its profile. Run it before trusting
+a change to profiles.
