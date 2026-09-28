@@ -314,7 +314,8 @@ upgrade.
   workspace. herdr reports a workspace's directory only when it is a git
   checkout, and pastor compares it with the expanded `--repo`, trailing `/`
   ignored, without resolving symlinks. With no such workspace, or no repo, the
-  task gets a workspace of its own named `t-N`, as before.
+  task gets a workspace of its own named `t-N`, as before (with no repo, in
+  the machine's home).
 - `own`: always a workspace of its own named `t-N` (for a worktree, the one
   herdr opens on the new checkout), whatever already shows the repo.
 - `pastor`: a pane in the machine's one workspace labelled `pastor`, made on
@@ -1281,6 +1282,12 @@ opens the pane somewhere else when it does not exist. Quote it, or your shell
 expands it to the head's home first. A `command` machine cannot report a home,
 and neither can one whose shell has no absolute `$HOME`; give those absolute
 paths.
+
+A task with no `--repo` (and no `repo` in its job) starts in that machine's
+home, in a workspace of its own or a pane split into a shared one. herdr puts
+a pane with no directory wherever its focused pane is, which can be someone's
+unrelated checkout. On a machine that cannot report its home, herdr still
+decides.
 
 `pastor task run` takes the prompt as its argument or, instead, `--prompt-file
 PATH`, and `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,

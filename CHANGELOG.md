@@ -3,6 +3,15 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- A task with no repo (no `--repo`, no `repo` in its job) opened its pane
+  wherever herdr's focused pane was, so it could start in an unrelated
+  checkout. It now starts in the machine's home directory; a machine that
+  cannot report its home (a `command` one) still leaves it to herdr.
+
 ## 0.7.1 - 2026-09-28
 
 ### Fixed

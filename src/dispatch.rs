@@ -274,6 +274,14 @@ async fn dispatch_steps(
         return Err(HerdrError::Protocol("worktree = true needs repo".into()).into());
     }
     let host = host_workspace(conn, &spec, repo.as_deref(), task.machine.as_deref()).await?;
+    // Where a task with no repo starts: herdr opens a pane with no `cwd`
+    // wherever its focused pane is, which can be anyone's checkout (t-284
+    // opened in a work repo). The machine's home instead; a machine that
+    // cannot tell leaves it to herdr, as before.
+    let dir = match repo.clone() {
+        Some(repo) => Some(repo),
+        None => conn.home_dir().await.map_err(CallError::from)?,
+    };
     let pane_id = match (host, repo.as_deref()) {
         // A pane of the task's own in a workspace someone else has: only
         // that pane is recorded, so closing the task closes only it.
@@ -292,7 +300,7 @@ async fn dispatch_steps(
             }
             let cwd = match worktree {
                 Some(_) => task.spec.checkout.as_ref().map(|c| c.path.clone()),
-                None => repo.clone(),
+                None => dir.clone(),
             };
             let pane = conn.pane_split(&host.pane_id, cwd.as_deref(), &env).await?;
             task.workspace_id = Some(host.workspace_id);
@@ -322,8 +330,8 @@ async fn dispatch_steps(
             }
             pane.pane_id
         }
-        (None, repo) => {
-            let created = conn.workspace_create(repo, name, &env).await?;
+        (None, _) => {
+            let created = conn.workspace_create(dir.as_deref(), name, &env).await?;
             task.workspace_id = Some(created.workspace.workspace_id.clone());
             task.pane_id = Some(created.root_pane.pane_id.clone());
             created.root_pane.pane_id
@@ -1592,6 +1600,41 @@ mod tests {
                     Some(repo),
                     "the spec keeps what was asked"
                 );
+            }
+        }
+    }
+
+    /// herdr opens a pane with no `cwd` wherever its focused pane is, which
+    /// put t-284, a task with no repo, in someone's work checkout
+    /// (2026-09-28). A task with no repo starts in the machine's home, in a
+    /// workspace of its own or a pane split into a shared one; a machine
+    /// that cannot tell its home leaves the choice to herdr, as before.
+    #[tokio::test]
+    async fn a_task_with_no_repo_starts_in_the_machine_s_home() {
+        for (home, cwd) in [
+            (Some("/home/fake"), serde_json::json!("/home/fake")),
+            (None, Value::Null),
+        ] {
+            for place in [Place::Repo, Place::Own, Place::Pastor] {
+                let fake = FakeHerdr::new();
+                fake.set_home(home);
+                let mut t = task(DispatchSpec {
+                    repo: None,
+                    place: place.clone(),
+                    ..spec()
+                });
+                dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                    .await
+                    .unwrap();
+                let req = fake
+                    .requests()
+                    .into_iter()
+                    .find(|r| {
+                        r.method == "pane.split"
+                            || (r.method == "workspace.create" && r.params["label"] == "t-7")
+                    })
+                    .unwrap();
+                assert_eq!(req.params["cwd"], cwd, "{place:?} with home {home:?}");
             }
         }
     }
