@@ -1006,6 +1006,21 @@ impl Fleet {
             .map_err(QueueError::Store)
     }
 
+    /// Set a queued task's priority (`Store::set_priority`), under the
+    /// dispatch lock like `queue_run`: otherwise a dispatch pass could read
+    /// the old priority, this update land on the still-queued row, and the
+    /// pass then claim it by the stale ordering, reporting the change
+    /// applied while it had no effect on that dispatch.
+    pub async fn set_priority(
+        &self,
+        id: i64,
+        priority: Priority,
+        from: &str,
+    ) -> Result<Task, PriorityError> {
+        let _pass = self.dispatch_lock.lock().await;
+        self.store.set_priority(id, priority, from)
+    }
+
     /// Try to place every queued task, oldest first. Serialised: a pass sees the
     /// live counts the previous pass left behind, because a machine actor
     /// refreshes its count before it answers a dispatch (see
@@ -1615,7 +1630,7 @@ impl Daemon {
                 Err(err) => IpcResponse::error("store_error", err),
             },
             IpcRequest::TaskPriority { id, priority } => {
-                match self.store.set_priority(id, priority, "task priority") {
+                match self.fleet.set_priority(id, priority, "task priority").await {
                     Ok(t) => IpcResponse::Task(t),
                     Err(err @ PriorityError::NotFound(_)) => {
                         IpcResponse::error("task_not_found", err)
