@@ -1427,12 +1427,6 @@ impl Actor {
         match cmd {
             MachineCommand::Dispatch { task_id, reply } => {
                 let (result, mut dead) = self.run_dispatch(task_id, false).await;
-                if let Ok(t) = &result
-                    && t.state == TaskState::Running
-                    && !t.activity_seen
-                {
-                    self.expect_uptake(t.id);
-                }
                 if matches!(&result, Ok(t) if t.state == TaskState::Blocked)
                     && let Err(err) = self.auto_trust().await
                 {
@@ -2553,6 +2547,10 @@ impl Actor {
         }
         match outcome {
             Ok(_) => {
+                // A resume's prompt can be lost as a dispatch's can.
+                if task.state == TaskState::Running && !task.activity_seen {
+                    self.expect_uptake(task.id);
+                }
                 self.emit(&format!("task.{}", task.state), Some(task.id));
                 (Ok(task), dead)
             }
@@ -5697,6 +5695,28 @@ mod tests {
         let t = store.get_task(t.id).unwrap().unwrap();
         assert_eq!(t.state, TaskState::Running);
         assert!(!t.prompt_pending);
+    }
+
+    /// A resumed task's prompt is watched the same way: an agent that lost
+    /// `RESUME_PROMPT` gets it again.
+    #[tokio::test]
+    async fn a_resume_prompt_the_agent_did_not_take_is_sent_again() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let mut t = new_task(&store);
+        t.state = TaskState::Paused;
+        t.machine = Some("m".into());
+        t.spec.session_id = crate::task::new_session_id();
+        store.update_task(&mut t).unwrap();
+        let t = h.resume(t.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        fake.ignore_prompts(false);
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 2);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
     /// An agent that never takes its prompt is not left `running` with

@@ -312,7 +312,7 @@ answered by a person at the pane waits the same: the head sees the agent
 leave `blocked` and sends the prompt `settle` later.
 
 A prompt the agent does not take anyway is sent again. An agent the head
-gave its prompt (at start, or after its startup prompt) that sits idle a
+gave its prompt (at start or resume, or after its startup prompt) that sits idle a
 whole settle window at the sequence the prompt went in at, never seen
 working or blocked, did not take it; the head sends it again, up to twice,
 then marks the task `blocked` with the error "agent did not take its
