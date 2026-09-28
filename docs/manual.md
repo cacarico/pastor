@@ -1672,8 +1672,17 @@ store, and never reads `flock.toml`.
   Once the head has pruned the task the answer is `already_seen`, and the
   key is marked seen all the same.
 - Every tick it reads the head's events past its cursor (`EventsSince`) and
-  hands them to this machine's hooks in order. The first time it reaches the
-  head it skips the head's history and starts from there.
+  hands them to this machine's hooks in order, saving the cursor after each.
+  The first time it reaches the head it skips the head's history and starts
+  from there. A hook with `only_own` hears only tasks of a job in this
+  machine's `jobs/` that uses its connector (and records about no job, as on
+  the head); a hook without it hears every head event in its `on`, with the
+  item and prompt of other jobs' tasks left out. A head job with the same
+  name as a local job counts as local, since ownership is read from the job
+  file here.
+- Events the head rotated out of its log before this machine read them are
+  lost to the hooks: it logs a `head_events_gap` warning and goes on from
+  the oldest record the head still has.
 - Its database is `shepherd.db` in the state dir: the jobs' state and seen
   keys, and the event cursor. `pastor.db` is left alone.
 - On `pastor.sock` it answers `ping` (with `role: "shepherd"`), `tick` and

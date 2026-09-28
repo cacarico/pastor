@@ -131,6 +131,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `--json`) reads the head's log through `events_since`: a page at a time
   from the start, then a poll every second with `--follow`. Records rotated
   out before they were read get one warning line on stderr.
+- A headless serve's hooks decide `only_own` from this machine's job files,
+  so they hear the tasks of its own jobs, and a head event rotated out of
+  the head's log before it was read is a `head_events_gap` warning, after
+  which the hooks go on from the oldest record left.
 
 ### Changed
 
