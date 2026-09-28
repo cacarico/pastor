@@ -249,6 +249,12 @@ struct RunArgs {
     /// Mark the task stale once it has run this long (30m, 2h; default: `[defaults]` timeout)
     #[arg(long)]
     timeout: Option<String>,
+    /// Label template of the workspace pastor makes for the task, with
+    /// {{ task.id }}, {{ flock }}, {{ machine }}, {{ job }} and
+    /// {{ item.key }} (default: the flock's `label`, else `[defaults]
+    /// label`, else {{ flock }}/{{ task.id }}). The agent stays t-N
+    #[arg(long, value_name = "TEMPLATE", value_parser = parse_label)]
+    label: Option<String>,
     /// Where the agent's pane goes: repo (under the repo it works on), own
     /// (its own workspace), pastor (the `pastor` workspace) or
     /// pane:<workspace> (default: `[defaults] place`, else repo)
@@ -1165,6 +1171,22 @@ fn needs_description_protocol(command: &Command) -> bool {
     }
 }
 
+/// `--label`, checked before anything is sent (`task::check_label`).
+fn parse_label(s: &str) -> Result<String, String> {
+    pastor::task::check_label(s).map(|()| s.to_string())
+}
+
+/// Whether `command` sends a label only a head of `LABEL_PROTOCOL` or later
+/// renders: `task run --label`.
+fn needs_label_protocol(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Task {
+            cmd: TaskCmd::Run(a)
+        } if a.label.is_some()
+    )
+}
+
 /// Whether `command` sends a request only a head of `PLACE_PROTOCOL` or later
 /// honours: `task retry --place`.
 fn needs_place_protocol(command: &Command) -> bool {
@@ -1211,7 +1233,12 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_summary_protocol(command) {
+    if needs_label_protocol(command) {
+        Some((
+            pastor::ipc::LABEL_PROTOCOL,
+            "predates workspace labels and would name the workspace t-N",
+        ))
+    } else if needs_summary_protocol(command) {
         Some((
             pastor::ipc::SUMMARY_PROTOCOL,
             "predates task summaries, and would drop the summary or refuse the request",
@@ -1416,6 +1443,11 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
             .clone()
             .unwrap_or_else(|| config.defaults.place.clone()),
         session_id: None,
+        // Only the ask: the head fills in the flock's or `[defaults]`.
+        label: pastor::task::WorkspaceLabel {
+            template: a.label.clone(),
+            ..Default::default()
+        },
     })
 }
 
@@ -3153,6 +3185,31 @@ mod tests {
         let why = paused_attach_refusal(&t).unwrap();
         assert!(why.starts_with("t-4 is paused for t-9;"), "{why}");
         assert!(why.contains("pi-1"), "{why}");
+    }
+
+    /// `task run --label` needs a head that settles and renders labels: an
+    /// older one would name the workspace `t-N` without a word. A bad
+    /// template is refused before anything is sent.
+    #[test]
+    fn a_label_needs_a_head_that_knows_it() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
+        assert_eq!(
+            need(&["pastor", "task", "run", "hi", "--label", "{{ machine }}"]),
+            Some(pastor::ipc::LABEL_PROTOCOL)
+        );
+        let Command::Task {
+            cmd: TaskCmd::Run(a),
+        } = parse(&["pastor", "task", "run", "hi", "--label", "x/{{ task.id }}"])
+        else {
+            panic!()
+        };
+        let spec = run_spec(&a, &PastorConfig::default()).unwrap();
+        assert_eq!(spec.label.template.as_deref(), Some("x/{{ task.id }}"));
+        let err = Cli::try_parse_from(["pastor", "task", "run", "hi", "--label", "{{ nope }}"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown placeholder"), "{err}");
     }
 
     /// `task run --priority` and `task priority` need a head that knows

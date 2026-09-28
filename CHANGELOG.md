@@ -47,6 +47,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with `--preempt` pauses a task only where that makes room for it, its
   flock's number included. Needs a head speaking IPC protocol 18 once
   flock.toml gives a flock's machines a number.
+- A `label` template for the herdr workspace pastor makes for a task (see
+  Changed): `--label` on `task run`, `label` in a job's `[dispatch]`, on a
+  `[[flock]]` and under `[defaults]`, the first of those that sets one
+  winning. It takes `{{ task.id }}`, `{{ flock }}`,
+  `{{ machine }}`, `{{ job }}` and `{{ item.key }}`. A label that renders
+  empty or with a control character falls back to `t-N` with a warning.
+  `task describe` shows the label and where it came from. `task run --label`
+  needs a head of IPC protocol 19.
 
 ### Changed
 
@@ -54,6 +62,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a job (`pastor job enable`), so it can clean up tasks it sent wrong and turn
   back on a job it disabled without waiting for a person. A plain agent is
   still refused both.
+- The herdr workspace pastor makes for a task is labelled
+  `<flock>/t-N`, such as `personal/t-285`, instead of `t-N`, so tasks of
+  several flocks on one machine can be told apart in herdr's sidebar. The
+  agent is still named `t-N`, and a task that joins a workspace leaves its
+  label alone.
 
 ### Fixed
 

@@ -78,6 +78,9 @@ pub struct DispatchTable {
     pub timeout: Option<String>,
     /// Where the job's tasks' panes go; `None` takes `[defaults] place`.
     pub place: Option<Place>,
+    /// The label template of each task's workspace; `None` takes the
+    /// flock's, else `[defaults] label` (`Defaults::resolve_label`).
+    pub label: Option<String>,
     pub max_tasks_per_run: Option<u32>,
     pub backfill: Option<String>,
     /// The template of each task's description; `None` is
@@ -280,6 +283,9 @@ impl Job {
             crate::config::check_profile_name(profile)
                 .map_err(|e| format!("dispatch.profile: {e}"))?;
         }
+        if let Some(label) = &d.label {
+            crate::task::check_label(label).map_err(|e| format!("dispatch.{e}"))?;
+        }
         for (field, text) in [
             ("prompt", Some(d.prompt.as_str())),
             ("branch", d.branch.as_deref()),
@@ -370,6 +376,10 @@ impl Job {
                 agent_source: None,
                 place: d.place.unwrap_or_else(|| defaults.place.clone()),
                 session_id: None,
+                label: crate::task::WorkspaceLabel {
+                    template: d.label,
+                    ..Default::default()
+                },
             },
         })
     }
@@ -978,6 +988,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             priority: None,
             agents: Default::default(),
             profile: None,
+            label: None,
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");
@@ -1010,6 +1021,38 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         assert_eq!(job.spec.place, Place::Own);
         let err = Job::parse(&text("place = \"elsewhere\"\n"), "j", &d, &Builtins).unwrap_err();
         assert!(err.contains("unknown place elsewhere"), "{err}");
+    }
+
+    /// `[dispatch] label` is the job's label template, kept unrendered for
+    /// dispatch; a job without one leaves it to the flock and `[defaults]`,
+    /// settled when each task is queued.
+    #[test]
+    fn label_is_the_job_s_own_template() {
+        let text = |extra: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        let d = Defaults {
+            label: Some("{{ machine }}".into()),
+            ..defaults()
+        };
+        let job = Job::parse(&text(""), "j", &d, &Builtins).unwrap();
+        assert_eq!(job.spec.label.template, None);
+        let job = Job::parse(
+            &text("label = \"{{ job }}/{{ item.key }}\"\n"),
+            "j",
+            &d,
+            &Builtins,
+        )
+        .unwrap();
+        assert_eq!(
+            job.spec.label.template.as_deref(),
+            Some("{{ job }}/{{ item.key }}")
+        );
+        let err =
+            Job::parse(&text("label = \"{{ job.name }}\"\n"), "j", &d, &Builtins).unwrap_err();
+        assert!(err.contains("dispatch.label: unknown placeholder"), "{err}");
     }
 
     #[test]

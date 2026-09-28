@@ -175,6 +175,7 @@ fn task(id: i64, state: TaskState) -> Task {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
             },
             flock: "default".into(),
             description: None,

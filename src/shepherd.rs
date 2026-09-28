@@ -590,4 +590,39 @@ mod tests {
             "{err}"
         );
     }
+
+    /// The same guard for a label: a head before `LABEL_PROTOCOL` drops
+    /// `[dispatch] label` (serde skips the unknown field) and names the
+    /// workspace by its own default instead of the job's chosen name.
+    #[tokio::test]
+    async fn submit_to_head_refuses_a_head_that_predates_labels() {
+        let old_head: Ask = Arc::new(|req| {
+            Box::pin(async move {
+                assert!(matches!(req, IpcRequest::Ping), "{req:?}");
+                Ok(IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol: crate::ipc::LABEL_PROTOCOL - 1,
+                    role: None,
+                })
+            })
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let fleet = Fleet::headless(store, old_head);
+        let job = crate::config::job::Job::parse(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nlabel = \"{{ item.key }}\"\nprompt = \"p\"\n",
+            "x",
+            &crate::config::Defaults::default(),
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let err = fleet
+            .submit_to_head(&job, vec![serde_json::json!({})])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliError>().map(|e| e.code.as_str()),
+            Some("head_too_old"),
+            "{err}"
+        );
+    }
 }

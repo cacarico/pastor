@@ -1884,6 +1884,7 @@ mod tests {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
             },
             agent: Default::default(),
             flock: None,

@@ -69,6 +69,7 @@ deny = []                    # tool patterns it must never use; wins over allow
 max_tasks_per_run = 5
 timeout = "2h"
 place = "repo"               # where a task's pane goes: repo, own, pastor or pane:<workspace>
+label = "{{ flock }}/{{ task.id }}"  # the name of a task's herdr workspace
 ```
 
 `[agents.<name>]` tables define agents by name, such as a second Claude

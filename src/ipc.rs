@@ -25,8 +25,8 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `JobTask::description`). 16: pausing (`Run::preempt`,
 /// `TaskPriority::preempt`). 17: task summaries (`TaskDone::summary`,
 /// `TaskSummaries`). 18: a machine in many flocks, each with its own number
-/// (`FlockEntry::machines`).
-pub const IPC_PROTOCOL: u32 = 18;
+/// (`FlockEntry::machines`). 19: workspace labels (`DispatchSpec::label`).
+pub const IPC_PROTOCOL: u32 = 19;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -100,6 +100,11 @@ pub const ROLE_PROTOCOL: u32 = 12;
 /// `flock add --description` and `machine add --description` send. An older
 /// one would drop it without a word.
 pub const DESCRIPTION_PROTOCOL: u32 = 14;
+
+/// The first protocol whose head settles and renders a task's workspace
+/// label (`task run --label`). An older one would name the workspace `t-N`
+/// without a word.
+pub const LABEL_PROTOCOL: u32 = 19;
 
 /// The first protocol whose head knows `JobSubmit`. An older one refuses the
 /// request as unreadable; `check_protocol` says why before it is sent.
@@ -909,6 +914,7 @@ mod tests {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
             },
             machine: None,
             workspace_id: None,

@@ -8,7 +8,7 @@ use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
 };
 pub use crate::machine::FlockSeat;
-use crate::task::{Checkout, DispatchSpec, Place, Priority, Reopen, Task, TaskState};
+use crate::task::{Checkout, DispatchSpec, Place, Priority, Reopen, Task, TaskState, render_label};
 
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
 const READY_POLL: Duration = Duration::from_millis(500);
@@ -352,10 +352,15 @@ async fn dispatch_steps(
         Some(repo) => Some(repo),
         None => conn.home_dir().await.map_err(CallError::from)?,
     };
+    task.spec.label.name = None;
+    task.spec.label.note = None;
     let pane_id = match (host, repo.as_deref()) {
         // A pane of the task's own in a workspace someone else has: only
-        // that pane is recorded, so closing the task closes only it.
+        // that pane is recorded, so closing the task closes only it. The
+        // workspace keeps its label.
         (Some(host), _) => {
+            task.spec.label.name = host.label.clone();
+            task.spec.label.note = Some(crate::task::JOINED_WORKSPACE.into());
             // A worktree is still made on disk, and the agent works in it;
             // only a workspace herdr just opened on it goes, with its one
             // pane. One that was already showing the checkout
@@ -364,7 +369,10 @@ async fn dispatch_steps(
             if spec.worktree
                 && let Some(repo) = repo.as_deref()
             {
-                let (created, branch) = open_worktree(conn, &spec, repo, name, resume).await?;
+                // Its workspace goes in a moment, so its label is the
+                // agent's name, never the template.
+                let (created, branch) =
+                    open_worktree(conn, &spec, repo, name, name, resume).await?;
                 task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
                 worktree = Some(created);
             }
@@ -381,7 +389,16 @@ async fn dispatch_steps(
             pane.pane_id
         }
         (None, Some(repo)) if spec.worktree => {
-            let (created, branch) = open_worktree(conn, &spec, repo, name, resume).await?;
+            let label = workspace_label(task, name);
+            let (created, branch) = open_worktree(conn, &spec, repo, name, &label, resume).await?;
+            // `worktree.open` answering `already_open` means the checkout
+            // was already in a workspace another task opened: that
+            // workspace's label is unchanged by this task, so its own
+            // label, not the template just rendered, is what gets recorded.
+            if created.already_open {
+                task.spec.label.name = created.workspace.label.clone();
+                task.spec.label.note = Some(crate::task::JOINED_WORKSPACE.into());
+            }
             task.workspace_id = Some(created.workspace.workspace_id.clone());
             task.pane_id = Some(created.root_pane.pane_id.clone());
             task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
@@ -401,7 +418,8 @@ async fn dispatch_steps(
             pane.pane_id
         }
         (None, _) => {
-            let created = conn.workspace_create(dir.as_deref(), name, &env).await?;
+            let label = workspace_label(task, name);
+            let created = conn.workspace_create(dir.as_deref(), &label, &env).await?;
             task.workspace_id = Some(created.workspace.workspace_id.clone());
             task.pane_id = Some(created.root_pane.pane_id.clone());
             created.root_pane.pane_id
@@ -460,6 +478,30 @@ async fn finish_dispatch(
 struct Host {
     workspace_id: String,
     pane_id: String,
+    /// The workspace's label, which the task leaves as it is.
+    label: Option<String>,
+}
+
+/// The label of the workspace a task makes, recorded on it: its template
+/// rendered (`task::render_label`), or `name` with the reason noted when
+/// that is refused. Only the workspace is named so; the agent keeps `name`,
+/// since pastor finds its agents by it.
+fn workspace_label(task: &mut Task, name: &str) -> String {
+    let label = match render_label(task.spec.label.template.as_deref(), task) {
+        Ok(label) => label,
+        Err(why) => {
+            tracing::warn!(
+                task = name,
+                template = task.spec.label.template.as_deref().unwrap_or(crate::task::DEFAULT_LABEL),
+                %why,
+                "label refused; the workspace is named after the task"
+            );
+            task.spec.label.note = Some(format!("fell back to {name}: {why}"));
+            name.to_string()
+        }
+    };
+    task.spec.label.name = Some(label.clone());
+    label
 }
 
 /// The label of the workspace `place = "pastor"` shares.
@@ -485,14 +527,14 @@ async fn host_workspace(
     let labelled = |label: &str, list: &[crate::herdr::WorkspaceInfo]| {
         list.iter()
             .find(|w| w.label.as_deref() == Some(label))
-            .map(|w| w.workspace_id.clone())
+            .map(|w| (w.workspace_id.clone(), w.label.clone()))
     };
     // A workspace can close between `workspace.list` and `pane.list`. Only
     // `repo` may then fall back to a workspace of the task's own; a named
     // one is looked up once more (`pastor` is made again if it is gone),
     // and still gone fails the task rather than put it somewhere else.
     for _ in 0..2 {
-        let workspace = match &spec.place {
+        let (workspace, label) = match &spec.place {
             Place::Own => return Ok(None),
             Place::Repo => {
                 let Some(repo) = repo.filter(|_| !spec.worktree) else {
@@ -504,7 +546,7 @@ async fn host_workspace(
                         .is_some_and(|c| same_dir(&c.checkout_path, repo))
                 });
                 match showing {
-                    Some(w) => w.workspace_id,
+                    Some(w) => (w.workspace_id, w.label),
                     None => return Ok(None),
                 }
             }
@@ -517,6 +559,7 @@ async fn host_workspace(
                     return Ok(Some(Host {
                         workspace_id: created.workspace.workspace_id,
                         pane_id: created.root_pane.pane_id,
+                        label: Some(PASTOR_WORKSPACE.into()),
                     }));
                 }
             },
@@ -537,6 +580,7 @@ async fn host_workspace(
                     return Ok(Some(Host {
                         workspace_id: workspace,
                         pane_id: p.pane_id,
+                        label,
                     }));
                 }
             }
@@ -564,20 +608,21 @@ pub(crate) fn same_dir(a: &str, b: &str) -> bool {
     trim(a) == trim(b)
 }
 
-/// The workspace of a worktree task, and the branch it is on: the checkout
-/// a retry may reopen (`reopenable`), or else a new worktree on the task's
-/// branch, `pastor/<name>` by default.
+/// The workspace of a worktree task, labelled `label`, and the branch it is
+/// on: the checkout a retry may reopen (`reopenable`), or else a new
+/// worktree on the task's branch, `pastor/<name>` by default.
 async fn open_worktree(
     conn: &dyn Connector,
     spec: &DispatchSpec,
     repo: &str,
     name: &str,
+    label: &str,
     resume: bool,
 ) -> Result<(Created, String), DispatchError> {
     // A paused task's own checkout, kept when it was paused: only it will
     // do, since Claude files the session under that directory.
     if resume && let Some(checkout) = spec.checkout.as_deref() {
-        return match conn.worktree_open(repo, &checkout.branch, name).await {
+        return match conn.worktree_open(repo, &checkout.branch, label).await {
             Ok(created) => Ok((created, checkout.branch.clone())),
             Err(err) if err.code() == Some("worktree_not_found") => {
                 Err(DispatchError::Task(format!(
@@ -589,14 +634,14 @@ async fn open_worktree(
         };
     }
     if let Some(reopen) = reopenable(conn, spec, repo).await? {
-        let created = conn.worktree_open(repo, &reopen.branch, name).await?;
+        let created = conn.worktree_open(repo, &reopen.branch, label).await?;
         return Ok((created, reopen.branch.clone()));
     }
     let branch = spec
         .branch
         .clone()
         .unwrap_or_else(|| format!("pastor/{name}"));
-    Ok((conn.worktree_create(repo, &branch, name).await?, branch))
+    Ok((conn.worktree_create(repo, &branch, label).await?, branch))
 }
 
 /// The one rule for reopening a checkout. A retry goes back to the checkout
@@ -838,6 +883,7 @@ mod tests {
     use super::*;
     use crate::herdr::AgentStatus;
     use crate::herdr::fake::{FakeHerdr, StartBehaviour};
+    use crate::task::WorkspaceLabel;
     use serde_json::Value;
 
     /// Generous next to every `ready_after` these tests use, so only the test
@@ -962,6 +1008,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         }
     }
 
@@ -1054,7 +1101,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             updated_at: now,
-            flock: None,
+            flock: Some("home".into()),
             role: Default::default(),
         }
     }
@@ -1325,7 +1372,7 @@ mod tests {
             .find(|r| r.method == "workspace.create")
             .unwrap();
         assert_eq!(ws.params["cwd"], "/srv/app");
-        assert_eq!(ws.params["label"], "t-7");
+        assert_eq!(ws.params["label"], "home/t-7");
         let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
         assert_eq!(start.params["kind"], "claude");
         assert_eq!(
@@ -1335,6 +1382,100 @@ mod tests {
         let prompt = reqs.iter().find(|r| r.method == "agent.prompt").unwrap();
         assert_eq!(prompt.params["target"], "t-7");
         assert_eq!(prompt.params["text"], "line one\n\"two\" {{ three }}");
+    }
+
+    /// The workspace takes the label template rendered; the agent, which
+    /// pastor finds by name, and the default branch stay `t-N`.
+    #[tokio::test]
+    async fn the_workspace_takes_the_label_and_the_agent_stays_t_n() {
+        for worktree in [false, true] {
+            let fake = FakeHerdr::new();
+            let mut t = task(DispatchSpec {
+                worktree,
+                label: WorkspaceLabel {
+                    template: Some("{{ machine }}:{{ task.id }}".into()),
+                    from: Some("task run".into()),
+                    ..Default::default()
+                },
+                ..spec()
+            });
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            let reqs = fake.requests();
+            let method = if worktree {
+                "worktree.create"
+            } else {
+                "workspace.create"
+            };
+            let create = reqs.iter().find(|r| r.method == method).unwrap();
+            assert_eq!(create.params["label"], "pi-1:t-7");
+            if worktree {
+                assert_eq!(create.params["branch"], "pastor/t-7");
+            }
+            let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+            assert_eq!(start.params["name"], "t-7");
+            assert_eq!(t.agent_name.as_deref(), Some("t-7"));
+            assert_eq!(t.spec.label.name.as_deref(), Some("pi-1:t-7"));
+            assert_eq!(t.spec.label.note, None);
+            assert_eq!(t.spec.label.from.as_deref(), Some("task run"));
+        }
+    }
+
+    /// A label that renders empty or with a control character (an item's
+    /// key can hold one) names the workspace `t-N`, and says why.
+    #[tokio::test]
+    async fn a_label_herdr_should_not_show_falls_back_to_t_n() {
+        for key in ["a\u{1b}[2Jb", ""] {
+            let fake = FakeHerdr::new();
+            let mut t = task(DispatchSpec {
+                label: WorkspaceLabel {
+                    template: Some("{{ item.key }}".into()),
+                    from: Some("job j".into()),
+                    ..Default::default()
+                },
+                ..spec()
+            });
+            t.job = "j".into();
+            t.item = serde_json::json!({ "key": key });
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            let create = fake
+                .requests()
+                .into_iter()
+                .find(|r| r.method == "workspace.create")
+                .unwrap();
+            assert_eq!(create.params["label"], "t-7", "{key:?}");
+            assert_eq!(t.spec.label.name.as_deref(), Some("t-7"));
+            let note = t.spec.label.note.clone().unwrap();
+            assert!(note.starts_with("fell back to t-7"), "{note}");
+        }
+    }
+
+    /// A task that joins a workspace leaves its label alone, and records
+    /// the one it joined.
+    #[tokio::test]
+    async fn a_joined_workspace_keeps_its_label() {
+        let fake = FakeHerdr::new();
+        fake.open_user_workspace("app", Some("/srv/app"));
+        let mut t = task(spec());
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert!(!methods(&fake).iter().any(|m| m.ends_with(".create")));
+        assert_eq!(t.spec.label.name.as_deref(), Some("app"));
+        assert_eq!(t.spec.label.note.as_deref(), Some("joined workspace"));
+
+        let mut shared = task(DispatchSpec {
+            place: Place::Pastor,
+            ..spec()
+        });
+        dispatch(&fake, &mut shared, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(shared.spec.label.name.as_deref(), Some("pastor"));
+        assert_eq!(shared.spec.label.note.as_deref(), Some("joined workspace"));
     }
 
     /// A claude task starts on a session of its own, `--session-id` after
@@ -1717,7 +1858,44 @@ mod tests {
             .unwrap();
         assert_eq!(wt.params["cwd"], "/srv/app");
         assert_eq!(wt.params["branch"], "pastor/k1");
-        assert_eq!(wt.params["label"], "t-7");
+        assert_eq!(wt.params["label"], "home/t-7");
+    }
+
+    /// A retry's `worktree.open` can answer a workspace someone else already
+    /// has open on the checkout (`already_open`): that workspace's own
+    /// label, not the template this task just rendered, is what gets
+    /// recorded, and the task is marked as having joined it.
+    #[tokio::test]
+    async fn a_reopened_worktree_already_open_elsewhere_keeps_its_own_label() {
+        let fake = FakeHerdr::new();
+        fake.worktree_create("/srv/app", "pastor/k1", "seed")
+            .await
+            .unwrap();
+        let path = fake
+            .worktree_list("/srv/app")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|w| w.branch.as_deref() == Some("pastor/k1"))
+            .unwrap()
+            .path;
+        let mut t = task(DispatchSpec {
+            worktree: true,
+            reopen: Some(Box::new(Reopen {
+                branch: "pastor/k1".into(),
+                path,
+                agent: "someone-else".into(),
+            })),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.label.name.as_deref(), Some("seed"));
+        assert_eq!(
+            t.spec.label.note.as_deref(),
+            Some(crate::task::JOINED_WORKSPACE)
+        );
     }
 
     /// herdr takes `cwd` literally and opens the pane elsewhere when it does
@@ -1793,7 +1971,7 @@ mod tests {
                     .into_iter()
                     .find(|r| {
                         r.method == "pane.split"
-                            || (r.method == "workspace.create" && r.params["label"] == "t-7")
+                            || (r.method == "workspace.create" && r.params["label"] != "pastor")
                     })
                     .unwrap();
                 assert_eq!(req.params["cwd"], cwd, "{place:?} with home {home:?}");
@@ -2195,7 +2373,7 @@ mod tests {
                 .into_iter()
                 .find(|r| r.method == "workspace.create")
                 .unwrap();
-            assert_eq!(create.params["label"], "t-7");
+            assert_eq!(create.params["label"], "home/t-7");
             assert_eq!(t.workspace_id.as_deref(), Some("w2"), "{repo:?}");
             assert!(!methods(&fake).contains(&"pane.split".to_string()));
         }
@@ -2241,7 +2419,7 @@ mod tests {
             .into_iter()
             .find(|r| r.method == "workspace.create")
             .unwrap();
-        assert_eq!(create.params["label"], "t-7");
+        assert_eq!(create.params["label"], "home/t-7");
     }
 
     /// `pastor`: the first task makes the machine's `pastor` workspace, the

@@ -460,6 +460,11 @@ pub struct Defaults {
     /// (`task::Place`).
     #[serde(skip_serializing_if = "crate::task::Place::is_repo")]
     pub place: crate::task::Place,
+    /// The label template of the workspace a task makes when its run
+    /// flags, job and flock set none; unset, `task::DEFAULT_LABEL`. See
+    /// `resolve_label`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// What `pastor task run` flags or a job file's `[dispatch]` say about the
@@ -790,6 +795,27 @@ impl Defaults {
     }
 }
 
+impl Defaults {
+    /// A task's workspace label template: from the first of `ask`
+    /// (`--label`, a job's `label`), `flock` and these defaults that sets
+    /// one, and the layer that did; `None` leaves `task::DEFAULT_LABEL`.
+    /// No machine layer: the label is settled when the task is queued,
+    /// before a machine is picked, and `{{ machine }}` covers that need.
+    pub fn resolve_label(
+        &self,
+        ask: Option<&str>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> Option<(String, Layer)> {
+        [
+            (Layer::Ask, ask),
+            (Layer::Flock, flock.and_then(|f| f.label.as_deref())),
+            (Layer::Defaults, self.label.as_deref()),
+        ]
+        .into_iter()
+        .find_map(|(layer, label)| Some((label?.to_string(), layer)))
+    }
+}
+
 impl Default for Defaults {
     fn default() -> Self {
         Defaults {
@@ -804,6 +830,7 @@ impl Default for Defaults {
             max_tasks_per_run: 5,
             timeout: "2h".into(),
             place: crate::task::Place::Repo,
+            label: None,
         }
     }
 }
@@ -1404,6 +1431,10 @@ impl PastorConfig {
                 check_kind_agents(Some(&cfg.defaults.agent), &cfg.defaults.agents, &cfg.agents)
             })
             .map_err(|e| anyhow::anyhow!("{}: defaults.{e}", path.display()))?;
+        if let Some(label) = &cfg.defaults.label {
+            crate::task::check_label(label)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.{e}", path.display()))?;
+        }
         if let Some(m) = &cfg.defaults.model {
             cfg.models
                 .check(m)
@@ -1697,6 +1728,60 @@ mod tests {
         assert!(parse_duration("5 m").is_err());
         assert!(parse_duration("x").is_err());
         assert!(parse_duration("300000000000000d").is_err());
+    }
+
+    /// A label comes from the first of the ask, the flock and `[defaults]`
+    /// that sets one; none leaves the built-in.
+    #[test]
+    fn a_label_comes_from_its_layers() {
+        let work = flock::FlockEntry {
+            name: "work".into(),
+            label: Some("w/{{ task.id }}".into()),
+            ..Default::default()
+        };
+        let bare = flock::FlockEntry {
+            name: "bare".into(),
+            ..Default::default()
+        };
+        let d = Defaults {
+            label: Some("d/{{ task.id }}".into()),
+            ..Default::default()
+        };
+        let got =
+            |d: &Defaults, ask: Option<&str>, f: &flock::FlockEntry| d.resolve_label(ask, Some(f));
+        assert_eq!(
+            got(&d, Some("a"), &work),
+            Some(("a".to_string(), Layer::Ask))
+        );
+        assert_eq!(
+            got(&d, None, &work),
+            Some(("w/{{ task.id }}".to_string(), Layer::Flock))
+        );
+        assert_eq!(
+            got(&d, None, &bare),
+            Some(("d/{{ task.id }}".to_string(), Layer::Defaults))
+        );
+        assert_eq!(got(&Defaults::default(), None, &bare), None);
+    }
+
+    /// `[defaults] label` is checked on load like any other template.
+    #[test]
+    fn a_defaults_label_is_checked_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nlabel = \"{{ machine }}/{{ task.id }}\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.defaults.label.as_deref(),
+            Some("{{ machine }}/{{ task.id }}")
+        );
+        std::fs::write(&path, "[defaults]\nlabel = \"{{ nope }}\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("defaults.label: unknown placeholder"), "{err}");
     }
 
     #[test]
@@ -2134,6 +2219,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         }
     }
 

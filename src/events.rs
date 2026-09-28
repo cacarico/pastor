@@ -690,6 +690,7 @@ mod tests {
                     agent_source: None,
                     place: Default::default(),
                     session_id: None,
+                    label: Default::default(),
                 },
                 flock: "work".into(),
             })

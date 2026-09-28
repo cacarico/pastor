@@ -841,7 +841,7 @@ impl Store {
                                                    'path', json_extract(spec, '$.checkout.path'),
                                                    'agent', COALESCE(agent_name, 't-' || id)))
                          ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
-                         '$.session_id'), ?3),
+                         '$.session_id', '$.label.name', '$.label.note'), ?3),
                     flock, role, description, 'queued', id, priority, priority_from, preempt, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
@@ -1682,6 +1682,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         }
     }
 
@@ -2624,6 +2625,35 @@ mod tests {
             .insert_retry_placed(t.id, Some(&crate::task::Place::Repo))
             .unwrap();
         assert_eq!(home.spec.place, crate::task::Place::Repo);
+    }
+
+    /// A retry keeps the label template and where it came from, and drops
+    /// the workspace the failed task was in: its own dispatch names one.
+    #[test]
+    fn a_retry_keeps_its_label_template_only() {
+        let s = Store::open_in_memory().unwrap();
+        let label = crate::task::WorkspaceLabel {
+            template: Some("{{ machine }}".into()),
+            from: Some("flock work".into()),
+            name: Some("pi-1".into()),
+            note: Some("joined workspace".into()),
+        };
+        let t = s
+            .insert_task(NewTask {
+                spec: DispatchSpec { label, ..spec() },
+                ..new_task("run")
+            })
+            .unwrap();
+        set_state(&s, t.id, TaskState::Failed);
+        let r = s.insert_retry(t.id).unwrap();
+        assert_eq!(
+            r.spec.label,
+            crate::task::WorkspaceLabel {
+                template: Some("{{ machine }}".into()),
+                from: Some("flock work".into()),
+                ..Default::default()
+            }
+        );
     }
 
     /// A retry of a failed worktree task that owns a checkout (dispatch

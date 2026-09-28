@@ -367,10 +367,11 @@ upgrade.
   workspace. herdr reports a workspace's directory only when it is a git
   checkout, and pastor compares it with the expanded `--repo`, trailing `/`
   ignored, without resolving symlinks. With no such workspace, or no repo, the
-  task gets a workspace of its own named `t-N`, as before (with no repo, in
-  the machine's home).
-- `own`: always a workspace of its own named `t-N` (for a worktree, the one
-  herdr opens on the new checkout), whatever already shows the repo.
+  task gets a workspace of its own (see [Workspace
+  labels](#workspace-labels) for its name; with no repo, in the machine's
+  home).
+- `own`: always a workspace of its own (for a worktree, the one herdr opens
+  on the new checkout), whatever already shows the repo.
 - `pastor`: a pane in the machine's one workspace labelled `pastor`, made on
   first use in the home directory. The first workspace with that label is
   the one used, so a checkout of a repo named `pastor` that herdr labelled
@@ -419,6 +420,43 @@ the checkout from a pane of the shared workspace, which no workspace of the
 checkout lists. An agent pastor did not start that works there from a
 workspace not showing the checkout is not seen (herdr reports no directory
 per agent).
+
+### Workspace labels
+
+The workspace pastor makes for a task, its own or its worktree's, is
+labelled from a template, so tasks of many flocks on one machine can be told
+apart in herdr's sidebar. The default is `{{ flock }}/{{ task.id }}`, such as
+`personal/t-285`. `label` is set like the other dispatch settings: `--label`
+on `task run`, `label` in a job's `[dispatch]`, `label` on a `[[flock]]` in
+`flock.toml`, and `label` under `[defaults]` in `pastor.toml`; the first of
+the task's own, its job's, its flock's and `[defaults]` wins. It is settled
+when the task is queued, and a retry keeps it.
+
+```toml
+[defaults]
+label = "{{ machine }}/{{ task.id }}"
+```
+
+A template knows five placeholders, in the `{{ }}` syntax of job prompts:
+`{{ task.id }}` (`t-285`), `{{ flock }}`, `{{ machine }}`, `{{ job }}` (empty
+for a `task run` task) and `{{ item.key }}` (empty with no item). Any other,
+an empty template or a control character is refused where it is written: the
+job, `flock.toml` or `pastor.toml` does not load, and `--label` is a usage
+error. Dispatch renders it on the machine it picked and drops leading and
+trailing spaces and slashes, so `{{ job }}/{{ task.id }}` reads `t-285` for a
+task with no job. herdr takes any label, but one that renders empty or with a
+control character (an item's key can hold one) names the workspace `t-N`
+instead, with a warning in the head's log and a note on the task.
+
+Only the workspace is named so. The herdr agent stays `t-N`, since pastor
+finds its agents by that name, and so do the default branch `pastor/t-N` and
+`PASTOR_TASK`. `pane:<workspace>` and the shared `pastor` workspace are
+untouched, and a task that joins a workspace (`place = "repo"` finding one,
+`pastor`, `pane:<workspace>`) leaves its label as it is. `task describe`
+prints the label with where it came from: the template until dispatch, then
+the workspace's name, `(joined workspace)` for one the task joined, and the
+reason when it fell back to `t-N`. A head from before labels would name the
+workspace `t-N`, so `task run --label` refuses one (`head_too_old`).
 
 An agent named like a task (`t-N`) that no open task owns is an orphan: a
 dispatch that failed after the agent started, a daemon killed mid-dispatch, a

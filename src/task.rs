@@ -207,6 +207,94 @@ pub struct DispatchSpec {
     /// own args pick the session (`picks_session`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The label of the workspace dispatch makes for the task: the
+    /// template, where it came from, and what the workspace was called.
+    #[serde(default, skip_serializing_if = "WorkspaceLabel::is_unset")]
+    pub label: WorkspaceLabel,
+}
+
+/// The label template a task's own workspace gets when no layer sets one.
+/// With many flocks on one machine, the flock is what tells them apart in
+/// herdr's sidebar.
+pub const DEFAULT_LABEL: &str = "{{ flock }}/{{ task.id }}";
+
+/// `WorkspaceLabel::note` for a task whose pane went into a workspace it
+/// did not make, which keeps its own label.
+pub const JOINED_WORKSPACE: &str = "joined workspace";
+
+/// A task's workspace label. Only the workspace is named this way: the
+/// herdr agent stays `t-N`, since pastor finds its agents by that name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceLabel {
+    /// `--label`, a job's `[dispatch] label`, the flock's or `[defaults]`,
+    /// settled when the task is queued; `None` is `DEFAULT_LABEL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// Where `template` came from, labelled like `AgentSource::agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The label of the workspace the task's pane is in, set by dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Why `name` is not the template rendered: the task joined a
+    /// workspace, or the template rendered to something herdr should not
+    /// show and dispatch fell back to `t-N`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl WorkspaceLabel {
+    pub fn is_unset(&self) -> bool {
+        *self == WorkspaceLabel::default()
+    }
+}
+
+/// Refuse a label template that could never name a workspace: bad
+/// `{{ }}` syntax, a placeholder other than the five a label knows, an
+/// empty one or a control character. Run where a template is written
+/// (`--label`, a job file, `flock.toml`, `pastor.toml`).
+pub fn check_label(template: &str) -> Result<(), String> {
+    if template.trim().is_empty() {
+        return Err("label must not be empty".into());
+    }
+    if template.chars().any(char::is_control) {
+        return Err("label must not hold a control character".into());
+    }
+    for path in crate::template::placeholders(template).map_err(|e| format!("label: {e}"))? {
+        if !LABEL_PLACEHOLDERS.contains(&path.as_str()) {
+            return Err(format!(
+                "label: unknown placeholder {{{{ {path} }}}}; use task.id, flock, machine, job or item.key"
+            ));
+        }
+    }
+    Ok(())
+}
+
+const LABEL_PLACEHOLDERS: [&str; 5] = ["task.id", "flock", "machine", "job", "item.key"];
+
+/// `template` (or `DEFAULT_LABEL`) rendered for `task`. A placeholder with
+/// nothing to fill it (no job, no item, no flock) renders empty, and
+/// leading and trailing spaces and slashes are dropped, so
+/// `{{ job }}/{{ task.id }}` reads `t-N` for a task with no job. Refused
+/// when the result is empty or holds a control character (an item's key
+/// can): the caller then names the workspace `t-N`.
+pub fn render_label(template: Option<&str>, task: &Task) -> Result<String, String> {
+    let ctx = serde_json::json!({
+        "task": {"id": task.display_id()},
+        "flock": task.flock,
+        "machine": task.machine,
+        "job": if task.from_job() { task.job.as_str() } else { "" },
+        "item": {"key": task.item.get("key")},
+    });
+    let text = crate::template::render(template.unwrap_or(DEFAULT_LABEL), &ctx)?.text;
+    if text.chars().any(char::is_control) {
+        return Err("it holds a control character".into());
+    }
+    let text = text.trim_matches(|c: char| c.is_whitespace() || c == '/');
+    if text.is_empty() {
+        return Err("it renders empty".into());
+    }
+    Ok(text.to_string())
 }
 
 /// Where dispatch puts a task's pane: `--place`, a job's `[dispatch] place`
@@ -1044,6 +1132,86 @@ mod tests {
         assert!(!text.contains("place"), "the default is left out: {text}");
     }
 
+    /// The built-in label is `<flock>/t-N`; each placeholder renders from
+    /// the task, and one with nothing to fill it leaves no stray slash.
+    #[test]
+    fn a_label_renders_every_placeholder() {
+        let mut t = task(TaskState::Queued, None);
+        t.id = 285;
+        t.flock = Some("personal".into());
+        t.machine = Some("pi-1".into());
+        t.job = "board".into();
+        t.item = serde_json::json!({"key": "card-9"});
+        assert_eq!(render_label(None, &t).unwrap(), "personal/t-285");
+        let one = |template: &str, t: &Task| render_label(Some(template), t).unwrap();
+        assert_eq!(one("{{ task.id }}", &t), "t-285");
+        assert_eq!(one("{{ flock }}", &t), "personal");
+        assert_eq!(one("{{ machine }}", &t), "pi-1");
+        assert_eq!(one("{{ job }}", &t), "board");
+        assert_eq!(one("{{ item.key }}", &t), "card-9");
+        assert_eq!(
+            one("{{job}}:{{ item.key }} ({{ task.id }})", &t),
+            "board:card-9 (t-285)"
+        );
+
+        // `task run` has no job and no item.
+        t.job = "run".into();
+        t.item = Value::Null;
+        assert_eq!(one("{{ job }}/{{ task.id }}", &t), "t-285");
+        assert_eq!(one("{{ item.key }}-x", &t), "-x");
+        // A task from before flocks has none.
+        t.flock = None;
+        assert_eq!(render_label(None, &t).unwrap(), "t-285");
+    }
+
+    /// A label herdr would show badly, or not at all, is refused with the
+    /// reason, and dispatch then names the workspace `t-N`.
+    #[test]
+    fn a_label_that_renders_empty_or_with_a_control_character_is_refused() {
+        let mut t = task(TaskState::Queued, None);
+        t.item = serde_json::json!({"key": "a\u{1b}[2Jb"});
+        t.job = "board".into();
+        let err = render_label(Some("{{ item.key }}"), &t).unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+        t.item = serde_json::json!({"key": " / "});
+        let err = render_label(Some("{{ item.key }}"), &t).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let err = render_label(Some("{{ item.key }}\n"), &t).unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    /// Only the five placeholders are known, and a bad one is refused
+    /// where the template is written, not when a task runs.
+    #[test]
+    fn check_label_knows_the_placeholders() {
+        for ok in [
+            "{{ flock }}/{{ task.id }}",
+            "{{ machine }}-{{ job }}-{{ item.key }}",
+            "plain",
+        ] {
+            check_label(ok).unwrap();
+        }
+        let err = check_label("{{ item.title }}").unwrap_err();
+        assert!(err.contains("unknown placeholder"), "{err}");
+        let err = check_label("{{ task.id ").unwrap_err();
+        assert!(err.contains("unterminated"), "{err}");
+        let err = check_label("  ").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let err = check_label("a\tb").unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    /// A spec that says nothing about its label writes nothing, and reads
+    /// back as the built-in.
+    #[test]
+    fn an_unset_label_is_left_out_of_the_spec() {
+        let old: DispatchSpec =
+            serde_json::from_value(serde_json::json!({"agent": "claude"})).unwrap();
+        assert_eq!(old.label, WorkspaceLabel::default());
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("label"), "{text}");
+    }
+
     pub fn task(state: TaskState, last_completion_seq: Option<u64>) -> Task {
         let now = Utc::now();
         Task {
@@ -1068,6 +1236,7 @@ mod tests {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),

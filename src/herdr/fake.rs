@@ -817,7 +817,19 @@ impl FakeHerdr {
                         ws
                     }
                 };
-                let label = p.get("label").cloned().unwrap_or(Value::Null);
+                // `already_open` means someone else's workspace: its own
+                // stored label, never the caller's just-rendered one, which
+                // real herdr would ignore too since it did not make this
+                // workspace.
+                let label = if already_open {
+                    s.labels
+                        .get(&ws)
+                        .cloned()
+                        .map(Value::from)
+                        .unwrap_or(Value::Null)
+                } else {
+                    p.get("label").cloned().unwrap_or(Value::Null)
+                };
                 // An open workspace answers with a pane it still has: its
                 // first may have been closed for a split (see `dispatch`).
                 let root = s

@@ -124,6 +124,10 @@ pub struct FlockEntry {
     /// `[defaults] profile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The label template of the workspace this flock's tasks make when
+    /// the task or job sets none, before `[defaults] label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// One line on what the flock is for (`flock list --wide`, `describe`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -229,6 +233,9 @@ impl Flock {
             if let Some(p) = &f.profile {
                 crate::config::check_profile_name(p)
                     .map_err(|e| format!("flock {}: {e}", f.name))?;
+            }
+            if let Some(label) = &f.label {
+                crate::task::check_label(label).map_err(|e| format!("flock {}: {e}", f.name))?;
             }
         }
         if !self.flocks.is_empty() {
@@ -1764,6 +1771,23 @@ tags = ["fast"]
             .unwrap_err()
         );
         assert!(err.contains("machine m: model name"), "{err}");
+    }
+
+    /// A flock's `label` is a label template, checked on load.
+    #[test]
+    fn a_flock_label_must_be_a_label_template() {
+        let flock = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!("[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n"),
+            )
+        };
+        let f = flock("label = \"p/{{ task.id }}\"").unwrap();
+        assert_eq!(f.flocks[0].label.as_deref(), Some("p/{{ task.id }}"));
+        let err = format!("{:#}", flock("label = \"{{ item.title }}\"").unwrap_err());
+        assert!(err.contains("flock p: label: unknown placeholder"), "{err}");
+        let err = format!("{:#}", flock("label = \" \"").unwrap_err());
+        assert!(err.contains("flock p: label must not be empty"), "{err}");
     }
 
     /// A flock's or a machine's `profile` must be a profile name, and one
