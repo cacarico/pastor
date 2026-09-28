@@ -58,6 +58,10 @@ pub struct MachineConfig {
     /// its flock's and `[defaults]` (see `Defaults::resolve_priority`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::task::Priority>,
+    /// The agent that runs a model of another kind than `agent`'s here, by
+    /// kind (see `Defaults::resolve_agent_for`).
+    #[serde(default, skip_serializing_if = "crate::config::KindAgents::is_empty")]
+    pub agents: crate::config::KindAgents,
 }
 
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
@@ -94,6 +98,9 @@ pub struct FlockEntry {
     /// priority`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::task::Priority>,
+    /// Like the machine's `agents`, before `[defaults] agents`.
+    #[serde(default, skip_serializing_if = "crate::config::KindAgents::is_empty")]
+    pub agents: crate::config::KindAgents,
 }
 
 /// Why a task cannot have the flock it asked for (`Flock::task_flock`).
@@ -182,6 +189,8 @@ impl Flock {
             if let Some(m) = &f.model {
                 crate::config::check_model_name(m).map_err(|e| format!("flock {}: {e}", f.name))?;
             }
+            crate::config::check_kind_agent_names(&f.agents)
+                .map_err(|e| format!("flock {}: {e}", f.name))?;
         }
         if !self.flocks.is_empty() {
             let defaults: Vec<&str> = self
@@ -235,6 +244,8 @@ impl Flock {
                 crate::config::check_model_name(model)
                     .map_err(|e| format!("machine {}: {e}", m.name))?;
             }
+            crate::config::check_kind_agent_names(&m.agents)
+                .map_err(|e| format!("machine {}: {e}", m.name))?;
             if m.max_agents == 0 {
                 return Err(format!("machine {}: max_agents must be at least 1", m.name));
             }
@@ -248,17 +259,31 @@ impl Flock {
     }
 
     /// Refuse a flock or machine `model` that `[models]` in pastor.toml
-    /// does not define. Apart from `validate` because the models live in the
-    /// other file; every caller that loads both runs it.
-    pub fn check_models(&self, models: &crate::config::Models) -> anyhow::Result<()> {
-        let flocks = self.flocks.iter().map(|f| ("flock", &f.name, &f.model));
-        let machines = self.machines.iter().map(|m| ("machine", &m.name, &m.model));
-        for (what, name, model) in flocks.chain(machines) {
+    /// does not define, and an `agents` entry `check_kind_agents` refuses
+    /// by the kinds `[agents]` gives. Apart from `validate` because models
+    /// and agents live in the other file; every caller that loads both runs
+    /// it.
+    pub fn check_config(
+        &self,
+        models: &crate::config::Models,
+        agents: &crate::config::Agents,
+    ) -> anyhow::Result<()> {
+        let flocks = self
+            .flocks
+            .iter()
+            .map(|f| ("flock", &f.name, &f.model, &f.agent, &f.agents));
+        let machines = self
+            .machines
+            .iter()
+            .map(|m| ("machine", &m.name, &m.model, &m.agent, &m.agents));
+        for (what, name, model, agent, by_kind) in flocks.chain(machines) {
             if let Some(model) = model {
                 models
                     .check(model)
                     .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
             }
+            crate::config::check_kind_agents(agent.as_deref(), by_kind, agents)
+                .map_err(|e| anyhow::anyhow!("flock.toml: {what} {name}: {e}"))?;
         }
         Ok(())
     }
@@ -799,6 +824,7 @@ mod tests {
             agent_args: None,
             model: None,
             priority: None,
+            agents: Default::default(),
         }
     }
 
@@ -1376,8 +1402,11 @@ tags = ["fast"]
         let f = flock("model = \"sonnet\"").unwrap();
         let models: crate::config::Models =
             toml::from_str("[sonnet]\nkind = \"claude\"\nargs = []\n").unwrap();
-        f.check_models(&models).unwrap();
-        let err = f.check_models(&Default::default()).unwrap_err().to_string();
+        f.check_config(&models, &Default::default()).unwrap();
+        let err = f
+            .check_config(&Default::default(), &Default::default())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("flock p: model sonnet is not in [models]"),
             "{err}"

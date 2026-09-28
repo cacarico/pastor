@@ -1073,6 +1073,7 @@ mod tests {
                     agent_args: None,
                     model: None,
                     priority: None,
+                    agents: Default::default(),
                 },
             },
             IpcRequest::MachineRemove { name: "m".into() },

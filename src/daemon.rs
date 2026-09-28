@@ -137,16 +137,17 @@ fn flock_of(flock: &Flock, name: &str) -> String {
         .to_string()
 }
 
-/// The part of a machine's entry its actor is built from. The flock and the
-/// agent are not: they only decide which tasks the machine is offered and
-/// what they run, which dispatch reads from the flock last applied, so
-/// moving a machine or changing its agent keeps its connection and the
-/// tasks already on it.
+/// The part of a machine's entry its actor is built from. The flock, the
+/// agent and its per-kind agents are not: they only decide which tasks the
+/// machine is offered and what they run, which dispatch reads from the flock
+/// last applied, so moving a machine or changing its agent keeps its
+/// connection and the tasks already on it.
 fn actor_config(m: &MachineConfig) -> MachineConfig {
     MachineConfig {
         flock: None,
         agent: None,
         agent_args: None,
+        agents: Default::default(),
         ..m.clone()
     }
 }
@@ -411,20 +412,32 @@ impl Fleet {
         machine: Option<&str>,
         asked_by: &str,
     ) -> Result<(), AgentRefusal> {
-        let pick = self.resolve_agent(ask, flock, machine);
+        let models = self.models.read().unwrap();
+        let agents = self.agents.read().unwrap();
+        let pick = {
+            let wanted = self.wanted.read().unwrap();
+            self.defaults.read().unwrap().resolve_agent_for(
+                ask,
+                machine.and_then(|m| wanted.get(m)),
+                wanted.entry(flock),
+                &models,
+                &agents,
+            )
+        };
         pick.apply_to(spec);
         let label = |layer| layer_label(layer, asked_by, flock, machine);
+        let mut agent_from = label(pick.agent_from);
+        if pick.by_kind {
+            agent_from.push_str(&format!(" agents.{}", agents.kind(&pick.agent)));
+        }
         spec.agent_source = Some(Box::new(AgentSource {
             ask: ask.clone(),
-            agent: label(pick.agent_from),
+            agent: agent_from,
             agent_args: pick.args_from.map(label),
             model: pick.model.as_ref().map(|(name, _)| name.clone()),
             model_from: pick.model.as_ref().map(|&(_, layer)| label(layer)),
         }));
-        self.models
-            .read()
-            .unwrap()
-            .apply(&pick, &self.agents.read().unwrap(), spec)
+        models.apply(&pick, &agents, spec)
     }
 
     /// The level of a task being queued in `flock`, pinned to `pinned` if it
@@ -976,7 +989,9 @@ impl Fleet {
         // A fixed fleet has no applied flock, which a reload leaves alone too.
         if self.spawner.is_some()
             && let Ok(flock) = Flock::load_existing(file)
-            && flock.check_models(&self.models.read().unwrap()).is_ok()
+            && flock
+                .check_config(&self.models.read().unwrap(), &self.agents.read().unwrap())
+                .is_ok()
         {
             *self.wanted.write().unwrap() = flock;
         }
@@ -1096,11 +1111,42 @@ impl Fleet {
                 settled_on(m).is_none_or(|r| r.is_ok())
             });
             let Some(name) = picked else {
-                // Say why, when a machine would take it but for its model.
-                if let Some(m) = pick_machine(&views, target, &task.spec, claim)
-                    && let Some(Err(err)) = settled_on(&m)
-                {
-                    let note = format!("{WAITING_FOR_MODEL}: {err}");
+                // Say why: no machine of the flock has an agent for its
+                // model, or one would take it but for its model.
+                let none_has = || {
+                    let kind = self
+                        .models
+                        .read()
+                        .unwrap()
+                        .get(task.model()?)
+                        .ok()?
+                        .kind
+                        .clone();
+                    let mut members = flock
+                        .machines
+                        .iter()
+                        .filter(|m| flock.flock_of(m) == target)
+                        .peekable();
+                    let none = task.spec.machine.is_none()
+                        && members.peek().is_some()
+                        && members.all(|m| {
+                            matches!(settled_on(&m.name), Some(Err(e)) if e.code == MODEL_KIND_MISMATCH)
+                        });
+                    none.then(|| {
+                        let a = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                            "an"
+                        } else {
+                            "a"
+                        };
+                        format!("no machine in flock {target} has {a} {kind} agent")
+                    })
+                };
+                let why = none_has().or_else(|| {
+                    let m = pick_machine(&views, target, &task.spec, claim)?;
+                    Some(settled_on(&m)?.err()?.to_string())
+                });
+                if let Some(why) = why {
+                    let note = format!("{WAITING_FOR_MODEL}: {why}");
                     if task.error.as_deref() != Some(note.as_str()) {
                         let mut t = task.clone();
                         t.error = Some(note);
@@ -2083,6 +2129,7 @@ impl Daemon {
             row: crate::cli::MachineRow::from(&status),
             session: m.session.clone(),
             model: m.model.clone(),
+            agents_by_kind: m.agents.clone(),
             tasks,
             recent_errors: crate::describe::machine_errors(events, name),
         })
@@ -2472,7 +2519,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     let on_disk = ConfigFingerprint::sample(&paths);
     let config = PastorConfig::load(&paths.config_file())?;
     let flock = Flock::load(&paths.flock_file())?;
-    flock.check_models(&config.models)?;
+    flock.check_config(&config.models, &config.agents)?;
     anyhow::ensure!(
         !flock.machines.is_empty(),
         "flock is empty; add a machine with `pastor machine add`"
@@ -2511,6 +2558,7 @@ mod tests {
             agent_args: None,
             model: None,
             priority: None,
+            agents: Default::default(),
         }
     }
 
@@ -3853,7 +3901,8 @@ mod tests {
     }
 
     /// A name `[models]` lacks, and a model of another kind than the agent
-    /// the task asked for or the machine it is pinned to, are refused.
+    /// the task asked for, or than every agent the machine it is pinned to
+    /// can run, are refused.
     #[tokio::test]
     async fn an_unknown_or_mismatched_model_is_refused() {
         let cx = MachineConfig {
@@ -3882,10 +3931,16 @@ mod tests {
             "model_kind_mismatch"
         );
         assert_eq!(
-            error_code(d.handle(run_model(Some("sonnet"), None, Some("cx"))).await),
+            error_code(d.handle(run_model(Some("gpt"), None, Some("pi"))).await),
             "model_kind_mismatch"
         );
         assert!(d.store.queued_tasks().unwrap().is_empty());
+        // cx's own agent is codex, but its flock's is a claude.
+        let IpcResponse::Task(t) = d.handle(run_model(Some("sonnet"), None, Some("cx"))).await
+        else {
+            panic!()
+        };
+        assert_eq!(t.spec.agent, "claude-personal");
     }
 
     /// An unpinned task goes only to a machine whose agent has its model's
@@ -3918,6 +3973,100 @@ mod tests {
         let err = t.error.unwrap_or_default();
         assert!(err.starts_with("waiting for a machine"), "{err}");
         assert!(err.contains("model gpt runs on codex agents"), "{err}");
+    }
+
+    /// `models_daemon` with `gpt5`, a model for opencode agents, in
+    /// `[models]` as well.
+    async fn opencode_daemon(
+        machines: Vec<MachineConfig>,
+        fakes: &[(&str, u32, FakeHerdr)],
+    ) -> (Daemon, tempfile::TempDir) {
+        let (d, tmp) = models_daemon(None, machines, fakes).await;
+        let mut config = models_config();
+        config.models.0.insert(
+            "gpt5".into(),
+            crate::config::ModelDef {
+                kind: "opencode".into(),
+                args: vec!["--model".into(), "openai/gpt-5.5".into()],
+            },
+        );
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        d.fleet().set_config(&config);
+        (d, tmp)
+    }
+
+    /// A model of another kind than the flock's agent runs on the machine
+    /// whose `agents` names one of its kind, as that agent, without the
+    /// flock's claude args; describe says where the agent came from.
+    #[tokio::test]
+    async fn a_model_of_another_kind_runs_on_the_agent_named_for_it() {
+        let desk = MachineConfig {
+            agents: [("opencode".to_string(), "opencode".to_string())].into(),
+            ..machine("desk", 1)
+        };
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = opencode_daemon(
+            vec![machine("pi", 1), desk],
+            &[("pi", 1, FakeHerdr::new()), ("desk", 1, fake.clone())],
+        )
+        .await;
+        let IpcResponse::Task(t) = d.handle(run_model(Some("gpt5"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(
+            (t.machine.as_deref(), t.spec.agent.as_str()),
+            (Some("desk"), "opencode")
+        );
+        assert_eq!(t.spec.agent_args, vec!["--model", "openai/gpt-5.5"]);
+        let start = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "agent.start")
+            .unwrap();
+        assert_eq!(start.params["kind"], "opencode");
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!(["--model", "openai/gpt-5.5"])
+        );
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("agent:      opencode (from machine desk agents.opencode)\n"),
+            "{text}"
+        );
+        // A claude model still runs on the flock's claude agent there.
+        let IpcResponse::Task(t) = d.handle(run_model(Some("sonnet"), None, Some("pi"))).await
+        else {
+            panic!()
+        };
+        assert_eq!(t.spec.agent, "claude-personal");
+    }
+
+    /// With no machine of the flock naming an agent of the model's kind,
+    /// the task waits and says so; pinned to such a machine, it is refused.
+    #[tokio::test]
+    async fn a_model_no_machine_has_an_agent_for_waits_or_is_refused() {
+        let (d, _tmp) = opencode_daemon(
+            vec![machine("pi", 1), machine("pi-2", 1)],
+            &[("pi", 1, FakeHerdr::new()), ("pi-2", 1, FakeHerdr::new())],
+        )
+        .await;
+        let IpcResponse::Task(t) = d.handle(run_model(Some("gpt5"), None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.unwrap_or_default();
+        assert!(
+            err.contains("no machine in flock personal has an opencode agent"),
+            "{err}"
+        );
+        let resp = d.handle(run_model(Some("gpt5"), None, Some("pi-2"))).await;
+        match resp {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "model_kind_mismatch", "{message}");
+                assert!(message.contains("no layer's agents.opencode"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// A retry settles its model again, so one since dropped from
@@ -4990,6 +5139,7 @@ mod tests {
                     agent_args: None,
                     model: None,
                     priority: None,
+                    agents: Default::default(),
                 },
             },
             IpcRequest::TaskClose {

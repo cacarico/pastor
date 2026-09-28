@@ -391,6 +391,7 @@ agent = "claude"          # optional: the agent for this flock's tasks
 agent_args = ["--model", "claude-sonnet-5"]
 # model = "sonnet"        # optional: a [models] name, see Models below
 # priority = "high"       # optional: see Priority and queue order below
+# agents = { opencode = "opencode" }  # optional: the agent per kind, see Models
 
 [[machine]]
 name = "desk"
@@ -692,10 +693,11 @@ claude-sonnet-5 ...` under the `claude-personal` definition.
 
 A model runs only on agents of its kind (the agent's `kind`, or its name
 without a definition). A task that asks for an agent of another kind with
-`--agent`, or is pinned to a machine whose agent is of another kind, is
-refused (`model_kind_mismatch`). A task that is not pinned is offered only to
-the machines of its flock whose agent has the model's kind; the others are
-skipped as machines of another flock are. If none has, it stays queued and
+`--agent`, or is pinned to a machine with no agent of the model's kind (see
+[An agent per kind](#an-agent-per-kind)), is refused (`model_kind_mismatch`).
+A task that is not pinned is offered only to the machines of its flock that
+have an agent of the model's kind; the others are skipped as machines of
+another flock are. If none has, it stays queued and
 `pastor task describe` says why in its `error`.
 
 A name `[models]` does not define is refused: `unknown_model` from `pastor
@@ -844,6 +846,66 @@ takes it; ties keep flock order. `machine add` takes `--job-slots` and
 `2+1j+1b` (`2` alone when both are 0), `machine describe` as `1 of 2+1j+1b`,
 and `--json` has `job_slots` and `burst` on each machine. Changing either
 restarts the machine's actor on reload, as changing `max_agents` does.
+
+#### An agent per kind
+
+A machine whose agent is a claude can still run a model of another kind if
+it says which agent runs that kind. `agents = { <kind> = "<agent>" }` goes on
+a `[[machine]]` or a `[[flock]]` entry in flock.toml, and under `[defaults]`
+in pastor.toml:
+
+```toml
+# pastor.toml
+[models.gpt]
+kind = "opencode"
+args = ["--model", "openai/gpt-5.5"]
+```
+
+```toml
+# flock.toml: desk runs gpt as its opencode; pi-3 has no opencode agent
+[[flock]]
+name = "personal"
+default = true
+agent = "claude-personal"
+agent_args = ["--permission-mode", "auto"]
+
+[[machine]]
+name = "desk"
+ssh = "user@desk"
+agents = { opencode = "opencode" }
+
+[[machine]]
+name = "pi-3"
+ssh = "user@pi-3"
+```
+
+The task's agent is settled as above first. When the model's kind differs
+from that agent's, pastor looks the kind up through the machine, the flock
+and `[defaults]`, in that order: at each, the layer's own `agent` if it is of
+that kind, else its `agents` entry for the kind. The first hit runs the task.
+So `pastor task run --model gpt` above lands on desk and starts `opencode
+--model openai/gpt-5.5`, while its claude tasks still run as
+`claude-personal`, and pi-3 never gets a gpt task. An agent the task or job
+named itself (`--agent`, a job's `agent`) is kept, and its kind must match
+the model's (`model_kind_mismatch`).
+
+An agent found this way takes `agent_args` only from layers whose `agent` is
+that same agent: a layer's `agent_args` with no `agent` are for its default
+agent, so the flock's claude args above never reach opencode.
+
+A value is any name `agent` accepts, a definition under `[agents]` or a
+built-in kind, and its kind must be the key: `agents = { opencode =
+"claude-personal" }` fails the load, as does an entry for the kind of the
+layer's own `agent` (which already runs that kind). An unpinned task goes only
+to the machines where the lookup finds an agent; with none in its flock it
+stays queued, and `pastor task describe` says why, such as `no machine in
+flock personal has an opencode agent`. A task pinned to a machine with none
+is refused (`model_kind_mismatch`), and a job records the error for the
+item. `task describe` shows where such an agent came from, such as `agent:
+opencode (from machine desk agents.opencode)`; `machine describe` and
+`flock describe` list the entry's own `agents` as `by kind`. A pastor from
+before this refuses the key on a `[[flock]]`, so add it once every machine
+runs a release that knows it.
 
 ## Events
 
@@ -1978,6 +2040,7 @@ timeout = "2h"
 place = "repo"               # where a task's pane goes: repo, own, pastor or pane:<workspace>
 # model = "sonnet"           # a [models] name for tasks that name none; unset: no model
 # priority = "normal"        # the level of tasks that set none: low, normal, high or critical
+# agents = { opencode = "opencode" }  # the agent for a model of another kind than agent's
 [agents.claude]              # one table per agent that needs one
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }

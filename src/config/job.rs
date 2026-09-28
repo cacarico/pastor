@@ -819,6 +819,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             place: Default::default(),
             model: None,
             priority: None,
+            agents: Default::default(),
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");

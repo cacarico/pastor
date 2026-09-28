@@ -445,6 +445,10 @@ pub struct Defaults {
     /// name none; unset, `normal`. See `resolve_priority`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::task::Priority>,
+    /// The agent that runs a model of another kind than `agent`'s, by kind
+    /// (`{ opencode = "opencode" }`). See `resolve_agent_for`.
+    #[serde(skip_serializing_if = "KindAgents::is_empty")]
+    pub agents: KindAgents,
     pub max_tasks_per_run: u32,
     pub timeout: String,
     /// Where a task's pane goes when its run flags and job say nothing
@@ -501,6 +505,52 @@ pub struct AgentPick {
     /// `None` when no layer names one. Its args are not in `agent_args`:
     /// `Models::apply` puts them in front.
     pub model: Option<(String, Layer)>,
+    /// The agent is `agent_from`'s `agents` entry for its kind, not its
+    /// `agent` (`Defaults::resolve_agent_for`).
+    pub by_kind: bool,
+}
+
+/// `agents = { <kind> = "<agent>" }` on a machine, a flock or `[defaults]`:
+/// the agent that layer runs a model of that kind on when its own `agent`
+/// is of another kind.
+pub type KindAgents = std::collections::BTreeMap<String, String>;
+
+/// Refuse a layer's `agents` entry whose agent is not of the kind it is
+/// filed under, or one for the kind of the layer's own agent (`own`),
+/// which that agent already runs. `agents` is `[agents]` from pastor.toml.
+pub fn check_kind_agents(
+    own: Option<&str>,
+    by_kind: &KindAgents,
+    agents: &Agents,
+) -> Result<(), String> {
+    for (kind, agent) in by_kind {
+        let is = agents.kind(agent);
+        if is != kind {
+            return Err(format!("agents.{kind}: agent {agent} is {is}, not {kind}"));
+        }
+        if let Some(own) = own
+            && agents.kind(own) == kind
+        {
+            return Err(format!(
+                "agents.{kind}: its own agent {own} is already {kind}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an `agents` key or agent that is empty: what `check_kind_agents`
+/// can check without `[agents]`.
+pub fn check_kind_agent_names(by_kind: &KindAgents) -> Result<(), String> {
+    for (kind, agent) in by_kind {
+        if kind.trim().is_empty() {
+            return Err("agents: a kind must not be empty".into());
+        }
+        if agent.trim().is_empty() {
+            return Err(format!("agents.{kind} must not be empty"));
+        }
+    }
+    Ok(())
 }
 
 impl AgentPick {
@@ -616,6 +666,81 @@ impl Defaults {
             agent_from,
             args_from,
             model,
+            by_kind: false,
+        }
+    }
+
+    /// `resolve_agent_on`, then, when the task's model runs on another kind
+    /// than that agent's, the agent for the model's kind: at the machine,
+    /// the flock and these defaults in turn, the layer's `agent` if it is
+    /// of that kind, else its `agents` entry for it. An agent the task or
+    /// job named itself is kept, as is the first agent when no layer has
+    /// one of the kind, for `Models::apply` to refuse. An agent found this
+    /// way takes `agent_args` only from layers whose `agent` is that same
+    /// one: a layer's args with no `agent` are for its default agent.
+    pub fn resolve_agent_for(
+        &self,
+        ask: &AgentChoice,
+        machine: Option<&flock::MachineConfig>,
+        flock: Option<&flock::FlockEntry>,
+        models: &Models,
+        agents: &Agents,
+    ) -> AgentPick {
+        let pick = self.resolve_agent_on(ask, machine, flock);
+        let Some(kind) = pick
+            .model
+            .as_ref()
+            .and_then(|(name, _)| models.0.get(name))
+            .map(|def| def.kind.as_str())
+        else {
+            return pick;
+        };
+        if pick.agent_from == Layer::Ask || agents.kind(&pick.agent) == kind {
+            return pick;
+        }
+        let layers = [
+            (
+                Layer::Machine,
+                machine.and_then(|m| m.agent.as_deref()),
+                machine.map(|m| &m.agents),
+                machine.and_then(|m| m.agent_args.as_ref()),
+            ),
+            (
+                Layer::Flock,
+                flock.and_then(|f| f.agent.as_deref()),
+                flock.map(|f| &f.agents),
+                flock.and_then(|f| f.agent_args.as_ref()),
+            ),
+            (
+                Layer::Defaults,
+                Some(self.agent.as_str()),
+                Some(&self.agents),
+                Some(&self.agent_args),
+            ),
+        ];
+        let found = layers
+            .iter()
+            .find_map(|&(layer, own, by_kind, _)| match own {
+                Some(own) if agents.kind(own) == kind => Some((layer, own.to_string(), false)),
+                _ => Some((layer, by_kind?.get(kind)?.clone(), true)),
+            });
+        let Some((agent_from, agent, by_kind)) = found else {
+            return pick;
+        };
+        let (args_from, agent_args) = layers
+            .iter()
+            .find_map(|&(layer, own, _, args)| {
+                args.filter(|_| own == Some(agent.as_str()))
+                    .map(|a| (Some(layer), a.clone()))
+            })
+            .unwrap_or_default();
+        AgentPick {
+            agent,
+            agent_args,
+            agent_from,
+            args_from,
+            by_kind,
+            ..pick
         }
     }
 }
@@ -653,6 +778,7 @@ impl Default for Defaults {
             deny: vec![],
             model: None,
             priority: None,
+            agents: KindAgents::new(),
             max_tasks_per_run: 5,
             timeout: "2h".into(),
             place: crate::task::Place::Repo,
@@ -954,10 +1080,16 @@ impl Models {
         let def = self.get(name)?;
         let kind = agents.kind(&pick.agent);
         if def.kind != kind {
+            // Not the task's own agent: no layer had one of the kind.
+            let none = if pick.agent_from == Layer::Ask {
+                String::new()
+            } else {
+                format!(", and no layer's agents.{} names one", def.kind)
+            };
             return Err(AgentRefusal {
                 code: MODEL_KIND_MISMATCH,
                 message: format!(
-                    "model {name} runs on {} agents, and agent {} is {kind}",
+                    "model {name} runs on {} agents, and agent {} is {kind}{none}",
                     def.kind, pick.agent
                 ),
             });
@@ -1159,6 +1291,11 @@ impl PastorConfig {
                 anyhow::bail!("{}: models.{name}.kind must not be empty", path.display());
             }
         }
+        check_kind_agent_names(&cfg.defaults.agents)
+            .and_then(|()| {
+                check_kind_agents(Some(&cfg.defaults.agent), &cfg.defaults.agents, &cfg.agents)
+            })
+            .map_err(|e| anyhow::anyhow!("{}: defaults.{e}", path.display()))?;
         if let Some(m) = &cfg.defaults.model {
             cfg.models
                 .check(m)
@@ -1720,6 +1857,151 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code, "unknown_model");
+    }
+
+    /// A model of another kind than the default agent's runs on the first
+    /// layer's agent of that kind: its own `agent`, else its `agents` entry.
+    /// That agent takes args only from layers that name it; claude's never
+    /// reach it. An agent the task named is kept, and so is the default one
+    /// when no layer has the kind.
+    #[test]
+    fn a_model_of_another_kind_takes_the_agent_named_for_its_kind() {
+        let models: Models = toml::from_str(
+            "[gpt]\nkind = \"opencode\"\nargs = [\"--model\", \"openai/gpt-5.5\"]\n",
+        )
+        .unwrap();
+        let agents: Agents = toml::from_str(
+            "[claude-personal]\nkind = \"claude\"\n[oc-work]\nkind = \"opencode\"\n",
+        )
+        .unwrap();
+        let d = Defaults {
+            agent_args: vec!["--permission-mode".into(), "auto".into()],
+            ..Default::default()
+        };
+        let flock: flock::FlockEntry =
+            toml::from_str("name = \"p\"\nagent = \"claude-personal\"\nagent_args = [\"-v\"]\n")
+                .unwrap();
+        let machine = |extra: &str| -> flock::MachineConfig {
+            toml::from_str(&format!("name = \"m\"\nlocal = true\n{extra}")).unwrap()
+        };
+        let gpt = AgentChoice {
+            model: Some("gpt".into()),
+            ..Default::default()
+        };
+        let pick = |ask: &AgentChoice, m: &flock::MachineConfig| {
+            d.resolve_agent_for(ask, Some(m), Some(&flock), &models, &agents)
+        };
+
+        let p = pick(&gpt, &machine("agents = { opencode = \"opencode\" }\n"));
+        assert_eq!(
+            (p.agent.as_str(), p.agent_from, p.by_kind),
+            ("opencode", Layer::Machine, true)
+        );
+        assert!(p.agent_args.is_empty(), "{:?}", p.agent_args);
+        assert_eq!(p.args_from, None);
+        let mut spec = spec_with("claude", &[], &[]);
+        p.apply_to(&mut spec);
+        models.apply(&p, &agents, &mut spec).unwrap();
+        assert_eq!(spec.agent_args, vec!["--model", "openai/gpt-5.5"]);
+
+        // The machine's own agent of the kind wins, with its own args; a
+        // layer's args with no agent stay with the default agent.
+        let m = machine("agent = \"oc-work\"\nagent_args = [\"--x\"]\n");
+        let p = pick(&gpt, &m);
+        assert_eq!((p.agent.as_str(), p.by_kind), ("oc-work", false));
+        assert_eq!(p.agent_args, vec!["--x"]);
+        let m = machine("agent_args = [\"--claude-only\"]\nagents = { opencode = \"oc-work\" }\n");
+        let p = pick(&gpt, &m);
+        assert_eq!(p.agent, "oc-work");
+        assert!(p.agent_args.is_empty(), "{:?}", p.agent_args);
+
+        // A flock's agents entry when the machine has none.
+        let flock_oc: flock::FlockEntry = toml::from_str(
+            "name = \"p\"\nagent = \"claude-personal\"\nagents = { opencode = \"oc-work\" }\n",
+        )
+        .unwrap();
+        let p = d.resolve_agent_for(&gpt, Some(&machine("")), Some(&flock_oc), &models, &agents);
+        assert_eq!(
+            (p.agent.as_str(), p.agent_from, p.by_kind),
+            ("oc-work", Layer::Flock, true)
+        );
+
+        // No layer has one: the default agent, for `apply` to refuse.
+        let p = pick(&gpt, &machine(""));
+        assert_eq!(p.agent, "claude-personal");
+        let err = models.apply(&p, &agents, &mut spec).unwrap_err();
+        assert_eq!(err.code, MODEL_KIND_MISMATCH);
+        assert!(err.message.contains("no layer's agents.opencode"), "{err}");
+
+        // The task's own agent is kept.
+        let asked = AgentChoice {
+            agent: Some("claude".into()),
+            ..gpt.clone()
+        };
+        let p = pick(&asked, &machine("agents = { opencode = \"opencode\" }\n"));
+        assert_eq!(p.agent, "claude");
+        let err = models.apply(&p, &agents, &mut spec).unwrap_err();
+        assert!(!err.message.contains("agents."), "{err}");
+    }
+
+    /// An `agents` entry whose agent is of another kind than its key, and
+    /// one for the kind of the layer's own agent, fail the load: in
+    /// `[defaults]`, and on a flock or machine against `[agents]`.
+    #[test]
+    fn a_bad_agents_entry_fails_the_load() {
+        let path = Path::new("pastor.toml");
+        let agents = "[agents.claude-personal]\nkind = \"claude\"\n";
+        let cfg = PastorConfig::parse(
+            path,
+            &format!("[defaults]\nagents = {{ opencode = \"opencode\" }}\n{agents}"),
+        )
+        .unwrap();
+        assert_eq!(cfg.defaults.agents["opencode"], "opencode");
+        for (defaults, says) in [
+            (
+                "agents = { opencode = \"claude-personal\" }",
+                "defaults.agents.opencode: agent claude-personal is claude, not opencode",
+            ),
+            (
+                "agents = { claude = \"claude-personal\" }",
+                "defaults.agents.claude: its own agent claude is already claude",
+            ),
+            (
+                "agents = { opencode = \"\" }",
+                "defaults.agents.opencode must not be empty",
+            ),
+        ] {
+            let err = format!(
+                "{:#}",
+                PastorConfig::parse(path, &format!("[defaults]\n{defaults}\n{agents}"))
+                    .unwrap_err()
+            );
+            assert!(err.contains(says), "{defaults}: {err}");
+        }
+
+        let config = PastorConfig::parse(path, agents).unwrap();
+        let flock = |text: &str| {
+            flock::Flock::parse(Path::new("flock.toml"), text)
+                .unwrap()
+                .check_config(&config.models, &config.agents)
+        };
+        flock(
+            "[[flock]]\nname = \"p\"\ndefault = true\nagent = \"claude-personal\"\nagents = { opencode = \"opencode\" }\n",
+        )
+        .unwrap();
+        for (text, says) in [
+            (
+                "[[machine]]\nname = \"m\"\nlocal = true\nagents = { opencode = \"claude-personal\" }\n",
+                "machine m: agents.opencode: agent claude-personal is claude, not opencode",
+            ),
+            (
+                "[[flock]]\nname = \"p\"\ndefault = true\nagent = \"claude-personal\"\nagents = { claude = \"claude\" }\n",
+                "flock p: agents.claude: its own agent claude-personal is already claude",
+            ),
+        ] {
+            let err = flock(text).unwrap_err().to_string();
+            assert!(err.contains(says), "{text}: {err}");
+        }
     }
 
     fn spec_with(agent: &str, allow: &[&str], deny: &[&str]) -> crate::task::DispatchSpec {

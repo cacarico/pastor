@@ -948,6 +948,7 @@ mod tests {
                 agent_args: None,
                 model: None,
                 priority: None,
+                agents: Default::default(),
             }],
         };
         let mut rows = task_rows(&tasks);

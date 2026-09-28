@@ -4779,6 +4779,52 @@ fn a_named_model_reaches_herdr_and_bad_ones_are_refused() {
     }
 }
 
+/// A model of another kind than the machine's agent runs as the agent its
+/// `agents` names for that kind, with only the model's args, and describe
+/// says where it came from; without that entry, a task pinned there is
+/// refused.
+#[test]
+fn a_model_of_another_kind_runs_on_the_machines_agent_for_it() {
+    let env = start();
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [defaults]\nagent_args = [\"-v\"]\n\
+         [models.gpt]\nkind = \"opencode\"\nargs = [\"--model\", \"openai/gpt-5.5\"]\n",
+    )
+    .unwrap();
+    let flock_file = env.config.join("flock.toml");
+    let plain = std::fs::read_to_string(&flock_file).unwrap();
+    std::fs::write(
+        &flock_file,
+        format!("{plain}agents = {{ opencode = \"opencode\" }}\n"),
+    )
+    .unwrap();
+    env.json(&["task", "run", "hi", "--model", "gpt", "--json"]);
+    let start = env.agent_start_params("t-1");
+    assert_eq!(start["kind"], "opencode", "{start}");
+    assert_eq!(
+        start["args"],
+        serde_json::json!(["--model", "openai/gpt-5.5"]),
+        "{start}"
+    );
+    let out = env.cmd(&["task", "describe", "t-1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("agent:      opencode (from machine fake agents.opencode)\n"),
+        "{text}"
+    );
+    let out = env.cmd(&["machine", "describe", "fake"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("opencode=opencode"), "{text}");
+
+    std::fs::write(&flock_file, plain).unwrap();
+    env.fails_with(
+        &["task", "run", "x", "--model", "gpt", "--machine", "fake"],
+        "model_kind_mismatch",
+    );
+}
+
 /// `task attach` on a task whose pane is gone: one of a kind with no
 /// session keeps the old error with a hint that only Claude tasks reopen; a
 /// Claude task goes on to its machine to reopen the session, which a
