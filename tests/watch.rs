@@ -176,6 +176,7 @@ fn task(id: i64, state: TaskState) -> Task {
                 place: Default::default(),
                 session_id: None,
                 label: Default::default(),
+                summary: Default::default(),
             },
             flock: "default".into(),
             description: None,

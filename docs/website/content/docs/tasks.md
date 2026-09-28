@@ -28,6 +28,7 @@ the same checkout.
 | `--timeout` | mark it stale after `30m`, `2h`, ... |
 | `--priority` | `low`, `normal`, `high` or `critical`: higher levels leave the queue first |
 | `--preempt` | critical only: on a full machine, pause a `low` Claude task and take its slot |
+| `--summary` | `ask` (default), `require` or `off`: whether the prompt asks for a summary, and whether the task fails without one |
 | `--description` | one line on what it is about; default: the prompt's first line |
 | `--label` | the name of its herdr workspace; default: `{{ flock }}/{{ task.id }}` |
 
@@ -129,6 +130,21 @@ round's; `task list --wide` shows the outcome as RESULT, and `--json` has
 `summary`. The `task.done` and `task.failed` events carry it, `pastor watch`
 prints `outcome=` on their lines, and a connector's finish command gets it
 on stdin.
+
+pastor asks for it: every prompt it sends ends with a line asking for
+`pastor task done --summary-file -` in that shape, and a `task send` that
+reopens a done task asks again. The line is not stored in the task's
+prompt. The `summary` setting changes that:
+
+| value | does |
+|---|---|
+| `ask` | the default: the line is added |
+| `require` | the line is added, and a summary is a condition of success: the agent's own bare `task done` is refused, and an agent that stops without one ends the task `failed` ("stopped without a summary"). Your `task done t-N` still passes. |
+| `off` | nothing is added and nothing required |
+
+Set it with `task run --summary`, in a job's `[dispatch]`, on a flock or in
+`[defaults]`; the most specific wins, and `task describe` shows what a task
+got.
 
 ## end it
 

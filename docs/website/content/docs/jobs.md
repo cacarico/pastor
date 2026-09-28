@@ -44,6 +44,7 @@ time. Any other `use` names an installed connector.
 | `flock`, `machine`, `tags` | which machines take the tasks |
 | `agent`, `agent_args` | the agent to start |
 | `allow`, `deny` | tool patterns, added to the flock's and `[defaults]` |
+| `summary` | `ask`, `require` or `off`: whether its tasks are asked for a summary, or need one ([tasks](../tasks/#how-it-ended)) |
 | `max_tasks_per_run` | at most this many tasks per run; the rest wait for the next |
 | `backfill` | on the first run, also take items from this far back |
 

@@ -64,6 +64,9 @@ pub struct DispatchTable {
     /// machine to start (see `Task::pause`); tasks it queues below critical
     /// ignore it.
     pub preempt: bool,
+    /// Whether the job's tasks are asked for a summary, or need one
+    /// (`SummaryMode`), before the flock's and `[defaults]`.
+    pub summary: Option<crate::task::SummaryMode>,
     /// A permission profile, built in or in `[profiles]`, before the
     /// machine's, the flock's and `[defaults]`.
     pub profile: Option<String>,
@@ -126,6 +129,9 @@ pub struct Job {
     pub priority: Option<String>,
     /// `dispatch.preempt`: its tasks that settle at critical get `preempt`.
     pub preempt: bool,
+    /// `dispatch.summary`: before the flock's and `[defaults]`
+    /// (`Defaults::resolve_summary`).
+    pub summary: Option<crate::task::SummaryMode>,
     /// The `[dispatch]` table as written, as JSON and without `prompt`: what
     /// a headless serve sends the head with its items (`IpcRequest::
     /// JobSubmit`), so the head applies its own `[defaults]` to what the
@@ -358,6 +364,7 @@ impl Job {
             flock: d.flock,
             priority: d.priority,
             preempt: d.preempt,
+            summary: d.summary,
             agent,
             dispatch: Value::Null,
             spec: DispatchSpec {
@@ -380,6 +387,7 @@ impl Job {
                     template: d.label,
                     ..Default::default()
                 },
+                summary: Default::default(),
             },
         })
     }
@@ -740,6 +748,33 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert!(job("Sonnet").unwrap_err().contains("dispatch.model"));
     }
 
+    /// `summary` is read from `[dispatch]`; a job without it leaves it to
+    /// the flock and `[defaults]`, and another word fails the file.
+    #[test]
+    fn a_jobs_summary_is_read_from_dispatch() {
+        use crate::task::SummaryMode;
+        let job = |extra: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\n{extra}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &Defaults::default(),
+                &Builtins,
+            )
+        };
+        assert_eq!(job("").unwrap().summary, None);
+        assert_eq!(
+            job("summary = \"require\"").unwrap().summary,
+            Some(SummaryMode::Require)
+        );
+        assert_eq!(
+            job("summary = \"off\"").unwrap().summary,
+            Some(SummaryMode::Off)
+        );
+        assert!(job("summary = \"never\"").is_err());
+    }
+
     /// `preempt` is read from `[dispatch]`, and refused beside a priority
     /// written below critical; a template decides per item.
     #[test]
@@ -989,6 +1024,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             agents: Default::default(),
             profile: None,
             label: None,
+            summary: None,
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");

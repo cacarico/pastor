@@ -360,6 +360,7 @@ pub enum MachineCommand {
     End {
         task_id: i64,
         summary: Option<String>,
+        by: EndBy,
         reply: oneshot::Sender<anyhow::Result<Task>>,
     },
     /// Pause a running `low` Claude task for critical task `for_task`:
@@ -607,12 +608,24 @@ impl MachineHandle {
         self.request(cmd, rx).await
     }
 
+    /// `end_by` the task's own agent.
     pub async fn end(&self, task_id: i64, summary: Option<String>) -> anyhow::Result<Task> {
+        self.end_by(task_id, summary, EndBy::Agent).await
+    }
+
+    /// See `MachineCommand::End`.
+    pub async fn end_by(
+        &self,
+        task_id: i64,
+        summary: Option<String>,
+        by: EndBy,
+    ) -> anyhow::Result<Task> {
         let (reply, rx) = oneshot::channel();
         self.request(
             MachineCommand::End {
                 task_id,
                 summary,
+                by,
                 reply,
             },
             rx,
@@ -838,6 +851,16 @@ fn task_id_of_agent(name: &str) -> Option<i64> {
     }
     let id: i64 = digits.parse().ok()?;
     (id > 0 && Task::agent_name_for(id) == name).then_some(id)
+}
+
+/// Who ran `pastor task done`: the task's own agent, from its pane (or
+/// through the bridge), or anyone else. A task whose `summary` is
+/// `require` refuses its agent's `task done` without a summary, never a
+/// person's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndBy {
+    Agent,
+    Hand,
 }
 
 /// How an idle agent ended its turn, read from its pane before a task is
@@ -1473,9 +1496,10 @@ impl Actor {
             MachineCommand::End {
                 task_id,
                 summary,
+                by,
                 reply,
             } => {
-                let _ = reply.send(self.end_task(task_id, summary));
+                let _ = reply.send(self.end_task(task_id, summary, by));
                 CommandOutcome::Nothing
             }
             MachineCommand::Pause {
@@ -1608,7 +1632,20 @@ impl Actor {
             let detail = serde_json::json!({"keys": keys, "trust": true});
             (None, keys, detail)
         } else {
-            (input.text.clone(), input.key_sequence(), input.detail())
+            // Text that reopens a done task is new work, a new round: it
+            // asks for a summary again, on the same line so no newline is
+            // typed. A reply to an open task gets nothing: the prompt's
+            // line is still in the agent's context.
+            let text = input
+                .text
+                .clone()
+                .map(|text| match task.spec.summary.ask_line() {
+                    Some(line) if task.state == TaskState::Done => {
+                        format!("{} {line}", text.trim_end())
+                    }
+                    _ => text,
+                });
+            (text, input.key_sequence(), input.detail())
         };
         let timeout = self.settings.request_timeout;
         let sent = tokio::time::timeout(timeout, async {
@@ -1654,7 +1691,18 @@ impl Actor {
     /// pane on this machine (starting, running, blocked, stale or done)
     /// becomes `done` and `ended`; its pane stays for `close_done_after`, as
     /// any done task's does, so the agent can finish the turn it said so in.
-    fn end_task(&mut self, task_id: i64, summary: Option<String>) -> anyhow::Result<Task> {
+    ///
+    /// A task whose `summary` is `require` refuses its own agent's `task
+    /// done` without a summary (`SUMMARY_REQUIRED`) and leaves the row as
+    /// it was, so the agent can run it again; a round it already ended with
+    /// one keeps it. A person's is not refused; the round reads
+    /// `ENDED_BY_HAND`.
+    fn end_task(
+        &mut self,
+        task_id: i64,
+        summary: Option<String>,
+        by: EndBy,
+    ) -> anyhow::Result<Task> {
         let Some(task) = self.store.get_task(task_id)? else {
             let err = SendRefused {
                 code: "task_not_found",
@@ -1675,6 +1723,19 @@ impl Actor {
             };
             return Err(err.into());
         }
+        let summary = summary.filter(|s| !s.trim().is_empty());
+        let required = task.spec.summary == crate::task::SummaryMode::Require;
+        if required && summary.is_none() && by == EndBy::Agent && !task.ended {
+            let err = SendRefused {
+                code: crate::task::SUMMARY_REQUIRED,
+                message: format!(
+                    "{} needs a summary: pastor task done --summary-file - <<'EOF', then a first line done, partial, blocked or nothing to do, up to five short lines, and EOF",
+                    task.display_id()
+                ),
+            };
+            return Err(err.into());
+        }
+        let by_hand = required && summary.is_none() && by == EndBy::Hand;
         let was_done = task.state == TaskState::Done;
         let written = write_task(&self.store, task, |t| {
             if !live(t) || t.ended {
@@ -1691,13 +1752,17 @@ impl Actor {
             t.ended = true;
             true
         })?;
-        let summary = summary.filter(|s| !s.trim().is_empty());
         let ended_now = written
             .as_ref()
             .is_some_and(|t| !was_done && t.state == TaskState::Done);
         if ended_now {
             // The round ends here, with what the agent said or the pane.
-            let round = match self.store.end_round(task_id, summary.as_deref()) {
+            let round = if by_hand {
+                self.store.end_round_by_hand(task_id)
+            } else {
+                self.store.end_round(task_id, summary.as_deref())
+            };
+            let round = match round {
                 Ok(round) => Some(round),
                 Err(err) => {
                     tracing::error!(machine = %self.name, %err, task_id, "save the task's summary");
@@ -2662,10 +2727,10 @@ impl Actor {
             .clone()
             .unwrap_or_else(|| Task::agent_name_for(task.id));
         let timeout = self.settings.request_timeout;
-        let result =
-            tokio::time::timeout(timeout, self.connector.agent_prompt(&name, &task.prompt))
-                .await
-                .map_err(|_| TimedOut("agent.prompt", timeout))?;
+        let prompt = crate::task::prompt_to_send(&task);
+        let result = tokio::time::timeout(timeout, self.connector.agent_prompt(&name, &prompt))
+            .await
+            .map_err(|_| TimedOut("agent.prompt", timeout))?;
         let id = task.id;
         // Only a row still waiting for this prompt, on a live pane, takes the
         // outcome. A row closed or failed meanwhile is left as it is.
@@ -3024,6 +3089,18 @@ impl Actor {
                 }
             }
             return;
+        };
+        // An agent that stops without a summary on a task that requires one
+        // did not finish: the agent's own `task done --summary` is the only
+        // way such a task ends `done` (`end_task`).
+        let to = if to == TaskState::Done
+            && !task.ended
+            && task.spec.summary == crate::task::SummaryMode::Require
+        {
+            task.error = Some(crate::task::STOPPED_WITHOUT_SUMMARY.into());
+            TaskState::Failed
+        } else {
+            to
         };
         if to == TaskState::Done || !to.is_open() {
             // The next completion needs activity of its own.
@@ -3466,6 +3543,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         }
     }
 
@@ -4075,7 +4153,11 @@ mod tests {
             .into_iter()
             .rfind(|r| r.method == "agent.prompt")
             .expect("at least one agent.prompt request was made");
-        assert_eq!(sent.params["text"], "hi", "our prompt, not a stray one");
+        assert_eq!(
+            sent.params["text"],
+            format!("hi\n\n{}", crate::task::SUMMARY_ASK),
+            "our prompt, not a stray one, asking for a summary"
+        );
     }
 
     /// A store error in reconcile is pastor's problem, not the machine's: the
@@ -6067,7 +6149,10 @@ mod tests {
         assert_eq!(
             fake.pane_input(&pane),
             [
-                crate::herdr::fake::PaneInput::Text("commit and push".into()),
+                crate::herdr::fake::PaneInput::Text(format!(
+                    "commit and push {}",
+                    crate::task::SUMMARY_ASK
+                )),
                 crate::herdr::fake::PaneInput::Keys(vec!["Enter".into()]),
             ]
         );
@@ -6283,6 +6368,114 @@ mod tests {
         assert_eq!(late.source, SummarySource::Agent);
     }
 
+    /// A task whose `summary` is `require`.
+    fn new_required_task(store: &Store) -> Task {
+        store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    summary: crate::task::SummaryMode::Require,
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// With `require`, the agent's own `task done` without a summary is
+    /// refused and leaves the task as it was; with one it ends `done`.
+    #[tokio::test]
+    async fn a_required_summary_refuses_the_agents_bare_task_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_required_task(&store).id).await.unwrap();
+        let err = h.end(t.id, None).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<SendRefused>().map(|r| r.code),
+            Some(crate::task::SUMMARY_REQUIRED)
+        );
+        assert!(err.to_string().contains("--summary-file -"), "{err}");
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert!(store.summaries(t.id).unwrap().is_empty());
+        let done = h
+            .end(t.id, Some("blocked: no access".into()))
+            .await
+            .unwrap();
+        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(
+            done.summary.unwrap().outcome,
+            crate::task::Outcome::Blocked,
+            "any outcome counts"
+        );
+        // Ended with one: a bare `task done` after it keeps it.
+        let again = h.end(t.id, None).await.unwrap();
+        assert_eq!(
+            again.summary.unwrap().outcome,
+            crate::task::Outcome::Blocked
+        );
+    }
+
+    /// With `require`, a person's `task done t-N` is not refused; the round
+    /// says it was ended by hand.
+    #[tokio::test]
+    async fn a_required_summary_lets_a_person_end_the_task() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_required_task(&store).id).await.unwrap();
+        let done = h.end_by(t.id, None, EndBy::Hand).await.unwrap();
+        assert_eq!(done.state, TaskState::Done);
+        let round = done.summary.unwrap();
+        assert_eq!(round.outcome, crate::task::Outcome::NoSummary);
+        assert_eq!(round.text, crate::task::ENDED_BY_HAND);
+    }
+
+    /// With `require`, an agent pastor finds idle and finished without a
+    /// summary ends the task `failed`, with the pane's last lines kept;
+    /// with `ask` the same finish is `done`.
+    #[tokio::test]
+    async fn a_required_summary_fails_an_idle_finish_without_one() {
+        use crate::task::{Outcome, SummarySource};
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(100)),
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_required_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● All finished\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+        let failed = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            failed.error.as_deref(),
+            Some(crate::task::STOPPED_WITHOUT_SUMMARY)
+        );
+        let round = failed.summary.expect("a failed task shows its round");
+        assert_eq!(round.outcome, Outcome::NoSummary);
+        assert_eq!(round.source, SummarySource::Pane);
+        assert!(round.text.contains("All finished"), "{round:?}");
+    }
+
     /// Typing into an ended task gives it more to do: it runs again, and no
     /// longer counts as ended.
     #[tokio::test]
@@ -6298,6 +6491,18 @@ mod tests {
         let t = h.dispatch(new_task(&store).id).await.unwrap();
         let pane = t.pane_id.clone().unwrap();
         fake.set_status(&pane, AgentStatus::Working);
+        let typed = || {
+            let sent = calls(&fake, "pane.send_text");
+            sent.last().unwrap()["text"].as_str().unwrap().to_string()
+        };
+        // A reply to a running task: nothing added.
+        let reply = SendInput {
+            text: Some("carry on".into()),
+            enter: true,
+            ..Default::default()
+        };
+        h.send(t.id, reply).await.unwrap();
+        assert_eq!(typed(), "carry on");
         h.end(t.id, None).await.unwrap();
         // The rest of the turn after `task done`: work, then idle.
         fake.set_status(&pane, AgentStatus::Working);
@@ -6319,6 +6524,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sent.state, TaskState::Running);
+        // New work asks for a summary again.
+        assert_eq!(
+            typed(),
+            format!("one more thing {}", crate::task::SUMMARY_ASK)
+        );
         assert!(!sent.ended);
         assert!(!store.get_task(t.id).unwrap().unwrap().ended);
         // An idle report before the agent picks the input up must not count

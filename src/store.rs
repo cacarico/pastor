@@ -533,6 +533,25 @@ impl Store {
     /// pastor read them (`note_pane_tail`), marked `source = pane`.
     pub fn end_round(&self, id: i64, summary: Option<&str>) -> anyhow::Result<TaskSummary> {
         let row = self.summary_row(id, summary);
+        self.insert_round(id, row)
+    }
+
+    /// `end_round` for a round a person ended by hand (`task done t-N`) on
+    /// a task that requires a summary: `no summary`, with `ENDED_BY_HAND`
+    /// in place of the pane's last lines.
+    pub fn end_round_by_hand(&self, id: i64) -> anyhow::Result<TaskSummary> {
+        let row = TaskSummary {
+            round: 0,
+            outcome: Outcome::NoSummary,
+            text: crate::task::ENDED_BY_HAND.into(),
+            source: SummarySource::Pane,
+            at: Utc::now(),
+        };
+        self.insert_round(id, row)
+    }
+
+    /// Store `row` as task `id`'s next round.
+    fn insert_round(&self, id: i64, row: TaskSummary) -> anyhow::Result<TaskSummary> {
         let conn = self.conn.lock().unwrap();
         let round: u32 = conn.query_row(
             "INSERT INTO task_summaries (task_id, round, outcome, text, source, at)
@@ -1683,6 +1702,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         }
     }
 

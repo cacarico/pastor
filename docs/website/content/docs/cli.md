@@ -27,7 +27,7 @@ and so on. This page lists them; `--help` after any command lists its flags.
 
 | command | does |
 |---|---|
-| `pastor task run` | create a one-off task and dispatch it |
+| `pastor task run` | create a one-off task and dispatch it; `--summary require` fails it if the agent stops without a summary |
 | `pastor task list` | live tasks across the flock; `--all` adds finished ones |
 | `pastor task describe` | one task in full: state, machine, agent, prompt, error, summary; `--all-summaries` for every round's |
 | `pastor task read` | recent output from a task's pane |

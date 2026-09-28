@@ -1868,6 +1868,7 @@ mod tests {
             prompt: "{{ job.name }}: {{ item.title }} ({{ task.id }})".into(),
             max_tasks_per_run: 5,
             backfill: Duration::from_secs(600),
+            summary: None,
             spec: DispatchSpec {
                 agent: "claude".into(),
                 agent_args: vec![],
@@ -1885,6 +1886,7 @@ mod tests {
                 place: Default::default(),
                 session_id: None,
                 label: Default::default(),
+                summary: Default::default(),
             },
             agent: Default::default(),
             flock: None,

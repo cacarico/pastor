@@ -128,6 +128,11 @@ pub struct FlockEntry {
     /// the task or job sets none, before `[defaults] label`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Whether this flock's tasks are asked for a summary, or need one
+    /// (`SummaryMode`), when the task and its job say nothing; before
+    /// `[defaults] summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::task::SummaryMode>,
     /// One line on what the flock is for (`flock list --wide`, `describe`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -1729,6 +1734,30 @@ tags = ["fast"]
         std::fs::write(&path, "").unwrap();
         let f = Flock::load_existing(&path).unwrap();
         assert!(f.machines.is_empty());
+    }
+
+    /// A flock's `summary` is one of its words; a flock without it leaves
+    /// it to `[defaults]`.
+    #[test]
+    fn a_flocks_summary_is_one_of_its_words() {
+        let flock = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"p\"\n"
+                ),
+            )
+        };
+        assert_eq!(flock("").unwrap().entry("p").unwrap().summary, None);
+        assert_eq!(
+            flock("summary = \"off\"")
+                .unwrap()
+                .entry("p")
+                .unwrap()
+                .summary,
+            Some(crate::task::SummaryMode::Off)
+        );
+        assert!(flock("summary = \"sometimes\"").is_err());
     }
 
     /// A flock's or a machine's `model` must be a model name, and one that

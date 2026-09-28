@@ -542,6 +542,21 @@ impl Fleet {
         };
     }
 
+    /// A task's `summary` setting as it is queued in `flock`
+    /// (`Defaults::resolve_summary`), from the flock and defaults as they
+    /// stand now.
+    fn settle_summary(
+        &self,
+        ask: Option<crate::task::SummaryMode>,
+        flock: &str,
+    ) -> crate::task::SummaryMode {
+        let wanted = self.wanted.read().unwrap();
+        self.defaults
+            .read()
+            .unwrap()
+            .resolve_summary(ask, wanted.entry(flock))
+    }
+
     /// `settle` for a task being queued: on the machine it is pinned to,
     /// else with no machine yet, as dispatch settles it again on the one it
     /// picks. Refused when the agent cannot be started as resolved on any
@@ -867,11 +882,13 @@ impl Fleet {
             TaskRole::Agent,
             None,
             false,
+            None,
         )
         .await
     }
 
-    /// `queue_run`, for a task of `role` (`task run --role`).
+    /// `queue_run`, for a task of `role` (`task run --role`). `summary` is
+    /// `task run --summary`; without it the flock or `[defaults]` decide.
     #[allow(clippy::too_many_arguments)]
     pub async fn queue_run_as(
         &self,
@@ -883,6 +900,7 @@ impl Fleet {
         role: TaskRole,
         description: Option<String>,
         preempt: bool,
+        summary: Option<crate::task::SummaryMode>,
     ) -> Result<Task, QueueError> {
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
@@ -901,6 +919,7 @@ impl Fleet {
         self.settle_label(&mut spec, &flock, "task run");
         let (priority, from) =
             self.settle_priority(priority, &flock, spec.machine.as_deref(), "task run");
+        spec.summary = self.settle_summary(summary, &flock);
         // Checked against the level it settles at: a machine or flock may
         // make it critical without `--priority`.
         if preempt && priority != Priority::Critical {
@@ -969,6 +988,7 @@ impl Fleet {
         // queues as it would without it.
         let preempt = job.preempt && priority == Priority::Critical;
         let description = job.task_description_for(item);
+        let summary = self.settle_summary(job.summary, &flock);
         self.store.insert_job_task_at(
             &job.name,
             &flock,
@@ -984,6 +1004,7 @@ impl Fleet {
                 spec.deny = settled.deny;
                 spec.agent_source = settled.agent_source;
                 spec.label = settled.label;
+                spec.summary = summary;
                 Ok((prompt, spec))
             },
         )
@@ -1083,6 +1104,21 @@ impl Fleet {
                     protocol,
                     crate::ipc::LABEL_PROTOCOL,
                     "a job naming a workspace label",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
+        // `summary` rides in `dispatch` the same way; a head before
+        // `SUMMARY_MODE_PROTOCOL` would answer an opaque `invalid_dispatch`.
+        if job.summary.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::SUMMARY_MODE_PROTOCOL,
+                    "a job with summary",
                 )?,
                 other => anyhow::bail!("the head answered a ping with {other:?}"),
             }
@@ -1983,6 +2019,13 @@ impl Daemon {
                 return IpcResponse::error("agent_refused", refusal(task, role));
             }
         }
+        // The agent ending its own task: one that must say what it did is
+        // held to it (`SummaryMode::Require`).
+        if req.ends_own_task(task)
+            && let IpcRequest::TaskDone { id, summary } = req
+        {
+            return self.end(id, summary, crate::machine::EndBy::Agent).await;
+        }
         self.handle(req).await
     }
 
@@ -2068,6 +2111,7 @@ impl Daemon {
                 role,
                 description,
                 preempt,
+                summary,
             } => {
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
@@ -2099,6 +2143,7 @@ impl Daemon {
                         role,
                         crate::config::clean_description(description.as_deref()),
                         preempt,
+                        summary,
                     )
                     .await
                 {
@@ -2309,7 +2354,9 @@ impl Daemon {
                 remove_worktree,
             } => self.close(id, remove_worktree).await,
             IpcRequest::TaskSend { id, input } => self.send(id, input).await,
-            IpcRequest::TaskDone { id, summary } => self.end(id, summary).await,
+            IpcRequest::TaskDone { id, summary } => {
+                self.end(id, summary, crate::machine::EndBy::Hand).await
+            }
             IpcRequest::TaskPrune {
                 states,
                 older_than_secs,
@@ -2393,6 +2440,8 @@ impl Daemon {
                     // sending the item; the head does not re-render it.
                     priority: None,
                     preempt: false,
+                    // `JobTask` carries none: the flock's or `[defaults]`.
+                    summary: None,
                     dispatch: serde_json::Value::Null,
                 };
                 self.job_task(job, item).await
@@ -2618,7 +2667,14 @@ impl Daemon {
     /// `TaskDone`: through the actor of the task's machine, which checks the
     /// row again and marks it done and ended. A task on no machine, or one
     /// whose machine has left the flock, has no pane to end.
-    async fn end(&self, id: i64, summary: Option<String>) -> IpcResponse {
+    /// `by` is who asks (`EndBy`): the task's own agent (`handle_from`), or
+    /// anyone else.
+    async fn end(
+        &self,
+        id: i64,
+        summary: Option<String>,
+        by: crate::machine::EndBy,
+    ) -> IpcResponse {
         let task = match self.store.get_task(id) {
             Ok(Some(t)) => t,
             Ok(None) => return IpcResponse::error("task_not_found", format!("t-{id}")),
@@ -2639,7 +2695,7 @@ impl Daemon {
                 ),
             );
         };
-        match handle.end(id, summary).await {
+        match handle.end_by(id, summary, by).await {
             Ok(t) => IpcResponse::Task(t),
             Err(err) => match err.downcast_ref::<SendRefused>() {
                 Some(r) => IpcResponse::error(r.code, r),
@@ -3009,6 +3065,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         }
     }
 
@@ -3638,6 +3695,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "hi".into(),
@@ -3690,6 +3748,7 @@ mod tests {
         let IpcResponse::Task(first) = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "1".into(),
@@ -3706,6 +3765,7 @@ mod tests {
         let IpcResponse::Task(second) = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "2".into(),
@@ -3741,6 +3801,7 @@ mod tests {
     fn run_at(prompt: &str, priority: Option<Priority>) -> IpcRequest {
         IpcRequest::Run {
             preempt: false,
+            summary: None,
             prompt: prompt.into(),
             spec: spec(),
             flock: None,
@@ -3838,6 +3899,7 @@ mod tests {
         .await;
         let run = |machine: Option<&str>, priority: Option<Priority>| IpcRequest::Run {
             preempt: false,
+            summary: None,
             prompt: "x".into(),
             spec: DispatchSpec {
                 machine: machine.map(Into::into),
@@ -3954,6 +4016,7 @@ mod tests {
             role: TaskRole::Agent,
             description: None,
             preempt: false,
+            summary: None,
         };
         let task = |resp: IpcResponse| match resp {
             IpcResponse::Task(t) => t,
@@ -4094,6 +4157,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -4124,6 +4188,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -4180,6 +4245,7 @@ mod tests {
     fn run_in(flock: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
             preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -4208,6 +4274,7 @@ mod tests {
         .await;
         let run = |flock: &str, agent: Option<AgentChoice>| IpcRequest::Run {
             preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -4298,6 +4365,7 @@ mod tests {
         .await;
         let run = |agent: Option<&str>| IpcRequest::Run {
             preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -4368,6 +4436,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -4445,6 +4514,7 @@ mod tests {
     fn run_model(model: Option<&str>, agent: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
             preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -4754,6 +4824,7 @@ mod tests {
     fn run_profile(profile: Option<&str>, machine: Option<&str>) -> IpcRequest {
         let IpcRequest::Run {
             preempt: false,
+            summary: _,
             prompt,
             spec,
             flock,
@@ -4767,6 +4838,7 @@ mod tests {
         };
         IpcRequest::Run {
             preempt: false,
+            summary: None,
             prompt,
             spec,
             flock,
@@ -4851,6 +4923,7 @@ mod tests {
         );
         let IpcRequest::Run {
             preempt: false,
+            summary: _,
             prompt,
             spec,
             flock,
@@ -4864,6 +4937,7 @@ mod tests {
         };
         let conflict = IpcRequest::Run {
             preempt: false,
+            summary: None,
             prompt,
             spec,
             flock,
@@ -4997,6 +5071,7 @@ mod tests {
         let IpcResponse::Task(busy) = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 prompt: "busy".into(),
                 spec: spec(),
                 flock: None,
@@ -5196,6 +5271,7 @@ mod tests {
         .await;
         let run = || IpcRequest::Run {
             preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -5787,6 +5863,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -5814,6 +5891,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -5889,6 +5967,7 @@ mod tests {
             &socket,
             &IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "hi".into(),
@@ -5946,6 +6025,7 @@ mod tests {
     fn run_hi_as(role: TaskRole) -> IpcRequest {
         IpcRequest::Run {
             preempt: false,
+            summary: None,
             role,
             description: None,
             prompt: "hi".into(),
@@ -6038,6 +6118,115 @@ mod tests {
             store.get_task(theirs.id).unwrap().unwrap().state,
             theirs.state
         );
+    }
+
+    /// `req`, a `Run`, with `task run --summary mode`.
+    fn with_summary(mut req: IpcRequest, mode: crate::task::SummaryMode) -> IpcRequest {
+        if let IpcRequest::Run { summary, .. } = &mut req {
+            *summary = Some(mode);
+        }
+        req
+    }
+
+    /// A task that requires a summary refuses its own agent's bare `task
+    /// done`, and takes a person's, whose round says it was ended by hand.
+    #[tokio::test]
+    async fn a_required_summary_holds_the_agent_not_a_person() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let run = || with_summary(run_hi(), crate::task::SummaryMode::Require);
+        let IpcResponse::Task(mine) = d.handle(run()).await else {
+            panic!("run failed")
+        };
+        let IpcResponse::Task(other) = d.handle(run()).await else {
+            panic!("run failed")
+        };
+        assert_eq!(mine.spec.summary, crate::task::SummaryMode::Require);
+        let store = d.store.clone();
+        let socket = serving(d).await;
+        let bare = |id| IpcRequest::TaskDone { id, summary: None };
+        let resp = ask_as(&socket, &bare(mine.id), &mine.display_id()).await;
+        assert_eq!(
+            code_of(&resp),
+            Some(crate::task::SUMMARY_REQUIRED),
+            "{resp:?}"
+        );
+        assert!(!store.get_task(mine.id).unwrap().unwrap().ended);
+        let with_one = IpcRequest::TaskDone {
+            id: mine.id,
+            summary: Some("done\npushed".into()),
+        };
+        let resp = ask_as(&socket, &with_one, &mine.display_id()).await;
+        assert!(
+            matches!(resp, IpcResponse::Task(ref t) if t.ended),
+            "{resp:?}"
+        );
+        // A person, with no task of their own.
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let line = crate::ipc::request_line(&bare(other.id), None).unwrap();
+        w.write_all(line.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        BufReader::new(r).read_line(&mut reply).await.unwrap();
+        let resp: IpcResponse = serde_json::from_str(reply.trim()).unwrap();
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(t.ended);
+        assert_eq!(t.summary.unwrap().text, crate::task::ENDED_BY_HAND);
+    }
+
+    /// A task's `summary` comes from `task run --summary`, else its job's,
+    /// else its flock's, else `[defaults]` (unset here: `ask`), and is
+    /// stored on the task.
+    #[tokio::test]
+    async fn the_summary_setting_is_settled_when_a_task_is_queued() {
+        use crate::task::SummaryMode;
+        let mut flock = home_and_work();
+        flock.flocks.push(crate::config::flock::FlockEntry {
+            name: "quiet".into(),
+            summary: Some(SummaryMode::Off),
+            ..Default::default()
+        });
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("h", 2, FakeHerdr::new()), ("w", 2, FakeHerdr::new())],
+        )
+        .await;
+        let settled = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => t.spec.summary,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            settled(d.handle(run_in(None, None)).await),
+            SummaryMode::Ask
+        );
+        assert_eq!(
+            settled(d.handle(run_in(Some("quiet"), None)).await),
+            SummaryMode::Off
+        );
+        let asked = with_summary(run_in(Some("quiet"), None), SummaryMode::Require);
+        assert_eq!(settled(d.handle(asked).await), SummaryMode::Require);
+        let submit = |job: &str, dispatch: serde_json::Value| IpcRequest::JobSubmit {
+            job: job.into(),
+            dispatch,
+            prompt: "p".into(),
+            items: vec![serde_json::json!({"key": "k"})],
+        };
+        let job_task = |resp: IpcResponse| match resp {
+            IpcResponse::JobSubmitted { tasks, .. } => tasks[0].spec.summary,
+            other => panic!("{other:?}"),
+        };
+        let from_flock = d
+            .handle(submit("j1", serde_json::json!({"flock": "quiet"})))
+            .await;
+        assert_eq!(job_task(from_flock), SummaryMode::Off);
+        let from_job = d
+            .handle(submit(
+                "j2",
+                serde_json::json!({"flock": "quiet", "summary": "require"}),
+            ))
+            .await;
+        assert_eq!(job_task(from_job), SummaryMode::Require);
     }
 
     /// A task with no pane has nothing to end.
@@ -7050,6 +7239,7 @@ mod tests {
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "hi".into(),
@@ -7187,6 +7377,7 @@ mod tests {
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -7222,6 +7413,7 @@ mod tests {
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -7590,6 +7782,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -7638,6 +7831,7 @@ mod tests {
                 role: Default::default(),
                 description: None,
                 preempt,
+                summary: None,
             }
         }
 

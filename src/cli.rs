@@ -336,6 +336,7 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         ("priority", priority),
         ("job", t.job.clone()),
         ("role", t.role.to_string()),
+        ("summary", t.spec.summary.describe()),
         ("flock", opt(&t.flock)),
         ("machine", opt(&t.machine)),
         ("agent", agent),
@@ -1160,6 +1161,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -1227,6 +1229,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -1384,6 +1387,24 @@ mod tests {
         );
     }
 
+    /// `task describe` says whether pastor asks the task for a summary.
+    #[test]
+    fn a_task_shows_its_summary_setting() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("summary:    ask (line added to the prompt)\n"),
+            "{out}"
+        );
+        t.spec.summary = crate::task::SummaryMode::Require;
+        assert!(
+            task_detail(&t)
+                .contains("summary:    require (line added to the prompt; fails without one)\n")
+        );
+        t.spec.summary = crate::task::SummaryMode::Off;
+        assert!(task_detail(&t).contains("summary:    off (nothing added to the prompt)\n"));
+    }
+
     /// `task describe` names the task's role, and `task list --json`'s
     /// record carries it, plain agents included.
     #[test]
@@ -1417,6 +1438,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         });
         let out = task_detail(&t);
         assert!(
@@ -1452,6 +1474,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);
@@ -1498,6 +1521,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
         let note = task_rows(std::slice::from_ref(&t))[0]
@@ -1528,6 +1552,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
         let out = task_detail(&t);
