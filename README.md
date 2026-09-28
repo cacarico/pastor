@@ -257,7 +257,9 @@ machine names.
   From its terminal it can read (`task list`, `describe`) and end its own
   task with `pastor task done`, but it can't start tasks, stop other tasks,
   edit machines, jobs or settings, or start its own head, unless you allow it
-  with `agents_change_fleet = true`.
+  with `agents_change_fleet = true`. A task you start with `pastor task run
+  --role orchestrator` may also run, retry and send to tasks and disable a
+  job, and nothing more; no task can start one.
 - **Agents keep their permission prompts.** pastor passes the allow and deny
   lists you set for each flock. Turning the prompts off is your decision, and
   [the manual](docs/manual.md#trust-model) says when not to.

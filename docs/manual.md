@@ -1024,6 +1024,7 @@ pastor task run "Review the open PR" --agent-arg=--model --agent-arg=claude-opus
 pastor task run "Fix the typo in README" --model sonnet   # a [models] name from pastor.toml
 pastor task run "Triage the inbox" --flock work   # only work machines take it
 pastor task run --prompt-file ./prompt.md --repo '~/work/api'   # a long prompt, no shell quoting
+pastor task run --prompt-file ./plan.md --role orchestrator   # may run, retry and send to tasks and disable jobs
 mkdir -p ~/.config/pastor/jobs
 cat > ~/.config/pastor/jobs/hourly.toml <<'EOF'
 every = "1h"
@@ -1776,6 +1777,21 @@ So:
   `agents_change_fleet = true` in `pastor.toml` turns this off. It stops an
   agent acting on its own, not a determined one: it runs as the same user and
   can unset the variable.
+- A task's role widens that guard for one task. `pastor task run --role
+  orchestrator` starts an orchestrator: from its pane it may also run tasks
+  (`task run`), retry and send to them (`task retry`, `task send`) and
+  disable a job (`job disable`); everything else that changes the fleet is
+  still `agent_refused`, `task close` and `job enable` included, and the
+  message names the role. Only a person starts one: `--role orchestrator`
+  from any task's pane is `role_refused`, an orchestrator's included and
+  whatever `agents_change_fleet` says, and so is a retry of an orchestrator
+  from a task's pane, since the copy keeps the role. The head keeps the role
+  (`role` in `task describe` and `task list --json`, `agent` for every other
+  task), so these go through `pastor serve`: with no head, `job disable` from
+  a task's pane is refused. Like the rest of the guard, a role is a guard
+  against an agent's mistakes, not a boundary: an orchestrator runs as the
+  same user as pastor and can do anything that user can. `--role
+  orchestrator` needs a head of IPC protocol 10 (`head_too_old`).
 
 The head's user is the fleet's trust boundary. Anything that runs as that
 user on the head controls every machine in the flock file, because it can:
@@ -1873,7 +1889,7 @@ sends nothing. A head from before these requests is refused
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
-~/.local/state/pastor/pastor.db   tasks (schema 9, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from and queue_pos), seen keys, job state, trusted repos, the last event seq
+~/.local/state/pastor/pastor.db   tasks (schema 10, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos and role), seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)

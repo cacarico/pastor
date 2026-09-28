@@ -73,10 +73,12 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l tag -d 'Only a machine with this tag takes the task; repeat for more, and it needs them all' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l timeout -d 'Mark the task stale once it has run this long (30m, 2h; default: `[defaults]` timeout)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l place -d 'Where the agent\'s pane goes: repo (under the repo it works on), own (its own workspace), pastor (the `pastor` workspace) or pane:<workspace> (default: `[defaults] place`, else repo)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l role -d 'What the agent may change through the head: agent (read, and end its own task) or orchestrator (also run, retry and send to tasks and disable jobs). Only a person may start an orchestrator, never a task' -r -f -a "agent\t'Reads, and `task done` for its own task; everything else is refused unless `agents_change_fleet` is on'
+orchestrator\t'Also runs, retries and types into tasks and disables jobs (`IpcRequest::orchestrator_may`). Only a person makes one: `task run --role orchestrator` from outside any task'"
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l worktree -d 'A git worktree per task, branched from --repo (so it needs --repo)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l json -d 'Print as a JSON object'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l job -d 'Only tasks from this job (omit for one-off `run` tasks)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l flock -d 'Only tasks of this flock' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l machine -d 'Only tasks on this machine' -r

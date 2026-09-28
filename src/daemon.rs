@@ -22,7 +22,7 @@ use crate::machine::{
 };
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{NewTask, PriorityError, RetryError, Store, TaskFilter};
-use crate::task::{AgentSource, PANE_OWNING_STATES, Priority, Task, TaskState};
+use crate::task::{AgentSource, PANE_OWNING_STATES, Priority, Task, TaskRole, TaskState};
 
 /// Where a headless serve's fleet sends each item its jobs find
 /// (`IpcRequest::JobTask`): to the head, which answers the task it queued.
@@ -773,10 +773,24 @@ impl Fleet {
     pub async fn queue_run(
         &self,
         prompt: String,
+        spec: crate::task::DispatchSpec,
+        flock: Option<&str>,
+        ask: Option<&AgentChoice>,
+        priority: Option<Priority>,
+    ) -> Result<Task, QueueError> {
+        self.queue_run_as(prompt, spec, flock, ask, priority, TaskRole::Agent)
+            .await
+    }
+
+    /// `queue_run`, for a task of `role` (`task run --role`).
+    pub async fn queue_run_as(
+        &self,
+        prompt: String,
         mut spec: crate::task::DispatchSpec,
         flock: Option<&str>,
         ask: Option<&AgentChoice>,
         priority: Option<Priority>,
+        role: TaskRole,
     ) -> Result<Task, QueueError> {
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
@@ -805,6 +819,7 @@ impl Fleet {
                 },
                 priority,
                 from.as_deref(),
+                role,
             )
             .map_err(QueueError::Store)
     }
@@ -1175,6 +1190,16 @@ pub(crate) async fn jobs_answer(
 
 /// Why an agent pastor started, in task `task`, was refused a change to
 /// the fleet. The CLI says the same for a change it makes on its own.
+/// What the head says when it refuses `task`, of `role`, a fleet change.
+fn refusal(task: &str, role: TaskRole) -> String {
+    match role {
+        TaskRole::Agent => agent_refusal(task),
+        TaskRole::Orchestrator => format!(
+            "{task} is an orchestrator, and an orchestrator may only run, retry and send to tasks and disable jobs besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
+        ),
+    }
+}
+
 pub fn agent_refusal(task: &str) -> String {
     format!(
         "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, reprioritize, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, serve or set up a head, open herdr's UI; `pastor task done` may end only its own task); set agents_change_fleet = true in pastor.toml to allow it"
@@ -1514,16 +1539,58 @@ impl Daemon {
 
     /// `handle`, for a caller that says it runs in a task's pane
     /// (`ipc::TASK_ENV`): unless `agents_change_fleet` is on, such a caller
-    /// may read but not change the fleet, save to end its own task.
+    /// may read but not change the fleet, save to end its own task, and an
+    /// orchestrator (`TaskRole::Orchestrator`) may make the changes
+    /// `IpcRequest::orchestrator_may` lists. No caller in a task may make an
+    /// orchestrator, `agents_change_fleet` or not: only a person does.
     pub async fn handle_from(&self, req: IpcRequest, from_task: Option<&str>) -> IpcResponse {
-        if let Some(task) = from_task
-            && req.changes_fleet()
-            && !req.ends_own_task(task)
-            && !self.fleet.agents_change_fleet()
-        {
-            return IpcResponse::error("agent_refused", agent_refusal(task));
+        let Some(task) = from_task else {
+            return self.handle(req).await;
+        };
+        if let Some(why) = self.makes_orchestrator(&req) {
+            return IpcResponse::error("role_refused", format!("{task} is a task, and {why}"));
+        }
+        if req.changes_fleet() && !req.ends_own_task(task) && !self.fleet.agents_change_fleet() {
+            let role = self.caller_role(task);
+            if !(role == TaskRole::Orchestrator && req.orchestrator_may()) {
+                return IpcResponse::error("agent_refused", refusal(task, role));
+            }
         }
         self.handle(req).await
+    }
+
+    /// Why `req` would make an orchestrator, which only a person may do:
+    /// `task run --role orchestrator`, or a retry of an orchestrator task,
+    /// whose copy keeps the role.
+    fn makes_orchestrator(&self, req: &IpcRequest) -> Option<String> {
+        match req {
+            IpcRequest::Run {
+                role: TaskRole::Orchestrator,
+                ..
+            } => Some("only a person may run a task with --role orchestrator".into()),
+            IpcRequest::TaskRetry { id, .. }
+                if self
+                    .store
+                    .get_task(*id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|t| t.role == TaskRole::Orchestrator) =>
+            {
+                Some(format!(
+                    "t-{id} is an orchestrator, whose retry would be one too; only a person may retry it"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The role of `task`, the task a caller says it runs in. One the store
+    /// does not know, or cannot read, is a plain agent: the refusal is the
+    /// safe side.
+    fn caller_role(&self, task: &str) -> TaskRole {
+        crate::task::parse_task_id(task)
+            .and_then(|id| self.store.get_task(id).ok().flatten())
+            .map_or(TaskRole::Agent, |t| t.role)
     }
 
     /// One `fleet_edit` edit of flock.toml for a CLI, then the reload that
@@ -1571,6 +1638,7 @@ impl Daemon {
                 flock,
                 agent,
                 priority,
+                role,
             } => {
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
@@ -1593,7 +1661,7 @@ impl Daemon {
                 }
                 let task = match self
                     .fleet
-                    .queue_run(prompt, spec, flock.as_deref(), agent.as_ref(), priority)
+                    .queue_run_as(prompt, spec, flock.as_deref(), agent.as_ref(), priority, role)
                     .await
                 {
                     Ok(t) => t,
@@ -3062,6 +3130,7 @@ mod tests {
         let mut events = d.subscribe();
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
@@ -3111,6 +3180,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
         let IpcResponse::Task(first) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "1".into(),
                 spec: spec(),
                 flock: None,
@@ -3124,6 +3194,7 @@ mod tests {
         assert_eq!(first.state, TaskState::Running);
         let IpcResponse::Task(second) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "2".into(),
                 spec: spec(),
                 flock: None,
@@ -3340,6 +3411,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     machine: Some("zzz".into()),
@@ -3367,6 +3439,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new()), ("b", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     machine: Some("b".into()),
@@ -3420,6 +3493,7 @@ mod tests {
 
     fn run_in(flock: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            role: Default::default(),
             prompt: "x".into(),
             spec: DispatchSpec {
                 machine: machine.map(Into::into),
@@ -3445,6 +3519,7 @@ mod tests {
         )
         .await;
         let run = |flock: &str, agent: Option<AgentChoice>| IpcRequest::Run {
+            role: Default::default(),
             prompt: "x".into(),
             spec: spec(),
             flock: Some(flock.into()),
@@ -3531,6 +3606,7 @@ mod tests {
         )
         .await;
         let run = |agent: Option<&str>| IpcRequest::Run {
+            role: Default::default(),
             prompt: "x".into(),
             spec: spec(),
             flock: Some("work".into()),
@@ -3598,6 +3674,7 @@ mod tests {
         std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "x".into(),
                 spec: spec(),
                 flock: Some("work".into()),
@@ -3672,6 +3749,7 @@ mod tests {
 
     fn run_model(model: Option<&str>, agent: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            role: Default::default(),
             prompt: "x".into(),
             spec: DispatchSpec {
                 machine: machine.map(Into::into),
@@ -3924,6 +4002,7 @@ mod tests {
         )
         .await;
         let run = || IpcRequest::Run {
+            role: Default::default(),
             prompt: "x".into(),
             spec: spec(),
             flock: None,
@@ -4507,6 +4586,7 @@ mod tests {
         assert!(diff.is_empty(), "{diff:?}");
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "x".into(),
                 spec: spec(),
                 flock: Some("home".into()),
@@ -4531,6 +4611,7 @@ mod tests {
         let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(false).await;
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     machine: Some("b".into()),
@@ -4603,6 +4684,7 @@ mod tests {
         let resp = crate::ipc::request(
             &socket,
             &IpcRequest::Run {
+                role: Default::default(),
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
@@ -4652,7 +4734,12 @@ mod tests {
     }
 
     fn run_hi() -> IpcRequest {
+        run_hi_as(TaskRole::Agent)
+    }
+
+    fn run_hi_as(role: TaskRole) -> IpcRequest {
         IpcRequest::Run {
+            role,
             prompt: "hi".into(),
             spec: spec(),
             flock: None,
@@ -4751,6 +4838,225 @@ mod tests {
             matches!(&resp, IpcResponse::Error { code, .. } if code == "task_not_live"),
             "{resp:?}"
         );
+    }
+
+    /// An orchestrator task, queued as a person would, and its agent name.
+    async fn orchestrator(d: &Daemon) -> String {
+        let IpcResponse::Task(t) = d.handle(run_hi_as(TaskRole::Orchestrator)).await else {
+            panic!("run failed")
+        };
+        assert_eq!(t.role, TaskRole::Orchestrator);
+        t.display_id()
+    }
+
+    fn code_of(resp: &IpcResponse) -> Option<&str> {
+        match resp {
+            IpcResponse::Error { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// A job file `name` in the head's jobs directory, enabled.
+    fn write_job(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        let file = paths.jobs_dir().join(format!("{name}.toml"));
+        std::fs::write(
+            &file,
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p {{ task.id }}\"\n",
+        )
+        .unwrap();
+        file
+    }
+
+    /// An orchestrator may run, retry and send to tasks and disable a job,
+    /// all from its own pane with `agents_change_fleet` off.
+    #[tokio::test]
+    async fn an_orchestrator_may_run_retry_send_and_disable() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        assert!(!d.fleet().agents_change_fleet());
+        let me = orchestrator(&d).await;
+        let own = me.as_str();
+
+        let resp = d.handle_from(run_hi(), Some(own)).await;
+        let IpcResponse::Task(worker) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(worker.role, TaskRole::Agent);
+
+        let send = IpcRequest::TaskSend {
+            id: worker.id,
+            input: crate::machine::SendInput {
+                text: Some("go on".into()),
+                enter: true,
+                ..Default::default()
+            },
+        };
+        let resp = d.handle_from(send, Some(own)).await;
+        assert_ne!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+
+        let mut failed = d.store.get_task(worker.id).unwrap().unwrap();
+        failed.state = TaskState::Failed;
+        d.store.update_task(&mut failed).unwrap();
+        let resp = d
+            .handle_from(
+                IpcRequest::TaskRetry {
+                    id: worker.id,
+                    place: None,
+                },
+                Some(own),
+            )
+            .await;
+        let IpcResponse::Task(retry) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(retry.retry_of, Some(worker.id));
+
+        let file = write_job(&tmp, "clock");
+        let resp = d
+            .handle_from(
+                IpcRequest::JobSetEnabled {
+                    name: "clock".into(),
+                    enabled: false,
+                },
+                Some(own),
+            )
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("enabled = false")
+        );
+    }
+
+    /// Everything else that changes the fleet is refused an orchestrator,
+    /// with a message that names the role; a plain agent is still refused
+    /// what an orchestrator may do.
+    #[tokio::test]
+    async fn an_orchestrator_is_refused_every_other_fleet_change() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let me = orchestrator(&d).await;
+        let IpcResponse::Task(worker) = d.handle(run_hi()).await else {
+            panic!("run failed")
+        };
+        let file = write_job(&tmp, "clock");
+        let refused = [
+            IpcRequest::FilePut {
+                file: "job:clock".into(),
+                text: String::new(),
+                base_hash: String::new(),
+            },
+            IpcRequest::MachineAdd {
+                machine: crate::config::flock::MachineConfig {
+                    name: "m".into(),
+                    local: true,
+                    ssh: None,
+                    command: None,
+                    session: "default".into(),
+                    max_agents: 1,
+                    tags: vec![],
+                    flock: None,
+                    agent: None,
+                    agent_args: None,
+                    model: None,
+                },
+            },
+            IpcRequest::TaskClose {
+                id: worker.id,
+                remove_worktree: false,
+            },
+            IpcRequest::JobSetEnabled {
+                name: "clock".into(),
+                enabled: true,
+            },
+            IpcRequest::JobRun {
+                name: "clock".into(),
+            },
+            IpcRequest::Reload,
+        ];
+        for req in refused {
+            let resp = d.handle_from(req.clone(), Some(&me)).await;
+            let IpcResponse::Error { code, message } = resp else {
+                panic!("{req:?} was not refused: {resp:?}")
+            };
+            assert_eq!(code, "agent_refused", "{req:?}");
+            assert!(message.contains("orchestrator"), "{message}");
+            assert!(message.contains(&me), "{message}");
+        }
+        assert_eq!(
+            d.store.get_task(worker.id).unwrap().unwrap().state,
+            worker.state
+        );
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("enabled"));
+
+        let agent = worker.display_id();
+        let resp = d.handle_from(run_hi(), Some(&agent)).await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        let resp = d
+            .handle_from(
+                IpcRequest::JobSetEnabled {
+                    name: "clock".into(),
+                    enabled: false,
+                },
+                Some(&agent),
+            )
+            .await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        // A task the head does not know is a plain agent.
+        let resp = d.handle_from(run_hi(), Some("t-999")).await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+    }
+
+    /// No task makes an orchestrator, not an orchestrator and not with
+    /// `agents_change_fleet` on: neither with `--role orchestrator` nor by
+    /// retrying one. A person may.
+    #[tokio::test]
+    async fn only_a_person_makes_an_orchestrator() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        d.fleet().set_config(&PastorConfig {
+            agents_change_fleet: true,
+            ..test_config()
+        });
+        let me = orchestrator(&d).await;
+        let IpcResponse::Task(worker) = d.handle(run_hi()).await else {
+            panic!("run failed")
+        };
+        let run_orch = run_hi_as(TaskRole::Orchestrator);
+        for caller in [me.as_str(), &worker.display_id()] {
+            let resp = d.handle_from(run_orch.clone(), Some(caller)).await;
+            let IpcResponse::Error { code, message } = resp else {
+                panic!("{resp:?}")
+            };
+            assert_eq!(code, "role_refused");
+            assert!(message.contains("orchestrator"), "{message}");
+        }
+        let id = crate::task::parse_task_id(&me).unwrap();
+        let mut failed = d.store.get_task(id).unwrap().unwrap();
+        failed.state = TaskState::Failed;
+        d.store.update_task(&mut failed).unwrap();
+        let retry = IpcRequest::TaskRetry { id, place: None };
+        let resp = d
+            .handle_from(retry.clone(), Some(&worker.display_id()))
+            .await;
+        assert_eq!(code_of(&resp), Some("role_refused"), "{resp:?}");
+        let before = d.store.list_tasks(&TaskFilter::default()).unwrap().len();
+        assert_eq!(before, 2);
+        let IpcResponse::Task(again) = d.handle_from(retry, None).await else {
+            panic!("a person's retry failed")
+        };
+        assert_eq!(again.role, TaskRole::Orchestrator);
+        // With agents_change_fleet on, a plain agent may still close tasks.
+        let resp = d
+            .handle_from(
+                IpcRequest::TaskClose {
+                    id: worker.id,
+                    remove_worktree: false,
+                },
+                Some(&worker.display_id()),
+            )
+            .await;
+        assert_ne!(code_of(&resp), Some("agent_refused"), "{resp:?}");
     }
 
     /// The refusal names every operation it covers, so its advice holds for
@@ -5380,6 +5686,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
@@ -5514,6 +5821,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "x".into(),
                 spec: spec(),
                 flock: None,
@@ -5546,6 +5854,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "x".into(),
                 spec: spec(),
                 flock: None,
@@ -5911,6 +6220,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                role: Default::default(),
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     worktree: true,

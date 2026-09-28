@@ -2950,6 +2950,74 @@ fn an_agent_may_end_its_own_task_only() {
     assert_eq!(env.json(&["task", "done", "t-2", "--json"])["ended"], true);
 }
 
+/// A person starts an orchestrator with `task run --role orchestrator`; from
+/// its pane it may run tasks, but not close one or make another
+/// orchestrator, and no plain agent may make one either. `task describe` and
+/// `task list --json` name the role.
+#[test]
+fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
+    let env = start();
+    let o = env.json(&[
+        "task",
+        "run",
+        "plan",
+        "--repo",
+        "/tmp",
+        "--role",
+        "orchestrator",
+        "--json",
+    ]);
+    assert_eq!(o["role"], "orchestrator", "{o}");
+    let from = |task: &str, args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("PASTOR_TASK", task)
+            .output()
+            .unwrap()
+    };
+    let worker: serde_json::Value = serde_json::from_str(&ok(from(
+        "t-1",
+        &["task", "run", "go", "--repo", "/tmp", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(worker["role"], "agent", "{worker}");
+    for task in ["t-1", "t-2"] {
+        let out = from(
+            task,
+            &[
+                "task",
+                "run",
+                "go",
+                "--repo",
+                "/tmp",
+                "--role",
+                "orchestrator",
+            ],
+        );
+        assert_eq!(error_code(&out), "role_refused", "{task}");
+    }
+    assert_eq!(
+        error_code(&from("t-1", &["task", "close", "t-2"])),
+        "agent_refused"
+    );
+    assert_eq!(
+        error_code(&from("t-2", &["task", "run", "go", "--repo", "/tmp"])),
+        "agent_refused"
+    );
+    let listed = env.json(&["task", "list", "--json"]);
+    let roles: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["agent", "orchestrator"], "{listed}");
+    let text = ok(env.cmd(&["task", "describe", "t-1"]));
+    assert!(text.contains("role:       orchestrator"), "{text}");
+}
+
 /// Machine, flock and job edits need no head, so the CLI refuses them
 /// itself, and leaves flock.toml as it was; `agents_change_fleet = true`
 /// turns that off.

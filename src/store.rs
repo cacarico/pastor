@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Priority, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -284,6 +284,7 @@ impl Store {
                         priority TEXT NOT NULL DEFAULT 'normal',
                         priority_from TEXT,
                         queue_pos INTEGER,
+                        role TEXT NOT NULL DEFAULT 'agent',
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -371,6 +372,11 @@ impl Store {
                         [],
                     )?;
                 }
+                // What the task's agent may change (`Task::role`); every
+                // older row is a plain agent.
+                if v < 10 {
+                    add_column(&tx, "role", "role TEXT NOT NULL DEFAULT 'agent'")?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -388,24 +394,25 @@ impl Store {
     }
 
     pub fn insert_task(&self, t: NewTask) -> anyhow::Result<Task> {
-        self.insert_task_at(t, Priority::Normal, None)
+        self.insert_task_at(t, Priority::Normal, None, crate::task::TaskRole::Agent)
     }
 
-    /// `insert_task` at `priority`, which `from` set (`Task::priority_from`).
-    /// The task goes last among its level's queued tasks: its position is
-    /// its id.
+    /// `insert_task` at `priority`, which `from` set (`Task::priority_from`),
+    /// for a task of `role` (`task run --role`). The task goes last among
+    /// its level's queued tasks: its position is its id.
     pub fn insert_task_at(
         &self,
         t: NewTask,
         priority: Priority,
         from: Option<&str>,
+        role: crate::task::TaskRole,
     ) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?8)",
-            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, now],
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?9)",
+            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, role.as_str(), now],
         )?;
         let id = tx.last_insert_rowid();
         place_last(&tx, id)?;
@@ -574,9 +581,10 @@ impl Store {
         let tx = conn.transaction()?;
         // Check and copy in one statement, so a task closed, pruned or
         // finished by another writer in between is not retried. The copy
-        // keeps the level, and where it came from, but queues last in it.
+        // keeps the level, its role, and where it came from, but queues
+        // last in it.
         let n = tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, retry_of, priority, priority_from, created_at, updated_at)
+            "INSERT INTO tasks (job, item, prompt, spec, flock, role, state, retry_of, priority, priority_from, created_at, updated_at)
              SELECT job, item, prompt,
                     json_patch(json_remove(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
                          THEN json_remove(spec, '$.checkout', '$.reopen')
@@ -587,7 +595,7 @@ impl Store {
                                                    'agent', COALESCE(agent_name, 't-' || id)))
                          ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
                          '$.session_id'), ?3),
-                    flock, 'queued', id, priority, priority_from, ?2, ?2 FROM tasks
+                    flock, role, 'queued', id, priority, priority_from, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
         )?;
@@ -1122,6 +1130,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let updated_at: String = row.get("updated_at")?;
     let started_at: Option<String> = row.get("started_at")?;
     let finished_at: Option<String> = row.get("finished_at")?;
+    let role: String = row.get("role")?;
     Ok(Task {
         id: row.get("id")?,
         job: row.get("job")?,
@@ -1153,6 +1162,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         queue_pos: row
             .get::<_, Option<i64>>("queue_pos")?
             .unwrap_or(row.get("id")?),
+        role: role.parse().map_err(conversion_failure::<String>)?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -1194,7 +1204,7 @@ fn row_to_job_state(row: &Row<'_>) -> rusqlite::Result<JobState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::{Checkout, Reopen};
+    use crate::task::{Checkout, Reopen, TaskRole};
 
     /// A headless serve keeps seen keys and its event cursor with no task
     /// rows of its own.
@@ -2124,6 +2134,47 @@ mod tests {
         assert!(s.get_task(1).unwrap().unwrap().ended);
     }
 
+    /// A v8 database has no roles; opening it adds the column and every
+    /// row reads as a plain agent.
+    #[test]
+    fn a_v8_database_gains_role_as_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN role;
+                 UPDATE meta SET value = '8' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(s.get_task(1).unwrap().unwrap().role, TaskRole::Agent);
+    }
+
+    /// A task keeps the role it was queued with, and its retry, the same
+    /// task again, keeps it too.
+    #[test]
+    fn a_task_keeps_its_role_and_a_retry_copies_it() {
+        let s = Store::open_in_memory().unwrap();
+        let plain = s.insert_task(new_task("run")).unwrap();
+        assert_eq!(plain.role, TaskRole::Agent);
+        let o = s
+            .insert_task_at(new_task("run"), Priority::Normal, None, TaskRole::Orchestrator)
+            .unwrap();
+        assert_eq!(o.role, TaskRole::Orchestrator);
+        let mut o = s.get_task(o.id).unwrap().unwrap();
+        assert_eq!(o.role, TaskRole::Orchestrator);
+        o.state = TaskState::Failed;
+        s.update_task(&mut o).unwrap();
+        let r = s.insert_retry(o.id).unwrap();
+        assert_eq!(r.role, TaskRole::Orchestrator);
+    }
+
     /// A v8 database has no levels or positions: its rows become `normal`,
     /// placed by id, so the queue keeps the order it had.
     #[test]
@@ -2169,7 +2220,11 @@ mod tests {
     #[test]
     fn queued_tasks_go_by_level_then_position_then_age() {
         let s = Store::open_in_memory().unwrap();
-        let at = |p: Priority| s.insert_task_at(new_task("run"), p, None).unwrap().id;
+        let at = |p: Priority| {
+            s.insert_task_at(new_task("run"), p, None, TaskRole::Agent)
+                .unwrap()
+                .id
+        };
         let low = at(Priority::Low);
         let normal = at(Priority::Normal);
         let high = at(Priority::High);
@@ -2342,11 +2397,12 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN priority;
                  ALTER TABLE tasks DROP COLUMN priority_from;
                  ALTER TABLE tasks DROP COLUMN queue_pos;
+                 ALTER TABLE tasks DROP COLUMN role;
                  DROP TABLE trusted_repos;
                  DROP TABLE event_seq;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '9' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '10' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -2374,7 +2430,8 @@ mod tests {
                 || c == "activity_seen"
                 || c == "ended"
                 || c == "priority"
-                || c == "queue_pos"),
+                || c == "queue_pos"
+                || c == "role"),
             "rolled back: {cols:?}"
         );
         drop(conn);

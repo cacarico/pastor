@@ -200,6 +200,7 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - When finished, run `pastor task done` (it ends your own task, from `PASTOR_TASK`), print `DONE` as your last line, then go idle. pastor marks the task `done` at once and closes your pane after `close_done_after`, freeing the machine's slot.
 - Do not close your pane or exit to clean up; `pastor task done` is how you say you are finished.
 - Do not run, send to, attach to, retry, reprioritize, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor machine open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `read`, `events`, `watch`, and `describe` for tasks, jobs, machines, flocks and connectors) is fine.
+- If `pastor task describe $PASTOR_TASK` says `role: orchestrator`, a person started you to coordinate: you may also `pastor task run`, `task retry` and `task send`, and `pastor job disable` a failing job. Everything else above is still refused, `task close` and `job enable` included, and you may never start another orchestrator (`--role orchestrator` is `role_refused` from any task).
 
 ## When something goes wrong
 

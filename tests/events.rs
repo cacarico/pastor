@@ -245,6 +245,7 @@ async fn the_daemon_writes_the_events_log() {
     let resp = pastor::ipc::request(
         &socket,
         &IpcRequest::Run {
+            role: Default::default(),
             prompt: "hi".into(),
             spec: DispatchSpec {
                 agent: "claude".into(),
