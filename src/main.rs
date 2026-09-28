@@ -91,6 +91,11 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::connector::cli::ConnectorCmd,
     },
+    /// Permission profiles: named tool allow and deny lists, built in and from pastor.toml
+    Profile {
+        #[command(subcommand)]
+        cmd: pastor::profile_cli::ProfileCmd,
+    },
     /// The repos whose folder-trust prompt pastor answers on each machine
     Trust {
         #[command(subcommand)]
@@ -561,6 +566,7 @@ fn main() {
             Command::Events(args) => pastor::events::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
+            Command::Profile { cmd } => pastor::profile_cli::run(&paths, cmd),
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
             Command::Head { cmd } => pastor::head::run(&paths, cmd, remote.as_ref()).await,

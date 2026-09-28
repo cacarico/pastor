@@ -1,5 +1,6 @@
 pub mod flock;
 pub mod job;
+pub mod profile;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -968,6 +969,9 @@ pub struct PastorConfig {
     pub agents: Agents,
     #[serde(skip_serializing_if = "Models::is_empty")]
     pub models: Models,
+    /// `[profiles.<name>]`: permission profiles beside the built-in ones.
+    #[serde(skip_serializing_if = "profile::Profiles::is_empty")]
+    pub profiles: profile::Profiles,
 }
 
 fn is_empty_agents(a: &Agents) -> bool {
@@ -988,6 +992,7 @@ impl Default for PastorConfig {
             defaults: Defaults::default(),
             agents: Agents::default(),
             models: Models::default(),
+            profiles: profile::Profiles::default(),
         }
     }
 }
@@ -1104,6 +1109,9 @@ impl PastorConfig {
                 .check(m)
                 .map_err(|e| anyhow::anyhow!("{}: defaults.model: {e}", path.display()))?;
         }
+        cfg.profiles
+            .validate()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         if cfg.agent_ready_timeout_duration() >= cfg.request_timeout_duration() {
             anyhow::bail!(
                 "{}: agent_ready_timeout must be shorter than request_timeout",
@@ -1504,6 +1512,24 @@ mod tests {
             let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
             assert!(err.contains(says), "{text}: {err}");
         }
+    }
+
+    /// `[profiles]` loads, and a bad profile fails the file's load.
+    #[test]
+    fn profiles_load_and_bad_ones_fail_the_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[profiles.ci]\nextends = \"develop\"\nallow = [\"Bash(docker:*)\"]\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        let ci = cfg.profiles.resolve("ci").unwrap();
+        assert_eq!(ci.chain, vec!["ci", "develop"]);
+        std::fs::write(&path, "[profiles.ci]\nextends = \"nope\"\n").unwrap();
+        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        assert!(err.contains("profiles.ci") && err.contains("nope"), "{err}");
     }
 
     /// The model comes from the first of the ask, the machine, the flock

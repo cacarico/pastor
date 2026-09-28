@@ -4884,3 +4884,74 @@ fn a_headless_serve_refuses_a_running_head() {
     let out = c.cmd(&["--head", "head-up", "serve"]);
     assert_eq!(error_code(&out), "head_running");
 }
+
+/// `pastor profile list|describe` read pastor.toml with no head: the
+/// built-in profiles and the written ones, `extends` followed, and an
+/// unknown name refused.
+#[test]
+fn profile_list_and_describe_show_the_profiles() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "[profiles.ci]\ndescription = \"develop, plus docker\"\nextends = \"develop\"\nallow = [\"Bash(docker:*)\"]\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .env("PASTOR_DATA_DIR", state.join("data"))
+            .output()
+            .unwrap()
+    };
+    let out = run(&["profile", "list"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    let names: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["ci", "develop", "review", "unrestricted"],
+        "{text}"
+    );
+    assert!(
+        text.contains("pastor.toml  develop  develop, plus docker"),
+        "{text}"
+    );
+
+    let out = run(&["profile", "describe", "ci", "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let ci: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(ci["chain"], serde_json::json!(["ci", "develop"]));
+    assert_eq!(ci["source"], "config");
+    assert_eq!(
+        ci["allow"].as_array().unwrap().last().unwrap(),
+        "Bash(docker:*)"
+    );
+    assert!(
+        ci["deny"]
+            .as_array()
+            .unwrap()
+            .contains(&"Bash(sudo:*)".into())
+    );
+
+    let out = run(&["profile", "describe", "review"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("source: built-in"), "{text}");
+    assert!(text.contains("deny: Edit, Write"), "{text}");
+
+    assert_eq!(
+        last_error(&run(&["profile", "describe", "nope"])).0,
+        "unknown_profile"
+    );
+    let (ok, out) = complete(&config, &state, &["profile", "describe", ""]);
+    assert!(ok);
+    assert!(
+        out.starts_with("ci\tdevelop, plus docker\ndevelop\t"),
+        "{out}"
+    );
+}
