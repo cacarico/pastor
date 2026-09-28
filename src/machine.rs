@@ -478,6 +478,10 @@ pub struct MachineHandle {
 /// the actor's next await, so this is only reached if a poll blocks.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
+/// How often a prompt the agent did not take is sent again before the task
+/// is left `blocked` for a human (see `Actor::unseen_prompt`).
+const MAX_PROMPT_RESENDS: u8 = 2;
+
 /// The running actor, shared by every clone of its handle. The join handle
 /// is kept, not just an abort handle, because aborting only asks the task to
 /// stop: until it has ended it can still write a row.
@@ -711,6 +715,7 @@ pub fn spawn_machine(
         rx,
         pending_done: HashMap::new(),
         trust_answered: HashMap::new(),
+        unseen_prompt: HashMap::new(),
         idle_agents: HashSet::new(),
         was_connected: false,
         failures: 0,
@@ -748,13 +753,22 @@ struct Actor {
     /// agent is still idle at that same sequence; with no sequence, the first
     /// check records one and starts the window over.
     pending_done: HashMap<i64, (Option<u64>, Instant)>,
-    /// task id -> when its trust keys went in. Claude redraws for a moment
-    /// after its trust dialog, already reported idle and ready, and loses a
-    /// prompt typed then although herdr accepts it; the pending prompt waits
-    /// `settle` from here (`deliver_pending_prompt`, `deliver_held_prompts`).
-    /// Kept in memory only: an actor started later comes well after the
-    /// redraw.
+    /// task id -> when its startup prompt was answered: its trust keys went
+    /// in, or, answered by a person at the pane, when the agent was first
+    /// seen out of `blocked`. Claude redraws for a moment after its trust
+    /// dialog, already reported idle and ready, and loses a prompt typed then
+    /// although herdr accepts it; the pending prompt waits `settle` from here
+    /// (`deliver_pending_prompt`, `deliver_held_prompts`). Kept in memory
+    /// only: an actor started later comes well after the redraw.
     trust_answered: HashMap<i64, Instant>,
+    /// task id -> how often its prompt was sent again, for a task whose
+    /// agent this actor gave its prompt (dispatch or a pending delivery) and
+    /// has not seen `working` or `blocked` since. An agent still idle a
+    /// settle window later at the sequence the prompt went in at never took
+    /// it: `confirm_pending_done` sends it again, up to `MAX_PROMPT_RESENDS`
+    /// times, then marks the task `blocked`. Kept in memory only, like the
+    /// activity flag was: after a restart such a task stays `running`.
+    unseen_prompt: HashMap<i64, u8>,
     /// Tasks whose agent this actor last saw `idle` or `done` (`unknown`
     /// changes nothing). Decides what an exit means: an agent that ends
     /// between turns finished its task; see `Observed::PaneExited`.
@@ -1413,6 +1427,12 @@ impl Actor {
         match cmd {
             MachineCommand::Dispatch { task_id, reply } => {
                 let (result, mut dead) = self.run_dispatch(task_id, false).await;
+                if let Ok(t) = &result
+                    && t.state == TaskState::Running
+                    && !t.activity_seen
+                {
+                    self.expect_uptake(t.id);
+                }
                 if matches!(&result, Ok(t) if t.state == TaskState::Blocked)
                     && let Err(err) = self.auto_trust().await
                 {
@@ -1616,6 +1636,8 @@ impl Actor {
             Err(_) => return (Err(TimedOut("pane input", timeout).into()), true),
         }
         self.emit_with("task.input", Some(task.id), Some(detail));
+        // Whatever the agent does next answers this input, not the prompt.
+        self.unseen_prompt.remove(&task.id);
         if task.state == TaskState::Done {
             return (self.reopen(task), false);
         }
@@ -2619,13 +2641,23 @@ impl Actor {
         if matches!(status, AgentStatus::Blocked | AgentStatus::Unknown) {
             return Ok(false);
         }
-        if let Some(at) = self.trust_answered.get(&task.id) {
-            if at.elapsed() < self.settings.settle {
+        match self.trust_answered.get(&task.id) {
+            Some(at) if at.elapsed() < self.settings.settle => {
                 // Still redrawing after its trust dialog: the settle tick
                 // sends it (`deliver_held_prompts`).
                 return Ok(true);
             }
-            self.trust_answered.remove(&task.id);
+            Some(_) => {
+                self.trust_answered.remove(&task.id);
+            }
+            None if task.state == TaskState::Blocked => {
+                // Out of its startup block with no answer from pastor: a
+                // person answered it at the pane, just now. The agent redraws
+                // as after any trust answer, so the prompt waits out `settle`.
+                self.trust_answered.insert(task.id, Instant::now());
+                return Ok(true);
+            }
+            None => {}
         }
         let name = task
             .agent_name
@@ -2687,6 +2719,12 @@ impl Actor {
             }
         };
         self.pending_done.remove(&id);
+        if written
+            .as_ref()
+            .is_some_and(|t| t.state == TaskState::Running && !t.activity_seen)
+        {
+            self.expect_uptake(id);
+        }
         // A row left alone keeps what it had: nothing seen while the prompt
         // was pending counted as activity (see `apply`).
         if let Some(t) = written {
@@ -2714,21 +2752,25 @@ impl Actor {
             .await
             .map_err(|_| TimedOut("agent.list", timeout))??;
         for id in due {
-            self.trust_answered.remove(&id);
-            let Ok(Some(task)) = self.store.get_task(id) else {
-                continue;
-            };
-            if !task.prompt_pending || !task.state.occupies_pane() {
-                continue;
+            let found = self
+                .store
+                .get_task(id)
+                .ok()
+                .flatten()
+                .filter(|t| t.prompt_pending && t.state.occupies_pane())
+                .and_then(|t| {
+                    let agent = agents
+                        .iter()
+                        .find(|a| Some(&a.pane_id) == t.pane_id.as_ref())?;
+                    Some((t, agent.agent_status))
+                });
+            if let Some((task, status)) = found {
+                // Its entry is still there and due, so the prompt goes in now
+                // rather than being held again as a fresh answer.
+                self.deliver_pending_prompt(task, status).await?;
             }
-            let Some(agent) = agents
-                .iter()
-                .find(|a| Some(&a.pane_id) == task.pane_id.as_ref())
-            else {
-                continue;
-            };
-            self.deliver_pending_prompt(task, agent.agent_status)
-                .await?;
+            // Sent, or blocked again: leaving the block next starts a new hold.
+            self.trust_answered.remove(&id);
         }
         Ok(())
     }
@@ -2776,6 +2818,19 @@ impl Actor {
                     .insert(id, (Some(agent.state_change_seq), Instant::now()));
                 continue;
             }
+            // Idle a whole window at the sequence its prompt went in at, never
+            // seen at work: the agent did not take the prompt.
+            if idle_like
+                && task.state == TaskState::Running
+                && !task.prompt_pending
+                && !task.activity_seen
+                && task.last_completion_seq == Some(agent.state_change_seq)
+                && let Some(&resent) = self.unseen_prompt.get(&id)
+            {
+                self.prompt_not_taken(task, agent.agent_status, resent)
+                    .await?;
+                continue;
+            }
             let observed = observed_from(agent);
             let end = if next_state(&task, &observed) == Some(TaskState::Done) {
                 match self.pane_end(&task).await {
@@ -2803,6 +2858,54 @@ impl Actor {
                 }
                 PaneEnd::Finished => self.apply(task, &observed),
             }
+        }
+        Ok(())
+    }
+
+    /// The agent of `task` sits at an empty input with the prompt it was
+    /// given nowhere (see `unseen_prompt`): send it again, or, after
+    /// `MAX_PROMPT_RESENDS`, mark the task `blocked` so it does not read as
+    /// `running` with nothing pending. The baseline stays at the idle it sits
+    /// at, so `next_state` holds it there until the agent moves.
+    async fn prompt_not_taken(
+        &mut self,
+        task: Task,
+        status: AgentStatus,
+        resent: u8,
+    ) -> anyhow::Result<()> {
+        let id = task.id;
+        let unchanged =
+            |t: &Task| t.state == TaskState::Running && !t.prompt_pending && !t.activity_seen;
+        if resent >= MAX_PROMPT_RESENDS {
+            self.unseen_prompt.remove(&id);
+            let message = format!(
+                "agent did not take its prompt ({} sent); send it with `pastor task send`",
+                resent + 1
+            );
+            tracing::warn!(machine = %self.name, task = %task.display_id(), "{message}");
+            let written = write_task(&self.store, task, |t| {
+                if !unchanged(t) {
+                    return false;
+                }
+                t.state = TaskState::Blocked;
+                t.error = Some(message.clone());
+                true
+            })?;
+            if let Some(t) = written {
+                self.emit("task.blocked", Some(t.id));
+                self.refresh_live();
+            }
+            return Ok(());
+        }
+        tracing::warn!(machine = %self.name, task = %task.display_id(), "agent did not take its prompt; sending it again");
+        self.unseen_prompt.insert(id, resent + 1);
+        let pending = write_task(&self.store, task, |t| {
+            let resend = unchanged(t);
+            t.prompt_pending |= resend;
+            resend
+        })?;
+        if let Some(task) = pending {
+            self.deliver_pending_prompt(task, status).await?;
         }
         Ok(())
     }
@@ -2882,9 +2985,21 @@ impl Actor {
             }
             AgentStatus::Working | AgentStatus::Blocked => {
                 self.idle_agents.remove(&id);
+                // It took its prompt, or stopped on something a person answers.
+                self.unseen_prompt.remove(&id);
             }
             AgentStatus::Unknown => {}
         }
+    }
+
+    /// The agent of task `id` was just given its prompt: watch that it takes
+    /// it (see `unseen_prompt`). The settle window starts now, since an agent
+    /// that lost the prompt sends no event to start one.
+    fn expect_uptake(&mut self, id: i64) {
+        self.unseen_prompt.entry(id).or_insert(0);
+        self.pending_done
+            .entry(id)
+            .or_insert((None, Instant::now()));
     }
 
     fn apply(&mut self, mut task: Task, observed: &Observed) {
@@ -2918,6 +3033,9 @@ impl Actor {
         }
         if !to.is_open() {
             self.idle_agents.remove(&task.id);
+        }
+        if to != TaskState::Running {
+            self.unseen_prompt.remove(&task.id);
         }
         if let Observed::Status {
             state_change_seq,
@@ -5538,6 +5656,103 @@ mod tests {
         assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
+    /// The same when a person answers the dialog at the pane: pastor sees
+    /// only the agent leave `blocked`, and still waits out the redraw.
+    #[tokio::test]
+    async fn a_trust_prompt_answered_at_the_pane_gets_the_prompt_after_the_redraw() {
+        let (fake, settings) = redrawing_after_trust();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h
+            .dispatch(repo_task(&store, "claude", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        fake.answer_trust_by_hand(t.pane_id.as_deref().unwrap());
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// An agent that sits at an empty input after its prompt went in (herdr
+    /// accepted it, the agent lost it) gets the prompt again once it has
+    /// sat idle a settle window at the sequence the prompt went in at.
+    #[tokio::test]
+    async fn a_prompt_the_agent_did_not_take_is_sent_again() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        fake.ignore_prompts(false);
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 2);
+        let t = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert!(!t.prompt_pending);
+    }
+
+    /// An agent that never takes its prompt is not left `running` with
+    /// nothing pending: after the resends it is `blocked`, saying so.
+    #[tokio::test]
+    async fn an_agent_that_never_takes_its_prompt_ends_blocked() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        assert_eq!(
+            calls(&fake, "agent.prompt").len(),
+            1 + MAX_PROMPT_RESENDS as usize
+        );
+        let t = store.get_task(t.id).unwrap().unwrap();
+        assert!(
+            t.error.as_deref().unwrap_or("").contains("did not take"),
+            "{:?}",
+            t.error
+        );
+        assert!(saw(&mut events, "task.blocked", t.id));
+        // Left for a human: no more prompts.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            calls(&fake, "agent.prompt").len(),
+            1 + MAX_PROMPT_RESENDS as usize
+        );
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+    }
+
+    /// The same for an agent that took its trust answer: a prompt lost
+    /// anyway (a redraw longer than `settle`) is sent again.
+    #[tokio::test]
+    async fn a_prompt_lost_after_a_trust_answer_is_sent_again() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        fake.set_trust_redraw(Duration::from_millis(250));
+        let settings = settings_with_settle(Duration::from_millis(100));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h
+            .dispatch(repo_task(&store, "claude", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        fake.answer_trust_by_hand(t.pane_id.as_deref().unwrap());
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        assert!(calls(&fake, "agent.prompt").len() >= 2);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
     /// The same for the actor's own answer to a trusted repo's dialog.
     #[tokio::test]
     async fn auto_trust_delivers_the_prompt_once_after_the_agent_redraws() {
@@ -6988,9 +7203,10 @@ mod tests {
         // An idle event with no state change behind it (herdr sends one when a
         // human looks at a `done` pane) is a candidate, not a completion.
         fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
-        // Several settle windows (100ms) and reconciles (200ms).
+        // Several settle windows (100ms) and reconciles (200ms). The prompt
+        // is sent again meanwhile, and then the task is blocked; never done.
         tokio::time::sleep(Duration::from_millis(700)).await;
-        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert_ne!(state_of(&store, t.id), TaskState::Done);
         assert!(!saw(&mut events, "task.done", t.id));
     }
 
