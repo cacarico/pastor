@@ -1578,9 +1578,9 @@ impl Fleet {
 
     /// `TaskReport`: what pull machine `machine` saw become of task `id`,
     /// written on the row with the event its own actor would have emitted.
-    /// A closed row stays closed, a stale one stays stale while its agent
-    /// works (as `task::next_state` keeps it), and one `task done` ended
-    /// stays done through the agent's last turn; each answers the row as it
+    /// A closed or failed row stays as it is, a stale one stays stale while
+    /// its agent works (as `task::next_state` keeps it), and one `task done`
+    /// ended stays done until its pane closes; each answers the row as it
     /// is.
     pub async fn report(
         &self,
@@ -1615,8 +1615,11 @@ impl Fleet {
                 state,
                 TaskState::Starting | TaskState::Running | TaskState::Blocked
             );
-            let kept = from == TaskState::Closed
-                || from == TaskState::Done && task.ended && working
+            // Reports carry no sequence and may arrive out of order, so a
+            // failed row takes no later report, and an ended one only its
+            // pane closing, which `next_state` also lets through.
+            let kept = matches!(from, TaskState::Closed | TaskState::Failed)
+                || from == TaskState::Done && task.ended && state != TaskState::Closed
                 || from == TaskState::Stale && working;
             if kept
                 || from == state
@@ -4246,6 +4249,34 @@ mod tests {
         d.handle(report("laptop", &running, TaskState::Done, None))
             .await;
         assert_eq!(state_of(&d, &running), TaskState::Done);
+    }
+
+    /// Reports carry no sequence, so a late one must not reopen a failed
+    /// task or move one `task done` ended anywhere but closed.
+    #[tokio::test]
+    async fn a_late_report_leaves_failed_and_ended_tasks_as_they_are() {
+        let (d, _tmp) = pull_daemon(2).await;
+        let failed = queued(&d, "f", Some("laptop")).await;
+        let ended = queued(&d, "e", Some("laptop")).await;
+        claim(&d, 2, false).await;
+        d.handle(report("laptop", &failed, TaskState::Failed, Some("boom")))
+            .await;
+        for late in [TaskState::Running, TaskState::Blocked, TaskState::Done] {
+            d.handle(report("laptop", &failed, late, None)).await;
+            assert_eq!(state_of(&d, &failed), TaskState::Failed, "{late}");
+        }
+        d.handle(IpcRequest::TaskDone {
+            id: ended.id,
+            summary: None,
+        })
+        .await;
+        for late in [TaskState::Failed, TaskState::Stale, TaskState::Running] {
+            d.handle(report("laptop", &ended, late, None)).await;
+            assert_eq!(state_of(&d, &ended), TaskState::Done, "{late}");
+        }
+        d.handle(report("laptop", &ended, TaskState::Closed, None))
+            .await;
+        assert_eq!(state_of(&d, &ended), TaskState::Closed);
     }
 
     /// `pull = true` is a way to reach a machine, like `ssh`, `local` and
