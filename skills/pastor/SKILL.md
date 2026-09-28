@@ -99,6 +99,7 @@ pastor task retry t-4                      # queues a copy of a failed or stale 
 pastor task retry t-4 --place own          # the same, with the copy's pane placed elsewhere
 pastor task close t-4                      # closes the pane if there is one, marks the task closed
 pastor task done t-4                       # marks a task with a pane done; its pane closes after close_done_after
+pastor task describe t-4 --all-summaries   # how each round of the task ended
 pastor task close t-4 --remove-worktree    # removes the worktree too; refused if it has uncommitted changes
 pastor task prune --done --older-than 3d   # deletes finished rows; --failed and --closed add those states
 ```
@@ -201,7 +202,7 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 - Work only in the directory you started in: your worktree and branch. Never touch other worktrees, branches or panes.
 - Commit and push exactly as the prompt says, and write the report it asks for.
 - Do not ask questions. Nobody is watching; a permission prompt or a question leaves the task `blocked` until a human happens to attach. If something is missing, say so in your report and stop.
-- When finished, run `pastor task done` (it ends your own task, from `PASTOR_TASK`), print `DONE` as your last line, then go idle. pastor marks the task `done` at once and closes your pane after `close_done_after`, freeing the machine's slot.
+- When finished, run `pastor task done --summary "<outcome>: <what you did>"` (it ends your own task, from `PASTOR_TASK`; `--summary-file -` reads a longer one from stdin), print `DONE` as your last line, then go idle. The summary's first line starts with the outcome: `done`, `partial`, `blocked` or `nothing to do`; say what you pushed or why you stopped. pastor marks the task `done` at once and closes your pane after `close_done_after`, freeing the machine's slot.
 - Do not close your pane or exit to clean up; `pastor task done` is how you say you are finished.
 - Do not run, send to, attach to, retry, reprioritize, move in the queue, close or prune tasks, tick (not even `--dry-run`), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, or run `pastor serve`, `pastor setup` or `pastor machine open`. pastor refuses these from your pane with `agent_refused` unless the user set `agents_change_fleet = true`; do not work around it. `pastor task done` for your own task is the one exception; for any other task it is refused too. Reading (`task list`, `queue`, `read`, `events`, `watch`, and `describe` for tasks, jobs, machines, flocks and connectors) is fine.
 - If `pastor task describe $PASTOR_TASK` says `role: orchestrator`, a person started you to coordinate: you may also `pastor task run`, `task retry` and `task send`, and `pastor job disable` a failing job. Everything else above is still refused, `task close` and `job enable` included, and you may never start another orchestrator (`--role orchestrator` is `role_refused` from any task).

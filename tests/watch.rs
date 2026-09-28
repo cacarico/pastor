@@ -94,6 +94,7 @@ impl FakeHead {
         let mut s = self.served.lock().unwrap();
         let seq = s.events.last().map_or(1, |r| r.seq + 1);
         s.events.push(EventRecord {
+            summary: None,
             seq,
             at: chrono::Utc::now(),
             kind: kind.into(),

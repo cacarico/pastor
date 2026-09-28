@@ -15,7 +15,8 @@ and so on. This page lists them; `--help` after any command lists its flags.
   should read ids and states from it rather than guess them.
 - `-w, --wide` on `task`, `job`, `machine`, `flock` and `connector list`
   adds a DESCRIPTION column, cut to the terminal's width. `describe` and
-  `--json` always show descriptions.
+  `--json` always show descriptions. On `task list` it adds RESULT too,
+  how each task's last round ended.
 - `--head` uses the head at an ssh destination for one command (see
   [remote head](../remote-head/)).
 - A runtime error is one JSON object on stderr, `{"code": ..., "message": ...}`,
@@ -28,13 +29,13 @@ and so on. This page lists them; `--help` after any command lists its flags.
 |---|---|
 | `pastor task run` | create a one-off task and dispatch it |
 | `pastor task list` | live tasks across the flock; `--all` adds finished ones |
-| `pastor task describe` | one task in full: state, machine, agent, prompt, error |
+| `pastor task describe` | one task in full: state, machine, agent, prompt, error, summary; `--all-summaries` for every round's |
 | `pastor task read` | recent output from a task's pane |
 | `pastor task attach` | attach to a task's agent terminal (ctrl+b q detaches) |
 | `pastor task send` | type text or press keys in a live task's agent |
 | `pastor task retry` | re-dispatch a failed or stale task as a new task |
 | `pastor task priority` | put a queued task at another level: low, normal, high or critical (`--preempt` with critical) |
-| `pastor task done` | mark a task done; an agent may end its own |
+| `pastor task done` | mark a task done; an agent may end its own, saying how with `--summary` or `--summary-file` |
 | `pastor task close` | close a task's pane, and its worktree with `--remove-worktree` |
 | `pastor task prune` | delete old finished tasks; their items stay seen |
 

@@ -247,6 +247,12 @@ fn escape_controls(s: &str, keep_lines: bool) -> String {
 /// command herdr runs; each is followed by where it came from, when the task
 /// knows (`DispatchSpec::agent_source`).
 pub fn task_detail(t: &Task) -> String {
+    task_detail_with(t, t.summary.as_slice())
+}
+
+/// `task_detail` with `summaries` in place of the last round's: `task
+/// describe --all-summaries` passes every round's.
+pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> String {
     let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
     let when = |v: Option<chrono::DateTime<Utc>>| {
         v.map(|at| format!("{} ({} ago)", at.format("%Y-%m-%d %H:%M:%S UTC"), age(at)))
@@ -356,6 +362,14 @@ pub fn task_detail(t: &Task) -> String {
             t.description_from()
         ),
     );
+    for s in summaries {
+        out.push(summary_heading(s));
+        out.extend(
+            printable(&s.text)
+                .lines()
+                .map(|l| format!("  {l}").trim_end().to_string()),
+        );
+    }
     out.push("prompt:".into());
     out.extend(
         printable(&t.prompt)
@@ -363,6 +377,30 @@ pub fn task_detail(t: &Task) -> String {
             .map(|l| format!("  {l}").trim_end().to_string()),
     );
     out.join("\n")
+}
+
+/// A summary's first line in `task describe`: its outcome, round, who wrote
+/// it and when.
+fn summary_heading(s: &crate::task::TaskSummary) -> String {
+    let by = match s.source {
+        crate::task::SummarySource::Agent => "from the agent",
+        crate::task::SummarySource::Pane => "the pane's last lines",
+    };
+    format!(
+        "{:<12}{} (round {}, {by}, {} ago)",
+        "summary:",
+        s.outcome,
+        s.round,
+        age(s.at)
+    )
+}
+
+/// The RESULT column of `task list --wide`: the outcome of the task's last
+/// round, `-` while it has none.
+pub fn task_result(t: &Task) -> String {
+    t.summary
+        .as_ref()
+        .map_or_else(|| "-".into(), |s| s.outcome.to_string())
 }
 
 /// The stable code and message for a request that got no reply. Only a connect
@@ -847,6 +885,7 @@ mod tests {
             priority_from: None,
             queue_pos: 0,
             pause: Default::default(),
+            summary: None,
             created_at: now,
             started_at: Some(now),
             finished_at: None,

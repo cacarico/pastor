@@ -755,6 +755,7 @@ mod tests {
     #[test]
     fn recent_events_keeps_the_last_ones_in_order() {
         let ev = |kind: &str| EventRecord {
+            summary: None,
             seq: 0,
             at: Utc::now(),
             kind: kind.into(),

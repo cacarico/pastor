@@ -57,12 +57,57 @@ pub struct DoneArgs {
     /// A task, like t-12 or 12: the one to end (default: the task this pane
     /// runs, from PASTOR_TASK)
     pub task: Option<String>,
+    /// What you did, its first line the outcome: done, partial, blocked or
+    /// nothing to do (kept to 2,000 characters)
+    #[arg(long, value_name = "TEXT", conflicts_with = "summary_file")]
+    pub summary: Option<String>,
+    /// Read the summary from a file, or - for stdin
+    #[arg(long, value_name = "PATH")]
+    pub summary_file: Option<String>,
     /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
 }
 
 impl DoneArgs {
+    /// Whether a summary is given, which only a head of `SUMMARY_PROTOCOL`
+    /// keeps.
+    pub fn has_summary(&self) -> bool {
+        self.summary.is_some() || self.summary_file.is_some()
+    }
+
+    /// The summary given: `--summary` as it is, or `--summary-file` read
+    /// (`-` is stdin). A blank one is an error, not a round with none.
+    pub fn summary_text(&self) -> anyhow::Result<Option<String>> {
+        let text = match (&self.summary, self.summary_file.as_deref()) {
+            (Some(s), _) => s.clone(),
+            (None, Some(path)) => {
+                use std::io::Read;
+                let mut text = String::new();
+                if path == "-" {
+                    std::io::stdin().read_to_string(&mut text)
+                } else {
+                    std::fs::File::open(path).and_then(|mut f| f.read_to_string(&mut text))
+                }
+                .map_err(|e| {
+                    CliError::err(
+                        "summary_file_unreadable",
+                        format!("cannot read the summary from {path}: {e}"),
+                    )
+                })?;
+                text
+            }
+            (None, None) => return Ok(None),
+        };
+        if text.trim().is_empty() {
+            return Err(CliError::err(
+                "summary_empty",
+                "the summary is empty; its first line names the outcome: done, partial, blocked or nothing to do",
+            ));
+        }
+        Ok(Some(text))
+    }
+
     /// Whether this ends `own`, the task the caller runs in: no task given,
     /// or that one.
     pub fn ends(&self, own: &str) -> bool {
@@ -233,7 +278,8 @@ pub async fn done(paths: &Paths, a: DoneArgs) -> anyhow::Result<()> {
         }
     };
     let id = task_id(&task)?;
-    match ask(paths, IpcRequest::TaskDone { id }).await? {
+    let summary = a.summary_text()?;
+    match ask(paths, IpcRequest::TaskDone { id, summary }).await? {
         IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }

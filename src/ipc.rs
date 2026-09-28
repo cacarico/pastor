@@ -23,8 +23,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// profiles (`AgentChoice::profile`). 14: `Queue` and `QueueMove`. 15:
 /// descriptions (`Run::description`, `FlockAdd::description`,
 /// `JobTask::description`). 16: pausing (`Run::preempt`,
-/// `TaskPriority::preempt`).
-pub const IPC_PROTOCOL: u32 = 16;
+/// `TaskPriority::preempt`). 17: task summaries (`TaskDone::summary`,
+/// `TaskSummaries`).
+pub const IPC_PROTOCOL: u32 = 17;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -121,6 +122,11 @@ pub const QUEUE_PROTOCOL: u32 = 14;
 /// and it would wait behind low work, without a word.
 pub const PREEMPT_PROTOCOL: u32 = 16;
 
+/// The first protocol whose head keeps what `task done --summary` sends and
+/// knows `TaskSummaries`. An older one would drop the summary without a
+/// word, or refuse the request as unreadable.
+pub const SUMMARY_PROTOCOL: u32 = 17;
+
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.
 pub fn check_protocol(version: &str, protocol: u32, needed: u32, what: &str) -> anyhow::Result<()> {
@@ -176,6 +182,11 @@ pub enum IpcRequest {
         filter: TaskFilter,
     },
     TaskShow {
+        id: i64,
+    },
+    /// Every round's summary of a task, the first first. Answers
+    /// `Summaries`.
+    TaskSummaries {
         id: i64,
     },
     TaskRead {
@@ -284,6 +295,10 @@ pub enum IpcRequest {
     /// (`ends_own_task`). Answers `Task`.
     TaskDone {
         id: i64,
+        /// What the agent did (`task done --summary`); its first line names
+        /// the outcome. `None` ends the round with the pane's last lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     /// The events log records numbered after `after`, oldest first, at most
     /// `limit`, only those about `task` if given, read from the log files.
@@ -389,6 +404,7 @@ impl IpcRequest {
             IpcRequest::Ping
             | IpcRequest::List { .. }
             | IpcRequest::TaskShow { .. }
+            | IpcRequest::TaskSummaries { .. }
             | IpcRequest::TaskRead { .. }
             | IpcRequest::FlockList
             | IpcRequest::JobList
@@ -443,7 +459,7 @@ impl IpcRequest {
     /// (`TASK_ENV`): an agent may say it is finished, but not for anyone
     /// else.
     pub fn ends_own_task(&self, task: &str) -> bool {
-        matches!(self, IpcRequest::TaskDone { id } if crate::task::parse_task_id(task) == Some(*id))
+        matches!(self, IpcRequest::TaskDone { id, .. } if crate::task::parse_task_id(task) == Some(*id))
     }
 }
 
@@ -538,6 +554,7 @@ pub enum IpcResponse {
     MachineDescription(crate::describe::MachineDescription),
     Queue(Vec<crate::queue::QueueEntry>),
     Moved(crate::store::Moved),
+    Summaries(Vec<crate::task::TaskSummary>),
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -899,6 +916,7 @@ mod tests {
             priority_from: None,
             queue_pos: 0,
             pause: Default::default(),
+            summary: None,
             created_at: now,
             started_at: None,
             finished_at: None,
@@ -934,6 +952,7 @@ mod tests {
             }),
             IpcResponse::Events(crate::events::EventsPage {
                 events: vec![crate::events::EventRecord {
+                    summary: None,
                     seq: 812,
                     at: chrono::Utc::now(),
                     kind: "task.done".into(),
@@ -957,6 +976,13 @@ mod tests {
                 skipped: vec!["k1".into()],
                 refused: vec![("k2".into(), "max_tasks_per_run".into())],
             },
+            IpcResponse::Summaries(vec![crate::task::TaskSummary {
+                round: 1,
+                outcome: crate::task::Outcome::NothingToDo,
+                text: "nothing to do".into(),
+                source: crate::task::SummarySource::Agent,
+                at: chrono::Utc::now(),
+            }]),
             IpcResponse::error("some_code", "some message"),
         ];
         for resp in responses {
@@ -1065,6 +1091,7 @@ mod tests {
                 filter: TaskFilter::default(),
             },
             IpcRequest::TaskShow { id: 1 },
+            IpcRequest::TaskSummaries { id: 1 },
             IpcRequest::TaskRead { id: 1, lines: 5 },
             IpcRequest::FlockList,
             IpcRequest::JobList,

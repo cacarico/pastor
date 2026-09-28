@@ -2020,6 +2020,7 @@ impl Daemon {
                     task_id: Some(task.id),
                     machine: None,
                     job: Some(task.job.clone()),
+                    summary: None,
                 });
                 self.fleet.dispatch_queued().await;
                 match self.store.get_task(task.id) {
@@ -2076,6 +2077,14 @@ impl Daemon {
             },
             IpcRequest::TaskShow { id } => match self.store.get_task(id) {
                 Ok(Some(t)) => IpcResponse::Task(t),
+                Ok(None) => IpcResponse::error("task_not_found", format!("t-{id}")),
+                Err(err) => IpcResponse::error("store_error", err),
+            },
+            IpcRequest::TaskSummaries { id } => match self.store.get_task(id) {
+                Ok(Some(_)) => match self.store.summaries(id) {
+                    Ok(all) => IpcResponse::Summaries(all),
+                    Err(err) => IpcResponse::error("store_error", format!("{err:#}")),
+                },
                 Ok(None) => IpcResponse::error("task_not_found", format!("t-{id}")),
                 Err(err) => IpcResponse::error("store_error", err),
             },
@@ -2192,7 +2201,7 @@ impl Daemon {
                 remove_worktree,
             } => self.close(id, remove_worktree).await,
             IpcRequest::TaskSend { id, input } => self.send(id, input).await,
-            IpcRequest::TaskDone { id } => self.end(id).await,
+            IpcRequest::TaskDone { id, summary } => self.end(id, summary).await,
             IpcRequest::TaskPrune {
                 states,
                 older_than_secs,
@@ -2501,7 +2510,7 @@ impl Daemon {
     /// `TaskDone`: through the actor of the task's machine, which checks the
     /// row again and marks it done and ended. A task on no machine, or one
     /// whose machine has left the flock, has no pane to end.
-    async fn end(&self, id: i64) -> IpcResponse {
+    async fn end(&self, id: i64, summary: Option<String>) -> IpcResponse {
         let task = match self.store.get_task(id) {
             Ok(Some(t)) => t,
             Ok(None) => return IpcResponse::error("task_not_found", format!("t-{id}")),
@@ -2522,7 +2531,7 @@ impl Daemon {
                 ),
             );
         };
-        match handle.end(id).await {
+        match handle.end(id, summary).await {
             Ok(t) => IpcResponse::Task(t),
             Err(err) => match err.downcast_ref::<SendRefused>() {
                 Some(r) => IpcResponse::error(r.code, r),
@@ -2590,6 +2599,7 @@ impl Daemon {
             task_id: Some(task.id),
             machine: None,
             job: Some(task.job.clone()),
+            summary: None,
         });
         self.fleet.dispatch_queued().await;
         match self.store.get_task(task.id) {
@@ -2658,6 +2668,7 @@ impl Daemon {
             task_id: Some(task.id),
             machine: None,
             job: Some(task.job.clone()),
+            summary: None,
         });
         self.fleet.dispatch_queued().await;
         match self.store.get_task(task.id) {
@@ -2758,6 +2769,7 @@ impl Daemon {
                     task_id: Some(id),
                     machine: None,
                     job: Some(closed.job.clone()),
+                    summary: None,
                 });
             }
             return IpcResponse::Task(closed);
@@ -2791,6 +2803,7 @@ impl Daemon {
                 task_id: Some(id),
                 machine: Some(machine),
                 job: Some(closed.job.clone()),
+                summary: None,
             });
             return IpcResponse::Task(closed);
         };
@@ -5721,13 +5734,29 @@ mod tests {
         let store = d.store.clone();
         let socket = serving(d).await;
         let own = mine.display_id();
-        let resp = ask_as(&socket, &IpcRequest::TaskDone { id: theirs.id }, &own).await;
+        let resp = ask_as(
+            &socket,
+            &IpcRequest::TaskDone {
+                id: theirs.id,
+                summary: None,
+            },
+            &own,
+        )
+        .await;
         assert!(
             matches!(&resp, IpcResponse::Error { code, .. } if code == "agent_refused"),
             "{resp:?}"
         );
         assert!(!store.get_task(theirs.id).unwrap().unwrap().ended);
-        let resp = ask_as(&socket, &IpcRequest::TaskDone { id: mine.id }, &own).await;
+        let resp = ask_as(
+            &socket,
+            &IpcRequest::TaskDone {
+                id: mine.id,
+                summary: None,
+            },
+            &own,
+        )
+        .await;
         let IpcResponse::Task(t) = resp else {
             panic!("{resp:?}")
         };
@@ -5747,7 +5776,12 @@ mod tests {
     #[tokio::test]
     async fn ending_a_task_with_no_pane_is_refused() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
-        let resp = d.handle(IpcRequest::TaskDone { id: 42 }).await;
+        let resp = d
+            .handle(IpcRequest::TaskDone {
+                id: 42,
+                summary: None,
+            })
+            .await;
         assert!(
             matches!(&resp, IpcResponse::Error { code, .. } if code == "task_not_found"),
             "{resp:?}"
@@ -5760,7 +5794,12 @@ mod tests {
             remove_worktree: false,
         })
         .await;
-        let resp = d.handle(IpcRequest::TaskDone { id: t.id }).await;
+        let resp = d
+            .handle(IpcRequest::TaskDone {
+                id: t.id,
+                summary: None,
+            })
+            .await;
         assert!(
             matches!(&resp, IpcResponse::Error { code, .. } if code == "task_not_live"),
             "{resp:?}"

@@ -67,6 +67,10 @@ pub struct EventRecord {
     /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
+    /// On `task.done` and `task.failed`: how the round that just ended
+    /// ended (`TaskSummary`), read when the record was built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::task::TaskSummary>,
 }
 
 /// Where `build` finds a machine's current status. The daemon's machine set
@@ -123,6 +127,12 @@ impl EventRecord {
         } else {
             None
         };
+        // Carried on the event itself, not re-read from the store: by the
+        // time this asynchronous build runs, the store's last summary for
+        // this task may belong to a later round (a reopen, or `task done
+        // --summary` landing on an already-done task) than the one this
+        // record is about.
+        let summary = ev.summary.clone();
         let seq = store.next_event_seq().unwrap_or_else(|err| {
             tracing::error!(%err, kind = %ev.kind, "event record: cannot take a sequence number");
             0
@@ -136,6 +146,7 @@ impl EventRecord {
             task,
             job,
             machine,
+            summary,
         }
     }
 
@@ -696,6 +707,46 @@ mod tests {
         assert_eq!(v["task"]["flock"], "work");
     }
 
+    /// `task.done` and `task.failed` carry how the round ended, taken from
+    /// the event itself; other task events carry none.
+    #[test]
+    fn a_task_end_carries_its_summary() {
+        let (store, t) = store_with_task("run");
+        let round = store
+            .end_round(t.id, Some("blocked: needs a token"))
+            .unwrap();
+        for kind in ["task.done", "task.failed"] {
+            let mut event = ev(kind, Some(t.id), None, None);
+            event.summary = Some(round.clone());
+            let rec = EventRecord::build(&event, &store, None);
+            let v = serde_json::to_value(&rec).unwrap();
+            assert_eq!(v["summary"]["outcome"], "blocked", "{kind}");
+            assert_eq!(v["summary"]["text"], "blocked: needs a token");
+            assert_eq!(v["summary"]["source"], "agent");
+        }
+        let rec = EventRecord::build(&ev("task.running", Some(t.id), None, None), &store, None);
+        assert!(serde_json::to_value(&rec).unwrap().get("summary").is_none());
+    }
+
+    /// A record is built from the summary the event was queued with, not
+    /// whatever the store holds by the time the asynchronous logger gets to
+    /// it: `task done --summary` landing on an already-done task, or a
+    /// reopen finishing again, must not repaint an earlier `task.done`
+    /// record with a later round's text.
+    #[test]
+    fn a_task_end_keeps_its_own_round_even_after_the_store_moves_on() {
+        let (store, t) = store_with_task("run");
+        let round = store.end_round(t.id, Some("first: done")).unwrap();
+        let mut event = ev("task.done", Some(t.id), None, None);
+        event.summary = Some(round);
+        store
+            .replace_last_summary(t.id, "second: reopened and finished again")
+            .unwrap();
+        let rec = EventRecord::build(&event, &store, None);
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["summary"]["text"], "first: done");
+    }
+
     fn ev(
         kind: &str,
         task_id: Option<i64>,
@@ -708,6 +759,7 @@ mod tests {
             task_id,
             machine: machine.map(Into::into),
             job: job.map(Into::into),
+            summary: None,
         }
     }
 
@@ -815,6 +867,7 @@ mod tests {
 
     fn record(kind: &str, task: Option<&Task>) -> EventRecord {
         EventRecord {
+            summary: None,
             seq: 0,
             detail: None,
             at: Utc::now(),
@@ -1269,6 +1322,7 @@ mod tests {
 
     fn numbered(seq: u64, kind: &str, task: Option<&Task>) -> EventRecord {
         EventRecord {
+            summary: None,
             seq,
             ..record(kind, task)
         }

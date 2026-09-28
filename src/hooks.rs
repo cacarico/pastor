@@ -60,7 +60,8 @@ pub fn wants(paths: &Paths, connector: &Connector, hook: &Hook, rec: &EventRecor
 }
 
 /// `rec` as a hook of a connector that does not own its job sees it: the task
-/// without its item (`null`) and prompt (empty). Those carry the text of
+/// without its item (`null`), prompt (empty) and summary text (empty; the
+/// outcome stays). Those carry the text of
 /// another connector's items, private messages or issues, which a notifier
 /// has no need to send off the host; the task's id, state, job and machine
 /// stay.
@@ -69,6 +70,12 @@ fn without_task_content(rec: &EventRecord) -> EventRecord {
     if let Some(task) = rec.task.as_mut() {
         task.item = serde_json::Value::Null;
         task.prompt.clear();
+        if let Some(s) = task.summary.as_mut() {
+            s.text.clear();
+        }
+    }
+    if let Some(s) = rec.summary.as_mut() {
+        s.text.clear();
     }
     rec
 }
@@ -183,9 +190,15 @@ pub async fn run_hook(paths: &Paths, connector: &Connector, hook: &Hook, rec: &E
 
 /// A task's end, as its connector's finish command hears it on stdin: the
 /// task row (its `item` too), `state` (`done` or `failed`), the job, the
-/// branch its agent worked on (`null` when it had none), and `last_output`,
-/// the last lines pastor read from the agent's pane, empty when it read none.
-fn finish_input(task: &Task, state: &str, last_output: &str) -> Vec<u8> {
+/// branch its agent worked on (`null` when it had none), `last_output`,
+/// the last lines pastor read from the agent's pane, empty when it read none,
+/// and `summary`, how the round ended (`TaskSummary`, `null` when unknown).
+fn finish_input(
+    task: &Task,
+    state: &str,
+    last_output: &str,
+    summary: Option<&crate::task::TaskSummary>,
+) -> Vec<u8> {
     let branch = task
         .spec
         .checkout
@@ -198,6 +211,7 @@ fn finish_input(task: &Task, state: &str, last_output: &str) -> Vec<u8> {
         "job": task.job,
         "branch": branch,
         "last_output": last_output,
+        "summary": summary,
     }))
     .expect("a task-end object serializes");
     v.push(b'\n');
@@ -210,6 +224,7 @@ struct FinishJob {
     task: Task,
     state: &'static str,
     last_output: String,
+    summary: Option<crate::task::TaskSummary>,
 }
 
 /// Run a connector's finish command for a task that ended. A failure of any
@@ -236,7 +251,7 @@ async fn run_finish(
         Spec {
             argv: &f.finish.command,
             timeout: f.finish.timeout,
-            stdin: finish_input(task, f.state, &f.last_output),
+            stdin: finish_input(task, f.state, &f.last_output, f.summary.as_ref()),
             heading,
         },
     )
@@ -268,6 +283,7 @@ async fn run_finish(
             machine: None,
             job: Some(task.job.clone()),
             detail: Some(serde_json::json!({"connector": connector.id, "reason": reason})),
+            summary: None,
         });
     }
 }
@@ -462,6 +478,7 @@ impl Dispatcher {
             task: task.clone(),
             state,
             last_output,
+            summary: rec.summary.clone().or_else(|| task.summary.clone()),
         })
     }
 
@@ -659,6 +676,7 @@ mod tests {
                 )
                 .unwrap();
             EventRecord {
+                summary: None,
                 seq: 0,
                 detail: None,
                 at: chrono::Utc::now(),
@@ -718,6 +736,7 @@ mod tests {
 
     fn machine_record(kind: &str) -> EventRecord {
         EventRecord {
+            summary: None,
             seq: 0,
             detail: None,
             at: chrono::Utc::now(),
@@ -824,13 +843,23 @@ mod tests {
         e.connector("slack", true, &[]);
         e.job("support", "slack");
         let mut d = Dispatcher::new(e.paths.clone());
-        let rec = e.task_record("task.done", "support");
+        let mut rec = e.task_record("task.done", "support");
         assert!(!rec.task.as_ref().unwrap().prompt.is_empty());
+        rec.summary = Some(crate::task::TaskSummary {
+            round: 1,
+            outcome: crate::task::Outcome::NoSummary,
+            text: "private pane text".into(),
+            source: crate::task::SummarySource::Pane,
+            at: chrono::Utc::now(),
+        });
         d.deliver(rec.clone());
         let got: serde_json::Value = serde_json::from_str(&e.wait_for("stdin").await).unwrap();
         assert_eq!(got["task"]["id"], rec.task.as_ref().unwrap().id);
         assert_eq!(got["task"]["item"], serde_json::Value::Null);
         assert_eq!(got["task"]["prompt"], "");
+        // The outcome, not what the summary says.
+        assert_eq!(got["summary"]["outcome"], "no summary");
+        assert_eq!(got["summary"]["text"], "");
         assert_eq!(got["job"], "support");
         let env_line = std::fs::read_to_string(e.out.join("env")).unwrap();
         assert_eq!(env_line.trim(), "support @notify");
@@ -983,6 +1012,14 @@ mod tests {
         }));
         e.store
             .note_pane_tail(task.id, "did the thing\nPR: https://example.org/pr/1\n");
+        rec.summary = Some(crate::task::TaskSummary {
+            round: 1,
+            outcome: crate::task::Outcome::Done,
+            text: "done: PR 1".into(),
+            source: crate::task::SummarySource::Agent,
+            at: chrono::Utc::now(),
+        });
+        let task = rec.task.as_ref().unwrap();
         let id = task.id;
         let item = task.item.clone();
         d.deliver(rec);
@@ -992,6 +1029,8 @@ mod tests {
         assert_eq!(got["task"]["id"], id);
         assert_eq!(got["task"]["item"], item);
         assert_eq!(got["branch"], "fix/it");
+        assert_eq!(got["summary"]["outcome"], "done");
+        assert_eq!(got["summary"]["text"], "done: PR 1");
         assert_eq!(
             got["last_output"],
             "did the thing\nPR: https://example.org/pr/1"
@@ -1229,6 +1268,7 @@ mod tests {
                 task_id: Some(rec.id),
                 machine: None,
                 job: None,
+                summary: None,
             })
             .unwrap();
         }

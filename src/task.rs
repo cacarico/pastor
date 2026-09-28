@@ -344,6 +344,131 @@ fn default_timeout() -> u64 {
     2 * 60 * 60
 }
 
+/// The most characters a task summary keeps (`cap_summary`).
+pub const SUMMARY_MAX: usize = 2000;
+
+/// How a round of a task ended, from the first line of its summary
+/// (`Outcome::parse`). `NoSummary` is a round that ended with none, whose
+/// row holds the pane's last lines instead; `Unknown` is a summary whose
+/// first line names none of the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    #[serde(rename = "done")]
+    Done,
+    #[serde(rename = "partial")]
+    Partial,
+    #[serde(rename = "blocked")]
+    Blocked,
+    #[serde(rename = "nothing to do")]
+    NothingToDo,
+    #[serde(rename = "no summary")]
+    NoSummary,
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl Outcome {
+    /// The outcomes an agent may name, longest first so `nothing to do`
+    /// is not read as anything shorter.
+    const NAMED: [Outcome; 4] = [
+        Outcome::NothingToDo,
+        Outcome::Partial,
+        Outcome::Blocked,
+        Outcome::Done,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Outcome::Done => "done",
+            Outcome::Partial => "partial",
+            Outcome::Blocked => "blocked",
+            Outcome::NothingToDo => "nothing to do",
+            Outcome::NoSummary => "no summary",
+            Outcome::Unknown => "unknown",
+        }
+    }
+
+    /// The outcome a summary's first line names, ignoring case: the line
+    /// is the outcome, or starts with it and then something that is not a
+    /// letter (`done: pushed`, `Partial - tests left`). `Unknown` otherwise.
+    pub fn parse(summary: &str) -> Outcome {
+        let first = summary.trim_start().lines().next().unwrap_or("").trim();
+        let first = first.to_lowercase();
+        Outcome::NAMED
+            .into_iter()
+            .find(|o| {
+                first.strip_prefix(o.as_str()).is_some_and(|rest| {
+                    !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                })
+            })
+            .unwrap_or(Outcome::Unknown)
+    }
+}
+
+impl std::str::FromStr for Outcome {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "done" => Outcome::Done,
+            "partial" => Outcome::Partial,
+            "blocked" => Outcome::Blocked,
+            "nothing to do" => Outcome::NothingToDo,
+            "no summary" => Outcome::NoSummary,
+            "unknown" => Outcome::Unknown,
+            other => return Err(format!("unknown outcome {other:?}")),
+        })
+    }
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Who wrote a summary: the agent (`task done --summary`), or pastor from
+/// the pane's last lines when the round ended with none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SummarySource {
+    Agent,
+    Pane,
+}
+
+impl SummarySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SummarySource::Agent => "agent",
+            SummarySource::Pane => "pane",
+        }
+    }
+}
+
+/// How one round of a task ended: from the prompt (or the input that
+/// reopened it) to `done` or `failed`. One row per round in
+/// `task_summaries`, numbered from 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub round: u32,
+    pub outcome: Outcome,
+    pub text: String,
+    pub source: SummarySource,
+    pub at: DateTime<Utc>,
+}
+
+/// `text` trimmed and cut to `SUMMARY_MAX` characters, its start kept.
+pub fn cap_summary(text: &str) -> String {
+    text.trim().chars().take(SUMMARY_MAX).collect()
+}
+
+/// The last `SUMMARY_MAX` characters of a pane's text, trimmed: what a
+/// round that ended with no summary keeps.
+pub fn cap_pane_tail(text: &str) -> String {
+    let text = text.trim();
+    let n = text.chars().count();
+    text.chars().skip(n.saturating_sub(SUMMARY_MAX)).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: i64,
@@ -422,6 +547,11 @@ pub struct Task {
     /// paused itself (`Preemption`).
     #[serde(flatten, default)]
     pub pause: Preemption,
+    /// How the task's last round ended (`TaskSummary`), on a task that is
+    /// done, failed or closed and has one. Not a column: the store reads it
+    /// from `task_summaries` with the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<TaskSummary>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -927,6 +1057,7 @@ mod tests {
             priority_from: None,
             queue_pos: 0,
             pause: Default::default(),
+            summary: None,
             created_at: now,
             started_at: Some(now),
             finished_at: None,
@@ -1412,6 +1543,58 @@ mod tests {
         assert_eq!(
             next_state(&t, &status(AgentStatus::Working, Some(10))),
             Some(TaskState::Running)
+        );
+    }
+
+    #[test]
+    fn a_summary_names_its_outcome_on_its_first_line() {
+        for (text, want) in [
+            ("done", Outcome::Done),
+            ("Done: pushed pastor/t-4\nPR #12", Outcome::Done),
+            ("  partial - tests left\n", Outcome::Partial),
+            ("BLOCKED. needs a token", Outcome::Blocked),
+            (
+                "nothing to do\nthe card was already built",
+                Outcome::NothingToDo,
+            ),
+            ("Nothing to do: already merged", Outcome::NothingToDo),
+            ("doneish", Outcome::Unknown),
+            ("pushed the branch\ndone", Outcome::Unknown),
+            ("", Outcome::Unknown),
+        ] {
+            assert_eq!(Outcome::parse(text), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn outcomes_round_trip_as_their_words() {
+        for o in [
+            Outcome::Done,
+            Outcome::Partial,
+            Outcome::Blocked,
+            Outcome::NothingToDo,
+            Outcome::NoSummary,
+            Outcome::Unknown,
+        ] {
+            assert_eq!(o.as_str().parse::<Outcome>().unwrap(), o);
+            assert_eq!(serde_json::to_value(o).unwrap(), o.as_str());
+        }
+    }
+
+    #[test]
+    fn summaries_are_capped_at_their_start_and_pane_tails_at_their_end() {
+        let long: String = "ab".repeat(SUMMARY_MAX);
+        let s = cap_summary(&format!("  {long}  "));
+        assert_eq!(s.chars().count(), SUMMARY_MAX);
+        assert!(s.starts_with("abab"));
+        let tail = cap_pane_tail(&format!("x{long}y\n"));
+        assert_eq!(tail.chars().count(), SUMMARY_MAX);
+        assert!(tail.ends_with("aby"));
+        assert_eq!(
+            cap_summary("é".repeat(SUMMARY_MAX + 3).as_str())
+                .chars()
+                .count(),
+            SUMMARY_MAX
         );
     }
 }

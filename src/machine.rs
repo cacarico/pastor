@@ -16,7 +16,7 @@ use crate::herdr::{
     subscription_agent_status, subscription_lifecycle,
 };
 use crate::store::Store;
-use crate::task::{Observed, Task, TaskState, next_state};
+use crate::task::{Observed, Task, TaskState, TaskSummary, next_state};
 
 /// A herdr request that got no answer within `request_timeout`.
 #[derive(Debug, thiserror::Error)]
@@ -265,6 +265,14 @@ pub struct PastorEvent {
     /// names sent and the length of any text, never the text itself.
     #[serde(default)]
     pub detail: Option<serde_json::Value>,
+    /// On `task.done` and `task.failed`: how the round that just ended
+    /// ended, taken at the moment the event was queued. The event log's
+    /// build step trusts this rather than re-reading the store, which by
+    /// then may hold a later round's summary (a reopen, or `task done
+    /// --summary` landing on an already-done task before this event was
+    /// processed).
+    #[serde(default)]
+    pub summary: Option<TaskSummary>,
 }
 
 pub enum MachineCommand {
@@ -296,8 +304,12 @@ pub enum MachineCommand {
     /// `pastor task done`: the agent says it is finished. Marks the task
     /// `done` and `ended`, so it stays done while the agent finishes its
     /// turn and auto-close takes its pane after `close_done_after`.
+    /// `summary` ends the round with what the agent said
+    /// (`Store::end_round`), or replaces the last round's on a task pastor
+    /// already found done.
     End {
         task_id: i64,
+        summary: Option<String>,
         reply: oneshot::Sender<anyhow::Result<Task>>,
     },
     /// Pause a running `low` Claude task for critical task `for_task`:
@@ -541,10 +553,17 @@ impl MachineHandle {
         self.request(cmd, rx).await
     }
 
-    pub async fn end(&self, task_id: i64) -> anyhow::Result<Task> {
+    pub async fn end(&self, task_id: i64, summary: Option<String>) -> anyhow::Result<Task> {
         let (reply, rx) = oneshot::channel();
-        self.request(MachineCommand::End { task_id, reply }, rx)
-            .await
+        self.request(
+            MachineCommand::End {
+                task_id,
+                summary,
+                reply,
+            },
+            rx,
+        )
+        .await
     }
 
     /// See `MachineCommand::Pause`.
@@ -1123,8 +1142,34 @@ impl Actor {
         self.emit_with(kind, task_id, None);
     }
 
-    /// `emit` with a `PastorEvent::detail`.
+    /// `emit` with a `PastorEvent::detail`. A task that turns `done` or
+    /// `failed` here ends a round with no summary from its agent, so the
+    /// round keeps the pane's last lines (`Store::end_round`); `end_task`
+    /// ends its own with what the agent said.
     fn emit_with(&self, kind: &str, task_id: Option<i64>, detail: Option<serde_json::Value>) {
+        let summary = task_id.filter(|_| matches!(kind, "task.done" | "task.failed"));
+        let summary = summary.and_then(|id| match self.store.end_round(id, None) {
+            Ok(summary) => Some(summary),
+            Err(err) => {
+                tracing::error!(machine = %self.name, %err, id, "save the task's summary");
+                None
+            }
+        });
+        self.send_event(kind, task_id, detail, summary);
+    }
+
+    /// Send the event as it is, the task's job read from its row. `summary`
+    /// is the round's summary at the moment the event is queued
+    /// (`task.done`/`task.failed` only): it travels with the event rather
+    /// than being read back from the store when the record is built, since
+    /// by then the store may hold a later round's summary.
+    fn send_event(
+        &self,
+        kind: &str,
+        task_id: Option<i64>,
+        detail: Option<serde_json::Value>,
+        summary: Option<TaskSummary>,
+    ) {
         let job = task_id.and_then(|id| match self.store.get_task(id) {
             Ok(t) => t.map(|t| t.job),
             Err(err) => {
@@ -1139,6 +1184,7 @@ impl Actor {
             task_id,
             machine: Some(self.name.clone()),
             job,
+            summary,
         });
     }
 
@@ -1342,8 +1388,12 @@ impl Actor {
                     CommandOutcome::Nothing
                 }
             }
-            MachineCommand::End { task_id, reply } => {
-                let _ = reply.send(self.end_task(task_id));
+            MachineCommand::End {
+                task_id,
+                summary,
+                reply,
+            } => {
+                let _ = reply.send(self.end_task(task_id, summary));
                 CommandOutcome::Nothing
             }
             MachineCommand::Pause {
@@ -1520,7 +1570,7 @@ impl Actor {
     /// pane on this machine (starting, running, blocked, stale or done)
     /// becomes `done` and `ended`; its pane stays for `close_done_after`, as
     /// any done task's does, so the agent can finish the turn it said so in.
-    fn end_task(&mut self, task_id: i64) -> anyhow::Result<Task> {
+    fn end_task(&mut self, task_id: i64, summary: Option<String>) -> anyhow::Result<Task> {
         let Some(task) = self.store.get_task(task_id)? else {
             let err = SendRefused {
                 code: "task_not_found",
@@ -1557,17 +1607,33 @@ impl Actor {
             t.ended = true;
             true
         })?;
-        let Some(t) = written else {
-            return self
-                .store
-                .get_task(task_id)?
-                .ok_or_else(|| anyhow::anyhow!("t-{task_id} not found"));
-        };
-        self.idle_agents.remove(&t.id);
-        if !was_done {
-            self.emit("task.done", Some(t.id));
+        let summary = summary.filter(|s| !s.trim().is_empty());
+        let ended_now = written
+            .as_ref()
+            .is_some_and(|t| !was_done && t.state == TaskState::Done);
+        if ended_now {
+            // The round ends here, with what the agent said or the pane.
+            let round = match self.store.end_round(task_id, summary.as_deref()) {
+                Ok(round) => Some(round),
+                Err(err) => {
+                    tracing::error!(machine = %self.name, %err, task_id, "save the task's summary");
+                    None
+                }
+            };
+            self.idle_agents.remove(&task_id);
+            self.send_event("task.done", Some(task_id), None, round);
+        } else {
+            if written.is_some() {
+                self.idle_agents.remove(&task_id);
+            }
+            // Already done: what the agent says now is how that round ended.
+            if let Some(summary) = &summary {
+                self.store.replace_last_summary(task_id, summary)?;
+            }
         }
-        Ok(t)
+        self.store
+            .get_task(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("t-{task_id} not found"))
     }
 
     /// A done task that was just given more to do runs again. The baseline
@@ -4151,6 +4217,9 @@ mod tests {
 
         fake.exit_pane(t.pane_id.as_deref().unwrap());
         wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+        // A failed task ended its round too, with no summary.
+        let failed = store.get_task(t.id).unwrap().unwrap().summary.unwrap();
+        assert_eq!(failed.outcome, crate::task::Outcome::NoSummary);
         let again = store.insert_retry(t.id).unwrap();
         assert_eq!(again.spec.reopen.as_ref().unwrap().branch, branch);
         let t = h.dispatch(again.id).await.unwrap();
@@ -5771,12 +5840,12 @@ mod tests {
             store.get_task(t.id).unwrap().unwrap().activity_seen
         })
         .await;
-        let ended = h.end(t.id).await.unwrap();
+        let ended = h.end(t.id, None).await.unwrap();
         assert_eq!(ended.state, TaskState::Done);
         assert!(ended.ended);
         assert_eq!(count(&mut events, "task.done", t.id).len(), 1);
         // Ending again changes nothing and says nothing.
-        assert!(h.end(t.id).await.unwrap().ended);
+        assert!(h.end(t.id, None).await.unwrap().ended);
         let before = lists(&fake);
         wait_for("a few reconciles", || lists(&fake) >= before + 4).await;
         assert_eq!(state_of(&store, t.id), TaskState::Done, "still at work");
@@ -5790,6 +5859,70 @@ mod tests {
         );
         assert!(count(&mut events, "task.done", t.id).is_empty());
         wait_for("live drops", || h.snapshot().live == 0).await;
+    }
+
+    /// `task done --summary` ends the round with what the agent said; said
+    /// again, it replaces that round's rather than starting another.
+    #[tokio::test]
+    async fn a_task_ended_with_a_summary_keeps_it_for_its_round() {
+        use crate::task::{Outcome, SummarySource};
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let ended = h
+            .end(t.id, Some("partial: tests left\npushed pastor/t-1".into()))
+            .await
+            .unwrap();
+        let summary = ended.summary.expect("the reply carries the summary");
+        assert_eq!(summary.round, 1);
+        assert_eq!(summary.outcome, Outcome::Partial);
+        assert_eq!(summary.source, SummarySource::Agent);
+        assert_eq!(count(&mut events, "task.done", t.id).len(), 1);
+        let again = h.end(t.id, Some("done".into())).await.unwrap();
+        assert_eq!(again.summary.unwrap().outcome, Outcome::Done);
+        let all = store.summaries(t.id).unwrap();
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(count(&mut events, "task.done", t.id).is_empty());
+    }
+
+    /// A task pastor finds done on its own ends a round with no summary,
+    /// holding the pane's last lines; the tail stays for the finish command,
+    /// and a summary the agent sends after replaces that round's.
+    #[tokio::test]
+    async fn a_round_with_no_summary_keeps_the_end_of_the_pane() {
+        use crate::task::{Outcome, SummarySource};
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(100)),
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● Opened https://example.org/pr/7\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        let done = store.get_task(t.id).unwrap().unwrap();
+        let summary = done.summary.expect("a done task shows its round");
+        assert_eq!(summary.outcome, Outcome::NoSummary);
+        assert_eq!(summary.source, SummarySource::Pane);
+        assert!(summary.text.contains("example.org/pr/7"), "{summary:?}");
+        assert!(store.take_pane_tail(t.id).is_some(), "left for the finish");
+        let late = h.end(t.id, Some("done: PR 7".into())).await.unwrap();
+        let late = late.summary.unwrap();
+        assert_eq!((late.round, late.outcome), (1, Outcome::Done));
+        assert_eq!(late.source, SummarySource::Agent);
     }
 
     /// Typing into an ended task gives it more to do: it runs again, and no
@@ -5807,7 +5940,7 @@ mod tests {
         let t = h.dispatch(new_task(&store).id).await.unwrap();
         let pane = t.pane_id.clone().unwrap();
         fake.set_status(&pane, AgentStatus::Working);
-        h.end(t.id).await.unwrap();
+        h.end(t.id, None).await.unwrap();
         // The rest of the turn after `task done`: work, then idle.
         fake.set_status(&pane, AgentStatus::Working);
         wait_for("activity recorded", || {
@@ -5852,14 +5985,14 @@ mod tests {
         })
         .await;
         let queued = new_task(&store);
-        let err = h.end(queued.id).await.unwrap_err();
+        let err = h.end(queued.id, None).await.unwrap_err();
         assert_eq!(
             err.downcast_ref::<SendRefused>().map(|r| r.code),
             Some("task_not_live"),
             "{err:#}"
         );
         assert_eq!(state_of(&store, queued.id), TaskState::Queued);
-        let err = h.end(999).await.unwrap_err();
+        let err = h.end(999, None).await.unwrap_err();
         assert_eq!(
             err.downcast_ref::<SendRefused>().map(|r| r.code),
             Some("task_not_found"),

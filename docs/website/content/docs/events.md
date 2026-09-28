@@ -56,6 +56,7 @@ The log is `~/.local/state/pastor/events.jsonl`. Past 10 MiB it moves to
 | `job` | the job name; `run` for a one-off task |
 | `machine` | the machine's status on `machine.*` events, else `null` |
 | `detail` | more, on the events that carry it |
+| `summary` | on `task.done` and `task.failed`: how the round ended, its `outcome`, `text`, `source` (`agent` or `pane`), `round` and `at` |
 
 Fields may be added; none are renamed or removed.
 

@@ -133,7 +133,7 @@ pub async fn answer_agent(socket: &Path, machine: &str, line: &[u8]) -> anyhow::
         }
         IpcRequest::TaskShow { id }
         | IpcRequest::TaskRead { id, .. }
-        | IpcRequest::TaskDone { id } => {
+        | IpcRequest::TaskDone { id, .. } => {
             let task = format!("t-{id}");
             let shown = ask(socket, &IpcRequest::TaskShow { id }, Some(&task)).await?;
             let on_machine = matches!(
@@ -354,12 +354,29 @@ mod tests {
         );
         assert_eq!(head.last()["op"], "task_read");
         assert_eq!(head.last()["lines"], 5);
-        let resp = head.ask(&IpcRequest::TaskDone { id: 1 }, None).await;
+        let resp = head
+            .ask(
+                &IpcRequest::TaskDone {
+                    id: 1,
+                    summary: None,
+                },
+                None,
+            )
+            .await;
         assert!(
             matches!(&resp, IpcResponse::Task(t) if t.id == 1),
             "{resp:?}"
         );
         assert_eq!(head.last()["op"], "task_done");
+        head.ask(
+            &IpcRequest::TaskDone {
+                id: 1,
+                summary: Some("done: pushed".into()),
+            },
+            None,
+        )
+        .await;
+        assert_eq!(head.last()["summary"], "done: pushed", "passed on as sent");
         let resp = head.ask(&IpcRequest::Ping, None).await;
         assert!(matches!(resp, IpcResponse::Pong { .. }), "{resp:?}");
     }
@@ -370,8 +387,14 @@ mod tests {
         for req in [
             IpcRequest::TaskShow { id: 2 },
             IpcRequest::TaskRead { id: 2, lines: 5 },
-            IpcRequest::TaskDone { id: 2 },
-            IpcRequest::TaskDone { id: 9 },
+            IpcRequest::TaskDone {
+                id: 2,
+                summary: None,
+            },
+            IpcRequest::TaskDone {
+                id: 9,
+                summary: None,
+            },
         ] {
             let resp = head.ask(&req, Some("t-1")).await;
             assert!(refused(&resp), "{req:?}: {resp:?}");
@@ -455,7 +478,14 @@ mod tests {
     #[tokio::test]
     async fn the_bridge_names_the_task_a_request_comes_from() {
         let head = fake_head();
-        head.ask(&IpcRequest::TaskDone { id: 1 }, Some("t-2")).await;
+        head.ask(
+            &IpcRequest::TaskDone {
+                id: 1,
+                summary: None,
+            },
+            Some("t-2"),
+        )
+        .await;
         assert_eq!(head.last()["op"], "task_done");
         assert_eq!(head.last()[crate::ipc::FROM_TASK_FIELD], "t-1");
         head.ask(&IpcRequest::Ping, Some("t-2")).await;

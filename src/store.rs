@@ -9,9 +9,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::queue::QueueSpot;
-use crate::task::{DispatchSpec, PANE_OWNING_STATES, Priority, Task, TaskState};
+use crate::task::{
+    DispatchSpec, Outcome, PANE_OWNING_STATES, Priority, SummarySource, Task, TaskState,
+    TaskSummary,
+};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -51,6 +54,27 @@ const V8_TABLES: &str = "CREATE TABLE IF NOT EXISTS event_seq (
         last INTEGER NOT NULL
      );
      INSERT OR IGNORE INTO event_seq (id, last) VALUES (1, 0);";
+
+/// Schema 12: how each round of a task ended (`TaskSummary`), one row per
+/// round, numbered from 1 for each task.
+const V13_TABLES: &str = "CREATE TABLE IF NOT EXISTS task_summaries (
+        task_id INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        outcome TEXT NOT NULL,
+        text TEXT NOT NULL,
+        source TEXT NOT NULL,
+        at TEXT NOT NULL,
+        PRIMARY KEY (task_id, round)
+     );";
+
+/// A task row with its last round's summary as JSON (`summary_json`), which
+/// `row_to_task` reads when the query has it.
+const TASK_WITH_SUMMARY: &str = "SELECT tasks.*,
+        (SELECT json_object('round', s.round, 'outcome', s.outcome, 'text', s.text,
+                            'source', s.source, 'at', s.at)
+           FROM task_summaries s WHERE s.task_id = tasks.id
+          ORDER BY s.round DESC LIMIT 1) AS summary_json
+     FROM tasks";
 
 /// One saved trust, as `pastor trust list` shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +366,7 @@ impl Store {
                 tx.execute_batch(V2_TABLES)?;
                 tx.execute_batch(V5_TABLES)?;
                 tx.execute_batch(V8_TABLES)?;
+                tx.execute_batch(V13_TABLES)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
@@ -353,6 +378,7 @@ impl Store {
                 tx.execute_batch(V2_TABLES)?;
                 tx.execute_batch(V5_TABLES)?;
                 tx.execute_batch(V8_TABLES)?;
+                tx.execute_batch(V13_TABLES)?;
             }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
@@ -438,6 +464,11 @@ impl Store {
                     add_column(&tx, "paused_for", "paused_for INTEGER")?;
                     add_column(&tx, "resumed_at", "resumed_at TEXT")?;
                 }
+                // How each round of a task ended. Older tasks have no rows
+                // and show no summary.
+                if v < 13 {
+                    tx.execute_batch(V13_TABLES)?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -495,6 +526,115 @@ impl Store {
         self.get_task(id)?.context("task vanished after insert")
     }
 
+    /// End a round of task `id`: a new summary row, numbered one past its
+    /// last. `summary` is what the agent said (`task done --summary`),
+    /// capped at `SUMMARY_MAX` characters; with none (or only blanks) the
+    /// round is `no summary` and keeps the pane's last lines, as far as
+    /// pastor read them (`note_pane_tail`), marked `source = pane`.
+    pub fn end_round(&self, id: i64, summary: Option<&str>) -> anyhow::Result<TaskSummary> {
+        let row = self.summary_row(id, summary);
+        let conn = self.conn.lock().unwrap();
+        let round: u32 = conn.query_row(
+            "INSERT INTO task_summaries (task_id, round, outcome, text, source, at)
+             SELECT ?1, COALESCE(MAX(round), 0) + 1, ?2, ?3, ?4, ?5
+               FROM task_summaries WHERE task_id = ?1
+             RETURNING round",
+            params![
+                id,
+                row.outcome.as_str(),
+                row.text,
+                row.source.as_str(),
+                row.at.to_rfc3339()
+            ],
+            |r| r.get(0),
+        )?;
+        Ok(TaskSummary { round, ..row })
+    }
+
+    /// Put `summary` in place of task `id`'s last round's, for an agent
+    /// that says what it did after pastor already found the task done. A
+    /// task with no rounds yet gets its first.
+    pub fn replace_last_summary(&self, id: i64, summary: &str) -> anyhow::Result<TaskSummary> {
+        let row = self.summary_row(id, Some(summary));
+        let conn = self.conn.lock().unwrap();
+        let round: Option<u32> = conn
+            .query_row(
+                "UPDATE task_summaries SET outcome = ?2, text = ?3, source = ?4, at = ?5
+                  WHERE task_id = ?1
+                    AND round = (SELECT MAX(round) FROM task_summaries WHERE task_id = ?1)
+                 RETURNING round",
+                params![
+                    id,
+                    row.outcome.as_str(),
+                    row.text,
+                    row.source.as_str(),
+                    row.at.to_rfc3339()
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        drop(conn);
+        match round {
+            Some(round) => Ok(TaskSummary { round, ..row }),
+            None => self.end_round(id, Some(summary)),
+        }
+    }
+
+    /// Every round's summary of task `id`, the first first.
+    pub fn summaries(&self, id: i64) -> anyhow::Result<Vec<TaskSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT round, outcome, text, source, at FROM task_summaries
+              WHERE task_id = ?1 ORDER BY round",
+        )?;
+        let rows = stmt.query_map(params![id], |r| {
+            let outcome: String = r.get(1)?;
+            let source: String = r.get(3)?;
+            let at: String = r.get(4)?;
+            Ok(TaskSummary {
+                round: r.get(0)?,
+                outcome: outcome.parse().map_err(conversion_failure)?,
+                text: r.get(2)?,
+                source: match source.as_str() {
+                    "agent" => SummarySource::Agent,
+                    "pane" => SummarySource::Pane,
+                    other => return Err(conversion_failure(format!("unknown source {other:?}"))),
+                },
+                at: DateTime::parse_from_rfc3339(&at)
+                    .map(|d| d.with_timezone(&Utc))
+                    .map_err(conversion_failure)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The row `end_round` writes for task `id`, round not yet numbered.
+    fn summary_row(&self, id: i64, summary: Option<&str>) -> TaskSummary {
+        let at = Utc::now();
+        match summary
+            .map(crate::task::cap_summary)
+            .filter(|s| !s.is_empty())
+        {
+            Some(text) => TaskSummary {
+                round: 0,
+                outcome: Outcome::parse(&text),
+                text,
+                source: SummarySource::Agent,
+                at,
+            },
+            None => TaskSummary {
+                round: 0,
+                outcome: Outcome::NoSummary,
+                text: self
+                    .pane_tail(id)
+                    .map(|t| crate::task::cap_pane_tail(&t))
+                    .unwrap_or_default(),
+                source: SummarySource::Pane,
+                at,
+            },
+        }
+    }
+
     /// Remember the last lines of `text`, what pastor read from `task_id`'s
     /// pane when it judged the task done, for the finish command of its
     /// connector (`take_pane_tail`). Kept in memory, not the database: it is
@@ -509,6 +649,17 @@ impl Store {
             tails.0.pop_front();
         }
         tails.0.push_back((task_id, tail));
+    }
+
+    /// The tail `note_pane_tail` kept for `task_id`, left for the finish
+    /// command to take.
+    fn pane_tail(&self, task_id: i64) -> Option<String> {
+        let tails = self.pane_tails.lock().unwrap_or_else(|p| p.into_inner());
+        tails
+            .0
+            .iter()
+            .find(|(id, _)| *id == task_id)
+            .map(|(_, t)| t.clone())
     }
 
     /// The tail `note_pane_tail` kept for `task_id`, once.
@@ -543,7 +694,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT * FROM tasks WHERE id = ?1",
+                &format!("{TASK_WITH_SUMMARY} WHERE id = ?1"),
                 params![id],
                 row_to_task,
             )
@@ -812,6 +963,10 @@ impl Store {
             &format!("DELETE FROM tasks WHERE {old} AND NOT ({on_disk})"),
             rusqlite::params_from_iter(args.iter()),
         )?;
+        tx.execute(
+            "DELETE FROM task_summaries WHERE task_id NOT IN (SELECT id FROM tasks)",
+            [],
+        )?;
         tx.commit()?;
         Ok(PruneOutcome {
             pruned,
@@ -820,7 +975,7 @@ impl Store {
     }
 
     pub fn list_tasks(&self, f: &TaskFilter) -> anyhow::Result<Vec<Task>> {
-        let mut sql = String::from("SELECT * FROM tasks WHERE 1=1");
+        let mut sql = format!("{TASK_WITH_SUMMARY} WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(job) = &f.job {
             args.push(Box::new(job.clone()));
@@ -1341,6 +1496,21 @@ where
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
 }
 
+/// The last round's summary a task row was read with (`TASK_WITH_SUMMARY`),
+/// on a task that is done, failed or closed: a round still going has none
+/// yet, and an older one says nothing about it. `None` from a query without
+/// the column.
+fn summary_of(row: &Row<'_>, state: &str) -> rusqlite::Result<Option<TaskSummary>> {
+    if !matches!(state, "done" | "failed" | "closed") {
+        return Ok(None);
+    }
+    let Ok(json) = row.get::<_, Option<String>>("summary_json") else {
+        return Ok(None);
+    };
+    json.map(|j| serde_json::from_str(&j).map_err(conversion_failure))
+        .transpose()
+}
+
 fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let parse_dt = |s: &str| -> rusqlite::Result<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(s)
@@ -1397,6 +1567,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
             paused_for: row.get("paused_for")?,
             resumed_at: resumed_at.as_deref().map(parse_dt).transpose()?,
         },
+        summary: summary_of(row, &state)?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -1700,6 +1871,102 @@ mod tests {
     }
 
     #[test]
+    fn a_v11_database_gains_the_summaries_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "DROP TABLE task_summaries;
+                 UPDATE meta SET value = '11' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "13");
+        assert_eq!(s.get_task(1).unwrap().unwrap().summary, None);
+        assert_eq!(s.end_round(1, Some("done")).unwrap().round, 1);
+    }
+
+    /// Each round of a task gets its own row, numbered from 1; a done,
+    /// failed or closed task is read with its last round's, a live one with
+    /// none.
+    #[test]
+    fn rounds_are_numbered_and_a_finished_task_shows_its_last() {
+        let s = Store::open_in_memory().unwrap();
+        let mut t = s.insert_task(new_task("run")).unwrap();
+        let first = s
+            .end_round(t.id, Some("  Partial: tests left\nsee the branch\n"))
+            .unwrap();
+        assert_eq!(first.round, 1);
+        assert_eq!(first.outcome, Outcome::Partial);
+        assert_eq!(first.text, "Partial: tests left\nsee the branch");
+        assert_eq!(first.source, SummarySource::Agent);
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().summary, None, "queued");
+        t.state = TaskState::Done;
+        s.update_task(&mut t).unwrap();
+        assert_eq!(
+            s.get_task(t.id).unwrap().unwrap().summary,
+            Some(first.clone())
+        );
+        let second = s.end_round(t.id, Some("done")).unwrap();
+        assert_eq!(second.round, 2);
+        let listed = s.list_tasks(&TaskFilter::default()).unwrap();
+        assert_eq!(listed[0].summary, Some(second.clone()));
+        assert_eq!(s.summaries(t.id).unwrap(), vec![first, second]);
+        t.state = TaskState::Running;
+        s.update_task(&mut t).unwrap();
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().summary, None, "running");
+    }
+
+    /// A round that ends with no summary keeps the pane's last lines, and
+    /// leaves them for the finish command.
+    #[test]
+    fn a_round_with_no_summary_keeps_the_pane_tail() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        let none = s.end_round(t.id, None).unwrap();
+        assert_eq!(none.outcome, Outcome::NoSummary);
+        assert_eq!(none.source, SummarySource::Pane);
+        assert_eq!(none.text, "");
+        s.note_pane_tail(t.id, "built it\npushed\n");
+        let blank = s.end_round(t.id, Some("  \n")).unwrap();
+        assert_eq!(blank.round, 2);
+        assert_eq!(blank.outcome, Outcome::NoSummary);
+        assert_eq!(blank.text, "built it\npushed");
+        assert_eq!(s.take_pane_tail(t.id).as_deref(), Some("built it\npushed"));
+    }
+
+    #[test]
+    fn a_late_summary_replaces_the_last_round() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        let first = s.replace_last_summary(t.id, "blocked: no token").unwrap();
+        assert_eq!((first.round, first.outcome), (1, Outcome::Blocked));
+        s.end_round(t.id, None).unwrap();
+        let late = s.replace_last_summary(t.id, "nothing to do").unwrap();
+        assert_eq!((late.round, late.outcome), (2, Outcome::NothingToDo));
+        assert_eq!(late.source, SummarySource::Agent);
+        assert_eq!(s.summaries(t.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pruning_a_task_drops_its_summaries() {
+        let s = Store::open_in_memory().unwrap();
+        let mut old = s.insert_task(new_task("run")).unwrap();
+        s.insert_task(new_task("run")).unwrap();
+        old.state = TaskState::Done;
+        old.finished_at = Some(Utc::now() - chrono::Duration::days(3));
+        s.update_task(&mut old).unwrap();
+        s.end_round(old.id, Some("done")).unwrap();
+        let out = s
+            .prune(&[TaskState::Done], Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(out.pruned, 1);
+        assert!(s.summaries(old.id).unwrap().is_empty());
+    }
+
+    #[test]
     fn unreadable_schema_version_refuses_to_open() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pastor.db");
@@ -1782,7 +2049,13 @@ mod tests {
         }
         assert_eq!(
             table_names(&path),
-            vec!["event_seq", "meta", "tasks", "trusted_repos"]
+            vec![
+                "event_seq",
+                "meta",
+                "task_summaries",
+                "tasks",
+                "trusted_repos"
+            ]
         );
         let s = Store::open(&path).unwrap();
         assert_eq!(
@@ -1792,6 +2065,7 @@ mod tests {
                 "job_state",
                 "meta",
                 "seen",
+                "task_summaries",
                 "tasks",
                 "trusted_repos"
             ]
@@ -1832,6 +2106,7 @@ mod tests {
                 "job_state",
                 "meta",
                 "seen",
+                "task_summaries",
                 "tasks",
                 "trusted_repos"
             ]
@@ -2963,9 +3238,10 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN resumed_at;
                  DROP TABLE trusted_repos;
                  DROP TABLE event_seq;
+                 DROP TABLE task_summaries;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '12' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '13' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -3004,7 +3280,8 @@ mod tests {
         let tables = table_names(&path);
         assert!(
             !tables.contains(&"trusted_repos".to_string())
-                && !tables.contains(&"event_seq".to_string()),
+                && !tables.contains(&"event_seq".to_string())
+                && !tables.contains(&"task_summaries".to_string()),
             "rolled back: {tables:?}"
         );
     }
