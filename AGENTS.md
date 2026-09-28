@@ -37,10 +37,8 @@ down here because getting them wrong cost a day.
   idle. The sequence alone is not proof of work: `unknown` bumps it too, so
   `idle -> unknown -> idle` would pass. herdr's own `agent.prompt --wait` makes
   the same two checks (`prompt_activity_statuses`, then
-  `after_state_change_seq`). The activity flag lives in the machine actor's
-  memory, not the store (a column would need a schema bump); after a restart
-  an agent found working or blocked counts again, one found idle stays running
-  until stale. Unreleased herdr adds `completion_seq` in the same sequence;
+  `after_state_change_seq`). The activity flag is stored with the task
+  (`tasks.activity_seen`, since schema 6), so a restart keeps it. Unreleased herdr adds `completion_seq` in the same sequence;
   pastor prefers it when present, with no activity needed.
 - herdr has no state for an agent that ended its turn on a question: it is
   idle, exactly like one that finished. So before confirming `done`,
@@ -197,7 +195,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
-~/.local/state/pastor/pastor.db   tasks (schema 9), seen keys, event seq, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 13), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1

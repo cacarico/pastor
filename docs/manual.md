@@ -78,9 +78,10 @@ it may be busy mid-request, and working as if no head ran would let `tick`
 start a second scheduler next to it, or an edit or a prune go offline behind
 it. `task list` and `task describe`
 read from `pastor serve` when it's running and fall back to the SQLite store
-when it's not (`task list` says so on stderr); `task attach` always reads the store
+when it's not (`task list` says so on stderr); `task attach` reads the local store
 directly, since it only needs the task's machine and agent name to hand off
-to `ssh`/`herdr`.
+to `ssh`/`herdr`; with a remote head set it asks the head for the task
+instead.
 
 `pastor machine list` opens with a line about the head, then lists the
 machines:
@@ -102,9 +103,11 @@ stderr that the machines were probed directly. `--flock F` lists only that
 flock's machines, and the line counts those.
 HOST is the ssh target, `local`, or the program a `command` machine runs.
 FLOCKS are the flocks the machine is in, with its number in each (see Flocks). PROFILE is the
-permission profile a task there runs under when it names none: the
-machine's own, else its flock's, else `[defaults]` (see [Permission
-profiles](#permission-profiles)); `profile` in `--json`. PASTOR is the pastor
+machine's own permission profile, the one that decides whether a task may
+ask for `unrestricted` there: the machine's `profile`, else its flock's,
+else `[defaults]` (see [Permission profiles](#permission-profiles));
+`profile` in `--json`. A task there runs under its own flock's profile
+before the machine's, so it can run under another one. PASTOR is the pastor
 installed on the machine:
 over the ssh master, pastor runs `pastor --version` in a shell that has
 `~/.cargo/bin` and `~/.local/bin` on its PATH, since ssh's non-login shell
@@ -239,7 +242,7 @@ pastor task done --summary-file notes.md      # or - for stdin
 ```
 
 The first line names the outcome: `done`, `partial`, `blocked` or `nothing
-to do`, in any case, alone or followed by something that is not a letter
+to do`, in any case, alone or followed by something that is not a letter, digit or underscore
 (`Partial - tests left`). A first line that names none is stored as
 `unknown`. A summary keeps its first 2,000 characters; a blank one is
 refused (`summary_empty`), and an unreadable file too
@@ -1388,7 +1391,8 @@ A retry settles the profile again from pastor.toml as it stands.
 `pastor task describe` prints it and where it came from, such as `profile:
 develop (from flock work)`, and the task's `--json` has a `profile` field;
 `machine list` has a PROFILE column, `machine describe` a `profile` line with
-the profile the machine's tasks get, and `flock describe` the flock's own.
+the machine's own profile (its `profile`, else its flock's, else
+`[defaults]`, as the unrestricted rule reads it), and `flock describe` the flock's own.
 Since a head from before profiles would start the agent without them, every
 command that can make it queue a task (`pastor task run`, `pastor task
 retry`, `pastor tick` without `--dry-run`, `pastor job run`) refuses one
@@ -1499,8 +1503,10 @@ A record, which is also what connector event hooks get on stdin:
   `[finish]` command failed), `machine.connected`, `machine.lost`, and
   `orchestrator.started|skipped|held|quota|failed|restarted|stopping|stopped`
   (see Orchestrators).
-- `task`: the full task row (the same object as `pastor task describe --json`) at
-  that moment, on `task.*` events; `null` otherwise or if the row is gone.
+- `task`: the full task row at that moment, as stored: `pastor task describe
+  --json` without the `model`, `profile` and `description_from` it adds, and
+  with `description` null when none was given (the record's own `model`
+  carries the model), on `task.*` events; `null` otherwise or if the row is gone.
   `task.flock` is the task's flock, so a hook can route work and personal
   notifications apart.
 - `job`: the job name. For a task event it is the task's `job` (`run` for a
