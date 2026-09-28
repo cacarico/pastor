@@ -142,6 +142,12 @@ pub struct DispatchSpec {
     /// `repo`.
     #[serde(default, skip_serializing_if = "Place::is_repo")]
     pub place: Place,
+    /// The Claude session the agent was started on (`--session-id`),
+    /// recorded by dispatch so `pastor task attach` can resume it once the
+    /// pane is gone. `None` for another kind of agent, and when the task's
+    /// own args pick the session (`picks_session`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Where dispatch puts a task's pane: `--place`, a job's `[dispatch] place`
@@ -353,6 +359,59 @@ pub fn parse_task_id(s: &str) -> Option<i64> {
 /// What to say when `s` is not something `parse_task_id` takes.
 pub fn bad_task_id(s: &str) -> String {
     format!("{s} is not a task id; write it like t-12 or 12")
+}
+
+/// Claude's flags that choose the session it starts on (`claude --help`).
+/// Agent args with any of them keep their own, and pastor records none.
+const CLAUDE_SESSION_FLAGS: [&str; 6] = [
+    "--session-id",
+    "--resume",
+    "-r",
+    "--continue",
+    "-c",
+    "--fork-session",
+];
+
+/// Do `args` already choose Claude's session, as `--flag value` or
+/// `--flag=value`?
+pub fn picks_session(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        let flag = a.split_once('=').map_or(a.as_str(), |(f, _)| f);
+        CLAUDE_SESSION_FLAGS.contains(&flag)
+    })
+}
+
+/// A new random (version 4) UUID for `claude --session-id`, from the
+/// kernel's random source. `None` when it cannot be read: the task then
+/// starts without a session of pastor's choosing, as before.
+pub fn new_session_id() -> Option<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .ok()?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
+
+/// Is `s` a UUID as Claude takes one: 8-4-4-4-12 hex digits. A recorded
+/// session goes into a command line on another machine, so attach checks
+/// it first.
+pub fn is_session_id(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.iter().map(|p| p.len()).eq([8, 4, 4, 4, 12])
+        && parts
+            .iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -593,6 +652,7 @@ mod tests {
                 reopen: None,
                 agent_source: None,
                 place: Default::default(),
+                session_id: None,
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),

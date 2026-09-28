@@ -169,7 +169,20 @@ async fn dispatch_steps(
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
-    let launch = agents.launch(&spec).map_err(DispatchError::Task)?;
+    let mut launch = agents.launch(&spec).map_err(DispatchError::Task)?;
+    // A Claude agent starts on a session pastor names, so `task attach` can
+    // resume it once the pane is gone; last, after the tool flags. The task
+    // records it only once `agent.start` succeeds (`finish_dispatch`): a
+    // task that failed before then never had that conversation to resume.
+    task.spec.session_id = None;
+    let mut session = None;
+    if launch.kind == "claude"
+        && !crate::task::picks_session(&launch.args)
+        && let Some(id) = crate::task::new_session_id()
+    {
+        launch.args.extend(["--session-id".to_string(), id.clone()]);
+        session = Some(id);
+    }
     let repo = match spec.repo.as_deref() {
         Some(repo) => Some(expand_home(conn, "repo", repo, task.machine.as_deref()).await?),
         None => None,
@@ -251,7 +264,7 @@ async fn dispatch_steps(
             created.root_pane.pane_id
         }
     };
-    finish_dispatch(conn, task, name, &launch, &pane_id, ready_timeout).await
+    finish_dispatch(conn, task, name, &launch, session, &pane_id, ready_timeout).await
 }
 
 /// Start the agent in its pane, wait for it to come up and prompt it.
@@ -260,6 +273,7 @@ async fn finish_dispatch(
     task: &mut Task,
     name: &str,
     launch: &crate::config::Launch,
+    session: Option<String>,
     pane_id: &str,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
@@ -268,6 +282,7 @@ async fn finish_dispatch(
     // the kind and the pane). Readiness shows up afterwards, in `agent.list` and
     // in whether `agent.prompt` is accepted.
     start_agent(conn, name, &launch.kind, &launch.args, pane_id).await?;
+    task.spec.session_id = session;
 
     let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
@@ -710,6 +725,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         }
     }
 
@@ -738,6 +754,7 @@ mod tests {
                     .any(|r| r.method.ends_with(".create")),
                 "nothing was created"
             );
+            assert_eq!(t.spec.session_id, None, "no session to resume");
         }
     }
 
@@ -758,6 +775,18 @@ mod tests {
             err.to_string().contains("/home/fake/gone does not exist"),
             "{err}"
         );
+    }
+
+    /// `args` with the `--session-id` dispatch gave `t` after them.
+    fn with_session(t: &Task, args: Value) -> Value {
+        let mut args = args.as_array().unwrap().clone();
+        let id = t
+            .spec
+            .session_id
+            .clone()
+            .expect("a claude task records a session");
+        args.extend([Value::from("--session-id"), Value::from(id)]);
+        Value::Array(args)
     }
 
     fn task(spec: DispatchSpec) -> Task {
@@ -902,10 +931,94 @@ mod tests {
         assert_eq!(ws.params["label"], "t-7");
         let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
         assert_eq!(start.params["kind"], "claude");
-        assert_eq!(start.params["args"], serde_json::json!(["--model", "opus"]));
+        assert_eq!(
+            start.params["args"],
+            with_session(&t, serde_json::json!(["--model", "opus"]))
+        );
         let prompt = reqs.iter().find(|r| r.method == "agent.prompt").unwrap();
         assert_eq!(prompt.params["target"], "t-7");
         assert_eq!(prompt.params["text"], "line one\n\"two\" {{ three }}");
+    }
+
+    /// A claude task starts on a session of its own, `--session-id` after
+    /// every other arg, and the task records it so attach can resume it
+    /// once the pane is gone.
+    #[tokio::test]
+    async fn a_claude_task_starts_on_a_session_it_records() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            deny: vec!["WebFetch".into()],
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let id = t.spec.session_id.clone().expect("a session id");
+        assert!(crate::task::is_session_id(&id), "{id}");
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(
+            start.params["args"],
+            serde_json::json!([
+                "--model",
+                "opus",
+                "--disallowedTools",
+                "WebFetch",
+                "--session-id",
+                id
+            ])
+        );
+        // Another task, another session.
+        let mut u = task(spec());
+        u.id = 8;
+        dispatch(&FakeHerdr::new(), &mut u, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_ne!(u.spec.session_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// Agent args that already pick a session keep it, and pastor records
+    /// none; an agent of another kind gets no flag it would not know.
+    #[tokio::test]
+    async fn a_session_the_args_pick_or_another_kind_gets_no_session_id() {
+        for args in [
+            vec!["--session-id", "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["--session-id=0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["--resume", "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["-r", "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--resume", "x", "--fork-session"],
+        ] {
+            let fake = FakeHerdr::new();
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            let mut t = task(DispatchSpec {
+                agent_args: args.clone(),
+                ..spec()
+            });
+            // A stale id copied from somewhere else is dropped, too.
+            t.spec.session_id = Some("stale".into());
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            assert_eq!(t.spec.session_id, None, "{args:?}");
+            let reqs = fake.requests();
+            let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+            assert_eq!(start.params["args"], serde_json::json!(args));
+        }
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            agent: "codex".into(),
+            agent_args: vec![],
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.session_id, None);
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["args"], serde_json::json!([]));
     }
 
     /// The tool lists reach herdr as the agent's own flags, after its args.
@@ -924,14 +1037,17 @@ mod tests {
         let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
         assert_eq!(
             start.params["args"],
-            serde_json::json!([
-                "--model",
-                "opus",
-                "--allowedTools",
-                "Bash(git:*)",
-                "--disallowedTools",
-                "WebFetch"
-            ])
+            with_session(
+                &t,
+                serde_json::json!([
+                    "--model",
+                    "opus",
+                    "--allowedTools",
+                    "Bash(git:*)",
+                    "--disallowedTools",
+                    "WebFetch"
+                ])
+            )
         );
     }
 
@@ -1004,7 +1120,10 @@ mod tests {
         assert_eq!(start.params["name"], "t-7");
         assert_eq!(
             start.params["args"],
-            serde_json::json!(["--model", "opus", "--disallowedTools", "WebFetch"])
+            with_session(
+                &t,
+                serde_json::json!(["--model", "opus", "--disallowedTools", "WebFetch"])
+            )
         );
         assert_eq!(fake.pane_env(t.pane_id.as_deref().unwrap()), want);
         assert!(!reqs.iter().any(|r| r.method == "pane.split"));
@@ -1377,6 +1496,17 @@ mod tests {
             "created workspace is recorded even on failure"
         );
         assert!(!fake.requests().iter().any(|r| r.method == "agent.prompt"));
+        // Claude never ran, so there is no session for attach to resume.
+        let start = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "agent.start");
+        assert!(
+            start.unwrap().params["args"]
+                .to_string()
+                .contains("--session-id")
+        );
+        assert_eq!(t.spec.session_id, None);
     }
 
     /// herdr answers `agent_pane_busy` while the new pane's shell is still

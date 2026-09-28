@@ -196,7 +196,9 @@ on the task naming the branch, for you to save and remove with `git worktree
 remove`. herdr never deletes the branch, even for a worktree it removes. Failed and stale tasks are left for
 `pastor task retry`; blocked tasks need their prompt answered
 (`pastor task send` or `pastor task attach`) or `pastor task close`. None of them is closed on its
-own. The grace period keeps the pane there for `pastor task attach`; the
+own. The grace period keeps the pane there for `pastor task attach` (a
+Claude task can be reopened after it anyway; see [Reopening a finished
+task](#reopening-a-finished-task)); the
 check runs with each reconcile, while the machine is connected. An agent
 that herdr shows working or blocked again
 at that moment is left alone, and its task goes back to running or blocked.
@@ -817,6 +819,7 @@ pastor task close t-1 --remove-worktree   # close its pane and remove its worktr
 pastor task done t-1                 # mark it done; its pane closes after close_done_after
 pastor task prune --done --closed --older-than 7d
 pastor task attach t-1               # lands in the agent's pane; ctrl+b q detaches
+                                     # (a closed Claude task: its session, reopened)
 pastor machine open pi-3             # the full herdr UI on that machine
 pastor events --follow               # task, job and machine events as they happen
 ```
@@ -847,6 +850,14 @@ agent](#a-flocks-or-a-machines-agent)); a job file that sets `agent_args = []`
 opts out of all three. `pastor task describe t-1` prints the agent and
 args a task was started with.
 
+An agent of kind `claude` also gets `--session-id <uuid>`, after every other
+argument, with a new id per task. The task records it (`session:` in `task
+describe`, `spec.session_id` in its JSON) so that `pastor task attach` can
+reopen the conversation after the pane is gone (see [Reopening a finished
+task](#reopening-a-finished-task)). Args that already choose a session
+(`--session-id`, `--resume`/`-r`, `--continue`/`-c` or `--fork-session`) are
+left as they are, and nothing is recorded. A retry starts a new session.
+
 `--prompt-file` reads the prompt from a file on the machine that runs the CLI,
 not on the agent's machine; `-` reads standard input. It spares a long prompt
 the shell's quoting, so `pastor task run --prompt-file - <<'EOF'` takes quotes,
@@ -866,6 +877,28 @@ FAKE_HERDR_AUTO_DONE_MS=500 fake-herdr --listen /tmp/fake-herdr.sock &
 pastor machine add fake --command "fake-herdr --connect /tmp/fake-herdr.sock"
 pastor serve
 ```
+
+### Reopening a finished task
+
+`pastor task attach t-N` on a task whose pane is still there lands in it, as
+always. Once the task is `closed` or `failed`, pastor looks on the task's
+machine first: while herdr still lists the task's agent, attach goes to it.
+Otherwise, for a task that recorded a Claude session, it opens a new
+workspace on that machine, labelled `t-N-resume`, in the task's directory
+(its worktree, else its repo), with the env of the task's agent definition
+(so `CLAUDE_CONFIG_DIR` points at the same account's sessions), runs `claude
+--resume <session>` there as the agent `t-N-resume`, and attaches. Attaching
+again while that pane is open goes back to it.
+
+The pane is yours, not the task's: the task's state does not change, and
+closing the pane leaves no trace on it. Claude files its sessions by
+directory, so a worktree removed at close is first put back at the same path
+on the task's branch (`git worktree prune`, then `git worktree add <path>
+<branch>`, in the task's repo); when the branch is gone too, attach fails with
+`branch_gone` and opens nothing. A task of another kind (opencode, codex), or
+a Claude task that recorded no session, has nothing to reopen: attach fails
+with `no_agent`, as before, and says so. A `command` machine has no terminal,
+so attach refuses it with `no_terminal` either way.
 
 ## Run under systemd
 

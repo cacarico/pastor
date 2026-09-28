@@ -23,6 +23,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   deploy key and a fine-grained token for one repository, so they can't
   merge), permissions for unattended agents, fresh code for every task, and
   `close_done_after` for short tasks. The docs test checks its commands too.
+- `pastor task attach` reopens a finished Claude task. Dispatch starts a
+  `claude` agent with `--session-id <uuid>` after its other args (unless they
+  already choose a session) and records the id on the task (`session:` in
+  `task describe`, `spec.session_id` in JSON). Attaching to a closed or
+  failed task whose agent is gone opens a workspace `t-N-resume` on the
+  task's machine, in its directory and with its agent definition's env, runs
+  `claude --resume <uuid>` there and attaches; the task does not change. A
+  worktree removed at close is re-created first on the task's branch
+  (`branch_gone` when the branch is gone too). Tasks of other agents keep the
+  old error, with a hint that only Claude tasks can be reopened. Closing done
+  panes early (`close_done_after`) no longer loses the conversation.
 - A connector can declare a `[finish]` command in its manifest (`command`,
   and a `timeout` that defaults like a hook's). The head runs it once, with the
   connector's env and secrets, when a task of one of its jobs reaches `done`

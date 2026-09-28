@@ -346,6 +346,16 @@ fn help_footer_points_agents_at_the_skill() {
 /// `--agent-arg` reaches herdr's `agent.start` as `args`, in order, and shows
 /// in `task describe` and `task list --json`; without it, the flock's
 /// `agent_args` do, then `[defaults] agent_args`.
+/// A claude agent's args without the `--session-id <uuid>` dispatch puts
+/// last.
+fn without_session(args: &serde_json::Value) -> serde_json::Value {
+    let mut args = args.as_array().unwrap().clone();
+    let n = args.len();
+    assert!(n >= 2 && args[n - 2] == "--session-id", "{args:?}");
+    args.truncate(n - 2);
+    serde_json::Value::Array(args)
+}
+
 #[test]
 fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     let env = start();
@@ -367,7 +377,11 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(task["spec"]["agent_args"], want);
     let start = env.agent_start_params("t-1");
-    assert_eq!(start["args"], want, "{start}");
+    // A claude agent starts on a session of its own, after its args, and
+    // the task records it.
+    let session = start["args"][3].as_str().unwrap().to_string();
+    assert_eq!(start["args"][2], "--session-id", "{start}");
+    assert_eq!(without_session(&start["args"]), want, "{start}");
     assert_eq!(start["kind"], "claude");
 
     let out = env.cmd(&["task", "describe", "t-1"]);
@@ -376,6 +390,10 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
         text.contains("agent args: --model claude-opus-5-5"),
         "{text}"
     );
+    assert!(text.contains(&format!("session:    {session}\n")), "{text}");
+    let out = env.cmd(&["task", "describe", "t-1", "--json"]);
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["spec"]["session_id"], session.as_str(), "{task}");
     let out = env.cmd(&["task", "list", "--all", "--json"]);
     let tasks: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(tasks[0]["spec"]["agent_args"], want, "{tasks}");
@@ -395,7 +413,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     );
     let start = env.agent_start_params("t-2");
     assert_eq!(
-        start["args"],
+        without_session(&start["args"]),
         serde_json::json!(["--model", "claude-sonnet-5"]),
         "{start}"
     );
@@ -424,7 +442,7 @@ fn agent_args_reach_herdr_from_the_flags_or_the_defaults() {
     );
     let start = env.agent_start_params("t-3");
     assert_eq!(
-        start["args"],
+        without_session(&start["args"]),
         serde_json::json!([
             "--model",
             "claude-haiku-4-5",
@@ -4518,7 +4536,7 @@ fn a_named_model_reaches_herdr_and_bad_ones_are_refused() {
     assert_eq!(task["model"], "sonnet", "{task}");
     let start = env.agent_start_params("t-1");
     assert_eq!(
-        start["args"],
+        without_session(&start["args"]),
         serde_json::json!(["--model", "claude-sonnet-5", "-v"]),
         "{start}"
     );
@@ -4548,4 +4566,26 @@ fn a_named_model_reaches_herdr_and_bad_ones_are_refused() {
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         assert_eq!(last_error(&out).0, code, "{args:?}");
     }
+}
+
+/// `task attach` on a task whose pane is gone: one of a kind with no
+/// session keeps the old error with a hint that only Claude tasks reopen; a
+/// Claude task goes on to its machine to reopen the session, which a
+/// `command` machine cannot show.
+#[test]
+fn attach_on_a_closed_task_reopens_only_a_claude_session() {
+    let env = start();
+    let t = env.json(&["task", "run", "hi", "--agent", "opencode", "--json"]);
+    assert_eq!(t["spec"].get("session_id"), None, "{t}");
+    env.json(&["task", "close", "t-1", "--json"]);
+    let out = env.cmd(&["task", "attach", "t-1"]);
+    assert_eq!(error_code(&out), "no_agent");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("t-1 is closed; nothing to attach to"), "{err}");
+    assert!(err.contains("only Claude tasks can be reopened"), "{err}");
+
+    let t = env.json(&["task", "run", "hi", "--json"]);
+    assert!(t["spec"]["session_id"].is_string(), "{t}");
+    env.json(&["task", "close", "t-2", "--json"]);
+    env.fails_with(&["task", "attach", "t-2"], "no_terminal");
 }

@@ -72,7 +72,7 @@ pastor task read t-12          # recent pane output; --lines N for more
 pastor events --task t-12      # what happened to it, and when
 ```
 
-`pastor task attach t-12` puts a human terminal into the agent's pane (ctrl+b q detaches). It needs a real terminal; as an agent, use `pastor task read`.
+`pastor task attach t-12` puts a human terminal into the agent's pane (ctrl+b q detaches). On a closed or failed Claude task whose pane is gone, it reopens the agent's own session (`claude --resume`) in a new pane on the task's machine, re-creating a removed worktree first; the task itself does not change. Other agents cannot be reopened. It needs a real terminal; as an agent, use `pastor task read`.
 
 States:
 

@@ -2100,6 +2100,7 @@ mod tests {
             reopen: None,
             agent_source: None,
             place: Default::default(),
+            session_id: None,
         }
     }
 
@@ -3178,10 +3179,14 @@ mod tests {
         let reqs = fake.requests();
         let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
         assert_eq!(start.params["kind"], "claude");
+        let args = start.params["args"].as_array().unwrap();
         assert_eq!(
-            start.params["args"],
+            args[..3],
             serde_json::json!(["--model", "claude-sonnet-5", "-v"])
+                .as_array()
+                .unwrap()[..]
         );
+        assert_eq!(args[3], "--session-id");
         let text = crate::cli::task_detail(&t);
         assert!(
             text.contains("model:      sonnet (from task run)"),
