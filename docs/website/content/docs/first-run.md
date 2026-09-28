@@ -25,11 +25,16 @@ herdr server; `pastor setup systemd --herdr` on it keeps one running.
 ## start the head
 
 ```sh
-pastor setup systemd  # setup launchd on macOS
+pastor serve          # in the background, until you stop it
 pastor machine list
 ```
 
-Setup shows what it will install and asks before it does. `machine list`
+`pastor serve` returns once the head answers; `pastor serve status` shows it,
+`pastor serve stop` stops it, and it logs to
+`~/.local/state/pastor/serve.log`. To have it start at login and come back
+after a crash, install it as a service instead: `pastor setup systemd`
+(`setup launchd` on macOS), which shows what it will install and asks before
+it does. `machine list`
 opens with a line about the head, then one row per machine. Only
 `connected` and `polling` machines take tasks.
 

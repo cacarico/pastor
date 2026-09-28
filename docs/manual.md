@@ -1343,7 +1343,7 @@ pastor watch --now                   # what needs attention right now, then exit
 pastor watch --interval 2m --all --json --connector prs
 ```
 
-```
+```text
 TASK t-12 failed pi-3 nightly outcome="no summary": agent exited
 TASK t-13 done pi-2 nightly outcome=partial
 TASK t-14 blocked pi-1 run
@@ -1430,7 +1430,7 @@ pastor machine add here --local
 pastor flock add work                # a second flock; the machines above stay in `default`
 pastor machine move pi-3 work
 pastor machine list                  # a line about the head, then each machine: host, flock, channel, herdr, pastor, agents
-pastor setup systemd                 # confirm, then install and enable --now; or `pastor serve &`
+pastor setup systemd                 # confirm, then install and enable --now; or just `pastor serve`
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --machine pi-3
 pastor task run "Review the open PR" --agent-arg=--model --agent-arg=claude-opus-5-5
 pastor task run "Fix the typo in README" --model sonnet   # a [models] name from pastor.toml
@@ -1529,7 +1529,7 @@ a server, and a bridge per request.
 ```bash
 FAKE_HERDR_AUTO_DONE_MS=500 fake-herdr --listen /tmp/fake-herdr.sock &
 pastor machine add fake --command "fake-herdr --connect /tmp/fake-herdr.sock"
-pastor serve
+pastor serve --foreground            # its log in this terminal; ctrl-c stops it
 ```
 
 ### Reopening a finished task
@@ -1554,6 +1554,48 @@ a Claude task that recorded no session, has nothing to reopen: attach fails
 with `no_agent`, as before, and says so. A `command` machine has no terminal,
 so attach refuses it with `no_terminal` either way.
 
+## Run the head
+
+`pastor serve` starts the head in the background and returns once it answers
+a ping, printing its pid and its log. The head runs in a session of its own,
+so closing the terminal or pressing ctrl-c there does not stop it, and it
+logs to `~/.local/state/pastor/serve.log`, rotated at 10 MB to `serve.log.1`,
+`serve.log.2` and `serve.log.3` (the oldest is dropped). With a head set on
+another machine it starts a headless serve the same way (see [A headless
+serve](#a-headless-serve)), and passes `--head` on when given one. If a head
+already answers on the socket it says so (`head_running`,
+`shepherd_running`) and starts nothing; if the new head exits before it
+answers, `pastor serve` fails with `serve_failed` and the head's own error,
+and after 30 seconds without an answer with `serve_slow`.
+
+`pastor serve --foreground` (`-f`) is the head in this terminal, logging to
+stderr until ctrl-c, SIGTERM or SIGHUP: what a service runs, and what to use
+when you want to watch it. A `pastor serve` that a service manager started
+stays in the foreground without the flag, so a unit written before
+`--foreground` existed keeps working: pastor looks at the process that
+started it, and a `systemd` manager (the user one or pid 1), launchd on
+macOS, or any other pid 1 counts as a service. It does not go by
+`INVOCATION_ID`, which every process under a systemd unit inherits, a shell
+in a herdr pane started by `herdr.service` included.
+
+`pastor serve status` pings the socket and says whether a head (or a
+headless serve) runs here: its pid, its version, and whether it runs under a
+service, in the background with its log, or in a terminal; `--json` prints
+`running`, `role` (`head` or `headless`), `pid`, `version`, `protocol`,
+`service` (`systemd`, `launchd`, `init` or null), `log` and `socket`. Nothing
+running is `not_running`, and something on the socket that does not answer
+is `head_unresponsive`. The head writes what it knows about itself to
+`serve.json` in the state dir as it starts, and status believes that file only
+when its pid is the one holding the socket; a head started by an older
+pastor has none, and its service is `unknown`.
+
+`pastor serve stop` sends SIGTERM to the process holding the socket and waits
+up to 30 seconds for it to exit; agents keep running, as with any stop. With
+nothing running it says so and succeeds. A head that runs under a service is
+refused (`service_managed`), since `Restart=always` and `KeepAlive` would
+start it again: stop it with `pastor setup systemd --stop` or `pastor setup
+launchd --stop`.
+
 ## Run under systemd
 
 `pastor setup systemd` installs `contrib/systemd/pastor.service` to
@@ -1564,7 +1606,10 @@ fails at once rather than wait for an answer. With no action flag it runs `syste
 unit. `--enable`, `--start`, `--enable --now`, `--enable --start` and `--stop`
 map to the same `systemctl --user` actions after the unit is written.
 `pastor setup systemd --herdr` does the same with `herdr.service` (the herdr
-server) and belongs on every machine in the flock. Both units always restart
+server) and belongs on every machine in the flock. `pastor.service` runs
+`pastor serve --foreground`; a unit from before that flag, with a bare
+`pastor serve`, keeps its head in the foreground too (see [Run the
+head](#run-the-head)), but re-run setup to bring it up to date. Both units always restart
 (`Restart=always`, so a head killed by a stray signal comes back) and log to
 the journal (`journalctl --user -u pastor`); `systemctl --user stop` still
 stops one for good, since systemd does not restart after an explicit stop.
@@ -1611,7 +1656,7 @@ same ask-first prompt. It writes `contrib/launchd/pastor.plist` to
 `--herdr`, `pastor.herdr` from `contrib/launchd/herdr.plist`), pointing
 ProgramArguments at the binary it finds and copying your shell's `PATH` (and,
 for pastor, the three absolute `PASTOR_*_DIR` values) into
-EnvironmentVariables. Output goes to `~/Library/Logs/<label>.log`. The actions
+EnvironmentVariables. pastor's agent runs `pastor serve --foreground`. Output goes to `~/Library/Logs/<label>.log`. The actions
 run in your `gui/<uid>` domain: `--enable` is `launchctl enable`, and on an
 agent that is not loaded yet also `launchctl bootstrap`, which starts it:
 unlike `systemctl enable`, launchd has no way to register an agent without
@@ -2134,7 +2179,9 @@ store, and never reads `flock.toml`.
   the head.
 
 `pastor setup systemd` (or `launchd`) installs it the same way: the unit
-runs `pastor serve`, which reads the head from `client.toml`. The head
+runs `pastor serve --foreground`, which reads the head from `client.toml`.
+Without a service, `pastor serve` starts it in the background, and `pastor
+serve status` and `stop` work on it as on a head. The head
 needs IPC protocol 7 or later for `job_submit`.
 
 ### Jobs on a shepherd
@@ -2460,6 +2507,8 @@ sends nothing. A head from before these requests is refused
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/watch/<name>.json   a `pastor watch` cursor
+~/.local/state/pastor/serve.log   a background `pastor serve`'s log, rotated at 10 MB to serve.log.1 .. .3
+~/.local/state/pastor/serve.json  the running serve's pid, service and log, for `serve status|stop`
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host, and one (`head-<hash>`) for a remote head
 ~/.config/systemd/user/{pastor,herdr}.service   written by `pastor setup systemd`
 ~/Library/LaunchAgents/pastor.{serve,herdr}.plist   written by `pastor setup launchd` (macOS)

@@ -93,7 +93,7 @@ fn start_with(jobs: &[(&str, &str)], herdr_env: &[(&str, &str)]) -> Env {
     .unwrap();
     let serve_log = std::fs::File::create(tmp.path().join("serve.log")).unwrap();
     let serve = pastor()
-        .args(["serve"])
+        .args(["serve", "--foreground"])
         .env("PASTOR_CONFIG_DIR", &config)
         .env("PASTOR_STATE_DIR", &state)
         .stdout(Stdio::null())
@@ -299,10 +299,14 @@ fn completions_offer_only_the_nested_spellings() {
         !bash.contains("pastor__subcmd__machine,status)"),
         "bash knows machine status"
     );
+    // `serve status` is a command of its own; only machine's is gone.
     assert!(
-        !fish.contains("-f -a \"status\""),
+        !fish
+            .lines()
+            .any(|l| l.contains("using_subcommand machine") && l.contains("-f -a \"status\"")),
         "fish offers machine status"
     );
+    assert!(fish.contains("-f -a \"status\" -d 'Whether pastor serve runs here"));
     assert!(bash.contains("pastor__subcmd__machine,list)"));
 }
 
@@ -1293,7 +1297,7 @@ fn assert_daemon_shuts_down_cleanly_on(signal: &str) {
 
     let stderr_path = tmp.path().join("serve.stderr");
     let serve = pastor()
-        .args(["serve"])
+        .args(["serve", "--foreground"])
         .env("PASTOR_CONFIG_DIR", &config)
         .env("PASTOR_STATE_DIR", &state)
         .stdout(Stdio::null())
@@ -5448,7 +5452,7 @@ impl Client {
     fn serve(&self) -> Served {
         let log = self.tmp.path().join("serve.log");
         let child = pastor()
-            .args(["serve"])
+            .args(["serve", "--foreground"])
             .env("PASTOR_CONFIG_DIR", &self.config)
             .env("PASTOR_STATE_DIR", &self.state)
             .env("PASTOR_DATA_DIR", &self.data)

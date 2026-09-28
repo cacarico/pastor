@@ -20,6 +20,7 @@ pub mod queue_cli;
 pub mod reopen;
 pub mod schedule;
 pub mod scheduler;
+pub mod serve_cli;
 pub mod setup;
 pub mod shepherd;
 pub mod store;

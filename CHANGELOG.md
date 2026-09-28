@@ -55,6 +55,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   empty or with a control character falls back to `t-N` with a warning.
   `task describe` shows the label and where it came from. `task run --label`
   needs a head of IPC protocol 19.
+- `pastor serve` starts the head in the background and returns once it
+  answers, logging to `~/.local/state/pastor/serve.log` (rotated at 10 MB,
+  three old files kept). `pastor serve --foreground` (`-f`) keeps it in the
+  terminal, as `pastor serve` did before. `pastor serve status` (with
+  `--json`) says whether a head or headless serve runs here, its pid,
+  version, service manager and log; `pastor serve stop` sends it SIGTERM and
+  waits for it to exit, and refuses one a service runs (`service_managed`).
+  A `pastor serve` started by systemd, launchd or another pid 1 stays in the
+  foreground, so units installed by an older pastor keep working. The
+  shipped `pastor.service` and `pastor.serve.plist` now run `pastor serve
+  --foreground`. **Upgrading:** on each machine with a unit, re-run `pastor
+  setup systemd` (or `pastor setup launchd` on macOS) and restart the
+  service, so its unit says `--foreground` and `pastor serve status` can
+  report the service.
 
 ### Changed
 

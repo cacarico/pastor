@@ -1009,7 +1009,7 @@ fn serve() -> Serve {
     )
     .unwrap();
     let daemon = Command::new(env!("CARGO_BIN_EXE_pastor"))
-        .arg("serve")
+        .args(["serve", "--foreground"])
         .env_remove("PASTOR_TASK")
         .env("PASTOR_CONFIG_DIR", cli.dir("c"))
         .env("PASTOR_STATE_DIR", cli.dir("s"))

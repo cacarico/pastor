@@ -1720,6 +1720,43 @@ impl ExtraSignals {
     }
 }
 
+/// Refuse a socket that something answers on, or that something holds but
+/// does not answer: only a refused (or absent) connect leaves it free to
+/// replace. `Daemon::bind_socket` checks this before it binds, and a
+/// background `pastor serve` before it starts the head that would.
+pub async fn refuse_live_socket(socket: &std::path::Path) -> anyhow::Result<()> {
+    // Staleness is a property of the connect, not of the reply: a live
+    // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
+    // herdr) can go a while without answering a ping, and a busy daemon
+    // looks exactly like a wedged one from the outside. Only a refused (or
+    // absent) connect means nothing is actually listening; anything else
+    // must be left alone rather than unlinked and stolen.
+    match crate::ipc::ping_head(socket).await {
+        HeadPing::Pong { role: Some(r), .. } if r == crate::ipc::SHEPHERD_ROLE => {
+            Err(crate::cli::CliError::err(
+                "shepherd_running",
+                format!(
+                    "a headless pastor serve is already running on {}; stop it first (`pastor serve stop`)",
+                    socket.display()
+                ),
+            ))
+        }
+        HeadPing::Pong { .. } => Err(crate::cli::CliError::err(
+            "head_running",
+            format!(
+                "another pastor daemon is already running on {}, as this machine's head; stop it first (`pastor serve stop`)",
+                socket.display()
+            ),
+        )),
+        HeadPing::Unresponsive => anyhow::bail!(
+            "a daemon is listening on {} but did not respond within 2s; \
+             remove the socket file by hand only if that daemon is dead",
+            socket.display()
+        ),
+        HeadPing::NotRunning => Ok(()),
+    }
+}
+
 /// What answers a request line on the socket: the head (`Daemon`) or a
 /// headless serve (`shepherd::Shepherd`).
 pub(crate) trait Answer: Send + Sync + 'static {
@@ -1880,38 +1917,8 @@ impl Daemon {
         socket: &std::path::Path,
     ) -> anyhow::Result<tokio::net::UnixListener> {
         if socket.exists() {
-            // Staleness is a property of the connect, not of the reply: a live
-            // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
-            // herdr) can go a while without answering a ping, and a busy daemon
-            // looks exactly like a wedged one from the outside. Only a refused (or
-            // absent) connect means nothing is actually listening; anything else
-            // must be left alone rather than unlinked and stolen.
-            match crate::ipc::ping_head(socket).await {
-                HeadPing::Pong { role: Some(r), .. } if r == crate::ipc::SHEPHERD_ROLE => {
-                    return Err(crate::cli::CliError::err(
-                        "shepherd_running",
-                        format!(
-                            "a headless pastor serve is already running on {}; stop it first",
-                            socket.display()
-                        ),
-                    ));
-                }
-                HeadPing::Pong { .. } => {
-                    return Err(crate::cli::CliError::err(
-                        "head_running",
-                        format!(
-                            "another pastor daemon is already running on {}, as this machine's head; stop it first",
-                            socket.display()
-                        ),
-                    ));
-                }
-                HeadPing::Unresponsive => anyhow::bail!(
-                    "a daemon is listening on {} but did not respond within 2s; \
-                     remove the socket file by hand only if that daemon is dead",
-                    socket.display()
-                ),
-                HeadPing::NotRunning => std::fs::remove_file(socket)?,
-            }
+            refuse_live_socket(socket).await?;
+            std::fs::remove_file(socket)?;
         }
         let listener = tokio::net::UnixListener::bind(socket)?;
         std::fs::set_permissions(

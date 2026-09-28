@@ -47,8 +47,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the daemon: scheduler, machine channels, dispatch. With a head set on another machine, run headless: only this machine's jobs and hooks
-    Serve,
+    /// Run the daemon in the background: scheduler, machine channels, dispatch. With a head set on another machine, run headless: only this machine's jobs and hooks
+    ///
+    /// A bare `pastor serve` starts the head in the background, logging to
+    /// serve.log in the state dir, and returns once it answers; --foreground
+    /// keeps it in this terminal. One started by systemd or launchd stays in
+    /// the foreground either way.
+    Serve(ServeArgs),
     /// Manage tasks
     Task {
         #[command(subcommand)]
@@ -114,6 +119,15 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::head::HeadCmd,
     },
+}
+
+#[derive(Args, Debug)]
+struct ServeArgs {
+    /// Run in this terminal until a signal, logging to stderr; what a service runs
+    #[arg(short, long)]
+    foreground: bool,
+    #[command(subcommand)]
+    cmd: Option<pastor::serve_cli::ServeCmd>,
 }
 
 #[derive(Args, Debug)]
@@ -496,13 +510,6 @@ enum FlockCmd {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pastor=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
     // `pastor __complete <shell> -- <words>` is what the completion scripts
     // ask at TAB time. It is not in the clap tree, which would put it in the
     // very scripts it serves, and it runs before the legacy migration, the
@@ -512,6 +519,8 @@ fn main() {
         complete(&args[2..]);
     }
     let cli = Cli::parse();
+    let serve_log = serve_log(&cli);
+    init_tracing(serve_log.as_deref());
     // `exclusive` does not cover subcommands, and `--head` being global rules
     // out `args_conflicts_with_subcommands`, so `--skill task` is refused here.
     if cli.skill && cli.command.is_some() {
@@ -526,6 +535,18 @@ fn main() {
         print!("{SKILL}");
         return;
     }
+    if let Some(Command::Serve(args)) = &cli.command
+        && args.foreground
+        && args.cmd.is_some()
+    {
+        <Cli as clap::CommandFactory>::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--foreground starts a head; it cannot be used with `serve stop` or `serve status`",
+            )
+            .exit();
+    }
+    let head_flag = cli.head.clone();
     // `arg_required_else_help` means clap has already printed help for a bare
     // `pastor`; the only other way here without a command is `--skill`.
     let Some(command) = cli.command else {
@@ -646,10 +667,7 @@ fn main() {
             None => Head::Absent,
         };
         match command {
-            Command::Serve => match remote.clone() {
-                Some(r) => pastor::shepherd::serve(paths, r).await,
-                None => pastor::daemon::serve(paths).await,
-            },
+            Command::Serve(args) => serve(paths, args, remote.clone(), head_flag, serve_log).await,
             Command::Task { cmd } => task(&paths, cmd, head).await,
             Command::Machine { cmd } => machine(&paths, cmd, head).await,
             Command::Flock { cmd } => flock(&paths, cmd, head).await,
@@ -684,6 +702,75 @@ fn main() {
             fail(&e.code, &e.message);
         }
         fail("runtime_error", &format!("{err:#}"));
+    }
+}
+
+/// The log a background `pastor serve --foreground` was started with
+/// (`serve_cli::LOG_ENV`), taken out of the environment before any thread
+/// starts, so the connectors and hooks it runs do not inherit it.
+fn serve_log(cli: &Cli) -> Option<std::path::PathBuf> {
+    let log = std::env::var_os(pastor::serve_cli::LOG_ENV)?;
+    // SAFETY: no other thread runs yet: the tokio runtime starts later.
+    unsafe { std::env::remove_var(pastor::serve_cli::LOG_ENV) };
+    match &cli.command {
+        Some(Command::Serve(ServeArgs {
+            foreground: true,
+            cmd: None,
+        })) => Some(log.into()),
+        _ => None,
+    }
+}
+
+/// Tracing to stderr, or for a background `pastor serve` to its rotated log,
+/// without colour.
+fn init_tracing(serve_log: Option<&std::path::Path>) {
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "pastor=info".into())
+    };
+    if let Some(path) = serve_log {
+        use pastor::serve_cli::{LOG_KEEP, LOG_MAX_BYTES, RotatingLog};
+        match RotatingLog::open(path.to_path_buf(), LOG_MAX_BYTES, LOG_KEEP, true) {
+            Ok(log) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter())
+                    .with_ansi(false)
+                    .with_writer(log)
+                    .init();
+                return;
+            }
+            Err(err) => fail("config_error", &format!("open {}: {err}", path.display())),
+        }
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(filter())
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// `pastor serve`, `serve stop` and `serve status`. A bare `serve` goes to
+/// the background unless a service manager started it.
+async fn serve(
+    paths: Paths,
+    args: ServeArgs,
+    remote: Option<pastor::head::RemoteHead>,
+    head_flag: Option<String>,
+    log: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    use pastor::serve_cli::{self, ServeCmd};
+    match args.cmd {
+        Some(ServeCmd::Stop) => return serve_cli::stop(&paths).await,
+        Some(ServeCmd::Status { json }) => return serve_cli::status(&paths, json).await,
+        None => {}
+    }
+    let service = serve_cli::service_manager();
+    if !args.foreground && service.is_none() {
+        return serve_cli::start_background(&paths, head_flag.as_deref()).await;
+    }
+    serve_cli::record_start(&paths, service, log.as_deref()).await?;
+    match remote {
+        Some(r) => pastor::shepherd::serve(paths, r).await,
+        None => pastor::daemon::serve(paths).await,
     }
 }
 
@@ -959,7 +1046,9 @@ fn remote_route(command: &Command) -> RemoteRoute {
         | Command::Head { .. }
         | Command::Bridge(_)
         | Command::Connector { .. } => RemoteRoute::Here,
-        Command::Serve => RemoteRoute::Serve,
+        // Stop and status act on this machine's serve, head or headless.
+        Command::Serve(ServeArgs { cmd: Some(_), .. }) => RemoteRoute::Here,
+        Command::Serve(_) => RemoteRoute::Serve,
         _ => RemoteRoute::Unsupported,
     }
 }
@@ -1025,7 +1114,12 @@ fn changes_fleet(command: &Command) -> bool {
         ),
         // A head started from an agent's pane schedules and dispatches with
         // no request to refuse; setup installs one that starts on login.
-        Command::Serve | Command::Setup { .. } => true,
+        // Status only reads.
+        Command::Serve(ServeArgs {
+            cmd: Some(pastor::serve_cli::ServeCmd::Status { .. }),
+            ..
+        }) => false,
+        Command::Serve(_) | Command::Setup { .. } => true,
         Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
         Command::Queue(a) => pastor::queue_cli::changes_fleet(a),
         _ => false,
