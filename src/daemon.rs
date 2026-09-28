@@ -282,6 +282,8 @@ pub struct Fleet {
     /// `agents_change_fleet` as last applied: whether the head takes a
     /// fleet-changing request from an agent it started.
     agents_change_fleet: std::sync::atomic::AtomicBool,
+    /// `max_orchestrators` as last applied.
+    max_orchestrators: std::sync::atomic::AtomicU32,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
@@ -313,6 +315,7 @@ impl Fleet {
             models: RwLock::default(),
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
+            max_orchestrators: std::sync::atomic::AtomicU32::new(1),
             store,
             spawner: None,
             forward: None,
@@ -354,6 +357,7 @@ impl Fleet {
             models: RwLock::default(),
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
+            max_orchestrators: std::sync::atomic::AtomicU32::new(1),
             store,
             spawner: Some(Spawner { connect, events }),
             forward: None,
@@ -431,6 +435,21 @@ impl Fleet {
             config.agents_change_fleet,
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.max_orchestrators.store(
+            config.max_orchestrators,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// `max_orchestrators` in `pastor.toml` as last applied.
+    pub fn max_orchestrators(&self) -> u32 {
+        self.max_orchestrators
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `[defaults]` as last applied.
+    pub fn defaults(&self) -> Defaults {
+        self.defaults.read().unwrap().clone()
     }
 
     /// Whether `pastor.toml` as last applied lets an agent pastor started
