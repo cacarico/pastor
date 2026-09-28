@@ -43,10 +43,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   than 64 KiB of lines backs off as a failing job does, `max_orchestrators` in
   pastor.toml (default 1, outside `max_agents`) holds agents back, and an
   agent that stopped on a quota error holds the next until the reset.
-  `session` files are checked (a key of the other kind makes a file invalid)
-  but not run yet. New commands: `pastor orchestrator list | describe | run |
-  enable | disable | note`; events
-  `orchestrator.started|skipped|held|quota|failed`. The pre and post scripts
+  A key of the other kind makes a file invalid. A `session` orchestrator
+  keeps one agent running through its `hours` (`{ start, stop }`, local
+  time): the head starts it at `hours.start`, or at once inside the hours,
+  with the prompt, the skill, the note and `pastor watch --now`; at
+  `hours.stop` its agent gets a last message and is closed after
+  `stop_grace`. An agent that dies, goes stale or ends early is restarted
+  with the note, at most three times an hour; one that stopped on a quota
+  error restarts at the reset. A session holds its `max_orchestrators` slot
+  from start to stop, so a scheduled run meanwhile is held, and a session due
+  while a scheduled agent works starts once it ends. New commands: `pastor
+  orchestrator list | describe | run | start | stop | enable | disable |
+  note`; events
+  `orchestrator.started|skipped|held|quota|failed|restarted|stopping|stopped`. The pre and post scripts
   run with `PASTOR_ORCHESTRATOR`, which the CLI sends with each request, and
   the head applies the orchestrator role's table to them; `PASTOR_TASK` wins
   when both are set. An orchestrator's agent may keep its note (`pastor

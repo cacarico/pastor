@@ -90,6 +90,8 @@ and so on. This page lists them; `--help` after any command lists its flags.
 | `pastor orchestrator list` | every orchestrator file: kind, state, schedule, last and next run, its agent |
 | `pastor orchestrator describe` | one orchestrator in full: settings, note, last runs with their lines |
 | `pastor orchestrator run` | run a scheduled orchestrator now, ignoring its schedule and `enabled` |
+| `pastor orchestrator start` | start a session orchestrator now, inside its hours or not; it stops at the next `hours.stop` |
+| `pastor orchestrator stop` | stop a session orchestrator: a last message, `stop_grace`, then its agent is closed |
 | `pastor orchestrator enable` | enable an orchestrator file |
 | `pastor orchestrator disable` | disable an orchestrator file; its agent keeps running |
 | `pastor orchestrator note` | keep the handover note every agent it starts gets |

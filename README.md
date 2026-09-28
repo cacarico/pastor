@@ -212,7 +212,7 @@ notification. Writing one takes a manifest and a script in any language. See
 | talk to an agent | `pastor task read t-3`, `pastor task send t-3 "..."`, `pastor task attach t-3` |
 | end a task | `pastor task close t-3` (an agent can run `pastor task done` itself) |
 | manage jobs | `pastor job list`, `pastor job describe NAME`, `pastor job run NAME`, `pastor job edit NAME` |
-| run orchestrators | `pastor orchestrator list`, `pastor orchestrator describe NAME`, `pastor orchestrator run NAME` (files in `~/.config/pastor/orchestrators/`, see [the manual](docs/manual.md#orchestrators)) |
+| run orchestrators | `pastor orchestrator list`, `pastor orchestrator describe NAME`, `pastor orchestrator run NAME`, `pastor orchestrator start NAME`, `pastor orchestrator stop NAME` (files in `~/.config/pastor/orchestrators/`, see [the manual](docs/manual.md#orchestrators)) |
 | manage flocks | `pastor flock list`, `pastor flock describe NAME`, `pastor flock edit` |
 | change settings | `pastor config edit` |
 | use connectors | `pastor connector list`, `pastor connector describe ID`, `pastor connector install OWNER/REPO/DIR` |
