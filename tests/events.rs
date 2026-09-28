@@ -187,6 +187,7 @@ async fn the_daemon_writes_the_events_log() {
     let flock = Flock {
         flocks: vec![],
         machines: vec![MachineConfig {
+            pull: false,
             description: None,
             name: "m".into(),
             local: false,

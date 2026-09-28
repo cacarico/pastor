@@ -2057,6 +2057,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             herdr,
         } => {
             let m = MachineConfig {
+                pull: false,
                 description: pastor::config::clean_description(description.as_deref()),
                 name: name.clone(),
                 local,

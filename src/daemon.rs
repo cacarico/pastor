@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -238,6 +238,17 @@ struct Member {
     /// The actor was stopped but has not ended. Nothing is dispatched to it
     /// and no replacement is spawned until a later `apply_flock` sees it end.
     shutting_down: bool,
+    /// A pull machine (`MachineConfig::pull`): no actor, never picked by a
+    /// dispatch pass; it takes its tasks with `Fleet::claim`.
+    pull: bool,
+}
+
+/// When the head last heard from a pull machine (`Fleet::claim`,
+/// `Fleet::report`), and whether it has been counted lost since.
+#[derive(Debug, Clone, Copy)]
+struct PullSeen {
+    at: tokio::time::Instant,
+    lost: bool,
 }
 
 struct Spawner {
@@ -277,6 +288,8 @@ pub struct Fleet {
     /// Set for a headless serve (`Fleet::headless`): job tasks go to the
     /// head instead of this store, and the head checks their flock.
     forward: Option<HeadForward>,
+    /// Pull machines by name, since each was added or last heard from.
+    pull_seen: std::sync::Mutex<HashMap<String, PullSeen>>,
     dispatch_lock: tokio::sync::Mutex<()>,
 }
 
@@ -289,6 +302,7 @@ impl Fleet {
                 handle,
                 spawned_from: None,
                 shutting_down: false,
+                pull: false,
             })
             .collect();
         Fleet {
@@ -302,6 +316,7 @@ impl Fleet {
             store,
             spawner: None,
             forward: None,
+            pull_seen: Default::default(),
             dispatch_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -342,6 +357,7 @@ impl Fleet {
             store,
             spawner: Some(Spawner { connect, events }),
             forward: None,
+            pull_seen: Default::default(),
             dispatch_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -369,6 +385,9 @@ impl Fleet {
             .iter()
             .map(|m| {
                 let flock = flock_of(&wanted, &m.handle.name);
+                if m.pull {
+                    self.count_pull(&m.handle);
+                }
                 let s = m.handle.snapshot();
                 crate::machine::MachineStatus {
                     profile: self.own_profile(&flock, Some(&m.handle.name)),
@@ -796,6 +815,10 @@ impl Fleet {
                  replaced or removed yet; the next reload pass tries again"
             );
         }
+        self.pull_seen
+            .lock()
+            .unwrap()
+            .retain(|name, _| members.iter().any(|m| m.pull && &m.handle.name == name));
         *self.members.write().unwrap() = members;
         diff
     }
@@ -810,6 +833,24 @@ impl Fleet {
 
     fn spawn(&self, spawner: &Spawner, m: &MachineConfig, settings: &MachineSettings) -> Member {
         let settings = &actor_settings(m, settings);
+        if m.pull {
+            // Heard from as of now: a head that starts gives the machine
+            // `pull_lost_after` to claim before its tasks go stale.
+            self.pull_seen.lock().unwrap().insert(
+                m.name.clone(),
+                PullSeen {
+                    at: tokio::time::Instant::now(),
+                    lost: false,
+                },
+            );
+            return Member {
+                handle: crate::machine::pull_machine(m.name.clone(), m.max_agents, m.tags.clone())
+                    .with_slots(m.job_slots, m.burst),
+                spawned_from: Some((actor_config(m), settings.clone())),
+                shutting_down: false,
+                pull: true,
+            };
+        }
         let handle = spawn_machine(
             m.name.clone(),
             m.max_agents,
@@ -824,6 +865,7 @@ impl Fleet {
             handle,
             spawned_from: Some((actor_config(m), settings.clone())),
             shutting_down: false,
+            pull: false,
         }
     }
 
@@ -844,8 +886,9 @@ impl Fleet {
                     live: s.live,
                     live_jobs: s.live_jobs,
                     // An aborted actor answers nothing, and a dispatch to
-                    // it would wait for as long as it stays wedged.
-                    healthy: !m.shutting_down && s.channel.accepts_dispatch(),
+                    // it would wait for as long as it stays wedged. A pull
+                    // machine takes its tasks itself (`claim`).
+                    healthy: !m.pull && !m.shutting_down && s.channel.accepts_dispatch(),
                     flocks: seats(&wanted, &s),
                 }
             })
@@ -1340,6 +1383,392 @@ impl Fleet {
         Ok(entries)
     }
 
+    /// `task`'s spec with its agent settled for `machine` in `flock`: a
+    /// machine whose agent cannot run the task's model does not take it. A
+    /// task from before `agent_source` keeps the agent it was queued with
+    /// (`None`). A profile it inherited (from a machine or flock, not its
+    /// own ask) is pinned onto the ask here, so a re-settle that can no
+    /// longer resolve it refuses instead of quietly dropping it.
+    fn settled_on(
+        &self,
+        task: &Task,
+        flock: &str,
+        machine: &str,
+    ) -> Option<Result<crate::task::DispatchSpec, AgentRefusal>> {
+        let source = task.spec.agent_source.as_ref()?;
+        let mut ask = source.ask.clone();
+        if ask.profile.is_none() {
+            ask.profile = source.profile.clone();
+        }
+        let mut spec = task.spec.clone();
+        let r = self.settle(&mut spec, &ask, flock, Some(machine), &asked_by(task));
+        Some(r.map(|()| spec))
+    }
+
+    /// Is `name` a pull machine (`MachineConfig::pull`) of the fleet?
+    pub fn is_pull(&self, name: &str) -> bool {
+        self.members
+            .read()
+            .unwrap()
+            .iter()
+            .any(|m| m.pull && m.handle.name == name)
+    }
+
+    /// The handle of pull machine `name`, or why a claim or report from it
+    /// is refused.
+    fn pull_handle(&self, name: &str) -> anyhow::Result<MachineHandle> {
+        let members = self.members.read().unwrap();
+        match members.iter().find(|m| m.handle.name == name) {
+            Some(m) if m.pull => Ok(m.handle.clone()),
+            Some(_) => Err(crate::cli::CliError::err(
+                "not_pull_machine",
+                format!("machine {name} is not a pull machine; the head reaches it itself"),
+            )),
+            None => Err(crate::cli::CliError::err(
+                "unknown_machine",
+                format!("machine {name} is not in the flock"),
+            )),
+        }
+    }
+
+    /// A pull machine's live counts, from the store: no actor keeps them.
+    fn count_pull(&self, handle: &MachineHandle) {
+        match self.store.tasks_on_machine(&handle.name) {
+            Ok(tasks) => crate::machine::count_live(&mut handle.status.write().unwrap(), &tasks),
+            Err(err) => {
+                tracing::error!(machine = %handle.name, %err, "count a pull machine's tasks")
+            }
+        }
+    }
+
+    /// Emit `kind` about `machine` and `task`, as an actor would: a
+    /// `task.done` or `task.failed` ends the task's round. A fixed fleet has
+    /// nowhere to send it.
+    fn emit(
+        &self,
+        kind: &str,
+        machine: &str,
+        task: Option<&Task>,
+        detail: Option<serde_json::Value>,
+    ) {
+        let Some(spawner) = &self.spawner else {
+            return;
+        };
+        let summary = task
+            .filter(|_| matches!(kind, "task.done" | "task.failed"))
+            .and_then(|t| match self.store.end_round(t.id, None) {
+                Ok(summary) => Some(summary),
+                Err(err) => {
+                    tracing::error!(machine, %err, id = t.id, "save the task's summary");
+                    None
+                }
+            });
+        tracing::info!(machine, kind, task = ?task.map(|t| t.id), "event");
+        let _ = spawner.events.send(PastorEvent {
+            kind: kind.into(),
+            task_id: task.map(|t| t.id),
+            machine: Some(machine.into()),
+            job: task.map(|t| t.job.clone()),
+            detail,
+            summary,
+        });
+    }
+
+    /// Pull machine `handle` was heard from now: it is connected, and one
+    /// counted lost is announced back.
+    fn heard(&self, handle: &MachineHandle) {
+        let was_lost = {
+            let mut seen = self.pull_seen.lock().unwrap();
+            let e = seen.entry(handle.name.clone()).or_insert(PullSeen {
+                at: tokio::time::Instant::now(),
+                lost: false,
+            });
+            e.at = tokio::time::Instant::now();
+            std::mem::replace(&mut e.lost, false)
+        };
+        {
+            let mut s = handle.status.write().unwrap();
+            s.channel = crate::machine::ChannelState::Connected;
+            s.error = None;
+        }
+        if was_lost {
+            self.emit("machine.connected", &handle.name, None, None);
+        }
+    }
+
+    /// `TaskClaim`: at most `free_slots` queued tasks for pull machine
+    /// `machine` to start, each `starting` there before this returns. Those
+    /// pinned to it first, then, with `flock_work`, any a dispatch pass
+    /// would place there now; both only while the machine and the task's
+    /// flock have room, as for any machine. Under the dispatch lock, so a
+    /// pass and a claim never take the same slot.
+    pub async fn claim(
+        &self,
+        machine: &str,
+        free_slots: u32,
+        flock_work: bool,
+    ) -> anyhow::Result<Vec<Task>> {
+        let _pass = self.dispatch_lock.lock().await;
+        let handle = self.pull_handle(machine)?;
+        self.heard(&handle);
+        self.count_pull(&handle);
+        let flock = self.flock();
+        let s = handle.snapshot();
+        let mut view = MachineView {
+            name: machine.to_string(),
+            max_agents: handle.max_agents,
+            job_slots: handle.job_slots,
+            burst: handle.burst,
+            tags: handle.tags.clone(),
+            live: s.live,
+            live_jobs: s.live_jobs,
+            healthy: true,
+            flocks: seats(&flock, &s),
+        };
+        let queued = self.store.queued_tasks()?;
+        let pinned = queued
+            .iter()
+            .filter(|t| t.spec.machine.as_deref() == Some(machine));
+        let loose = queued
+            .iter()
+            .filter(|t| flock_work && t.spec.machine.is_none());
+        let mut claimed = Vec::new();
+        for task in pinned.chain(loose) {
+            if claimed.len() >= free_slots as usize {
+                break;
+            }
+            if task.state != TaskState::Queued {
+                continue;
+            }
+            let target = task.flock.as_deref().unwrap_or(flock.default_flock());
+            let settled = self.settled_on(task, target, machine);
+            let claim = Claim::of(task);
+            let accepts = |_: &str| settled.as_ref().is_none_or(|r| r.is_ok());
+            let views = std::slice::from_ref(&view);
+            if pick_machine_where(views, target, &task.spec, claim, &accepts).is_none() {
+                continue;
+            }
+            let mut on = task.clone();
+            if let Some(Ok(spec)) = settled {
+                on.spec = spec;
+            }
+            if on
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
+            {
+                on.error = None;
+            }
+            if (on.spec != task.spec || on.error != task.error)
+                && let Err(err) = self.store.update_task(&mut on)
+            {
+                tracing::warn!(task = %task.display_id(), machine, %err, "settle agent");
+                continue;
+            }
+            let Some(t) = self.store.claim_task(task.id, machine)? else {
+                continue;
+            };
+            tracing::info!(task = %t.display_id(), machine, "claimed by a pull machine");
+            view.take(target, claim);
+            claimed.push(t);
+        }
+        self.count_pull(&handle);
+        Ok(claimed)
+    }
+
+    /// `TaskReport`: what pull machine `machine` saw become of task `id`,
+    /// written on the row with the event its own actor would have emitted.
+    /// A closed row stays closed, a stale one stays stale while its agent
+    /// works (as `task::next_state` keeps it), and one `task done` ended
+    /// stays done through the agent's last turn; each answers the row as it
+    /// is.
+    pub async fn report(
+        &self,
+        machine: &str,
+        id: i64,
+        state: TaskState,
+        pane: Option<String>,
+        detail: Option<String>,
+    ) -> anyhow::Result<Task> {
+        let handle = self.pull_handle(machine)?;
+        self.heard(&handle);
+        if matches!(state, TaskState::Queued | TaskState::Paused) {
+            return Err(crate::cli::CliError::err(
+                "invalid_report",
+                format!("a pull machine cannot report a task {state}"),
+            ));
+        }
+        // Twice at most: once more on the fresh row after a write that lost
+        // a race (a `task close` on the head, say).
+        for _ in 0..2 {
+            let mut task = self.store.get_task(id)?.ok_or_else(|| {
+                crate::cli::CliError::err("task_not_found", format!("t-{id} not found"))
+            })?;
+            if task.machine.as_deref() != Some(machine) {
+                return Err(crate::cli::CliError::err(
+                    "not_on_machine",
+                    format!("{} is not on {machine}", task.display_id()),
+                ));
+            }
+            let from = task.state;
+            let working = matches!(
+                state,
+                TaskState::Starting | TaskState::Running | TaskState::Blocked
+            );
+            let kept = from == TaskState::Closed
+                || from == TaskState::Done && task.ended && working
+                || from == TaskState::Stale && working;
+            if kept
+                || from == state
+                    && task.error == detail
+                    && pane
+                        .as_ref()
+                        .is_none_or(|p| task.pane_id.as_ref() == Some(p))
+            {
+                return Ok(task);
+            }
+            task.state = state;
+            if pane.is_some() {
+                task.pane_id = pane.clone();
+            }
+            task.error = detail.clone();
+            let now = chrono::Utc::now();
+            if matches!(state, TaskState::Running | TaskState::Blocked) && task.started_at.is_none()
+            {
+                task.started_at = Some(now);
+            }
+            task.finished_at = match state {
+                TaskState::Closed => task.finished_at.or(Some(now)),
+                TaskState::Done | TaskState::Failed if from != state => Some(now),
+                TaskState::Done | TaskState::Failed => task.finished_at,
+                _ => None,
+            };
+            match self.store.update_task(&mut task) {
+                Ok(()) => {}
+                Err(err) if err.downcast_ref::<crate::store::Conflict>().is_some() => continue,
+                Err(err) => return Err(err),
+            }
+            if from != state {
+                let question = (state == TaskState::Blocked)
+                    .then(|| detail.as_deref()?.strip_prefix("agent asked: "))
+                    .flatten()
+                    .map(|q| serde_json::json!({ "question": q }));
+                self.emit(&format!("task.{state}"), machine, Some(&task), question);
+            }
+            self.count_pull(&handle);
+            return Ok(task);
+        }
+        Err(crate::cli::CliError::err(
+            "store_error",
+            format!("t-{id} kept changing under the report; try again"),
+        ))
+    }
+
+    /// `task done` for a task on a pull machine, which has no actor here:
+    /// the row is ended as `Actor::end_task` ends it, `done` and `ended`, so
+    /// a report of the agent's last turn does not take it back to running.
+    pub fn end_pull(&self, task: Task, summary: Option<String>) -> anyhow::Result<Task> {
+        let machine = task.machine.clone().unwrap_or_default();
+        let summary = summary.filter(|s| !s.trim().is_empty());
+        if task.ended {
+            if let Some(summary) = &summary {
+                self.store.replace_last_summary(task.id, summary)?;
+            }
+            return Ok(task);
+        }
+        let was_done = task.state == TaskState::Done;
+        let mut t = task;
+        if !was_done {
+            t.state = TaskState::Done;
+            t.finished_at = Some(chrono::Utc::now());
+            t.activity_seen = false;
+            t.prompt_pending = false;
+            t.error = None;
+        }
+        t.ended = true;
+        self.store.update_task(&mut t)?;
+        if was_done {
+            if let Some(summary) = &summary {
+                self.store.replace_last_summary(t.id, summary)?;
+            }
+        } else if let Some(spawner) = &self.spawner {
+            let round = match self.store.end_round(t.id, summary.as_deref()) {
+                Ok(round) => Some(round),
+                Err(err) => {
+                    tracing::error!(%machine, %err, id = t.id, "save the task's summary");
+                    None
+                }
+            };
+            let _ = spawner.events.send(PastorEvent {
+                kind: "task.done".into(),
+                task_id: Some(t.id),
+                machine: Some(machine),
+                job: Some(t.job.clone()),
+                detail: None,
+                summary: round,
+            });
+        }
+        Ok(t)
+    }
+
+    /// Count each pull machine not heard from for `after` lost, once per
+    /// silence: `machine.lost`, and its starting and running tasks go
+    /// stale, as a task does whose agent pastor lost sight of. Tasks pinned
+    /// to it stay queued. Answers the machines it counted lost now.
+    pub async fn check_pull_lost(&self, after: Duration) -> Vec<String> {
+        let _pass = self.dispatch_lock.lock().await;
+        let now = tokio::time::Instant::now();
+        let lost: Vec<String> = self
+            .pull_seen
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|(_, seen)| !seen.lost && now.duration_since(seen.at) >= after)
+            .map(|(name, seen)| {
+                seen.lost = true;
+                name.clone()
+            })
+            .collect();
+        for name in &lost {
+            let Ok(handle) = self.pull_handle(name) else {
+                continue;
+            };
+            let why = format!(
+                "pull machine {name} has not claimed or reported for {}s",
+                after.as_secs()
+            );
+            {
+                let mut s = handle.status.write().unwrap();
+                s.channel = crate::machine::ChannelState::Reconnecting;
+                s.error = Some(why.clone());
+            }
+            tracing::warn!(machine = %name, "{why}; counted lost");
+            self.emit("machine.lost", name, None, None);
+            let tasks = match self.store.tasks_on_machine(name) {
+                Ok(tasks) => tasks,
+                Err(err) => {
+                    tracing::error!(machine = %name, %err, "list a lost pull machine's tasks");
+                    continue;
+                }
+            };
+            for mut t in tasks {
+                if !matches!(t.state, TaskState::Starting | TaskState::Running) {
+                    continue;
+                }
+                t.state = TaskState::Stale;
+                t.error = Some(why.clone());
+                match self.store.update_task(&mut t) {
+                    Ok(()) => self.emit("task.stale", name, Some(&t), None),
+                    Err(err) => {
+                        tracing::warn!(task = %t.display_id(), %err, "mark stale")
+                    }
+                }
+            }
+            self.count_pull(&handle);
+        }
+        lost
+    }
+
     /// Try to place every queued task, oldest first. Serialised: a pass sees the
     /// live counts the previous pass left behind, because a machine actor
     /// refreshes its count before it answers a dispatch (see
@@ -1369,16 +1798,7 @@ impl Fleet {
             // A profile it inherited (from a machine or flock, not its own
             // ask) is pinned onto the ask here, so a re-settle that can no
             // longer resolve it refuses instead of quietly dropping it.
-            let settled_on = |machine: &str| {
-                let source = task.spec.agent_source.as_ref()?;
-                let mut ask = source.ask.clone();
-                if ask.profile.is_none() {
-                    ask.profile = source.profile.clone();
-                }
-                let mut spec = task.spec.clone();
-                let r = self.settle(&mut spec, &ask, target, Some(machine), &asked_by(&task));
-                Some(r.map(|()| spec))
-            };
+            let settled_on = |machine: &str| self.settled_on(&task, target, machine);
             let claim = Claim::of(&task);
             let accepts = |m: &str| settled_on(m).is_none_or(|r| r.is_ok());
             let mut picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
@@ -2253,6 +2673,9 @@ impl Daemon {
                         format!("t-{id} is not on any machine"),
                     );
                 };
+                if self.fleet.is_pull(&handle.name) {
+                    return pull_machine_task(&task, &handle.name);
+                }
                 // Its aborted actor answers nothing; the read would wait for
                 // as long as it stays wedged.
                 if self.fleet.shutting_down(&handle.name) {
@@ -2488,6 +2911,24 @@ impl Daemon {
             }
             IpcRequest::FlockDescribe { name } => self.describe_flock(&name),
             IpcRequest::MachineDescribe { name } => self.describe_machine(&name),
+            IpcRequest::TaskClaim {
+                machine,
+                free_slots,
+                flock_work,
+            } => match self.fleet.claim(&machine, free_slots, flock_work).await {
+                Ok(tasks) => IpcResponse::Tasks(tasks),
+                Err(err) => cli_error(err),
+            },
+            IpcRequest::TaskReport {
+                machine,
+                id,
+                state,
+                pane,
+                detail,
+            } => match self.fleet.report(&machine, id, state, pane, detail).await {
+                Ok(task) => IpcResponse::Task(task),
+                Err(err) => cli_error(err),
+            },
         }
     }
 
@@ -2636,6 +3077,9 @@ impl Daemon {
                 ),
             );
         };
+        if self.fleet.is_pull(&handle.name) {
+            return pull_machine_task(&task, &handle.name);
+        }
         if self.fleet.shutting_down(&handle.name) {
             return IpcResponse::error(
                 "machine_shutting_down",
@@ -2695,6 +3139,12 @@ impl Daemon {
                 ),
             );
         };
+        if self.fleet.is_pull(&handle.name) {
+            return match self.fleet.end_pull(task, summary) {
+                Ok(t) => IpcResponse::Task(t),
+                Err(err) => cli_error(err),
+            };
+        }
         match handle.end_by(id, summary, by).await {
             Ok(t) => IpcResponse::Task(t),
             Err(err) => match err.downcast_ref::<SendRefused>() {
@@ -2940,10 +3390,16 @@ impl Daemon {
         };
         // A removed machine held only until its old actor ends counts as
         // gone: that actor answers nothing and no replacement will come.
+        // A pull machine has no actor either: the head closes the row, and
+        // its own pastor serve closes the pane when it next reports on it.
+        let pull = self.fleet.is_pull(&machine);
+        if pull && remove_worktree {
+            return pull_machine_task(&t, &machine);
+        }
         let handle = self
             .fleet
             .get(&machine)
-            .filter(|_| self.fleet.in_flock(&machine));
+            .filter(|_| self.fleet.in_flock(&machine) && !pull);
         let Some(handle) = handle else {
             // Its machine left the flock, so no actor owns the row and no
             // herdr can be asked: a plain close is only the row, but the
@@ -2987,6 +3443,18 @@ impl Daemon {
     }
 }
 
+/// The answer to a request about `task` that only its pull machine
+/// `machine` can carry out, being the one that reaches its pane.
+fn pull_machine_task(task: &Task, machine: &str) -> IpcResponse {
+    IpcResponse::error(
+        "pull_machine_task",
+        format!(
+            "{} runs on pull machine {machine}, which the head never reaches; read, send to or attach to it from {machine} itself",
+            task.display_id()
+        ),
+    )
+}
+
 /// A request that lost the race with a reload stopping its machine's actor
 /// answers like one refused up front; any other failure keeps `code`.
 fn stopped_or(err: anyhow::Error, code: &str) -> IpcResponse {
@@ -3026,6 +3494,7 @@ mod tests {
 
     fn machine(name: &str, max: u32) -> MachineConfig {
         MachineConfig {
+            pull: false,
             description: None,
             name: name.into(),
             local: false,
@@ -3478,11 +3947,321 @@ mod tests {
             .await
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while d.fleet().views().iter().any(|v| !v.healthy) {
+        while d
+            .fleet()
+            .views()
+            .iter()
+            .any(|v| !v.healthy && !d.fleet().is_pull(&v.name))
+        {
             assert!(Instant::now() < deadline, "machines never connected");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         (d, tmp)
+    }
+
+    /// `a` (a fake herdr, one slot) and `laptop`, a pull machine with
+    /// `slots`.
+    async fn pull_daemon(slots: u32) -> (Daemon, tempfile::TempDir) {
+        let laptop = MachineConfig {
+            pull: true,
+            command: None,
+            ..machine("laptop", slots)
+        };
+        let flock = Flock {
+            flocks: vec![],
+            machines: vec![machine("a", 1), laptop],
+        };
+        daemon_with_flock(flock, &[("a", 1, FakeHerdr::new())]).await
+    }
+
+    fn run_on(prompt: &str, machine: Option<&str>) -> IpcRequest {
+        IpcRequest::Run {
+            preempt: false,
+            prompt: prompt.into(),
+            spec: DispatchSpec {
+                machine: machine.map(str::to_string),
+                ..spec()
+            },
+            flock: None,
+            agent: None,
+            priority: None,
+            role: TaskRole::Agent,
+            description: None,
+            summary: None,
+        }
+    }
+
+    async fn queued(d: &Daemon, prompt: &str, machine: Option<&str>) -> Task {
+        match d.handle(run_on(prompt, machine)).await {
+            IpcResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    async fn claim(d: &Daemon, free_slots: u32, flock_work: bool) -> Vec<String> {
+        let req = IpcRequest::TaskClaim {
+            machine: "laptop".into(),
+            free_slots,
+            flock_work,
+        };
+        match d.handle(req).await {
+            IpcResponse::Tasks(ts) => ts
+                .into_iter()
+                .map(|t| {
+                    assert_eq!(t.state, TaskState::Starting, "{t:?}");
+                    assert_eq!(t.machine.as_deref(), Some("laptop"));
+                    t.prompt
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn report(machine: &str, t: &Task, state: TaskState, detail: Option<&str>) -> IpcRequest {
+        IpcRequest::TaskReport {
+            machine: machine.into(),
+            id: t.id,
+            state,
+            pane: Some("p-9".into()),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    /// (kind, task id, machine) of each event sent so far.
+    fn events_of(rx: &mut broadcast::Receiver<PastorEvent>) -> Vec<(String, Option<i64>, String)> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| (e.kind, e.task_id, e.machine.unwrap_or_default()))
+            .collect()
+    }
+
+    fn state_of(d: &Daemon, t: &Task) -> TaskState {
+        d.store().get_task(t.id).unwrap().unwrap().state
+    }
+
+    /// The head runs no actor for a pull machine and never dispatches to
+    /// it: tasks pinned there wait until it claims them, pinned ones first
+    /// and flock work only when asked, within its free slots and its own
+    /// number. Its reports land on the rows with the events an actor
+    /// would send; one about another machine's task, or from a machine the
+    /// head reaches itself, is refused.
+    #[tokio::test]
+    async fn a_pull_machine_claims_its_tasks_and_reports_them() {
+        let (d, _tmp) = pull_daemon(3).await;
+        let laptop = || {
+            d.fleet()
+                .statuses()
+                .into_iter()
+                .find(|s| s.name == "laptop")
+                .unwrap()
+        };
+        assert_eq!(laptop().endpoint, crate::machine::PULL_ENDPOINT);
+        assert_eq!(laptop().channel, crate::machine::ChannelState::Connecting);
+        let p1 = queued(&d, "p1", Some("laptop")).await;
+        let p2 = queued(&d, "p2", Some("laptop")).await;
+        let on_a = queued(&d, "u1", None).await;
+        let loose = queued(&d, "u2", None).await;
+        assert_eq!(p1.state, TaskState::Queued);
+        assert_eq!(on_a.machine.as_deref(), Some("a"));
+        assert_eq!(loose.state, TaskState::Queued, "a is full");
+        d.fleet().dispatch_queued().await;
+        assert_eq!(state_of(&d, &p1), TaskState::Queued, "never dispatched");
+
+        let mut rx = d.subscribe();
+        assert_eq!(claim(&d, 1, false).await, ["p1"]);
+        assert_eq!(laptop().channel, crate::machine::ChannelState::Connected);
+        assert_eq!(claim(&d, 5, false).await, ["p2"], "no flock work unasked");
+        assert_eq!(claim(&d, 5, true).await, ["u2"]);
+        assert!(claim(&d, 5, true).await.is_empty());
+        assert_eq!(laptop().live, 3);
+
+        let resp = d
+            .handle(report("laptop", &p1, TaskState::Running, None))
+            .await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(t.pane_id.as_deref(), Some("p-9"));
+        assert!(t.started_at.is_some());
+        // The same report again changes nothing and says nothing.
+        d.handle(report("laptop", &p1, TaskState::Running, None))
+            .await;
+        d.handle(report("laptop", &p1, TaskState::Done, None)).await;
+        d.handle(report(
+            "laptop",
+            &p2,
+            TaskState::Blocked,
+            Some("agent asked: go on?"),
+        ))
+        .await;
+        let blocked = d.store().get_task(p2.id).unwrap().unwrap();
+        assert_eq!(blocked.error.as_deref(), Some("agent asked: go on?"));
+        let events = events_of(&mut rx);
+        let lap = |kind: &str, t: &Task| (kind.to_string(), Some(t.id), "laptop".to_string());
+        assert_eq!(
+            events,
+            [
+                lap("task.running", &p1),
+                lap("task.done", &p1),
+                lap("task.blocked", &p2)
+            ]
+        );
+        assert_eq!(state_of(&d, &p1), TaskState::Done);
+
+        assert_eq!(
+            error_code(d.handle(report("a", &on_a, TaskState::Done, None)).await),
+            "not_pull_machine"
+        );
+        assert_eq!(
+            error_code(
+                d.handle(report("laptop", &on_a, TaskState::Done, None))
+                    .await
+            ),
+            "not_on_machine"
+        );
+        assert_eq!(
+            error_code(
+                d.handle(report("laptop", &p1, TaskState::Queued, None))
+                    .await
+            ),
+            "invalid_report"
+        );
+        assert_eq!(
+            error_code(
+                d.handle(IpcRequest::TaskClaim {
+                    machine: "nope".into(),
+                    free_slots: 1,
+                    flock_work: false,
+                })
+                .await
+            ),
+            "unknown_machine"
+        );
+    }
+
+    /// Reading, typing into or removing the worktree of a pull machine's
+    /// task needs that machine; `task done` and a plain close are the
+    /// head's rows alone, and a report after `task done` leaves it done.
+    #[tokio::test]
+    async fn a_pull_machine_s_task_is_read_and_sent_to_on_that_machine() {
+        let (d, _tmp) = pull_daemon(2).await;
+        let t = queued(&d, "p", Some("laptop")).await;
+        claim(&d, 1, false).await;
+        d.handle(report("laptop", &t, TaskState::Running, None))
+            .await;
+        assert_eq!(
+            error_code(d.handle(IpcRequest::TaskRead { id: t.id, lines: 5 }).await),
+            "pull_machine_task"
+        );
+        let send = IpcRequest::TaskSend {
+            id: t.id,
+            input: SendInput {
+                text: Some("hi".into()),
+                ..Default::default()
+            },
+        };
+        assert_eq!(error_code(d.handle(send).await), "pull_machine_task");
+        let mut rx = d.subscribe();
+        let done = IpcRequest::TaskDone {
+            id: t.id,
+            summary: Some("did it".into()),
+        };
+        let IpcResponse::Task(ended) = d.handle(done).await else {
+            panic!()
+        };
+        assert_eq!(ended.state, TaskState::Done);
+        assert!(ended.ended);
+        d.handle(report("laptop", &t, TaskState::Running, None))
+            .await;
+        assert_eq!(state_of(&d, &t), TaskState::Done, "ended stays done");
+        assert_eq!(
+            events_of(&mut rx),
+            [("task.done".to_string(), Some(t.id), "laptop".to_string())]
+        );
+        let close = |remove_worktree| IpcRequest::TaskClose {
+            id: t.id,
+            remove_worktree,
+        };
+        let mut wt = d.store().get_task(t.id).unwrap().unwrap();
+        wt.spec.worktree = true;
+        wt.spec.repo = Some("~/r".into());
+        d.store().update_task(&mut wt).unwrap();
+        assert_eq!(error_code(d.handle(close(true)).await), "pull_machine_task");
+        let IpcResponse::Task(closed) = d.handle(close(false)).await else {
+            panic!()
+        };
+        assert_eq!(closed.state, TaskState::Closed);
+        d.handle(report("laptop", &t, TaskState::Done, None)).await;
+        assert_eq!(state_of(&d, &t), TaskState::Closed, "closed stays closed");
+    }
+
+    /// A pull machine that neither claims nor reports for `after` is lost
+    /// once: its starting and running tasks go stale, the ones pinned to it
+    /// stay queued, and its next claim brings it back. A report of work on
+    /// a stale task leaves it stale; one of its end does not.
+    #[tokio::test]
+    async fn a_silent_pull_machine_is_lost_and_its_tasks_go_stale() {
+        let (d, _tmp) = pull_daemon(2).await;
+        let fleet = d.fleet();
+        let after = Duration::from_millis(300);
+        let running = queued(&d, "r", Some("laptop")).await;
+        let starting = queued(&d, "s", Some("laptop")).await;
+        claim(&d, 2, false).await;
+        d.handle(report("laptop", &running, TaskState::Running, None))
+            .await;
+        let waiting = queued(&d, "w", Some("laptop")).await;
+        let mut rx = d.subscribe();
+        assert!(fleet.check_pull_lost(after).await.is_empty(), "just heard");
+        tokio::time::sleep(after).await;
+        assert_eq!(fleet.check_pull_lost(after).await, ["laptop"]);
+        assert!(fleet.check_pull_lost(after).await.is_empty(), "lost once");
+        assert_eq!(state_of(&d, &running), TaskState::Stale);
+        assert_eq!(state_of(&d, &starting), TaskState::Stale);
+        assert_eq!(state_of(&d, &waiting), TaskState::Queued);
+        let status = fleet
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == "laptop")
+            .unwrap();
+        assert_eq!(status.channel, crate::machine::ChannelState::Reconnecting);
+        assert!(status.error.unwrap().contains("has not claimed"));
+        let mut events = events_of(&mut rx);
+        events[1..].sort();
+        let lap = |kind: &str, id: Option<i64>| (kind.to_string(), id, "laptop".to_string());
+        assert_eq!(
+            events,
+            [
+                lap("machine.lost", None),
+                lap("task.stale", Some(running.id)),
+                lap("task.stale", Some(starting.id)),
+            ]
+        );
+
+        // Two slots, both stale tasks still hold theirs.
+        assert!(claim(&d, 2, false).await.is_empty());
+        assert_eq!(events_of(&mut rx), [lap("machine.connected", None)]);
+        d.handle(report("laptop", &running, TaskState::Running, None))
+            .await;
+        assert_eq!(state_of(&d, &running), TaskState::Stale);
+        d.handle(report("laptop", &running, TaskState::Done, None))
+            .await;
+        assert_eq!(state_of(&d, &running), TaskState::Done);
+    }
+
+    /// `pull = true` is a way to reach a machine, like `ssh`, `local` and
+    /// `command`: exactly one of them.
+    #[test]
+    fn a_pull_machine_has_no_other_way_in() {
+        let f: Flock = toml::from_str("[[machine]]\nname = \"laptop\"\npull = true\n").unwrap();
+        f.validate().unwrap();
+        assert!(f.machines[0].pull);
+        let f: Flock =
+            toml::from_str("[[machine]]\nname = \"laptop\"\npull = true\nssh = \"user@pi-1\"\n")
+                .unwrap();
+        assert_eq!(
+            f.validate().unwrap_err(),
+            "machine laptop: set exactly one of local, ssh, command, pull"
+        );
     }
 
     /// `JobSubmit` queues another machine's items as this head's own job
@@ -6402,6 +7181,7 @@ mod tests {
             },
             IpcRequest::MachineAdd {
                 machine: crate::config::flock::MachineConfig {
+                    pull: false,
                     name: "m".into(),
                     local: true,
                     ssh: None,

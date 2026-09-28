@@ -1282,6 +1282,10 @@ pub struct PastorConfig {
     /// `pastor task attach` can still show the agent's last screen. `never`
     /// turns auto-close off.
     pub close_done_after: String,
+    /// How long a pull machine (`pull = true` in flock.toml) may go without
+    /// a `TaskClaim` or `TaskReport` before the head counts it lost and its
+    /// starting and running tasks go stale.
+    pub pull_lost_after: String,
     /// Whether an agent pastor started (`ipc::TASK_ENV` in its pane) may
     /// change the fleet: run, send to, retry, close or prune tasks, run jobs,
     /// and edit machines, flocks and jobs. Off by default, so the head
@@ -1340,6 +1344,7 @@ impl Default for PastorConfig {
             request_timeout: "60s".into(),
             agent_ready_timeout: "30s".into(),
             close_done_after: "15m".into(),
+            pull_lost_after: "10m".into(),
             agents_change_fleet: false,
             head_address: None,
             defaults: Defaults::default(),
@@ -1393,6 +1398,7 @@ impl PastorConfig {
             ("agent_ready_timeout", &cfg.agent_ready_timeout, false),
             ("defaults.timeout", &cfg.defaults.timeout, true),
             ("close_done_after", &cfg.close_done_after, false),
+            ("pull_lost_after", &cfg.pull_lost_after, false),
         ] {
             if name == "close_done_after" && v == CLOSE_NEVER {
                 continue;
@@ -1521,6 +1527,12 @@ impl PastorConfig {
             &self.close_done_after,
             &PastorConfig::default().close_done_after,
         ))
+    }
+    pub fn pull_lost_after_duration(&self) -> Duration {
+        duration_or_default(
+            &self.pull_lost_after,
+            &PastorConfig::default().pull_lost_after,
+        )
     }
     pub fn agent_ready_timeout_duration(&self) -> Duration {
         duration_or_default(
@@ -3202,6 +3214,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(c.close_done_after_duration(), None);
+    }
+
+    /// A pull machine is lost after ten silent minutes unless pastor.toml
+    /// says otherwise; zero is refused like any other timing.
+    #[test]
+    fn pull_lost_after_defaults_to_ten_minutes() {
+        assert_eq!(
+            PastorConfig::default().pull_lost_after_duration(),
+            Duration::from_secs(600)
+        );
+        let path = Path::new("pastor.toml");
+        let cfg = PastorConfig::parse(path, "pull_lost_after = \"90s\"").unwrap();
+        assert_eq!(cfg.pull_lost_after_duration(), Duration::from_secs(90));
+        let err = PastorConfig::parse(path, "pull_lost_after = \"0s\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pull_lost_after"), "{err}");
     }
 
     #[test]

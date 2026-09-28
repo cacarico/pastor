@@ -27,8 +27,8 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `TaskSummaries`). 18: a machine in many flocks, each with its own number
 /// (`FlockEntry::machines`). 19: workspace labels (`DispatchSpec::label`).
 /// 20: the `summary` setting (`Run::summary`, a job's `[dispatch]
-/// summary`).
-pub const IPC_PROTOCOL: u32 = 20;
+/// summary`). 21: pull machines (`TaskClaim`, `TaskReport`).
+pub const IPC_PROTOCOL: u32 = 21;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -78,6 +78,10 @@ pub const SHEPHERD_PROTOCOL: u32 = 9;
 /// membership instead, so a CLI new enough to write `machines` refuses to
 /// send it work (see `multi_flock_declared` in `main.rs`).
 pub const MULTI_FLOCK_PROTOCOL: u32 = 18;
+
+/// The first protocol whose head knows pull machines: it answers
+/// `TaskClaim` and `TaskReport`. An older one refuses them as unreadable.
+pub const PULL_PROTOCOL: u32 = 21;
 
 /// `Pong::role` of a headless `pastor serve`: it runs this machine's jobs
 /// and hooks against a head elsewhere, and is not a head itself.
@@ -418,6 +422,31 @@ pub enum IpcRequest {
     MachineDescribe {
         name: String,
     },
+    /// A pull machine's headless serve asks for work: at most `free_slots`
+    /// queued tasks to start, those pinned to `machine` first, then, with
+    /// `flock_work`, any its flocks would place there now. Each one handed
+    /// out is `starting` on `machine` before the reply. Also what keeps the
+    /// machine from going lost (`pull_lost_after`). Answers `Tasks`.
+    TaskClaim {
+        machine: String,
+        free_slots: u32,
+        #[serde(default)]
+        flock_work: bool,
+    },
+    /// A pull machine's serve says what became of a task it claimed: its
+    /// state, its pane, and `detail`, the note the task carries there (why
+    /// it failed, the question it asked). The head writes it on the row and
+    /// emits the event its own actor would have. Refused `not_on_machine`
+    /// for a task placed elsewhere. Answers `Task`.
+    TaskReport {
+        machine: String,
+        id: i64,
+        state: TaskState,
+        #[serde(default)]
+        pane: Option<String>,
+        #[serde(default)]
+        detail: Option<String>,
+    },
 }
 
 impl IpcRequest {
@@ -462,7 +491,9 @@ impl IpcRequest {
             | IpcRequest::JobSubmit { .. }
             | IpcRequest::JobTask { .. }
             | IpcRequest::TrustAdd { .. }
-            | IpcRequest::TrustRemove { .. } => true,
+            | IpcRequest::TrustRemove { .. }
+            | IpcRequest::TaskClaim { .. }
+            | IpcRequest::TaskReport { .. } => true,
         }
     }
 
@@ -1095,6 +1126,18 @@ mod tests {
                 limit: 50,
                 task: Some(3),
             },
+            IpcRequest::TaskClaim {
+                machine: "laptop".into(),
+                free_slots: 2,
+                flock_work: true,
+            },
+            IpcRequest::TaskReport {
+                machine: "laptop".into(),
+                id: 4,
+                state: crate::task::TaskState::Blocked,
+                pane: Some("p1".into()),
+                detail: Some("agent asked: go on?".into()),
+            },
         ] {
             let json = serde_json::to_string(&req).unwrap();
             let back: IpcRequest = serde_json::from_str(&json).unwrap();
@@ -1194,6 +1237,7 @@ mod tests {
             IpcRequest::FlockSetDefault { name: "f".into() },
             IpcRequest::MachineAdd {
                 machine: crate::config::flock::MachineConfig {
+                    pull: false,
                     description: None,
                     name: "m".into(),
                     local: true,

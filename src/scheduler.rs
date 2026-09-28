@@ -1347,6 +1347,9 @@ impl Scheduler {
             }
         }
         self.fleet.dispatch_queued().await;
+        self.fleet
+            .check_pull_lost(self.config.pull_lost_after_duration())
+            .await;
         self.warn_long_queued(now);
     }
 

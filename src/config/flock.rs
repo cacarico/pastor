@@ -23,6 +23,12 @@ pub struct MachineConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local: bool,
+    /// A machine the head never connects to: its own headless `pastor
+    /// serve` asks the head for tasks (`IpcRequest::TaskClaim`) and runs
+    /// them itself, reporting each change (`IpcRequest::TaskReport`). The
+    /// head runs no actor for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pull: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<String>,
     /// Developer option: argv speaking the herdr protocol on stdio.
@@ -268,10 +274,11 @@ impl Flock {
             if !seen.insert(&m.name) {
                 return Err(format!("machine {} listed twice", m.name));
             }
-            let ways = m.local as u8 + m.ssh.is_some() as u8 + m.command.is_some() as u8;
+            let ways =
+                m.local as u8 + m.ssh.is_some() as u8 + m.command.is_some() as u8 + m.pull as u8;
             if ways != 1 {
                 return Err(format!(
-                    "machine {}: set exactly one of local, ssh, command",
+                    "machine {}: set exactly one of local, ssh, command, pull",
                     m.name
                 ));
             }
@@ -983,6 +990,7 @@ mod tests {
 
     fn pi(name: &str) -> MachineConfig {
         MachineConfig {
+            pull: false,
             description: None,
             name: name.into(),
             local: false,

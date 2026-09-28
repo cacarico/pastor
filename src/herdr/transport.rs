@@ -852,6 +852,7 @@ mod tests {
 
     fn ssh_machine(name: &str) -> MachineConfig {
         MachineConfig {
+            pull: false,
             description: None,
             name: name.into(),
             local: false,
@@ -984,6 +985,7 @@ mod tests {
     #[test]
     fn ssh_endpoint_multiplexes_through_one_master() {
         let m = MachineConfig {
+            pull: false,
             description: None,
             name: "pi-3".into(),
             local: false,
@@ -1476,6 +1478,7 @@ mod tests {
         // directory and the name, so a deep state dir runs out.
         let deep = format!("/tmp/{}", "d".repeat(80));
         let m = MachineConfig {
+            pull: false,
             description: None,
             name: "pi-3".into(),
             local: false,
