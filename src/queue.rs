@@ -247,6 +247,7 @@ mod tests {
             priority_from: None,
             queue_pos: id,
             pause: Default::default(),
+            summary: None,
             created_at: now,
             started_at: None,
             finished_at: None,

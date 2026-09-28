@@ -28,7 +28,7 @@ use crate::events::{EventRecord, EventsPage};
 use crate::ipc::{IpcRequest, IpcResponse};
 use crate::scheduler::JobStatus;
 use crate::store::TaskFilter;
-use crate::task::{LIVE_STATES, Task, TaskState};
+use crate::task::{LIVE_STATES, Outcome, Task, TaskState};
 
 /// The cursor a watcher with no `--name` keeps.
 pub const DEFAULT_NAME: &str = "default";
@@ -91,12 +91,15 @@ fn parse_interval(s: &str) -> Result<Duration, String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "UPPERCASE")]
 pub enum Line {
-    /// A task reached `state`.
+    /// A task reached `state`. `outcome` is how its round ended, on a
+    /// task done or failed.
     Task {
         task: String,
         state: TaskState,
         machine: Option<String>,
         job: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outcome: Option<Outcome>,
         reason: Option<String>,
     },
     /// A job's last run failed (`failing`), or it ran fine again (`ok`).
@@ -135,11 +138,13 @@ impl Line {
                 state,
                 machine,
                 job,
+                outcome,
                 reason: r,
             } => format!(
-                "TASK {task} {state} {} {}{}",
+                "TASK {task} {state} {} {}{}{}",
                 dash(machine),
                 dash(job),
+                outcome.map(outcome_field).unwrap_or_default(),
                 reason(r)
             ),
             Line::Job {
@@ -346,6 +351,25 @@ fn connector_state(id: &str, state: &str, reason: Option<String>) -> Line {
     }
 }
 
+/// ` outcome=partial`, quoted when the outcome is more than one word
+/// (` outcome="nothing to do"`), so the line still splits on spaces.
+fn outcome_field(o: Outcome) -> String {
+    let o = o.as_str();
+    if o.contains(' ') {
+        format!(" outcome=\"{o}\"")
+    } else {
+        format!(" outcome={o}")
+    }
+}
+
+/// How a task's round ended, on a line for it in `state`: only a done or
+/// failed task has ended one.
+fn task_outcome(task: &Task, state: TaskState) -> Option<Outcome> {
+    matches!(state, TaskState::Done | TaskState::Failed)
+        .then(|| task.summary.as_ref().map(|s| s.outcome))
+        .flatten()
+}
+
 /// A `TASK` line for a task event that moved it to a state the watcher
 /// prints (`ATTENTION_STATES`, or any with `all`). Events that are not a
 /// state change (`task.started`, `task.input`) print nothing.
@@ -360,6 +384,10 @@ pub fn task_line(rec: &EventRecord, all: bool) -> Option<Line> {
         state,
         machine: task.machine.clone(),
         job: rec.job.clone(),
+        outcome: matches!(state, TaskState::Done | TaskState::Failed)
+            .then(|| rec.summary.as_ref().map(|s| s.outcome))
+            .flatten()
+            .or_else(|| task_outcome(task, state)),
         reason: task_reason(task, state),
     })
 }
@@ -383,6 +411,7 @@ pub fn now_task_lines(tasks: &[Task], all: bool) -> Vec<Line> {
             state: t.state,
             machine: t.machine.clone(),
             job: Some(t.job.clone()),
+            outcome: task_outcome(t, t.state),
             reason: task_reason(t, t.state),
         })
         .collect()
@@ -730,6 +759,7 @@ mod tests {
 
     fn rec(seq: u64, kind: &str, t: &Task) -> EventRecord {
         EventRecord {
+            summary: None,
             seq,
             at: chrono::Utc::now(),
             kind: kind.into(),
@@ -800,6 +830,44 @@ mod tests {
         let mut c = Cursor::default();
         let lines = c.events(&page(vec![rec(5, "task.running", &running)]), true);
         assert_eq!(texts(&lines), ["TASK t-13 running pi-1 nightly"]);
+    }
+
+    /// A done or failed task's line says how its round ended.
+    #[test]
+    fn a_task_end_prints_its_outcome() {
+        use crate::task::{Outcome, SummarySource, TaskSummary};
+        let summary = |outcome| TaskSummary {
+            round: 1,
+            outcome,
+            text: String::new(),
+            source: SummarySource::Agent,
+            at: chrono::Utc::now(),
+        };
+        let mut failed = task(12, TaskState::Failed);
+        failed.error = Some("agent exited".into());
+        let mut ended = rec(2, "task.failed", &failed);
+        ended.summary = Some(summary(Outcome::NoSummary));
+        let mut done = rec(3, "task.done", &task(13, TaskState::Done));
+        done.summary = Some(summary(Outcome::Partial));
+        let mut from_row = task(14, TaskState::Done);
+        from_row.summary = Some(summary(Outcome::NothingToDo));
+        let mut c = Cursor::default();
+        let lines = c.events(
+            &page(vec![ended, done, rec(4, "task.done", &from_row)]),
+            false,
+        );
+        assert_eq!(
+            texts(&lines),
+            [
+                "TASK t-12 failed pi-1 nightly outcome=\"no summary\": agent exited",
+                "TASK t-13 done pi-1 nightly outcome=partial",
+                "TASK t-14 done pi-1 nightly outcome=\"nothing to do\"",
+            ]
+        );
+        assert_eq!(
+            texts(&now_task_lines(&[from_row], false)),
+            ["TASK t-14 done pi-1 nightly outcome=\"nothing to do\""]
+        );
     }
 
     #[test]

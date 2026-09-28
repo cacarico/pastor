@@ -67,6 +67,10 @@ pub struct EventRecord {
     /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
+    /// On `task.done` and `task.failed`: how the round that just ended
+    /// ended (`TaskSummary`), read when the record was built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::task::TaskSummary>,
 }
 
 /// Where `build` finds a machine's current status. The daemon's machine set
@@ -123,6 +127,14 @@ impl EventRecord {
         } else {
             None
         };
+        let summary = match (ev.kind.as_str(), ev.task_id) {
+            ("task.done" | "task.failed", Some(id)) => store
+                .summaries(id)
+                .map_err(|err| tracing::warn!(%err, id, "event record: cannot read the summary"))
+                .ok()
+                .and_then(|mut all| all.pop()),
+            _ => None,
+        };
         let seq = store.next_event_seq().unwrap_or_else(|err| {
             tracing::error!(%err, kind = %ev.kind, "event record: cannot take a sequence number");
             0
@@ -136,6 +148,7 @@ impl EventRecord {
             task,
             job,
             machine,
+            summary,
         }
     }
 
@@ -696,6 +709,25 @@ mod tests {
         assert_eq!(v["task"]["flock"], "work");
     }
 
+    /// `task.done` and `task.failed` carry how the round ended; other task
+    /// events carry none.
+    #[test]
+    fn a_task_end_carries_its_summary() {
+        let (store, t) = store_with_task("run");
+        store
+            .end_round(t.id, Some("blocked: needs a token"))
+            .unwrap();
+        for kind in ["task.done", "task.failed"] {
+            let rec = EventRecord::build(&ev(kind, Some(t.id), None, None), &store, None);
+            let v = serde_json::to_value(&rec).unwrap();
+            assert_eq!(v["summary"]["outcome"], "blocked", "{kind}");
+            assert_eq!(v["summary"]["text"], "blocked: needs a token");
+            assert_eq!(v["summary"]["source"], "agent");
+        }
+        let rec = EventRecord::build(&ev("task.running", Some(t.id), None, None), &store, None);
+        assert!(serde_json::to_value(&rec).unwrap().get("summary").is_none());
+    }
+
     fn ev(
         kind: &str,
         task_id: Option<i64>,
@@ -815,6 +847,7 @@ mod tests {
 
     fn record(kind: &str, task: Option<&Task>) -> EventRecord {
         EventRecord {
+            summary: None,
             seq: 0,
             detail: None,
             at: Utc::now(),
@@ -1269,6 +1302,7 @@ mod tests {
 
     fn numbered(seq: u64, kind: &str, task: Option<&Task>) -> EventRecord {
         EventRecord {
+            summary: None,
             seq,
             ..record(kind, task)
         }

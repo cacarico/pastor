@@ -302,10 +302,13 @@ enum TaskCmd {
     Run(Box<RunArgs>),
     /// List live tasks across the flock; --all adds finished ones
     List(ListArgs),
-    /// One task in full: state, machine, agent, prompt, error
+    /// One task in full: state, machine, agent, prompt, error, summary
     Describe {
         /// A task, like t-12 or 12
         task: String,
+        /// Show every round's summary, not only the last
+        #[arg(long)]
+        all_summaries: bool,
         /// Print as a JSON object
         #[arg(long)]
         json: bool,
@@ -1108,6 +1111,21 @@ fn needs_preempt_protocol(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` sends a summary, or asks for every round's, which only
+/// a head of `SUMMARY_PROTOCOL` or later keeps or knows: `task done
+/// --summary|--summary-file` and `task describe --all-summaries`.
+fn needs_summary_protocol(command: &Command) -> bool {
+    match command {
+        Command::Task {
+            cmd: TaskCmd::Done(a),
+        } => a.has_summary(),
+        Command::Task {
+            cmd: TaskCmd::Describe { all_summaries, .. },
+        } => *all_summaries,
+        _ => false,
+    }
+}
+
 /// Whether `command` sends a description only a head of
 /// `DESCRIPTION_PROTOCOL` or later keeps: `task run`, `flock add` or
 /// `machine add` with `--description`.
@@ -1172,7 +1190,12 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_preempt_protocol(command) {
+    if needs_summary_protocol(command) {
+        Some((
+            pastor::ipc::SUMMARY_PROTOCOL,
+            "predates task summaries, and would drop the summary or refuse the request",
+        ))
+    } else if needs_preempt_protocol(command) {
         Some((
             pastor::ipc::PREEMPT_PROTOCOL,
             "predates pausing a low task, and would queue the task without --preempt",
@@ -1707,9 +1730,17 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
         }
         let descriptions: Vec<Option<String>> =
             tasks.iter().map(|t| Some(t.description_text())).collect();
+        // `--wide` adds how each task's last round ended, before DESCRIPTION.
+        let mut header = pastor::cli::TASK_HEADER.to_vec();
+        if a.wide {
+            header.push("RESULT");
+            for (row, t) in rows.iter_mut().zip(&tasks) {
+                row.push(pastor::cli::task_result(t));
+            }
+        }
         println!(
             "{}",
-            pastor::cli::list_table(&pastor::cli::TASK_HEADER, &rows, a.wide, &descriptions)
+            pastor::cli::list_table(&header, &rows, a.wide, &descriptions)
         );
     }
     // Orphans have no row to list, so they get a line each under the table.
@@ -1747,22 +1778,48 @@ async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
     match cmd {
         TaskCmd::Run(args) => run(paths, *args).await?,
         TaskCmd::List(args) => list(paths, args, head).await?,
-        TaskCmd::Describe { task, json } => {
+        TaskCmd::Describe {
+            task,
+            all_summaries,
+            json,
+        } => {
             let id = task_id(&task);
-            let t = if head.is_live() {
+            let (t, all) = if head.is_live() {
                 let IpcResponse::Task(t) = ask(paths, IpcRequest::TaskShow { id }).await? else {
                     unreachable!()
                 };
-                t
+                let all = if all_summaries {
+                    let IpcResponse::Summaries(all) =
+                        ask(paths, IpcRequest::TaskSummaries { id }).await?
+                    else {
+                        unreachable!()
+                    };
+                    Some(all)
+                } else {
+                    None
+                };
+                (t, all)
             } else {
-                open_store(paths)?
+                let store = open_store(paths)?;
+                let t = store
                     .get_task(id)?
-                    .unwrap_or_else(|| fail("task_not_found", &task))
+                    .unwrap_or_else(|| fail("task_not_found", &task));
+                let all = if all_summaries {
+                    Some(store.summaries(id)?)
+                } else {
+                    None
+                };
+                (t, all)
             };
-            if json {
-                print_task(&t, true);
-            } else {
-                println!("{}", pastor::cli::task_detail(&t));
+            match (json, all) {
+                (true, Some(all)) => {
+                    let mut v = t.to_json();
+                    v["summaries"] = serde_json::to_value(&all)?;
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                }
+                (true, None) => print_task(&t, true),
+                (false, Some(all)) => println!("{}", pastor::cli::task_detail_with(&t, &all)),
+                (false, None) => println!("{}", pastor::cli::task_detail(&t)),
             }
         }
         TaskCmd::Read { task, lines } => {

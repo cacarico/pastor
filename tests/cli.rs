@@ -2988,6 +2988,80 @@ fn an_agent_may_end_its_own_task_only() {
     assert_eq!(env.json(&["task", "done", "t-2", "--json"])["ended"], true);
 }
 
+/// `task done --summary` (or `--summary-file`, `-` for stdin) ends the
+/// round with what the agent said: `task describe` shows it, `--all-summaries`
+/// every round's, `task list --wide` its outcome as RESULT, and `--json` the
+/// `summary` object.
+#[test]
+fn a_task_done_with_a_summary_shows_it() {
+    let env = start();
+    for _ in 0..2 {
+        env.json(&["task", "run", "go on", "--repo", "/tmp", "--json"]);
+    }
+    let ended = env.json(&[
+        "task",
+        "done",
+        "t-1",
+        "--summary",
+        "Partial: tests left\npushed pastor/t-1",
+        "--json",
+    ]);
+    assert_eq!(ended["summary"]["outcome"], "partial", "{ended}");
+    assert_eq!(ended["summary"]["source"], "agent", "{ended}");
+    assert_eq!(ended["summary"]["round"], 1, "{ended}");
+    // Said again, it replaces the round's summary.
+    let out = env.cmd_stdin(
+        &["task", "done", "t-1", "--summary-file", "-", "--json"],
+        "nothing to do\nalready merged\n",
+    );
+    let again: serde_json::Value = serde_json::from_str(&ok(out)).unwrap();
+    assert_eq!(again["summary"]["outcome"], "nothing to do", "{again}");
+    let text = ok(env.cmd(&["task", "describe", "t-1"]));
+    assert!(
+        text.contains("summary:    nothing to do (round 1, from the agent,"),
+        "{text}"
+    );
+    assert!(text.contains("\n  already merged\n"), "{text}");
+    let all = env.json(&["task", "describe", "t-1", "--all-summaries", "--json"]);
+    assert_eq!(all["summaries"].as_array().unwrap().len(), 1, "{all}");
+    let listed = ok(env.cmd(&["task", "list", "--all", "--wide"]));
+    let header = listed.lines().next().unwrap();
+    assert!(
+        header.contains(" RESULT ") && header.ends_with("DESCRIPTION"),
+        "{listed}"
+    );
+    let row = listed.lines().find(|l| l.starts_with("t-1 ")).unwrap();
+    assert!(row.contains("nothing to do"), "{listed}");
+    let row = listed.lines().find(|l| l.starts_with("t-2 ")).unwrap();
+    assert!(row.contains(" - "), "{listed}");
+    let tasks = env.json(&["task", "list", "--all", "--json"]);
+    let t1 = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == 1)
+        .unwrap();
+    assert_eq!(
+        t1["summary"]["text"], "nothing to do\nalready merged",
+        "{t1}"
+    );
+    env.fails_with(&["task", "done", "t-2", "--summary", "  "], "summary_empty");
+    env.fails_with(
+        &[
+            "task",
+            "done",
+            "t-2",
+            "--summary-file",
+            "/nonexistent/summary",
+        ],
+        "summary_file_unreadable",
+    );
+    // With no summary the round keeps the pane's last lines instead.
+    let t2 = env.json(&["task", "done", "t-2", "--json"]);
+    assert_eq!(t2["summary"]["outcome"], "no summary", "{t2}");
+    assert_eq!(t2["summary"]["source"], "pane", "{t2}");
+}
+
 /// A person starts an orchestrator with `task run --role orchestrator`; from
 /// its pane it may run tasks, but not close one or make another
 /// orchestrator, and no plain agent may make one either. `task describe` and

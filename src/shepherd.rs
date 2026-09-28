@@ -248,6 +248,7 @@ mod tests {
 
     fn rec(seq: u64) -> EventRecord {
         EventRecord {
+            summary: None,
             seq,
             at: chrono::Utc::now(),
             kind: "task.done".into(),
@@ -428,6 +429,7 @@ mod tests {
         .unwrap();
 
         let about = |seq: u64, kind: &str, job: Option<&str>| EventRecord {
+            summary: None,
             kind: kind.into(),
             job: job.map(str::to_string),
             ..rec(seq)
