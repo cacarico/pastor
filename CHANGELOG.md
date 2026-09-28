@@ -54,6 +54,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   room for the task. `machine add` takes `--job-slots` and `--burst`;
   `machine list` shows the room as `2+1j+1b` and `--json` has `job_slots`
   and `burst`.
+- Task roles. `pastor task run --role orchestrator` starts a task whose
+  agent may, from its own pane, run tasks, retry and send to them, and
+  disable a job; every other fleet change stays `agent_refused`, with a
+  message naming the role, unless `agents_change_fleet = true`. Only a
+  person starts an orchestrator: `--role orchestrator`, or a retry of an
+  orchestrator, from any task's pane is `role_refused`. A retry keeps its
+  task's role. `task describe` and `task list --json` show `role` (`agent`
+  for every other task). The store goes to schema 10 (a `role` column, `agent`
+  for existing rows) and the IPC protocol to 12; `--role orchestrator`
+  refuses an older head (`head_too_old`). A guard against mistakes, not a
+  boundary: the agent runs as the same user as pastor.
 - Named models: `[models.<name>]` in pastor.toml, each with a herdr agent
   `kind` and the `args` that select it. A task runs one with `pastor task run
   --model <name>`, a job's `[dispatch] model` (a template, so

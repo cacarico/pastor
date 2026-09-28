@@ -217,6 +217,7 @@ pub fn task_detail(t: &Task) -> String {
         ("state", t.state.to_string()),
         ("priority", priority),
         ("job", t.job.clone()),
+        ("role", t.role.to_string()),
         ("flock", opt(&t.flock)),
         ("machine", opt(&t.machine)),
         ("agent", agent),
@@ -685,6 +686,7 @@ mod tests {
             finished_at: None,
             updated_at: now,
             flock: None,
+            role: Default::default(),
         }
     }
 
@@ -1038,6 +1040,18 @@ mod tests {
         let json = t.to_json();
         assert_eq!(json["priority"], "high");
         assert_eq!(json["priority_from"], "flock work");
+    }
+
+    /// `task describe` names the task's role, and `task list --json`'s
+    /// record carries it, plain agents included.
+    #[test]
+    fn a_task_shows_its_role() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(task_detail(&t).contains("role:       agent\n"));
+        assert_eq!(t.to_json()["role"], "agent");
+        t.role = crate::task::TaskRole::Orchestrator;
+        assert!(task_detail(&t).contains("role:       orchestrator\n"));
+        assert_eq!(t.to_json()["role"], "orchestrator");
     }
 
     /// An error can be raw multi-line stderr; it must stay one field on one

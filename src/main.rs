@@ -13,7 +13,9 @@ use pastor::herdr::{Connector, ConnectorExt, Endpoint, shell_quote};
 use pastor::ipc::{Head, HeadPing, IpcRequest, IpcResponse, request};
 use pastor::scheduler::{JobRunReport, JobStatus, Scheduler};
 use pastor::store::{Store, TaskFilter};
-use pastor::task::{DispatchSpec, LIVE_STATES, Place, Task, TaskState, bad_task_id, parse_task_id};
+use pastor::task::{
+    DispatchSpec, LIVE_STATES, Place, Task, TaskRole, TaskState, bad_task_id, parse_task_id,
+};
 
 /// The agent skill, built into the binary so an agent on any machine with
 /// pastor installed can read the guide that matches this exact CLI.
@@ -237,6 +239,11 @@ struct RunArgs {
     /// pane:<workspace> (default: `[defaults] place`, else repo)
     #[arg(long, value_name = "PLACE")]
     place: Option<Place>,
+    /// What the agent may change through the head: agent (read, and end
+    /// its own task) or orchestrator (also run, retry and send to tasks and
+    /// disable jobs). Only a person may start an orchestrator, never a task
+    #[arg(long, value_enum, value_name = "ROLE", default_value_t = TaskRole::Agent)]
+    role: TaskRole,
     /// Print as a JSON object
     #[arg(long)]
     json: bool,
@@ -524,12 +531,25 @@ fn main() {
     }
     pastor::ipc::set_remote_head(remote.clone());
     pastor::ipc::set_caller_task(pastor::ipc::task_from_env());
-    if let Some(task) = pastor::ipc::caller_task()
-        && changes_fleet(&command)
-        && !ends_own_task(&command, &task)
-        && !agents_change_fleet(&paths)
-    {
-        fail("agent_refused", &pastor::daemon::agent_refusal(&task));
+    if let Some(task) = pastor::ipc::caller_task() {
+        if makes_orchestrator(&command) {
+            fail(
+                "role_refused",
+                &format!(
+                    "{task} is a task, and only a person may run a task with --role orchestrator"
+                ),
+            );
+        }
+        if changes_fleet(&command)
+            && !ends_own_task(&command, &task)
+            && !orchestrator_may(&command)
+            && !agents_change_fleet(&paths)
+        {
+            fail(
+                "agent_refused",
+                &pastor::daemon::refusal(&task, local_caller_role(&paths, &task)),
+            );
+        }
     }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async {
@@ -939,6 +959,27 @@ fn changes_fleet(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` is `task run --role orchestrator`, which no task may
+/// send.
+fn makes_orchestrator(command: &Command) -> bool {
+    matches!(command, Command::Task { cmd: TaskCmd::Run(a) } if a.role == TaskRole::Orchestrator)
+}
+
+/// Whether `command` is one an orchestrator task may make
+/// (`IpcRequest::orchestrator_may`). The CLI does not know the caller's
+/// role, so from a task's pane it leaves these to the head, which does:
+/// `task run|retry|send` only ever go through it, and `job disable` with no
+/// head is refused in `toggle`.
+fn orchestrator_may(command: &Command) -> bool {
+    match command {
+        Command::Task { cmd } => {
+            matches!(cmd, TaskCmd::Run(_) | TaskCmd::Retry(_) | TaskCmd::Send(_))
+        }
+        Command::Job { cmd } => matches!(cmd, JobCmd::Disable { .. }),
+        _ => false,
+    }
+}
+
 /// Whether `command` is `task done` for `task`, the task the caller runs
 /// in: the one change an agent may make without `agents_change_fleet`.
 fn ends_own_task(command: &Command, task: &str) -> bool {
@@ -949,6 +990,21 @@ fn ends_own_task(command: &Command, task: &str) -> bool {
 /// as off: the refusal is the safe side.
 fn agents_change_fleet(paths: &Paths) -> bool {
     PastorConfig::load(&paths.config_file()).is_ok_and(|c| c.agents_change_fleet)
+}
+
+/// The role of `task`, read straight from the database for this local guard,
+/// which runs before the head is ever contacted. One the store does not know,
+/// or cannot read, is a plain agent: the refusal is the safe side, same as
+/// `Daemon::caller_role`.
+fn local_caller_role(paths: &Paths, task: &str) -> TaskRole {
+    parse_task_id(task)
+        .and_then(|id| {
+            Store::open_read_only(&paths.db_file())
+                .ok()?
+                .get_task(id)
+                .ok()?
+        })
+        .map_or(TaskRole::Agent, |t| t.role)
 }
 
 /// Whether `command` can make the head queue a task, whose agent and model
@@ -1037,7 +1093,12 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `MODEL_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_priority_protocol(command) {
+    if makes_orchestrator(command) {
+        Some((
+            pastor::ipc::ROLE_PROTOCOL,
+            "predates task roles, and would start a plain agent instead of an orchestrator",
+        ))
+    } else if needs_priority_protocol(command) {
         Some((
             pastor::ipc::PRIORITY_PROTOCOL,
             "predates task priority, and would queue the task at its own level or refuse the request",
@@ -1144,6 +1205,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
             spec,
             flock: a.flock,
             priority,
+            role: a.role,
         },
     )
     .await?
@@ -2341,6 +2403,19 @@ async fn flock_describe(paths: &Paths, name: &str, json: bool, head: Head) -> an
 }
 
 async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow::Result<()> {
+    // Let through from a task's pane for an orchestrator
+    // (`orchestrator_may`), whose role only the head knows.
+    if !head.is_live()
+        && let Some(task) = pastor::ipc::caller_task()
+        && !agents_change_fleet(paths)
+    {
+        return Err(CliError::err(
+            "agent_refused",
+            format!(
+                "{task} is an agent pastor started; with no pastor serve running to check its role, it may not disable a job"
+            ),
+        ));
+    }
     if head.is_live() {
         let req = IpcRequest::JobSetEnabled {
             name: name.to_string(),
@@ -2371,6 +2446,43 @@ mod tests {
                 cmd: TaskCmd::Run(a),
             } => *a,
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// `task run --role orchestrator` needs a head that knows roles, and is
+    /// what no task may send; from a task's pane, the commands an
+    /// orchestrator may make are left to the head, which knows its role.
+    #[test]
+    fn an_orchestrator_run_needs_the_role_protocol() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let orch = parse(&["pastor", "task", "run", "x", "--role", "orchestrator"]);
+        assert!(makes_orchestrator(&orch));
+        assert_eq!(
+            protocol_need(&orch).map(|(p, _)| p),
+            Some(pastor::ipc::ROLE_PROTOCOL)
+        );
+        let plain = parse(&["pastor", "task", "run", "x"]);
+        assert!(!makes_orchestrator(&plain));
+        assert_eq!(
+            protocol_need(&plain).map(|(p, _)| p),
+            Some(pastor::ipc::MODEL_PROTOCOL)
+        );
+        assert!(Cli::try_parse_from(["pastor", "task", "run", "x", "--role", "boss"]).is_err());
+        for argv in [
+            &["pastor", "task", "run", "x"][..],
+            &["pastor", "task", "retry", "t-1"],
+            &["pastor", "task", "send", "t-1", "go"],
+            &["pastor", "job", "disable", "j"],
+        ] {
+            assert!(orchestrator_may(&parse(argv)), "{argv:?}");
+        }
+        for argv in [
+            &["pastor", "task", "close", "t-1"][..],
+            &["pastor", "job", "enable", "j"],
+            &["pastor", "job", "run", "j"],
+            &["pastor", "machine", "add", "m", "--local"],
+        ] {
+            assert!(!orchestrator_may(&parse(argv)), "{argv:?}");
         }
     }
 

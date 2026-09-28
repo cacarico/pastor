@@ -386,6 +386,10 @@ pub struct Task {
     /// its id unless something has moved it.
     #[serde(default)]
     pub queue_pos: i64,
+    /// What the head lets the task's agent change (`TaskRole`). `agent` on
+    /// every row from before roles.
+    #[serde(default)]
+    pub role: TaskRole,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -419,6 +423,52 @@ impl Task {
             );
         }
         v
+    }
+}
+
+/// What a task's agent may change through the head. A guard against an
+/// agent's mistakes, not a boundary: the agent runs as the same user as
+/// pastor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRole {
+    /// Reads, and `task done` for its own task; everything else is refused
+    /// unless `agents_change_fleet` is on.
+    #[default]
+    Agent,
+    /// Also runs, retries and types into tasks and disables jobs
+    /// (`IpcRequest::orchestrator_may`). Only a person makes one: `task run
+    /// --role orchestrator` from outside any task.
+    Orchestrator,
+}
+
+impl TaskRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskRole::Agent => "agent",
+            TaskRole::Orchestrator => "orchestrator",
+        }
+    }
+
+    pub fn is_agent(&self) -> bool {
+        *self == TaskRole::Agent
+    }
+}
+
+impl std::fmt::Display for TaskRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TaskRole {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "agent" => Ok(TaskRole::Agent),
+            "orchestrator" => Ok(TaskRole::Orchestrator),
+            other => Err(format!("unknown role {other:?}; agent or orchestrator")),
+        }
     }
 }
 
@@ -743,6 +793,7 @@ mod tests {
             finished_at: None,
             updated_at: now,
             flock: None,
+            role: Default::default(),
         }
     }
 

@@ -8,7 +8,7 @@ use crate::config::AgentChoice;
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::store::TaskFilter;
-use crate::task::{DispatchSpec, Task, TaskState};
+use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 
 /// The head's IPC protocol, answered in `Pong`. Bumped when a request gains a
 /// field an older head would silently ignore (serde skips unknown fields), so
@@ -19,8 +19,8 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// `JobSetEnabled`. 7: `JobSubmit`. 8: named models (`AgentChoice::model`).
 /// 9: `JobTask`, and `Pong::role`. 10: `TrustList`, `TrustAdd`,
 /// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. 11: task priority
-/// (`Run::priority`, `TaskPriority`).
-pub const IPC_PROTOCOL: u32 = 11;
+/// (`Run::priority`, `TaskPriority`). 12: `Run::role`.
+pub const IPC_PROTOCOL: u32 = 12;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -79,6 +79,10 @@ pub const ALREADY_SEEN: &str = "already_seen";
 /// refuses it with `head_too_old` first.
 pub const HEAD_READS_PROTOCOL: u32 = 10;
 
+/// The first protocol whose head honours `Run::role`. An older one would
+/// queue a plain agent and say it succeeded.
+pub const ROLE_PROTOCOL: u32 = 12;
+
 /// The first protocol whose head knows `JobSubmit`. An older one refuses the
 /// request as unreadable; `check_protocol` says why before it is sent.
 pub const JOB_SUBMIT_PROTOCOL: u32 = 7;
@@ -128,6 +132,11 @@ pub enum IpcRequest {
         /// head still reads the request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         priority: Option<crate::task::Priority>,
+        /// The task's role (`task run --role`). Left out for a plain agent,
+        /// so an older head still reads the request; given, the CLI sends it
+        /// only to a head of `ROLE_PROTOCOL` or later.
+        #[serde(default, skip_serializing_if = "TaskRole::is_agent")]
+        role: TaskRole,
     },
     List {
         filter: TaskFilter,
@@ -350,6 +359,21 @@ impl IpcRequest {
             | IpcRequest::JobTask { .. }
             | IpcRequest::TrustAdd { .. }
             | IpcRequest::TrustRemove { .. } => true,
+        }
+    }
+
+    /// Whether an orchestrator task (`TaskRole::Orchestrator`) may make this
+    /// change without `agents_change_fleet`: run, retry and type into tasks,
+    /// and disable a job. One arm per request, so adding one is one line.
+    /// Making another orchestrator is refused apart from this, whoever asks
+    /// from inside a task (`Daemon::handle_from`).
+    pub fn orchestrator_may(&self) -> bool {
+        match self {
+            IpcRequest::Run { .. } => true,
+            IpcRequest::TaskRetry { .. } => true,
+            IpcRequest::TaskSend { .. } => true,
+            IpcRequest::JobSetEnabled { enabled, .. } => !enabled,
+            _ => false,
         }
     }
 
@@ -814,6 +838,7 @@ mod tests {
             finished_at: None,
             updated_at: now,
             flock: None,
+            role: Default::default(),
         }
     }
 
@@ -993,13 +1018,21 @@ mod tests {
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
         }
-        let changes = [
+        for req in fleet_changes() {
+            assert!(req.changes_fleet(), "{req:?}");
+        }
+    }
+
+    /// One of every request that changes the fleet.
+    fn fleet_changes() -> Vec<IpcRequest> {
+        vec![
             IpcRequest::Run {
                 prompt: "p".into(),
                 spec: minimal_task().spec,
                 flock: None,
                 agent: None,
                 priority: None,
+                role: TaskRole::Agent,
             },
             IpcRequest::TaskPriority {
                 id: 1,
@@ -1066,6 +1099,10 @@ mod tests {
                 name: "j".into(),
                 enabled: false,
             },
+            IpcRequest::JobSetEnabled {
+                name: "j".into(),
+                enabled: true,
+            },
             IpcRequest::JobSubmit {
                 job: "j".into(),
                 dispatch: serde_json::Value::Null,
@@ -1080,10 +1117,64 @@ mod tests {
                 machine: "m".into(),
                 repo: "/r".into(),
             },
-        ];
-        for req in changes {
-            assert!(req.changes_fleet(), "{req:?}");
+        ]
+    }
+
+    /// An orchestrator may run, retry and type into tasks and disable a job,
+    /// and nothing else that changes the fleet: not `task close`, not a job
+    /// enabled, not a file or machine edit.
+    #[test]
+    fn an_orchestrator_may_make_exactly_the_specs_changes() {
+        for req in fleet_changes() {
+            let allowed = matches!(
+                req,
+                IpcRequest::Run { .. }
+                    | IpcRequest::TaskRetry { .. }
+                    | IpcRequest::TaskSend { .. }
+                    | IpcRequest::JobSetEnabled { enabled: false, .. }
+            );
+            assert_eq!(req.orchestrator_may(), allowed, "{req:?}");
         }
+        assert!(
+            !IpcRequest::JobSetEnabled {
+                name: "j".into(),
+                enabled: true
+            }
+            .orchestrator_may()
+        );
+        assert!(
+            !IpcRequest::TaskClose {
+                id: 1,
+                remove_worktree: false
+            }
+            .orchestrator_may()
+        );
+    }
+
+    /// A plain agent's `Run` leaves `role` out, so an older head reads it;
+    /// an orchestrator's names it, and both read back.
+    #[test]
+    fn run_names_its_role_only_when_not_a_plain_agent() {
+        let run = |role| IpcRequest::Run {
+            prompt: "p".into(),
+            spec: minimal_task().spec,
+            flock: None,
+            agent: None,
+            priority: None,
+            role,
+        };
+        let v = serde_json::to_value(run(TaskRole::Agent)).unwrap();
+        assert!(v.get("role").is_none(), "{v}");
+        let v = serde_json::to_value(run(TaskRole::Orchestrator)).unwrap();
+        assert_eq!(v["role"], "orchestrator");
+        let back: IpcRequest = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            IpcRequest::Run {
+                role: TaskRole::Orchestrator,
+                ..
+            }
+        ));
     }
 
     /// The CLI tells the head which task it runs in, beside the request's

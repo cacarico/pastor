@@ -864,6 +864,7 @@ mod tests {
             finished_at: None,
             updated_at: now,
             flock: None,
+            role: Default::default(),
         }
     }
 
