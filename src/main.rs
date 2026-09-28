@@ -3163,8 +3163,8 @@ mod tests {
     /// (`t-12`, a quoted prompt); flags are checked on the command reached.
     /// Every Markdown file under `skills/` counts: the reference files and
     /// worked examples are read by agents as much as the SKILL.md itself.
-    /// README.md, docs/manual.md and docs/recommended-setup.md are read by
-    /// people, and count too.
+    /// README.md, docs/manual.md, docs/recommended-setup.md and the
+    /// website's docs pages are read by people, and count too.
     #[test]
     fn skills_mention_only_real_commands_and_flags() {
         let mut files = Vec::new();
@@ -3174,6 +3174,7 @@ mod tests {
         files.push(repo.join("README.md"));
         files.push(repo.join("docs/manual.md"));
         files.push(repo.join("docs/recommended-setup.md"));
+        markdown_files(&repo.join("docs/website/content"), &mut files);
         let mut wrong = Vec::new();
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();

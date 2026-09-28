@@ -1505,8 +1505,9 @@ so its agents reach the head only as that user. What the pastor skill asks
 of a dispatched agent, to stay in its own pane and worktree, is advice, not
 a control.
 
-Plugins run as the head's user too, with the same reach and the head's
-environment; [Plugins](#plugins) lists what they inherit.
+Connectors run as the head's user too, with the same reach and the head's
+environment; [What a connector inherits](#what-a-connector-inherits) lists
+what they get.
 
 ## Describe and edit
 
