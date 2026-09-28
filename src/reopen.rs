@@ -7,7 +7,7 @@
 //! `t-<id>` counts), and a second attach goes back to it while it lives.
 
 use crate::config::Agents;
-use crate::dispatch::{DispatchError, expand_home};
+use crate::dispatch::{DispatchError, expand_home, no_repo_dir};
 use crate::herdr::{CallError, Connector, ConnectorExt};
 use crate::task::Task;
 
@@ -60,7 +60,7 @@ pub fn why_not(task: &Task, agents: &Agents) -> Option<String> {
 /// The agent `pastor task attach` should attach to for `task`, whose pane
 /// pastor holds closed: its own agent while herdr still lists it, else an
 /// earlier resume that is still open, else a new pane in the task's working
-/// directory, with its agent definition's env, running
+/// directory (`~/pastor-tasks` for a task with no repo, as at dispatch), with its agent definition's env, running
 /// `claude --resume <session>`. A worktree removed at close is put back
 /// first, at the same path on the same branch, since Claude files its
 /// sessions by directory.
@@ -130,7 +130,8 @@ pub async fn reopen(
             }
             Some(checkout.path.clone())
         }
-        (_, repo) => repo.clone(),
+        (_, Some(repo)) => Some(repo.clone()),
+        (_, None) => no_repo_dir(conn, Some(machine)).await?,
     };
     if let Some(dir) = cwd.as_deref()
         && conn.dir_exists(dir).await.map_err(CallError::from)? == Some(false)
@@ -278,6 +279,23 @@ mod tests {
             .filter(|r| r.method == "agent.start")
             .count();
         assert_eq!(starts, 1);
+    }
+
+    /// A task with no repo ran in `~/pastor-tasks`, and Claude files its
+    /// sessions by directory, so the resume opens there too, not wherever
+    /// herdr's focused pane happens to be.
+    #[tokio::test]
+    async fn a_task_with_no_repo_resumes_in_the_no_repo_folder() {
+        let fake = FakeHerdr::new();
+        let mut t = closed("claude", Some(SESSION));
+        t.spec.repo = None;
+        reopen(&fake, &t, &Agents::default()).await.unwrap();
+        let reqs = fake.requests();
+        let ws = reqs
+            .iter()
+            .find(|r| r.method == "workspace.create")
+            .unwrap();
+        assert_eq!(ws.params["cwd"], "/home/fake/pastor-tasks");
     }
 
     /// While the task's own agent is still listed, attach goes to it.

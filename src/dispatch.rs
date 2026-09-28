@@ -842,7 +842,7 @@ pub const NO_REPO_DIR: &str = "pastor-tasks";
 /// `~/pastor-tasks`, made when missing, where Claude asks once per machine.
 /// A folder that cannot be made falls back to the home; a machine that
 /// cannot tell its home leaves it to herdr, as before.
-async fn no_repo_dir(
+pub(crate) async fn no_repo_dir(
     conn: &dyn Connector,
     machine: Option<&str>,
 ) -> Result<Option<String>, DispatchError> {

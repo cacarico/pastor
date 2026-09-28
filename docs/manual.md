@@ -2010,7 +2010,7 @@ always. Once the task is `closed` or `failed`, pastor looks on the task's
 machine first: while herdr still lists the task's agent, attach goes to it.
 Otherwise, for a task that recorded a Claude session, it opens a new
 workspace on that machine, labelled `t-N-resume`, in the task's directory
-(its worktree, else its repo), with the env of the task's agent definition
+(its worktree, else its repo, else `~/pastor-tasks`), with the env of the task's agent definition
 (so `CLAUDE_CONFIG_DIR` points at the same account's sessions), runs `claude
 --resume <session>` there as the agent `t-N-resume`, and attaches. Attaching
 again while that pane is open goes back to it.
@@ -2020,7 +2020,8 @@ closing the pane leaves no trace on it. Claude files its sessions by
 directory, so a worktree removed at close is first put back at the same path
 on the task's branch (`git worktree prune`, then `git worktree add <path>
 <branch>`, in the task's repo); when the branch is gone too, attach fails with
-`branch_gone` and opens nothing. A task of another kind (opencode, codex), or
+`branch_gone` and opens nothing. When the worktree can't be put back, or the
+directory is gone, attach fails with `reopen_failed`. A task of another kind (opencode, codex), or
 a Claude task that recorded no session, has nothing to reopen: attach fails
 with `no_agent`, as before, and says so. A `command` machine has no terminal,
 so attach refuses it with `no_terminal` either way.
