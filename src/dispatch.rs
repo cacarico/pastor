@@ -950,7 +950,7 @@ mod tests {
             deny: vec!["WebFetch".into()],
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         let id = t.spec.session_id.clone().expect("a session id");
@@ -971,7 +971,7 @@ mod tests {
         // Another task, another session.
         let mut u = task(spec());
         u.id = 8;
-        dispatch(&FakeHerdr::new(), &mut u, &Agents::default(), READY)
+        dispatch(&FakeHerdr::new(), &mut u, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_ne!(u.spec.session_id.as_deref(), Some(id.as_str()));
@@ -998,7 +998,7 @@ mod tests {
             });
             // A stale id copied from somewhere else is dropped, too.
             t.spec.session_id = Some("stale".into());
-            dispatch(&fake, &mut t, &Agents::default(), READY)
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
                 .await
                 .unwrap();
             assert_eq!(t.spec.session_id, None, "{args:?}");
@@ -1012,7 +1012,7 @@ mod tests {
             agent_args: vec![],
             ..spec()
         });
-        dispatch(&fake, &mut t, &Agents::default(), READY)
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
         assert_eq!(t.spec.session_id, None);
