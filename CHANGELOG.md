@@ -124,8 +124,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `running` until the shell ends and the agent goes idle again.
 - A task with no repo (no `--repo`, no `repo` in its job) opened its pane
   wherever herdr's focused pane was, so it could start in an unrelated
-  checkout. It now starts in the machine's home directory; a machine that
-  cannot report its home (a `command` one) still leaves it to herdr.
+  checkout. It now starts in `~/pastor-tasks` on its machine, which pastor
+  makes when it is missing; a machine that cannot report its home (a
+  `command` one) still leaves it to herdr. Not the home itself: Claude Code
+  never saves folder trust for the home directory, so a task there asked
+  "Is this a project you trust?" at every start and sat `blocked`. In
+  `~/pastor-tasks` Claude asks once per machine. If the folder cannot be
+  made, the task starts in the home.
 - A task blocked on Claude's folder-trust prompt that a person answered at
   the pane got its prompt at once, while Claude redraws after the dialog
   and drops what is typed, so it read `running` with the agent at an empty

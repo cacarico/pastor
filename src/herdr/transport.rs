@@ -412,6 +412,13 @@ pub trait Connector: Send + Sync {
     fn dir_exists(&self, _path: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// Make the directory `path` on the machine, parents too, unless it is
+    /// already there: where a task with no repo starts. `Some(true)` when it
+    /// is there now, `Some(false)` when it could not be made, `None` when it
+    /// cannot be known.
+    fn ensure_dir(&self, _path: &str) -> DirFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// Whether the git checkout at `path` on the machine has commits that are
     /// on no remote. herdr's `worktree.remove` refuses only uncommitted
     /// changes, so auto-close asks this first and keeps such a checkout.
@@ -457,6 +464,10 @@ impl Connector for Endpoint {
     fn dir_exists(&self, path: &str) -> DirFuture<'_> {
         let path = path.to_string();
         Box::pin(async move { dir_exists(self, &path).await })
+    }
+    fn ensure_dir(&self, path: &str) -> DirFuture<'_> {
+        let path = path.to_string();
+        Box::pin(async move { ensure_dir(self, &path).await })
     }
     fn unpushed_commits(&self, path: &str) -> DirFuture<'_> {
         let path = path.to_string();
@@ -513,6 +524,28 @@ async fn dir_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectEr
             let argv = ssh_argv_running(target, control_path.as_deref(), remote_dir_command(path));
             let out = probe_output(&argv).await?;
             remote_dir_answer(target, &out)
+        }
+        // An arbitrary bridge command says nothing about where it lands.
+        Endpoint::Command { .. } => Ok(None),
+    }
+}
+
+async fn ensure_dir(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectError> {
+    match ep {
+        // The head and this herdr share a machine, and so a filesystem.
+        Endpoint::Local { .. } => Ok(Some(std::fs::create_dir_all(path).is_ok())),
+        Endpoint::Ssh {
+            target,
+            control_path,
+            ..
+        } => {
+            ensure_control_dir(control_path.as_deref())?;
+            let argv =
+                ssh_argv_running(target, control_path.as_deref(), remote_mkdir_command(path));
+            let out = probe_output(&argv).await?;
+            // The answer reads like `remote_dir_command`'s, save that a
+            // failed `mkdir` says `no` rather than nothing.
+            Ok(remote_dir_answer(target, &out)?.or(Some(false)))
         }
         // An arbitrary bridge command says nothing about where it lands.
         Endpoint::Command { .. } => Ok(None),
@@ -742,6 +775,15 @@ fn remote_pastor_version(
 fn remote_dir_command(path: &str) -> String {
     format!(
         "if test -d {}; then printf yes; else printf no; fi",
+        shell_quote(path)
+    )
+}
+
+/// `mkdir -p` on the machine, answered like `remote_dir_command`. Its own
+/// complaint goes to stderr, so stdout holds only the answer (and rc noise).
+fn remote_mkdir_command(path: &str) -> String {
+    format!(
+        "if mkdir -p {}; then printf yes; else printf no; fi",
         shell_quote(path)
     )
 }
@@ -1225,6 +1267,43 @@ mod tests {
             remote_dir_command("/srv/my app/it's"),
             "if test -d '/srv/my app/it'\\''s'; then printf yes; else printf no; fi"
         );
+    }
+
+    #[test]
+    fn remote_mkdir_command_quotes_the_path() {
+        assert_eq!(
+            remote_mkdir_command("/home/u/pastor tasks"),
+            "if mkdir -p '/home/u/pastor tasks'; then printf yes; else printf no; fi"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_dir_per_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = Endpoint::Local {
+            session: "s".into(),
+        };
+        let dir = tmp.path().join("a/pastor-tasks");
+        assert_eq!(
+            local.ensure_dir(dir.to_str().unwrap()).await.unwrap(),
+            Some(true)
+        );
+        assert!(dir.is_dir());
+        assert_eq!(
+            local.ensure_dir(dir.to_str().unwrap()).await.unwrap(),
+            Some(true),
+            "already there is fine"
+        );
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            local.ensure_dir(file.to_str().unwrap()).await.unwrap(),
+            Some(false)
+        );
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.ensure_dir("/").await.unwrap(), None);
     }
 
     /// Only ssh failing to reach the machine is an error. rc-file noise comes

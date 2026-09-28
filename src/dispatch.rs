@@ -344,13 +344,9 @@ async fn dispatch_steps(
         return Err(HerdrError::Protocol("worktree = true needs repo".into()).into());
     }
     let host = host_workspace(conn, &spec, repo.as_deref(), task.machine.as_deref()).await?;
-    // Where a task with no repo starts: herdr opens a pane with no `cwd`
-    // wherever its focused pane is, which can be anyone's checkout (t-284
-    // opened in a work repo). The machine's home instead; a machine that
-    // cannot tell leaves it to herdr, as before.
     let dir = match repo.clone() {
         Some(repo) => Some(repo),
-        None => conn.home_dir().await.map_err(CallError::from)?,
+        None => no_repo_dir(conn, task.machine.as_deref()).await?,
     };
     task.spec.label.name = None;
     task.spec.label.note = None;
@@ -746,6 +742,37 @@ async fn start_agent(
                 tokio::time::sleep(PANE_BUSY_WAIT).await;
             }
             Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// Where a task with no repo starts, under the machine's home.
+pub const NO_REPO_DIR: &str = "pastor-tasks";
+
+/// Where a task with no repo starts: herdr opens a pane with no `cwd`
+/// wherever its focused pane is, which can be anyone's checkout (t-284 opened
+/// in a work repo). Not the home itself either: Claude Code never saves
+/// folder trust for the home, so it asked at every start (t-358). So
+/// `~/pastor-tasks`, made when missing, where Claude asks once per machine.
+/// A folder that cannot be made falls back to the home; a machine that
+/// cannot tell its home leaves it to herdr, as before.
+async fn no_repo_dir(
+    conn: &dyn Connector,
+    machine: Option<&str>,
+) -> Result<Option<String>, DispatchError> {
+    let Some(home) = conn.home_dir().await.map_err(CallError::from)? else {
+        return Ok(None);
+    };
+    let dir = format!("{}/{NO_REPO_DIR}", home.trim_end_matches('/'));
+    match conn.ensure_dir(&dir).await.map_err(CallError::from)? {
+        Some(true) => Ok(Some(dir)),
+        _ => {
+            tracing::warn!(
+                machine = machine.unwrap_or("this machine"),
+                %dir,
+                "cannot make the folder for tasks with no repo; starting in the home"
+            );
+            Ok(Some(home))
         }
     }
 }
@@ -1982,18 +2009,24 @@ mod tests {
 
     /// herdr opens a pane with no `cwd` wherever its focused pane is, which
     /// put t-284, a task with no repo, in someone's work checkout
-    /// (2026-09-28). A task with no repo starts in the machine's home, in a
-    /// workspace of its own or a pane split into a shared one; a machine
-    /// that cannot tell its home leaves the choice to herdr, as before.
+    /// (2026-09-28). A task with no repo starts in `~/pastor-tasks`, made
+    /// when missing, in a workspace of its own or a pane split into a shared
+    /// one: not the home itself, which Claude Code never saves trust for, so
+    /// it asked at every start (t-358). A machine that cannot tell its home
+    /// leaves the choice to herdr, as before.
     #[tokio::test]
-    async fn a_task_with_no_repo_starts_in_the_machine_s_home() {
+    async fn a_task_with_no_repo_starts_in_pastor_tasks() {
         for (home, cwd) in [
-            (Some("/home/fake"), serde_json::json!("/home/fake")),
+            (
+                Some("/home/fake"),
+                serde_json::json!("/home/fake/pastor-tasks"),
+            ),
             (None, Value::Null),
         ] {
             for place in [Place::Repo, Place::Own, Place::Pastor] {
                 let fake = FakeHerdr::new();
                 fake.set_home(home);
+                fake.set_missing_dir("/home/fake/pastor-tasks");
                 let mut t = task(DispatchSpec {
                     repo: None,
                     place: place.clone(),
@@ -2011,8 +2044,36 @@ mod tests {
                     })
                     .unwrap();
                 assert_eq!(req.params["cwd"], cwd, "{place:?} with home {home:?}");
+                let made: Vec<String> = home
+                    .map(|_| "/home/fake/pastor-tasks".to_string())
+                    .into_iter()
+                    .collect();
+                assert_eq!(fake.made_dirs(), made, "{place:?} with home {home:?}");
             }
         }
+    }
+
+    /// A folder that cannot be made (a file in the way, no permission) is no
+    /// reason to refuse the task: it starts in the home, as before this
+    /// folder, and Claude asks for trust there.
+    #[tokio::test]
+    async fn a_task_with_no_repo_falls_back_to_home_when_the_folder_cannot_be_made() {
+        let fake = FakeHerdr::new();
+        fake.set_unmakeable_dir("/home/fake/pastor-tasks");
+        let mut t = task(DispatchSpec {
+            repo: None,
+            place: Place::Own,
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let req = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "workspace.create" && r.params["label"] != "pastor")
+            .unwrap();
+        assert_eq!(req.params["cwd"], "/home/fake");
     }
 
     /// Where `~` cannot be resolved the task fails up front with a reason,
