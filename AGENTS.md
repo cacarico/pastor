@@ -71,10 +71,11 @@ down here because getting them wrong cost a day.
   full suite. Run it before every commit. `make help` lists the rest.
 - CI (`.github/workflows/ci.yml`) runs `make check` and `make test-machine` on
   every pull request that touches code (`paths:` skips docs-only diffs), or
-  by hand (`workflow_dispatch`). Since this project merges by fast-forwarding
-  a PR's exact head sha to main, that sha was already checked on its PR, so
-  push-to-main does not run `check` again; a direct push that skips a PR goes
-  unchecked unless someone dispatches it by hand.
+  by hand (`workflow_dispatch`). Push to main does not run `check`. Pull
+  requests land as merge commits, so the merge sha on main is never checked
+  itself: only each PR's head was. Two PRs that pass alone can still break
+  main together, and a direct push that skips a PR goes unchecked, unless
+  someone dispatches CI on main by hand.
 - The repository is public. `.github/workflows/gitleaks.yml` scans the whole
   history of every ref on every pull request, on push to `main`, and weekly,
   and `make leaks` runs the same scan here. It does not run on push to other
