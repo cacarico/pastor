@@ -178,11 +178,11 @@ These commands edit `flock.toml` in place, keeping its comments.
 
 Before a new machine takes work unattended, go through this once:
 
-1. herdr, pastor and the agents must be on the PATH of a non-interactive ssh command. The head runs `ssh user@host sh -c 'herdr … remote-api-bridge'`, and many `~/.bashrc` files return early when not interactive (Debian's does), so put the PATH line before that check. Check with `ssh user@host 'command -v claude herdr pastor'`.
+1. herdr, pastor and the agents must be on the PATH of a non-interactive ssh command. The head runs `ssh user@host sh -c 'herdr … remote-api-bridge'`, and many `~/.bashrc` files return early when not interactive (Debian's does), so put the PATH line before that check. Check each name on its own, since POSIX `command -v` takes one: `ssh user@host 'command -v claude && command -v herdr && command -v pastor'`.
 2. Every repo the flock's jobs and tasks use must exist at the same path on the machine. pastor does not clone. Clone each one before the machine joins a flock whose jobs use it.
 3. Save trust for each repo right after cloning: `pastor trust add <machine> <repo>`. The head then answers Claude's folder-trust prompt for that repo's tasks and worktrees on that machine. `pastor trust list` shows the pairs.
 4. Log the agent in, then finish its first-run setup once. For Claude, `claude auth login` saves credentials, but the first interactive start still stops on first-run screens (theme, login confirmation) and the first task sits `blocked`. Finish them with `pastor task attach t-N` and detach with ctrl+b q. `~/.claude.json` has `hasCompletedOnboarding: true` once it is done.
-5. Prove it with a task pinned to the machine: `pastor task run --machine <machine> --repo <repo> --worktree "Reply with the single word ready. Do not run any commands."`, then `pastor task read t-N` and `pastor task close t-N`.
+5. Prove it with a task pinned to the machine: `pastor task run --machine <machine> --repo <repo> --worktree "Reply with the single word ready. Do not run any commands."`, then `pastor task read t-N` and `pastor task close t-N --remove-worktree` so the test checkout does not stay on disk.
 
 Every machine needs a herdr server running, and the head needs passwordless ssh to it. Start herdr with `herdr server`, or better as a user service: `pastor setup systemd --herdr --yes` on that machine. The head itself runs as a service with `pastor setup systemd --yes`. On macOS use `pastor setup launchd` with the same flags. Setup needs `--yes` when stdin is not a terminal. Ask the user before installing services.
 
