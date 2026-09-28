@@ -29,10 +29,11 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// 20: the `summary` setting (`Run::summary`, a job's `[dispatch]
 /// summary`). 21: pull machines (`TaskClaim`, `TaskReport`). 22:
 /// `FlockJoin`, `FlockLeave` and `FlockAdd::machines`. 23: orchestrators
-/// (`Orchestrator*` requests, session ones included, and
-/// `FROM_ORCHESTRATOR_FIELD`). 24: a flock's own `timeout` and `place`
-/// (`FlockEntry::timeout`, `FlockEntry::place`).
-pub const IPC_PROTOCOL: u32 = 24;
+/// (`Orchestrator*` requests, and `FROM_ORCHESTRATOR_FIELD`). 24: a
+/// flock's own `timeout` and `place` (`FlockEntry::timeout`,
+/// `FlockEntry::place`). 25: session orchestrators (`OrchestratorStart`,
+/// `OrchestratorStop`).
+pub const IPC_PROTOCOL: u32 = 25;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -192,6 +193,11 @@ pub const SUMMARY_MODE_PROTOCOL: u32 = 20;
 /// The first protocol whose head runs orchestrator files and answers the
 /// `Orchestrator*` requests; an older one refuses them as unreadable.
 pub const ORCHESTRATOR_PROTOCOL: u32 = 23;
+
+/// The first protocol whose head runs session orchestrators and answers
+/// `OrchestratorStart` and `OrchestratorStop`; an older one refuses them as
+/// unreadable.
+pub const SESSION_PROTOCOL: u32 = 25;
 
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.

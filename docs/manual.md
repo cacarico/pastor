@@ -1832,7 +1832,7 @@ tasks appear in `pastor task list` in a table of their own above the others;
 and `note --name` edit them, and `run`, `start` and `stop` are refused
 (`no_head`). With a head on
 another machine, every command goes to it. The commands need a head of IPC
-protocol 23 (`head_too_old`).
+protocol 23, and `start` and `stop` one of protocol 25 (`head_too_old`).
 
 What the head keeps per orchestrator lives in
 `~/.local/state/pastor/orchestrators/<name>/`: `state.json` (last run,

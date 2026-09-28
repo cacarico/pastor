@@ -355,7 +355,10 @@ fn parse_clock(s: &str) -> Option<NaiveTime> {
 }
 
 /// The first local time of day `clock` after `now`. A time a clock change
-/// skips that day is skipped with it.
+/// skips that day is skipped with it; one it repeats counts once, at its
+/// first occurrence. Counting the second too would start a session again
+/// an hour after it stopped at a repeated `hours.stop`, and `in_hours`
+/// already starts a head that comes up between the two at once.
 fn next_clock(clock: NaiveTime, now: DateTime<Utc>) -> DateTime<Utc> {
     let mut day = now.with_timezone(&Local).date_naive();
     for _ in 0..4 {
@@ -1931,8 +1934,11 @@ impl Runner {
         if let Some(t) = state
             .task
             .and_then(|id| self.store.get_task(id).ok().flatten())
+            && !self.close_agent(name, &t).await
         {
-            self.close_agent(name, &t).await;
+            // Its agent may still run: keep the session, and try again.
+            state.session = Some(run);
+            return;
         }
         let reason = run.stop_reason.unwrap_or_else(|| "hours".into());
         tracing::info!(orchestrator = name, %reason, "session stopped");
@@ -1954,19 +1960,45 @@ impl Runner {
 
     /// Close task `t` of orchestrator `name`: through its machine when it
     /// holds a pane there, else its row. A closed or ended-without-pane task
-    /// is left as it is.
-    async fn close_agent(&self, name: &str, t: &Task) {
-        let result = match t.state {
-            TaskState::Queued | TaskState::Paused => self.store.close_queued(t.id).map(|_| ()),
-            s if s.occupies_pane() => match t.machine.as_deref().and_then(|m| self.fleet.get(m)) {
-                Some(h) => h.close(t.id, false).await.map(|_| ()),
-                None => self.store.close_task(t.id).map(|_| ()),
-            },
-            _ => Ok(()),
-        };
-        if let Err(err) = result {
-            tracing::warn!(orchestrator = name, task = %t.display_id(), err = %format!("{err:#}"), "close the session's agent");
+    /// is left as it is. A queued one a dispatch claims in between is read
+    /// again and closed through its machine. Whether it is closed now: on
+    /// `false` it may still run, so the caller must not start another agent
+    /// and tries again on its next pass.
+    async fn close_agent(&self, name: &str, t: &Task) -> bool {
+        let mut t = t.clone();
+        // A claim moves a task out of `queued` once; two reads settle it.
+        for _ in 0..3 {
+            let result = match t.state {
+                TaskState::Queued | TaskState::Paused => match self.store.close_queued(t.id) {
+                    Ok(Some(_)) => return true,
+                    Ok(None) => match self.store.get_task(t.id) {
+                        Ok(Some(fresh)) => {
+                            t = fresh;
+                            continue;
+                        }
+                        Ok(None) => return true,
+                        Err(err) => Err(err),
+                    },
+                    Err(err) => Err(err),
+                },
+                s if s.occupies_pane() => {
+                    match t.machine.as_deref().and_then(|m| self.fleet.get(m)) {
+                        Some(h) => h.close(t.id, false).await.map(|_| ()),
+                        None => self.store.close_task(t.id).map(|_| ()),
+                    }
+                }
+                _ => return true,
+            };
+            return match result {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(orchestrator = name, task = %t.display_id(), err = %format!("{err:#}"), "close the session's agent");
+                    false
+                }
+            };
         }
+        tracing::warn!(orchestrator = name, task = %t.display_id(), "the session's agent kept changing state while closing it");
+        false
     }
 
     /// One pass of session `orch` at `now`, under its lock: start it on its
@@ -2037,6 +2069,7 @@ impl Runner {
                     if let Some(until) = quota_reset(&said, now) {
                         tracing::warn!(orchestrator = name, task = %t.display_id(), until = %until, "session agent stopped on a quota; restarting at the reset");
                         state.quota_until = Some(until);
+                        // A failed close is tried again before the restart.
                         self.close_agent(name, t).await;
                         self.emit(
                             "quota",
@@ -2082,8 +2115,12 @@ impl Runner {
         }
         run.capped = false;
         let old = task.as_ref().map(|t| t.id);
-        if let Some(t) = &task {
-            self.close_agent(name, t).await;
+        if let Some(t) = &task
+            && !self.close_agent(name, t).await
+        {
+            // The old agent may still run: no second one beside it.
+            state.session = Some(run);
+            return;
         }
         run.restarts.push(now);
         let restarts = run.restarts.len();
@@ -2990,11 +3027,29 @@ prompt = "You are the night orchestrator."
     }
 
     #[tokio::test]
+    async fn an_agent_claimed_while_closing_is_closed_on_its_machine() {
+        let head = Head::new(SESSION, "", "");
+        head.step(at(28, 22, 0)).await;
+        let read = head.agent();
+        assert_eq!(read.state, TaskState::Queued);
+        // A dispatch claims it between that read and the close.
+        let mut claimed = head.store.claim_task(read.id, "head").unwrap().unwrap();
+        claimed.state = TaskState::Running;
+        head.store.update_task(&mut claimed).unwrap();
+        assert!(head.runner.close_agent("merge", &read).await);
+        assert_eq!(head.agent().state, TaskState::Closed);
+    }
+
+    #[tokio::test]
     async fn a_session_stopped_by_hand_waits_for_its_next_hours() {
         let mut head = Head::new(SESSION, "", "");
         head.step(at(28, 22, 0)).await;
         head.kinds();
-        let said = head.runner.stop_by_hand("merge", Utc::now()).await.unwrap();
+        let said = head
+            .runner
+            .stop_by_hand("merge", at(28, 22, 30))
+            .await
+            .unwrap();
         assert!(said.contains("last message"), "{said}");
         assert_eq!(head.kinds(), ["orchestrator.stopping"]);
         let since = head.state().session.unwrap().stopping_since.unwrap();
@@ -3007,7 +3062,7 @@ prompt = "You are the night orchestrator."
         assert_eq!(head.tasks().len(), 2);
         let err = head
             .runner
-            .stop_by_hand("other", Utc::now())
+            .stop_by_hand("other", at(29, 22, 30))
             .await
             .unwrap_err();
         assert_eq!(err.0, "orchestrator_not_found");

@@ -1492,7 +1492,18 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if matches!(command, Command::Orchestrator { .. }) {
+    if matches!(
+        command,
+        Command::Orchestrator {
+            cmd: pastor::orchestrator_cli::OrchestratorCmd::Start { .. }
+                | pastor::orchestrator_cli::OrchestratorCmd::Stop { .. }
+        }
+    ) {
+        Some((
+            pastor::ipc::SESSION_PROTOCOL,
+            "predates session orchestrators, and would refuse the request",
+        ))
+    } else if matches!(command, Command::Orchestrator { .. }) {
         Some((
             pastor::ipc::ORCHESTRATOR_PROTOCOL,
             "predates orchestrator files, and would refuse the request",
