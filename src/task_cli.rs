@@ -31,6 +31,10 @@ pub struct PriorityArgs {
     /// Its new level: low, normal, high or critical
     #[arg(value_name = "LEVEL")]
     pub level: String,
+    /// Critical only: let the task pause the newest low Claude task on a
+    /// full machine to start; without it the task's flag goes
+    #[arg(long)]
+    pub preempt: bool,
     /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
@@ -177,7 +181,16 @@ pub async fn retry(paths: &Paths, a: RetryArgs) -> anyhow::Result<()> {
 pub async fn priority(paths: &Paths, a: PriorityArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
     let priority = parse_priority(&a.level)?;
-    match ask(paths, IpcRequest::TaskPriority { id, priority }).await? {
+    match ask(
+        paths,
+        IpcRequest::TaskPriority {
+            id,
+            priority,
+            preempt: a.preempt,
+        },
+    )
+    .await?
+    {
         IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }

@@ -5,6 +5,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- A `critical` task started with `--preempt` (or `preempt = true` under a
+  job's `[dispatch]`) that finds its machines full, job slots and burst
+  included, pauses the newest running `low` Claude task on one and starts
+  in its slot in the same pass. The paused task's agent is interrupted and
+  its pane closed; its worktree stays. It goes to a new `paused` state
+  (event `task.paused`), first among `low` tasks and pinned to its machine,
+  and resumes its own session there (`claude --resume`) when a slot frees.
+  A normal, opencode, done or recently resumed task is never paused.
+  `pastor task priority t-N critical --preempt` sets the flag on a queued
+  task; `--preempt` below critical is `preempt_needs_critical`. On a paused
+  task `task close` closes the row (`--remove-worktree` removes the kept
+  checkout), `task send` answers `task_not_live` and `task attach` refuses
+  with `task_paused`. `pastor queue` shows paused tasks and why they wait,
+  and `task describe` when and for which task one was paused. The store
+  goes to schema 12 (`preempt`, `paused_at`, `paused_for`, `resumed_at`) and
+  the head's IPC protocol to 16; the CLI refuses `--preempt` to an older
+  head (`head_too_old`).
+
 ### Fixed
 
 - A task with no repo (no `--repo`, no `repo` in its job) opened its pane

@@ -1883,6 +1883,7 @@ mod tests {
             agent: Default::default(),
             flock: None,
             priority: None,
+            preempt: false,
             dispatch: json!({
                 "agent": "claude",
                 "repo": "/srv/{{ job.name }}",

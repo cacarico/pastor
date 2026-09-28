@@ -172,7 +172,8 @@ passes never run at once, and a task moves from `queued` to `starting` with a
 conditional update, so a machine is never given more than its room (see Room
 on a machine).
 
-`pastor task list` shows live tasks only: queued, starting, running and blocked.
+`pastor task list` shows live tasks only: queued, starting, running, blocked
+and paused (see [Pausing a low task](#pausing-a-low-task)).
 Finished ones (done, failed, stale, closed) appear with `--all`, and an empty
 default list says so on stderr. `--blocked` and `--done` narrow to just that
 state, `--job`, `--flock` and `--machine` narrow whichever set is shown, and
@@ -848,11 +849,67 @@ off, and a normal `task run` task is always held at `max_agents`. So two long
 a critical task still gets past a full machine.
 
 Among the machines with room for the task, the one with the fewest live tasks
-takes it; ties keep flock order. `machine add` takes `--job-slots` and
-`--burst` as it takes `--max-agents`. `machine list` shows the room as
+takes it; ties keep flock order. A critical task can also take the slot of
+a low one: see [Pausing a low task](#pausing-a-low-task). `machine add`
+takes `--job-slots` and `--burst` as it takes `--max-agents`. `machine list` shows the room as
 `2+1j+1b` (`2` alone when both are 0), `machine describe` as `1 of 2+1j+1b`,
 and `--json` has `job_slots` and `burst` on each machine. Changing either
 restarts the machine's actor on reload, as changing `max_agents` does.
+
+### Pausing a low task
+
+A `critical` task does not have to wait behind `low` work, but only when
+you ask for it: `pastor task run --priority critical --preempt` (or
+`preempt = true` under a job's `[dispatch]`) marks the task, and the flag
+stays on it. When a dispatch pass finds no machine with room for such a
+task, job slots and burst included, it looks at the machines the task may
+run on (its flock, connected, its tags, its pin) for one that would have
+room once its newest pausable task is gone, takes the one with the fewest
+live tasks, pauses that task and starts the critical one there, in the same
+pass.
+
+A task can be paused when it is `running`, `low`, of an agent of kind
+`claude`, has a recorded Claude session (see [Reopening a finished
+task](#reopening-a-finished-task)), has not said it is done (`task done`),
+and did not resume from a pause in the last 10 minutes, so two critical
+tasks cannot trade one low task back and forth. A `normal` task, an
+opencode or codex one, a blocked or done one is never paused.
+
+Pausing goes in this order: pastor presses `esc` in the task's pane, which
+interrupts Claude's turn, then closes the pane, which ends the agent. A
+worktree stays on disk: only `worktree.remove` deletes one. The task goes
+`paused` (event `task.paused`), with no pane or workspace, and records when
+and for which task (`paused: ... for t-9` in `task describe`, `paused_at`
+and `paused_for` in its JSON).
+
+A paused task waits in the queue first among the `low` tasks and pinned to
+the machine it was paused on, whatever its flock or pin: `pastor queue`
+shows it there with `paused for t-9; machine pi-3 is full (2/2)`. When that
+machine has room for it, a dispatch pass resumes it: the same steps as a
+dispatch, but a worktree task goes back to its own checkout (`worktree.open`
+on its branch), the agent starts with `--resume <session>` in place of a new
+`--session-id`, and its prompt is a line telling it that it was paused and
+to carry on; its own prompt is already in the conversation. The task goes
+`running` again, with `resumed:` in `task describe` (`resumed_at`). A resume
+that fails (the agent does not come up, the checkout is gone) fails the
+task, as any dispatch does, and `pastor task retry` starts it over.
+
+On a paused task, `pastor task close` closes the row: there is no pane to
+close. `--remove-worktree` opens its kept checkout in a workspace and
+removes it through that, as for a closed task placed in a shared workspace.
+`pastor task send` answers `task_not_live`, and `pastor task attach` refuses
+it with `task_paused`: its session resumes on its own, and a second `claude
+--resume` in attach's pane would put two agents on one conversation.
+
+`--preempt` below critical is refused with `preempt_needs_critical`: from
+`task run`, checked against the level the task settles at (a machine or
+flock may make it critical); from `task priority`, which sets the flag with
+the level (`pastor task priority t-4 critical --preempt`) and drops it when
+given without; and in a job file whose `priority` is written below
+critical. A job whose `priority` is a template keeps `preempt` only on the
+items that come out critical. `task retry` keeps it. A head from before
+pausing would queue the task without it, so the CLI refuses to send it there
+(`head_too_old`).
 
 #### An agent per kind
 
@@ -1109,7 +1166,7 @@ A record, which is also what connector event hooks get on stdin:
   head's database cannot hand out a number for it; consumers must not assume
   every new record has a positive `seq`.
 - `at`: when the daemon received the event, RFC 3339 UTC.
-- `type`: `task.queued|running|blocked|done|stale|failed|closed`,
+- `type`: `task.queued|running|blocked|done|stale|failed|closed|paused`,
   `task.input` (`pastor task send`), `task.trusted` (the head answered a
   trust prompt), `job.failed`, `connector.finish_failed` (a connector's
   `[finish]` command failed), `machine.connected`, `machine.lost`.
@@ -1263,6 +1320,7 @@ pastor task list --all               # finished tasks too
 pastor task read t-1                 # recent pane output, without attaching
 pastor task retry t-4                # a failed or stale task again, as a new task
 pastor task priority t-5 high        # a queued task goes ahead of normal ones
+pastor task run --priority critical --preempt "prod is down"  # pauses a low task if it must
 pastor queue                         # the queue in the order it runs, and why each waits
 pastor queue move t-6 --before t-5   # take t-5's place, and its level
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
@@ -1292,7 +1350,8 @@ decides.
 `pastor task run` takes the prompt as its argument or, instead, `--prompt-file
 PATH`, and `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
 `--model` (a name from `[models]`, see [Models](#models)), `--priority` (see
-[Priority and queue order](#priority-and-queue-order)), `--profile` (see
+[Priority and queue order](#priority-and-queue-order)), `--preempt` (see
+[Pausing a low task](#pausing-a-low-task)), `--profile` (see
 [Permission profiles](#permission-profiles)), `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
 `--timeout`, `--place` (see [Where a task's pane goes](#where-a-tasks-pane-goes))
 and `--json`. `--agent-arg` hands one argument to the agent,
@@ -2254,7 +2313,7 @@ sends nothing. A head from before these requests is refused
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
-~/.local/state/pastor/pastor.db   tasks (schema 11, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role and description), seen keys, job state, trusted repos, the last event seq
+~/.local/state/pastor/pastor.db   tasks (schema 12, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role, description, preempt, paused_at, paused_for and resumed_at), seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)

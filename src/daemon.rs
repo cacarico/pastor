@@ -814,8 +814,17 @@ impl Fleet {
         ask: Option<&AgentChoice>,
         priority: Option<Priority>,
     ) -> Result<Task, QueueError> {
-        self.queue_run_as(prompt, spec, flock, ask, priority, TaskRole::Agent, None)
-            .await
+        self.queue_run_as(
+            prompt,
+            spec,
+            flock,
+            ask,
+            priority,
+            TaskRole::Agent,
+            None,
+            false,
+        )
+        .await
     }
 
     /// `queue_run`, for a task of `role` (`task run --role`).
@@ -829,6 +838,7 @@ impl Fleet {
         priority: Option<Priority>,
         role: TaskRole,
         description: Option<String>,
+        preempt: bool,
     ) -> Result<Task, QueueError> {
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
@@ -846,8 +856,18 @@ impl Fleet {
         }
         let (priority, from) =
             self.settle_priority(priority, &flock, spec.machine.as_deref(), "task run");
+        // Checked against the level it settles at: a machine or flock may
+        // make it critical without `--priority`.
+        if preempt && priority != Priority::Critical {
+            return Err(QueueError::Agent(crate::config::AgentRefusal {
+                code: crate::task::PREEMPT_NEEDS_CRITICAL,
+                message: format!(
+                    "--preempt needs critical: only a critical task may pause another, and this one is {priority}"
+                ),
+            }));
+        }
         self.store
-            .insert_task_at(
+            .insert_task_preempting(
                 NewTask {
                     description,
                     job: "run".into(),
@@ -859,6 +879,7 @@ impl Fleet {
                 priority,
                 from.as_deref(),
                 role,
+                preempt,
             )
             .map_err(QueueError::Store)
     }
@@ -897,12 +918,17 @@ impl Fleet {
             &asked_by,
         );
         let level = (priority, from.as_deref());
+        // A job's tasks keep `preempt` only where they settle at critical:
+        // its level may be a template, and an item below critical just
+        // queues as it would without it.
+        let preempt = job.preempt && priority == Priority::Critical;
         let description = job.task_description_for(item);
         self.store.insert_job_task_at(
             &job.name,
             &flock,
             item,
             level,
+            preempt,
             description.as_deref(),
             |id| {
                 let (prompt, mut spec) = render(id)?;
@@ -976,6 +1002,23 @@ impl Fleet {
                     protocol,
                     crate::ipc::DESCRIPTION_PROTOCOL,
                     "a job naming a description",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
+        // `preempt` rides in `dispatch` the same way; the head's
+        // `DispatchTable` refuses an unknown field, so a head before
+        // `PREEMPT_PROTOCOL` would answer an opaque `invalid_dispatch`
+        // instead of this clear refusal.
+        if job.preempt {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::PREEMPT_PROTOCOL,
+                    "a job with preempt",
                 )?,
                 other => anyhow::bail!("the head answered a ping with {other:?}"),
             }
@@ -1139,8 +1182,22 @@ impl Fleet {
         priority: Priority,
         from: &str,
     ) -> Result<Task, PriorityError> {
+        self.set_priority_preempting(id, priority, from, false)
+            .await
+    }
+
+    /// `set_priority`, setting the task's `preempt` (`task priority
+    /// --preempt`); the caller has checked the level is critical.
+    pub async fn set_priority_preempting(
+        &self,
+        id: i64,
+        priority: Priority,
+        from: &str,
+        preempt: bool,
+    ) -> Result<Task, PriorityError> {
         let _pass = self.dispatch_lock.lock().await;
-        self.store.set_priority(id, priority, from)
+        self.store
+            .set_priority_preempting(id, priority, from, preempt)
     }
 
     /// Move a queued task (`Store::move_queued`), under the dispatch lock
@@ -1200,8 +1257,12 @@ impl Fleet {
         };
         let flock = self.flock();
         for task in queued {
+            if task.state == TaskState::Paused {
+                self.resume_paused(&task).await;
+                continue;
+            }
             let target = task.flock.as_deref().unwrap_or(flock.default_flock());
-            let views = self.views();
+            let mut views = self.views();
             // The agent can depend on the machine: a machine whose agent
             // cannot run the task's model does not take it. A task from
             // before `agent_source` keeps the agent it was queued with.
@@ -1219,9 +1280,29 @@ impl Fleet {
                 Some(r.map(|()| spec))
             };
             let claim = Claim::of(&task);
-            let picked = pick_machine_where(&views, target, &task.spec, claim, &|m| {
-                settled_on(m).is_none_or(|r| r.is_ok())
-            });
+            let accepts = |m: &str| settled_on(m).is_none_or(|r| r.is_ok());
+            let mut picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
+            // A critical task with `preempt` that finds no room pauses the
+            // newest low Claude task on a machine it would fit once that one
+            // is gone, then takes the slot in the same pass.
+            if picked.is_none()
+                && task.pause.preempt
+                && task.priority == Priority::Critical
+                && let Some((machine, victim)) =
+                    self.pausable_for(&views, target, &task, claim, &accepts)
+                && let Some(handle) = self.get(&machine)
+            {
+                match handle.pause(victim, task.id).await {
+                    Ok(_) => {
+                        tracing::info!(task = %task.display_id(), paused = %Task::agent_name_for(victim), machine = %machine, "paused a low task");
+                        views = self.views();
+                        picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
+                    }
+                    Err(err) => {
+                        tracing::warn!(task = %task.display_id(), victim = %Task::agent_name_for(victim), machine = %machine, %err, "pause failed")
+                    }
+                }
+            }
             let Some(name) = picked else {
                 // Say why: no machine of the flock has an agent for its
                 // model, or one would take it but for its model.
@@ -1296,6 +1377,80 @@ impl Fleet {
                 Err(err) => {
                     tracing::warn!(task = %task.display_id(), machine = %name, %err, "dispatch failed")
                 }
+            }
+        }
+    }
+
+    /// Where critical task `task` could start by pausing a task: the
+    /// machines it may run on (its flock, healthy, its tags, its pin, one
+    /// `accepts`) that have no room for `claim` now but would once their
+    /// newest pausable task (`Task::pausable`) is gone, the one with the
+    /// fewest live tasks first. Answers the machine and that task's id.
+    fn pausable_for(
+        &self,
+        views: &[MachineView],
+        flock: &str,
+        task: &Task,
+        claim: Claim,
+        accepts: &dyn Fn(&str) -> bool,
+    ) -> Option<(String, i64)> {
+        let agents = self.agents.read().unwrap().clone();
+        let now = chrono::Utc::now();
+        views
+            .iter()
+            .filter(|m| {
+                m.flock == flock
+                    && m.healthy
+                    && !m.has_room(claim)
+                    && task.spec.machine.as_ref().is_none_or(|p| *p == m.name)
+                    && task.spec.tags.iter().all(|t| m.tags.contains(t))
+                    && accepts(&m.name)
+            })
+            .filter_map(|m| {
+                let victim = self
+                    .store
+                    .tasks_on_machine(&m.name)
+                    .ok()?
+                    .into_iter()
+                    .filter(|t| t.pausable(agents.kind(&t.spec.agent), now))
+                    .max_by_key(|t| t.id)?;
+                let after = MachineView {
+                    live: m.live.saturating_sub(1),
+                    live_jobs: m.live_jobs.saturating_sub(usize::from(victim.from_job())),
+                    ..m.clone()
+                };
+                after
+                    .has_room(claim)
+                    .then(|| (m.live, m.name.clone(), victim.id))
+            })
+            .min_by_key(|(live, _, _)| *live)
+            .map(|(_, name, id)| (name, id))
+    }
+
+    /// Resume paused task `task` on the machine it was paused on, once that
+    /// machine is healthy, still in the flock and has room for it. It is
+    /// not settled again: it goes back to the agent and session it had.
+    async fn resume_paused(&self, task: &Task) {
+        let Some(machine) = task.pinned_machine() else {
+            return;
+        };
+        let views = self.views();
+        let fits = views
+            .iter()
+            .find(|m| m.name == machine)
+            .is_some_and(|m| m.healthy && m.has_room(Claim::of(task)));
+        if !fits || !self.in_flock(machine) {
+            return;
+        }
+        let Some(handle) = self.get(machine) else {
+            return;
+        };
+        match handle.resume(task.id).await {
+            Ok(t) => {
+                tracing::info!(task = %t.display_id(), machine = %machine, state = %t.state, "resumed")
+            }
+            Err(err) => {
+                tracing::warn!(task = %task.display_id(), machine = %machine, %err, "resume failed")
             }
         }
     }
@@ -1804,6 +1959,7 @@ impl Daemon {
                 priority,
                 role,
                 description,
+                preempt,
             } => {
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
@@ -1834,6 +1990,7 @@ impl Daemon {
                         priority,
                         role,
                         crate::config::clean_description(description.as_deref()),
+                        preempt,
                     )
                     .await
                 {
@@ -1875,8 +2032,24 @@ impl Daemon {
                 Ok(ts) => IpcResponse::Tasks(ts),
                 Err(err) => IpcResponse::error("store_error", err),
             },
-            IpcRequest::TaskPriority { id, priority } => {
-                match self.fleet.set_priority(id, priority, "task priority").await {
+            IpcRequest::TaskPriority {
+                id,
+                priority,
+                preempt,
+            } => {
+                if preempt && priority != Priority::Critical {
+                    return IpcResponse::error(
+                        crate::task::PREEMPT_NEEDS_CRITICAL,
+                        format!(
+                            "--preempt needs critical: only a critical task may pause another, not a {priority} one"
+                        ),
+                    );
+                }
+                match self
+                    .fleet
+                    .set_priority_preempting(id, priority, "task priority", preempt)
+                    .await
+                {
                     Ok(t) => IpcResponse::Task(t),
                     Err(err @ PriorityError::NotFound(_)) => {
                         IpcResponse::error("task_not_found", err)
@@ -2102,6 +2275,7 @@ impl Daemon {
                     // A headless serve resolves priority itself before
                     // sending the item; the head does not re-render it.
                     priority: None,
+                    preempt: false,
                     dispatch: serde_json::Value::Null,
                 };
                 self.job_task(job, item).await
@@ -2548,11 +2722,15 @@ impl Daemon {
             if t.state == TaskState::Closed && !remove_worktree {
                 return IpcResponse::Task(t);
             }
-            if let Some(m) = t.machine.clone() {
+            // A paused task holds no pane: a plain close is its row alone,
+            // unless a resume claims it first. Its checkout is on its
+            // machine, so `--remove-worktree` goes there.
+            let paused = t.state == TaskState::Paused && !remove_worktree;
+            if !paused && let Some(m) = t.machine.clone() {
                 break m;
             }
             let was = t.state;
-            let closed = if was == TaskState::Queued {
+            let closed = if was == TaskState::Queued || paused {
                 match self.store.close_queued(id) {
                     Ok(Some(c)) => c,
                     // Claimed (or closed) since the read: read it again.
@@ -3337,6 +3515,7 @@ mod tests {
         let mut events = d.subscribe();
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "hi".into(),
@@ -3388,6 +3567,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
         let IpcResponse::Task(first) = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "1".into(),
@@ -3403,6 +3583,7 @@ mod tests {
         assert_eq!(first.state, TaskState::Running);
         let IpcResponse::Task(second) = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "2".into(),
@@ -3437,6 +3618,7 @@ mod tests {
 
     fn run_at(prompt: &str, priority: Option<Priority>) -> IpcRequest {
         IpcRequest::Run {
+            preempt: false,
             prompt: prompt.into(),
             spec: spec(),
             flock: None,
@@ -3469,7 +3651,11 @@ mod tests {
         assert_eq!(high.priority, Priority::High);
         assert_eq!(high.priority_from.as_deref(), Some("task run"));
 
-        let set = |id: i64, priority: Priority| IpcRequest::TaskPriority { id, priority };
+        let set = |id: i64, priority: Priority| IpcRequest::TaskPriority {
+            preempt: false,
+            id,
+            priority,
+        };
         let raised = task(d.handle(set(low.id, Priority::Critical)).await);
         assert_eq!(raised.priority, Priority::Critical);
         assert_eq!(raised.priority_from.as_deref(), Some("task priority"));
@@ -3529,6 +3715,7 @@ mod tests {
         )
         .await;
         let run = |machine: Option<&str>, priority: Option<Priority>| IpcRequest::Run {
+            preempt: false,
             prompt: "x".into(),
             spec: DispatchSpec {
                 machine: machine.map(Into::into),
@@ -3625,6 +3812,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -3654,6 +3842,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new()), ("b", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -3709,6 +3898,7 @@ mod tests {
 
     fn run_in(flock: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            preempt: false,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -3736,6 +3926,7 @@ mod tests {
         )
         .await;
         let run = |flock: &str, agent: Option<AgentChoice>| IpcRequest::Run {
+            preempt: false,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -3825,6 +4016,7 @@ mod tests {
         )
         .await;
         let run = |agent: Option<&str>| IpcRequest::Run {
+            preempt: false,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -3894,6 +4086,7 @@ mod tests {
         std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -3970,6 +4163,7 @@ mod tests {
 
     fn run_model(model: Option<&str>, agent: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            preempt: false,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -4278,6 +4472,7 @@ mod tests {
 
     fn run_profile(profile: Option<&str>, machine: Option<&str>) -> IpcRequest {
         let IpcRequest::Run {
+            preempt: false,
             prompt,
             spec,
             flock,
@@ -4290,6 +4485,7 @@ mod tests {
             unreachable!()
         };
         IpcRequest::Run {
+            preempt: false,
             prompt,
             spec,
             flock,
@@ -4373,6 +4569,7 @@ mod tests {
             "unknown_profile"
         );
         let IpcRequest::Run {
+            preempt: false,
             prompt,
             spec,
             flock,
@@ -4385,6 +4582,7 @@ mod tests {
             unreachable!()
         };
         let conflict = IpcRequest::Run {
+            preempt: false,
             prompt,
             spec,
             flock,
@@ -4517,6 +4715,7 @@ mod tests {
         // Occupy pi's one slot so the new task must wait.
         let IpcResponse::Task(busy) = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 prompt: "busy".into(),
                 spec: spec(),
                 flock: None,
@@ -4715,6 +4914,7 @@ mod tests {
         )
         .await;
         let run = || IpcRequest::Run {
+            preempt: false,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -5305,6 +5505,7 @@ mod tests {
         assert!(diff.is_empty(), "{diff:?}");
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -5331,6 +5532,7 @@ mod tests {
         let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(false).await;
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -5405,6 +5607,7 @@ mod tests {
         let resp = crate::ipc::request(
             &socket,
             &IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "hi".into(),
@@ -5461,6 +5664,7 @@ mod tests {
 
     fn run_hi_as(role: TaskRole) -> IpcRequest {
         IpcRequest::Run {
+            preempt: false,
             role,
             description: None,
             prompt: "hi".into(),
@@ -6421,6 +6625,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "hi".into(),
@@ -6557,6 +6762,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -6591,6 +6797,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -6958,6 +7165,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -6978,5 +7186,386 @@ mod tests {
                 .is_empty(),
             "no row for a refused run"
         );
+    }
+
+    /// Pausing a low task for a critical one (`Task::pause`), against the
+    /// fake herdr on a one-slot machine with no burst.
+    mod pausing {
+        use super::*;
+        use crate::herdr::ConnectorExt;
+        use serde_json::Value;
+
+        /// A worktree task, so the checkout kept at pause can be followed.
+        fn wt() -> DispatchSpec {
+            DispatchSpec {
+                repo: Some("/srv/app".into()),
+                worktree: true,
+                ..spec()
+            }
+        }
+
+        fn run(prompt: &str, spec: DispatchSpec, priority: Priority, preempt: bool) -> IpcRequest {
+            IpcRequest::Run {
+                prompt: prompt.into(),
+                spec,
+                flock: None,
+                agent: None,
+                priority: Some(priority),
+                role: Default::default(),
+                description: None,
+                preempt,
+            }
+        }
+
+        async fn start(d: &Daemon, req: IpcRequest) -> Task {
+            match d.handle(req).await {
+                IpcResponse::Task(t) => t,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        fn get(d: &Daemon, id: i64) -> Task {
+            d.store.get_task(id).unwrap().unwrap()
+        }
+
+        fn started_args(fake: &FakeHerdr, agent: &str) -> Vec<Value> {
+            fake.requests()
+                .iter()
+                .rev()
+                .find(|r| r.method == "agent.start" && r.params["name"] == agent)
+                .map(|r| r.params["args"].as_array().cloned().unwrap_or_default())
+                .unwrap_or_default()
+        }
+
+        /// A critical task with `--preempt` on a full machine pauses the
+        /// low task there and starts in the same pass. The paused task's
+        /// agent is interrupted and its pane closed; its worktree stays.
+        #[tokio::test]
+        async fn a_preempting_critical_task_pauses_the_newest_low_task() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
+            let older = start(&d, run("older", wt(), Priority::Low, false)).await;
+            let low = start(&d, run("low", wt(), Priority::Low, false)).await;
+            assert_eq!(get(&d, low.id).state, TaskState::Running);
+            let checkout = get(&d, low.id).spec.checkout.clone().expect("a checkout");
+            let pane = get(&d, low.id).pane_id.clone().unwrap();
+
+            let crit = start(&d, run("fix prod", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit.state, TaskState::Running, "started in the same pass");
+            assert!(crit.pause.preempt);
+            let paused = get(&d, low.id);
+            assert_eq!(paused.state, TaskState::Paused, "the newest low task");
+            assert_eq!(paused.pause.paused_for, Some(crit.id));
+            assert!(paused.pause.paused_at.is_some());
+            assert_eq!(
+                paused.machine.as_deref(),
+                Some("a"),
+                "pinned to its machine"
+            );
+            assert_eq!((paused.pane_id, paused.workspace_id), (None, None));
+            assert_eq!(get(&d, older.id).state, TaskState::Running);
+            assert!(
+                fake.pane_input(&pane)
+                    .contains(&crate::herdr::fake::PaneInput::Keys(vec!["esc".into()])),
+                "interrupted before its pane closed"
+            );
+            assert!(
+                !fake
+                    .agents()
+                    .iter()
+                    .any(|a| a.name.as_deref() == Some("t-2"))
+            );
+            let reqs = fake.requests();
+            assert!(!reqs.iter().any(|r| r.method == "worktree.remove"));
+            let kept = fake.worktree_list("/srv/app").await.unwrap();
+            assert!(
+                kept.iter().any(|w| w.path == checkout.path),
+                "the worktree is kept: {kept:?}"
+            );
+        }
+
+        /// Without `--preempt` a critical task still waits on a full
+        /// machine (burst 0), and nothing is paused.
+        #[tokio::test]
+        async fn a_critical_task_without_preempt_waits() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", spec(), Priority::Low, false)).await;
+            let crit = start(&d, run("crit", spec(), Priority::Critical, false)).await;
+            assert_eq!(crit.state, TaskState::Queued);
+            assert_eq!(get(&d, low.id).state, TaskState::Running);
+        }
+
+        /// `--preempt` is for critical tasks only, from `task run` and
+        /// `task priority` alike, and nothing is queued or changed.
+        #[tokio::test]
+        async fn preempt_is_refused_below_critical() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            let resp = d.handle(run("x", spec(), Priority::High, true)).await;
+            assert_eq!(error_code(resp), crate::task::PREEMPT_NEEDS_CRITICAL);
+            assert!(
+                d.store
+                    .list_tasks(&TaskFilter::default())
+                    .unwrap()
+                    .is_empty()
+            );
+
+            start(&d, run("busy", spec(), Priority::Normal, false)).await;
+            let queued = start(&d, run("q", spec(), Priority::Normal, false)).await;
+            let resp = d
+                .handle(IpcRequest::TaskPriority {
+                    id: queued.id,
+                    priority: Priority::High,
+                    preempt: true,
+                })
+                .await;
+            assert_eq!(error_code(resp), crate::task::PREEMPT_NEEDS_CRITICAL);
+            let IpcResponse::Task(t) = d
+                .handle(IpcRequest::TaskPriority {
+                    id: queued.id,
+                    priority: Priority::Critical,
+                    preempt: true,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert!(t.pause.preempt);
+            let IpcResponse::Task(t) = d
+                .handle(IpcRequest::TaskPriority {
+                    id: queued.id,
+                    priority: Priority::Critical,
+                    preempt: false,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert!(!t.pause.preempt, "task priority without --preempt drops it");
+        }
+
+        /// No task to pause: a normal one, an opencode one, one that
+        /// resumed a moment ago, a done one. The critical task waits.
+        #[tokio::test]
+        async fn only_a_running_low_claude_task_can_be_paused() {
+            for case in ["normal", "opencode", "resumed", "done"] {
+                let fake = FakeHerdr::new();
+                let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+                let (level, agent) = match case {
+                    "normal" => (Priority::Normal, "claude"),
+                    "opencode" => (Priority::Low, "opencode"),
+                    _ => (Priority::Low, "claude"),
+                };
+                let busy = start(
+                    &d,
+                    run(
+                        "busy",
+                        DispatchSpec {
+                            agent: agent.into(),
+                            ..spec()
+                        },
+                        level,
+                        false,
+                    ),
+                )
+                .await;
+                let mut t = get(&d, busy.id);
+                match case {
+                    "resumed" => t.pause.resumed_at = Some(chrono::Utc::now()),
+                    "done" => t.state = TaskState::Done,
+                    _ => {}
+                }
+                d.store.update_task(&mut t).unwrap();
+                let crit = start(&d, run("crit", spec(), Priority::Critical, true)).await;
+                assert_eq!(crit.state, TaskState::Queued, "{case}");
+                assert_ne!(get(&d, busy.id).state, TaskState::Paused, "{case}");
+            }
+        }
+
+        /// A paused task goes first among the low tasks, and resumes its
+        /// own session in its own worktree once a slot frees: `claude
+        /// --resume <session>`, told to carry on.
+        #[tokio::test]
+        async fn a_paused_task_resumes_first_among_low_tasks_when_a_slot_frees() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", wt(), Priority::Low, false)).await;
+            let session = get(&d, low.id).spec.session_id.clone().expect("a session");
+            let branch = get(&d, low.id).spec.checkout.clone().unwrap().branch;
+            let crit = start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit.state, TaskState::Running);
+            let later = start(&d, run("later low", spec(), Priority::Low, false)).await;
+            assert_eq!(later.state, TaskState::Queued);
+            let queue: Vec<i64> = d
+                .store
+                .queued_tasks()
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect();
+            assert_eq!(queue, vec![low.id, later.id], "the paused task goes first");
+            let entries = d.fleet().queue(None, None).unwrap();
+            assert_eq!(entries[0].task.id, low.id);
+
+            // Still full: it stays paused.
+            d.fleet().dispatch_queued().await;
+            assert_eq!(get(&d, low.id).state, TaskState::Paused);
+
+            let IpcResponse::Task(_) = d
+                .handle(IpcRequest::TaskClose {
+                    id: crit.id,
+                    remove_worktree: false,
+                })
+                .await
+            else {
+                panic!()
+            };
+            d.fleet().dispatch_queued().await;
+            let resumed = get(&d, low.id);
+            assert_eq!(resumed.state, TaskState::Running);
+            assert!(resumed.pause.resumed_at.is_some());
+            assert_eq!(resumed.spec.session_id.as_deref(), Some(session.as_str()));
+            assert_eq!(get(&d, later.id).state, TaskState::Queued);
+            let args = started_args(&fake, "t-1");
+            assert_eq!(
+                args[args.len() - 2..],
+                [Value::from("--resume"), Value::from(session.as_str())]
+            );
+            let reqs = fake.requests();
+            let open = reqs
+                .iter()
+                .rev()
+                .find(|r| r.method == "worktree.open")
+                .expect("its own checkout opened again");
+            assert_eq!(open.params["branch"], branch.as_str());
+            let prompt = reqs
+                .iter()
+                .rev()
+                .find(|r| r.method == "agent.prompt" && r.params["target"] == "t-1")
+                .unwrap();
+            assert_eq!(prompt.params["text"], crate::task::RESUME_PROMPT);
+            assert_eq!(get(&d, low.id).prompt, "low", "its own prompt is kept");
+
+            // Resumed a moment ago: another critical task does not pause it.
+            let again = start(&d, run("crit 2", spec(), Priority::Critical, true)).await;
+            assert_eq!(again.state, TaskState::Queued);
+            assert_eq!(get(&d, low.id).state, TaskState::Running);
+        }
+
+        /// Two low tasks paused for two critical ones, both pinned to the
+        /// same machine: closing only one critical frees a single slot, and
+        /// `dispatch_queued` resumes exactly one paused task, not both. Each
+        /// `resume_paused` call reads a fresh `views()` after the previous
+        /// one's actor has replied (`refresh_live` runs before the reply),
+        /// so the second sees the slot the first just took.
+        #[tokio::test]
+        async fn only_one_of_two_paused_tasks_resumes_into_one_freed_slot() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
+            let low1 = start(&d, run("low1", spec(), Priority::Low, false)).await;
+            let low2 = start(&d, run("low2", spec(), Priority::Low, false)).await;
+            assert_eq!(low1.state, TaskState::Running);
+            assert_eq!(low2.state, TaskState::Running);
+            let crit1 = start(&d, run("crit1", spec(), Priority::Critical, true)).await;
+            let crit2 = start(&d, run("crit2", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit1.state, TaskState::Running);
+            assert_eq!(crit2.state, TaskState::Running);
+            assert_eq!(get(&d, low1.id).state, TaskState::Paused);
+            assert_eq!(get(&d, low2.id).state, TaskState::Paused);
+
+            // Free exactly one slot.
+            d.handle(IpcRequest::TaskClose {
+                id: crit1.id,
+                remove_worktree: false,
+            })
+            .await;
+            d.fleet().dispatch_queued().await;
+
+            let states = [get(&d, low1.id).state, get(&d, low2.id).state];
+            let running = states.iter().filter(|s| **s == TaskState::Running).count();
+            let paused = states.iter().filter(|s| **s == TaskState::Paused).count();
+            assert_eq!(running, 1, "only one freed slot, only one may resume");
+            assert_eq!(paused, 1, "the other stays paused");
+        }
+
+        /// A resume whose agent does not come up fails the task, as any
+        /// dispatch that fails does.
+        #[tokio::test]
+        async fn a_failed_resume_fails_the_task() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", spec(), Priority::Low, false)).await;
+            let crit = start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(get(&d, low.id).state, TaskState::Paused);
+            d.handle(IpcRequest::TaskClose {
+                id: crit.id,
+                remove_worktree: false,
+            })
+            .await;
+            fake.exit_agents_on_start(true);
+            d.fleet().dispatch_queued().await;
+            let failed = get(&d, low.id);
+            assert_eq!(failed.state, TaskState::Failed);
+            assert!(failed.error.is_some());
+        }
+
+        /// A paused task has no agent: `send` has nothing to type into,
+        /// and `close` closes its row, with nothing asked of the machine.
+        #[tokio::test]
+        async fn send_and_close_on_a_paused_task() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", spec(), Priority::Low, false)).await;
+            start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(get(&d, low.id).state, TaskState::Paused);
+            let resp = d
+                .handle(IpcRequest::TaskSend {
+                    id: low.id,
+                    input: SendInput {
+                        text: Some("hi".into()),
+                        enter: true,
+                        ..Default::default()
+                    },
+                })
+                .await;
+            assert_eq!(error_code(resp), "task_not_live");
+            let before = fake.requests().len();
+            let IpcResponse::Task(t) = d
+                .handle(IpcRequest::TaskClose {
+                    id: low.id,
+                    remove_worktree: false,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert_eq!(t.state, TaskState::Closed);
+            assert_eq!(fake.requests().len(), before, "the row alone");
+            assert!(d.store.queued_tasks().unwrap().is_empty());
+        }
+
+        /// `close --remove-worktree` on a paused task opens its kept
+        /// checkout and removes it through that workspace.
+        #[tokio::test]
+        async fn close_remove_worktree_on_a_paused_task_removes_its_checkout() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", wt(), Priority::Low, false)).await;
+            let checkout = get(&d, low.id).spec.checkout.clone().unwrap();
+            start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(get(&d, low.id).state, TaskState::Paused);
+            let IpcResponse::Task(t) = d
+                .handle(IpcRequest::TaskClose {
+                    id: low.id,
+                    remove_worktree: true,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert_eq!(t.state, TaskState::Closed);
+            let left = fake.worktree_list("/srv/app").await.unwrap();
+            assert!(!left.iter().any(|w| w.path == checkout.path), "{left:?}");
+        }
     }
 }

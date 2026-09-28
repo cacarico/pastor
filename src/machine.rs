@@ -300,6 +300,28 @@ pub enum MachineCommand {
         task_id: i64,
         reply: oneshot::Sender<anyhow::Result<Task>>,
     },
+    /// Pause a running `low` Claude task for critical task `for_task`:
+    /// interrupt its agent, close its pane (its worktree stays) and mark it
+    /// `paused` (see `Task::pause`). Refused with `PauseRefused` for a task
+    /// that cannot be paused (`task::why_not_pausable`).
+    Pause {
+        task_id: i64,
+        for_task: i64,
+        reply: oneshot::Sender<anyhow::Result<Task>>,
+    },
+    /// Start a paused task again on its own session (`dispatch::resume`).
+    Resume {
+        task_id: i64,
+        reply: oneshot::Sender<anyhow::Result<Task>>,
+    },
+}
+
+/// Why `Pause` left a task alone.
+#[derive(Debug, thiserror::Error)]
+#[error("{task} cannot be paused: {why}")]
+pub struct PauseRefused {
+    pub task: String,
+    pub why: String,
 }
 
 /// What `pastor task send` types into a task's pane: `text` first, then
@@ -522,6 +544,24 @@ impl MachineHandle {
     pub async fn end(&self, task_id: i64) -> anyhow::Result<Task> {
         let (reply, rx) = oneshot::channel();
         self.request(MachineCommand::End { task_id, reply }, rx)
+            .await
+    }
+
+    /// See `MachineCommand::Pause`.
+    pub async fn pause(&self, task_id: i64, for_task: i64) -> anyhow::Result<Task> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = MachineCommand::Pause {
+            task_id,
+            for_task,
+            reply,
+        };
+        self.request(cmd, rx).await
+    }
+
+    /// See `MachineCommand::Resume`.
+    pub async fn resume(&self, task_id: i64) -> anyhow::Result<Task> {
+        let (reply, rx) = oneshot::channel();
+        self.request(MachineCommand::Resume { task_id, reply }, rx)
             .await
     }
 
@@ -1043,6 +1083,8 @@ impl Actor {
                     Some(MachineCommand::Close { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Send { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::End { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::Pause { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::Resume { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                 },
             }
         }
@@ -1256,7 +1298,7 @@ impl Actor {
     async fn handle_command(&mut self, cmd: MachineCommand) -> CommandOutcome {
         match cmd {
             MachineCommand::Dispatch { task_id, reply } => {
-                let (result, mut dead) = self.run_dispatch(task_id).await;
+                let (result, mut dead) = self.run_dispatch(task_id, false).await;
                 if matches!(&result, Ok(t) if t.state == TaskState::Blocked)
                     && let Err(err) = self.auto_trust().await
                 {
@@ -1303,6 +1345,32 @@ impl Actor {
             MachineCommand::End { task_id, reply } => {
                 let _ = reply.send(self.end_task(task_id));
                 CommandOutcome::Nothing
+            }
+            MachineCommand::Pause {
+                task_id,
+                for_task,
+                reply,
+            } => {
+                let result = self.pause_task(task_id, for_task).await;
+                let dead = matches!(&result, Err(err) if is_outage(err));
+                self.refresh_live();
+                let _ = reply.send(result);
+                if dead {
+                    CommandOutcome::Reconnect
+                } else {
+                    CommandOutcome::Nothing
+                }
+            }
+            MachineCommand::Resume { task_id, reply } => {
+                let (result, dead) = self.run_dispatch(task_id, true).await;
+                let changed = result.is_ok();
+                self.refresh_live();
+                let _ = reply.send(result);
+                match (dead, changed) {
+                    (true, _) => CommandOutcome::Reconnect,
+                    (false, true) => CommandOutcome::Resubscribe,
+                    (false, false) => CommandOutcome::Nothing,
+                }
             }
             MachineCommand::Read {
                 task_id,
@@ -1582,6 +1650,10 @@ impl Actor {
                     anyhow::bail!("task {name} is on machine {m}, not {}", self.name)
                 }
                 Some(_) => {}
+            }
+            // A paused task has no pane or agent; only its checkout.
+            if t.state == TaskState::Paused {
+                return self.close_paused(t.clone(), remove_worktree).await;
             }
             // A closed row with no workspace had its worktree removed (or
             // noted for manual cleanup) already: nothing is left to do.
@@ -2056,6 +2128,43 @@ impl Actor {
         self.finish_close(t)
     }
 
+    /// `close_inner` for a paused task: its pane is gone already, so a plain
+    /// close is the row alone. With `remove_worktree` its checkout, kept
+    /// when it was paused, is opened in a workspace (`open_checkout`) and
+    /// removed through it; a dirty one stays, the workspace goes again, and
+    /// the task stays paused, as `task close --remove-worktree` leaves any
+    /// task whose checkout herdr refuses.
+    async fn close_paused(&mut self, t: Task, remove_worktree: bool) -> anyhow::Result<Task> {
+        if !remove_worktree {
+            return self.finish_close(t);
+        }
+        let name = t.display_id();
+        let Some(created) = self.open_checkout(&t, &name).await? else {
+            // Gone already: nothing left to remove.
+            return self.finish_close(t);
+        };
+        if created.already_open {
+            let why = format!(
+                "workspace {} shows it and pastor did not open it",
+                created.workspace.workspace_id
+            );
+            let note = worktree_kept_note(&t, &name, &why);
+            return self.finish_close_with_note(t, note);
+        }
+        let timeout = self.settings.request_timeout;
+        let ws = created.workspace.workspace_id.clone();
+        let removed = tokio::time::timeout(timeout, self.connector.worktree_remove(&ws, false))
+            .await
+            .map_err(|_| TimedOut("worktree.remove", timeout))?;
+        match removed {
+            Ok(()) => self.finish_close(t),
+            Err(err) => {
+                self.close_reopened(Some(&created.root_pane.pane_id)).await;
+                Err(anyhow::Error::from(err).context(format!("remove the worktree of {name}")))
+            }
+        }
+    }
+
     fn finish_close(&mut self, t: Task) -> anyhow::Result<Task> {
         let was = t.state;
         let closed = self.store.close_task(t.id)?;
@@ -2162,19 +2271,88 @@ impl Actor {
         }
     }
 
-    async fn run_dispatch(&mut self, task_id: i64) -> (anyhow::Result<Task>, bool) {
+    /// `MachineCommand::Pause`. The agent is interrupted first (`esc`, so
+    /// Claude ends its turn and saves the conversation as it stands), then
+    /// its pane closes, which ends the agent; a worktree stays on disk, since
+    /// only `worktree.remove` deletes one. The row goes `paused` last, with
+    /// no pane or workspace: the pane is gone, and the workspace closed with
+    /// its last pane or is someone else's.
+    async fn pause_task(&mut self, task_id: i64, for_task: i64) -> anyhow::Result<Task> {
+        let task = self
+            .store
+            .get_task(task_id)?
+            .with_context(|| format!("task t-{task_id} not found"))?;
+        let refuse = |why: &str| PauseRefused {
+            task: task.display_id(),
+            why: why.to_string(),
+        };
+        if task.machine.as_deref() != Some(&self.name) {
+            return Err(refuse(&format!("it is not on {}", self.name)).into());
+        }
+        let kind = self.settings.agents.kind(&task.spec.agent).to_string();
+        if let Some(why) = crate::task::why_not_pausable(&task, &kind, Utc::now()) {
+            return Err(refuse(why).into());
+        }
+        let name = task.display_id();
+        if let Some(pane) = task.pane_id.as_deref() {
+            let timeout = self.settings.request_timeout;
+            let keys = ["esc".to_string()];
+            match tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
+                .await
+                .map_err(|_| TimedOut("pane.send_keys", timeout))?
+            {
+                Ok(()) => {}
+                // Gone already: nothing left to interrupt.
+                Err(err) if err.code() == Some("pane_not_found") => {}
+                Err(err) => {
+                    return Err(
+                        anyhow::Error::from(err).context(format!("interrupt the agent of {name}"))
+                    );
+                }
+            }
+            self.close_pane_of(pane, &name).await?;
+        }
+        self.pending_done.remove(&task_id);
+        let now = Utc::now();
+        let paused = write_task(&self.store, task, |t| {
+            if !t.state.occupies_pane() {
+                return false;
+            }
+            t.state = TaskState::Paused;
+            t.pane_id = None;
+            t.workspace_id = None;
+            t.prompt_pending = false;
+            t.activity_seen = false;
+            t.error = None;
+            t.pause.paused_at = Some(now);
+            t.pause.paused_for = Some(for_task);
+            true
+        })?
+        .with_context(|| format!("{name} moved on while it was paused"))?;
+        self.emit("task.paused", Some(task_id));
+        Ok(paused)
+    }
+
+    async fn run_dispatch(&mut self, task_id: i64, resume: bool) -> (anyhow::Result<Task>, bool) {
         // The claim is the `Queued -> Starting` transition done as a conditional
         // UPDATE: a task another pass already took, or that finished meanwhile,
         // is simply not claimable. It also persists `machine` and `agent_name`
         // before the first herdr call, so a daemon crash mid-dispatch leaves a
         // row `reconcile` can adopt by agent name instead of one that still reads
         // `Queued` and gets dispatched twice.
-        let mut task = match self.store.claim_task(task_id, &self.name) {
+        // A paused task is claimed only on the machine it was paused on.
+        let claimed = if resume {
+            self.store.claim_paused(task_id, &self.name)
+        } else {
+            self.store.claim_task(task_id, &self.name)
+        };
+        let mut task = match claimed {
             Ok(Some(t)) => t,
             Ok(None) => {
+                let what = if resume { "paused here" } else { "queued" };
                 return (
                     Err(anyhow::anyhow!(
-                        "task t-{task_id} is not queued (already claimed, finished, or unknown)"
+                        "task t-{task_id} is not {what} (already claimed, finished, or unknown)"
                     )),
                     false,
                 );
@@ -2183,18 +2361,17 @@ impl Actor {
         };
         self.keep_occupied_checkout(&mut task).await;
         let timeout = self.settings.request_timeout;
-        let outcome = match tokio::time::timeout(
-            timeout,
-            dispatch(
-                self.connector.as_ref(),
-                &mut task,
-                &self.settings.agents,
-                self.settings.head_address.as_deref(),
-                self.settings.agent_ready_timeout,
-            ),
-        )
-        .await
-        {
+        let start = async {
+            let (conn, agents) = (self.connector.as_ref(), &self.settings.agents);
+            let head = self.settings.head_address.as_deref();
+            let ready = self.settings.agent_ready_timeout;
+            if resume {
+                crate::dispatch::resume(conn, &mut task, agents, head, ready).await
+            } else {
+                dispatch(conn, &mut task, agents, head, ready).await
+            }
+        };
+        let outcome = match tokio::time::timeout(timeout, start).await {
             Ok(outcome) => outcome,
             // `dispatch()` itself never got to resolve, so its own Failed-recording
             // never ran; do the same bookkeeping it would have done on an error, and

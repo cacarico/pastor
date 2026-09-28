@@ -79,6 +79,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 orchestrator\t'Also runs, retries and types into tasks and disables jobs (`IpcRequest::orchestrator_may`). Only a person makes one: `task run --role orchestrator` from outside any task'"
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l description -d 'One line on what the task is about, for `task list --wide` and `describe` (default: the prompt\'s first line)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l preempt -d 'A critical task only: on a full machine, pause the newest low Claude task there (its session resumes when a slot frees) and take its slot'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l worktree -d 'A git worktree per task, branched from --repo (so it needs --repo)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -s h -l help -d 'Print help (see more with \'--help\')'
@@ -105,6 +106,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from retry" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from retry" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from priority" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from priority" -l preempt -d 'Critical only: let the task pause the newest low Claude task on a full machine to start; without it the task\'s flag goes'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from priority" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from priority" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from close" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r

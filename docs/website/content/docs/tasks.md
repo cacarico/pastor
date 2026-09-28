@@ -27,6 +27,7 @@ the same checkout.
 | `--agent` | the agent command: `claude`, `codex`, ... |
 | `--timeout` | mark it stale after `30m`, `2h`, ... |
 | `--priority` | `low`, `normal`, `high` or `critical`: higher levels leave the queue first |
+| `--preempt` | critical only: on a full machine, pause a `low` Claude task and take its slot |
 | `--description` | one line on what it is about; default: the prompt's first line |
 
 ## states
@@ -41,6 +42,7 @@ the same checkout.
 | `stale` | it ran past its timeout; the agent is left running |
 | `failed` | it could not start, or the agent exited before it was done |
 | `closed` | finished for good |
+| `paused` | a critical task took its slot; it resumes its session when there is room |
 
 `done` means the agent stopped, not that the work is right. Read the output.
 
@@ -60,6 +62,16 @@ pastor task priority t-8 high        # another level, same place in it
 A moved task takes the level of where it lands: in front of a higher task
 it is lifted, behind a lower one it is lowered. Levels do not age, so a
 `low` task can wait for ever; WAITED shows you.
+
+A `critical` task started with `--preempt` does not wait behind `low`
+work. On a full machine it pauses the newest running `low` Claude task
+there: its agent is interrupted, its pane closed, its worktree kept. The
+paused task goes first among the `low` ones and resumes its own session
+on the same machine when a slot frees.
+
+```sh
+pastor task run --priority critical --preempt "prod is down: find out why"
+```
 
 ## follow it
 

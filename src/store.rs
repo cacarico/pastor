@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::queue::QueueSpot;
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Priority, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -135,9 +135,12 @@ pub struct Moved {
 }
 
 /// The order dispatch takes queued tasks in: by level, highest first, then
-/// by position, then oldest first.
+/// a paused task before a queued one (only a `low` task is ever paused, so
+/// it goes first among the `low` ones), then by position, then oldest
+/// first.
 const QUEUE_ORDER: &str = "CASE priority WHEN 'critical' THEN 3 WHEN 'high' THEN 2
                                   WHEN 'normal' THEN 1 ELSE 0 END DESC,
+                         state = 'paused' DESC,
                          COALESCE(queue_pos, id), created_at, id";
 
 /// Why `set_priority` changed nothing, each with its own IPC code.
@@ -324,6 +327,10 @@ impl Store {
                         queue_pos INTEGER,
                         role TEXT NOT NULL DEFAULT 'agent',
                         description TEXT,
+                        preempt INTEGER NOT NULL DEFAULT 0,
+                        paused_at TEXT,
+                        paused_for INTEGER,
+                        resumed_at TEXT,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -421,6 +428,16 @@ impl Store {
                 if v < 11 {
                     add_column(&tx, "description", "description TEXT")?;
                 }
+                // Pausing a low task for a critical one (`Task::pause`):
+                // whether a task may pause one, and when a paused one was
+                // paused, for whom, and when it resumed. Older rows neither
+                // pause nor were paused.
+                if v < 12 {
+                    add_column(&tx, "preempt", "preempt INTEGER NOT NULL DEFAULT 0")?;
+                    add_column(&tx, "paused_at", "paused_at TEXT")?;
+                    add_column(&tx, "paused_for", "paused_for INTEGER")?;
+                    add_column(&tx, "resumed_at", "resumed_at TEXT")?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -451,12 +468,25 @@ impl Store {
         from: Option<&str>,
         role: crate::task::TaskRole,
     ) -> anyhow::Result<Task> {
+        self.insert_task_preempting(t, priority, from, role, false)
+    }
+
+    /// `insert_task_at`, with `preempt` (`task run --preempt`): the caller
+    /// has checked that `priority` is critical.
+    pub fn insert_task_preempting(
+        &self,
+        t: NewTask,
+        priority: Priority,
+        from: Option<&str>,
+        role: crate::task::TaskRole,
+        preempt: bool,
+    ) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, role, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?10, ?10)",
-            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, role.as_str(), t.description, now],
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, role, description, preempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?11, ?10, ?10)",
+            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, role.as_str(), t.description, now, preempt],
         )?;
         let id = tx.last_insert_rowid();
         place_last(&tx, id)?;
@@ -533,7 +563,8 @@ impl Store {
         let n = conn.execute(
             "UPDATE tasks SET machine = ?2, workspace_id = ?3, pane_id = ?4, agent_name = ?5, state = ?6, error = ?7,
                 last_completion_seq = ?8, started_at = ?9, finished_at = ?10, updated_at = ?11, prompt = ?12, spec = ?13,
-                prompt_pending = ?14, activity_seen = ?16, ended = ?17
+                prompt_pending = ?14, activity_seen = ?16, ended = ?17,
+                paused_at = ?18, paused_for = ?19, resumed_at = ?20
              WHERE id = ?1 AND updated_at = ?15",
             params![
                 t.id,
@@ -553,6 +584,9 @@ impl Store {
                 t.updated_at.to_rfc3339(),
                 t.activity_seen,
                 t.ended,
+                t.pause.paused_at.map(|d| d.to_rfc3339()),
+                t.pause.paused_for,
+                t.pause.resumed_at.map(|d| d.to_rfc3339()),
             ],
         )?;
         if n == 1 {
@@ -582,6 +616,24 @@ impl Store {
         let n = conn.execute(
             "UPDATE tasks SET state = 'starting', machine = ?2, agent_name = ?3, error = NULL, updated_at = ?4
              WHERE id = ?1 AND state = 'queued'",
+            params![id, machine, Task::agent_name_for(id), now],
+        )?;
+        drop(conn);
+        if n == 0 {
+            return Ok(None);
+        }
+        self.get_task(id)
+    }
+
+    /// `claim_task` for a paused task: `paused` -> `starting` on the machine
+    /// it was paused on, and only there, stamping `resumed_at`. `None` means
+    /// it was not paused there any more (closed meanwhile, or unknown).
+    pub fn claim_paused(&self, id: i64, machine: &str) -> anyhow::Result<Option<Task>> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE tasks SET state = 'starting', agent_name = ?3, error = NULL, resumed_at = ?4, updated_at = ?4
+             WHERE id = ?1 AND state = 'paused' AND machine = ?2",
             params![id, machine, Task::agent_name_for(id), now],
         )?;
         drop(conn);
@@ -628,7 +680,7 @@ impl Store {
         // keeps the level, its role, description and where it came from,
         // but queues last in it.
         let n = tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, role, description, state, retry_of, priority, priority_from, created_at, updated_at)
+            "INSERT INTO tasks (job, item, prompt, spec, flock, role, description, state, retry_of, priority, priority_from, preempt, created_at, updated_at)
              SELECT job, item, prompt,
                     json_patch(json_remove(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
                          THEN json_remove(spec, '$.checkout', '$.reopen')
@@ -639,7 +691,7 @@ impl Store {
                                                    'agent', COALESCE(agent_name, 't-' || id)))
                          ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
                          '$.session_id'), ?3),
-                    flock, role, description, 'queued', id, priority, priority_from, ?2, ?2 FROM tasks
+                    flock, role, description, 'queued', id, priority, priority_from, preempt, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
         )?;
@@ -682,9 +734,9 @@ impl Store {
         Ok(t)
     }
 
-    /// Close task `id` only if it is still `queued`, in one conditional
-    /// UPDATE. A queued task has no machine yet, so nothing but its row to
-    /// close; `None` means it was not queued any more, typically because a
+    /// Close task `id` only if it is still `queued` (or `paused`), in one
+    /// conditional UPDATE. A queued task has no machine yet, and a paused one
+    /// no pane, so nothing but its row to close; `None` means it was not queued any more, typically because a
     /// dispatch claimed it in between (`claim_task`), and the close must then
     /// go through that machine. The counterpart of `claim_task`.
     pub fn close_queued(&self, id: i64) -> anyhow::Result<Option<Task>> {
@@ -692,7 +744,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE tasks SET state = 'closed', finished_at = COALESCE(finished_at, ?2), updated_at = ?2
-             WHERE id = ?1 AND state = 'queued'",
+             WHERE id = ?1 AND state IN ('queued', 'paused')",
             params![id, now],
         )?;
         drop(conn);
@@ -833,12 +885,13 @@ impl Store {
             .collect())
     }
 
-    /// Queued tasks in the order dispatch takes them: by level, highest
-    /// first, then by position, then oldest first.
+    /// Queued and paused tasks in the order dispatch takes them: by level,
+    /// highest first, a paused task first in its level, then by position,
+    /// then oldest first.
     pub fn queued_tasks(&self) -> anyhow::Result<Vec<Task>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT * FROM tasks WHERE state = 'queued' ORDER BY {QUEUE_ORDER}"
+            "SELECT * FROM tasks WHERE state IN ('queued', 'paused') ORDER BY {QUEUE_ORDER}"
         ))?;
         let rows = stmt.query_map([], row_to_task)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -854,12 +907,25 @@ impl Store {
         priority: Priority,
         from: &str,
     ) -> Result<Task, PriorityError> {
+        self.set_priority_preempting(id, priority, from, false)
+    }
+
+    /// `set_priority`, setting the task's `preempt` to `preempt` (`task
+    /// priority --preempt`; without it the flag goes): the caller has
+    /// checked that `priority` is critical when `preempt` is set.
+    pub fn set_priority_preempting(
+        &self,
+        id: i64,
+        priority: Priority,
+        from: &str,
+        preempt: bool,
+    ) -> Result<Task, PriorityError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE tasks SET priority = ?2, priority_from = ?3, updated_at = ?4
+            "UPDATE tasks SET priority = ?2, priority_from = ?3, preempt = ?5, updated_at = ?4
              WHERE id = ?1 AND state = 'queued'",
-            params![id, priority.as_str(), from, now],
+            params![id, priority.as_str(), from, now, preempt],
         )?;
         if n == 0 {
             let state: Option<String> = conn
@@ -1083,18 +1149,21 @@ impl Store {
             flock,
             item,
             (Priority::Normal, None),
+            false,
             description,
             render,
         )
     }
 
     /// `insert_job_task` at a level, and what set it (`Task::priority_from`).
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_job_task_at(
         &self,
         job: &str,
         flock: &str,
         item: &Value,
         (priority, from): (Priority, Option<&str>),
+        preempt: bool,
         description: Option<&str>,
         render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
@@ -1107,8 +1176,8 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, description, state, priority, priority_from, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, ?7, 'queued', ?5, ?6, ?4, ?4)",
-            params![job, serde_json::to_string(item)?, flock, now, priority.as_str(), from, description],
+            "INSERT INTO tasks (job, item, prompt, spec, flock, description, state, priority, priority_from, preempt, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, ?7, 'queued', ?5, ?6, ?8, ?4, ?4)",
+            params![job, serde_json::to_string(item)?, flock, now, priority.as_str(), from, description, preempt],
         )?;
         let id = tx.last_insert_rowid();
         place_last(&tx, id)?;
@@ -1287,6 +1356,8 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let started_at: Option<String> = row.get("started_at")?;
     let finished_at: Option<String> = row.get("finished_at")?;
     let role: String = row.get("role")?;
+    let paused_at: Option<String> = row.get("paused_at")?;
+    let resumed_at: Option<String> = row.get("resumed_at")?;
     Ok(Task {
         id: row.get("id")?,
         job: row.get("job")?,
@@ -1320,6 +1391,12 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
             .unwrap_or(row.get("id")?),
         role: role.parse().map_err(conversion_failure::<String>)?,
         description: row.get("description")?,
+        pause: crate::task::Preemption {
+            preempt: row.get("preempt")?,
+            paused_at: paused_at.as_deref().map(parse_dt).transpose()?,
+            paused_for: row.get("paused_for")?,
+            resumed_at: resumed_at.as_deref().map(parse_dt).transpose()?,
+        },
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -2125,6 +2202,96 @@ mod tests {
         assert_eq!(r.description.as_deref(), Some("Fix the flaky test"));
     }
 
+    /// A v11 database has no pause columns: opening it adds them, and its
+    /// rows neither preempt nor were paused.
+    #[test]
+    fn a_v11_database_gains_the_pause_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN preempt;
+                 ALTER TABLE tasks DROP COLUMN paused_at;
+                 ALTER TABLE tasks DROP COLUMN paused_for;
+                 ALTER TABLE tasks DROP COLUMN resumed_at;
+                 UPDATE meta SET value = '11' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let old = s.get_task(1).unwrap().unwrap();
+        assert_eq!(old.pause, crate::task::Preemption::default());
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("preempt").is_none() && json.get("paused_at").is_none());
+        let new = s
+            .insert_task_preempting(
+                new_task("run"),
+                Priority::Critical,
+                None,
+                TaskRole::Agent,
+                true,
+            )
+            .unwrap();
+        assert!(new.pause.preempt);
+        assert_eq!(serde_json::to_value(&new).unwrap()["preempt"], true);
+    }
+
+    /// A paused task goes first among the `low` tasks, after every higher
+    /// one, and is claimed back only on the machine it was paused on.
+    #[test]
+    fn a_paused_task_is_first_among_low_tasks_and_claimed_on_its_machine() {
+        let s = Store::open_in_memory().unwrap();
+        let at = |p| {
+            s.insert_task_at(new_task("run"), p, None, TaskRole::Agent)
+                .unwrap()
+        };
+        let low = at(Priority::Low);
+        let high = at(Priority::High);
+        let paused = at(Priority::Low);
+        let mut t = s.claim_task(paused.id, "a").unwrap().unwrap();
+        t.state = TaskState::Paused;
+        t.pause.paused_at = Some(Utc::now());
+        t.pause.paused_for = Some(high.id);
+        s.update_task(&mut t).unwrap();
+        let order: Vec<i64> = s.queued_tasks().unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![high.id, paused.id, low.id]);
+        assert!(s.claim_paused(paused.id, "b").unwrap().is_none());
+        assert!(
+            s.claim_task(paused.id, "a").unwrap().is_none(),
+            "not queued"
+        );
+        let back = s.claim_paused(paused.id, "a").unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Starting);
+        assert!(back.pause.resumed_at.is_some());
+        assert_eq!(back.pause.paused_for, Some(high.id));
+        assert!(
+            s.claim_paused(paused.id, "a").unwrap().is_none(),
+            "claimed once"
+        );
+    }
+
+    /// A retry keeps `preempt` with the level it copies.
+    #[test]
+    fn a_retry_keeps_preempt() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task_preempting(
+                new_task("run"),
+                Priority::Critical,
+                None,
+                TaskRole::Agent,
+                true,
+            )
+            .unwrap();
+        set_state(&s, t.id, TaskState::Failed);
+        assert!(s.insert_retry(t.id).unwrap().pause.preempt);
+    }
+
     /// A v8 database has no description column: opening it adds one, and
     /// its rows read as their prompt's first line.
     #[test]
@@ -2499,6 +2666,7 @@ mod tests {
                 "default",
                 &serde_json::json!({"key": "k"}),
                 (Priority::High, Some("job j")),
+                false,
                 None,
                 |_| Ok(("p".into(), spec())),
             )
@@ -2789,11 +2957,15 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN queue_pos;
                  ALTER TABLE tasks DROP COLUMN role;
                  ALTER TABLE tasks DROP COLUMN description;
+                 ALTER TABLE tasks DROP COLUMN preempt;
+                 ALTER TABLE tasks DROP COLUMN paused_at;
+                 ALTER TABLE tasks DROP COLUMN paused_for;
+                 ALTER TABLE tasks DROP COLUMN resumed_at;
                  DROP TABLE trusted_repos;
                  DROP TABLE event_seq;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '11' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '12' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -2823,7 +2995,9 @@ mod tests {
                 || c == "priority"
                 || c == "queue_pos"
                 || c == "role"
-                || c == "description"),
+                || c == "description"
+                || c == "preempt"
+                || c == "paused_at"),
             "rolled back: {cols:?}"
         );
         drop(conn);

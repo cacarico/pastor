@@ -33,7 +33,7 @@ and so on. This page lists them; `--help` after any command lists its flags.
 | `pastor task attach` | attach to a task's agent terminal (ctrl+b q detaches) |
 | `pastor task send` | type text or press keys in a live task's agent |
 | `pastor task retry` | re-dispatch a failed or stale task as a new task |
-| `pastor task priority` | put a queued task at another level: low, normal, high or critical |
+| `pastor task priority` | put a queued task at another level: low, normal, high or critical (`--preempt` with critical) |
 | `pastor task done` | mark a task done; an agent may end its own |
 | `pastor task close` | close a task's pane, and its worktree with `--remove-worktree` |
 | `pastor task prune` | delete old finished tasks; their items stay seen |

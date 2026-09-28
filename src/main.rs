@@ -227,6 +227,10 @@ struct RunArgs {
     /// flock's, else `[defaults] priority`, else normal)
     #[arg(long, value_name = "LEVEL")]
     priority: Option<String>,
+    /// A critical task only: on a full machine, pause the newest low Claude
+    /// task there (its session resumes when a slot frees) and take its slot
+    #[arg(long)]
+    preempt: bool,
     /// Run under this permission profile, built in or from `[profiles]` in
     /// pastor.toml: a Claude agent gets its allow and deny lists and never
     /// asks (default: the machine's, else its flock's, else `[defaults]
@@ -1091,6 +1095,19 @@ fn needs_priority_protocol(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` sends `--preempt`, which only a head of
+/// `PREEMPT_PROTOCOL` or later honours.
+fn needs_preempt_protocol(command: &Command) -> bool {
+    match command {
+        Command::Task { cmd } => match cmd {
+            TaskCmd::Run(a) => a.preempt,
+            TaskCmd::Priority(a) => a.preempt,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether `command` sends a description only a head of
 /// `DESCRIPTION_PROTOCOL` or later keeps: `task run`, `flock add` or
 /// `machine add` with `--description`.
@@ -1155,7 +1172,12 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_description_protocol(command) {
+    if needs_preempt_protocol(command) {
+        Some((
+            pastor::ipc::PREEMPT_PROTOCOL,
+            "predates pausing a low task, and would queue the task without --preempt",
+        ))
+    } else if needs_description_protocol(command) {
         Some((
             pastor::ipc::DESCRIPTION_PROTOCOL,
             "predates descriptions and would drop --description",
@@ -1287,6 +1309,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
             priority,
             role: a.role,
             description: pastor::config::clean_description(a.description.as_deref()),
+            preempt: a.preempt,
         },
     )
     .await?
@@ -2148,6 +2171,29 @@ fn attach_remote_command(session: &str, agent: &str) -> String {
     )
 }
 
+/// The code `task attach` refuses a paused task with.
+const TASK_PAUSED: &str = "task_paused";
+
+/// Why `task attach` refuses `t`: a paused task's session resumes on its
+/// own when a slot frees, and a second `claude --resume` of it in a pane of
+/// attach's would put two agents on one conversation. `None` for any
+/// other state.
+fn paused_attach_refusal(t: &Task) -> Option<String> {
+    (t.state == TaskState::Paused).then(|| {
+        let by = t
+            .pause
+            .paused_for
+            .map(|id| format!(" for {}", Task::agent_name_for(id)))
+            .unwrap_or_default();
+        format!(
+            "{} is paused{by}; its session resumes in a new pane on {} when a slot there frees. Close it (`pastor task close {}`) to give it up",
+            t.display_id(),
+            t.machine.as_deref().unwrap_or("its machine"),
+            t.display_id()
+        )
+    })
+}
+
 async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     let id = task_id(task);
     let t = open_store(paths)?
@@ -2156,6 +2202,9 @@ async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     let (Some(machine), Some(mut agent)) = (t.machine.clone(), t.agent_name.clone()) else {
         fail("no_agent", &format!("{} has no agent yet", t.display_id()))
     };
+    if let Some(why) = paused_attach_refusal(&t) {
+        fail(TASK_PAUSED, &why);
+    }
     let f = Flock::load(&paths.flock_file())?;
     let m = f
         .get(&machine)
@@ -2939,6 +2988,51 @@ mod tests {
         ])));
     }
 
+    /// `--preempt` needs a head that knows pausing; without it the task
+    /// would wait behind low work.
+    #[test]
+    fn preempt_needs_a_head_that_knows_it() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
+        assert_eq!(
+            need(&[
+                "pastor",
+                "task",
+                "run",
+                "hi",
+                "--priority",
+                "critical",
+                "--preempt"
+            ]),
+            Some(pastor::ipc::PREEMPT_PROTOCOL)
+        );
+        assert_eq!(
+            need(&["pastor", "task", "priority", "t-1", "critical", "--preempt"]),
+            Some(pastor::ipc::PREEMPT_PROTOCOL)
+        );
+    }
+
+    /// `task attach` refuses a paused task: its session resumes on its own,
+    /// and a second resume would put two agents on one conversation.
+    #[test]
+    fn attach_refuses_a_paused_task() {
+        let mut t: Task = serde_json::from_value(serde_json::json!({
+            "id": 4, "job": "run", "item": null, "prompt": "p",
+            "spec": {"agent": "claude"}, "machine": "pi-1", "workspace_id": null,
+            "pane_id": null, "agent_name": "t-4", "state": "running", "error": null,
+            "last_completion_seq": null,
+            "created_at": "2026-09-28T10:00:00Z", "started_at": null,
+            "finished_at": null, "updated_at": "2026-09-28T10:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(paused_attach_refusal(&t), None);
+        t.state = TaskState::Paused;
+        t.pause.paused_for = Some(9);
+        let why = paused_attach_refusal(&t).unwrap();
+        assert!(why.starts_with("t-4 is paused for t-9;"), "{why}");
+        assert!(why.contains("pi-1"), "{why}");
+    }
+
     /// `task run --priority` and `task priority` need a head that knows
     /// levels: an older one would queue at its own level, or refuse the
     /// request as unreadable. A run without the flag does not.
@@ -3301,6 +3395,7 @@ mod tests {
                 TaskState::Starting,
                 TaskState::Running,
                 TaskState::Blocked,
+                TaskState::Paused,
             ]
         );
         for s in [

@@ -52,9 +52,9 @@ pub const QUEUE_HEADER: [&str; 7] = [
 pub const WAITING_FOR_MODEL: &str = "waiting for a machine";
 
 impl QueueEntry {
-    /// The machine it is pinned to, else its flock.
+    /// The machine it is pinned to (or paused on), else its flock.
     pub fn place(&self) -> String {
-        match &self.task.spec.machine {
+        match self.task.pinned_machine() {
             Some(m) => format!("machine {m}"),
             None => format!("flock {}", self.flock),
         }
@@ -69,7 +69,7 @@ impl QueueEntry {
     /// machine it is pinned to.
     pub fn matches(&self, flock: Option<&str>, machine: Option<&str>) -> bool {
         flock.is_none_or(|f| f == self.flock)
-            && machine.is_none_or(|m| self.task.spec.machine.as_deref() == Some(m))
+            && machine.is_none_or(|m| self.task.pinned_machine() == Some(m))
     }
 
     pub fn to_json(&self) -> Value {
@@ -82,7 +82,7 @@ impl QueueEntry {
             "priority": self.task.priority,
             "where": self.place(),
             "flock": self.flock,
-            "machine": self.task.spec.machine,
+            "machine": self.task.pinned_machine(),
             "from": self.from(),
             "waited_secs": waited,
             "why": self.why,
@@ -145,6 +145,25 @@ fn why_waiting(
         return note.clone();
     }
     let claim = Claim::of(task);
+    // A paused task resumes only on its machine, whatever its flock.
+    if task.state == crate::task::TaskState::Paused {
+        let m = task.machine.as_deref().unwrap_or("-");
+        let by = task
+            .pause
+            .paused_for
+            .map(|id| format!("paused for {}; ", Task::agent_name_for(id)))
+            .unwrap_or_default();
+        return match views.iter_mut().find(|v| v.name == m) {
+            None => format!("{by}machine {m} is not in the flock"),
+            Some(v) if !v.healthy => format!("{by}machine {m} is not connected"),
+            Some(v) if v.has_room(claim) => {
+                v.live += 1;
+                v.live_jobs += usize::from(task.from_job());
+                format!("next pass: resumes on {m}")
+            }
+            Some(v) => format!("{by}machine {m} is full ({}/{})", v.live, v.max_agents),
+        };
+    }
     if let Some(m) = pick_machine_where(views, flock, &task.spec, claim, &|m| accepts(task, m)) {
         let v = views.iter_mut().find(|v| v.name == m).expect("picked");
         v.live += 1;
@@ -227,6 +246,7 @@ mod tests {
             priority: Priority::Normal,
             priority_from: None,
             queue_pos: id,
+            pause: Default::default(),
             created_at: now,
             started_at: None,
             finished_at: None,
@@ -264,6 +284,46 @@ mod tests {
             whys(vec![task(1, None, None), task(2, None, None)], &views),
             ["next pass: a has room", "flock default is full"]
         );
+    }
+
+    /// A paused job task that the simulation resumes takes the machine's
+    /// one job slot, so a job task queued behind it reads that slot as
+    /// taken instead of still free.
+    #[test]
+    fn a_resumed_paused_job_task_takes_the_job_slot_in_the_simulation() {
+        let mut paused = task(3, Some("default"), None);
+        paused.job = "board".into();
+        paused.state = TaskState::Paused;
+        paused.machine = Some("b".into());
+        let mut behind = task(4, Some("default"), None);
+        behind.job = "board".into();
+        let mut b = view("b", "default", 0, 0, true);
+        b.job_slots = 1;
+        assert_eq!(
+            whys(vec![paused, behind], &[b]),
+            ["next pass: resumes on b", "flock default is full",],
+            "the job slot the paused task takes is not free twice"
+        );
+    }
+
+    /// A paused task waits on the machine it was paused on, whatever its
+    /// flock or pin, and says for whom it was paused.
+    #[test]
+    fn a_paused_task_waits_on_its_own_machine() {
+        let mut paused = task(3, Some("default"), None);
+        paused.state = TaskState::Paused;
+        paused.machine = Some("b".into());
+        paused.pause.paused_for = Some(9);
+        let full = [
+            view("a", "default", 0, 2, true),
+            view("b", "work", 1, 1, true),
+        ];
+        let e = &entries(vec![paused.clone()], &full, "default", &|_, _| true)[0];
+        assert_eq!(e.why, "paused for t-9; machine b is full (1/1)");
+        assert_eq!(e.place(), "machine b");
+        assert!(e.matches(None, Some("b")));
+        let free = [view("b", "work", 0, 1, true)];
+        assert_eq!(whys(vec![paused], &free), ["next pass: resumes on b"]);
     }
 
     /// Each reason a flock or a pinned machine takes nothing is named.
