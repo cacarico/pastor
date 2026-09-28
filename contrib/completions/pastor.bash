@@ -4073,7 +4073,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__run)
-            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --priority --preempt --profile --worktree --branch --tag --timeout --label --place --role --description --json --head --help"
+            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --priority --preempt --profile --worktree --branch --tag --timeout --label --place --role --summary --description --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4137,6 +4137,10 @@ _pastor() {
                     ;;
                 --role)
                     COMPREPLY=($(compgen -W "agent orchestrator" -- "${cur}"))
+                    return 0
+                    ;;
+                --summary)
+                    COMPREPLY=($(compgen -W "ask require off" -- "${cur}"))
                     return 0
                     ;;
                 --description)
