@@ -29,6 +29,10 @@ pub const IPC_PROTOCOL: u32 = 9;
 /// same user and can unset it.
 pub const TASK_ENV: &str = "PASTOR_TASK";
 
+/// Set in an agent's pane on a machine other than the head's: the ssh
+/// destination (`head_address` in pastor.toml) that reaches the head.
+pub const HEAD_ENV: &str = "PASTOR_HEAD";
+
 /// The field beside a request's own that names the task it comes from.
 pub const FROM_TASK_FIELD: &str = "from_task";
 

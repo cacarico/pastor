@@ -743,7 +743,7 @@ impl std::fmt::Display for FlockDoc {
 /// parses a target that starts with `-` as an option (`-oProxyCommand=...`
 /// runs a local command), and pastor passes it after `--` as well; spaces and
 /// control characters have no place in a `[user@]host`.
-fn ssh_target_problem(target: &str) -> Option<&'static str> {
+pub(crate) fn ssh_target_problem(target: &str) -> Option<&'static str> {
     if target.is_empty() {
         Some("is empty")
     } else if target.starts_with('-') {
