@@ -15,7 +15,7 @@ use crate::config::{
 };
 use crate::dispatch::{Claim, MachineView, pick_machine, pick_machine_where};
 use crate::herdr::{Connector, Endpoint};
-use crate::ipc::{HeadPing, IpcRequest, IpcResponse};
+use crate::ipc::{HeadPing, IpcRequest, IpcResponse, MODEL_PROTOCOL, check_protocol};
 use crate::machine::{
     ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, SendInput,
     SendRefused, ShutdownOutcome, spawn_machine,
@@ -24,16 +24,10 @@ use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{NewTask, PriorityError, RetryError, Store, TaskFilter};
 use crate::task::{AgentSource, PANE_OWNING_STATES, Priority, Task, TaskRole, TaskState};
 
-/// Where a headless serve's fleet sends each item its jobs find
-/// (`IpcRequest::JobTask`): to the head, which answers the task it queued.
-pub type JobTaskForward = Arc<
-    dyn Fn(
-            IpcRequest,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Task>> + Send>>
-        + Send
-        + Sync,
->;
+/// How a headless serve's fleet reaches the head with the items a job run
+/// found (`IpcRequest::JobSubmit`): one request, its reply, or an `Err` for
+/// an unreachable head or an error reply (a `CliError` with its code).
+pub type HeadForward = crate::shepherd::Ask;
 
 /// Builds a machine's transport from its flock entry. `serve` uses
 /// `endpoint_factory`; tests hand out fakes by machine name.
@@ -252,7 +246,7 @@ pub struct Fleet {
     spawner: Option<Spawner>,
     /// Set for a headless serve (`Fleet::headless`): job tasks go to the
     /// head instead of this store, and the head checks their flock.
-    forward: Option<JobTaskForward>,
+    forward: Option<HeadForward>,
     dispatch_lock: tokio::sync::Mutex<()>,
 }
 
@@ -284,7 +278,7 @@ impl Fleet {
     /// A headless serve's fleet: no machines and no flock, and every job
     /// task it queues goes through `forward` to the head. `store` keeps only
     /// the jobs' state and seen keys.
-    pub fn headless(store: Arc<Store>, forward: JobTaskForward) -> Fleet {
+    pub fn headless(store: Arc<Store>, forward: HeadForward) -> Fleet {
         Fleet {
             forward: Some(forward),
             ..Fleet::new(Vec::new(), store)
@@ -838,8 +832,8 @@ impl Fleet {
         item: &serde_json::Value,
         render: impl FnOnce(i64) -> Result<(String, crate::task::DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
-        if let Some(forward) = &self.forward {
-            return self.forward_job_task(forward, job, item).await;
+        if self.forward.is_some() {
+            anyhow::bail!("a headless serve queues nothing here; its runs submit to the head");
         }
         let _pass = self.dispatch_lock.lock().await;
         let flock = self.job_task_flock(job)?;
@@ -870,45 +864,68 @@ impl Fleet {
             })
     }
 
-    /// `queue_job_task` for a headless serve: the head renders and queues
-    /// the task, and the item is marked seen here once it has, since this
-    /// store is the one the job's next run checks.
-    async fn forward_job_task(
+    /// Whether job runs send their items to a head (`Fleet::headless`)
+    /// instead of queueing them here.
+    pub fn submits_to_head(&self) -> bool {
+        self.forward.is_some()
+    }
+
+    /// A headless serve's job run hands the head what it found, in one
+    /// `JobSubmit`: the head keeps the `seen` keys, renders and queues each
+    /// item as that job's task, and dispatches them. The keys it queued or
+    /// had seen are marked seen here too, since this store is the one the
+    /// job's next run checks. An unreachable head, or an error reply such as
+    /// `job_name_taken`, is an `Err` with its code, and nothing is kept.
+    pub async fn submit_to_head(
         &self,
-        forward: &JobTaskForward,
         job: &crate::config::job::Job,
-        item: &serde_json::Value,
-    ) -> anyhow::Result<Task> {
-        let key = item
-            .get("key")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("item has no string key"))?
-            .to_string();
-        let task = forward(IpcRequest::JobTask {
-            job: job.name.clone(),
-            flock: job.flock.clone(),
-            agent: job.agent.clone(),
-            prompt: job.prompt.clone(),
-            spec: job.spec.clone(),
-            item: item.clone(),
-        })
-        .await;
-        // The head answers a key it has seen with the task it queued then,
-        // or `already_seen` once that row is pruned: either way the key is
-        // done, and the run counts it seen rather than hold its cursor.
-        let task = match task {
-            Err(err)
-                if err
-                    .downcast_ref::<crate::cli::CliError>()
-                    .is_some_and(|e| e.code == crate::ipc::ALREADY_SEEN) =>
-            {
-                self.store.mark_seen(&job.name, &key, None)?;
-                return Err(err);
-            }
-            other => other?,
+        items: Vec<serde_json::Value>,
+    ) -> anyhow::Result<crate::scheduler::Submitted> {
+        let Some(forward) = &self.forward else {
+            anyhow::bail!("this pastor serve is the head; it queues its jobs' items itself");
         };
-        self.store.mark_seen(&job.name, &key, Some(task.id))?;
-        Ok(task)
+        // A named model rides in `dispatch`, which only a head of
+        // `MODEL_PROTOCOL` or later reads; an older one would drop it and
+        // start the agent on its default model without a word.
+        if job.agent.model.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(&version, protocol, MODEL_PROTOCOL, "a job naming a model")?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
+        let reply = forward(IpcRequest::JobSubmit {
+            job: job.name.clone(),
+            dispatch: job.dispatch.clone(),
+            prompt: job.prompt.clone(),
+            items,
+        })
+        .await?;
+        let (tasks, skipped, refused) = match reply {
+            IpcResponse::JobSubmitted {
+                tasks,
+                skipped,
+                refused,
+            } => (tasks, skipped, refused),
+            IpcResponse::Error { code, message } => {
+                return Err(crate::cli::CliError::err(&code, message));
+            }
+            other => anyhow::bail!("the head answered a job submit with {other:?}"),
+        };
+        for t in &tasks {
+            if let Some(key) = t.item.get("key").and_then(serde_json::Value::as_str) {
+                self.store.mark_seen(&job.name, key, Some(t.id))?;
+            }
+        }
+        for key in &skipped {
+            self.store.mark_seen(&job.name, key, None)?;
+        }
+        Ok(crate::scheduler::Submitted {
+            tasks,
+            skipped,
+            refused,
+        })
     }
 
     /// `flock remove` with a head running: refuse while queued tasks name
@@ -1911,6 +1928,7 @@ impl Daemon {
                     // A headless serve resolves priority itself before
                     // sending the item; the head does not re-render it.
                     priority: None,
+                    dispatch: serde_json::Value::Null,
                 };
                 self.job_task(job, item).await
             }

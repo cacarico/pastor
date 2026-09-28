@@ -160,8 +160,8 @@ same rendering, path checks and `max_tasks_per_run` cap as its own jobs. It
 answers the tasks queued, the keys skipped as seen, and each refused item with
 its reason (`max_tasks_per_run` for those past the cap; they stay unseen). A
 name the head has a job file for is `job_name_taken`; submitters of one name
-share its seen keys. It needs a head of IPC protocol 4 (`head_too_old`
-otherwise). No command sends it yet.
+share its seen keys. It needs a head of IPC protocol 7 (`head_too_old`
+otherwise). A headless serve (below) sends it for each run of its jobs.
 
 A machine whose requests answer but whose event subscription will not open is
 `polling`: it still takes tasks and is reconciled every `tick`. Two dispatch
@@ -1663,16 +1663,20 @@ it runs the jobs in this machine's `jobs/` and this machine's connector
 hooks, and nothing else. It has no queue, no machine actors and no task
 store, and never reads `flock.toml`.
 
-- Each item a job finds goes to the head as one `JobTask` request, with the
-  job's unrendered prompt, repo and branch, its flock and its agent. The head
-  renders them with the id it gives the task, checks the item's paths and
-  the flock, resolves the agent as for its own jobs and queues and dispatches
-  the task under the job's name. A head that refuses the item, or does not
-  answer, fails the run and holds the job's cursor, as a failed insert does.
-- A key the head has queued for that job before is answered with that task
-  again, so a run whose reply was lost marks the key seen on the next try.
-  Once the head has pruned the task the answer is `already_seen`, and the
-  key is marked seen all the same.
+- The new items a job run finds (not seen here, within `max_tasks_per_run`)
+  go to the head together, in one `job_submit` request with the job's
+  `[dispatch]` table as written and its unrendered prompt. The head applies
+  its own `[defaults]` to what the table leaves out, renders each item with
+  the id it gives the task, checks its paths and the flock, and queues and
+  dispatches the tasks under the job's name. The keys it queued, and those
+  it had seen already (a run whose reply was lost), are marked seen here.
+- A head that does not answer fails the run with `head_unreachable`, and a
+  head with a job file of that name with `job_name_taken`: either counts as
+  a failed run, backing the job off as a failing connector does, and no item
+  is kept, so the next run asks the connector for them again. An item the
+  head refuses for its paths is reported and skipped; one past its cap waits
+  for the next run; any other refusal fails the run and holds the job's
+  cursor, as a failed insert does.
 - Every tick it reads the head's events past its cursor (`EventsSince`) and
   hands them to this machine's hooks in order, saving the cursor after each.
   The first time it reaches the head it skips the head's history and starts
@@ -1703,7 +1707,7 @@ store, and never reads `flock.toml`.
 
 `pastor setup systemd` (or `launchd`) installs it the same way: the unit
 runs `pastor serve`, which reads the head from `client.toml`. The head
-needs this pastor's protocol (9) for `JobTask`.
+needs IPC protocol 7 or later for `job_submit`.
 
 ### Jobs on a shepherd
 

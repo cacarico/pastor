@@ -100,6 +100,11 @@ pub struct Job {
     /// `dispatch.priority`, still a template: `priority_for` renders it for
     /// one item.
     pub priority: Option<String>,
+    /// The `[dispatch]` table as written, as JSON and without `prompt`: what
+    /// a headless serve sends the head with its items (`IpcRequest::
+    /// JobSubmit`), so the head applies its own `[defaults]` to what the
+    /// file leaves out. `Null` for a job the head built from a `JobTask`.
+    pub dispatch: Value,
 }
 
 impl Job {
@@ -113,6 +118,13 @@ impl Job {
         catalog: &dyn Catalog,
     ) -> Result<Job, String> {
         let file: JobFile = toml::from_str(text).map_err(|e| e.to_string())?;
+        let raw: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        let dispatch = raw
+            .get("dispatch")
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(Value::Null);
         let name = file.name.clone().unwrap_or_else(|| stem.to_string());
         if name != stem {
             return Err(format!(
@@ -136,6 +148,10 @@ impl Job {
             file.dispatch,
             defaults,
         )
+        .map(|job| Job {
+            dispatch: Value::Object(table_without_prompt(&dispatch)),
+            ..job
+        })
     }
 
     /// A job another machine runs and submits items for (`IpcRequest::
@@ -167,6 +183,10 @@ impl Job {
             d,
             defaults,
         )
+        .map(|job| Job {
+            dispatch: Value::Object(table_without_prompt(dispatch)),
+            ..job
+        })
     }
 
     /// The `[dispatch]` checks and defaults, shared by a job file and a
@@ -285,6 +305,7 @@ impl Job {
             flock: d.flock,
             priority: d.priority,
             agent,
+            dispatch: Value::Null,
             spec: DispatchSpec {
                 agent: pick.agent,
                 agent_args: pick.agent_args,
@@ -354,6 +375,13 @@ impl Job {
 /// outside a full `Job::parse` (the CLI's `enable`/`disable`) can reject a
 /// name before joining it under the jobs directory: an unvalidated name like
 /// `"../pastor"` resolves outside it entirely.
+/// A `[dispatch]` table with `prompt` removed, since it travels beside it.
+fn table_without_prompt(table: &Value) -> serde_json::Map<String, Value> {
+    let mut map = table.as_object().cloned().unwrap_or_default();
+    map.remove("prompt");
+    map
+}
+
 pub fn check_name(name: &str) -> Result<(), String> {
     let first_ok = name
         .chars()
@@ -898,6 +926,24 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         )
         .unwrap_err();
         assert!(err.contains("prompt is required"), "{err}");
+    }
+
+    /// A job keeps its `[dispatch]` table as written, less the prompt, for
+    /// a headless serve to submit: the head builds the same job from it.
+    #[test]
+    fn a_job_keeps_its_dispatch_table_for_the_head() {
+        let file = Job::parse(SPEC_EXAMPLE, "support-slack", &defaults(), &Builtins).unwrap();
+        assert!(file.dispatch.get("prompt").is_none(), "{:?}", file.dispatch);
+        assert_eq!(file.dispatch["repo"], "~/work/support");
+        assert_eq!(file.dispatch["timeout"], "2h");
+        assert!(file.dispatch.get("place").is_none(), "the head's default");
+        let sub =
+            Job::submitted("support-slack", &file.dispatch, &file.prompt, &defaults()).unwrap();
+        assert_eq!(sub.spec, file.spec);
+        assert_eq!(sub.agent, file.agent);
+        assert_eq!(sub.flock, file.flock);
+        assert_eq!(sub.prompt, file.prompt);
+        assert_eq!(sub.dispatch, file.dispatch);
     }
 
     /// A submitted job's `[dispatch]` is the job file's, checked the same
