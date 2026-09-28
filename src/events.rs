@@ -691,6 +691,7 @@ mod tests {
                     place: Default::default(),
                     session_id: None,
                     label: Default::default(),
+                    summary: Default::default(),
                 },
                 flock: "work".into(),
             })

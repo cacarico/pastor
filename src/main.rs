@@ -280,6 +280,11 @@ struct RunArgs {
     /// orchestrator, never a task
     #[arg(long, value_enum, value_name = "ROLE", default_value_t = TaskRole::Agent)]
     role: TaskRole,
+    /// Ask the agent for a summary when it finishes (ask), also fail the
+    /// task if it stops without one (require), or neither (off) (default:
+    /// the flock's `summary`, else `[defaults] summary`, else ask)
+    #[arg(long, value_enum, value_name = "MODE")]
+    summary: Option<pastor::task::SummaryMode>,
     /// One line on what the task is about, for `task list --wide` and
     /// `describe` (default: the prompt's first line)
     #[arg(long, value_name = "TEXT")]
@@ -1232,6 +1237,12 @@ fn needs_preempt_protocol(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` sends `task run --summary`, which only a head of
+/// `SUMMARY_MODE_PROTOCOL` or later honours.
+fn needs_summary_mode_protocol(command: &Command) -> bool {
+    matches!(command, Command::Task { cmd: TaskCmd::Run(a) } if a.summary.is_some())
+}
+
 /// Whether `command` sends a summary, or asks for every round's, which only
 /// a head of `SUMMARY_PROTOCOL` or later keeps or knows: `task done
 /// --summary|--summary-file` and `task describe --all-summaries`.
@@ -1327,7 +1338,12 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_label_protocol(command) {
+    if needs_summary_mode_protocol(command) {
+        Some((
+            pastor::ipc::SUMMARY_MODE_PROTOCOL,
+            "predates the summary setting, and would queue the task without --summary",
+        ))
+    } else if needs_label_protocol(command) {
         Some((
             pastor::ipc::LABEL_PROTOCOL,
             "predates workspace labels and would name the workspace t-N",
@@ -1484,6 +1500,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
             role: a.role,
             description: pastor::config::clean_description(a.description.as_deref()),
             preempt: a.preempt,
+            summary: a.summary,
         },
     )
     .await?
@@ -1542,6 +1559,7 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
             template: a.label.clone(),
             ..Default::default()
         },
+        summary: Default::default(),
     })
 }
 
@@ -3257,6 +3275,25 @@ mod tests {
         assert_eq!(
             need(&["pastor", "task", "priority", "t-1", "critical", "--preempt"]),
             Some(pastor::ipc::PREEMPT_PROTOCOL)
+        );
+    }
+
+    /// `task run --summary` needs a head that knows the setting; a run
+    /// without it does not.
+    #[test]
+    fn summary_setting_needs_a_head_that_knows_it() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
+        assert_eq!(
+            need(&["pastor", "task", "run", "hi", "--summary", "require"]),
+            Some(pastor::ipc::SUMMARY_MODE_PROTOCOL)
+        );
+        assert_ne!(
+            need(&["pastor", "task", "run", "hi"]),
+            Some(pastor::ipc::SUMMARY_MODE_PROTOCOL)
+        );
+        assert!(
+            Cli::try_parse_from(["pastor", "task", "run", "hi", "--summary", "always"]).is_err()
         );
     }
 

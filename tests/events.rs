@@ -46,6 +46,7 @@ fn task(id: i64) -> Task {
                 place: Default::default(),
                 session_id: None,
                 label: Default::default(),
+                summary: Default::default(),
             },
             flock: "default".into(),
         })
@@ -253,6 +254,7 @@ async fn the_daemon_writes_the_events_log() {
         &IpcRequest::Run {
             role: Default::default(),
             preempt: false,
+            summary: None,
             description: None,
             prompt: "hi".into(),
             spec: DispatchSpec {
@@ -272,6 +274,7 @@ async fn the_daemon_writes_the_events_log() {
                 place: Default::default(),
                 session_id: None,
                 label: Default::default(),
+                summary: Default::default(),
             },
             flock: None,
             agent: None,

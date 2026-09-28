@@ -425,10 +425,11 @@ async fn dispatch_steps(
             created.root_pane.pane_id
         }
     };
+    // A resumed session already has the line asking for a summary.
     let prompt = if resume {
         crate::task::RESUME_PROMPT.to_string()
     } else {
-        task.prompt.clone()
+        crate::task::prompt_to_send(task)
     };
     finish_dispatch(
         conn,
@@ -1009,6 +1010,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         }
     }
 
@@ -1381,7 +1383,41 @@ mod tests {
         );
         let prompt = reqs.iter().find(|r| r.method == "agent.prompt").unwrap();
         assert_eq!(prompt.params["target"], "t-7");
-        assert_eq!(prompt.params["text"], "line one\n\"two\" {{ three }}");
+        // The prompt as stored, then the line asking for a summary.
+        assert_eq!(
+            prompt.params["text"],
+            format!(
+                "line one\n\"two\" {{{{ three }}}}\n\n{}",
+                crate::task::SUMMARY_ASK
+            )
+        );
+        assert_eq!(t.prompt, "line one\n\"two\" {{ three }}", "not stored");
+    }
+
+    /// `summary = "off"` sends the prompt alone; `require` adds the
+    /// warning after the line that asks.
+    #[tokio::test]
+    async fn dispatch_asks_for_a_summary_as_the_task_is_set() {
+        use crate::task::{SUMMARY_REQUIRE, SummaryMode};
+        let sent = |mode: SummaryMode| async move {
+            let fake = FakeHerdr::new();
+            let mut t = task(DispatchSpec {
+                summary: mode,
+                ..spec()
+            });
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            let reqs = fake.requests();
+            let prompt = reqs.iter().find(|r| r.method == "agent.prompt").unwrap();
+            prompt.params["text"].as_str().unwrap().to_string()
+        };
+        assert_eq!(
+            sent(SummaryMode::Off).await,
+            "line one\n\"two\" {{ three }}"
+        );
+        let required = sent(SummaryMode::Require).await;
+        assert!(required.ends_with(SUMMARY_REQUIRE), "{required}");
     }
 
     /// The workspace takes the label template rendered; the agent, which

@@ -469,6 +469,11 @@ pub struct Defaults {
     pub profile: Option<String>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
+    /// Whether tasks whose run flags, job and flock say nothing are asked
+    /// for a summary, or need one (`SummaryMode`); unset, `ask`. See
+    /// `resolve_summary`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::task::SummaryMode>,
     /// Where a task's pane goes when its run flags and job say nothing
     /// (`task::Place`).
     #[serde(skip_serializing_if = "crate::task::Place::is_repo")]
@@ -806,6 +811,19 @@ impl Defaults {
         .find_map(|(layer, p)| Some((p?, Some(layer))))
         .unwrap_or_default()
     }
+
+    /// A task's `summary` setting: from the first of `ask` (`task run
+    /// --summary`, a job's `[dispatch] summary`), its flock and these
+    /// defaults that sets one; `ask` from none.
+    pub fn resolve_summary(
+        &self,
+        ask: Option<crate::task::SummaryMode>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> crate::task::SummaryMode {
+        ask.or_else(|| flock.and_then(|f| f.summary))
+            .or(self.summary)
+            .unwrap_or_default()
+    }
 }
 
 impl Defaults {
@@ -842,6 +860,7 @@ impl Default for Defaults {
             profile: None,
             max_tasks_per_run: 5,
             timeout: "2h".into(),
+            summary: None,
             place: crate::task::Place::Repo,
             label: None,
         }
@@ -1935,6 +1954,53 @@ mod tests {
         assert!(err.contains("profiles.ci") && err.contains("nope"), "{err}");
     }
 
+    /// `summary` comes from the first of the ask (`task run`, the job), the
+    /// flock and `[defaults]` that sets one; with none it is `ask`.
+    #[test]
+    fn the_summary_setting_comes_from_the_first_layer_that_sets_one() {
+        use crate::task::SummaryMode;
+        let d = Defaults {
+            summary: Some(SummaryMode::Off),
+            ..Default::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "p".into(),
+            summary: Some(SummaryMode::Require),
+            ..Default::default()
+        };
+        assert_eq!(
+            d.resolve_summary(Some(SummaryMode::Ask), Some(&flock)),
+            SummaryMode::Ask
+        );
+        assert_eq!(d.resolve_summary(None, Some(&flock)), SummaryMode::Require);
+        assert_eq!(
+            d.resolve_summary(None, Some(&flock::FlockEntry::default())),
+            SummaryMode::Off
+        );
+        assert_eq!(
+            Defaults::default().resolve_summary(None, None),
+            SummaryMode::Ask
+        );
+    }
+
+    /// `[defaults] summary` loads as one of its words; a file without it
+    /// loads as before, and asks; another word fails the load.
+    #[test]
+    fn defaults_summary_loads_and_is_ask_when_absent() {
+        use crate::task::SummaryMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "[defaults]\nagent = \"claude\"\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.summary, None);
+        assert_eq!(cfg.defaults.resolve_summary(None, None), SummaryMode::Ask);
+        std::fs::write(&path, "[defaults]\nsummary = \"require\"\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.summary, Some(SummaryMode::Require));
+        std::fs::write(&path, "[defaults]\nsummary = \"always\"\n").unwrap();
+        assert!(PastorConfig::load(&path).is_err());
+    }
+
     /// The level comes from the first of the ask, the pinned machine, the
     /// flock and `[defaults]` that sets one; with none it is `normal`.
     #[test]
@@ -2233,6 +2299,7 @@ mod tests {
             place: Default::default(),
             session_id: None,
             label: Default::default(),
+            summary: Default::default(),
         }
     }
 

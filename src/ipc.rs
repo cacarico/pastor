@@ -26,7 +26,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `TaskPriority::preempt`). 17: task summaries (`TaskDone::summary`,
 /// `TaskSummaries`). 18: a machine in many flocks, each with its own number
 /// (`FlockEntry::machines`). 19: workspace labels (`DispatchSpec::label`).
-pub const IPC_PROTOCOL: u32 = 19;
+/// 20: the `summary` setting (`Run::summary`, a job's `[dispatch]
+/// summary`).
+pub const IPC_PROTOCOL: u32 = 20;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -140,6 +142,11 @@ pub const PREEMPT_PROTOCOL: u32 = 16;
 /// word, or refuse the request as unreadable.
 pub const SUMMARY_PROTOCOL: u32 = 17;
 
+/// The first protocol whose head honours `Run::summary` and a job's
+/// `[dispatch] summary`. An older one would ask for a summary on its own
+/// terms, or refuse the job's dispatch table as unreadable.
+pub const SUMMARY_MODE_PROTOCOL: u32 = 20;
+
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.
 pub fn check_protocol(version: &str, protocol: u32, needed: u32, what: &str) -> anyhow::Result<()> {
@@ -190,6 +197,12 @@ pub enum IpcRequest {
         /// `PREEMPT_PROTOCOL` or later.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         preempt: bool,
+        /// `task run --summary`; `None` lets the flock or `[defaults]`
+        /// decide. Left out when not given, so an older head still reads
+        /// the request; given, the CLI sends it only to a head of
+        /// `SUMMARY_MODE_PROTOCOL` or later.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<crate::task::SummaryMode>,
     },
     List {
         filter: TaskFilter,
@@ -915,6 +928,7 @@ mod tests {
                 place: Default::default(),
                 session_id: None,
                 label: Default::default(),
+                summary: Default::default(),
             },
             machine: None,
             workspace_id: None,
@@ -1140,6 +1154,7 @@ mod tests {
         vec![
             IpcRequest::Run {
                 preempt: false,
+                summary: None,
                 description: None,
                 prompt: "p".into(),
                 spec: minimal_task().spec,
@@ -1290,6 +1305,7 @@ mod tests {
     fn run_names_its_role_only_when_not_a_plain_agent() {
         let run = |role| IpcRequest::Run {
             preempt: false,
+            summary: None,
             prompt: "p".into(),
             spec: minimal_task().spec,
             flock: None,

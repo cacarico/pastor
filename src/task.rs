@@ -211,6 +211,12 @@ pub struct DispatchSpec {
     /// template, where it came from, and what the workspace was called.
     #[serde(default, skip_serializing_if = "WorkspaceLabel::is_unset")]
     pub label: WorkspaceLabel,
+    /// Whether pastor asks the agent for a summary when it sends the
+    /// prompt, and whether the task needs one to succeed (`SummaryMode`),
+    /// as resolved when the task was queued. Left out of the JSON when it
+    /// is `ask`, so a spec from before it reads as `ask`.
+    #[serde(default, skip_serializing_if = "SummaryMode::is_ask")]
+    pub summary: SummaryMode,
 }
 
 /// The label template a task's own workspace gets when no layer sets one.
@@ -295,6 +301,97 @@ pub fn render_label(template: Option<&str>, task: &Task) -> Result<String, Strin
         return Err("it renders empty".into());
     }
     Ok(text.to_string())
+}
+
+/// The `summary` setting: `task run --summary`, a job's `[dispatch]
+/// summary`, a flock's or `[defaults]`, the most specific first
+/// (`Defaults::resolve_summary`). `ask` adds `SUMMARY_ASK` to every prompt
+/// pastor sends; `require` adds it and `SUMMARY_REQUIRE`, refuses the
+/// agent's own `task done` without a summary and fails a task that goes
+/// idle without one; `off` adds nothing and requires nothing.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryMode {
+    /// Add the line that asks for a summary to the prompt
+    #[default]
+    Ask,
+    /// Ask, and fail the task if its agent stops without one
+    Require,
+    /// Add nothing and require nothing
+    Off,
+}
+
+/// The code of a `summary` that is not one of `SummaryMode`'s.
+pub const UNKNOWN_SUMMARY_MODE: &str = "unknown_summary_mode";
+
+/// The paragraph pastor adds to a task's prompt when it sends it, unless
+/// the task's `summary` is `off`. Not stored in the task's prompt.
+pub const SUMMARY_ASK: &str = "When you finish, run `pastor task done --summary-file -` with a short summary on stdin: first line `done`, `partial`, `blocked` or `nothing to do`; then up to five short lines: what changed, where (branch, PR, files or notes), what is left.";
+
+/// Added after `SUMMARY_ASK` for a task whose `summary` is `require`.
+pub const SUMMARY_REQUIRE: &str = "pastor fails this task if you stop without one.";
+
+/// The error of a `require` task whose agent went idle without a summary.
+pub const STOPPED_WITHOUT_SUMMARY: &str = "stopped without a summary";
+
+/// The code of an agent's own `task done` without a summary on a
+/// `require` task.
+pub const SUMMARY_REQUIRED: &str = "summary_required";
+
+/// The text of the round a person ends by hand (`task done t-N` from
+/// outside the task's pane) on a `require` task, with no summary.
+pub const ENDED_BY_HAND: &str = "no summary (ended by hand)";
+
+impl SummaryMode {
+    pub const ALL: [SummaryMode; 3] = [SummaryMode::Ask, SummaryMode::Require, SummaryMode::Off];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SummaryMode::Ask => "ask",
+            SummaryMode::Require => "require",
+            SummaryMode::Off => "off",
+        }
+    }
+
+    pub fn is_ask(&self) -> bool {
+        *self == SummaryMode::Ask
+    }
+
+    /// The paragraph that asks for a summary, `None` for `off`.
+    pub fn ask_line(&self) -> Option<String> {
+        match self {
+            SummaryMode::Ask => Some(SUMMARY_ASK.to_string()),
+            SummaryMode::Require => Some(format!("{SUMMARY_ASK} {SUMMARY_REQUIRE}")),
+            SummaryMode::Off => None,
+        }
+    }
+
+    /// What `task describe` says about it.
+    pub fn describe(&self) -> String {
+        match self {
+            SummaryMode::Ask => "ask (line added to the prompt)".into(),
+            SummaryMode::Require => "require (line added to the prompt; fails without one)".into(),
+            SummaryMode::Off => "off (nothing added to the prompt)".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SummaryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SummaryMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        SummaryMode::ALL
+            .into_iter()
+            .find(|m| m.as_str() == s)
+            .ok_or_else(|| format!("unknown summary {s:?}; use ask, require or off"))
+    }
 }
 
 /// Where dispatch puts a task's pane: `--place`, a job's `[dispatch] place`
@@ -656,6 +753,15 @@ pub const RESUME_GRACE: chrono::Duration = chrono::Duration::minutes(10);
 
 /// What a paused task's agent is told once its session is open again: it
 /// was stopped mid-turn, and the prompt is already in its conversation.
+/// The text dispatch sends a task's agent: its prompt, then, after a
+/// blank line, the paragraph its `summary` setting adds (`ask_line`).
+pub fn prompt_to_send(task: &Task) -> String {
+    match task.spec.summary.ask_line() {
+        Some(line) => format!("{}\n\n{line}", task.prompt.trim_end()),
+        None => task.prompt.clone(),
+    }
+}
+
 pub const RESUME_PROMPT: &str = "pastor paused this session for a critical task and has now resumed it; carry on where you left off.";
 
 /// A task's part in pausing: whether it may pause a `low` task to start
@@ -1237,6 +1343,7 @@ mod tests {
                 place: Default::default(),
                 session_id: None,
                 label: Default::default(),
+                summary: Default::default(),
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),
@@ -1814,5 +1921,46 @@ mod tests {
                 .count(),
             SUMMARY_MAX
         );
+    }
+
+    /// `summary` reads and writes as its word; a spec that says nothing is
+    /// `ask`, and `ask` is left out of the JSON.
+    #[test]
+    fn summary_mode_round_trips_and_defaults_to_ask() {
+        for m in SummaryMode::ALL {
+            assert_eq!(m.as_str().parse::<SummaryMode>().unwrap(), m);
+            assert_eq!(serde_json::to_value(m).unwrap(), m.as_str());
+        }
+        assert!("Ask".parse::<SummaryMode>().is_err());
+        let old: DispatchSpec =
+            serde_json::from_value(serde_json::json!({"agent": "claude"})).unwrap();
+        assert_eq!(old.summary, SummaryMode::Ask);
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("summary"), "the default is left out: {text}");
+        let mut req = old.clone();
+        req.summary = SummaryMode::Require;
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["summary"], "require");
+    }
+
+    /// The prompt pastor sends ends with the paragraph asking for a
+    /// summary, after a blank line, for `ask` and `require`; `off` sends
+    /// the prompt alone. The stored prompt never changes.
+    #[test]
+    fn the_prompt_sent_asks_for_a_summary_unless_off() {
+        let mut t = task(TaskState::Queued, None);
+        t.prompt = "fix it\n".into();
+        assert_eq!(prompt_to_send(&t), format!("fix it\n\n{SUMMARY_ASK}"));
+        assert!(SUMMARY_ASK.contains("pastor task done --summary-file -"));
+        t.spec.summary = SummaryMode::Require;
+        let sent = prompt_to_send(&t);
+        assert!(
+            sent.starts_with(&format!("fix it\n\n{SUMMARY_ASK}")),
+            "{sent}"
+        );
+        assert!(sent.ends_with(SUMMARY_REQUIRE), "{sent}");
+        t.spec.summary = SummaryMode::Off;
+        assert_eq!(prompt_to_send(&t), "fix it\n");
+        assert_eq!(t.prompt, "fix it\n");
     }
 }
