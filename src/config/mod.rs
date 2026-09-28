@@ -463,11 +463,11 @@ pub struct Defaults {
     pub allow: Vec<String>,
     /// Tool patterns every task's agent must never use; wins over `allow`.
     pub deny: Vec<String>,
-    /// The `[models]` entry tasks run when their run flags, job, machine and
-    /// flock name none. See `resolve_agent`.
+    /// The `[models]` entry tasks run when their run flags, job, flock and
+    /// machine name none. See `resolve_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The level of tasks whose run flags, job, pinned machine and flock
+    /// The level of tasks whose run flags, job, flock and pinned machine
     /// name none; unset, `normal`. See `resolve_priority`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::task::Priority>,
@@ -476,7 +476,7 @@ pub struct Defaults {
     #[serde(skip_serializing_if = "KindAgents::is_empty")]
     pub agents: KindAgents,
     /// The permission profile tasks run under when their run flags, job,
-    /// machine and flock name none. See `resolve_agent`.
+    /// flock and machine name none. See `resolve_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     pub max_tasks_per_run: u32,
@@ -512,13 +512,22 @@ pub struct AgentChoice {
     /// Tool patterns added to the flock's and `[defaults]` deny lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
-    /// A `[models]` name, before the machine's, the flock's and `[defaults]`.
+    /// A `[models]` name, before the flock's, the machine's and `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// A permission profile, before the machine's, the flock's and
+    /// A permission profile, before the flock's, the machine's and
     /// `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// `--timeout` or a job's `[dispatch] timeout`, in seconds, before the
+    /// flock's and `[defaults]` (`Defaults::resolve_timeout`). Unset from a
+    /// client that predates flock timeouts: the spec's own then stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// `--place` or a job's `[dispatch] place`, before the flock's and
+    /// `[defaults]` (`Defaults::resolve_place`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<crate::task::Place>,
 }
 
 /// Where a task's agent, or its args, came from (`Defaults::resolve_agent_on`).
@@ -555,6 +564,10 @@ pub struct AgentPick {
     /// The permission profile the task runs under, and the layer that named
     /// it; `None` when no layer names one. `Profiles::apply` adds its lists.
     pub profile: Option<(String, Layer)>,
+    /// The kind of the agent the flock names, when the machine runs another
+    /// kind and has no agent of this one (`Defaults::resolve_agent_for`):
+    /// the task cannot run there.
+    pub missing_kind: Option<String>,
 }
 
 /// `agents = { <kind> = "<agent>" }` on a machine, a flock or `[defaults]`:
@@ -644,7 +657,10 @@ impl Defaults {
 
     /// `resolve_agent` for a task on `machine`: its `agent` and
     /// `agent_args` come between the ask and the flock's, so machines of
-    /// one flock can run different agents. Tool lists stay per flock.
+    /// one flock can run different agents, each the one installed and
+    /// logged in there. The `model` and `profile` come from the flock
+    /// before the machine: a project's flock sets them on a shared machine.
+    /// Tool lists stay per flock.
     pub fn resolve_agent_on(
         &self,
         ask: &AgentChoice,
@@ -699,16 +715,16 @@ impl Defaults {
             .unwrap_or_default();
         let model = [
             (Layer::Ask, ask.model.as_ref()),
-            (Layer::Machine, machine.and_then(|m| m.model.as_ref())),
             (Layer::Flock, flock.and_then(|f| f.model.as_ref())),
+            (Layer::Machine, machine.and_then(|m| m.model.as_ref())),
             (Layer::Defaults, self.model.as_ref()),
         ]
         .into_iter()
         .find_map(|(layer, name)| Some((name?.clone(), layer)));
         let profile = [
             (Layer::Ask, ask.profile.as_ref()),
-            (Layer::Machine, machine.and_then(|m| m.profile.as_ref())),
             (Layer::Flock, flock.and_then(|f| f.profile.as_ref())),
+            (Layer::Machine, machine.and_then(|m| m.profile.as_ref())),
             (Layer::Defaults, self.profile.as_ref()),
         ]
         .into_iter()
@@ -723,11 +739,14 @@ impl Defaults {
             model,
             by_kind: false,
             profile,
+            missing_kind: None,
         }
     }
 
-    /// `resolve_agent_on`, then, when the task's model runs on another kind
-    /// than that agent's, the agent for the model's kind: at the machine,
+    /// `resolve_agent_on`, then, for a task with no model, the machine's
+    /// agent of the kind its flock's agent is (`flock_kind_on`). When the
+    /// task's model runs on another kind than that agent's, the model's
+    /// kind decides instead, and the agent is the one for it: at the machine,
     /// the flock and these defaults in turn, the layer's `agent` if it is
     /// of that kind, else its `agents` entry for it. An agent the task or
     /// job named itself is kept, as is the first agent when no layer has
@@ -749,7 +768,7 @@ impl Defaults {
             .and_then(|(name, _)| models.0.get(name))
             .map(|def| def.kind.as_str())
         else {
-            return pick;
+            return self.flock_kind_on(pick, ask, machine, flock, agents);
         };
         if pick.agent_from == Layer::Ask || agents.kind(&pick.agent) == kind {
             return pick;
@@ -799,11 +818,76 @@ impl Defaults {
             ..pick
         }
     }
+
+    /// The agent the flock names, on `machine`: the machine keeps choosing
+    /// it, but of the flock agent's kind. Its `agent` when that is of the
+    /// kind, else its `agents` entry for the kind; a machine that names no
+    /// agent runs the flock's. A machine whose `agent` is of another kind
+    /// and has no entry for this one cannot run the task (`missing_kind`).
+    /// An agent the task or job named is kept.
+    fn flock_kind_on(
+        &self,
+        pick: AgentPick,
+        ask: &AgentChoice,
+        machine: Option<&flock::MachineConfig>,
+        flock: Option<&flock::FlockEntry>,
+        agents: &Agents,
+    ) -> AgentPick {
+        let (Some(m), Some(wanted)) = (machine, flock.and_then(|f| f.agent.as_deref())) else {
+            return pick;
+        };
+        if ask.agent.is_some() {
+            return pick;
+        }
+        let kind = agents.kind(wanted);
+        if agents.kind(&pick.agent) == kind {
+            return pick;
+        }
+        let Some(agent) = m.agents.get(kind) else {
+            if m.agent.is_some() {
+                return AgentPick {
+                    missing_kind: Some(kind.to_string()),
+                    ..pick
+                };
+            }
+            return pick;
+        };
+        // Args only from a layer written for this very agent, as for a
+        // model's kind: the machine's and the flock's are for their own.
+        let (args_from, agent_args) = [
+            (Layer::Ask, None, ask.agent_args.as_ref()),
+            (Layer::Machine, m.agent.as_deref(), m.agent_args.as_ref()),
+            (
+                Layer::Flock,
+                Some(wanted),
+                flock.and_then(|f| f.agent_args.as_ref()),
+            ),
+            (
+                Layer::Defaults,
+                Some(self.agent.as_str()),
+                Some(&self.agent_args),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(layer, own, args)| {
+            args.filter(|_| own.is_none_or(|a| a == agent))
+                .map(|a| (Some(layer), a.clone()))
+        })
+        .unwrap_or_default();
+        AgentPick {
+            agent: agent.clone(),
+            agent_args,
+            agent_from: Layer::Machine,
+            args_from,
+            by_kind: true,
+            ..pick
+        }
+    }
 }
 
 impl Defaults {
     /// A task's level: from the first of `ask` (`--priority`, a job's
-    /// `priority`), the machine it is pinned to, its flock and these
+    /// `priority`), its flock, the machine it is pinned to and these
     /// defaults that sets one, and the layer that did; `normal` from none.
     /// Only a pinned task has a machine here: an unpinned one is queued
     /// before any machine is picked, and its level is settled then.
@@ -815,13 +899,69 @@ impl Defaults {
     ) -> (crate::task::Priority, Option<Layer>) {
         [
             (Layer::Ask, ask),
-            (Layer::Machine, pinned.and_then(|m| m.priority)),
             (Layer::Flock, flock.and_then(|f| f.priority)),
+            (Layer::Machine, pinned.and_then(|m| m.priority)),
             (Layer::Defaults, self.priority),
         ]
         .into_iter()
         .find_map(|(layer, p)| Some((p?, Some(layer))))
         .unwrap_or_default()
+    }
+
+    /// A task's timeout in seconds: from the first of `ask` (`--timeout`, a
+    /// job's `[dispatch] timeout`), its flock and these defaults, and the
+    /// layer that set it. No machine layer: a machine has no `timeout`.
+    /// Both files are checked on load; one that no longer parses is passed
+    /// over.
+    pub fn resolve_timeout(
+        &self,
+        ask: Option<u64>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> (u64, Layer) {
+        let secs = |t: &str| parse_duration(t).ok().map(|d| d.as_secs());
+        [
+            (Layer::Ask, ask),
+            (
+                Layer::Flock,
+                flock.and_then(|f| f.timeout.as_deref()).and_then(secs),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(layer, t)| Some((t?, layer)))
+        .unwrap_or_else(|| {
+            let t = duration_or_default(&self.timeout, &Defaults::default().timeout);
+            (t.as_secs(), Layer::Defaults)
+        })
+    }
+
+    /// Where a task's pane goes: from the first of `ask` (`--place`, a
+    /// job's `[dispatch] place`), its flock and these defaults, and the
+    /// layer that set it. No machine layer, as for `resolve_timeout`.
+    pub fn resolve_place(
+        &self,
+        ask: Option<&crate::task::Place>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> (crate::task::Place, Layer) {
+        match (ask, flock.and_then(|f| f.place.as_ref())) {
+            (Some(p), _) => (p.clone(), Layer::Ask),
+            (None, Some(p)) => (p.clone(), Layer::Flock),
+            (None, None) => (self.place.clone(), Layer::Defaults),
+        }
+    }
+
+    /// The machine's own profile, which decides whether a task may ask for
+    /// `unrestricted` on it (`Profiles::apply`): its `profile`, else its
+    /// flock's, else these defaults'. The machine comes first here, unlike
+    /// the profile a task runs under, so a flock's never lifts it.
+    pub fn own_profile(
+        &self,
+        machine: Option<&flock::MachineConfig>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> Option<String> {
+        machine
+            .and_then(|m| m.profile.clone())
+            .or_else(|| flock.and_then(|f| f.profile.clone()))
+            .or_else(|| self.profile.clone())
     }
 
     /// A task's `summary` setting: from the first of `ask` (`task run
@@ -1197,6 +1337,11 @@ pub fn check_profile_name(name: &str) -> Result<(), String> {
 
 /// The code of a model whose kind is not the task's agent's.
 pub const MODEL_KIND_MISMATCH: &str = "model_kind_mismatch";
+
+/// The code of a task whose flock names an agent of a kind the machine has
+/// no agent of (`AgentPick::missing_kind`): an unpinned task skips that
+/// machine, as for `MODEL_KIND_MISMATCH`.
+pub const AGENT_KIND_MISSING: &str = "agent_kind_missing";
 
 /// Why a task's agent cannot run as resolved: a stable code for the CLI's
 /// error and a message.
@@ -2123,13 +2268,15 @@ mod tests {
             d.resolve_priority(Some(Priority::Normal), Some(&machine), Some(&flock)),
             (Priority::Normal, Some(Layer::Ask))
         );
+        // The flock before the machine: a project's flock sets the level
+        // on a shared machine.
         assert_eq!(
             d.resolve_priority(None, Some(&machine), Some(&flock)),
-            (Priority::Critical, Some(Layer::Machine))
+            (Priority::High, Some(Layer::Flock))
         );
         assert_eq!(
-            d.resolve_priority(None, None, Some(&flock)),
-            (Priority::High, Some(Layer::Flock))
+            d.resolve_priority(None, Some(&machine), None),
+            (Priority::Critical, Some(Layer::Machine))
         );
         assert_eq!(
             d.resolve_priority(None, None, None),
@@ -2194,11 +2341,11 @@ mod tests {
         );
         assert_eq!(
             model(d.resolve_agent_on(&ask(None), Some(&machine), Some(&flock))),
-            ("haiku".into(), Layer::Machine)
+            ("sonnet".into(), Layer::Flock)
         );
         assert_eq!(
-            model(d.resolve_agent(&ask(None), Some(&flock))),
-            ("sonnet".into(), Layer::Flock)
+            model(d.resolve_agent_on(&ask(None), Some(&machine), None)),
+            ("haiku".into(), Layer::Machine)
         );
         assert_eq!(
             model(d.resolve_agent(&ask(None), None)),
@@ -2321,6 +2468,125 @@ mod tests {
         assert_eq!(p.agent, "claude");
         let err = models.apply(&p, &agents, &mut spec).unwrap_err();
         assert!(!err.message.contains("agents."), "{err}");
+    }
+
+    /// A flock's timeout and place come after the task's or job's and
+    /// before `[defaults]`; a flock's timeout is checked on load.
+    #[test]
+    fn a_flocks_timeout_and_place_come_before_the_defaults() {
+        use crate::task::Place;
+        let d = Defaults::default();
+        let flock: flock::FlockEntry =
+            toml::from_str("name = \"p\"\ntimeout = \"30m\"\nplace = \"pastor\"\n").unwrap();
+        assert_eq!(d.resolve_timeout(Some(60), Some(&flock)), (60, Layer::Ask));
+        assert_eq!(d.resolve_timeout(None, Some(&flock)), (1800, Layer::Flock));
+        assert_eq!(d.resolve_timeout(None, None), (7200, Layer::Defaults));
+        let own = Place::Own;
+        assert_eq!(
+            d.resolve_place(Some(&own), Some(&flock)),
+            (Place::Own, Layer::Ask)
+        );
+        assert_eq!(
+            d.resolve_place(None, Some(&flock)),
+            (Place::Pastor, Layer::Flock)
+        );
+        assert_eq!(d.resolve_place(None, None), (Place::Repo, Layer::Defaults));
+
+        let f: flock::Flock = toml::from_str(
+            "[[machine]]\nname = \"m\"\nlocal = true\n[[flock]]\nname = \"p\"\ndefault = true\ntimeout = \"soon\"\n",
+        )
+        .unwrap();
+        let err = f.validate().unwrap_err();
+        assert!(err.contains("flock p: timeout"), "{err}");
+        assert!(
+            toml::from_str::<flock::FlockEntry>("name = \"p\"\nplace = \"nowhere\"\n").is_err()
+        );
+    }
+
+    /// A flock that names an agent sets its kind; the machine picks which
+    /// agent of that kind runs: its `agent` if of the kind, else its
+    /// `agents` entry. A machine whose agent is of another kind and has no
+    /// entry for this one cannot run the task. A machine that names no
+    /// agent runs the flock's, and the task's own agent is kept.
+    #[test]
+    fn a_flocks_agent_kind_takes_the_machines_agent_of_that_kind() {
+        let models = Models::default();
+        let agents: Agents = toml::from_str(
+            "[claude-personal]\nkind = \"claude\"\n[oc-work]\nkind = \"opencode\"\n",
+        )
+        .unwrap();
+        let d = Defaults::default();
+        let flock: flock::FlockEntry =
+            toml::from_str("name = \"p\"\nagent = \"opencode\"\nagent_args = [\"-q\"]\n").unwrap();
+        let machine = |extra: &str| -> flock::MachineConfig {
+            toml::from_str(&format!("name = \"m\"\nlocal = true\n{extra}")).unwrap()
+        };
+        let pick = |ask: &AgentChoice, m: &flock::MachineConfig| {
+            d.resolve_agent_for(ask, Some(m), Some(&flock), &models, &agents)
+        };
+        let none = AgentChoice::default();
+
+        // The machine's own agent, of the flock's kind.
+        let p = pick(
+            &none,
+            &machine("agent = \"oc-work\"\nagent_args = [\"--x\"]\n"),
+        );
+        assert_eq!(
+            (p.agent.as_str(), p.agent_from),
+            ("oc-work", Layer::Machine)
+        );
+        assert_eq!(p.agent_args, vec!["--x"]);
+        assert_eq!(p.missing_kind, None);
+
+        // Its agent is claude: its agents entry for opencode, with no args
+        // written for another agent.
+        let p = pick(
+            &none,
+            &machine(
+                "agent = \"claude-personal\"\nagent_args = [\"-v\"]\nagents = { opencode = \"oc-work\" }\n",
+            ),
+        );
+        assert_eq!(
+            (p.agent.as_str(), p.agent_from, p.by_kind),
+            ("oc-work", Layer::Machine, true)
+        );
+        assert!(p.agent_args.is_empty(), "{:?}", p.agent_args);
+        assert_eq!(p.missing_kind, None);
+
+        // No opencode agent there: the machine cannot run the task.
+        let p = pick(&none, &machine("agent = \"claude-personal\"\n"));
+        assert_eq!(p.missing_kind.as_deref(), Some("opencode"));
+
+        // A machine that names no agent runs the flock's, with its args.
+        let p = pick(&none, &machine(""));
+        assert_eq!((p.agent.as_str(), p.agent_from), ("opencode", Layer::Flock));
+        assert_eq!(p.agent_args, vec!["-q"]);
+        assert_eq!(p.missing_kind, None);
+
+        // The task's own agent is kept.
+        let asked = AgentChoice {
+            agent: Some("claude".into()),
+            ..Default::default()
+        };
+        let p = pick(&asked, &machine("agent = \"claude-personal\"\n"));
+        assert_eq!((p.agent.as_str(), p.missing_kind), ("claude", None));
+
+        // A flock with no agent leaves the machine's alone.
+        let plain = flock::FlockEntry {
+            name: "p".into(),
+            ..Default::default()
+        };
+        let p = d.resolve_agent_for(
+            &none,
+            Some(&machine("agent = \"claude-personal\"\n")),
+            Some(&plain),
+            &models,
+            &agents,
+        );
+        assert_eq!(
+            (p.agent.as_str(), p.missing_kind),
+            ("claude-personal", None)
+        );
     }
 
     /// An `agents` entry whose agent is of another kind than its key, and
@@ -2466,6 +2732,8 @@ mod tests {
                 model_from: None,
                 profile: Some("develop".into()),
                 profile_from: Some("defaults".into()),
+                timeout_from: None,
+                place_from: None,
             }));
             spec
         };
@@ -2543,6 +2811,8 @@ mod tests {
             model_from: None,
             profile: Some("develop".into()),
             profile_from: Some("defaults".into()),
+            timeout_from: None,
+            place_from: None,
         }));
         let agents: Agents = toml::from_str(
             "[opencode]\nallow_flag = \"--allow\"\n\
@@ -2606,12 +2876,23 @@ mod tests {
         );
         assert_eq!(
             profile(d.resolve_agent_on(&ask(None), Some(&machine), Some(&flock))),
-            ("ci".into(), Layer::Machine)
-        );
-        assert_eq!(
-            profile(d.resolve_agent(&ask(None), Some(&flock))),
             ("develop".into(), Layer::Flock)
         );
+        assert_eq!(
+            profile(d.resolve_agent_on(&ask(None), Some(&machine), None)),
+            ("ci".into(), Layer::Machine)
+        );
+        // The machine's own profile, which decides `unrestricted`, is
+        // still its own before the flock's.
+        assert_eq!(
+            d.own_profile(Some(&machine), Some(&flock)).as_deref(),
+            Some("ci")
+        );
+        assert_eq!(
+            d.own_profile(None, Some(&flock)).as_deref(),
+            Some("develop")
+        );
+        assert_eq!(d.own_profile(None, None).as_deref(), Some("review"));
         assert_eq!(
             profile(d.resolve_agent(&ask(None), None)),
             ("review".into(), Layer::Defaults)
@@ -2884,6 +3165,7 @@ mod tests {
             deny: vec![],
             model: None,
             profile: None,
+            ..Default::default()
         };
         assert_eq!(pick(&own, Some(&work)), ("aider".into(), "-v".into()));
         // Args follow the agent they were written for: the flock's are for
@@ -2895,6 +3177,7 @@ mod tests {
             deny: vec![],
             model: None,
             profile: None,
+            ..Default::default()
         };
         assert_eq!(
             pick(&claude, Some(&work)),
@@ -2907,6 +3190,7 @@ mod tests {
             deny: vec![],
             model: None,
             profile: None,
+            ..Default::default()
         };
         assert_eq!(
             pick(&codex, Some(&work)),

@@ -346,10 +346,24 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         ("allow", list(&t.spec.allow)),
         ("deny", list(&t.spec.deny)),
         ("repo", repo),
-        ("place", t.spec.place.to_string()),
+        (
+            "place",
+            format!(
+                "{}{}",
+                t.spec.place,
+                from(source.and_then(|s| s.place_from.as_ref()))
+            ),
+        ),
         ("label", label),
         ("tags", tags),
-        ("timeout", format!("{}s", t.spec.timeout_secs)),
+        (
+            "timeout",
+            format!(
+                "{}s{}",
+                t.spec.timeout_secs,
+                from(source.and_then(|s| s.timeout_from.as_ref()))
+            ),
+        ),
         ("pane", opt(&t.pane_id)),
         ("session", opt(&t.spec.session_id)),
         ("created", when(Some(t.created_at))),
@@ -1348,6 +1362,8 @@ mod tests {
                 model_from: None,
                 profile: None,
                 profile_from: None,
+                timeout_from: None,
+                place_from: None,
             })),
             ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
         };
@@ -1370,6 +1386,8 @@ mod tests {
                 model_from: None,
                 profile: None,
                 profile_from: None,
+                timeout_from: None,
+                place_from: None,
             })),
             ..spec
         }));

@@ -123,7 +123,8 @@ pub struct MachineDescription {
     #[serde(flatten)]
     pub row: MachineRow,
     pub session: String,
-    /// The machine's own `model`; `None` falls through to its flock's.
+    /// The machine's own `model`, after its task's flock's; `None` falls
+    /// through to `[defaults]`.
     pub model: Option<String>,
     /// The machine's own `agents`, the agent per kind for a model of
     /// another kind than its agent's. Missing from an older head.
@@ -148,15 +149,23 @@ pub struct FlockDescription {
     pub agent_args: Option<Vec<String>>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
-    /// The flock's own `model`; `None` falls through to `[defaults]`.
+    /// The flock's own `model`, before the machine's; `None` falls through
+    /// to the machine's, then `[defaults]`.
     pub model: Option<String>,
     /// The flock's own `agents`, as the machine's. Missing from an older
     /// head.
     #[serde(default)]
     pub agents_by_kind: crate::config::KindAgents,
-    /// The flock's own `profile`; `None` falls through to `[defaults]`.
+    /// The flock's own `profile`, before the machine's, as `model`.
     #[serde(default)]
     pub profile: Option<String>,
+    /// The flock's own `timeout`; `None` falls through to `[defaults]`.
+    /// Missing from an older head.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// The flock's own `place`, as `timeout`.
+    #[serde(default)]
+    pub place: Option<crate::task::Place>,
     pub machines: Vec<String>,
     /// Live agents on its machines; known only from a running head.
     pub agents: Option<usize>,
@@ -318,6 +327,8 @@ pub fn flock_description(
         model: entry.model,
         agents_by_kind: entry.agents,
         profile: entry.profile,
+        timeout: entry.timeout,
+        place: entry.place,
         machines: row.machines,
         agents: row.agents,
         tasks,
@@ -570,7 +581,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
             "model",
             m.model
                 .clone()
-                .unwrap_or_else(|| "- (from its flock)".into()),
+                .unwrap_or_else(|| "- (from [defaults])".into()),
         ),
         ("by kind", by_kind(&m.agents_by_kind, "its flock")),
         ("profile", dash(r.profile.clone())),
@@ -615,14 +626,26 @@ pub fn flock_text(f: &FlockDescription) -> String {
             "model",
             f.model
                 .clone()
-                .unwrap_or_else(|| "- (from [defaults])".into()),
+                .unwrap_or_else(|| "- (from the machine or [defaults])".into()),
         ),
         ("by kind", by_kind(&f.agents_by_kind, "[defaults]")),
         (
             "profile",
             f.profile
                 .clone()
+                .unwrap_or_else(|| "- (from the machine or [defaults])".into()),
+        ),
+        (
+            "timeout",
+            f.timeout
+                .clone()
                 .unwrap_or_else(|| "- (from [defaults])".into()),
+        ),
+        (
+            "place",
+            f.place
+                .as_ref()
+                .map_or_else(|| "- (from [defaults])".into(), |p| p.to_string()),
         ),
         ("machines", dash(Some(f.machines.join(",")))),
         ("agents", dash(f.agents.map(|n| n.to_string()))),
@@ -799,12 +822,16 @@ mod tests {
             model: Some("sonnet".into()),
             agents_by_kind: Default::default(),
             profile: Some("develop".into()),
+            timeout: None,
+            place: Some(crate::task::Place::Pastor),
             machines: vec!["pi-1".into(), "pi-2".into()],
             agents: None,
             tasks: vec![],
         };
         let text = flock_text(&f);
         assert!(text.contains("agent:       - (from [defaults])"), "{text}");
+        assert!(text.contains("timeout:     - (from [defaults])"), "{text}");
+        assert!(text.contains("place:       pastor\n"), "{text}");
         assert!(text.contains("by kind:     - (from [defaults])"), "{text}");
         let with = FlockDescription {
             agents_by_kind: [("opencode".to_string(), "opencode".to_string())].into(),

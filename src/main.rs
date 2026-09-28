@@ -718,6 +718,21 @@ fn main() {
                             pastor::ipc::FILE_PROTOCOL,
                             "predates reading its files through the head",
                         )))
+                    } else if remote.is_none() && flock_timeout_or_place_declared(&paths) {
+                        // Per-flock `timeout`/`place` are fields an older
+                        // head's `FlockEntry` (`deny_unknown_fields`) does
+                        // not know; its reload fails and it silently keeps
+                        // its old flock settings, so refuse rather than let
+                        // the CLI dispatch, list or reload on that stale view.
+                        protocol_need(&command).map_or(
+                            Some((
+                                pastor::ipc::FLOCK_TIMEOUT_PLACE_PROTOCOL,
+                                "predates per-flock timeout and place, and would silently drop flock.toml's `timeout`/`place` on reload, keeping its old settings",
+                            )),
+                            |(p, why)| {
+                                Some((p.max(pastor::ipc::FLOCK_TIMEOUT_PLACE_PROTOCOL), why))
+                            },
+                        )
                     } else {
                         protocol_need(&command)
                     },
@@ -1577,6 +1592,19 @@ fn multi_flock_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| !e.machines.is_empty()))
 }
 
+/// Whether flock.toml gives any flock its own `timeout` or `place`, the
+/// schema an older head's `FlockEntry` does not know (see
+/// `FLOCK_TIMEOUT_PLACE_PROTOCOL`). A flock.toml that does not load counts
+/// as not declaring it: a head that cannot read the file either is refused
+/// for other reasons first.
+fn flock_timeout_or_place_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| {
+        f.flocks
+            .iter()
+            .any(|e| e.timeout.is_some() || e.place.is_some())
+    })
+}
+
 /// The prompt of `pastor task run`: the positional one as given, or the
 /// contents of `--prompt-file` (`-` is stdin) without the newlines an editor
 /// or `echo` leaves at the end.
@@ -1660,14 +1688,21 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What `pastor task run`'s flags say about the agent; the head fills in the
-/// rest from the task's flock and `[defaults]`.
+/// What `pastor task run`'s flags say about the agent, its timeout and its
+/// place; the head fills in the rest from the task's flock and `[defaults]`.
 fn agent_choice(a: &RunArgs) -> AgentChoice {
     AgentChoice {
         agent: a.agent.clone(),
         agent_args: (!a.agent_args.is_empty()).then(|| a.agent_args.clone()),
         model: a.model.clone(),
         profile: a.profile.clone(),
+        // Checked by `run_spec`, which refuses a bad one.
+        timeout_secs: a
+            .timeout
+            .as_deref()
+            .and_then(|t| parse_duration(t).ok())
+            .map(|d| d.as_secs()),
+        place: a.place.clone(),
         ..Default::default()
     }
 }
@@ -1789,18 +1824,13 @@ fn probe_fields(
 /// calls, each on its own connection, exactly as the head makes them: herdr
 /// answers one request per connection. Orphans are agents no open task owns;
 /// the rows live in the store here even with no head running.
-/// The profile a task on `m` runs under when it names none, from this
-/// machine's pastor.toml and flock.toml, as the head would settle it.
+/// The own profile of `m`, which decides whether a task may ask for
+/// `unrestricted` there, from this machine's pastor.toml and flock.toml, as
+/// the head would settle it (`Defaults::own_profile`).
 fn own_profile(config: &PastorConfig, f: &Flock, m: &MachineConfig) -> Option<String> {
     config
         .defaults
-        .resolve_agent_on(
-            &AgentChoice::default(),
-            Some(m),
-            f.entry(f.primary_flock(m)),
-        )
-        .profile
-        .map(|(name, _)| name)
+        .own_profile(Some(m), f.entry(f.primary_flock(m)))
 }
 
 async fn probe_machine(
@@ -3961,6 +3991,16 @@ mod tests {
             AgentChoice {
                 agent: Some("codex".into()),
                 agent_args: Some(vec!["-v".into()]),
+                ..Default::default()
+            }
+        );
+        // Sent as asked, so the head knows they win over the flock's.
+        let a = run_args(&["hi", "--timeout", "5m", "--place", "own"]);
+        assert_eq!(
+            agent_choice(&a),
+            AgentChoice {
+                timeout_secs: Some(300),
+                place: Some(pastor::task::Place::Own),
                 ..Default::default()
             }
         );

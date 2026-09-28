@@ -423,7 +423,9 @@ writing tasks. Retry and close need it.
 `place` decides where on its machine's herdr a task's agent gets its pane.
 It is set like every dispatch setting: `--place` on `task run` (and on `task
 retry`, to move a retry), `place = "..."` in a job's `[dispatch]`, `place` under
-`[defaults]` in `pastor.toml`; `task describe` prints it. A head from before
+`[defaults]` in `pastor.toml`, or under the task's `[[flock]]` entry, which
+comes before `[defaults]`; `task describe` prints it and where it came from,
+such as `place: own (from flock work)`. A head from before
 `task retry --place` would retry the task where it was, so `task retry
 --place` refuses one (`head_too_old`): restart `pastor serve` after an
 upgrade.
@@ -542,8 +544,10 @@ A flock is a named group of machines. A machine can be in many flocks, and
 every task and job targets one: only that flock's machines take its tasks.
 Flocks keep kinds of work apart, such as work and personal machines that run
 agents on different accounts, or share one machine between projects so one
-project never takes every slot. A flock can also say which agent its tasks
-run.
+project never takes every slot. A flock also carries every per-task setting
+`[defaults]` has, so a project's flock sets its model, permissions, priority
+and timeout on a shared machine, while the machine picks the agent (see
+[What a flock sets](#what-a-flock-sets)).
 
 ```toml
 # flock.toml
@@ -561,6 +565,8 @@ agent_args = ["--model", "claude-sonnet-5"]
 # priority = "high"       # optional: see Priority and queue order below
 # agents = { opencode = "opencode" }  # optional: the agent per kind, see Models
 # profile = "develop"     # optional: a permission profile, see Permission profiles below
+# timeout = "30m"         # optional: how long its tasks may run, before [defaults]
+# place = "pastor"        # optional: where its tasks' panes go, see Where a task's pane goes
 # summary = "require"     # optional: ask, require or off, see Asking for one
 
 [[machine]]
@@ -694,6 +700,55 @@ no `--flock` means the default flock rather than every machine. A head that
 is listening but does not answer is refused whether flocks are in play or not
 (`head_unresponsive`); only a head that is not running at all is passed by.
 
+### What a flock sets
+
+A `[[flock]]` entry takes every per-task setting `[defaults]` has: `agent`,
+`agent_args`, `agents`, `model`, `profile`, `priority`, `allow`, `deny`,
+`timeout`, `place`, `label` and `summary` (`max_tasks_per_run` stays a job
+setting). A task gets the settings of its own flock, the one it is queued
+in; a machine in many flocks does not mix them.
+
+For everything but the agent, the flock comes before the machine: a task
+takes each setting from the first of its run flags (or job's `[dispatch]`),
+its flock, the machine it runs on, and `[defaults]` that sets it. Only
+`model`, `profile` and `priority` have a machine layer; a machine has no
+`timeout`, `place`, `label` or `summary`. `allow` and `deny` add up instead
+(see [Tool allow and deny lists](#tool-allow-and-deny-lists)).
+
+```toml
+# flock.toml: desk is shared; each project's flock sets its own
+[[flock]]
+name = "pastor"
+machines = { desk = 2 }
+model = "sonnet"
+profile = "develop"
+priority = "high"
+timeout = "1h"
+
+[[flock]]
+name = "life"
+machines = { desk = 1 }
+model = "haiku"
+place = "pastor"
+
+[[machine]]
+name = "desk"
+local = true
+max_agents = 3
+agent = "claude-personal"   # the account logged in here: every flock runs it
+model = "opus"              # only for a flock that names no model
+```
+
+The agent and its args are the exception: the machine comes before the
+flock, since it knows what is installed and logged in there (see [A flock's
+or a machine's agent](#a-flocks-or-a-machines-agent)). A machine's
+`profile` also keeps its other job, deciding whether a task may ask for
+`unrestricted` there (see [the unrestricted
+rule](#permission-profiles)); a flock's profile never lifts it.
+
+A timeout or place from the flock shows in `task describe` as `timeout:
+3600s (from flock pastor)`, and `flock describe` lists the flock's own.
+
 ### A flock's or a machine's agent
 
 `agent` and `agent_args` under a `[[flock]]` entry are the agent its tasks and
@@ -707,6 +762,17 @@ from the first of these that says:
 3. the task's flock, in `flock.toml`;
 4. `[defaults]` in `pastor.toml`;
 5. the built-in: `claude` with no args.
+
+A flock that names an agent also names its kind. On a machine that names
+an agent of another kind, the task runs that machine's agent of the flock's
+kind instead: its `agents` entry for the kind (see [An agent per
+kind](#an-agent-per-kind)). A machine that has none is skipped for the task,
+as a machine whose agent cannot run a task's model is: an unpinned task goes
+to the flock's other machines, or waits with `waiting for a machine: flock
+work runs opencode agents, and machine pi-3 has none ...` in its `error`,
+and a task pinned there is refused (`agent_kind_missing`). A machine that
+names no agent runs the flock's. A task with a model goes by the model's
+kind instead, as below, and an agent the task or job named is kept.
 
 The agent and its args are looked up on their own, with one rule: args follow
 the agent they were written for. A layer's `agent_args` only apply when that
@@ -911,14 +977,15 @@ model = "sonnet"
 
 A task settles its model like its agent, from the first of these that names
 one: `--model` on `pastor task run` (or `model` under a job's `[dispatch]`),
-`model` under the `[[machine]]` entry it runs on, `model` under its
-`[[flock]]` entry, `[defaults] model`; with none, it runs no model and nothing
-changes. `--model` takes a name only, never raw args.
+`model` under its `[[flock]]` entry, `model` under the `[[machine]]` entry it
+runs on, `[defaults] model`; with none, it runs no model and nothing
+changes. The flock comes before the machine, unlike for the agent (see [What
+a flock sets](#what-a-flock-sets)). `--model` takes a name only, never raw args.
 
 A job's `model` is a template, rendered for each item:
 `model = "{{ item.model }}"` runs the model the item names. It may use
 `item.*` and `job.name`. When it renders empty, the job says nothing and the
-lookup goes on to the machine, the flock and `[defaults]`.
+lookup goes on to the flock, the machine and `[defaults]`.
 
 The model's `args` go first, then the task's `agent_args` settled as above,
 then the allow and deny flags, so permission flags in `agent_args` still
@@ -1004,10 +1071,10 @@ still start where a higher one cannot.
 
 A task settles its level when it is queued, from the first of these that
 sets one: `--priority` on `pastor task run` (or `priority` under a job's
-`[dispatch]`), `priority` under the `[[machine]]` entry it is pinned to
-(`--machine` or a job's `machine`; an unpinned task never takes a
-machine's, since no machine is picked yet), `priority` under its
-`[[flock]]` entry, `[defaults] priority`; with none it is `normal`.
+`[dispatch]`), `priority` under its `[[flock]]` entry, `priority` under the
+`[[machine]]` entry it is pinned to (`--machine` or a job's `machine`; an
+unpinned task never takes a machine's, since no machine is picked yet),
+`[defaults] priority`; with none it is `normal`.
 
 ```toml
 # pastor.toml
@@ -1017,17 +1084,21 @@ priority = "low"            # tasks that set none
 # flock.toml
 [[flock]]
 name = "work"
-priority = "high"           # this flock's tasks, before [defaults]
+machines = { pi-3 = 2 }
+priority = "high"           # this flock's tasks, before the machine's
+
+[[flock]]
+name = "play"               # sets no priority
+machines = { pi-3 = 2 }
 
 [[machine]]
 name = "pi-3"
-flock = "work"
-priority = "critical"       # tasks pinned to pi-3, before the flock's
+priority = "critical"       # tasks pinned to pi-3 whose flock sets none
 ```
 
 A job's `priority` is a template, rendered for each item, so `priority =
 "{{ item.priority }}"` takes the level the item names; rendered empty, it
-falls through to the machine, flock and `[defaults]`. A value that is not
+falls through to the flock, the machine and `[defaults]`. A value that is not
 one of the four levels is refused: `unknown_priority` from `task run
 --priority` and `task priority`, an error for that item in a job (the
 cursor holds, as for any item error), and a load failure in pastor.toml,
@@ -1199,8 +1270,8 @@ runs a release that knows it.
 
 A task settles its profile like its model, from the first of these that
 names one: `--profile` on `pastor task run` (or `profile` under a job's
-`[dispatch]`), `profile` under the `[[machine]]` entry it runs on, `profile`
-under its `[[flock]]` entry, `[defaults] profile`; with none, it runs no
+`[dispatch]`), `profile` under its `[[flock]]` entry, `profile` under the
+`[[machine]]` entry it runs on, `[defaults] profile`; with none, it runs no
 profile and nothing changes. `--profile` and a job's `profile` take a name,
 not a template.
 
@@ -1265,9 +1336,11 @@ expand it, and a machine that cannot report its home (a `command` one) runs
 such a profile too.
 
 **The unrestricted rule.** A task may ask for `unrestricted` (with
-`--profile` or a job's `profile`) only on a machine whose own profile, the
-one its tasks get when they name none, is `unrestricted` as well: its
-`[[machine]]` entry says so, or its flock's, or `[defaults]`. Denying nothing
+`--profile` or a job's `profile`) only on a machine whose own profile is
+`unrestricted` as well: its `[[machine]]` entry says so, or, when it names
+none, its flock's, or `[defaults]`. Here the machine comes first, though a
+task's own profile takes the flock's before the machine's: a flock's
+`unrestricted` never lifts a machine's narrower one. Denying nothing
 is the choice of whoever owns the machine, made in flock.toml or
 pastor.toml, not one a run flag or a job file can make for it. A task pinned
 to another machine is refused (`profile_not_allowed`); one that is not

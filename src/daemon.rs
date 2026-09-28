@@ -10,8 +10,8 @@ use crate::config::flock::{
     DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig, TaskFlockError,
 };
 use crate::config::{
-    AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer, MODEL_KIND_MISMATCH, Models,
-    PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
+    AGENT_KIND_MISSING, AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer,
+    MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
 };
 use crate::dispatch::{Claim, FlockSeat, MachineView, pick_machine, pick_machine_where};
 use crate::herdr::{Connector, Endpoint};
@@ -477,12 +477,15 @@ impl Fleet {
         )
     }
 
-    /// The profile a task in `flock` on `machine` runs under when it names
-    /// none: the machine's, else the flock's, else `[defaults]`.
+    /// The own profile of `machine` for a task in `flock`, which decides
+    /// whether it may ask for `unrestricted` there: the machine's, else the
+    /// flock's, else `[defaults]` (`Defaults::own_profile`).
     pub fn own_profile(&self, flock: &str, machine: Option<&str>) -> Option<String> {
-        self.resolve_agent(&AgentChoice::default(), flock, machine)
-            .profile
-            .map(|(name, _)| name)
+        let wanted = self.wanted.read().unwrap();
+        self.defaults
+            .read()
+            .unwrap()
+            .own_profile(machine.and_then(|m| wanted.get(m)), wanted.entry(flock))
     }
 
     /// `resolve_agent` written into `spec`, with the ask and where the agent
@@ -512,8 +515,25 @@ impl Fleet {
                 &agents,
             )
         };
+        if let Some(kind) = &pick.missing_kind {
+            return Err(AgentRefusal {
+                code: AGENT_KIND_MISSING,
+                message: format!(
+                    "flock {flock} runs {kind} agents, and machine {} has none: its agent {} is {}, and it has no agents.{kind}",
+                    machine.unwrap_or("-"),
+                    pick.agent,
+                    agents.kind(&pick.agent)
+                ),
+            });
+        }
         pick.apply_to(spec);
         let label = |layer| layer_label(layer, asked_by, flock, machine);
+        // Settled once, when the task is queued (`settle_run`); kept here.
+        let (timeout_from, place_from) = spec
+            .agent_source
+            .as_ref()
+            .map(|s| (s.timeout_from.clone(), s.place_from.clone()))
+            .unwrap_or_default();
         let mut agent_from = label(pick.agent_from);
         if pick.by_kind {
             agent_from.push_str(&format!(" agents.{}", agents.kind(&pick.agent)));
@@ -526,6 +546,8 @@ impl Fleet {
             model_from: pick.model.as_ref().map(|&(_, layer)| label(layer)),
             profile: pick.profile.as_ref().map(|(name, _)| name.clone()),
             profile_from: pick.profile.as_ref().map(|&(_, layer)| label(layer)),
+            timeout_from,
+            place_from,
         }));
         models.apply(&pick, &agents, spec)?;
         // What the machine's owner lets run there (the unrestricted rule).
@@ -580,6 +602,41 @@ impl Fleet {
         };
     }
 
+    /// A task's timeout and place as it is queued in `flock`, from what its
+    /// run or job asked for, else the flock's, else `[defaults]`
+    /// (`Defaults::resolve_timeout`, `resolve_place`), with where each came
+    /// from in its `agent_source`. `settle_agent` makes that first. An ask
+    /// from a client that predates flock timeouts carries neither, and
+    /// keeps the spec's own unless the flock sets one.
+    fn settle_run(
+        &self,
+        spec: &mut crate::task::DispatchSpec,
+        ask: &AgentChoice,
+        flock: &str,
+        asked_by: &str,
+    ) {
+        let wanted = self.wanted.read().unwrap();
+        let entry = wanted.entry(flock);
+        let defaults = self.defaults.read().unwrap();
+        let label = |layer| layer_label(layer, asked_by, flock, None);
+        let (timeout, timeout_from) = defaults.resolve_timeout(ask.timeout_secs, entry);
+        let (place, place_from) = defaults.resolve_place(ask.place.as_ref(), entry);
+        let mut from = (Some(label(timeout_from)), Some(label(place_from)));
+        if timeout_from == Layer::Defaults {
+            from.0 = None;
+        } else {
+            spec.timeout_secs = timeout;
+        }
+        if place_from == Layer::Defaults {
+            from.1 = None;
+        } else {
+            spec.place = place;
+        }
+        if let Some(source) = spec.agent_source.as_mut() {
+            (source.timeout_from, source.place_from) = from;
+        }
+    }
+
     /// A task's `summary` setting as it is queued in `flock`
     /// (`Defaults::resolve_summary`), from the flock and defaults as they
     /// stand now.
@@ -619,6 +676,7 @@ impl Fleet {
         let per_machine = |e: &AgentRefusal| {
             pinned.is_none()
                 && ((e.code == MODEL_KIND_MISMATCH && ask.agent.is_none())
+                    || e.code == AGENT_KIND_MISSING
                     || e.code == PROFILE_NOT_ALLOWED)
         };
         let mut landings = Vec::new();
@@ -977,6 +1035,7 @@ impl Fleet {
         if let Some(ask) = ask {
             self.settle_agent(&mut spec, ask, &flock, "task run")
                 .map_err(QueueError::Agent)?;
+            self.settle_run(&mut spec, ask, &flock, "task run");
         }
         self.settle_label(&mut spec, &flock, "task run");
         let (priority, from) =
@@ -1037,6 +1096,7 @@ impl Fleet {
         let asked_by = format!("job {}", job.name);
         self.settle_agent(&mut settled, &ask, &flock, &asked_by)
             .map_err(|e| anyhow::Error::msg(e.message))?;
+        self.settle_run(&mut settled, &ask, &flock, &asked_by);
         self.settle_label(&mut settled, &flock, &asked_by);
         let (priority, from) = self.settle_priority(
             job.priority_for(item).map_err(anyhow::Error::msg)?,
@@ -1065,6 +1125,8 @@ impl Fleet {
                 spec.allow = settled.allow;
                 spec.deny = settled.deny;
                 spec.agent_source = settled.agent_source;
+                spec.timeout_secs = settled.timeout_secs;
+                spec.place = settled.place;
                 spec.label = settled.label;
                 spec.summary = summary;
                 Ok((prompt, spec))
@@ -4885,8 +4947,8 @@ mod tests {
         assert_eq!(state(normal.id), TaskState::Queued);
     }
 
-    /// A task's level comes from `--priority`, else the machine it is
-    /// pinned to, else its flock, else `[defaults]`; an unpinned task never
+    /// A task's level comes from `--priority`, else its flock, else the
+    /// machine it is pinned to, else `[defaults]`; an unpinned task never
     /// takes a machine's. A job's comes from its template, and an empty
     /// value falls through; a value that is not a level is the item's error.
     #[tokio::test]
@@ -4897,18 +4959,31 @@ mod tests {
         urgent.priority = Some(Priority::Critical);
         let mut plain = machine("b", 4);
         plain.flock = Some("work".into());
+        let mut loud = machine("c", 4);
+        loud.flock = Some("play".into());
+        loud.priority = Some(Priority::Critical);
         let flock = Flock {
-            flocks: vec![FlockEntry {
-                name: "work".into(),
-                default: true,
-                priority: Some(Priority::High),
-                ..Default::default()
-            }],
-            machines: vec![urgent, plain],
+            flocks: vec![
+                FlockEntry {
+                    name: "work".into(),
+                    default: true,
+                    priority: Some(Priority::High),
+                    ..Default::default()
+                },
+                FlockEntry {
+                    name: "play".into(),
+                    ..Default::default()
+                },
+            ],
+            machines: vec![urgent, plain, loud],
         };
         let (d, _tmp) = daemon_with_flock(
             flock,
-            &[("a", 4, FakeHerdr::new()), ("b", 4, FakeHerdr::new())],
+            &[
+                ("a", 4, FakeHerdr::new()),
+                ("b", 4, FakeHerdr::new()),
+                ("c", 4, FakeHerdr::new()),
+            ],
         )
         .await;
         let run = |machine: Option<&str>, priority: Option<Priority>| IpcRequest::Run {
@@ -4929,9 +5004,15 @@ mod tests {
             IpcResponse::Task(t) => (t.priority, t.priority_from.unwrap_or_default()),
             other => panic!("{other:?}"),
         };
+        // The flock before the machine it is pinned to.
         assert_eq!(
             level(d.handle(run(Some("a"), None)).await),
-            (Priority::Critical, "machine a".into())
+            (Priority::High, "flock work".into())
+        );
+        // A flock that sets none leaves it to the machine.
+        assert_eq!(
+            level(d.handle(run(Some("c"), None)).await),
+            (Priority::Critical, "machine c".into())
         );
         assert_eq!(
             level(d.handle(run(Some("a"), Some(Priority::Low))).await),
@@ -4978,6 +5059,86 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("unknown_priority"), "{err:#}");
+    }
+
+    /// A flock's timeout and place reach its tasks that set none, run or
+    /// job, and describe says so; `--timeout` and `--place` win.
+    #[tokio::test]
+    async fn a_flocks_timeout_and_place_reach_its_tasks() {
+        use crate::config::flock::FlockEntry;
+        use crate::task::Place;
+        let mut pi = machine("pi", 4);
+        pi.flock = Some("work".into());
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "work".into(),
+                default: true,
+                timeout: Some("30m".into()),
+                place: Some(Place::Own),
+                ..Default::default()
+            }],
+            machines: vec![pi],
+        };
+        let (d, _tmp) = daemon_with_flock(flock, &[("pi", 4, FakeHerdr::new())]).await;
+        let run = |ask: AgentChoice| IpcRequest::Run {
+            preempt: false,
+            summary: None,
+            prompt: "x".into(),
+            spec: spec(),
+            flock: None,
+            agent: Some(ask),
+            priority: None,
+            role: TaskRole::Agent,
+            description: None,
+        };
+        let IpcResponse::Task(t) = d.handle(run(AgentChoice::default())).await else {
+            panic!()
+        };
+        assert_eq!((t.spec.timeout_secs, &t.spec.place), (1800, &Place::Own));
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("timeout:    1800s (from flock work)"),
+            "{text}"
+        );
+        assert!(text.contains("place:      own (from flock work)"), "{text}");
+        let asked = AgentChoice {
+            timeout_secs: Some(60),
+            place: Some(Place::Pastor),
+            ..Default::default()
+        };
+        let IpcResponse::Task(t) = d.handle(run(asked)).await else {
+            panic!()
+        };
+        assert_eq!((t.spec.timeout_secs, &t.spec.place), (60, &Place::Pastor));
+        let text = crate::cli::task_detail(&t);
+        assert!(text.contains("timeout:    60s (from task run)"), "{text}");
+
+        let config = test_config();
+        let job = |dispatch: &str| {
+            crate::config::job::Job::parse(
+                &format!("every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{dispatch}"),
+                "j",
+                &config.defaults,
+                &crate::connector::Builtins,
+            )
+            .unwrap()
+        };
+        let queue = |job: crate::config::job::Job, key: &str| {
+            let fleet = d.fleet().clone();
+            let item = serde_json::json!({ "key": key });
+            async move {
+                fleet
+                    .queue_job_task(&job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                    .await
+                    .unwrap()
+            }
+        };
+        let t = queue(job(""), "a").await;
+        assert_eq!((t.spec.timeout_secs, &t.spec.place), (1800, &Place::Own));
+        let t = queue(job("timeout = \"5m\"\nplace = \"repo\"\n"), "b").await;
+        assert_eq!((t.spec.timeout_secs, &t.spec.place), (300, &Place::Repo));
+        let text = crate::cli::task_detail(&t);
+        assert!(text.contains("timeout:    300s (from job j)"), "{text}");
     }
 
     /// A task's workspace label comes from `--label`, else its job's, else
@@ -5318,6 +5479,7 @@ mod tests {
             deny: vec![],
             model: None,
             profile: None,
+            ..Default::default()
         });
         assert_eq!(
             queued(d.handle(run("work", own)).await),
@@ -5773,6 +5935,67 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A flock that names an agent sets its kind, and each machine runs
+    /// its own agent of that kind: an unpinned task skips a machine that
+    /// has none and waits, saying why, when no machine is left; pinned to
+    /// such a machine, it is refused.
+    #[tokio::test]
+    async fn a_flocks_agent_kind_runs_on_the_machines_agent_of_that_kind() {
+        use crate::config::flock::FlockEntry;
+        let own = |name: &str, extra: crate::config::KindAgents| MachineConfig {
+            agent: Some("claude-personal".into()),
+            agents: extra,
+            ..machine(name, 1)
+        };
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "personal".into(),
+                default: true,
+                agent: Some("codex".into()),
+                ..Default::default()
+            }],
+            machines: vec![
+                own("pi", Default::default()),
+                own(
+                    "cx",
+                    [("codex".to_string(), "codex-work".to_string())].into(),
+                ),
+            ],
+        };
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("pi", 1, FakeHerdr::new()), ("cx", 1, FakeHerdr::new())],
+        )
+        .await;
+        let mut config = models_config();
+        config.agents.0.insert(
+            "codex-work".into(),
+            crate::config::AgentDef {
+                kind: Some("codex".into()),
+                ..Default::default()
+            },
+        );
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        d.fleet().set_config(&config);
+        let IpcResponse::Task(t) = d.handle(run_model(None, None, None)).await else {
+            panic!()
+        };
+        assert_eq!(
+            (t.machine.as_deref(), t.spec.agent.as_str()),
+            (Some("cx"), "codex-work")
+        );
+        // cx is full, and pi has no codex agent.
+        let IpcResponse::Task(t) = d.handle(run_model(None, None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.unwrap_or_default();
+        assert!(err.starts_with("waiting for a machine"), "{err}");
+        assert!(err.contains("machine pi has none"), "{err}");
+        let resp = d.handle(run_model(None, None, Some("pi"))).await;
+        assert_eq!(error_code(resp), "agent_kind_missing");
     }
 
     /// A retry settles its model again, so one since dropped from

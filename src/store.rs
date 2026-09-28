@@ -913,6 +913,17 @@ impl Store {
         }
         let id = tx.last_insert_rowid();
         place_last(&tx, id)?;
+        if place.is_some() {
+            // `agent_source.place_from` is read by `task describe`: an
+            // overridden place explains itself as `task retry`, not as
+            // whatever placed the failed run. A task queued before
+            // `agent_source` existed has none to update.
+            tx.execute(
+                "UPDATE tasks SET spec = json_set(spec, '$.agent_source.place_from', 'task retry')
+                 WHERE id = ?1 AND json_extract(spec, '$.agent_source') IS NOT NULL",
+                params![id],
+            )?;
+        }
         tx.commit()?;
         drop(conn);
         Ok(self.get_task(id)?.context("task vanished after insert")?)
@@ -2677,6 +2688,47 @@ mod tests {
             .insert_retry_placed(t.id, Some(&crate::task::Place::Repo))
             .unwrap();
         assert_eq!(home.spec.place, crate::task::Place::Repo);
+    }
+
+    /// `task retry --place` records itself as the override's source, not
+    /// whatever placed the original run, so `task describe` does not lie
+    /// about where the new place came from.
+    #[test]
+    fn a_retry_that_changes_its_place_updates_its_source() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task(NewTask {
+                spec: DispatchSpec {
+                    place: crate::task::Place::Pastor,
+                    agent_source: Some(Box::new(crate::task::AgentSource {
+                        ask: Default::default(),
+                        agent: "claude".into(),
+                        agent_args: None,
+                        model: None,
+                        model_from: None,
+                        profile: None,
+                        profile_from: None,
+                        timeout_from: None,
+                        place_from: Some("flock default".into()),
+                    })),
+                    ..spec()
+                },
+                ..new_task("run")
+            })
+            .unwrap();
+        set_state(&s, t.id, TaskState::Failed);
+        let moved = s
+            .insert_retry_placed(t.id, Some(&crate::task::Place::Pane("work".into())))
+            .unwrap();
+        assert_eq!(
+            moved.spec.agent_source.unwrap().place_from.as_deref(),
+            Some("task retry")
+        );
+        let same = s.insert_retry(t.id).unwrap();
+        assert_eq!(
+            same.spec.agent_source.unwrap().place_from.as_deref(),
+            Some("flock default")
+        );
     }
 
     /// A retry keeps the label template and where it came from, and drops

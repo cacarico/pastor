@@ -130,6 +130,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- A flock carries every per-task setting `[defaults]` has: `[[flock]]` takes
+  `timeout` and `place` too, before `[defaults]`, and `task describe` says
+  when one came from the flock (`timeout: 1800s (from flock work)`); `flock
+  describe` lists them. The order changed for `model`, `profile` and
+  `priority`: the flock now comes before the machine (task > job > flock >
+  machine > `[defaults]`), so a project's flock sets its model, permissions
+  and level on a shared machine. The agent and its args stay machine first.
+  A flock that names an agent sets its kind: a machine whose agent is of
+  another kind runs its `agents` entry for that kind, and a machine with
+  none is skipped for the flock's tasks, with a note while they wait, or
+  refuses a task pinned to it (`agent_kind_missing`). A machine's own
+  profile still decides whether `unrestricted` may run there; a flock's
+  never lifts it.
 - `pastor machine move` takes the machine out of every flock and lists it
   in the one named, with its `max_agents`, instead of setting its `flock`
   key and leaving other flocks' `machines` alone.

@@ -495,6 +495,13 @@ pub struct AgentSource {
     /// Where `profile` came from, labelled like `agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_from: Option<String>,
+    /// Where the spec's `timeout_secs` came from, labelled like `agent`;
+    /// `None` for `[defaults]`, or a task queued before flocks had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_from: Option<String>,
+    /// Where the spec's `place` came from, like `timeout_from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_from: Option<String>,
 }
 
 /// A worktree herdr made for a task: its branch and where it is on disk.

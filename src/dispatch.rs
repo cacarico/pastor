@@ -1666,6 +1666,8 @@ mod tests {
                 model_from: None,
                 profile: profile.map(str::to_string),
                 profile_from: Some("defaults".into()),
+                timeout_from: None,
+                place_from: None,
             })),
             ..spec()
         }
