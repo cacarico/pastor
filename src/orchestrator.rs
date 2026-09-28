@@ -3229,8 +3229,8 @@ prompt = "You are the night orchestrator."
         let (mut files, mut scripts) = (0, 0);
         for doc in [
             "docs/manual.md",
-            "docs/website/content/docs/orchestrators.md",
-            "docs/website/content/docs/examples.md",
+            "docs/website/content/docs/concepts/orchestrators.md",
+            "docs/website/content/docs/examples/overnight.md",
         ] {
             let text = std::fs::read_to_string(repo.join(doc)).unwrap();
             for fence in text.split("```").skip(1).step_by(2) {

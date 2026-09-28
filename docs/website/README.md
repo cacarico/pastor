@@ -12,15 +12,19 @@ tab is also a plain link.
   `static/term.js` types it out; without scripts, or with reduced motion, it
   reads as a plain transcript. The unit test `website_demo_commands_are_real`
   fails when one of its commands or flags does not exist.
-- `content/docs/*.md` are the docs pages, one topic each. Front matter:
-  `title`, `summary` (shown in the index), `group` (start, use, run,
-  reference), `weight` (order: 1x start, 2x use, 3x run, 4x reference) and
-  `manual` (an anchor in the manual for the "More in the manual" link).
-- The last page is `docs/manual.md` itself, mounted by `hugo.toml`: the full
-  reference stays one file. Edit the manual there, not a copy.
+- `content/docs/` holds five sections, each a folder with an `_index.md`:
+  `start`, `concepts` (one page per part of pastor, explaining it),
+  `deploy` (the deployment modes: solo, fleet, remote, as a service),
+  `examples` (real workflows to copy) and `reference` (tables to look up).
+  A page's front matter is `title`, `summary` (shown in the indexes),
+  `weight` (its order in the section) and, for a page that moved,
+  `aliases` with its old URL. The nav, the pager and the status bar all
+  read the order from `layouts/_partials/docpages.html`.
+- The site is for people learning pastor. `docs/manual.md` stays in the
+  repo for agents and is not mounted: what a reader needs goes in a page.
 - The unit test that checks commands in the README and the manual reads
-  `content/docs/` too, so a page that names a command or flag that does not
-  exist fails `make check`.
+  every page under `content/docs/` too, so a page that names a command or
+  flag that does not exist fails `make check`.
 - `sh` and `bash` code blocks go through `layouts/_partials/cmd.html`, which
   adds a `$ ` prompt (not copied with the text) and dims comments. Other
   blocks are plain.

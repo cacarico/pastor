@@ -4698,34 +4698,40 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// The website's examples page is reached from the docs index, from the
-    /// pages its examples belong to, and from the home's "what you can do"
-    /// pane, so a rename or a lost link shows here rather than as a dead page.
+    /// The docs are five sections, each an index with its pages, and every
+    /// docs link on the homepage lands on one of them, so a moved or renamed
+    /// page shows here rather than as a dead link.
     #[test]
-    fn website_examples_page_is_linked() {
+    fn website_sections_and_home_links_resolve() {
         let site = skills_dir().parent().unwrap().join("docs/website");
         let docs = site.join("content/docs");
-        assert!(docs.join("examples.md").is_file(), "no examples.md");
-        for page in [
-            "_index.md",
-            "jobs.md",
-            "tasks.md",
-            "flocks.md",
-            "remote-head.md",
-            "orchestrators.md",
-        ] {
-            let text = std::fs::read_to_string(docs.join(page)).unwrap();
-            assert!(text.contains("examples/"), "{page} does not link examples");
+        for section in ["start", "concepts", "deploy", "examples", "reference"] {
+            let dir = docs.join(section);
+            assert!(dir.join("_index.md").is_file(), "no {section}/_index.md");
+            let pages = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name() != "_index.md")
+                .count();
+            assert!(pages > 0, "{section} has no pages");
         }
         let home = std::fs::read_to_string(site.join("layouts/home.html")).unwrap();
         assert!(
             home.contains("what you can do"),
             "no \"what you can do\" pane"
         );
-        assert!(
-            home.contains("docs/examples/"),
-            "home does not link examples"
-        );
+        let mut links = 0;
+        for link in home.split("\"docs/").skip(1) {
+            let path = link.split('"').next().unwrap().trim_end_matches('/');
+            let path = path.split('#').next().unwrap();
+            let page = docs.join(format!("{path}.md"));
+            let index = docs.join(path).join("_index.md");
+            assert!(
+                path.is_empty() || page.is_file() || index.is_file(),
+                "home links docs/{path}/, which is no page"
+            );
+            links += 1;
+        }
+        assert!(links > 5, "only {links} docs links on the home");
     }
 
     /// The manual's remote head section lists which commands go to the head,
