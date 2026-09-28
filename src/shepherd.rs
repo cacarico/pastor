@@ -217,11 +217,15 @@ impl Follower {
                 after = page.events.last().map_or(after, |r| r.seq);
                 self.store.set_meta(CURSOR_KEY, &after.to_string())?;
             } else {
+                // The records left still go to the hooks, from the oldest
+                // the head returned: a lost stretch is logged, not retried.
                 if page.gap {
                     tracing::warn!(
+                        code = "head_events_gap",
+                        head = %self.head,
                         after,
                         oldest = ?page.oldest,
-                        "head events past the cursor were rotated out of its log; the hooks missed them"
+                        "head events past the cursor were rotated out of its log before this machine read them; the hooks missed them and go on from the oldest record left"
                     );
                 }
                 for rec in page.events {
@@ -283,8 +287,11 @@ mod tests {
                 let IpcRequest::EventsSince { after, limit, .. } = req else {
                     panic!("{req:?}")
                 };
+                // As `events::since` answers: `gap` when the oldest record
+                // left is past `after + 1`.
                 let log = log.lock().unwrap();
                 let newest = log.iter().map(|r| r.seq).max();
+                let oldest = log.first().map(|r| r.seq);
                 let events: Vec<EventRecord> = log
                     .iter()
                     .filter(|r| r.seq > after)
@@ -293,8 +300,8 @@ mod tests {
                     .collect();
                 Ok(IpcResponse::Events(EventsPage {
                     events,
-                    gap: false,
-                    oldest: None,
+                    gap: oldest.is_some_and(|o| o > after + 1),
+                    oldest,
                     newest,
                 }))
             })
@@ -357,6 +364,118 @@ mod tests {
         log.lock().unwrap().push(rec(1));
         f.pass().await;
         assert_eq!(seqs(&mut rx), vec![1]);
+    }
+
+    /// Waits for `path`, one record per line, to hold as many records as
+    /// `want`, and checks their sequence numbers.
+    async fn heard(path: &std::path::Path, want: &[u64]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got: Vec<u64> = std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<EventRecord>(l).ok())
+                .map(|r| r.seq)
+                .collect();
+            if got.len() >= want.len() {
+                assert_eq!(got, want, "{}", path.display());
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{}: {got:?}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Records rotated out of the head's log past the cursor are lost to
+    /// the hooks; the follower goes on from the oldest record the head
+    /// returned, and each one after it is heard once.
+    #[tokio::test]
+    async fn a_gap_goes_on_from_the_oldest_record_returned() {
+        let log = Arc::new(Mutex::new((1..=10).map(rec).collect::<Vec<_>>()));
+        let (mut f, mut rx) = follower(head(log.clone(), Arc::new(Mutex::new(false))));
+        f.pass().await;
+        assert_eq!(f.store.meta(CURSOR_KEY).unwrap().as_deref(), Some("10"));
+
+        // 11..=299 are written and rotated out before the next tick.
+        *log.lock().unwrap() = (300..=320).map(rec).collect();
+        f.pass().await;
+        assert_eq!(f.reachable, Some(true), "a gap is not a failure");
+        assert_eq!(seqs(&mut rx), (300..=320).collect::<Vec<_>>());
+        assert_eq!(f.store.meta(CURSOR_KEY).unwrap().as_deref(), Some("320"));
+        log.lock().unwrap().push(rec(321));
+        f.pass().await;
+        assert_eq!(seqs(&mut rx), vec![321]);
+    }
+
+    /// Head events reach this machine's hooks through the hook runner: an
+    /// `only_own` hook hears only tasks of a job in this machine's `jobs/`
+    /// that uses its connector, and records about no job; a hook without
+    /// `only_own` hears every record in its `on`.
+    #[tokio::test]
+    async fn only_own_is_decided_by_this_machines_job_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = paths.connectors_dir().join("note");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Each hook appends the record it got, one JSON line.
+        let hook = |name: &str| format!("cat >> '{}'", out.join(name).display());
+        std::fs::write(dir.join("own.sh"), hook("own")).unwrap();
+        std::fs::write(dir.join("all.sh"), hook("all")).unwrap();
+        std::fs::write(
+            dir.join(crate::connector::manifest::MANIFEST_FILE),
+            "id = \"note\"\nversion = \"0.1.0\"\n[connector]\ncommand = [\"true\"]\n\
+             [[events]]\non = [\"task.done\", \"machine.lost\"]\nonly_own = true\ncommand = [\"sh\", \"own.sh\"]\n\
+             [[events]]\non = [\"task.done\"]\ncommand = [\"sh\", \"all.sh\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        std::fs::write(
+            crate::config::job::job_path(&paths.jobs_dir(), "mine"),
+            "every = \"1h\"\n[connector]\nuse = \"note\"\n[dispatch]\nprompt = \"p\"\n",
+        )
+        .unwrap();
+
+        let about = |seq: u64, kind: &str, job: Option<&str>| EventRecord {
+            kind: kind.into(),
+            job: job.map(str::to_string),
+            ..rec(seq)
+        };
+        let log = Arc::new(Mutex::new(vec![about(1, "task.done", None)]));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (events, _) = broadcast::channel(4);
+        let (to_hooks, hooks_rx) = mpsc::channel(16);
+        let runner =
+            crate::hooks::spawn(paths.clone(), store.clone(), events.downgrade(), hooks_rx);
+        let mut f = Follower {
+            head: "user@pi-1".into(),
+            ask: head(log.clone(), Arc::new(Mutex::new(false))),
+            store,
+            to_hooks,
+            reachable: None,
+        };
+        f.pass().await;
+        log.lock().unwrap().extend([
+            about(2, "task.done", Some("mine")),
+            about(3, "task.done", Some("theirs")),
+            about(4, "machine.lost", None),
+            about(5, "task.queued", Some("mine")),
+        ]);
+        f.pass().await;
+        drop(f);
+        tokio::time::timeout(Duration::from_secs(10), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        // Queued hooks outlive the runner.
+        heard(&out.join("own"), &[2, 4]).await;
+        heard(&out.join("all"), &[2, 3]).await;
     }
 
     /// Its own jobs' requests, a ping that says what it is, and a refusal
