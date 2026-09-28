@@ -66,6 +66,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   wherever herdr's focused pane was, so it could start in an unrelated
   checkout. It now starts in the machine's home directory; a machine that
   cannot report its home (a `command` one) still leaves it to herdr.
+- A task blocked on Claude's folder-trust prompt that a person answered at
+  the pane got its prompt at once, while Claude redraws after the dialog
+  and drops what is typed, so it read `running` with the agent at an empty
+  input. The prompt now waits `settle` after the block clears, however it
+  was answered. A prompt the agent still does not take (idle a settle
+  window at the sequence it went in at, never seen working) is sent again,
+  up to twice, then the task is `blocked` with an error saying so.
 
 ## 0.7.1 - 2026-09-28
 

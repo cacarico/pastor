@@ -307,7 +307,18 @@ one), since the read includes scrollback where an earlier trust prompt can
 linger above a later dialog. An agent with no marker (`trust_marker =
 ""`, or one that is not Claude and sets none) gets the keys without the check. Either way the task's prompt goes in
 once, `settle` after the trust keys: Claude redraws for a moment after the
-dialog and loses what is typed then, though herdr takes it.
+dialog and loses what is typed then, though herdr takes it. A prompt
+answered by a person at the pane waits the same: the head sees the agent
+leave `blocked` and sends the prompt `settle` later.
+
+A prompt the agent does not take anyway is sent again. An agent the head
+gave its prompt (at start, or after its startup prompt) that sits idle a
+whole settle window at the sequence the prompt went in at, never seen
+working or blocked, did not take it; the head sends it again, up to twice,
+then marks the task `blocked` with the error "agent did not take its
+prompt", for a person to look at the pane and `task send` it. This is kept
+in the head's memory: after a restart such a task stays `running` until it
+goes stale.
 `pastor trust list [--json]` shows
 the saved pairs, `pastor trust add <machine> <repo>` saves one without a
 blocked task, and `pastor trust remove <machine> <repo>` forgets one. With
