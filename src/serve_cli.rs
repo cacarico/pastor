@@ -121,19 +121,34 @@ async fn socket_pid(socket: &Path) -> Option<u32> {
     u32::try_from(pid).ok()
 }
 
-/// Whether `pid` still runs. A zombie (exited, its parent has not reaped
-/// it yet) does not: on Linux its `/proc` state says so.
+/// Whether `pid` still runs. On Linux a zombie (exited, its parent has not
+/// reaped it yet) does not, as its `/proc` state says. Elsewhere there is no
+/// `/proc`, so the signal probe alone decides and a zombie counts as running
+/// until it is reaped; a background head's parent is launchd by then, which
+/// reaps at once.
 fn alive(pid: u32) -> bool {
     if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
         return false;
     }
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    !zombie(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
     // The state follows the command name, which is in parentheses and may
     // hold spaces or parentheses itself.
     let state = stat
         .rsplit_once(") ")
         .and_then(|(_, rest)| rest.chars().next());
-    state != Some('Z')
+    state == Some('Z')
+}
+
+#[cfg(not(target_os = "linux"))]
+fn zombie(_pid: u32) -> bool {
+    false
 }
 
 fn role_name(role: Option<&str>) -> &'static str {
@@ -302,7 +317,7 @@ pub async fn status(paths: &Paths, json: bool) -> anyhow::Result<()> {
 }
 
 /// `pastor serve stop`: SIGTERM to the process holding the socket, then wait
-/// for it to go. One a service manager runs is refused: systemd and launchd
+/// for it to go. One that a service manager runs is refused: systemd and launchd
 /// would start it again, so it is stopped through them.
 pub async fn stop(paths: &Paths) -> anyhow::Result<()> {
     let socket = paths.socket_file();
@@ -466,6 +481,21 @@ mod tests {
         assert_eq!(classify(4242, Some("fish"), false), None);
         assert_eq!(classify(4242, Some("herdr"), false), None);
         assert_eq!(classify(4242, None, true), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_child_is_not_alive() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        // It exits at once but stays a zombie until waited on.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !zombie(pid) {
+            assert!(Instant::now() < deadline, "child never became a zombie");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!alive(pid));
+        child.wait().unwrap();
     }
 
     fn write(log: &RotatingLog, line: &str) {
