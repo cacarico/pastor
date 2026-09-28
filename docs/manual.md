@@ -1642,7 +1642,7 @@ It needs:
 it never falls back to this machine's files.
 
 These commands go to a remote head: `task run|list|describe|read|retry|priority|close|prune|send|done`,
-`machine list`, `tick`, `job reload`, `events`, and the `job` commands for
+`machine list`, `tick`, `job reload`, `events`, and job commands for
 the head's jobs (see [Jobs on a shepherd](#jobs-on-a-shepherd)). `machine list`'s first line
 names the head by its ssh destination and shows its herdr as `-`. `task run`
 fills what its flags leave out from the built-in defaults, not from the

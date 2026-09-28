@@ -33,7 +33,7 @@ complete -c pastor -n "__fish_pastor_needs_command" -f -a "task" -d 'Manage task
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "machine" -d 'Manage the machines and which flock each is in'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "flock" -d 'Manage the flocks: named groups of machines that tasks and jobs target'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "tick" -d 'Run one scheduler pass now and report what it did'
-complete -c pastor -n "__fish_pastor_needs_command" -f -a "job" -d 'Manage jobs (files in ~/.config/pastor/jobs/)'
+complete -c pastor -n "__fish_pastor_needs_command" -f -a "job" -d 'Manage jobs (files in ~/.config/pastor/jobs/). With a head elsewhere, a job whose file is here is this machine\'s; the rest are the head\'s'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "config" -d 'pastor.toml: the head\'s settings and the task defaults'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "completions" -d 'Print a shell completion script (fish, bash, zsh, ...) to stdout'
 complete -c pastor -n "__fish_pastor_needs_command" -f -a "events" -d 'Show the events log (task, job and machine events)'
@@ -222,7 +222,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand tick" -l json -d 'Print as
 complete -c pastor -n "__fish_pastor_using_subcommand tick" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result. With a head elsewhere, the head\'s jobs, then this machine\'s'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -f -a "enable" -d 'Enable a job file'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -f -a "disable" -d 'Disable a job file'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -f -a "run" -d 'Fire a job now, ignoring its schedule and `enabled`; it starts once a run already going has finished'
@@ -231,7 +231,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -f -a "describe" -d 'One job in full: schedule, connector, dispatch, last runs, recent tasks'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and not __fish_seen_subcommand_from list enable disable run reload edit describe help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
-complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON array'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON array; with a head elsewhere, each job says `where` it lives (head or shepherd)'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from enable" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from enable" -s h -l help -d 'Print help'
@@ -246,7 +246,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subco
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from describe" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from describe" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from describe" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result'
+complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result. With a head elsewhere, the head\'s jobs, then this machine\'s'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "enable" -d 'Enable a job file'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "disable" -d 'Disable a job file'
 complete -c pastor -n "__fish_pastor_using_subcommand job; and __fish_seen_subcommand_from help" -f -a "run" -d 'Fire a job now, ignoring its schedule and `enabled`; it starts once a run already going has finished'
@@ -399,7 +399,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_
 complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock tick job config completions events watch setup connector profile trust bridge head help" -f -a "machine" -d 'Manage the machines and which flock each is in'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock tick job config completions events watch setup connector profile trust bridge head help" -f -a "flock" -d 'Manage the flocks: named groups of machines that tasks and jobs target'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock tick job config completions events watch setup connector profile trust bridge head help" -f -a "tick" -d 'Run one scheduler pass now and report what it did'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock tick job config completions events watch setup connector profile trust bridge head help" -f -a "job" -d 'Manage jobs (files in ~/.config/pastor/jobs/)'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock tick job config completions events watch setup connector profile trust bridge head help" -f -a "job" -d 'Manage jobs (files in ~/.config/pastor/jobs/). With a head elsewhere, a job whose file is here is this machine\'s; the rest are the head\'s'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock tick job config completions events watch setup connector profile trust bridge head help" -f -a "config" -d 'pastor.toml: the head\'s settings and the task defaults'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock tick job config completions events watch setup connector profile trust bridge head help" -f -a "completions" -d 'Print a shell completion script (fish, bash, zsh, ...) to stdout'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task machine flock tick job config completions events watch setup connector profile trust bridge head help" -f -a "events" -d 'Show the events log (task, job and machine events)'
@@ -435,7 +435,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "default" -d 'The flock that new tasks and jobs go to'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "edit" -d 'Open flock.toml in $VISUAL or $EDITOR; save it only once it is valid'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from flock" -f -a "describe" -d 'One flock in full: default or not, its agent, machines, live tasks'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "list" -d 'Every job file: schedule, enabled, last run, next run, last result. With a head elsewhere, the head\'s jobs, then this machine\'s'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "enable" -d 'Enable a job file'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "disable" -d 'Disable a job file'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from job" -f -a "run" -d 'Fire a job now, ignoring its schedule and `enabled`; it starts once a run already going has finished'
