@@ -15,8 +15,8 @@ well-scoped changes with clear tests are easiest to review.
 
 ## Development checks
 
-`make check` is the pull request gate. It runs formatting checks, clippy with
-warnings as errors, and the full test suite.
+`make check` is the pull request gate. It runs the changelog check,
+formatting checks, clippy with warnings as errors, and the full test suite.
 
 Useful targets:
 
@@ -65,9 +65,11 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   CLI and head from the same minor always work together and a mismatch is
   `head_too_old`; the connector protocol; and the minimum herdr version, which
   only rises in a minor bump, noted under Changed.
-- Platforms: the README lists the tiers. Tier 1 is built and tested on every
-  release, tier 2 built but not tested, tier 3 best effort. Moving a platform
-  down a tier is a breaking change.
+- Platforms: the tiers follow the README's Platforms table. Tier 1 is built,
+  tested in CI and released (Linux x86_64). Tier 2 is built and released but
+  not tested (Linux aarch64, armv7, riscv64, macOS). Tier 3 is best effort:
+  compiled in CI, no binaries (FreeBSD). Moving a platform down a tier is a
+  breaking change.
 - The minimum Rust version is `rust-version` in `Cargo.toml`. Raising it is
   a minor bump, never a patch.
 - Release when there is something worth shipping, not on a calendar. Cut an
@@ -78,7 +80,9 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   run `make changelog VERSION=X.Y.Z`, which writes `## X.Y.Z - <today>`
   into `CHANGELOG.md` from `changes/*.md` (entries in the order their files
   reached `main`) and deletes the files; commit both, merge, and push the
-  signed tag `vX.Y.Z` on `main`. A prerelease tag leaves the change files
+  signed tag `vX.Y.Z` on the release pull request's merge commit. Merge
+  nothing between the release pull request and the tag: a change merged in
+  between would ship in the tag with no line in its notes. A prerelease tag leaves the change files
   in place and takes its notes from them (`scripts/changelog.sh notes`). `.github/workflows/release.yml` builds the tarballs
   and drafts the GitHub release with that section as notes. Before
   publishing the draft, check the tag's signature with `git tag -v vX.Y.Z`;
