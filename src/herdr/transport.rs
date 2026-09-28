@@ -18,7 +18,7 @@ const CONTROL_PATH_STAGING: usize = 17;
 
 /// `sun_path` is 108 bytes on Linux and 104 on macOS and the BSDs, including
 /// the terminating NUL.
-const UNIX_PATH_MAX: usize = unix_path_max(cfg!(target_os = "linux"));
+pub(crate) const UNIX_PATH_MAX: usize = unix_path_max(cfg!(target_os = "linux"));
 
 const fn unix_path_max(linux: bool) -> usize {
     if linux { 108 } else { 104 }
@@ -170,7 +170,17 @@ fn expanded_len(path: &Path) -> usize {
 /// recognisable in `ls`; `%C` (a hash of the destination) is what keeps
 /// machines apart, so cutting the name loses nothing. `None` only when even a
 /// bare `-%C` does not fit, which takes an unusually deep state dir.
-fn fitting_control_path(paths: &Paths, machine: &str) -> Option<PathBuf> {
+/// ssh options that turn multiplexing off whatever the user's ssh config says.
+pub(crate) fn no_multiplexing() -> [String; 4] {
+    [
+        "-o".into(),
+        "ControlMaster=no".into(),
+        "-o".into(),
+        "ControlPath=none".into(),
+    ]
+}
+
+pub(crate) fn fitting_control_path(paths: &Paths, machine: &str) -> Option<PathBuf> {
     let chars = machine.chars().count();
     (0..=chars).rev().find_map(|keep| {
         let short: String = machine.chars().take(keep).collect();
@@ -230,6 +240,10 @@ fn ssh_argv_running(target: &str, control_path: Option<&Path>, remote: String) -
             "-o".into(),
             format!("ControlPersist={CONTROL_PERSIST_SECS}"),
         ]);
+    } else {
+        // Said outright, so a `ControlMaster` in the user's ssh config cannot
+        // bring back the socket that did not fit.
+        argv.extend(no_multiplexing());
     }
     // `--` so a target is never read as an option; `Flock::validate` also
     // refuses one that starts with `-`.
@@ -1491,9 +1505,15 @@ mod tests {
         };
         assert!(control_path.is_none(), "{control_path:?}");
         let argv = ssh_argv(&target, &session, control_path.as_deref());
+        for opt in ["ControlMaster=no", "ControlPath=none"] {
+            assert!(
+                argv.windows(2).any(|w| w == ["-o", opt]),
+                "a machine still connects, just without multiplexing, whatever ~/.ssh/config says: {argv:?}"
+            );
+        }
         assert!(
-            !argv.iter().any(|a| a.starts_with("ControlPath=")),
-            "a machine still connects, just without multiplexing: {argv:?}"
+            !argv.iter().any(|a| a.starts_with("ControlPersist")),
+            "{argv:?}"
         );
         assert_eq!(
             argv.last().unwrap(),
