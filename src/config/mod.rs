@@ -1450,9 +1450,9 @@ pub struct PastorConfig {
     /// as the same user, so it is not a security boundary.
     pub agents_change_fleet: bool,
     /// How many orchestrator agents (`role = "orchestrator"`) the head runs
-    /// at once, of both kinds, outside `max_agents` and job slots. A
-    /// scheduled orchestrator's run past it starts no agent
-    /// (`orchestrator.held`).
+    /// at once, of both kinds. Each also takes a slot under `max_agents` on
+    /// its machine, like any task. A scheduled orchestrator's run past it
+    /// starts no agent (`orchestrator.held`).
     pub max_orchestrators: u32,
     /// The ssh destination other machines reach the head by. Agents on
     /// machines other than the head's own get it as `ipc::HEAD_ENV`.
@@ -1488,7 +1488,7 @@ pub struct ShepherdConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
     /// Take any task the head would place on this machine, not only those
-    /// pinned to it (`task run --shepherd`, `--machine <this one>`).
+    /// pinned to it (`task run --machine <this one>`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub takes_flock_work: bool,
     /// Developer option: argv speaking the herdr protocol on stdio, in
