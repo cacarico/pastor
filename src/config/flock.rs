@@ -922,7 +922,9 @@ impl FlockDoc {
 
     /// `machine move`: leave every flock and join `flock` with the machine's
     /// `max_agents`, listed by name, so it stays there whichever flock is
-    /// the default later. A no-op when `flock` is already its only one.
+    /// the default later. A no-op when `flock`'s `machines` is already its
+    /// only membership; a machine with the old `flock` key is edited even
+    /// when the key names `flock`, since this is its first membership edit.
     pub fn move_machine(&mut self, name: &str, flock: &str) -> Result<(), EditError> {
         let f = self.current()?;
         let m = f
@@ -933,7 +935,7 @@ impl FlockDoc {
             return Err(EditError::UnknownFlock(flock.into()));
         }
         let now = f.flocks_of(&m);
-        if !f.unplaced(&m) && now.len() == 1 && now[0].0 == flock {
+        if m.flock.is_none() && matches!(now.as_slice(), [(only, Some(_))] if *only == flock) {
             return Ok(());
         }
         self.declare_implicit();
@@ -1740,6 +1742,17 @@ ssh = "user@spare"
         assert_eq!(
             d.flock().unwrap().machine_flocks("pi-3").unwrap(),
             [("work", Some(3))]
+        );
+
+        // So does moving it to the flock the key already names.
+        let mut d = FlockDoc::parse(&text).unwrap();
+        d.move_machine("pi-3", "work").unwrap();
+        let out = d.to_string();
+        assert!(!out.contains("flock = \"work\""), "{out}");
+        assert!(out.contains("machines = { pi-3 = 2 }"), "{out}");
+        assert_eq!(
+            d.flock().unwrap().machine_flocks("pi-3").unwrap(),
+            [("work", Some(2))]
         );
 
         // A file with no `[[flock]]` gets its implicit flock declared.

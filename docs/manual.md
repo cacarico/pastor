@@ -635,10 +635,12 @@ tasks are queued in the implicit flock the machines stay there, so those
 tasks keep somewhere to run, and the output names the tasks. `flock add` says
 which flock those machines are in afterwards. `flock default set` writes the old
 default flock onto every machine that named none, so changing where new work goes moves no machine.
-`machine move` sets the machine's `flock` key and leaves the flocks' `machines`
-tables alone, so a machine they list stays in those flocks too; moving it into
-a flock whose `machines` table already lists it is a no-op, since it is
-already a member there and the `flock` key would only duplicate it.
+`machine move` takes the machine out of every flock and lists it in the named
+flock's `machines` table with its `max_agents`, so it is in that one flock
+only, whichever flock is the default later. Moving it into the flock whose
+`machines` table is already its only membership is a no-op. A machine with
+the old `flock = "..."` key has the key removed on its first move, even to
+the flock the key names; pastor does not rewrite the key otherwise.
 AGENTS in `flock list` counts the flock's own live tasks on its machines; it
 needs a running head and is `-` without one.
 
