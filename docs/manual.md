@@ -104,10 +104,13 @@ flock's machines, and the line counts those.
 HOST is the ssh target, `local`, or the program a `command` machine runs.
 FLOCKS are the flocks the machine is in, with its number in each (see Flocks). PROFILE is the
 machine's own permission profile, the one that decides whether a task may
-ask for `unrestricted` there: the machine's `profile`, else its flock's,
-else `[defaults]` (see [Permission profiles](#permission-profiles));
-`profile` in `--json`. A task there runs under its own flock's profile
-before the machine's, so it can run under another one. PASTOR is the pastor
+ask for `unrestricted` there: the machine's `profile`, else its primary
+flock's, else `[defaults]` (see [Permission profiles](#permission-profiles));
+`profile` in `--json`. On a machine in several flocks with no `profile` of
+its own, the gate reads the task's flock instead, so a task from another
+flock can meet a different profile than the one shown. A task there runs
+under its own flock's profile before the machine's, so it can run under
+another one. PASTOR is the pastor
 installed on the machine:
 over the ssh master, pastor runs `pastor --version` in a shell that has
 `~/.cargo/bin` and `~/.local/bin` on its PATH, since ssh's non-login shell
@@ -126,8 +129,10 @@ AGENTS counts pastor's tasks and orphans (see below) against the machine's
 room, `max_agents` followed by `+<n>j` for job slots and `+<n>b` for burst
 when they are set (see Room on a machine). Without it, the command
 probes each machine itself (a ping and an `agent.list`, one at a time, with no
-time limit, plus the pastor version for a machine that answered); CHANNEL
-reads one of four values: `probed` (the ping answered — an old protocol or a
+time limit, plus the pastor version for a machine that answered). A pull
+machine is not probed: nothing connects to it, so its row reads HOST `pull`
+and CHANNEL `not probed`, and AGENTS counts the tasks the store puts there.
+For any other machine CHANNEL reads one of four values: `probed` (the ping answered — an old protocol or a
 failed `agent.list` still counts as `probed`, with the reason in ERROR),
 `server down` (a local endpoint's own socket has nothing listening),
 `unreachable` (any other transport failure), or `error` (the ping itself came
@@ -135,7 +140,7 @@ back with a non-transport API error). AGENTS counts every agent herdr reports,
 and stderr says so. `--json` prints
 `{"head": {...}, "machines": [...]}`, with `pastor_version` on the head and
 on each machine (`null` when unknown), `flock` on each machine, and `channel`
-one of the same four probe values (or the head's live channel state when
+one of the same four probe values or `not probed` (or the head's live channel state when
 `pastor serve` is running).
 
 Jobs are one TOML file each in `~/.config/pastor/jobs/`. On every `tick` the
