@@ -21,6 +21,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
+      - "scripts/changelog.sh"
       - ".github/workflows/ci.yml"
       - ".github/workflows/release.yml"
       - "install.sh"

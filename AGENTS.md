@@ -115,8 +115,15 @@ down here because getting them wrong cost a day.
   usage errors stay plain text with exit 2.
 - Rust edition 2024, toolchain from mise. No new runtime dependencies without
   a reason in the commit body.
+- A changelog entry is its own file, `changes/<branch>.md` (slashes as
+  dashes, Keep a Changelog `###` subsections inside), never a line in
+  `CHANGELOG.md`, so two pull requests never conflict over it. `make check`
+  (`scripts/changelog.sh check`) fails on an Unreleased section or a
+  malformed change file; `changes/README.md` has the format.
 - Releases are tagged `vX.Y.Z` on `main` with a signed tag. `CHANGELOG.md`
-  gets one section per release; the tag push runs
+  gets one section per release, written by `make changelog VERSION=X.Y.Z`
+  on the release pull request from `changes/*.md` in merge order, which
+  also deletes them; the tag push runs
   `.github/workflows/release.yml`, which builds the tarballs and drafts the
   GitHub release with that section as notes. `CONTRIBUTING.md` has the
   release policy.
@@ -207,6 +214,8 @@ Still open as of the last review; none of them blocks normal use.
 ~/.local/state/pastor/orchestrators/<name>/ state.json, note, scripts' scratch/ and runs/
 skills/pastor/SKILL.md            agent skill, in the repo; `pastor --skill` prints it
 skills/spec/                      plan-for-the-flock skill, its plan format and example
+changes/<branch>.md               a pull request's changelog entry, gathered at release
+scripts/changelog.sh              check, notes and gather for those files
 .claude-plugin/plugin.json        makes the repo a Claude Code plugin named pastor
 ```
 

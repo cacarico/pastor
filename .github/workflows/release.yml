@@ -41,7 +41,8 @@ env:
 jobs:
   # The tag must name the version Cargo.toml carries, and CHANGELOG.md must
   # have that version's section because the release notes come from it; a
-  # prerelease (v1.2.3-rc.1) may still be under "Unreleased". `make check`
+  # prerelease (v1.2.3-rc.1) may still have its entries in changes/*.md, and
+  # its notes are then what `scripts/changelog.sh notes` prints. `make check`
   # runs again here because a tag can point at a commit that never went
   # through a pull request. The tag's signature is not checked here: the
   # release stays a draft, and the maintainer runs `git tag -v` before
@@ -66,8 +67,8 @@ jobs:
           section="${tag%%-*}"
           if grep -q "^## $section " CHANGELOG.md; then
             :
-          elif [ "$tag" != "$section" ] && grep -q '^## Unreleased' CHANGELOG.md; then
-            section=Unreleased
+          elif [ "$tag" != "$section" ] && [ -n "$(scripts/changelog.sh notes)" ]; then
+            section=changes
           else
             echo "CHANGELOG.md has no section for $section" >&2
             exit 1
@@ -172,7 +173,11 @@ jobs:
       VERSION: ${{ needs.verify.outputs.version }}
       SECTION: ${{ needs.verify.outputs.section }}
     steps:
+      # Full history: prerelease notes from changes/*.md are in merge order,
+      # which scripts/changelog.sh reads from git log.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
@@ -188,10 +193,15 @@ jobs:
             dist/pastor-*.tar.gz
             dist/SHA256SUMS
       # The section's body without its heading; the heading is the release
-      # title. `verify` already checked the section exists.
+      # title. `verify` already checked the section exists. A prerelease cut
+      # before the release PR gathered changes/*.md gets them as its notes.
       - name: Release notes from the changelog
         run: |
-          awk -v s="$SECTION" '/^## /{ if (p) exit; p = ($2 == s); next } p' CHANGELOG.md > notes.md
+          if [ "$SECTION" = changes ]; then
+            scripts/changelog.sh notes > notes.md
+          else
+            awk -v s="$SECTION" '/^## /{ if (p) exit; p = ($2 == s); next } p' CHANGELOG.md > notes.md
+          fi
           if ! grep -q '[^[:space:]]' notes.md; then
             echo "CHANGELOG.md section $SECTION is empty" >&2
             exit 1
