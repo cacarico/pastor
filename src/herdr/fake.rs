@@ -428,6 +428,18 @@ impl FakeHerdr {
         self.state.lock().unwrap().trust_redraw = d;
     }
 
+    /// A person answers the trust question of the agent in `pane_id` at the
+    /// pane itself, not through `pane.send_keys`: it goes idle, publishes
+    /// that, and redraws for `trust_redraw` as after any trust answer.
+    pub fn answer_trust_by_hand(&self, pane_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .trust_answered
+            .insert(pane_id.into(), Instant::now());
+        self.set_status(pane_id, AgentStatus::Idle);
+    }
+
     /// `agent.prompt` is accepted from now on, but the agent never starts
     /// working on it, as if the text never reached it.
     pub fn ignore_prompts(&self, yes: bool) {
