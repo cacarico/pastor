@@ -5636,6 +5636,198 @@ fn a_headless_serve_runs_its_jobs_through_the_head() {
     assert!(serve.child.try_wait().unwrap().is_none(), "{}", serve.log());
 }
 
+/// A fake herdr listening on `socket`, killed when dropped, and the
+/// `command` that reaches it (`--connect`).
+struct FakeHerdrServer(std::process::Child);
+
+impl Drop for FakeHerdrServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn fake_herdr_at(socket: &std::path::Path, env: &[(&str, &str)]) -> (FakeHerdrServer, String) {
+    let child = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+        .arg("--listen")
+        .arg(socket)
+        .env("FAKE_HERDR_READY_MS", "200")
+        .envs(env.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let command = format!(
+        "[\"{}\", \"--connect\", \"{}\"]",
+        env!("CARGO_BIN_EXE_fake-herdr"),
+        socket.display()
+    );
+    (FakeHerdrServer(child), command)
+}
+
+/// The head of `start()` with `laptop` as a pull machine too, and
+/// `extra` in its pastor.toml; waits until the head has reloaded.
+fn head_with_pull_machine(extra: &str) -> Env {
+    let env = start();
+    let flock = std::fs::read_to_string(env.config.join("flock.toml")).unwrap();
+    std::fs::write(
+        env.config.join("flock.toml"),
+        format!("{flock}\n[[machine]]\nname = \"laptop\"\npull = true\n"),
+    )
+    .unwrap();
+    let config = std::fs::read_to_string(env.config.join("pastor.toml")).unwrap();
+    std::fs::write(env.config.join("pastor.toml"), format!("{config}{extra}")).unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !ok(env.cmd(&["machine", "list", "--json"])).contains("\"laptop\"") {
+        assert!(Instant::now() < deadline, "the head never took laptop");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    env
+}
+
+/// A shepherd whose head is `env` and which is its pull machine `laptop`,
+/// running tasks on the fake herdr `command` reaches.
+fn pull_shepherd(env: &Env, command: &str) -> (Client, Served) {
+    let c = client(Some(env));
+    ok(c.head_set("head-up", &[]));
+    std::fs::create_dir_all(&c.config).unwrap();
+    std::fs::write(
+        c.config.join("pastor.toml"),
+        format!(
+            "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n[shepherd]\nmachine = \"laptop\"\ncommand = {command}\n"
+        ),
+    )
+    .unwrap();
+    let mut serve = c.serve();
+    serve.wait_log("headless");
+    (c, serve)
+}
+
+fn task_state(env: &Env, id: &str) -> serde_json::Value {
+    serde_json::from_str(&ok(env.cmd(&["task", "describe", id, "--json"]))).unwrap()
+}
+
+fn wait_pulled(env: &Env, id: &str, want: &str, serve: &Served) -> serde_json::Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let t = task_state(env, id);
+        if t["state"] == want {
+            return t;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{id} never {want}: {t}\n{}",
+            serve.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A head and a shepherd, each with its own dirs, the shepherd reaching the
+/// head through the fake ssh: the task pinned to the shepherd's pull
+/// machine waits on the head until the shepherd claims it, runs on the
+/// shepherd's herdr, and the head's row and events follow it to done, with
+/// the machine named, as for a machine the head runs itself.
+#[test]
+fn a_shepherd_runs_the_task_pinned_to_it_and_the_head_sees_it() {
+    let env = head_with_pull_machine("");
+    let tmp = tempfile::tempdir().unwrap();
+    let (_herdr, command) = fake_herdr_at(
+        &tmp.path().join("laptop.sock"),
+        &[("FAKE_HERDR_AUTO_DONE_MS", "300")],
+    );
+    let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
+        "task",
+        "run",
+        "hello",
+        "--machine",
+        "laptop",
+        "--repo",
+        "/tmp",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(t["state"], "queued", "{t}");
+    let id = format!("t-{}", t["id"]);
+
+    let (_c, serve) = pull_shepherd(&env, &command);
+    let running = wait_pulled(&env, &id, "done", &serve);
+    assert_eq!(running["machine"], "laptop", "{running}");
+    assert!(running["pane_id"].is_string(), "{running}");
+
+    let out = ok(env.cmd(&["events", "--task", &id, "--json"]));
+    let events: Vec<(String, String)> = out
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .map(|e| {
+            (
+                e["type"].as_str().unwrap().to_string(),
+                e["task"]["machine"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    let lap = |k: &str| (k.to_string(), "laptop".to_string());
+    assert_eq!(
+        events,
+        [
+            ("task.queued".to_string(), String::new()),
+            lap("task.running"),
+            lap("task.done")
+        ],
+        "{out}"
+    );
+    let machines = ok(env.cmd(&["machine", "list", "--json"]));
+    let laptop = serde_json::from_str::<serde_json::Value>(&machines).unwrap()["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "laptop")
+        .cloned()
+        .unwrap();
+    assert_eq!(laptop["channel"], "connected", "{laptop}");
+}
+
+/// A pull machine that stops asking is lost after `pull_lost_after`: its
+/// running task goes stale on the head, with the reason.
+#[test]
+fn a_silent_pull_machine_s_tasks_go_stale() {
+    let env = head_with_pull_machine("pull_lost_after = \"3s\"\n");
+    let tmp = tempfile::tempdir().unwrap();
+    let (_herdr, command) = fake_herdr_at(&tmp.path().join("laptop.sock"), &[]);
+    let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
+        "task",
+        "run",
+        "hello",
+        "--machine",
+        "laptop",
+        "--repo",
+        "/tmp",
+        "--json",
+    ])))
+    .unwrap();
+    let id = format!("t-{}", t["id"]);
+    let (_c, serve) = pull_shepherd(&env, &command);
+    wait_pulled(&env, &id, "running", &serve);
+    // The shepherd stops: nothing claims or reports for the machine now.
+    drop(serve);
+    let deadline = Instant::now() + WAIT;
+    let t = loop {
+        let t = task_state(&env, &id);
+        if t["state"] == "stale" {
+            break t;
+        }
+        assert!(Instant::now() < deadline, "never stale: {t}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        t["error"]
+            .as_str()
+            .unwrap()
+            .contains("has not claimed or reported"),
+        "{t}"
+    );
+}
+
 /// A head this machine cannot reach is a warning, not a reason to stop:
 /// the headless serve keeps running and asks again each tick.
 #[test]

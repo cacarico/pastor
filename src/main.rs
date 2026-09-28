@@ -1744,19 +1744,9 @@ async fn probe_machine(
     })
 }
 
-/// This machine's hostname, read from the kernel and files rather than a
-/// new dependency for `gethostname`; `-` when none says.
+/// This machine's hostname (`config::hostname`).
 fn hostname() -> String {
-    ["/proc/sys/kernel/hostname", "/etc/hostname"]
-        .iter()
-        .find_map(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "-".into())
+    pastor::config::hostname()
 }
 
 /// The head's row: this machine's hostname and the herdr it has, if any.

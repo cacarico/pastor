@@ -1307,6 +1307,69 @@ pub struct PastorConfig {
     /// What `pastor watch` runs besides the head's events.
     #[serde(skip_serializing_if = "WatchConfig::is_empty")]
     pub watch: WatchConfig,
+    /// `[shepherd]`: how this machine takes tasks when its `pastor serve`
+    /// runs headless and the head has it as a pull machine.
+    #[serde(skip_serializing_if = "ShepherdConfig::is_empty")]
+    pub shepherd: ShepherdConfig,
+}
+
+/// The variable that makes a headless serve take flock work, as
+/// `[shepherd] takes_flock_work = true` does: `1` or `true`.
+pub const SHEPHERD_FLOCK_WORK_ENV: &str = "PASTOR_SHEPHERD_FLOCK_WORK";
+
+/// `[shepherd]` in pastor.toml, read by a headless `pastor serve`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShepherdConfig {
+    /// The name this machine has in the head's flock.toml, where it is
+    /// `pull = true`; the hostname when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// Take any task the head would place on this machine, not only those
+    /// pinned to it (`task run --shepherd`, `--machine <this one>`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub takes_flock_work: bool,
+    /// Developer option: argv speaking the herdr protocol on stdio, in
+    /// place of this machine's own herdr (as `command` in flock.toml).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+}
+
+impl ShepherdConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &ShepherdConfig::default()
+    }
+
+    /// The pull machine this machine is: `machine`, else the hostname.
+    pub fn machine_name(&self) -> String {
+        self.machine
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(hostname)
+    }
+
+    /// Whether it takes flock work: `takes_flock_work`, or
+    /// `SHEPHERD_FLOCK_WORK_ENV` set to `1` or `true`.
+    pub fn flock_work(&self) -> bool {
+        self.takes_flock_work
+            || std::env::var(SHEPHERD_FLOCK_WORK_ENV)
+                .is_ok_and(|v| matches!(v.trim(), "1" | "true"))
+    }
+}
+
+/// This machine's hostname, read from the kernel and files rather than a
+/// new dependency for `gethostname`; `-` when none says.
+pub fn hostname() -> String {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .find_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "-".into())
 }
 
 /// `[watch]` in pastor.toml.
@@ -1352,6 +1415,7 @@ impl Default for PastorConfig {
             models: Models::default(),
             profiles: profile::Profiles::default(),
             watch: WatchConfig::default(),
+            shepherd: ShepherdConfig::default(),
         }
     }
 }
@@ -1485,6 +1549,14 @@ impl PastorConfig {
             cfg.profiles
                 .resolve(p)
                 .map_err(|e| anyhow::anyhow!("{}: defaults.profile: {e}", path.display()))?;
+        }
+        if cfg.shepherd.command.as_ref().is_some_and(|c| c.is_empty()) {
+            anyhow::bail!("{}: shepherd.command is empty", path.display());
+        }
+        if let Some(m) = &cfg.shepherd.machine
+            && m.trim().is_empty()
+        {
+            anyhow::bail!("{}: shepherd.machine must not be empty", path.display());
         }
         if cfg.agent_ready_timeout_duration() >= cfg.request_timeout_duration() {
             anyhow::bail!(
@@ -3214,6 +3286,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(c.close_done_after_duration(), None);
+    }
+
+    /// `[shepherd]` names the pull machine this one is, the hostname when
+    /// it does not; an empty name or command and an unknown key are refused.
+    #[test]
+    fn shepherd_names_the_pull_machine_this_one_is() {
+        let path = Path::new("pastor.toml");
+        let d = PastorConfig::default();
+        assert!(d.shepherd.is_empty());
+        assert_eq!(d.shepherd.machine_name(), hostname());
+        let cfg = PastorConfig::parse(
+            path,
+            "[shepherd]\nmachine = \"laptop\"\ntakes_flock_work = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.shepherd.machine_name(), "laptop");
+        assert!(cfg.shepherd.flock_work());
+        for (bad, key) in [
+            ("[shepherd]\nmachine = \" \"\n", "shepherd.machine"),
+            ("[shepherd]\ncommand = []\n", "shepherd.command"),
+            ("[shepherd]\nmachines = \"x\"\n", "machines"),
+        ] {
+            let err = format!("{:#}", PastorConfig::parse(path, bad).unwrap_err());
+            assert!(err.contains(key), "{bad}: {err}");
+        }
     }
 
     /// A pull machine is lost after ten silent minutes unless pastor.toml

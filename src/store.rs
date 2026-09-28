@@ -526,6 +526,38 @@ impl Store {
         self.get_task(id)?.context("task vanished after insert")
     }
 
+    /// A task the head handed this machine (`IpcRequest::TaskClaim`), as a
+    /// queued row under the head's own id, so this machine's actor
+    /// dispatches it as it would one of its own (`claim_task`) and every
+    /// report names the head's row. A row already there (a claim this
+    /// serve took before a restart) is left as it is and returned.
+    pub fn adopt_claimed(&self, t: &Task) -> anyhow::Result<Task> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "INSERT OR IGNORE INTO tasks (id, job, item, prompt, spec, flock, state, priority, priority_from, role, description, preempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+            params![t.id, t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, t.priority.as_str(), t.priority_from, t.role.as_str(), t.description, t.pause.preempt, now],
+        )?;
+        if n == 1 {
+            place_last(&tx, t.id)?;
+        }
+        tx.commit()?;
+        drop(conn);
+        self.get_task(t.id)?.context("task vanished after insert")
+    }
+
+    /// Delete task `id`'s row and its summaries: a claimed task whose end
+    /// the head has heard of (`shepherd`), so the rows here do not pile up.
+    pub fn forget_task(&self, id: i64) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM task_summaries WHERE task_id = ?1", params![id])?;
+        tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// End a round of task `id`: a new summary row, numbered one past its
     /// last. `summary` is what the agent said (`task done --summary`),
     /// capped at `SUMMARY_MAX` characters; with none (or only blanks) the
