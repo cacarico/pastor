@@ -13,7 +13,7 @@ and so on. This page lists them; `--help` after any command lists its flags.
 - Most read commands take `--json`: `pastor task list`, `pastor machine list`,
   `pastor job list`, `pastor events` and every `describe`. Scripts and agents
   should read ids and states from it rather than guess them.
-- `-w, --wide` on `task`, `job`, `machine`, `flock` and `connector list`
+- `-w, --wide` on `task`, `job`, `orchestrator`, `machine`, `flock` and `connector list`
   adds a DESCRIPTION column, cut to the terminal's width. `describe` and
   `--json` always show descriptions. On `task list` it adds RESULT too,
   how each task's last round ended.
@@ -28,7 +28,7 @@ and so on. This page lists them; `--help` after any command lists its flags.
 | command | does |
 |---|---|
 | `pastor task run` | create a one-off task and dispatch it; `--summary require` fails it if the agent stops without a summary |
-| `pastor task list` | live tasks across the flock; `--all` adds finished ones |
+| `pastor task list` | live tasks across the flock, orchestrators in a table of their own first; `--all` adds finished ones |
 | `pastor task describe` | one task in full: state, machine, agent, prompt, error, summary; `--all-summaries` for every round's |
 | `pastor task read` | recent output from a task's pane |
 | `pastor task attach` | attach to a task's agent terminal (ctrl+b q detaches) |
@@ -82,6 +82,17 @@ and so on. This page lists them; `--help` after any command lists its flags.
 | `pastor job reload` | re-read job files, flock.toml and pastor.toml now |
 | `pastor job describe` | one job in full: connector, dispatch, last runs, tasks |
 | `pastor job edit` | open a job file in your editor; saved only once valid |
+
+## orchestrator
+
+| command | does |
+|---|---|
+| `pastor orchestrator list` | every orchestrator file: kind, state, schedule, last and next run, its agent |
+| `pastor orchestrator describe` | one orchestrator in full: settings, note, last runs with their lines |
+| `pastor orchestrator run` | run a scheduled orchestrator now, ignoring its schedule and `enabled` |
+| `pastor orchestrator enable` | enable an orchestrator file |
+| `pastor orchestrator disable` | disable an orchestrator file; its agent keeps running |
+| `pastor orchestrator note` | keep the handover note every agent it starts gets |
 
 ## connector
 

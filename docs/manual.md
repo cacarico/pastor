@@ -1395,7 +1395,8 @@ A record, which is also what connector event hooks get on stdin:
 - `type`: `task.queued|running|blocked|done|stale|failed|closed|paused`,
   `task.input` (`pastor task send`), `task.trusted` (the head answered a
   trust prompt), `job.failed`, `connector.finish_failed` (a connector's
-  `[finish]` command failed), `machine.connected`, `machine.lost`.
+  `[finish]` command failed), `machine.connected`, `machine.lost`, and
+  `orchestrator.started|skipped|held|quota|failed` (see Orchestrators).
 - `task`: the full task row (the same object as `pastor task describe --json`) at
   that moment, on `task.*` events; `null` otherwise or if the row is gone.
   `task.flock` is the task's flock, so a hook can route work and personal
@@ -1412,7 +1413,12 @@ A record, which is also what connector event hooks get on stdin:
   (the length of any text) and `trust` (sent by `--trust`); on
   `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
   turn on a question, `question`; on `connector.finish_failed`, `connector`
-  (its id) and `reason` (why: the exit status and stderr tail, or a timeout).
+  (its id) and `reason` (why: the exit status and stderr tail, or a timeout);
+  on `orchestrator.*`, `orchestrator` (its name) and: `lines` on `started`
+  (whose task is the record's `task`), `reason` on `skipped` (`busy`) and
+  `held` (`max_orchestrators`, with `max`, or `quota`, with `until`),
+  `until` on `quota`, and `stage` (`pre`, `agent` or `post`) and `error` on
+  `failed`.
 - `summary`: on `task.done` and `task.failed`, how the round that just ended
   ended (see Task summaries): `round`, `outcome` (`done`, `partial`,
   `blocked`, `nothing to do`, `unknown`, or `no summary`), `text`, `source`
@@ -1516,6 +1522,182 @@ malformed command line gets clap's plain usage text and exit 2.
 Each machine needs herdr 0.9 or newer (protocol 22 or newer) with its server
 running, and SSH access from the head without a passphrase prompt (a key in
 ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
+
+## Orchestrators
+
+An orchestrator is an agent that drives the others: it reads what changed,
+merges what is ready, sends fixes and answers what is blocked. pastor runs
+orchestrators itself, from files in `~/.config/pastor/orchestrators/`, one
+per orchestrator, next to `jobs/`. The head re-reads them on each tick; a
+file that stops parsing keeps its last good version and shows the error in
+`pastor orchestrator list`.
+
+Each file names its `kind`, required and with no default:
+
+- `scheduled`: a pre script runs on a schedule and does everything
+  mechanical itself; the head starts an agent only when the script prints
+  lines that need judgment, and gives it every line. Most runs start no
+  agent, and each agent is short.
+- `session`: one agent kept running through set hours. This version checks
+  session files (so a mistake shows before they run) but does not run them.
+
+Keys: both kinds take `kind`, `model` (a `[models]` name), `skill` (a skill
+the agent is told to use), `prompt` (required), and optionally `enabled`
+(default true), `description` and `repo` (the repo its agents work in, each
+in a worktree of its own; without it the agent starts in the home
+directory). `scheduled` adds `every` or `cron` (exactly one), `pre`
+(required), `post` and `timeout`; `session` adds `hours` (`{ start =
+"22:00", stop = "08:00" }`, local time) and `stop_grace`. A file without
+`kind`, with a key of the other kind (`pre` in a session, `hours` in a
+scheduled one), or with an unknown key is invalid, and the error names the
+key. There is no `machine` key: everything an orchestrator runs, its scripts,
+its agent and the agent's worktree, runs on the head's own machine (the
+`local = true` one in flock.toml).
+
+```toml
+# ~/.config/pastor/orchestrators/merge.toml
+kind = "scheduled"
+cron = "*/5 22-23,0-7 * * *"     # or every = "5m", as a job
+pre = ["./merge-pre.sh"]         # relative to this file's directory
+post = ["./merge-post.sh"]       # optional
+timeout = "5m"                   # for pre and post each; the default
+model = "sonnet"
+skill = "orchestrating-pastor"
+prompt = "Decide what to do with each line below."
+description = "merges the night's green PRs"
+```
+
+A pre script, doing the mechanical part and printing the rest:
+
+```sh
+#!/bin/sh
+# ~/.config/pastor/orchestrators/merge-pre.sh
+# Merge what is green, send one rebase per PR, print what needs judgment.
+set -eu
+repo=owner/repo
+gh pr list --repo "$repo" --json number,mergeStateStatus,reviewDecision \
+  --jq '.[] | "\(.number) \(.mergeStateStatus) \(.reviewDecision)"' |
+while read -r pr state review; do
+  if [ "$state" = CLEAN ] && [ "$review" = APPROVED ]; then
+    echo "merging #$pr" >&2
+    gh pr merge "$pr" --repo "$repo" --squash >&2 || echo "PR #$pr merge refused"
+  elif [ "$state" = BEHIND ] && [ ! -e "$PASTOR_ORCHESTRATOR_STATE_DIR/rebase-$pr" ]; then
+    pastor task run "Rebase PR #$pr onto main and push." --repo '~/src/repo' --worktree >&2
+    touch "$PASTOR_ORCHESTRATOR_STATE_DIR/rebase-$pr"
+  else
+    echo "PR #$pr merge=$state review=$review"
+  fi
+done
+# A blocked task needs an answer.
+pastor task list --json | jq -r '.[] | select(.state == "blocked") | "TASK t-\(.id) blocked"'
+```
+
+A scheduled run:
+
+1. **Skip if busy.** While the last run's agent still works (queued,
+   starting, running, blocked or paused), the run is skipped, pre script
+   included, with `orchestrator.skipped`.
+2. **Pre.** The head runs `pre` in the file's directory with
+   `PASTOR_ORCHESTRATOR=<name>`, `PASTOR_ORCHESTRATOR_STATE_DIR` (the
+   orchestrator's scratch dir, kept between runs), `PASTOR_CONFIG_DIR`,
+   `PASTOR_STATE_DIR`, the `pastor` that runs the head first on `PATH`, and
+   the variables of an `.env` in the orchestrators directory if there is one.
+   Each line it prints on stdout is one thing that needs judgment; blank lines
+   are dropped, and so are control characters other than tab. Its stderr is
+   its log, kept with its stdout under
+   `~/.local/state/pastor/orchestrators/<name>/runs/`, with every `.env`
+   value redacted. Exit 0 with no lines ends the run: no agent. An exit other
+   than 0, or a run past `timeout`, fails the run (`orchestrator.failed`,
+   `stage: "pre"`): its lines are dropped and the orchestrator backs off as a
+   failing job does, a minute doubling to an hour.
+3. **Agent.** With lines, one task with `role = "orchestrator"`, pinned to
+   the head's machine, the file's `model`, and a prompt made of the file's
+   `prompt`, the skill, the handover note and every line; as for every task,
+   the `summary` setting adds the ask for a summary when it is sent (see
+   [Task summaries](#task-summaries)), and the post script gets it. Its
+   description is `orchestrator <name>: <n> lines`. When `max_orchestrators`
+   orchestrator agents already work, or the orchestrator waits for a quota
+   reset, no agent starts (`orchestrator.held`); the next run tries again.
+4. **Post.** When that task ends `done`, `failed` or `stale`, the head runs
+   `post` once, with the pre script's environment and on stdin the finish
+   command's object (see [The finish command](#the-finish-command)) plus
+   `orchestrator` and `lines`:
+
+   ```json
+   {
+     "task": {"id": 17, "role": "orchestrator", "...": "the whole task row"},
+     "state": "stale",
+     "job": "run",
+     "branch": null,
+     "summary": {"round": 1, "outcome": "done", "text": "...", "...": "..."},
+     "last_output": "...",
+     "orchestrator": "merge",
+     "lines": ["PR #31 merge=BLOCKED review=REVIEW_REQUIRED", "TASK t-240 blocked"]
+   }
+   ```
+
+   `summary` is the task's latest summary, `null` when it has none. A post
+   script that fails is logged and emitted as `orchestrator.failed` with
+   `stage: "post"`, and changes nothing. A task closed before pastor saw it
+   end runs no post script.
+
+**The role.** Every agent an orchestrator starts runs with `role =
+"orchestrator"` (see [Trust model](#trust-model)), and its pre and post
+scripts run under the same table: the CLI sends `PASTOR_ORCHESTRATOR` with
+each request, as it sends `PASTOR_TASK`, so a script may `task run`, `retry`,
+`send` and `close`, `job enable` and `job disable`, keep its own note and
+read everything, and anything else (`machine add`, file edits, `orchestrator
+run`, `enable` and `disable`, `--role orchestrator`) is `agent_refused` or
+`role_refused`. A name the head has no file for is refused every change.
+When both variables are set, `PASTOR_TASK` wins, so an agent cannot widen
+its rights by setting the other, and the head clears `PASTOR_TASK` for the
+scripts it runs. Like the rest of the guard, it stops mistakes, not a
+determined script. `agents_change_fleet = true` lifts it for scripts too.
+
+**The limit.** `max_orchestrators` in pastor.toml (default 1) is how many
+orchestrator agents the head runs at once, of both kinds and hand-started
+ones (`task run --role orchestrator`) too, outside `max_agents` and job
+slots. A run that starts no agent counts nothing.
+
+**The handover note.** `pastor orchestrator note <text>` keeps one short
+note per orchestrator (4 KiB at most, the last one wins, empty removes it)
+in `~/.local/state/pastor/orchestrators/<name>/note`. Every agent the
+orchestrator starts gets it in its prompt. Its own agent and its scripts
+leave the name out, and may keep only their own orchestrator's note; a
+person names it with `--name`. `-` reads the note from stdin.
+
+**Quota.** When the agent ends on a quota error (its error or the last
+lines of its pane say `usage limit`, `limit reached`, `hit your limit` or
+`quota exceeded`), the head reads the reset time from the message
+(`|<unix time>`, or `resets 3am` or `resets at 15:30`, the next such time in
+local time), or waits an hour when it finds none, emits `orchestrator.quota`
+with `until`, and starts no agent for that orchestrator before then. The pre
+script keeps running, so the mechanical work goes on.
+
+```bash
+pastor orchestrator list                 # kind, state, schedule, last and next run, agent
+pastor orchestrator describe merge       # settings, note, last runs with their lines, events
+pastor orchestrator run merge            # one run now, whatever the schedule and enabled
+pastor orchestrator disable merge        # its agent keeps running; no more runs
+pastor orchestrator note --name merge "merged #31; #32 waits on review"
+```
+
+`list` shows each file's state: `idle`, `running` (its agent works),
+`waiting for quota`, `off` (disabled) or `invalid` (the file never parsed).
+`run` ignores the schedule and `enabled`, waits for a run or post script of
+the same orchestrator already going, and is still skipped while the last
+agent works; it returns at once, and `describe` shows how it went. Orchestrator
+tasks appear in `pastor task list` in a table of their own above the others;
+`--json` keeps one array with `role`. With no head running, `list` and
+`describe` read the files and the state the head left, `enable`, `disable`
+and `note --name` edit them, and `run` is refused (`no_head`). With a head on
+another machine, every command goes to it. The commands need a head of IPC
+protocol 23 (`head_too_old`).
+
+What the head keeps per orchestrator lives in
+`~/.local/state/pastor/orchestrators/<name>/`: `state.json` (last run,
+failures and backoff, its last agent, the lines it was started with, a quota
+wait, the last ten runs), `note`, `scratch/` and `runs/`.
 
 ## Try it
 
@@ -2462,7 +2644,8 @@ So:
 - A task's role widens that guard for one task. `pastor task run --role
   orchestrator` starts an orchestrator: from its pane it may also run tasks
   (`task run`), retry, send to and close them (`task retry`, `task send`,
-  `task close`) and enable or disable a job (`job enable`, `job disable`);
+  `task close`), enable or disable a job (`job enable`, `job disable`) and
+  keep its orchestrator's handover note (`orchestrator note`);
   everything else that changes the fleet is still `agent_refused`, `task
   prune` and file and machine edits included, and the message names the
   role. Only a person starts one: `--role orchestrator`
@@ -2656,15 +2839,17 @@ sends nothing. A head from before these requests is refused
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, head_address, defaults, agents, models, profiles, watch (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, agents_change_fleet, max_orchestrators, head_address, defaults, agents, models, profiles, watch (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
+~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (and an optional .env for its scripts)
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
 ~/.local/state/pastor/pastor.db   tasks (schema 13, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role, description, preempt, paused_at, paused_for and resumed_at), task summaries, seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/watch/<name>.json   a `pastor watch` cursor
+~/.local/state/pastor/orchestrators/<name>/  an orchestrator's state.json, note, scripts' scratch/ and runs/
 ~/.local/state/pastor/serve.log   a background `pastor serve`'s log, rotated at 10 MB to serve.log.1 .. .3
 ~/.local/state/pastor/serve.json  the running serve's pid, service and log, for `serve status|stop`
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host, and one (`head-<hash>`) for a remote head
@@ -2691,6 +2876,7 @@ request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "15m"     # a done task's pane closes after this; "never" keeps it
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
+max_orchestrators = 1        # orchestrator agents at once, outside max_agents
 # head_address = "user@head.example"  # unset by default; see below
 [defaults]                   # for run flags, job keys and flock keys that are left out
 agent = "claude"

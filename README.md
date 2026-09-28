@@ -212,6 +212,7 @@ notification. Writing one takes a manifest and a script in any language. See
 | talk to an agent | `pastor task read t-3`, `pastor task send t-3 "..."`, `pastor task attach t-3` |
 | end a task | `pastor task close t-3` (an agent can run `pastor task done` itself) |
 | manage jobs | `pastor job list`, `pastor job describe NAME`, `pastor job run NAME`, `pastor job edit NAME` |
+| run orchestrators | `pastor orchestrator list`, `pastor orchestrator describe NAME`, `pastor orchestrator run NAME` (files in `~/.config/pastor/orchestrators/`, see [the manual](docs/manual.md#orchestrators)) |
 | manage flocks | `pastor flock list`, `pastor flock describe NAME`, `pastor flock edit` |
 | change settings | `pastor config edit` |
 | use connectors | `pastor connector list`, `pastor connector describe ID`, `pastor connector install OWNER/REPO/DIR` |
@@ -262,8 +263,10 @@ machine names.
   task with `pastor task done`, but it can't start tasks, stop other tasks,
   edit machines, jobs or settings, or start its own head, unless you allow it
   with `agents_change_fleet = true`. A task you start with `pastor task run
-  --role orchestrator` may also run, retry, send to and close tasks and
-  enable or disable a job, and nothing more; no task can start one.
+  --role orchestrator`, or that an orchestrator file starts, may also run,
+  retry, send to and close tasks, enable or disable a job and keep its
+  handover note, and nothing more; no task can start one. An orchestrator's
+  scripts get the same rights.
 - **Agents keep their permission prompts.** pastor passes the allow and deny
   lists you set for each flock. Turning the prompts off is your decision, and
   [the manual](docs/manual.md#trust-model) says when not to.

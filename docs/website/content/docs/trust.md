@@ -50,6 +50,12 @@ of machines, flocks, jobs and `pastor.toml`, `serve`, `setup` and
 agents_change_fleet = true  # turn the refusal off
 ```
 
+An orchestrator (`task run --role orchestrator`, or any agent an
+[orchestrator](../orchestrators/) file starts) may also run, retry, send to
+and close tasks, enable and disable jobs and keep its handover note; its pre
+and post scripts (`PASTOR_ORCHESTRATOR`) get the same table. Only a person
+starts an orchestrator.
+
 This stops an agent acting on its own, not a determined one: it runs as the
 same user and can unset the variable. Anything running as the head's user
 controls the fleet, so do not give a `local = true` machine untrusted work.

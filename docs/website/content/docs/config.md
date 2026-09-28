@@ -60,6 +60,7 @@ request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent start to an accepted prompt
 close_done_after = "15m"     # a done task's pane closes after this; "never" keeps it
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
+max_orchestrators = 1        # orchestrator agents at once, outside max_agents
 
 [defaults]                   # for run flags, job keys and flock keys left out
 agent = "claude"

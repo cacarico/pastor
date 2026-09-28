@@ -32,6 +32,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   here, naming it. `flock list`, `flock default show`, `profile`, `task
   attach` and `machine open` need a remote head speaking IPC protocol 6.
 - The manual has a "Moving the head" runbook.
+- Orchestrators run from files. `~/.config/pastor/orchestrators/<name>.toml`
+  names its `kind` (required): a `scheduled` orchestrator runs its `pre`
+  script on `every` or `cron`, and only when the script prints lines that
+  need judgment does the head start one agent, with the `orchestrator` role,
+  on its own machine, with the file's `prompt`, `skill` and `model`, the
+  handover note and every line; its `post` script gets the agent's end state
+  (`done`, `failed` or `stale`), summary and lines. A run is skipped while
+  the last agent works, a failing pre script backs off as a failing job
+  does, `max_orchestrators` in pastor.toml (default 1, outside `max_agents`)
+  holds agents back, and an agent that stopped on a quota error holds the
+  next until the reset. `session` files are checked (a key of the other kind
+  makes a file invalid) but not run yet. New commands: `pastor orchestrator
+  list | describe | run | enable | disable | note`; events
+  `orchestrator.started|skipped|held|quota|failed`. The pre and post scripts
+  run with `PASTOR_ORCHESTRATOR`, which the CLI sends with each request, and
+  the head applies the orchestrator role's table to them; `PASTOR_TASK` wins
+  when both are set. An orchestrator's agent may keep its note (`pastor
+  orchestrator note`). `pastor task list` shows orchestrator tasks in a table
+  of their own first. The head's IPC protocol goes to 23; the store keeps its
+  schema (orchestrator state lives under `state/orchestrators/<name>/`).
 - A `critical` task started with `--preempt` (or `preempt = true` under a
   job's `[dispatch]`) that finds its machines full, job slots and burst
   included, pauses the newest running `low` Claude task on one and starts
