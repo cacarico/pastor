@@ -1670,9 +1670,27 @@ impl Fleet {
     /// `task done` for a task on a pull machine, which has no actor here:
     /// the row is ended as `Actor::end_task` ends it, `done` and `ended`, so
     /// a report of the agent's last turn does not take it back to running.
-    pub fn end_pull(&self, task: Task, summary: Option<String>) -> anyhow::Result<Task> {
+    /// A required summary is held to the same rules as there (`by`).
+    pub fn end_pull(
+        &self,
+        task: Task,
+        summary: Option<String>,
+        by: crate::machine::EndBy,
+    ) -> anyhow::Result<Task> {
+        use crate::machine::EndBy;
         let machine = task.machine.clone().unwrap_or_default();
         let summary = summary.filter(|s| !s.trim().is_empty());
+        let required = task.spec.summary == crate::task::SummaryMode::Require;
+        if required && summary.is_none() && by == EndBy::Agent && !task.ended {
+            return Err(crate::cli::CliError::err(
+                crate::task::SUMMARY_REQUIRED,
+                format!(
+                    "{} needs a summary: pastor task done --summary-file - <<'EOF', then a first line done, partial, blocked or nothing to do, up to five short lines, and EOF",
+                    task.display_id()
+                ),
+            ));
+        }
+        let by_hand = required && summary.is_none() && by == EndBy::Hand;
         if task.ended {
             if let Some(summary) = &summary {
                 self.store.replace_last_summary(task.id, summary)?;
@@ -1695,7 +1713,12 @@ impl Fleet {
                 self.store.replace_last_summary(t.id, summary)?;
             }
         } else if let Some(spawner) = &self.spawner {
-            let round = match self.store.end_round(t.id, summary.as_deref()) {
+            let round = if by_hand {
+                self.store.end_round_by_hand(t.id)
+            } else {
+                self.store.end_round(t.id, summary.as_deref())
+            };
+            let round = match round {
                 Ok(round) => Some(round),
                 Err(err) => {
                     tracing::error!(%machine, %err, id = t.id, "save the task's summary");
@@ -3143,7 +3166,7 @@ impl Daemon {
             );
         };
         if self.fleet.is_pull(&handle.name) {
-            return match self.fleet.end_pull(task, summary) {
+            return match self.fleet.end_pull(task, summary, by) {
                 Ok(t) => IpcResponse::Task(t),
                 Err(err) => cli_error(err),
             };
@@ -4196,6 +4219,31 @@ mod tests {
         assert_eq!(closed.state, TaskState::Closed);
         d.handle(report("laptop", &t, TaskState::Done, None)).await;
         assert_eq!(state_of(&d, &t), TaskState::Closed, "closed stays closed");
+    }
+
+    /// A task on a pull machine that requires a summary is held to it as
+    /// one on a herdr machine: its agent's bare `task done` is refused, and
+    /// a person's ends it by hand.
+    #[tokio::test]
+    async fn a_pull_task_holds_its_agent_to_a_required_summary() {
+        use crate::machine::EndBy;
+        let (d, _tmp) = pull_daemon(2).await;
+        let t = queued(&d, "p", Some("laptop")).await;
+        claim(&d, 1, false).await;
+        let mut row = d.store().get_task(t.id).unwrap().unwrap();
+        row.spec.summary = crate::task::SummaryMode::Require;
+        d.store().update_task(&mut row).unwrap();
+        let err = d
+            .fleet()
+            .end_pull(row.clone(), None, EndBy::Agent)
+            .unwrap_err();
+        let err = err.downcast_ref::<crate::cli::CliError>().unwrap();
+        assert_eq!(err.code, crate::task::SUMMARY_REQUIRED);
+        assert!(!d.store().get_task(t.id).unwrap().unwrap().ended);
+        let ended = d.fleet().end_pull(row, None, EndBy::Hand).unwrap();
+        assert!(ended.ended);
+        let round = d.store().get_task(t.id).unwrap().unwrap().summary.unwrap();
+        assert_eq!(round.text, crate::task::ENDED_BY_HAND);
     }
 
     /// A pull machine that neither claims nor reports for `after` is lost
