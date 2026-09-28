@@ -389,6 +389,11 @@ pub async fn run_job(
                 });
                 report.created.push(t.display_id());
             }
+            // Queued by another request first, or, for a headless serve,
+            // by the head on a try whose reply was lost.
+            Err(_) if store.is_seen(&job.name, &item.key).unwrap_or(false) => {
+                report.skipped_seen += 1;
+            }
             Err(e) => {
                 tracing::error!(job = %job.name, key = %item.key, %e, "create task");
                 problems.push(format!("{}: {e:#}", item.key));
@@ -748,6 +753,9 @@ pub struct Scheduler {
     /// `pastor.toml` as last applied. `tick`, `defaults` and the machine
     /// timings (`daemon::machine_settings`) all come from it.
     config: PastorConfig,
+    /// A headless serve's scheduler: flock.toml is the head's business, so
+    /// it is never read here, and tasks go to the head (`Fleet::headless`).
+    headless: bool,
     /// `pastor.toml` and `flock.toml` as last applied. `None` makes the next
     /// `reload_config` apply whatever is on disk; `Daemon::start` sets it
     /// with `with_config_baseline` to what its caller saw before loading.
@@ -784,6 +792,7 @@ impl Scheduler {
             warned_removed: HashSet::new(),
             config: config.clone(),
             config_fingerprint: None,
+            headless: false,
         }
     }
 
@@ -795,6 +804,12 @@ impl Scheduler {
     /// nothing on disk changed.
     pub fn with_config_baseline(mut self, baseline: ConfigFingerprint) -> Self {
         self.config_fingerprint = Some(baseline);
+        self
+    }
+
+    /// For a headless serve: see `headless`.
+    pub fn headless(mut self) -> Self {
+        self.headless = true;
         self
     }
 
@@ -1078,20 +1093,24 @@ impl Scheduler {
                 tracing::error!(%err, "pastor.toml does not load; the previous version stays in use")
             }
         }
-        let flock = match Flock::load_existing(&files[1])
-            .and_then(|f| f.check_models(&self.config.models).map(|()| f))
-        {
-            Ok(f) => f,
-            Err(err) if is_not_found(&err) => {
-                tracing::warn!(
-                    path = %files[1].display(),
-                    "flock.toml is missing; the previous flock stays in use"
-                );
-                self.fleet.flock()
-            }
-            Err(err) => {
-                tracing::error!(%err, "flock.toml does not load; the previous flock stays in use");
-                self.fleet.flock()
+        let flock = if self.headless {
+            self.fleet.flock()
+        } else {
+            match Flock::load_existing(&files[1])
+                .and_then(|f| f.check_models(&self.config.models).map(|()| f))
+            {
+                Ok(f) => f,
+                Err(err) if is_not_found(&err) => {
+                    tracing::warn!(
+                        path = %files[1].display(),
+                        "flock.toml is missing; the previous flock stays in use"
+                    );
+                    self.fleet.flock()
+                }
+                Err(err) => {
+                    tracing::error!(%err, "flock.toml does not load; the previous flock stays in use");
+                    self.fleet.flock()
+                }
             }
         };
         let diff = self.fleet.apply_config(&self.config, &flock).await;
@@ -1791,6 +1810,132 @@ mod tests {
         broadcast::Receiver<PastorEvent>,
     ) {
         broadcast::channel(16)
+    }
+
+    /// A headless serve's fleet (`Fleet::headless`) whose head is `head`:
+    /// each forwarded `JobTask` is queued there as the head would, or
+    /// refused with `refuse` when set. Returns the requests it got.
+    fn headless_fleet(
+        store: &Arc<Store>,
+        head: Arc<Store>,
+        refuse: Arc<Mutex<Option<String>>>,
+    ) -> (Fleet, Arc<Mutex<Vec<crate::ipc::IpcRequest>>>) {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let seen = got.clone();
+        let forward: crate::daemon::JobTaskForward = Arc::new(move |req| {
+            seen.lock().unwrap().push(req.clone());
+            let head = head.clone();
+            let refuse = refuse.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(why) = refuse {
+                    anyhow::bail!(why);
+                }
+                let crate::ipc::IpcRequest::JobTask {
+                    job: name,
+                    flock,
+                    agent,
+                    prompt,
+                    spec,
+                    item,
+                } = req
+                else {
+                    panic!("{req:?}")
+                };
+                let j = Job {
+                    prompt,
+                    spec,
+                    agent,
+                    flock,
+                    ..job(&name)
+                };
+                head.insert_job_task(&name, "default", &item, |id| render_task(&j, &item, id))
+            })
+        });
+        (Fleet::headless(store.clone(), forward), got)
+    }
+
+    #[tokio::test]
+    async fn a_headless_run_sends_its_items_to_the_head_and_keeps_only_seen_keys() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let head = Arc::new(Store::open_in_memory().unwrap());
+        let refuse = Arc::new(Mutex::new(None));
+        let (fleet, got) = headless_fleet(&store, head.clone(), refuse.clone());
+        let src = Scripted::with_keys(&["k1", "k2"]);
+        *src.cursor.lock().unwrap() = Some("c1".into());
+        let (tx, _rx) = events();
+        let mut j = job("j");
+        j.flock = Some("gpu".into());
+        let report = run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
+        assert_eq!(report.created, vec!["t-1", "t-2"]);
+        // The templates travel unrendered, with the job's own flock.
+        let first = got.lock().unwrap()[0].clone();
+        let crate::ipc::IpcRequest::JobTask { prompt, flock, .. } = first else {
+            panic!()
+        };
+        assert_eq!(prompt, j.prompt);
+        assert_eq!(flock.as_deref(), Some("gpu"));
+        // The rows are the head's, rendered with the head's ids.
+        let tasks = head.list_tasks(&TaskFilter::default()).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(
+            head.get_task(1).unwrap().unwrap().prompt,
+            "j: title of k1 (t-1)"
+        );
+        assert!(store.list_tasks(&TaskFilter::default()).unwrap().is_empty());
+        assert!(store.is_seen("j", "k1").unwrap() && store.is_seen("j", "k2").unwrap());
+        assert_eq!(
+            store.job_state("j").unwrap().unwrap().cursor.as_deref(),
+            Some("c1")
+        );
+
+        // Seen here, so the next run sends nothing again.
+        src.items.lock().unwrap().push(item("k3"));
+        *src.cursor.lock().unwrap() = Some("c2".into());
+        *refuse.lock().unwrap() = Some("head_unreachable: ssh failed".into());
+        let report = run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.skipped_seen, 2);
+        // A head that does not take the item fails the run and holds the
+        // cursor, so the item is asked for again.
+        assert_eq!(report.outcome, RunOutcome::Failed);
+        assert!(report.error.unwrap().contains("ssh failed"));
+        assert!(!store.is_seen("j", "k3").unwrap());
+        assert_eq!(
+            store.job_state("j").unwrap().unwrap().cursor.as_deref(),
+            Some("c1")
+        );
+        *refuse.lock().unwrap() = None;
+        let report = run_job(&fleet, &j, &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.created, vec!["t-3"]);
+        assert_eq!(got.lock().unwrap().len(), 4);
+    }
+
+    /// A head that answers `already_seen` queued the key on a try whose
+    /// reply was lost: the key is seen here and the cursor moves on.
+    #[tokio::test]
+    async fn a_headless_run_counts_a_key_the_head_already_queued_as_seen() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let forward: crate::daemon::JobTaskForward = Arc::new(|_| {
+            Box::pin(async {
+                Err(crate::cli::CliError::err(
+                    crate::ipc::ALREADY_SEEN,
+                    "its task is gone",
+                ))
+            })
+        });
+        let fleet = Fleet::headless(store.clone(), forward);
+        let src = Scripted::with_keys(&["k1"]);
+        *src.cursor.lock().unwrap() = Some("c1".into());
+        let (tx, _rx) = events();
+        let report = run_job(&fleet, &job("j"), &src, &tx, Utc::now(), false).await;
+        assert_eq!(report.outcome, RunOutcome::Ran, "{report:?}");
+        assert_eq!(report.skipped_seen, 1);
+        assert!(report.created.is_empty() && report.error.is_none());
+        assert_eq!(store.seen_task("j", "k1").unwrap(), Some(None));
+        assert_eq!(
+            store.job_state("j").unwrap().unwrap().cursor.as_deref(),
+            Some("c1")
+        );
     }
 
     #[tokio::test]

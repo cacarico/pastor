@@ -45,7 +45,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the daemon: scheduler, machine channels, dispatch
+    /// Run the daemon: scheduler, machine channels, dispatch. With a head set on another machine, run headless: only this machine's jobs and hooks
     Serve,
     /// Manage tasks
     Task {
@@ -490,14 +490,8 @@ fn main() {
     };
     if let Some(r) = &remote {
         match remote_route(&command) {
-            RemoteRoute::Head | RemoteRoute::Here => {}
-            RemoteRoute::Serve => fail(
-                "remote_head_set",
-                &format!(
-                    "a remote head is set ({}); pastor serve would be a second head. Run `pastor head unset` first",
-                    r.ssh
-                ),
-            ),
+            // With a head elsewhere, serve runs headless (`shepherd`).
+            RemoteRoute::Head | RemoteRoute::Here | RemoteRoute::Serve => {}
             RemoteRoute::Unsupported => fail(
                 "remote_head_unsupported",
                 &format!(
@@ -539,7 +533,10 @@ fn main() {
             None => Head::Absent,
         };
         match command {
-            Command::Serve => pastor::daemon::serve(paths).await,
+            Command::Serve => match remote.clone() {
+                Some(r) => pastor::shepherd::serve(paths, r).await,
+                None => pastor::daemon::serve(paths).await,
+            },
             Command::Task { cmd } => task(&paths, cmd, head).await,
             Command::Machine { cmd } => machine(&paths, cmd, head).await,
             Command::Flock { cmd } => flock(&paths, cmd, head).await,
@@ -691,7 +688,15 @@ async fn probe_head(
         Some(remote) => {
             let line = pastor::ipc::request_line(&IpcRequest::Ping, None)?;
             match remote.request(&line, pastor::head::PING_TIMEOUT).await {
-                Ok(IpcResponse::Pong { version, protocol }) => HeadPing::Pong { version, protocol },
+                Ok(IpcResponse::Pong {
+                    version,
+                    protocol,
+                    role,
+                }) => HeadPing::Pong {
+                    version,
+                    protocol,
+                    role,
+                },
                 Ok(other) => {
                     return Err(CliError::err(
                         "head_unresponsive",
@@ -705,6 +710,21 @@ async fn probe_head(
     };
     match ping {
         HeadPing::NotRunning => Ok(Head::Absent),
+        HeadPing::Pong {
+            role: Some(role), ..
+        } if role == pastor::ipc::SHEPHERD_ROLE => Err(pastor::cli::CliError::err(
+            "shepherd_running",
+            match pastor::ipc::remote_head() {
+                Some(r) => format!(
+                    "{} runs a headless pastor serve, not a head; point `pastor head set` at the head",
+                    r.ssh
+                ),
+                None => format!(
+                    "a headless pastor serve holds {} and there is no head here; set one with `pastor head set`, or stop it",
+                    socket.display()
+                ),
+            },
+        )),
         HeadPing::Unresponsive => Err(pastor::cli::CliError::err(
             "head_unresponsive",
             format!(
@@ -712,9 +732,9 @@ async fn probe_head(
                 socket.display()
             ),
         )),
-        HeadPing::Pong { version, protocol }
-            if fleet_edit && protocol < pastor::ipc::FLEET_EDIT_PROTOCOL =>
-        {
+        HeadPing::Pong {
+            version, protocol, ..
+        } if fleet_edit && protocol < pastor::ipc::FLEET_EDIT_PROTOCOL => {
             Err(pastor::cli::CliError::err(
                 "head_too_old",
                 format!(
@@ -722,9 +742,10 @@ async fn probe_head(
                 ),
             ))
         }
-        HeadPing::Pong { version, protocol }
-            if let Some((needed, why)) = need
-                && protocol < needed =>
+        HeadPing::Pong {
+            version, protocol, ..
+        } if let Some((needed, why)) = need
+            && protocol < needed =>
         {
             Err(pastor::cli::CliError::err(
                 "head_too_old",
@@ -791,7 +812,8 @@ enum RemoteRoute {
     /// Here, without the head, on purpose: connectors are this machine's,
     /// and attach goes to the machine directly.
     Here,
-    /// `pastor serve`: a second head.
+    /// `pastor serve`: headless, running this machine's jobs and hooks for
+    /// the head.
     Serve,
     /// Not moved behind the head yet: it would read or edit this machine's
     /// files, so it is refused rather than act on the wrong ones.
@@ -2356,6 +2378,7 @@ mod tests {
                 let pong = IpcResponse::Pong {
                     version: "0.4.0".into(),
                     protocol: 1,
+                    role: None,
                 };
                 let mut out = serde_json::to_string(&pong).unwrap();
                 out.push('\n');
@@ -2421,6 +2444,7 @@ mod tests {
                 let pong = IpcResponse::Pong {
                     version: "0.5.0".into(),
                     protocol: pastor::ipc::AGENT_PROTOCOL,
+                    role: None,
                 };
                 let mut out = serde_json::to_string(&pong).unwrap();
                 out.push('\n');
@@ -2478,6 +2502,7 @@ mod tests {
                 let pong = IpcResponse::Pong {
                     version: "0.6.0".into(),
                     protocol: pastor::ipc::PLACE_PROTOCOL,
+                    role: None,
                 };
                 let mut out = serde_json::to_string(&pong).unwrap();
                 out.push('\n');
@@ -2539,6 +2564,7 @@ mod tests {
                 let pong = IpcResponse::Pong {
                     version: "0.6.0".into(),
                     protocol: pastor::ipc::PLACE_PROTOCOL,
+                    role: None,
                 };
                 let mut out = serde_json::to_string(&pong).unwrap();
                 out.push('\n');

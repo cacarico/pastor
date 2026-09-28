@@ -4269,17 +4269,25 @@ struct Client {
     tmp: tempfile::TempDir,
     config: std::path::PathBuf,
     state: std::path::PathBuf,
+    /// Its own data dir, so a `connector link` never lands in the real one.
+    data: std::path::PathBuf,
     path: std::ffi::OsString,
 }
 
 fn client(head: Option<&Env>) -> Client {
+    client_to(head.map(|e| (e.config.as_path(), e.state.as_path())))
+}
+
+/// `client`, whose `head-up` is the machine with these config and state
+/// dirs.
+fn client_to(head: Option<(&std::path::Path, &std::path::Path)>) -> Client {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let empty = tmp.path().join("empty");
     let (up_config, up_state) = match head {
-        Some(e) => (e.config.clone(), e.state.clone()),
+        Some((config, state)) => (config.to_path_buf(), state.to_path_buf()),
         None => (empty.clone(), empty.clone()),
     };
     let script = format!(
@@ -4312,6 +4320,7 @@ exec sh -c "$*"
     Client {
         config: tmp.path().join("c"),
         state: tmp.path().join("s"),
+        data: tmp.path().join("d"),
         tmp,
         path,
     }
@@ -4323,6 +4332,7 @@ impl Client {
             .args(args)
             .env("PASTOR_CONFIG_DIR", &self.config)
             .env("PASTOR_STATE_DIR", &self.state)
+            .env("PASTOR_DATA_DIR", &self.data)
             .env("PATH", &self.path)
             .env_remove("PASTOR_HEAD")
             .output()
@@ -4443,7 +4453,6 @@ fn a_remote_head_refuses_what_would_act_on_local_files() {
         );
     }
     assert!(!c.config.join("flock.toml").exists());
-    assert_eq!(error_code(&c.cmd(&["serve"])), "remote_head_set");
     ok(c.cmd(&["completions", "bash"]));
     ok(c.cmd(&["connector", "list"]));
 
@@ -4588,4 +4597,222 @@ fn attach_on_a_closed_task_reopens_only_a_claude_session() {
     assert!(t["spec"]["session_id"].is_string(), "{t}");
     env.json(&["task", "close", "t-2", "--json"]);
     env.fails_with(&["task", "attach", "t-2"], "no_terminal");
+}
+
+impl Client {
+    /// `pastor serve` in the background, its log in `serve.log`.
+    fn serve(&self) -> Served {
+        let log = self.tmp.path().join("serve.log");
+        let child = pastor()
+            .args(["serve"])
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .env("PASTOR_DATA_DIR", &self.data)
+            .env("PATH", &self.path)
+            .env_remove("PASTOR_HEAD")
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        Served { child, log }
+    }
+
+    /// One request line to this machine's own socket, through `pastor
+    /// bridge`, and its reply.
+    fn local(&self, line: &str) -> serde_json::Value {
+        use std::io::Write;
+        let mut child = pastor()
+            .args(["bridge"])
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .env("PASTOR_DATA_DIR", &self.data)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{line}").unwrap();
+        let out = child.wait_with_output().unwrap();
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stdout)))
+    }
+}
+
+struct Served {
+    child: std::process::Child,
+    log: std::path::PathBuf,
+}
+
+impl Served {
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Wait until the log says `what`, failing if serve exits first.
+    fn wait_log(&mut self, what: &str) {
+        let deadline = Instant::now() + WAIT;
+        while !self.log().contains(what) {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "serve exited:\n{}",
+                self.log()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "never logged {what:?}:\n{}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// With a head set, `pastor serve` runs headless: this machine's jobs run
+/// here, their tasks go to the head, and this machine's hooks hear the
+/// head's events. It keeps job state in its own small database, answers
+/// only its own job requests on the local socket, and a head refuses to
+/// start beside it.
+#[test]
+fn a_headless_serve_runs_its_jobs_through_the_head() {
+    let env = start();
+    let c = client(Some(&env));
+    let notify =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/connector/notify");
+    ok(c.cmd(&["connector", "link", notify.to_str().unwrap()]));
+    ok(c.head_set("head-up", &[]));
+    std::fs::create_dir_all(c.config.join("jobs")).unwrap();
+    std::fs::write(c.config.join("pastor.toml"), "tick = \"1s\"\n").unwrap();
+    std::fs::write(
+        c.config.join("jobs/sweep.toml"),
+        "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nrepo = \"/tmp\"\nprompt = \"sweep {{ item.key }} for {{ job.name }} as {{ task.id }}\"\n",
+    )
+    .unwrap();
+    let mut serve = c.serve();
+    serve.wait_log("headless");
+
+    // The job ran here and its task is the head's, rendered with the
+    // head's id.
+    let deadline = Instant::now() + WAIT;
+    let task = loop {
+        let out = ok(env.cmd(&["task", "list", "--all", "--json"]));
+        let tasks: serde_json::Value = serde_json::from_str(&out).unwrap();
+        if let Some(t) = tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["job"] == "sweep")
+        {
+            break t.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no task reached the head:\n{}",
+            serve.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let id = task["agent_name"].as_str().unwrap_or("t-1").to_string();
+    assert!(
+        task["prompt"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("for sweep as {id}")),
+        "{task}"
+    );
+    env.wait_done(&id);
+
+    // The head's task.done reached this machine's hook.
+    let heard = c.state.join("connectors/@notify/notify.jsonl");
+    let deadline = Instant::now() + WAIT;
+    while !std::fs::read_to_string(&heard)
+        .unwrap_or_default()
+        .contains("sweep")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the hook never heard:\n{}",
+            serve.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Its own small database, never the head's task store.
+    assert!(c.state.join("shepherd.db").exists());
+    assert!(!c.state.join("pastor.db").exists());
+
+    let pong = c.local(r#"{"op":"ping"}"#);
+    assert_eq!(pong["data"]["role"], "shepherd", "{pong}");
+    let jobs = c.local(r#"{"op":"job_list"}"#);
+    assert_eq!(jobs["data"][0]["name"], "sweep", "{jobs}");
+    assert!(
+        jobs["data"][0]["last_result"]
+            .as_str()
+            .unwrap()
+            .starts_with("ok:"),
+        "{jobs}"
+    );
+    let run = c.local(r#"{"op":"job_run","name":"ghost"}"#);
+    assert_eq!(run["data"]["code"], "job_not_found", "{run}");
+    let list = c.local(r#"{"op":"list","filter":{}}"#);
+    assert_eq!(list["data"]["code"], "shepherd_unsupported", "{list}");
+
+    // `head set` at this machine is refused, --force or not: it answers,
+    // and is not a head.
+    let other = client_to(Some((&c.config, &c.state)));
+    assert_eq!(
+        error_code(&other.head_set("head-up", &[])),
+        "shepherd_running"
+    );
+    assert_eq!(
+        error_code(&other.head_set("head-up", &["--force"])),
+        "shepherd_running"
+    );
+    assert!(!other.config.join("client.toml").exists());
+
+    // A second serve, headless or head, refuses the socket.
+    assert_eq!(error_code(&c.cmd(&["serve"])), "shepherd_running");
+    ok(c.cmd(&["head", "unset"]));
+    std::fs::write(
+        c.config.join("flock.toml"),
+        "[[machine]]\nname = \"m\"\nlocal = true\n",
+    )
+    .unwrap();
+    assert_eq!(error_code(&c.cmd(&["serve"])), "shepherd_running");
+    assert!(serve.child.try_wait().unwrap().is_none(), "{}", serve.log());
+}
+
+/// A head this machine cannot reach is a warning, not a reason to stop:
+/// the headless serve keeps running and asks again each tick.
+#[test]
+fn a_headless_serve_waits_for_an_unreachable_head() {
+    let c = client(None);
+    ok(c.head_set("unreachable", &["--force"]));
+    std::fs::create_dir_all(&c.config).unwrap();
+    std::fs::write(c.config.join("pastor.toml"), "tick = \"1s\"\n").unwrap();
+    let mut serve = c.serve();
+    serve.wait_log("shepherd_needs_head");
+    serve.wait_log("headless");
+    let pong = c.local(r#"{"op":"ping"}"#);
+    assert_eq!(pong["data"]["role"], "shepherd", "{pong}");
+}
+
+/// A head that holds this machine's socket keeps a headless serve from
+/// starting.
+#[test]
+fn a_headless_serve_refuses_a_running_head() {
+    let env = start();
+    let c = Client {
+        config: env.config.clone(),
+        state: env.state.clone(),
+        ..client(Some(&env))
+    };
+    let out = c.cmd(&["--head", "head-up", "serve"]);
+    assert_eq!(error_code(&out), "head_running");
 }

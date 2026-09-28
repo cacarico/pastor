@@ -339,7 +339,9 @@ pub async fn run(paths: &Paths, cmd: HeadCmd, active: Option<&RemoteHead>) -> an
                     save(&file, Some(&setting))?;
                     println!("head: {} (remote, pastor {version})", setting.ssh);
                 }
-                Err(err) if force => {
+                // --force is for a head that is down or old, never for a
+                // machine that answered as a headless serve.
+                Err(err) if force && !is_shepherd(&err) => {
                     save(&file, Some(&setting))?;
                     let why = err
                         .downcast_ref::<CliError>()
@@ -382,20 +384,34 @@ pub async fn run(paths: &Paths, cmd: HeadCmd, active: Option<&RemoteHead>) -> an
     Ok(())
 }
 
+fn is_shepherd(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CliError>()
+        .is_some_and(|e| e.code == "shepherd_running")
+}
+
 /// One ping through the bridge: the head's version, or why not.
 async fn check(head: &RemoteHead) -> anyhow::Result<String> {
     let line = crate::ipc::request_line(&IpcRequest::Ping, None)?;
     match head.request(&line, PING_TIMEOUT).await {
-        Ok(IpcResponse::Pong { version, protocol }) if protocol < crate::ipc::IPC_PROTOCOL => {
-            Err(CliError::err(
-                "head_too_old",
-                format!(
-                    "pastor serve on {} ({version}) speaks protocol {protocol}, older than this CLI's {}; upgrade it, or pass --force",
-                    head.ssh,
-                    crate::ipc::IPC_PROTOCOL
-                ),
-            ))
-        }
+        Ok(IpcResponse::Pong {
+            role: Some(role), ..
+        }) if role == crate::ipc::SHEPHERD_ROLE => Err(CliError::err(
+            "shepherd_running",
+            format!(
+                "{} runs a headless pastor serve, not a head; point `pastor head set` at the head",
+                head.ssh
+            ),
+        )),
+        Ok(IpcResponse::Pong {
+            version, protocol, ..
+        }) if protocol < crate::ipc::IPC_PROTOCOL => Err(CliError::err(
+            "head_too_old",
+            format!(
+                "pastor serve on {} ({version}) speaks protocol {protocol}, older than this CLI's {}; upgrade it, or pass --force",
+                head.ssh,
+                crate::ipc::IPC_PROTOCOL
+            ),
+        )),
         Ok(IpcResponse::Pong { version, .. }) => Ok(version),
         Ok(other) => Err(CliError::err(
             "runtime_error",

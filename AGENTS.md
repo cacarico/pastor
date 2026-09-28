@@ -152,6 +152,12 @@ Still open as of the last review; none of them blocks normal use.
 - `tests/transport.rs` `command_transport_talks_to_fake_herdr` failed once
   under a loaded `make check` (the stdio fake-herdr closed before replying)
   and passed on every rerun.
+- A headless serve (`src/shepherd.rs`) is reachable only through its
+  socket: with the head set, `job list|run|reload` and `tick` still go to the
+  head. Its own `job.failed` and `task.queued` events are only logged, never
+  written to an events log or heard by its hooks. Its jobs share the head's
+  seen table by name, so a head job of the same name with the same item key
+  refuses the item (`job_task_refused`).
 - Cron minutes that do not exist on a spring-forward day are skipped;
   Vixie cron runs them instead.
 - With a remote head (`pastor head set`), `task run` fills what its flags
@@ -169,6 +175,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
 ~/.local/state/pastor/pastor.db   tasks (schema 8), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
 ~/.config/systemd/user/*.service  from `pastor setup systemd [--herdr]`

@@ -1346,7 +1346,7 @@ way pastor reaches a machine: ssh, never a network port.
 ```bash
 pastor head set user@pi-1                                # checks the head, then saves it
 pastor head set user@pi-1 --pastor '~/.local/bin/pastor' # pastor is not on its PATH over ssh
-pastor head set user@pi-1 --force                        # save it even if it does not answer
+pastor head set user@pi-1 --force                        # save it even if it does not answer or is too old
 pastor head show [--json]                                # head: user@pi-1 (remote), or head: this machine
 pastor head unset                                        # back to this machine's head
 ```
@@ -1398,8 +1398,48 @@ Local on purpose, as with no head set: `completions`, `setup`, `head`,
 
 Every other command would read or edit this machine's files instead of the
 head's, so it fails with `remote_head_unsupported` until it is moved behind
-the head; run it on the head. `pastor serve` refuses to start while a remote
-head is set (`remote_head_set`).
+the head; run it on the head.
+
+### A headless serve
+
+With a head set, `pastor serve` runs headless, as this machine's shepherd:
+it runs the jobs in this machine's `jobs/` and this machine's connector
+hooks, and nothing else. It has no queue, no machine actors and no task
+store, and never reads `flock.toml`.
+
+- Each item a job finds goes to the head as one `JobTask` request, with the
+  job's unrendered prompt, repo and branch, its flock and its agent. The head
+  renders them with the id it gives the task, checks the item's paths and
+  the flock, resolves the agent as for its own jobs and queues and dispatches
+  the task under the job's name. A head that refuses the item, or does not
+  answer, fails the run and holds the job's cursor, as a failed insert does.
+- A key the head has queued for that job before is answered with that task
+  again, so a run whose reply was lost marks the key seen on the next try.
+  Once the head has pruned the task the answer is `already_seen`, and the
+  key is marked seen all the same.
+- Every tick it reads the head's events past its cursor (`EventsSince`) and
+  hands them to this machine's hooks in order. The first time it reaches the
+  head it skips the head's history and starts from there.
+- Its database is `shepherd.db` in the state dir: the jobs' state and seen
+  keys, and the event cursor. `pastor.db` is left alone.
+- On `pastor.sock` it answers `ping` (with `role: "shepherd"`), `tick` and
+  `job list|run|reload` for its own jobs; anything else is
+  `shepherd_unsupported`. The CLI with the head set still sends those
+  commands to the head, so reach the shepherd with `pastor bridge` on this
+  machine, or unset the head for one command's sake.
+- A head that does not answer is a warning in its log, `shepherd_needs_head`,
+  not a reason to stop; it asks again each tick and says when the head
+  answers again.
+- It refuses to start while a head holds this machine's socket
+  (`head_running`), and a head, or a second headless serve, refuses to start
+  while it holds it (`shepherd_running`). A CLI with no head set that finds
+  a shepherd on the socket, and `head set` pointed at a machine running one,
+  fail with `shepherd_running` too; `--force` does not save a shepherd as
+  the head.
+
+`pastor setup systemd` (or `launchd`) installs it the same way: the unit
+runs `pastor serve`, which reads the head from `client.toml`. The head
+needs this pastor's protocol (9) for `JobTask`.
 
 ### Agents on other machines
 
@@ -1580,6 +1620,7 @@ sends nothing. A head from before these requests is refused
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
 ~/.local/state/pastor/pastor.db   tasks (schema 8, with retry_of, flock, trust_sent, activity_seen and ended), seen keys, job state, trusted repos, the last event seq
+~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine and host, and one (`head-<hash>`) for a remote head

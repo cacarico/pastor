@@ -796,6 +796,19 @@ impl Store {
         Ok(())
     }
 
+    /// The task `(job, key)` was seen as: `None` when it is unseen,
+    /// `Some(None)` when seen with no task id recorded.
+    pub fn seen_task(&self, job: &str, key: &str) -> anyhow::Result<Option<Option<i64>>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT task_id FROM seen WHERE job = ?1 AND key = ?2",
+                params![job, key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn is_seen(&self, job: &str, key: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row(
@@ -926,8 +939,31 @@ impl Store {
         Ok(n == 1)
     }
 
-    #[cfg(test)]
-    pub(crate) fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+    /// Record `key` as seen for `job` without a task row here: a headless
+    /// serve's item became task `task_id` on the head, whose store holds
+    /// the row, or `None` when the head no longer has it. Seen already is
+    /// not an error.
+    pub fn mark_seen(&self, job: &str, key: &str, task_id: Option<i64>) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
+            params![job, key, task_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Set `key` in the meta table, where the schema version lives too.
+    pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(key != "schema_version", "schema_version is not a setting");
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
@@ -1040,6 +1076,30 @@ fn row_to_job_state(row: &Row<'_>) -> rusqlite::Result<JobState> {
 mod tests {
     use super::*;
     use crate::task::{Checkout, Reopen};
+
+    /// A headless serve keeps seen keys and its event cursor with no task
+    /// rows of its own.
+    #[test]
+    fn seen_keys_and_settings_without_tasks() {
+        let s = Store::open_in_memory().unwrap();
+        s.mark_seen("j", "k1", Some(7)).unwrap();
+        s.mark_seen("j", "k1", Some(8)).unwrap();
+        s.mark_seen("j", "k3", None).unwrap();
+        assert!(s.is_seen("j", "k1").unwrap());
+        assert!(!s.is_seen("j", "k2").unwrap());
+        assert_eq!(s.seen_task("j", "k1").unwrap(), Some(Some(7)));
+        assert_eq!(s.seen_task("j", "k2").unwrap(), None);
+        assert_eq!(s.seen_task("j", "k3").unwrap(), Some(None));
+        assert_eq!(s.meta("head_event_seq").unwrap(), None);
+        s.set_meta("head_event_seq", "12").unwrap();
+        s.set_meta("head_event_seq", "13").unwrap();
+        assert_eq!(s.meta("head_event_seq").unwrap().as_deref(), Some("13"));
+        assert!(s.set_meta("schema_version", "1").is_err());
+        assert_eq!(
+            s.meta("schema_version").unwrap(),
+            Some(SCHEMA_VERSION.to_string())
+        );
+    }
 
     #[test]
     fn a_pane_tail_is_the_last_lines_and_taken_once() {

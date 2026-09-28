@@ -15,7 +15,7 @@ use crate::config::{
 };
 use crate::dispatch::{MachineView, pick_machine, pick_machine_where};
 use crate::herdr::{Connector, Endpoint};
-use crate::ipc::{DaemonProbe, IpcRequest, IpcResponse};
+use crate::ipc::{HeadPing, IpcRequest, IpcResponse};
 use crate::machine::{
     ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, SendInput,
     SendRefused, ShutdownOutcome, spawn_machine,
@@ -23,6 +23,17 @@ use crate::machine::{
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{NewTask, RetryError, Store, TaskFilter};
 use crate::task::{AgentSource, PANE_OWNING_STATES, Task, TaskState};
+
+/// Where a headless serve's fleet sends each item its jobs find
+/// (`IpcRequest::JobTask`): to the head, which answers the task it queued.
+pub type JobTaskForward = Arc<
+    dyn Fn(
+            IpcRequest,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Task>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Builds a machine's transport from its flock entry. `serve` uses
 /// `endpoint_factory`; tests hand out fakes by machine name.
@@ -239,6 +250,9 @@ pub struct Fleet {
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
+    /// Set for a headless serve (`Fleet::headless`): job tasks go to the
+    /// head instead of this store, and the head checks their flock.
+    forward: Option<JobTaskForward>,
     dispatch_lock: tokio::sync::Mutex<()>,
 }
 
@@ -262,7 +276,18 @@ impl Fleet {
             agents_change_fleet: Default::default(),
             store,
             spawner: None,
+            forward: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// A headless serve's fleet: no machines and no flock, and every job
+    /// task it queues goes through `forward` to the head. `store` keeps only
+    /// the jobs' state and seen keys.
+    pub fn headless(store: Arc<Store>, forward: JobTaskForward) -> Fleet {
+        Fleet {
+            forward: Some(forward),
+            ..Fleet::new(Vec::new(), store)
         }
     }
 
@@ -290,6 +315,7 @@ impl Fleet {
             agents_change_fleet: Default::default(),
             store,
             spawner: Some(Spawner { connect, events }),
+            forward: None,
             dispatch_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -501,6 +527,10 @@ impl Fleet {
     /// no dispatch can find. `run_job` checks this before the connector and
     /// `queue_job_task` again under the dispatch lock.
     pub fn job_task_flock(&self, job: &crate::config::job::Job) -> anyhow::Result<String> {
+        // The flocks are the head's; it checks them when the task arrives.
+        if self.forward.is_some() {
+            return Ok(job.flock.clone().unwrap_or_default());
+        }
         if let Some(m) = &job.spec.machine
             && !self.in_flock(m)
         {
@@ -762,6 +792,9 @@ impl Fleet {
         item: &serde_json::Value,
         render: impl FnOnce(i64) -> Result<(String, crate::task::DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
+        if let Some(forward) = &self.forward {
+            return self.forward_job_task(forward, job, item).await;
+        }
         let _pass = self.dispatch_lock.lock().await;
         let flock = self.job_task_flock(job)?;
         let mut settled = job.spec.clone();
@@ -780,6 +813,47 @@ impl Fleet {
             spec.agent_source = settled.agent_source;
             Ok((prompt, spec))
         })
+    }
+
+    /// `queue_job_task` for a headless serve: the head renders and queues
+    /// the task, and the item is marked seen here once it has, since this
+    /// store is the one the job's next run checks.
+    async fn forward_job_task(
+        &self,
+        forward: &JobTaskForward,
+        job: &crate::config::job::Job,
+        item: &serde_json::Value,
+    ) -> anyhow::Result<Task> {
+        let key = item
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("item has no string key"))?
+            .to_string();
+        let task = forward(IpcRequest::JobTask {
+            job: job.name.clone(),
+            flock: job.flock.clone(),
+            agent: job.agent.clone(),
+            prompt: job.prompt.clone(),
+            spec: job.spec.clone(),
+            item: item.clone(),
+        })
+        .await;
+        // The head answers a key it has seen with the task it queued then,
+        // or `already_seen` once that row is pruned: either way the key is
+        // done, and the run counts it seen rather than hold its cursor.
+        let task = match task {
+            Err(err)
+                if err
+                    .downcast_ref::<crate::cli::CliError>()
+                    .is_some_and(|e| e.code == crate::ipc::ALREADY_SEEN) =>
+            {
+                self.store.mark_seen(&job.name, &key, None)?;
+                return Err(err);
+            }
+            other => other?,
+        };
+        self.store.mark_seen(&job.name, &key, Some(task.id))?;
+        Ok(task)
     }
 
     /// `flock remove` with a head running: refuse while queued tasks name
@@ -1003,6 +1077,35 @@ fn cli_error(err: anyhow::Error) -> IpcResponse {
     }
 }
 
+/// The answer to `Tick`, `Reload`, `JobList` or `JobRun` from `scheduler`,
+/// the same from the head and a headless serve; `None` for any other
+/// request.
+pub(crate) async fn jobs_answer(
+    scheduler: &SchedulerHandle,
+    req: IpcRequest,
+) -> Option<IpcResponse> {
+    Some(match req {
+        IpcRequest::Tick { job, dry_run } => match scheduler.tick(job, dry_run).await {
+            Ok(runs) => IpcResponse::Runs(runs),
+            Err(err) => IpcResponse::error("scheduler_error", err),
+        },
+        IpcRequest::Reload => match scheduler.reload().await {
+            Ok(jobs) => IpcResponse::Jobs(jobs),
+            Err(err) => IpcResponse::error("scheduler_error", err),
+        },
+        IpcRequest::JobList => match scheduler.job_list().await {
+            Ok(jobs) => IpcResponse::Jobs(jobs),
+            Err(err) => IpcResponse::error("scheduler_error", err),
+        },
+        IpcRequest::JobRun { name } => match scheduler.fire(&name).await {
+            Ok(Ok(msg)) => IpcResponse::Text(msg),
+            Ok(Err(reason)) => IpcResponse::error("job_not_found", reason),
+            Err(err) => IpcResponse::error("scheduler_error", err),
+        },
+        _ => return None,
+    })
+}
+
 /// Why an agent pastor started, in task `task`, was refused a change to
 /// the fleet. The CLI says the same for a change it makes on its own.
 pub fn agent_refusal(task: &str) -> String {
@@ -1105,6 +1208,81 @@ impl ExtraSignals {
     }
 }
 
+/// What answers a request line on the socket: the head (`Daemon`) or a
+/// headless serve (`shepherd::Shepherd`).
+pub(crate) trait Answer: Send + Sync + 'static {
+    fn answer(
+        &self,
+        req: IpcRequest,
+        from_task: Option<String>,
+    ) -> impl std::future::Future<Output = IpcResponse> + Send;
+}
+
+impl Answer for Daemon {
+    async fn answer(&self, req: IpcRequest, from_task: Option<String>) -> IpcResponse {
+        self.handle_from(req, from_task.as_deref()).await
+    }
+}
+
+/// The accept loop on a socket `daemon` already owns, until a signal. See
+/// `Daemon::run_with_listener`.
+pub(crate) async fn answer_on<A: Answer>(
+    daemon: Arc<A>,
+    listener: tokio::net::UnixListener,
+    socket: PathBuf,
+) -> anyhow::Result<()> {
+    let mut extra_signals = ExtraSignals::new()?;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    // Out of file descriptors, or a client that hung up
+                    // mid-accept: the listener is fine, and exiting would
+                    // hand every other client a restart loop. Back off so
+                    // EMFILE does not spin, then keep serving.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept on the socket failed");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                };
+                let d = daemon.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let resp = match read_request(r, MAX_IPC_REQUEST, IPC_READ_TIMEOUT).await {
+                        Ok(line) => match crate::ipc::parse_request_line(line.trim()) {
+                            Ok((req, from_task)) => d.answer(req, from_task).await,
+                            Err(err) => IpcResponse::error("invalid_request", err),
+                        },
+                        Err(RequestReadError::TooLarge) => IpcResponse::error(
+                            "request_too_large",
+                            format!("a request is at most {MAX_IPC_REQUEST} bytes"),
+                        ),
+                        Err(RequestReadError::NotUtf8) => {
+                            IpcResponse::error("invalid_request", "a request must be UTF-8")
+                        }
+                        Err(_) => return,
+                    };
+                    let mut out = serde_json::to_string(&resp).unwrap_or_else(|e| format!("{{\"kind\":\"error\",\"code\":\"internal\",\"message\":\"{e}\"}}"));
+                    out.push('\n');
+                    let _ = w.write_all(out.as_bytes()).await;
+                });
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutting down on SIGINT; agents keep running");
+                let _ = std::fs::remove_file(&socket);
+                return Ok(());
+            }
+            msg = extra_signals.recv() => {
+                tracing::info!("{msg}");
+                let _ = std::fs::remove_file(&socket);
+                return Ok(());
+            }
+        }
+    }
+}
+
 impl Daemon {
     /// `on_disk` is `ConfigFingerprint::sample` taken before `config` and
     /// `flock` were read (or built): the scheduler keeps them until either
@@ -1186,7 +1364,9 @@ impl Daemon {
     /// the shared database — not after, which is what let a second daemon
     /// reconcile and mutate the store for up to the probe timeout before it
     /// finally bailed.
-    async fn bind_socket(socket: &std::path::Path) -> anyhow::Result<tokio::net::UnixListener> {
+    pub(crate) async fn bind_socket(
+        socket: &std::path::Path,
+    ) -> anyhow::Result<tokio::net::UnixListener> {
         if socket.exists() {
             // Staleness is a property of the connect, not of the reply: a live
             // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
@@ -1194,17 +1374,31 @@ impl Daemon {
             // looks exactly like a wedged one from the outside. Only a refused (or
             // absent) connect means nothing is actually listening; anything else
             // must be left alone rather than unlinked and stolen.
-            match crate::ipc::probe_daemon(socket).await {
-                DaemonProbe::Running => anyhow::bail!(
-                    "another pastor daemon is already running on {}",
-                    socket.display()
-                ),
-                DaemonProbe::Unresponsive => anyhow::bail!(
+            match crate::ipc::ping_head(socket).await {
+                HeadPing::Pong { role: Some(r), .. } if r == crate::ipc::SHEPHERD_ROLE => {
+                    return Err(crate::cli::CliError::err(
+                        "shepherd_running",
+                        format!(
+                            "a headless pastor serve is already running on {}; stop it first",
+                            socket.display()
+                        ),
+                    ));
+                }
+                HeadPing::Pong { .. } => {
+                    return Err(crate::cli::CliError::err(
+                        "head_running",
+                        format!(
+                            "another pastor daemon is already running on {}, as this machine's head; stop it first",
+                            socket.display()
+                        ),
+                    ));
+                }
+                HeadPing::Unresponsive => anyhow::bail!(
                     "a daemon is listening on {} but did not respond within 2s; \
                      remove the socket file by hand only if that daemon is dead",
                     socket.display()
                 ),
-                DaemonProbe::NotRunning => std::fs::remove_file(socket)?,
+                HeadPing::NotRunning => std::fs::remove_file(socket)?,
             }
         }
         let listener = tokio::net::UnixListener::bind(socket)?;
@@ -1248,57 +1442,7 @@ impl Daemon {
     /// stayed down. All three now take the same shutdown path.
     pub async fn run_with_listener(self, listener: tokio::net::UnixListener) -> anyhow::Result<()> {
         let socket = self.socket_path();
-        let daemon = Arc::new(self);
-        let mut extra_signals = ExtraSignals::new()?;
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    let stream = match accepted {
-                        Ok((stream, _)) => stream,
-                        // Out of file descriptors, or a client that hung up
-                        // mid-accept: the listener is fine, and exiting would
-                        // hand every other client a restart loop. Back off so
-                        // EMFILE does not spin, then keep serving.
-                        Err(e) => {
-                            tracing::warn!(error = %e, "accept on the socket failed");
-                            tokio::time::sleep(ACCEPT_BACKOFF).await;
-                            continue;
-                        }
-                    };
-                    let d = daemon.clone();
-                    tokio::spawn(async move {
-                        let (r, mut w) = stream.into_split();
-                        let resp = match read_request(r, MAX_IPC_REQUEST, IPC_READ_TIMEOUT).await {
-                            Ok(line) => match crate::ipc::parse_request_line(line.trim()) {
-                                Ok((req, from_task)) => d.handle_from(req, from_task.as_deref()).await,
-                                Err(err) => IpcResponse::error("invalid_request", err),
-                            },
-                            Err(RequestReadError::TooLarge) => IpcResponse::error(
-                                "request_too_large",
-                                format!("a request is at most {MAX_IPC_REQUEST} bytes"),
-                            ),
-                            Err(RequestReadError::NotUtf8) => {
-                                IpcResponse::error("invalid_request", "a request must be UTF-8")
-                            }
-                            Err(_) => return,
-                        };
-                        let mut out = serde_json::to_string(&resp).unwrap_or_else(|e| format!("{{\"kind\":\"error\",\"code\":\"internal\",\"message\":\"{e}\"}}"));
-                        out.push('\n');
-                        let _ = w.write_all(out.as_bytes()).await;
-                    });
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("shutting down on SIGINT; agents keep running");
-                    let _ = std::fs::remove_file(&socket);
-                    return Ok(());
-                }
-                msg = extra_signals.recv() => {
-                    tracing::info!("{msg}");
-                    let _ = std::fs::remove_file(&socket);
-                    return Ok(());
-                }
-            }
-        }
+        answer_on(Arc::new(self), listener, socket).await
     }
 
     /// `handle`, for a caller that says it runs in a task's pane
@@ -1352,6 +1496,7 @@ impl Daemon {
             IpcRequest::Ping => IpcResponse::Pong {
                 version: env!("CARGO_PKG_VERSION").into(),
                 protocol: crate::ipc::IPC_PROTOCOL,
+                role: None,
             },
             IpcRequest::Run {
                 prompt,
@@ -1511,23 +1656,12 @@ impl Daemon {
                 })
                 .await
             }
-            IpcRequest::Tick { job, dry_run } => match self.scheduler.tick(job, dry_run).await {
-                Ok(runs) => IpcResponse::Runs(runs),
-                Err(err) => IpcResponse::error("scheduler_error", err),
-            },
-            IpcRequest::Reload => match self.scheduler.reload().await {
-                Ok(jobs) => IpcResponse::Jobs(jobs),
-                Err(err) => IpcResponse::error("scheduler_error", err),
-            },
-            IpcRequest::JobList => match self.scheduler.job_list().await {
-                Ok(jobs) => IpcResponse::Jobs(jobs),
-                Err(err) => IpcResponse::error("scheduler_error", err),
-            },
-            IpcRequest::JobRun { name } => match self.scheduler.fire(&name).await {
-                Ok(Ok(msg)) => IpcResponse::Text(msg),
-                Ok(Err(reason)) => IpcResponse::error("job_not_found", reason),
-                Err(err) => IpcResponse::error("scheduler_error", err),
-            },
+            req @ (IpcRequest::Tick { .. }
+            | IpcRequest::Reload
+            | IpcRequest::JobList
+            | IpcRequest::JobRun { .. }) => jobs_answer(&self.scheduler, req)
+                .await
+                .expect("a job request"),
             IpcRequest::JobSubmit {
                 job,
                 dispatch,
@@ -1594,6 +1728,31 @@ impl Daemon {
                     Ok(d) => IpcResponse::Job(d),
                     Err(err) => cli_error(err),
                 }
+            }
+            IpcRequest::JobTask {
+                job,
+                flock,
+                agent,
+                prompt,
+                spec,
+                item,
+            } => {
+                let job = crate::config::job::Job {
+                    name: job,
+                    // A headless serve schedules the job; the head only
+                    // queues what it found, so these are never read.
+                    schedule: crate::schedule::Schedule::Every(Duration::from_secs(3600)),
+                    enabled: true,
+                    connector: String::new(),
+                    connector_config: serde_json::Value::Null,
+                    prompt,
+                    max_tasks_per_run: 1,
+                    backfill: Duration::ZERO,
+                    spec,
+                    agent,
+                    flock,
+                };
+                self.job_task(job, item).await
             }
             IpcRequest::JobSetEnabled { name, enabled } => {
                 let set = crate::edit::ConfigFile::Job(name.clone())
@@ -1848,6 +2007,95 @@ impl Daemon {
     /// `TaskRetry`: a new queued row copying `id` (see `Store::insert_retry`),
     /// dispatched at once like a `Run`. Answers the new row as it stands after
     /// the dispatch pass.
+    /// `JobTask`: one item a headless serve's job found, queued here as
+    /// that job's task, with the checks and rendering the head's own jobs
+    /// get (`run_job`), then dispatched.
+    async fn job_task(&self, job: crate::config::job::Job, item: serde_json::Value) -> IpcResponse {
+        if let Err(err) = crate::config::job::check_name(&job.name) {
+            return IpcResponse::error("invalid_request", format!("job name: {err}"));
+        }
+        if item
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return IpcResponse::error("invalid_request", "the item has no string key");
+        }
+        if job.spec.worktree && job.spec.repo.is_none() {
+            return IpcResponse::error(
+                "worktree_needs_repo",
+                "a worktree task needs a repo to branch from",
+            );
+        }
+        if let Err(why) = crate::scheduler::check_item_paths(&job, &item) {
+            return IpcResponse::error("item_rejected", why);
+        }
+        let key = item
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if let Some(resp) = self.seen_job_task(&job.name, key) {
+            return resp;
+        }
+        // As for `Run`: the agent resolves against the config as it reads now.
+        if let Err(err) = self.scheduler.sync_config().await {
+            tracing::warn!(%err, "config not re-read before a job task");
+        }
+        let task = match self
+            .fleet
+            .queue_job_task(&job, &item, |id| {
+                crate::scheduler::render_task(&job, &item, id)
+            })
+            .await
+        {
+            Ok(t) => t,
+            // Another request queued the key first.
+            Err(err) => {
+                return self
+                    .seen_job_task(&job.name, key)
+                    .unwrap_or_else(|| IpcResponse::error("job_task_refused", format!("{err:#}")));
+            }
+        };
+        tracing::info!(job = %job.name, task = %task.display_id(), "task queued for a headless serve");
+        let _ = self.events.send(PastorEvent {
+            detail: None,
+            kind: "task.queued".into(),
+            task_id: Some(task.id),
+            machine: None,
+            job: Some(task.job.clone()),
+        });
+        self.fleet.dispatch_queued().await;
+        match self.store.get_task(task.id) {
+            Ok(Some(t)) => IpcResponse::Task(t),
+            Ok(None) => IpcResponse::error("task_not_found", task.id),
+            Err(err) => IpcResponse::error("store_error", err),
+        }
+    }
+
+    /// The answer to a `JobTask` whose key this head has seen: the task it
+    /// queued then, so a serve that lost the first reply can mark the key
+    /// seen and move its cursor. `already_seen` when that row is gone.
+    /// `None` for an unseen key.
+    fn seen_job_task(&self, job: &str, key: &str) -> Option<IpcResponse> {
+        let id = match self.store.seen_task(job, key) {
+            Ok(Some(id)) => id,
+            Ok(None) => return None,
+            Err(err) => return Some(IpcResponse::error("store_error", err)),
+        };
+        let gone = || {
+            IpcResponse::error(
+                crate::ipc::ALREADY_SEEN,
+                format!("job {job} queued item {key} already, and its task is gone"),
+            )
+        };
+        let Some(id) = id else { return Some(gone()) };
+        Some(match self.store.get_task(id) {
+            Ok(Some(t)) => IpcResponse::Task(t),
+            Ok(None) => gone(),
+            Err(err) => IpcResponse::error("store_error", err),
+        })
+    }
+
     async fn retry(&self, id: i64, place: Option<crate::task::Place>) -> IpcResponse {
         // The store checks the state and copies in one statement; its error
         // says which check failed, so a row pruned by a concurrent request is
@@ -4569,6 +4817,64 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             job.replace("1h", "2h")
         );
+    }
+
+    /// `JobTask`, from a headless serve: rendered with this head's id,
+    /// queued as that job's task and dispatched, its key seen here too; an
+    /// item seen already answers its task again, or `already_seen` once
+    /// that is gone; one that would climb out of its branch is refused.
+    #[tokio::test]
+    async fn a_job_task_is_rendered_queued_and_dispatched_here() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let req = |key: &str, branch: Option<&str>| IpcRequest::JobTask {
+            job: "sweep".into(),
+            flock: None,
+            agent: AgentChoice::default(),
+            prompt: "sweep {{ item.key }} for {{ job.name }} as {{ task.id }}".into(),
+            spec: crate::task::DispatchSpec {
+                repo: Some("/tmp".into()),
+                branch: branch.map(Into::into),
+                ..spec()
+            },
+            item: serde_json::json!({ "key": key }),
+        };
+        let IpcResponse::Task(t) = d.handle(req("k1", None)).await else {
+            panic!()
+        };
+        assert_eq!(t.job, "sweep");
+        assert_eq!(t.prompt, format!("sweep k1 for sweep as t-{}", t.id));
+        assert_eq!(t.state, TaskState::Running);
+        assert!(d.store().is_seen("sweep", "k1").unwrap());
+        // A resubmitted key, as after a lost reply, gets the same task back.
+        let IpcResponse::Task(again) = d.handle(req("k1", None)).await else {
+            panic!()
+        };
+        assert_eq!(again.id, t.id);
+        assert_eq!(
+            d.store().list_tasks(&TaskFilter::default()).unwrap().len(),
+            1
+        );
+        d.store().mark_seen("sweep", "gone", None).unwrap();
+        assert_eq!(
+            error_code(d.handle(req("gone", None)).await),
+            crate::ipc::ALREADY_SEEN
+        );
+        assert_eq!(
+            error_code(d.handle(req("..", Some("b/{{ item.key }}"))).await),
+            "item_rejected"
+        );
+        let IpcRequest::JobTask { spec, .. } = req("k2", None) else {
+            panic!()
+        };
+        let keyless = IpcRequest::JobTask {
+            job: "sweep".into(),
+            flock: None,
+            agent: AgentChoice::default(),
+            prompt: "p".into(),
+            spec,
+            item: serde_json::json!({}),
+        };
+        assert_eq!(error_code(d.handle(keyless).await), "invalid_request");
     }
 
     #[tokio::test]
