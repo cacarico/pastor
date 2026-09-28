@@ -16,6 +16,7 @@ A job is one TOML file in `~/.config/pastor/jobs/`, named after the file.
 This one, `morning.toml`, wakes an agent every weekday at nine:
 
 ```toml
+description = "Run the test suite every weekday morning"
 cron = "0 9 * * 1-5"
 
 [connector]
@@ -26,7 +27,8 @@ repo = "~/work/api"
 prompt = "It is {{ item.key }}. Run the test suite and fix what broke."
 ```
 
-`every = "1h"` or `cron = "..."` says when; cron is in local time. The
+`description` is optional: one line on what the job does, for `pastor job
+list --wide` and `pastor job describe`. `every = "1h"` or `cron = "..."` says when; cron is in local time. The
 built-in `clock` connector hands over one item per run, keyed by the run
 time. Any other `use` names an installed connector.
 
@@ -37,6 +39,7 @@ time. Any other `use` names an installed connector.
 | key | does |
 |---|---|
 | `prompt` | the prompt template for each item |
+| `description` | each task's description, a template like `prompt`; default `{{ item.title }}` |
 | `repo`, `worktree`, `branch` | where the agent works, as on `task run` |
 | `flock`, `machine`, `tags` | which machines take the tasks |
 | `agent`, `agent_args` | the agent to start |
@@ -59,6 +62,7 @@ itself, and a connector that fails backs it off, one minute doubling to an hour.
 
 ```sh
 pastor job list  # schedule, enabled, last and next run, last result
+pastor job list --wide  # and each job's description
 pastor job describe morning
 pastor tick --dry-run --job morning  # what a run would create, creating nothing
 pastor job run morning  # fire it now, ignoring the schedule

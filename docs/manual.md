@@ -176,7 +176,8 @@ on a machine).
 Finished ones (done, failed, stale, closed) appear with `--all`, and an empty
 default list says so on stderr. `--blocked` and `--done` narrow to just that
 state, `--job`, `--flock` and `--machine` narrow whichever set is shown, and
-`--json` prints the same selection. FLOCK is the flock the task targets. `pastor task read t-1` fetches recent output from the
+`--json` prints the same selection. `--wide` adds each task's description
+(see Descriptions). FLOCK is the flock the task targets. `pastor task read t-1` fetches recent output from the
 task's pane over the machine channel. Text that came from an item or a pane is
 printed with its control characters escaped (`\x1b`, `\r`, ...), so none of
 it can move the cursor, retitle the terminal or set the clipboard: the NOTE
@@ -420,8 +421,8 @@ file fail to load the same way, since ssh would read it as an option. Put
 ports, keys and jump hosts in `~/.ssh/config` under a host alias instead.
 
 ```
-pastor flock list                       NAME, DEFAULT, MACHINES, AGENTS, QUEUED (--json)
-pastor flock add <name> [--default]
+pastor flock list                       NAME, DEFAULT, MACHINES, AGENTS, QUEUED (--json; --wide adds DESCRIPTION)
+pastor flock add <name> [--default] [--description TEXT]
 pastor flock remove <name>              refused while it has machines or queued tasks, or is the default
 pastor flock default show               print the default flock
 pastor flock default set <name>         new tasks and jobs go to <name>
@@ -2060,6 +2061,93 @@ Connectors run as the head's user too, with the same reach and the head's
 environment; [What a connector inherits](#what-a-connector-inherits) lists
 what they get.
 
+## Descriptions
+
+A name like `answered-pastor` or `life` does not say what a job does. A job,
+a flock, a machine and a task can each carry one short line that does. It is
+optional everywhere: none shows as `-`, and files without one load as they
+always have.
+
+```toml
+# ~/.config/pastor/jobs/answered-pastor.toml
+description = "Carry out the answers on the Pastor board's Answered list"
+every = "1m"
+
+[connector]
+use = "clock"
+
+[dispatch]
+description = "{{ item.title }}"   # each task's; the default, so it can be left out
+prompt = "..."
+```
+
+```toml
+# flock.toml
+[[flock]]
+name = "life"
+default = true
+description = "Personal errands and side projects"
+
+[[machine]]
+name = "pi-3"
+ssh = "user@pi-3"
+description = "The one under the desk"
+```
+
+A job's own `description` goes at the top of its file, beside `every`. A
+flock's and a machine's go in their entries in `flock.toml`;
+`pastor flock add <name> --description <text>` and `pastor machine add
+<name> <ssh> --description <text>` write them, and `pastor flock edit`
+changes them. A connector's is the `description` in its manifest. Leading
+and trailing whitespace is trimmed, and there is no length limit.
+
+A task's is fixed when it is queued, from the first of these that says
+something:
+
+1. `pastor task run "<prompt>" --description "<text>"`;
+2. its job's `[dispatch] description`, rendered with the item like the
+   prompt (`{{ item.* }}` and `{{ job.name }}`; not `{{ task.id }}`, which
+   is not known yet). With no such key it is `{{ item.title }}`, so a
+   board card's task reads as the card. A path the item lacks renders
+   empty, which counts as nothing;
+3. the prompt's first line.
+
+`task retry` copies it. Tasks from before descriptions read as their
+prompt's first line. A headless serve's jobs send `description` inside their
+`[dispatch]` like any other key, and the head renders it.
+
+The lists stay as narrow as they were unless asked. `-w, --wide` on `pastor
+task list`, `pastor job list`, `pastor machine list`, `pastor flock list`
+and `pastor connector list` adds a DESCRIPTION column, last:
+
+```text
+NAME             SCHEDULE   ENABLED  FLOCK  CONNECTOR  LAST RUN  NEXT    RESULT  DESCRIPTION
+answered-pastor  every 1m   yes      life   obsidian   20s ago   in 40s  ok      Carry out the answers on the Pastor…
+```
+
+When stdout is a terminal, the column is cut to what the other columns
+leave of its width, ending in `…`, but it keeps at least 20 characters, so
+a very wide table can still wrap. The width comes from the terminal itself,
+else `$COLUMNS`. Piped or saved to a file, nothing is cut. A newline in a
+description shows escaped, as `\n`. `task list` keeps its NOTE column as it
+was (the error, else the item's title, else the prompt's first line), since
+NOTE also carries errors and "retry of"; DESCRIPTION comes after it.
+
+Every `describe` prints a `description:` line near the top, `-` when there
+is none, whole and with its newlines. A task's also says where it came from:
+`--description`, `job <name>`, or `the prompt`.
+
+`--json` always has them: every object of a `list --json` and every
+`describe --json` has a `description` key, `null` when there is none. A
+task's is always a string, the one it resolved to, with `description_from`
+beside it. `--wide` with `--json` changes nothing.
+
+`task run --description`, `flock add --description` and `machine add
+--description` need a head from this release or later; an older one would
+drop the line, so the CLI refuses it (`head_too_old`). The tasks table gains
+a `description` column (schema 9), added in place when the new pastor first
+opens the store.
+
 ## Describe and edit
 
 In the terminal pastor reads like kubectl: `list` shows many things, `describe`
@@ -2130,7 +2218,7 @@ sends nothing. A head from before these requests is refused
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
-~/.local/state/pastor/pastor.db   tasks (schema 10, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos and role), seen keys, job state, trusted repos, the last event seq
+~/.local/state/pastor/pastor.db   tasks (schema 11, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role and description), seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
@@ -2216,7 +2304,9 @@ static script cannot know them, so at TAB it runs `pastor __complete <shell>
 -- <words>`, which reads the job files, `flock.toml`, the connectors
 directory and the task store directly, never the head, and prints nothing
 when it cannot read them. Task ids come live ones first, newest first, and
-fish shows each task's note beside it. Other shells get the static script
+fish shows each task's note beside it; beside a job, flock or machine it
+shows its description (see Descriptions), and without one a flock's
+`default` mark or a machine's flock, as before. Other shells get the static script
 only. `--opt=<TAB>` works in fish; bash splits it at the `=`, which pastor
 handles too.
 

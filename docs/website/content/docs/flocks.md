@@ -20,6 +20,7 @@ default = true  # tasks and jobs that name no flock go here
 
 [[flock]]
 name = "work"
+description = "Paid work, on the work account"  # optional, for --wide and describe
 agent = "claude"
 agent_args = ["--model", "claude-sonnet-5"]
 
@@ -59,7 +60,8 @@ config. `pastor task describe` shows which agent a task got and where from.
 ## manage them
 
 ```sh
-pastor flock list
+pastor flock list --wide  # with each flock's description
+pastor flock add lab --description "Test rigs"
 pastor flock describe work
 pastor machine move pi-1 work  # tasks already on it stay there
 pastor flock edit  # saved only once valid

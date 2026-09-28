@@ -956,6 +956,23 @@ impl Fleet {
                 other => anyhow::bail!("the head answered a ping with {other:?}"),
             }
         }
+        // A description template rides in `dispatch` the same way; the
+        // head's `DispatchTable` refuses an unknown field, so an older head
+        // would answer an opaque `invalid_dispatch` instead of this clear
+        // refusal.
+        if job.task_description.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::DESCRIPTION_PROTOCOL,
+                    "a job naming a description",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
         let reply = forward(IpcRequest::JobSubmit {
             job: job.name.clone(),
             dispatch: job.dispatch.clone(),
