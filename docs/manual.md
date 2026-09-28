@@ -696,7 +696,9 @@ reads flock.toml until it listens. So a head starting meanwhile waits for the
 edit and reads the edited file, never queueing a task in a flock the edit
 just removed. An edit that finds a head listening once the lock is free stops
 with `head_started`; run it again and it goes through the head. Either side
-gives up after 30 seconds with `fleet_locked`.
+gives up after 30 seconds with `fleet_locked`. A bare `pastor serve` waits
+for the lock before it starts the head and begins its own 30 seconds, so it
+reports `fleet_locked` too rather than `serve_slow`.
 
 pastor never rewrites a machine's old `flock` key on its own. The first of
 `flock join`, `flock leave` or `machine move` on that machine (a move even to

@@ -6790,6 +6790,30 @@ fn spare_flock(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf
     (config, state)
 }
 
+/// Returns once process `pid` has `fleet.lock` in `state` open: an offline
+/// edit opens it only after its ping found no head, just before it waits on
+/// the lock. Linux only, from `/proc`, like CI.
+fn wait_for_fleet_lock_open(pid: u32, state: &std::path::Path) {
+    let lock = state.canonicalize().unwrap().join("fleet.lock");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let open = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock));
+        if open {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the edit never opened {}",
+            lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `flock remove` with no head checks the store and edits flock.toml under
 /// the fleet lock a starting head takes, so a head that starts in between
 /// cannot queue a task in the flock between the check and the save: the
@@ -6836,7 +6860,7 @@ fn offline_flock_remove_refuses_a_head_that_started_while_it_waited() {
         .spawn()
         .unwrap();
     // Past the ping that found no head, the edit waits on the lock.
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_for_fleet_lock_open(child.id(), &state);
     let _head = std::os::unix::net::UnixListener::bind(state.join("pastor.sock")).unwrap();
     drop(held);
     let out = child.wait_with_output().unwrap();
