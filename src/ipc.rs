@@ -18,8 +18,9 @@ use crate::task::{DispatchSpec, Task, TaskState};
 /// edits (`FLEET_EDIT_PROTOCOL`). 6: `FileGet`, `FilePut`, `JobDescribe`,
 /// `JobSetEnabled`. 7: `JobSubmit`. 8: named models (`AgentChoice::model`).
 /// 9: `JobTask`, and `Pong::role`. 10: `TrustList`, `TrustAdd`,
-/// `TrustRemove`, `FlockDescribe` and `MachineDescribe`.
-pub const IPC_PROTOCOL: u32 = 10;
+/// `TrustRemove`, `FlockDescribe` and `MachineDescribe`. 11: task priority
+/// (`Run::priority`, `TaskPriority`).
+pub const IPC_PROTOCOL: u32 = 11;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -87,6 +88,11 @@ pub const JOB_SUBMIT_PROTOCOL: u32 = 7;
 /// on its default model without a word.
 pub const MODEL_PROTOCOL: u32 = 8;
 
+/// The first protocol whose head honours `Run::priority` and knows
+/// `TaskPriority`. An older one would queue the task at its own level
+/// without a word, or refuse the request as unreadable.
+pub const PRIORITY_PROTOCOL: u32 = 11;
+
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.
 pub fn check_protocol(version: &str, protocol: u32, needed: u32, what: &str) -> anyhow::Result<()> {
@@ -117,6 +123,11 @@ pub enum IpcRequest {
         /// client that predates it: `spec` already holds the agent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<AgentChoice>,
+        /// `--priority`; `None` lets the pinned machine, the flock or
+        /// `[defaults]` set the level. Left out when not given, so an older
+        /// head still reads the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<crate::task::Priority>,
     },
     List {
         filter: TaskFilter,
@@ -181,6 +192,12 @@ pub enum IpcRequest {
         /// of `PLACE_PROTOCOL` or later.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         place: Option<crate::task::Place>,
+    },
+    /// Put a queued task at another level (`task priority`). Refused
+    /// `not_queued` for a task that has left the queue. Answers `Task`.
+    TaskPriority {
+        id: i64,
+        priority: crate::task::Priority,
     },
     /// Close the task's pane (or, with `remove_worktree`, its worktree) and
     /// mark it closed. Answers `Task`, or `Text` for an orphaned agent with no
@@ -321,6 +338,7 @@ impl IpcRequest {
             | IpcRequest::MachineMove { .. }
             | IpcRequest::JobRun { .. }
             | IpcRequest::TaskRetry { .. }
+            | IpcRequest::TaskPriority { .. }
             | IpcRequest::TaskClose { .. }
             | IpcRequest::TaskSend { .. }
             | IpcRequest::TaskDone { .. }
@@ -787,6 +805,9 @@ mod tests {
             activity_seen: false,
             ended: false,
             retry_of: None,
+            priority: Default::default(),
+            priority_from: None,
+            queue_pos: 0,
             created_at: now,
             started_at: None,
             finished_at: None,
@@ -976,6 +997,11 @@ mod tests {
                 spec: minimal_task().spec,
                 flock: None,
                 agent: None,
+                priority: None,
+            },
+            IpcRequest::TaskPriority {
+                id: 1,
+                priority: crate::task::Priority::High,
             },
             IpcRequest::TaskSend {
                 id: 1,
@@ -1009,6 +1035,7 @@ mod tests {
                     agent: None,
                     agent_args: None,
                     model: None,
+                    priority: None,
                 },
             },
             IpcRequest::MachineRemove { name: "m".into() },

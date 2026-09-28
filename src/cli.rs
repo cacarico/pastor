@@ -80,6 +80,7 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
             vec![
                 t.display_id(),
                 t.state.to_string(),
+                t.priority.to_string(),
                 t.machine.clone().unwrap_or_else(|| "-".into()),
                 t.flock.clone().unwrap_or_else(|| "-".into()),
                 t.spec.agent.clone(),
@@ -175,6 +176,7 @@ pub fn task_detail(t: &Task) -> String {
         Some(m) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
         None => "-".to_string(),
     };
+    let priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
     let args = if t.spec.agent_args.is_empty() {
         "-".to_string()
     } else {
@@ -213,6 +215,7 @@ pub fn task_detail(t: &Task) -> String {
     let mut fields = vec![
         ("id", t.display_id()),
         ("state", t.state.to_string()),
+        ("priority", priority),
         ("job", t.job.clone()),
         ("flock", opt(&t.flock)),
         ("machine", opt(&t.machine)),
@@ -294,13 +297,13 @@ pub fn mark_removed(rows: &mut [Vec<String>], tasks: &[Task], known: impl Fn(&st
             && t.state.occupies_pane()
             && !known(m)
         {
-            row[2] = format!("{m} (removed)");
+            row[3] = format!("{m} (removed)");
         }
     }
 }
 
-pub const TASK_HEADER: [&str; 9] = [
-    "ID", "STATE", "MACHINE", "FLOCK", "AGENT", "MODEL", "JOB", "AGE", "NOTE",
+pub const TASK_HEADER: [&str; 10] = [
+    "ID", "STATE", "PRIORITY", "MACHINE", "FLOCK", "AGENT", "MODEL", "JOB", "AGE", "NOTE",
 ];
 
 /// One flock in `pastor flock list`. `agents` is the live agents on its
@@ -652,6 +655,9 @@ mod tests {
             activity_seen: false,
             ended: false,
             retry_of: None,
+            priority: Default::default(),
+            priority_from: None,
+            queue_pos: 0,
             created_at: now,
             started_at: Some(now),
             finished_at: None,
@@ -855,16 +861,17 @@ mod tests {
                 agent: None,
                 agent_args: None,
                 model: None,
+                priority: None,
             }],
         };
         let mut rows = task_rows(&tasks);
         mark_removed(&mut rows, &tasks, |m| flock.get(m).is_some());
-        assert_eq!(rows[0][2], "pi-3 (removed)");
+        assert_eq!(rows[0][3], "pi-3 (removed)");
         assert_eq!(
-            rows[1][2], "pi-3",
+            rows[1][3], "pi-3",
             "a closed task is history, not a live row"
         );
-        assert_eq!(rows[2][2], "pi-1");
+        assert_eq!(rows[2][3], "pi-1");
     }
 
     #[test]
@@ -958,6 +965,31 @@ mod tests {
             "{bare}"
         );
         assert!(bare.contains("agent args: -\n"), "{bare}");
+    }
+
+    /// `task describe` gives the level and the layer that set it, and
+    /// `task list` the level, beside the state.
+    #[test]
+    fn a_tasks_priority_shows_with_where_it_came_from() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(
+            task_detail(&t).contains("priority:   normal\n"),
+            "{}",
+            task_detail(&t)
+        );
+        t.priority = crate::task::Priority::High;
+        t.priority_from = Some("flock work".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("priority:   high (from flock work)\n"),
+            "{out}"
+        );
+        let rows = task_rows(std::slice::from_ref(&t));
+        assert_eq!(TASK_HEADER[2], "PRIORITY");
+        assert_eq!(rows[0][2], "high");
+        let json = t.to_json();
+        assert_eq!(json["priority"], "high");
+        assert_eq!(json["priority_from"], "flock work");
     }
 
     /// An error can be raw multi-line stderr; it must stay one field on one

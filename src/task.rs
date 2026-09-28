@@ -93,6 +93,58 @@ impl std::str::FromStr for TaskState {
     }
 }
 
+/// A queued task's level: dispatch takes queued tasks by level, highest
+/// first, then by position, then by age (`Store::queued_tasks`). Settled
+/// when the task is queued (`Defaults::resolve_priority`) and stored on it.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    Low,
+    #[default]
+    Normal,
+    High,
+    Critical,
+}
+
+/// The code of a level that is not one of `Priority`'s.
+pub const UNKNOWN_PRIORITY: &str = "unknown_priority";
+
+impl Priority {
+    pub const ALL: [Priority; 4] = [
+        Priority::Low,
+        Priority::Normal,
+        Priority::High,
+        Priority::Critical,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Priority::Low => "low",
+            Priority::Normal => "normal",
+            Priority::High => "high",
+            Priority::Critical => "critical",
+        }
+    }
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Priority {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Priority::ALL
+            .into_iter()
+            .find(|p| p.as_str() == s)
+            .ok_or_else(|| format!("unknown priority {s:?}; use low, normal, high or critical"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchSpec {
     pub agent: String,
@@ -322,6 +374,18 @@ pub struct Task {
     /// it reads as the default flock.
     #[serde(default)]
     pub flock: Option<String>,
+    /// The task's level in the queue. `normal` on a row from before it.
+    #[serde(default)]
+    pub priority: Priority,
+    /// Where `priority` came from, labelled like `AgentSource::agent`
+    /// (`task run`, `job <name>`, `machine <name>`, `flock <name>`,
+    /// `defaults`, `task priority`); `None` when no layer set one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_from: Option<String>,
+    /// The task's position among queued tasks of its level, lowest first;
+    /// its id unless something has moved it.
+    #[serde(default)]
+    pub queue_pos: i64,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -665,6 +729,9 @@ mod tests {
             activity_seen: false,
             ended: false,
             retry_of: None,
+            priority: Default::default(),
+            priority_from: None,
+            queue_pos: 0,
             created_at: now,
             started_at: Some(now),
             finished_at: None,

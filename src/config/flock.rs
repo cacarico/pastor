@@ -40,6 +40,10 @@ pub struct MachineConfig {
     /// its flock's and `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The level of tasks pinned to this machine that name none, before
+    /// its flock's and `[defaults]` (see `Defaults::resolve_priority`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::task::Priority>,
 }
 
 /// The flock a file with no `[[flock]]` entry has: every machine is in it.
@@ -72,6 +76,10 @@ pub struct FlockEntry {
     /// `[defaults] model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The level of this flock's tasks that name none, before `[defaults]
+    /// priority`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::task::Priority>,
 }
 
 /// Why a task cannot have the flock it asked for (`Flock::task_flock`).
@@ -774,6 +782,7 @@ mod tests {
             agent: None,
             agent_args: None,
             model: None,
+            priority: None,
         }
     }
 

@@ -14,6 +14,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   describe <name>` (both with `--json`) show them; an unknown name is
   `unknown_profile`, and a bad profile fails pastor.toml's load. Nothing
   reaches an agent yet.
+- Task priority: a task has a level, `low`, `normal` (the default), `high`
+  or `critical`, and each dispatch pass takes queued tasks by level, then
+  position, then age, still skipping what does not fit. The level comes from
+  `pastor task run --priority`, a job's `[dispatch] priority` (a template;
+  rendered empty it falls through), the `priority` of the machine the task
+  is pinned to, of its flock, or `[defaults] priority`, settled when the task
+  is queued. `pastor task priority <task> <level>` changes a queued task's
+  level, refused with `not_queued` for any other and from an agent pastor
+  started; `task retry` keeps it. A word that is not a level is
+  `unknown_priority`. `task describe` shows the level and the layer that set
+  it, `task list` a PRIORITY column, and `--json` `priority`,
+  `priority_from` and `queue_pos`. The store goes to schema 9 (columns
+  `priority`, `priority_from` and `queue_pos`; existing rows become `normal`,
+  placed by id), and the IPC protocol to 9: `task run --priority` and `task
+  priority` refuse an older head (`head_too_old`).
 - Named models: `[models.<name>]` in pastor.toml, each with a herdr agent
   `kind` and the `args` that select it. A task runs one with `pastor task run
   --model <name>`, a job's `[dispatch] model` (a template, so

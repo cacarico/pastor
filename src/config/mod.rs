@@ -441,6 +441,10 @@ pub struct Defaults {
     /// flock name none. See `resolve_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The level of tasks whose run flags, job, pinned machine and flock
+    /// name none; unset, `normal`. See `resolve_priority`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::task::Priority>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
     /// Where a task's pane goes when its run flags and job say nothing
@@ -616,6 +620,30 @@ impl Defaults {
     }
 }
 
+impl Defaults {
+    /// A task's level: from the first of `ask` (`--priority`, a job's
+    /// `priority`), the machine it is pinned to, its flock and these
+    /// defaults that sets one, and the layer that did; `normal` from none.
+    /// Only a pinned task has a machine here: an unpinned one is queued
+    /// before any machine is picked, and its level is settled then.
+    pub fn resolve_priority(
+        &self,
+        ask: Option<crate::task::Priority>,
+        pinned: Option<&flock::MachineConfig>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> (crate::task::Priority, Option<Layer>) {
+        [
+            (Layer::Ask, ask),
+            (Layer::Machine, pinned.and_then(|m| m.priority)),
+            (Layer::Flock, flock.and_then(|f| f.priority)),
+            (Layer::Defaults, self.priority),
+        ]
+        .into_iter()
+        .find_map(|(layer, p)| Some((p?, Some(layer))))
+        .unwrap_or_default()
+    }
+}
+
 impl Default for Defaults {
     fn default() -> Self {
         Defaults {
@@ -624,6 +652,7 @@ impl Default for Defaults {
             allow: vec![],
             deny: vec![],
             model: None,
+            priority: None,
             max_tasks_per_run: 5,
             timeout: "2h".into(),
             place: crate::task::Place::Repo,
@@ -1530,6 +1559,70 @@ mod tests {
         std::fs::write(&path, "[profiles.ci]\nextends = \"nope\"\n").unwrap();
         let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
         assert!(err.contains("profiles.ci") && err.contains("nope"), "{err}");
+    }
+
+    /// The level comes from the first of the ask, the pinned machine, the
+    /// flock and `[defaults]` that sets one; with none it is `normal`.
+    #[test]
+    fn the_priority_comes_from_the_first_layer_that_sets_one() {
+        use crate::task::Priority;
+        let d = Defaults {
+            priority: Some(Priority::Low),
+            ..Default::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "p".into(),
+            priority: Some(Priority::High),
+            ..Default::default()
+        };
+        let machine: flock::MachineConfig =
+            toml::from_str("name = \"m\"\nlocal = true\npriority = \"critical\"\n").unwrap();
+        assert_eq!(
+            d.resolve_priority(Some(Priority::Normal), Some(&machine), Some(&flock)),
+            (Priority::Normal, Some(Layer::Ask))
+        );
+        assert_eq!(
+            d.resolve_priority(None, Some(&machine), Some(&flock)),
+            (Priority::Critical, Some(Layer::Machine))
+        );
+        assert_eq!(
+            d.resolve_priority(None, None, Some(&flock)),
+            (Priority::High, Some(Layer::Flock))
+        );
+        assert_eq!(
+            d.resolve_priority(None, None, None),
+            (Priority::Low, Some(Layer::Defaults))
+        );
+        assert_eq!(
+            Defaults::default().resolve_priority(None, None, None),
+            (Priority::Normal, None)
+        );
+    }
+
+    /// `[defaults] priority`, a flock's and a machine's take only the four
+    /// levels.
+    #[test]
+    fn a_priority_in_a_config_file_must_be_a_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "[defaults]\npriority = \"high\"\n").unwrap();
+        assert_eq!(
+            PastorConfig::load(&path).unwrap().defaults.priority,
+            Some(crate::task::Priority::High)
+        );
+        std::fs::write(&path, "[defaults]\npriority = \"urgent\"\n").unwrap();
+        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        assert!(err.contains("urgent"), "{err}");
+        for text in [
+            "[[flock]]\nname = \"p\"\ndefault = true\npriority = \"asap\"\n",
+            "[[machine]]\nname = \"m\"\nlocal = true\npriority = \"asap\"\n",
+        ] {
+            let err = format!(
+                "{:#}",
+                flock::Flock::parse(std::path::Path::new("flock.toml"), text).unwrap_err()
+            );
+            assert!(err.contains("asap"), "{text}: {err}");
+        }
     }
 
     /// The model comes from the first of the ask, the machine, the flock

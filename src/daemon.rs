@@ -21,8 +21,8 @@ use crate::machine::{
     SendRefused, ShutdownOutcome, spawn_machine,
 };
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
-use crate::store::{NewTask, RetryError, Store, TaskFilter};
-use crate::task::{AgentSource, PANE_OWNING_STATES, Task, TaskState};
+use crate::store::{NewTask, PriorityError, RetryError, Store, TaskFilter};
+use crate::task::{AgentSource, PANE_OWNING_STATES, Priority, Task, TaskState};
 
 /// Where a headless serve's fleet sends each item its jobs find
 /// (`IpcRequest::JobTask`): to the head, which answers the task it queued.
@@ -419,12 +419,7 @@ impl Fleet {
     ) -> Result<(), AgentRefusal> {
         let pick = self.resolve_agent(ask, flock, machine);
         pick.apply_to(spec);
-        let label = |layer| match layer {
-            Layer::Ask => asked_by.to_string(),
-            Layer::Machine => format!("machine {}", machine.unwrap_or("-")),
-            Layer::Flock => format!("flock {flock}"),
-            Layer::Defaults => "defaults".to_string(),
-        };
+        let label = |layer| layer_label(layer, asked_by, flock, machine);
         spec.agent_source = Some(Box::new(AgentSource {
             ask: ask.clone(),
             agent: label(pick.agent_from),
@@ -436,6 +431,29 @@ impl Fleet {
             .read()
             .unwrap()
             .apply(&pick, &self.agents.read().unwrap(), spec)
+    }
+
+    /// The level of a task being queued in `flock`, pinned to `pinned` if it
+    /// is, and the label of the layer that set it
+    /// (`Defaults::resolve_priority`), from the flock and defaults as they
+    /// stand now. `asked_by` names the ask, as for `settle`.
+    fn settle_priority(
+        &self,
+        ask: Option<Priority>,
+        flock: &str,
+        pinned: Option<&str>,
+        asked_by: &str,
+    ) -> (Priority, Option<String>) {
+        let wanted = self.wanted.read().unwrap();
+        let (priority, layer) = self.defaults.read().unwrap().resolve_priority(
+            ask,
+            pinned.and_then(|m| wanted.get(m)),
+            wanted.entry(flock),
+        );
+        (
+            priority,
+            layer.map(|l| layer_label(l, asked_by, flock, pinned)),
+        )
     }
 
     /// `settle` for a task being queued: on the machine it is pinned to,
@@ -745,13 +763,16 @@ impl Fleet {
     /// machines are the flock, all in the default one.
     /// `ask` is what the run's flags said about the agent; the flock and
     /// `[defaults]` fill in the rest. `None`, from a client that predates
-    /// it, keeps the agent `spec` already carries.
+    /// it, keeps the agent `spec` already carries. `priority` is
+    /// `--priority`; without it the pinned machine, the flock or
+    /// `[defaults]` set the level.
     pub async fn queue_run(
         &self,
         prompt: String,
         mut spec: crate::task::DispatchSpec,
         flock: Option<&str>,
         ask: Option<&AgentChoice>,
+        priority: Option<Priority>,
     ) -> Result<Task, QueueError> {
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
@@ -767,14 +788,20 @@ impl Fleet {
             self.settle_agent(&mut spec, ask, &flock, "task run")
                 .map_err(QueueError::Agent)?;
         }
+        let (priority, from) =
+            self.settle_priority(priority, &flock, spec.machine.as_deref(), "task run");
         self.store
-            .insert_task(NewTask {
-                job: "run".into(),
-                item: serde_json::Value::Null,
-                prompt,
-                spec,
-                flock,
-            })
+            .insert_task_at(
+                NewTask {
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt,
+                    spec,
+                    flock,
+                },
+                priority,
+                from.as_deref(),
+            )
             .map_err(QueueError::Store)
     }
 
@@ -802,17 +829,26 @@ impl Fleet {
             model: job.model_for(item).map_err(anyhow::Error::msg)?,
             ..job.agent.clone()
         };
-        self.settle_agent(&mut settled, &ask, &flock, &format!("job {}", job.name))
+        let asked_by = format!("job {}", job.name);
+        self.settle_agent(&mut settled, &ask, &flock, &asked_by)
             .map_err(|e| anyhow::Error::msg(e.message))?;
-        self.store.insert_job_task(&job.name, &flock, item, |id| {
-            let (prompt, mut spec) = render(id)?;
-            spec.agent = settled.agent;
-            spec.agent_args = settled.agent_args;
-            spec.allow = settled.allow;
-            spec.deny = settled.deny;
-            spec.agent_source = settled.agent_source;
-            Ok((prompt, spec))
-        })
+        let (priority, from) = self.settle_priority(
+            job.priority_for(item).map_err(anyhow::Error::msg)?,
+            &flock,
+            job.spec.machine.as_deref(),
+            &asked_by,
+        );
+        let level = (priority, from.as_deref());
+        self.store
+            .insert_job_task_at(&job.name, &flock, item, level, |id| {
+                let (prompt, mut spec) = render(id)?;
+                spec.agent = settled.agent;
+                spec.agent_args = settled.agent_args;
+                spec.allow = settled.allow;
+                spec.deny = settled.deny;
+                spec.agent_source = settled.agent_source;
+                Ok((prompt, spec))
+            })
     }
 
     /// `queue_job_task` for a headless serve: the head renders and queues
@@ -1059,6 +1095,17 @@ impl Fleet {
 /// agent its model suits; cleared once one takes it.
 const WAITING_FOR_MODEL: &str = "waiting for a machine";
 
+/// How `AgentSource` and `Task::priority_from` name a layer: `asked_by`
+/// for the ask, else the machine, the flock or `defaults`.
+fn layer_label(layer: Layer, asked_by: &str, flock: &str, machine: Option<&str>) -> String {
+    match layer {
+        Layer::Ask => asked_by.to_string(),
+        Layer::Machine => format!("machine {}", machine.unwrap_or("-")),
+        Layer::Flock => format!("flock {flock}"),
+        Layer::Defaults => "defaults".to_string(),
+    }
+}
+
 /// Who asked for `task`'s agent, as `AgentSource` labels it.
 fn asked_by(task: &Task) -> String {
     if task.job == "run" {
@@ -1110,7 +1157,7 @@ pub(crate) async fn jobs_answer(
 /// the fleet. The CLI says the same for a change it makes on its own.
 pub fn agent_refusal(task: &str) -> String {
     format!(
-        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, serve or set up a head, open herdr's UI; `pastor task done` may end only its own task); set agents_change_fleet = true in pastor.toml to allow it"
+        "{task} is an agent pastor started, and agents may not change the fleet (run, send to, attach to, retry, reprioritize, close or prune tasks, tick (dry runs too), run or reload jobs, install, link, uninstall or unlink connectors, edit machines, flocks, jobs or pastor.toml, serve or set up a head, open herdr's UI; `pastor task done` may end only its own task); set agents_change_fleet = true in pastor.toml to allow it"
     )
 }
 
@@ -1503,6 +1550,7 @@ impl Daemon {
                 spec,
                 flock,
                 agent,
+                priority,
             } => {
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
@@ -1525,7 +1573,7 @@ impl Daemon {
                 }
                 let task = match self
                     .fleet
-                    .queue_run(prompt, spec, flock.as_deref(), agent.as_ref())
+                    .queue_run(prompt, spec, flock.as_deref(), agent.as_ref(), priority)
                     .await
                 {
                     Ok(t) => t,
@@ -1566,6 +1614,20 @@ impl Daemon {
                 Ok(ts) => IpcResponse::Tasks(ts),
                 Err(err) => IpcResponse::error("store_error", err),
             },
+            IpcRequest::TaskPriority { id, priority } => {
+                match self.store.set_priority(id, priority, "task priority") {
+                    Ok(t) => IpcResponse::Task(t),
+                    Err(err @ PriorityError::NotFound(_)) => {
+                        IpcResponse::error("task_not_found", err)
+                    }
+                    Err(err @ PriorityError::NotQueued { .. }) => {
+                        IpcResponse::error("not_queued", err)
+                    }
+                    Err(PriorityError::Store(err)) => {
+                        IpcResponse::error("store_error", format!("{err:#}"))
+                    }
+                }
+            }
             IpcRequest::TaskShow { id } => match self.store.get_task(id) {
                 Ok(Some(t)) => IpcResponse::Task(t),
                 Ok(None) => IpcResponse::error("task_not_found", format!("t-{id}")),
@@ -2329,6 +2391,7 @@ mod tests {
             agent: None,
             agent_args: None,
             model: None,
+            priority: None,
         }
     }
 
@@ -2977,6 +3040,7 @@ mod tests {
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -3025,6 +3089,7 @@ mod tests {
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -3037,6 +3102,7 @@ mod tests {
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -3062,6 +3128,187 @@ mod tests {
         );
     }
 
+    fn run_at(prompt: &str, priority: Option<Priority>) -> IpcRequest {
+        IpcRequest::Run {
+            prompt: prompt.into(),
+            spec: spec(),
+            flock: None,
+            agent: None,
+            priority,
+        }
+    }
+
+    /// When a slot frees, the queued task of the highest level takes it,
+    /// whatever its age; `task priority` moves a queued task, and refuses
+    /// one that left the queue, one that is not there and an agent pastor
+    /// started.
+    #[tokio::test]
+    async fn the_highest_level_takes_a_freed_slot() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+        let task = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let first = task(d.handle(run_at("1", None)).await);
+        assert_eq!(first.state, TaskState::Running);
+        let normal = task(d.handle(run_at("2", None)).await);
+        let high = task(d.handle(run_at("3", Some(Priority::High))).await);
+        let low = task(d.handle(run_at("4", Some(Priority::Low))).await);
+        assert_eq!(normal.priority, Priority::Normal);
+        assert_eq!(normal.priority_from, None);
+        assert_eq!(high.priority, Priority::High);
+        assert_eq!(high.priority_from.as_deref(), Some("task run"));
+
+        let set = |id: i64, priority: Priority| IpcRequest::TaskPriority { id, priority };
+        let raised = task(d.handle(set(low.id, Priority::Critical)).await);
+        assert_eq!(raised.priority, Priority::Critical);
+        assert_eq!(raised.priority_from.as_deref(), Some("task priority"));
+        assert_eq!(
+            error_code(d.handle(set(first.id, Priority::Low)).await),
+            "not_queued"
+        );
+        assert_eq!(
+            error_code(d.handle(set(999, Priority::Low)).await),
+            "task_not_found"
+        );
+        assert_eq!(
+            error_code(
+                d.handle_from(set(normal.id, Priority::Low), Some("t-1"))
+                    .await
+            ),
+            "agent_refused"
+        );
+
+        fake.close_pane(first.pane_id.as_deref().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.store.get_task(first.id).unwrap().unwrap().state != TaskState::Closed {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        d.fleet().dispatch_queued().await;
+        let state = |id: i64| d.store.get_task(id).unwrap().unwrap().state;
+        assert_eq!(state(low.id), TaskState::Running);
+        assert_eq!(state(high.id), TaskState::Queued);
+        assert_eq!(state(normal.id), TaskState::Queued);
+    }
+
+    /// A task's level comes from `--priority`, else the machine it is
+    /// pinned to, else its flock, else `[defaults]`; an unpinned task never
+    /// takes a machine's. A job's comes from its template, and an empty
+    /// value falls through; a value that is not a level is the item's error.
+    #[tokio::test]
+    async fn a_tasks_priority_comes_from_its_layers() {
+        use crate::config::flock::FlockEntry;
+        let mut urgent = machine("a", 4);
+        urgent.flock = Some("work".into());
+        urgent.priority = Some(Priority::Critical);
+        let mut plain = machine("b", 4);
+        plain.flock = Some("work".into());
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "work".into(),
+                default: true,
+                priority: Some(Priority::High),
+                ..Default::default()
+            }],
+            machines: vec![urgent, plain],
+        };
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("a", 4, FakeHerdr::new()), ("b", 4, FakeHerdr::new())],
+        )
+        .await;
+        let run = |machine: Option<&str>, priority: Option<Priority>| IpcRequest::Run {
+            prompt: "x".into(),
+            spec: DispatchSpec {
+                machine: machine.map(Into::into),
+                ..spec()
+            },
+            flock: None,
+            agent: None,
+            priority,
+        };
+        let level = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => (t.priority, t.priority_from.unwrap_or_default()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            level(d.handle(run(Some("a"), None)).await),
+            (Priority::Critical, "machine a".into())
+        );
+        assert_eq!(
+            level(d.handle(run(Some("a"), Some(Priority::Low))).await),
+            (Priority::Low, "task run".into())
+        );
+        assert_eq!(
+            level(d.handle(run(Some("b"), None)).await),
+            (Priority::High, "flock work".into())
+        );
+        assert_eq!(
+            level(d.handle(run(None, None)).await),
+            (Priority::High, "flock work".into())
+        );
+
+        let config = test_config();
+        let text = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\npriority = \"{{ item.priority }}\"\nprompt = \"p\"\n";
+        let job = crate::config::job::Job::parse(
+            text,
+            "j",
+            &config.defaults,
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let queue = |item: serde_json::Value| {
+            let job = job.clone();
+            let fleet = d.fleet().clone();
+            async move {
+                fleet
+                    .queue_job_task(&job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                    .await
+            }
+        };
+        let t = queue(serde_json::json!({"key": "a", "priority": "low"}))
+            .await
+            .unwrap();
+        assert_eq!(t.priority, Priority::Low);
+        assert_eq!(t.priority_from.as_deref(), Some("job j"));
+        let t = queue(serde_json::json!({"key": "b", "priority": ""}))
+            .await
+            .unwrap();
+        assert_eq!(t.priority, Priority::High);
+        assert_eq!(t.priority_from.as_deref(), Some("flock work"));
+        let err = queue(serde_json::json!({"key": "c", "priority": "urgent"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unknown_priority"), "{err:#}");
+    }
+
+    /// A retry keeps the level of the task it copies, and where it came
+    /// from.
+    #[tokio::test]
+    async fn a_retry_keeps_its_priority() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let IpcResponse::Task(mut t) = d.handle(run_at("x", Some(Priority::High))).await else {
+            panic!()
+        };
+        t.state = TaskState::Failed;
+        t.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut t).unwrap();
+        let IpcResponse::Task(copy) = d
+            .handle(IpcRequest::TaskRetry {
+                id: t.id,
+                place: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(copy.retry_of, Some(t.id));
+        assert_eq!(copy.priority, Priority::High);
+        assert_eq!(copy.priority_from.as_deref(), Some("task run"));
+    }
+
     #[tokio::test]
     async fn pinned_unknown_machine_and_bad_ids_are_errors() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
@@ -3074,6 +3321,7 @@ mod tests {
                 },
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         let IpcResponse::Error { code, .. } = resp else {
@@ -3100,6 +3348,7 @@ mod tests {
                 },
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -3152,6 +3401,7 @@ mod tests {
             },
             flock: flock.map(Into::into),
             agent: None,
+            priority: None,
         }
     }
 
@@ -3173,6 +3423,7 @@ mod tests {
             spec: spec(),
             flock: Some(flock.into()),
             agent,
+            priority: None,
         };
         let queued = |resp: IpcResponse| match resp {
             IpcResponse::Task(t) => (t.spec.agent, t.spec.agent_args.join(" ")),
@@ -3262,6 +3513,7 @@ mod tests {
                 allow: vec!["Edit".into()],
                 ..Default::default()
             }),
+            priority: None,
         };
         let IpcResponse::Task(t) = d.handle(run(None)).await else {
             panic!()
@@ -3324,6 +3576,7 @@ mod tests {
                 spec: spec(),
                 flock: Some("work".into()),
                 agent: Some(AgentChoice::default()),
+                priority: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -3404,6 +3657,7 @@ mod tests {
                 model: model.map(Into::into),
                 ..Default::default()
             }),
+            priority: None,
         }
     }
 
@@ -3648,6 +3902,7 @@ mod tests {
             spec: spec(),
             flock: None,
             agent: Some(AgentChoice::default()),
+            priority: None,
         };
         let mut seen = vec![];
         for _ in 0..2 {
@@ -3712,6 +3967,7 @@ mod tests {
                 pinned.clone(),
                 None,
                 Some(&AgentChoice::default()),
+                None,
             )
             .await
             .unwrap();
@@ -3725,7 +3981,7 @@ mod tests {
         };
         let t = d
             .fleet()
-            .queue_run("x".into(), pinned, None, Some(&asked))
+            .queue_run("x".into(), pinned, None, Some(&asked), None)
             .await
             .unwrap();
         assert_eq!(t.spec.agent, "aider");
@@ -4019,7 +4275,7 @@ mod tests {
                 let fleet = fleet.clone();
                 async move {
                     fleet
-                        .queue_run("x".into(), spec(), Some("spare"), None)
+                        .queue_run("x".into(), spec(), Some("spare"), None, None)
                         .await
                 }
             };
@@ -4069,7 +4325,7 @@ mod tests {
             .await
             .unwrap();
         let t = fleet
-            .queue_run("x".into(), spec_on("w"), None, None)
+            .queue_run("x".into(), spec_on("w"), None, None, None)
             .await
             .unwrap();
         assert_eq!(t.flock.as_deref(), Some("home"), "w moved to home");
@@ -4077,7 +4333,9 @@ mod tests {
             .edit_flock_file(&file, |f| crate::fleet_edit::remove_machine(f, "w"))
             .await
             .unwrap();
-        let run = fleet.queue_run("x".into(), spec_on("w"), None, None).await;
+        let run = fleet
+            .queue_run("x".into(), spec_on("w"), None, None, None)
+            .await;
         assert!(matches!(run, Err(QueueError::UnknownMachine(_))), "{run:?}");
     }
 
@@ -4227,6 +4485,7 @@ mod tests {
                 spec: spec(),
                 flock: Some("home".into()),
                 agent: Some(AgentChoice::default()),
+                priority: None,
             })
             .await;
         let IpcResponse::Task(t) = resp else {
@@ -4253,6 +4512,7 @@ mod tests {
                 },
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         let IpcResponse::Error { code, .. } = resp else {
@@ -4321,6 +4581,7 @@ mod tests {
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             },
         )
         .await
@@ -4370,6 +4631,7 @@ mod tests {
             spec: spec(),
             flock: None,
             agent: None,
+            priority: None,
         }
     }
 
@@ -5050,6 +5312,7 @@ mod tests {
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -5183,6 +5446,7 @@ mod tests {
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -5214,6 +5478,7 @@ mod tests {
                 spec: spec(),
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await
         else {
@@ -5581,6 +5846,7 @@ mod tests {
                 },
                 flock: None,
                 agent: None,
+                priority: None,
             })
             .await;
         assert_eq!(error_code(resp), "worktree_needs_repo");

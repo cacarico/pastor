@@ -194,6 +194,7 @@ async fn the_daemon_writes_the_events_log() {
             agent: None,
             agent_args: None,
             model: None,
+            priority: None,
         }],
     };
     let fake: Arc<dyn Connector> = Arc::new(FakeHerdr::new());
@@ -262,6 +263,7 @@ async fn the_daemon_writes_the_events_log() {
             },
             flock: None,
             agent: None,
+            priority: None,
         },
     )
     .await
