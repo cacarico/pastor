@@ -521,6 +521,27 @@ impl Fleet {
         )
     }
 
+    /// The label template of a task being queued in `flock`: its own
+    /// (`--label`, a job's `label`), else the flock's, else `[defaults]`,
+    /// as they stand now, with where it came from
+    /// (`Defaults::resolve_label`). `asked_by` names the ask, as for
+    /// `settle`. Dispatch renders it on the machine it picks.
+    fn settle_label(&self, spec: &mut crate::task::DispatchSpec, flock: &str, asked_by: &str) {
+        let wanted = self.wanted.read().unwrap();
+        let picked = self
+            .defaults
+            .read()
+            .unwrap()
+            .resolve_label(spec.label.template.as_deref(), wanted.entry(flock));
+        spec.label = crate::task::WorkspaceLabel {
+            from: picked
+                .as_ref()
+                .map(|&(_, layer)| layer_label(layer, asked_by, flock, None)),
+            template: picked.map(|(template, _)| template),
+            ..Default::default()
+        };
+    }
+
     /// `settle` for a task being queued: on the machine it is pinned to,
     /// else with no machine yet, as dispatch settles it again on the one it
     /// picks. Refused when the agent cannot be started as resolved on any
@@ -877,6 +898,7 @@ impl Fleet {
             self.settle_agent(&mut spec, ask, &flock, "task run")
                 .map_err(QueueError::Agent)?;
         }
+        self.settle_label(&mut spec, &flock, "task run");
         let (priority, from) =
             self.settle_priority(priority, &flock, spec.machine.as_deref(), "task run");
         // Checked against the level it settles at: a machine or flock may
@@ -934,6 +956,7 @@ impl Fleet {
         let asked_by = format!("job {}", job.name);
         self.settle_agent(&mut settled, &ask, &flock, &asked_by)
             .map_err(|e| anyhow::Error::msg(e.message))?;
+        self.settle_label(&mut settled, &flock, &asked_by);
         let (priority, from) = self.settle_priority(
             job.priority_for(item).map_err(anyhow::Error::msg)?,
             &flock,
@@ -960,6 +983,7 @@ impl Fleet {
                 spec.allow = settled.allow;
                 spec.deny = settled.deny;
                 spec.agent_source = settled.agent_source;
+                spec.label = settled.label;
                 Ok((prompt, spec))
             },
         )
@@ -2960,6 +2984,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         }
     }
 
@@ -3853,6 +3878,165 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("unknown_priority"), "{err:#}");
+    }
+
+    /// A task's workspace label comes from `--label`, else its job's, else
+    /// its flock's, else `[defaults]`, settled when it is queued; dispatch
+    /// renders it on the machine, and the agent stays `t-N`. A retry keeps
+    /// the template and where it came from.
+    #[tokio::test]
+    async fn a_tasks_label_comes_from_its_layers() {
+        use crate::config::flock::FlockEntry;
+        let mut a = machine("a", 4);
+        a.flock = Some("work".into());
+        let mut b = machine("b", 4);
+        b.flock = Some("bare".into());
+        let flock = Flock {
+            flocks: vec![
+                FlockEntry {
+                    name: "work".into(),
+                    default: true,
+                    label: Some("w/{{ task.id }}".into()),
+                    ..Default::default()
+                },
+                FlockEntry {
+                    name: "bare".into(),
+                    ..Default::default()
+                },
+            ],
+            machines: vec![a, b],
+        };
+        let fake_a = FakeHerdr::new();
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("a", 4, fake_a.clone()), ("b", 4, FakeHerdr::new())],
+        )
+        .await;
+        let mut config = test_config();
+        config.defaults.label = Some("{{ machine }}/{{ task.id }}".into());
+        d.fleet().set_config(&config);
+        let run = |label: Option<&str>, flock: &str| IpcRequest::Run {
+            prompt: "x".into(),
+            spec: DispatchSpec {
+                label: crate::task::WorkspaceLabel {
+                    template: label.map(Into::into),
+                    ..Default::default()
+                },
+                ..spec()
+            },
+            flock: Some(flock.into()),
+            agent: None,
+            priority: None,
+            role: TaskRole::Agent,
+            description: None,
+            preempt: false,
+        };
+        let task = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let label = |t: &Task| {
+            (
+                t.spec.label.template.clone().unwrap_or_default(),
+                t.spec.label.from.clone().unwrap_or_default(),
+                t.spec.label.name.clone().unwrap_or_default(),
+            )
+        };
+        let asked = task(d.handle(run(Some("mine-{{ task.id }}"), "work")).await);
+        let id = asked.display_id();
+        assert_eq!(
+            label(&asked),
+            (
+                "mine-{{ task.id }}".into(),
+                "task run".into(),
+                format!("mine-{id}")
+            )
+        );
+        assert_eq!(asked.agent_name.as_deref(), Some(id.as_str()));
+        let from_flock = task(d.handle(run(None, "work")).await);
+        assert_eq!(
+            label(&from_flock),
+            (
+                "w/{{ task.id }}".into(),
+                "flock work".into(),
+                format!("w/{}", from_flock.display_id())
+            )
+        );
+        let from_defaults = task(d.handle(run(None, "bare")).await);
+        assert_eq!(
+            label(&from_defaults),
+            (
+                "{{ machine }}/{{ task.id }}".into(),
+                "defaults".into(),
+                format!("b/{}", from_defaults.display_id())
+            )
+        );
+        let created: Vec<String> = fake_a
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "workspace.create")
+            .map(|r| r.params["label"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            created,
+            vec![
+                format!("mine-{id}"),
+                format!("w/{}", from_flock.display_id())
+            ]
+        );
+
+        let text = |extra: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        let parse = |extra: &str| {
+            crate::config::job::Job::parse(
+                &text(extra),
+                "j",
+                &config.defaults,
+                &crate::connector::Builtins,
+            )
+            .unwrap()
+        };
+        for (job, want) in [
+            (
+                parse("label = \"{{ job }}/{{ item.key }}\"\n"),
+                ("{{ job }}/{{ item.key }}", "job j"),
+            ),
+            (parse(""), ("w/{{ task.id }}", "flock work")),
+        ] {
+            let item = serde_json::json!({"key": want.1.replace(' ', "-")});
+            let t = d
+                .fleet()
+                .queue_job_task(&job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                .await
+                .unwrap();
+            assert_eq!(t.spec.label.template.as_deref(), Some(want.0));
+            assert_eq!(t.spec.label.from.as_deref(), Some(want.1));
+        }
+
+        let mut failed = asked.clone();
+        failed.state = TaskState::Failed;
+        failed.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut failed).unwrap();
+        let copy = task(
+            d.handle(IpcRequest::TaskRetry {
+                id: failed.id,
+                place: None,
+            })
+            .await,
+        );
+        assert_eq!(
+            copy.spec.label.template.as_deref(),
+            Some("mine-{{ task.id }}")
+        );
+        assert_eq!(copy.spec.label.from.as_deref(), Some("task run"));
+        assert_eq!(
+            copy.spec.label.name,
+            Some(format!("mine-{}", copy.display_id())),
+            "rendered again for the copy"
+        );
     }
 
     /// A retry keeps the level of the task it copies, and where it came

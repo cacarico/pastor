@@ -29,6 +29,22 @@ the same checkout.
 | `--priority` | `low`, `normal`, `high` or `critical`: higher levels leave the queue first |
 | `--preempt` | critical only: on a full machine, pause a `low` Claude task and take its slot |
 | `--description` | one line on what it is about; default: the prompt's first line |
+| `--label` | the name of its herdr workspace; default: `{{ flock }}/{{ task.id }}` |
+
+## name its workspace
+
+herdr's sidebar shows each task's workspace as `personal/t-285`: its flock,
+then the task. With many projects on one machine, that tells them apart.
+Change it with a template, per task, job, flock or in `[defaults]`:
+
+```sh
+pastor task run "Fix the login page" --repo '~/work/web' --label '{{ machine }}/{{ task.id }}'
+```
+
+A template takes `{{ task.id }}`, `{{ flock }}`, `{{ machine }}`, `{{ job }}`
+and `{{ item.key }}`. Only the workspace is renamed: the agent is still
+`t-285`, and a task that joins a workspace leaves its name alone.
+`pastor task describe` shows the label and where it came from.
 
 ## states
 

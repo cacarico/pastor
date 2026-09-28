@@ -242,6 +242,27 @@ fn escape_controls(s: &str, keep_lines: bool) -> String {
     out
 }
 
+/// The `label` line of `task describe`: the workspace's name once dispatch
+/// gave it one, else the template, then where it came from. A task that
+/// joined a workspace says so instead, since no template named it.
+fn workspace_label(l: &crate::task::WorkspaceLabel) -> String {
+    let from = match &l.from {
+        Some(from) => format!("from {from}"),
+        None => "built-in".to_string(),
+    };
+    let why = match l.note.as_deref() {
+        Some(note @ crate::task::JOINED_WORKSPACE) => note.to_string(),
+        Some(note) => format!("{from}; {note}"),
+        None => from,
+    };
+    let shown = l
+        .name
+        .as_deref()
+        .or(l.template.as_deref())
+        .unwrap_or(crate::task::DEFAULT_LABEL);
+    format!("{shown} ({why})")
+}
+
 /// `pastor task describe`: every field a human asks about one task, one per line,
 /// then the prompt. The agent args are shell-quoted, so the line reads as the
 /// command herdr runs; each is followed by where it came from, when the task
@@ -303,6 +324,7 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         }
         repo.push(')');
     }
+    let label = workspace_label(&t.spec.label);
     let tags = if t.spec.tags.is_empty() {
         "-".to_string()
     } else {
@@ -324,6 +346,7 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         ("deny", list(&t.spec.deny)),
         ("repo", repo),
         ("place", t.spec.place.to_string()),
+        ("label", label),
         ("tags", tags),
         ("timeout", format!("{}s", t.spec.timeout_secs)),
         ("pane", opt(&t.pane_id)),
@@ -1136,6 +1159,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -1202,6 +1226,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -1319,6 +1344,46 @@ mod tests {
         assert_eq!(json["priority_from"], "flock work");
     }
 
+    /// `task describe` gives the workspace label and where it came from:
+    /// the template until dispatch names the workspace, then that name,
+    /// with a note when it joined a workspace or fell back to `t-N`.
+    #[test]
+    fn a_tasks_label_shows_with_where_it_came_from() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      {{ flock }}/{{ task.id }} (built-in)\n"),
+            "{out}"
+        );
+        t.spec.label.template = Some("{{ machine }}/{{ task.id }}".into());
+        t.spec.label.from = Some("flock work".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      {{ machine }}/{{ task.id }} (from flock work)\n"),
+            "{out}"
+        );
+        t.spec.label.name = Some("pi-1/t-1".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      pi-1/t-1 (from flock work)\n"),
+            "{out}"
+        );
+        t.spec.label.name = Some("t-1".into());
+        t.spec.label.note = Some("fell back to t-1: it renders empty".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      t-1 (from flock work; fell back to t-1: it renders empty)\n"),
+            "{out}"
+        );
+        t.spec.label.name = Some("pastor".into());
+        t.spec.label.note = Some("joined workspace".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      pastor (joined workspace)\n"),
+            "{out}"
+        );
+    }
+
     /// `task describe` names the task's role, and `task list --json`'s
     /// record carries it, plain agents included.
     #[test]
@@ -1351,6 +1416,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         });
         let out = task_detail(&t);
         assert!(
@@ -1385,6 +1451,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);
@@ -1430,6 +1497,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
         let note = task_rows(std::slice::from_ref(&t))[0]
@@ -1459,6 +1527,7 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
         let out = task_detail(&t);

@@ -45,6 +45,7 @@ fn task(id: i64) -> Task {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
             },
             flock: "default".into(),
         })
@@ -270,6 +271,7 @@ async fn the_daemon_writes_the_events_log() {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
             },
             flock: None,
             agent: None,

@@ -193,6 +193,7 @@ mod tests {
                 agent_source: None,
                 place: Default::default(),
                 session_id: session.map(String::from),
+                label: Default::default(),
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w9".into()),
