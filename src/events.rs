@@ -1335,9 +1335,11 @@ mod tests {
         fn page(&mut self, after: u64, limit: u32, task: Option<i64>) -> EventsPage {
             self.asked.push(after);
             let oldest = self.log.iter().map(|r| r.seq).filter(|&s| s > 0).min();
+            let newest = self.log.iter().map(|r| r.seq).max().filter(|&s| s > 0);
             EventsPage {
                 gap: oldest.is_some_and(|o| o > after + 1),
                 oldest,
+                newest,
                 events: self
                     .log
                     .iter()
