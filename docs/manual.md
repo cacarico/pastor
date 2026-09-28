@@ -5,7 +5,9 @@ version.
 
 ## How it works
 
-`pastor serve` runs on one machine, the head. herdr answers one request per
+`pastor serve` runs on one machine, the head: the one whose serve holds the
+queue. Other machines may run a headless serve (see [A headless
+serve](#a-headless-serve)). herdr answers one request per
 connection and then closes it, so pastor opens a connection per request: an
 `ssh` running `herdr --session <s> remote-api-bridge`, which pipes herdr's
 socket protocol over stdio. Every command pastor runs over ssh (this one, the
@@ -3188,9 +3190,9 @@ agent, either for your user or for one project:
 
 ```bash
 mkdir -p ~/.claude/skills
-ln -s ~/ghq/github.com/cacarico/pastor/skills/pastor ~/.claude/skills/pastor   # for you
+ln -s ~/src/pastor/skills/pastor ~/.claude/skills/pastor   # for you; ~/src/pastor is your checkout
 mkdir -p .claude/skills
-ln -s ~/ghq/github.com/cacarico/pastor/skills/pastor .claude/skills/pastor     # for one project
+ln -s ~/src/pastor/skills/pastor .claude/skills/pastor     # for one project
 ```
 
 An agent that pastor dispatched runs on a flock machine, where this checkout

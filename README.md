@@ -52,8 +52,8 @@ someone else's cloud. The longer story is in [the blog post](https://cacari.co/p
     clock, GitHub issues, ...)          move the card, notify you
 ```
 
-- **The head** is one machine that runs `pastor serve`. It holds the queue,
-  the schedule and the history.
+- **The head** is the machine whose `pastor serve` holds the queue, the
+  schedule and the history.
 - **Machines** take the tasks. The head can be one of them. Others are
   reached over ssh, and each runs herdr.
 - **A task** is one agent, one prompt, in a repo or, with `--worktree`, in a
