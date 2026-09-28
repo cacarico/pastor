@@ -5,6 +5,7 @@
 // Loaded as a module, so its names never meet keys.js's globals.
 
 const term = document.querySelector('[data-term]');
+const READ_PAUSE = 6000; // ms a finished act stays on screen
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 
 if (term && !still.matches) play(term);
@@ -74,7 +75,8 @@ function play(term) {
         for (const line of act) {
           if (!(await put(line, mine))) return;
         }
-        if (!(await wait(3000, mine))) return;
+        // A full screen stays up long enough to read before it clears.
+        if (!(await wait(READ_PAUSE, mine))) return;
       }
     }
   }
