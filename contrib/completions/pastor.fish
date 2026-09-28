@@ -314,6 +314,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand config; and not __fish_see
 complete -c pastor -n "__fish_pastor_using_subcommand config; and not __fish_seen_subcommand_from edit help" -f -a "edit" -d 'Open pastor.toml in $VISUAL or $EDITOR; save it only once it is valid'
 complete -c pastor -n "__fish_pastor_using_subcommand config; and not __fish_seen_subcommand_from edit help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand config; and __fish_seen_subcommand_from edit" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand config; and __fish_seen_subcommand_from edit" -l local -d 'This machine\'s pastor.toml, even with a head on another machine'
 complete -c pastor -n "__fish_pastor_using_subcommand config; and __fish_seen_subcommand_from edit" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand config; and __fish_seen_subcommand_from help" -f -a "edit" -d 'Open pastor.toml in $VISUAL or $EDITOR; save it only once it is valid'
 complete -c pastor -n "__fish_pastor_using_subcommand config; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
