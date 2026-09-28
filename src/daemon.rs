@@ -986,7 +986,7 @@ impl Fleet {
     /// `ask` is what the run's flags said about the agent; the flock and
     /// `[defaults]` fill in the rest. `None`, from a client that predates
     /// it, keeps the agent `spec` already carries. `priority` is
-    /// `--priority`; without it the pinned machine, the flock or
+    /// `--priority`; without it the flock, the pinned machine or
     /// `[defaults]` set the level.
     pub async fn queue_run(
         &self,

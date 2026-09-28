@@ -241,13 +241,13 @@ struct RunArgs {
     #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
     agent_args: Vec<String>,
     /// Run this model, a name from `[models]` in pastor.toml; its args go
-    /// before the agent's (default: the machine's, else its flock's, else
+    /// before the agent's (default: the flock's, else the machine's, else
     /// `[defaults] model`, else none)
     #[arg(long, value_name = "NAME")]
     model: Option<String>,
     /// Queue at this level: low, normal, high or critical; dispatch takes
-    /// higher levels first (default: the pinned machine's, else its
-    /// flock's, else `[defaults] priority`, else normal)
+    /// higher levels first (default: the flock's, else the pinned
+    /// machine's, else `[defaults] priority`, else normal)
     #[arg(long, value_name = "LEVEL")]
     priority: Option<String>,
     /// A critical task only: on a full machine, pause the newest low Claude
@@ -256,7 +256,7 @@ struct RunArgs {
     preempt: bool,
     /// Run under this permission profile, built in or from `[profiles]` in
     /// pastor.toml: a Claude agent gets its allow and deny lists and never
-    /// asks (default: the machine's, else its flock's, else `[defaults]
+    /// asks (default: the flock's, else the machine's, else `[defaults]
     /// profile`, else none)
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
@@ -4593,6 +4593,36 @@ mod tests {
             if let Err(e) = Cli::try_parse_from(&args) {
                 panic!("{args:?}: {e}");
             }
+        }
+    }
+
+    /// `task run` help names the layers in the order the code reads them:
+    /// the agent from the machine before its flock
+    /// (`Defaults::resolve_agent_on`), the model, profile and priority from
+    /// the flock before the machine (`resolve_agent_on`,
+    /// `Defaults::resolve_priority`).
+    #[test]
+    fn run_help_names_the_layers_in_the_order_they_apply() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let run = root
+            .find_subcommand("task")
+            .and_then(|t| t.find_subcommand("run"))
+            .unwrap();
+        let help = |id: &str| {
+            let arg = run.get_arguments().find(|a| a.get_id() == id).unwrap();
+            arg.get_help().unwrap().to_string().replace('\n', " ")
+        };
+        let order = |text: &str, first: &str, then: &str| {
+            let (a, b) = (text.find(first), text.find(then));
+            assert!(
+                a.is_some() && b.is_some() && a < b,
+                "{first:?} should come before {then:?} in {text:?}"
+            );
+        };
+        order(&help("agent"), "machine's", "flock's");
+        for id in ["model", "profile", "priority"] {
+            order(&help(id), "flock's", "machine's");
         }
     }
 
