@@ -1919,12 +1919,12 @@ impl Fleet {
                 .is_none_or(|r| r.is_ok())
         };
         for (i, task) in queued.iter().enumerate() {
+            let later = &queued[i + 1..];
             if task.state == TaskState::Paused {
-                self.resume_paused(task).await;
+                self.resume_paused(task, later, &takes).await;
                 continue;
             }
             let target = task.flock.as_deref().unwrap_or(flock.default_flock());
-            let later = &queued[i + 1..];
             let default = flock.default_flock();
             let mut views = self.views();
             mark_waiting_under_share(&mut views, target, later, default, &takes);
@@ -1945,7 +1945,7 @@ impl Fleet {
                 && task.pause.preempt
                 && task.priority == Priority::Critical
                 && let Some((machine, victim)) =
-                    self.pausable_for(&views, target, task, claim, &accepts)
+                    self.pausable_for(&views, target, task, claim, &accepts, later, &takes)
                 && let Some(handle) = self.get(&machine)
             {
                 match handle.pause(victim, task.id).await {
@@ -2063,7 +2063,11 @@ impl Fleet {
     /// (`Task::pausable`) is gone, the newest such, the machine with the
     /// fewest live tasks first. Pausing another flock's task frees a slot,
     /// not a seat in `flock`, so it only helps a machine short of slots.
-    /// Answers the machine and that task's id.
+    /// Past its share, `flock` may take the freed slot only while no flock
+    /// under its share there has a task in `later` waiting for it, the same
+    /// rule dispatch applies, so a pause never frees a slot the task then
+    /// may not take. Answers the machine and that task's id.
+    #[allow(clippy::too_many_arguments)]
     fn pausable_for(
         &self,
         views: &[MachineView],
@@ -2071,6 +2075,8 @@ impl Fleet {
         task: &Task,
         claim: Claim,
         accepts: &dyn Fn(&str) -> bool,
+        later: &[Task],
+        takes: &dyn Fn(&Task, &str) -> bool,
     ) -> Option<(String, i64)> {
         let agents = self.agents.read().unwrap().clone();
         let default = self.flock().default_flock().to_string();
@@ -2080,7 +2086,7 @@ impl Fleet {
             .filter(|m| {
                 m.in_flock(flock)
                     && m.healthy
-                    && !(m.has_room(claim) && m.flock_has_room(flock))
+                    && !(m.has_room(claim) && m.flock_may_take(flock))
                     && task.spec.machine.as_ref().is_none_or(|p| *p == m.name)
                     && task.spec.tags.iter().all(|t| m.tags.contains(t))
                     && accepts(&m.name)
@@ -2102,7 +2108,16 @@ impl Fleet {
                         if let Some(s) = after.flocks.iter_mut().find(|s| s.name == freed) {
                             s.live = s.live.saturating_sub(1);
                         }
-                        after.has_room(claim) && after.flock_has_room(flock)
+                        // The pause can bring `flock` from its max to
+                        // past its share, where waiters matter again.
+                        mark_waiting_under_share(
+                            std::slice::from_mut(&mut after),
+                            flock,
+                            later,
+                            &default,
+                            takes,
+                        );
+                        after.has_room(claim) && after.flock_may_take(flock)
                     })
                     .max_by_key(|t| t.id)?;
                 Some((m.live, m.name.clone(), victim.id))
@@ -2113,19 +2128,27 @@ impl Fleet {
 
     /// Resume paused task `task` on the machine it was paused on, once that
     /// machine is healthy, still in the flock and has room for it, its own
-    /// flock under its number there. It is not settled again: it goes back
-    /// to the agent and session it had.
-    async fn resume_paused(&self, task: &Task) {
+    /// flock under its number there. Past its share, it also waits while a
+    /// flock under its share there has a task in `later` for that slot, as
+    /// a queued task would (`MachineView::flock_may_take`). It is not
+    /// settled again: it goes back to the agent and session it had.
+    async fn resume_paused(
+        &self,
+        task: &Task,
+        later: &[Task],
+        takes: &(dyn Fn(&Task, &str) -> bool + Sync),
+    ) {
         let Some(machine) = task.pinned_machine() else {
             return;
         };
         let flock = self.flock();
         let target = task.flock.as_deref().unwrap_or(flock.default_flock());
-        let views = self.views();
+        let mut views = self.views();
+        mark_waiting_under_share(&mut views, target, later, flock.default_flock(), takes);
         let fits = views
             .iter()
             .find(|m| m.name == machine)
-            .is_some_and(|m| m.healthy && m.has_room(Claim::of(task)) && m.flock_has_room(target));
+            .is_some_and(|m| m.healthy && m.has_room(Claim::of(task)) && m.flock_may_take(target));
         if !fits || !self.in_flock(machine) {
             return;
         }
@@ -9700,6 +9723,60 @@ mod tests {
             let paused = states.iter().filter(|s| **s == TaskState::Paused).count();
             assert_eq!(running, 1, "only one freed slot, only one may resume");
             assert_eq!(paused, 1, "the other stays paused");
+        }
+
+        /// A paused task past its flock's share waits, as a queued one
+        /// would, while a flock under its share there has a task for the
+        /// freed slot; it resumes once nobody under a share wants it.
+        #[tokio::test]
+        async fn a_paused_task_past_its_share_leaves_the_slot_to_a_flock_under_its_share() {
+            let fake = FakeHerdr::new();
+            let flock: Flock = toml::from_str(
+                "[[flock]]\nname = \"pastor\"\ndefault = true\nmachines = { desk = { share = 1, max = 2 } }\n\n\
+                 [[flock]]\nname = \"life\"\nmachines = { desk = 2 }\n\n\
+                 [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 2\n",
+            )
+            .unwrap();
+            flock.validate().unwrap();
+            let (d, _tmp) = daemon_with_flock(flock, &[("desk", 2, fake.clone())]).await;
+            let first = start(&d, run("first", spec(), Priority::Low, false)).await;
+            let second = start(&d, run("second", spec(), Priority::Low, false)).await;
+            assert_eq!(first.state, TaskState::Running);
+            assert_eq!(
+                second.state,
+                TaskState::Running,
+                "past its share, nobody waits"
+            );
+            let crit = start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit.state, TaskState::Running);
+            assert_eq!(get(&d, second.id).state, TaskState::Paused);
+
+            let mut req = run("life", spec(), Priority::Low, false);
+            if let IpcRequest::Run { flock, .. } = &mut req {
+                *flock = Some("life".into());
+            }
+            let life = start(&d, req).await;
+            assert_eq!(life.state, TaskState::Queued);
+
+            // One slot frees: pastor is at its share again, life is under
+            // its own and waits, so life takes it.
+            d.handle(IpcRequest::TaskClose {
+                id: crit.id,
+                remove_worktree: false,
+            })
+            .await;
+            d.fleet().dispatch_queued().await;
+            assert_eq!(get(&d, life.id).state, TaskState::Running);
+            assert_eq!(get(&d, second.id).state, TaskState::Paused);
+
+            // Nobody under a share waits now: the paused task resumes.
+            d.handle(IpcRequest::TaskClose {
+                id: life.id,
+                remove_worktree: false,
+            })
+            .await;
+            d.fleet().dispatch_queued().await;
+            assert_eq!(get(&d, second.id).state, TaskState::Running);
         }
 
         /// A resume whose agent does not come up fails the task, as any

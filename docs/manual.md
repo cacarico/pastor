@@ -610,7 +610,7 @@ one at its max says `waiting for a machine: flock code is at 4 of 2/4 on
 desk`. Nothing passes the machine's own room,
 and job slots and burst never take a flock past its max. `max` below `share`,
 `max` alone (the plain number is that), a share alone and a share of 0 fail
-the load. A head needs IPC protocol 25 to read this form; the CLI refuses an
+the load. A head needs IPC protocol 26 to read this form; the CLI refuses an
 older one while flock.toml uses it.
 
 The `flock` key on a machine still works: it puts the machine in that flock
