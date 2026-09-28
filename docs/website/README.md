@@ -24,7 +24,14 @@ d/u, gg/G to scroll. Every tab is also a plain link.
 - The version in the header comes from `Cargo.toml`.
 
 `make site` builds into `docs/website/public/`; `make site-serve` serves it
-with live reload. Both need `hugo` (from mise). On push to main,
-`.github/workflows/website.yml` builds it and publishes it to GitHub Pages.
+with live reload. Both need `hugo` (from mise).
+
+`.github/workflows/website.yml` builds it on pushes to main and on pull
+requests that touch the docs, but publishes it to GitHub Pages only from
+`cacarico/pastor`; elsewhere Pages is off and only the build runs. To see
+the site before then, download the pull request's `website` artifact from
+its checks, unzip it and serve the folder (`python3 -m http.server` in it),
+or run `make site-serve`. Opening `index.html` from disk does not work: the
+pretty URLs (`docs/install/`) show a folder listing there.
 
 The design rounds that led here live in the private `cacarico-layouts` repo.
