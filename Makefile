@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine leaks smoke smoke-profiles install install-completions completions demo site site-serve clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh leaks smoke smoke-profiles install install-completions completions demo site site-serve clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -37,6 +37,12 @@ test: ## whole suite, including the end-to-end CLI tests against the fake herdr
 
 test-machine: ## the machine actor tests five times, to catch timing flakes
 	@for i in 1 2 3 4 5; do cargo test --lib machine:: -q || exit 1; done
+
+# Starts an sshd of its own on a localhost port, as the user running it, and
+# drives the CLI against a head through the real ssh and `pastor bridge`;
+# see tests/real_ssh.rs. Needs OpenSSH's server (sshd) and ssh-keygen.
+test-ssh: ## the CLI against a head over a real ssh, through a throwaway sshd
+	cargo test --test real_ssh -- --ignored
 
 # The repository is public; CI runs this same scan. The rules are gitleaks'
 # own defaults at the pinned version, fetched outside the checkout; the scan

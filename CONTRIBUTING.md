@@ -24,13 +24,16 @@ Useful targets:
 make help
 make test
 make test-machine
+make test-ssh
 make smoke SESSION=s
 ```
 
 The normal test suite must not require a real herdr. Use `make smoke` only when
 you intentionally test against a real herdr instance, and `make
 smoke-profiles` (a live review task per agent through a head running your
-build) before trusting a change to permission profiles.
+build) before trusting a change to permission profiles. `make test-ssh` runs
+the CLI against a head over a real ssh, through an sshd it starts on a
+localhost port as you; it needs OpenSSH's server installed, and CI runs it.
 
 ## Pull requests
 
