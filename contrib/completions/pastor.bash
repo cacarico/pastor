@@ -3589,7 +3589,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__describe)
-            opts="-h --json --head --help"
+            opts="-h --all-summaries --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3607,12 +3607,20 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__done)
-            opts="-h --json --head --help"
+            opts="-h --summary --summary-file --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --summary)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --summary-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --head)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0

@@ -52,7 +52,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "run" -d 'Create a one-off task and dispatch it'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "describe" -d 'One task in full: state, machine, agent, prompt, error'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "describe" -d 'One task in full: state, machine, agent, prompt, error, summary'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "read" -d 'Read recent output from a task\'s pane'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches); a closed Claude task\'s session reopens in a new pane'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and not __fish_seen_subcommand_from run list describe read attach retry priority close prune send done help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
@@ -94,6 +94,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON array of full task records'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from describe" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from describe" -l all-summaries -d 'Show every round\'s summary, not only the last'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from describe" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from describe" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from read" -l lines -d 'How many lines from the bottom of the pane' -r
@@ -126,12 +127,14 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l trust -d 'Accept the agent\'s folder-trust prompt with its trust keys, and trust the task\'s repo on its machine from now on'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from send" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from done" -l summary -d 'What you did, its first line the outcome: done, partial, blocked or nothing to do (kept to 2,000 characters)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from done" -l summary-file -d 'Read the summary from a file, or - for stdin' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from done" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from done" -l json -d 'Print as a JSON object'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from done" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "run" -d 'Create a one-off task and dispatch it'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
-complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "describe" -d 'One task in full: state, machine, agent, prompt, error'
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "describe" -d 'One task in full: state, machine, agent, prompt, error, summary'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "read" -d 'Read recent output from a task\'s pane'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches); a closed Claude task\'s session reopens in a new pane'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from help" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
@@ -442,7 +445,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_
 complete -c pastor -n "__fish_pastor_using_subcommand help; and not __fish_seen_subcommand_from serve task queue machine flock tick job config completions events watch setup connector profile trust bridge head help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "run" -d 'Create a one-off task and dispatch it'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "list" -d 'List live tasks across the flock; --all adds finished ones'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "describe" -d 'One task in full: state, machine, agent, prompt, error'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "describe" -d 'One task in full: state, machine, agent, prompt, error, summary'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "read" -d 'Read recent output from a task\'s pane'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "attach" -d 'Attach to a task\'s agent terminal (ctrl+b q detaches); a closed Claude task\'s session reopens in a new pane'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from task" -f -a "retry" -d 'Re-dispatch a failed or stale task as a new task (retry_of points back)'
