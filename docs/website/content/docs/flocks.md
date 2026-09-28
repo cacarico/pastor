@@ -27,6 +27,7 @@ machines = { here = 1 }  # and at most 1 of work's
 description = "Paid work, on the work account"  # optional, for --wide and describe
 agent = "claude"
 agent_args = ["--model", "claude-sonnet-5"]
+summary = "require"  # optional: ask, require or off, before [defaults]
 
 [[machine]]
 name = "here"

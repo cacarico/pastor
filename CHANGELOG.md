@@ -35,6 +35,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it, `pastor watch` prints `outcome=` on their TASK lines, and a
   connector's `[finish]` stdin has `summary`. Needs a head speaking IPC
   protocol 17.
+- pastor asks every task for a summary: each prompt it sends ends with a
+  paragraph asking for `pastor task done --summary-file -` in that shape,
+  added when it is sent and not stored in the task's prompt, and again on a
+  `task send` that reopens a done task. `summary = "ask" | "require" |
+  "off"` in `[defaults]`, on a flock, in a job's `[dispatch]` or as `task
+  run --summary` (the most specific wins, stored on the task) turns it off,
+  or makes a summary a condition of success: with `require`, the agent's own
+  bare `task done` is refused (`summary_required`) and an idle finish
+  without one ends the task `failed` ("stopped without a summary"); a
+  person's `task done t-N` passes. `task describe` shows the setting.
+  Config files without `summary` load unchanged and ask. `--summary` and a
+  job's `summary` need a head speaking IPC protocol 20.
 - A machine can be in many flocks. A `[[flock]]` entry takes `machines = {
   desk = 2 }`: the machines it may use and at most how many of its live tasks
   each one runs. Dispatch starts a task on a machine only when the machine has

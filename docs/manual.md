@@ -141,7 +141,9 @@ good version and shows the error in `pastor job list`), asks each due job's
 connector for items, drops keys it has seen before, renders `prompt`, `repo`
 and `branch` with `{{ item.* }}`, `{{ job.name }}` and `{{ task.id }}`, and
 queues one task per new item up to `max_tasks_per_run`. The rest stay unseen
-for the next run. Item text comes from outside, so an item's control
+for the next run. `summary` under `[dispatch]` (`ask`, `require` or `off`)
+says whether the job's tasks are asked for a summary, or need one (see
+Asking for one). Item text comes from outside, so an item's control
 characters, other than newline and tab, are dropped before its values go
 into the prompt, which is typed into the agent's terminal. An item value put
 into `repo` or `branch` must be one plain path component: not empty (a missing
@@ -272,6 +274,61 @@ closed; a running one has none yet. `task done --summary` and
 otherwise). Summaries are in the store's `task_summaries` table (schema 13),
 created when the new pastor first opens an older store; its tasks show
 none.
+
+#### Asking for one
+
+pastor asks for the summary itself. Every prompt it sends ends, after a
+blank line, with:
+
+> When you finish, run `pastor task done --summary-file -` with a short
+> summary on stdin: first line `done`, `partial`, `blocked` or `nothing to
+> do`; then up to five short lines: what changed, where (branch, PR, files
+> or notes), what is left.
+
+The line is added as the prompt is sent (at dispatch, or once an agent
+blocked at launch is past its question), not stored in the task's prompt:
+`task list`'s NOTE, the description and `task describe`'s prompt stay the
+task's own words. A `task send` whose text reopens a done task adds it
+again, after a space, since that is new work and a new round; a reply to a
+running or blocked task adds nothing, and neither does resuming a paused
+session.
+
+The `summary` setting decides what pastor does:
+
+| value | the prompt | a round without a summary |
+|---|---|---|
+| `ask` (default) | the line above | ends as usual, keeping the pane's last lines |
+| `require` | the line, then "pastor fails this task if you stop without one." | see below |
+| `off` | nothing added | ends as usual; the agent may still send one |
+
+It is set in `[defaults]` in pastor.toml, on a `[[flock]]` in flock.toml,
+under a job's `[dispatch]`, or per task with `pastor task run --summary
+ask|require|off`. The most specific wins: `task run` or the job, then the
+flock, then `[defaults]`, else `ask`. It is settled when the task is queued
+and stored with it (`summary` in its spec, left out of `--json` when it is
+`ask`); a retry keeps it. `task describe` shows it, as `summary: ask (line
+added to the prompt)`. A config file without `summary` loads as before and
+asks.
+
+With `require`, a summary is a condition of success; any outcome counts,
+`blocked` included:
+
+- The agent's own `pastor task done` (from its pane, where `PASTOR_TASK`
+  names the task, or through the bridge) without `--summary` or
+  `--summary-file` is refused with `summary_required`, and the task stays
+  as it was, so the agent can run it again with one. A bare `task done`
+  after one that carried a summary keeps it.
+- An agent that pastor finds idle and finished without having sent one
+  ends the task `failed` with error `stopped without a summary`, and the
+  round keeps `no summary` and the pane's last lines. The pane stays open
+  until someone closes it (`task close`); reconcile reports its agent as an
+  orphan meanwhile.
+- A person's `pastor task done t-N`, from outside the task's pane, is not
+  refused: the round reads `no summary (ended by hand)`.
+
+No reminder is sent first. `task run --summary`, and a headless serve
+forwarding a job with `summary`, need a head speaking protocol 20
+(`head_too_old` otherwise).
 
 `pastor task send t-3 "yes, go on"` types into the pane of a live task
 (starting, running, blocked, or done with its pane still open) and presses
@@ -504,6 +561,7 @@ agent_args = ["--model", "claude-sonnet-5"]
 # priority = "high"       # optional: see Priority and queue order below
 # agents = { opencode = "opencode" }  # optional: the agent per kind, see Models
 # profile = "develop"     # optional: a permission profile, see Permission profiles below
+# summary = "require"     # optional: ask, require or off, see Asking for one
 
 [[machine]]
 name = "desk"
@@ -1472,6 +1530,7 @@ pastor queue move t-6 --before t-5   # take t-5's place, and its level
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
 pastor task done t-1                 # mark it done; its pane closes after close_done_after
 pastor task done --summary "done: PR #31"   # from its own pane: how it ended
+pastor task run --summary require "Fix issue 12"   # fails if its agent stops without one
 pastor task prune --done --closed --older-than 7d
 pastor task attach t-1               # lands in the agent's pane; ctrl+b q detaches
                                      # (a closed Claude task: its session, reopened)
@@ -1498,7 +1557,8 @@ decides.
 PATH`, and `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
 `--model` (a name from `[models]`, see [Models](#models)), `--priority` (see
 [Priority and queue order](#priority-and-queue-order)), `--preempt` (see
-[Pausing a low task](#pausing-a-low-task)), `--profile` (see
+[Pausing a low task](#pausing-a-low-task)), `--summary` (see [Asking for
+one](#asking-for-one)), `--profile` (see
 [Permission profiles](#permission-profiles)), `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
 `--timeout`, `--place` (see [Where a task's pane goes](#where-a-tasks-pane-goes))
 and `--json`. `--agent-arg` hands one argument to the agent,
@@ -2557,6 +2617,7 @@ place = "repo"               # where a task's pane goes: repo, own, pastor or pa
 # priority = "normal"        # the level of tasks that set none: low, normal, high or critical
 # agents = { opencode = "opencode" }  # the agent for a model of another kind than agent's
 # profile = "develop"        # a permission profile for tasks that name none; unset: none
+# summary = "ask"            # ask for a summary in each prompt; require: also fail without one; off: neither
 [agents.claude]              # one table per agent that needs one
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
