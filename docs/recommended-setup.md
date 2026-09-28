@@ -14,14 +14,16 @@ agents work on.
 
 - **One head, on a machine that stays on.** It owns the queue and the jobs.
   A job that reads local files (a notes vault, say) must run where those files
-  are, so pin it with `machine = "..."` in its `[dispatch]`.
+  are. `machine = "..."` in its `[dispatch]` only moves the agent, so put the
+  job file on that machine instead, under its headless `pastor serve`.
 - **A flock per account.** Put work machines in a `work` flock and personal
   ones in `personal`, and never give a machine both accounts' logins. A task
   only goes to machines of its flock, so the two never mix.
 - **Slots to match the machine.** `max_agents` is how many agents a machine
   runs at once. A Pi 5 with 8 GB handles 2 or 3 Claude agents; a desktop,
   more. A machine that every pinned job needs fills up first, so give it the
-  most slots.
+  most slots. Job slots and burst add one each by default, so
+  `--max-agents 3` can run 5; add `--job-slots 0 --burst 0` to cap it at 3.
 
 ```bash
 pastor flock add personal --default
@@ -133,8 +135,8 @@ A dispatched agent has nobody watching its pane. When its own permission
 system asks before a command, the task sits `blocked` until someone answers.
 
 - **Claude:** give each flock allow and deny lists, so common commands go
-  through and dangerous ones never do (see "Tool allow and deny lists" in the
-  manual):
+  through and dangerous ones never do (see [allow and deny
+  lists](manual.md#tool-allow-and-deny-lists)):
 
   ```toml
   # flock.toml
@@ -144,6 +146,10 @@ system asks before a command, the task sits `blocked` until someone answers.
   deny = ["Bash(sudo:*)", "Bash(git push --force:*)", "Read(~/.ssh/**)"]
   ```
 
+- **A profile** (`profile = "develop"` on a flock, or `--profile`) turns
+  Claude's prompts off and refuses whatever its lists don't allow, so a task
+  never parks on a question. Pick the narrowest: `review` for reading,
+  `develop` for changing a checkout. `pastor profile list` shows them.
 - **opencode:** a `permission` block in `~/.config/opencode/opencode.json`
   with `"bash": {"*": "ask"}` stops every task at its first shell command.
   On a machine that runs opencode tasks, allow what those tasks run, or give
@@ -183,8 +189,8 @@ want time to attach and read a task's last screen, keep the pane longer:
 close_done_after = "15m"
 ```
 
-A task that goes `stale` keeps its slot until you close it, and so does a
-`failed` or `blocked` one. Check with `pastor machine describe pi-1` and free
+A `stale` or `blocked` task keeps its slot until you close it. A `failed`
+one holds none. Check with `pastor machine describe pi-1` and free
 it with `pastor task close t-7`, which keeps its worktree on disk.
 
 ## Reviews
