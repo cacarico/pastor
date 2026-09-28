@@ -15,7 +15,7 @@ and the config files easy to read.
 |---|---|
 | head | the one machine that runs `pastor serve`: the queue, the schedule, the history |
 | machine | a computer that takes tasks, running herdr; the head can be one |
-| flock | a named group of machines; every machine is in exactly one |
+| flock | a named group of machines; a machine can be in many |
 | task | one agent, one prompt, in a repo or its own git worktree |
 | agent | the coding agent a task starts, such as `claude` or `codex` |
 | job | a TOML file: a schedule plus a connector, turning work into tasks |

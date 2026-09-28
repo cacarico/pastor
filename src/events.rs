@@ -790,6 +790,8 @@ mod tests {
                 tags: vec![],
                 orphans: vec![],
                 flock: None,
+                flocks: vec![],
+                live_by_flock: vec![],
                 shutting_down: false,
                 profile: None,
             })),

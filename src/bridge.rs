@@ -115,16 +115,18 @@ pub async fn answer_agent(socket: &Path, machine: &str, line: &[u8]) -> anyhow::
     match req {
         IpcRequest::Ping => ask(socket, &req, None).await,
         IpcRequest::List { mut filter } => {
-            let Some(flock) = machine_flock(socket, machine).await? else {
+            let Some(flocks) = machine_flocks(socket, machine).await? else {
                 return refuse(format!(
-                    "the head has no machine {machine}, so its flock is unknown"
+                    "the head has no machine {machine}, so its flocks are unknown"
                 ));
             };
-            filter.flock = Some(flock.clone());
+            if let [one] = &flocks[..] {
+                filter.flock = Some(one.clone());
+            }
             let reply = ask(socket, &IpcRequest::List { filter }, None).await?;
             match serde_json::from_slice::<IpcResponse>(&reply) {
                 Ok(IpcResponse::Tasks(mut tasks)) => {
-                    tasks.retain(|t| t.flock.as_deref() == Some(flock.as_str()));
+                    tasks.retain(|t| t.flock.as_ref().is_some_and(|f| flocks.contains(f)));
                     reply_line(&IpcResponse::Tasks(tasks))
                 }
                 Ok(IpcResponse::Error { .. }) => Ok(reply),
@@ -163,20 +165,23 @@ fn op_name(req: &IpcRequest) -> String {
         .unwrap_or_else(|| "this request".into())
 }
 
-/// `machine`'s flock, as the head reports it: never read from local files,
+/// `machine`'s flocks, as the head reports them: never read from local files,
 /// which the head may not share. `None` when the head has no such machine,
 /// or when a reload has already taken it out of the flock and is only
 /// waiting for its actor to stop (`shutting_down`): its reported flock is a
 /// fallback for display, not proof it still belongs there, and this key was
 /// scoped to the machine, not to whichever flock a stale record falls into.
-async fn machine_flock(socket: &Path, machine: &str) -> anyhow::Result<Option<String>> {
+/// A head from before many flocks reports one, and one from before flocks
+/// none, which leaves the machine unknown here as before.
+async fn machine_flocks(socket: &Path, machine: &str) -> anyhow::Result<Option<Vec<String>>> {
     let reply = ask(socket, &IpcRequest::FlockList, None).await?;
     Ok(match serde_json::from_slice::<IpcResponse>(&reply) {
         Ok(IpcResponse::Machines(ms)) => ms
             .into_iter()
             .find(|m| m.name == machine)
             .filter(|m| !m.shutting_down)
-            .and_then(|m| m.flock),
+            .filter(|m| m.flock.is_some() || !m.flocks.is_empty())
+            .map(|m| m.flock_names()),
         _ => None,
     })
 }

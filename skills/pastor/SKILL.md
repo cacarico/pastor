@@ -5,7 +5,7 @@ description: "Drive pastor, a daemon that runs coding agents on a fleet of machi
 
 # pastor
 
-pastor runs coding agents on machines the user owns. One machine runs the head, `pastor serve`, which talks over ssh to the machines listed in `flock.toml`, each running a herdr server. Every machine is in one flock, a named group; a task goes only to machines of its flock. A task is one agent in one herdr pane, optionally in its own git worktree; a job is a TOML file that queues tasks on a schedule.
+pastor runs coding agents on machines the user owns. One machine runs the head, `pastor serve`, which talks over ssh to the machines listed in `flock.toml`, each running a herdr server. Every machine is in one or more flocks, named groups; a task goes only to machines of its flock. A task is one agent in one herdr pane, optionally in its own git worktree; a job is a TOML file that queues tasks on a schedule.
 
 ## Learn the current CLI
 
@@ -151,7 +151,7 @@ The head picks up job file edits by itself. A file that stops parsing keeps its 
 
 ## The fleet
 
-`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2), `job_slots` (default 1: extra slots only tasks from jobs take, a free one first), `burst` (default 1: how many past `max_agents` a `critical` task may start; `0` turns either off), `tags`, `flock`, and optionally the `agent`, `agent_args`, `model` and `profile` its tasks get when they name none, before the flock's. `[[flock]]` entries (`name`, `default = true` on one of them, and optionally the `agent`, `agent_args`, `model` and `profile` its tasks and jobs get when they name none, and `allow` and `deny` tool lists added to theirs) declare the flocks; a machine with no `flock` is in the default one, and a file with no `[[flock]]` has a single flock named `default`.
+`~/.config/pastor/flock.toml` holds one `[[machine]]` per machine: `name`, exactly one of `ssh = "user@host"`, `local = true` or `command = [...]` (for tests), `session` (the herdr session, default `default`), `max_agents` (default 2), `job_slots` (default 1: extra slots only tasks from jobs take, a free one first), `burst` (default 1: how many past `max_agents` a `critical` task may start; `0` turns either off), `tags`, `flock`, and optionally the `agent`, `agent_args`, `model` and `profile` its tasks get when they name none, before the flock's. `[[flock]]` entries (`name`, `default = true` on one of them, `machines = { desk = 2 }` naming the machines it may use with at most how many of its live tasks each runs, and optionally the `agent`, `agent_args`, `model` and `profile` its tasks and jobs get when they name none, and `allow` and `deny` tool lists added to theirs) declare the flocks. A machine's own `flock` key also puts it in that flock, with no number but the machine's limits; a machine nothing places is in the default one, and a file with no `[[flock]]` has a single flock named `default`. A task starts on a machine only when the machine has room and the task's flock is under its number there (job slots and burst never pass it).
 
 ```bash
 pastor machine add pi-3 user@pi-3 --max-agents 2 --tag arm --herdr
@@ -209,7 +209,7 @@ You are a pastor task when `PASTOR_TASK=t-N` is set (or, from an older pastor, `
 
 ## When something goes wrong
 
-- A task stays `queued`: no connected machine of its flock carries all its tags or has a free slot. Compare `pastor machine list` (FLOCK, TAGS) with the task's flock and tags. The head logs a warning after an hour, and at once for a task pinned to a machine that has moved to another flock.
+- A task stays `queued`: no connected machine of its flock carries all its tags or has a free slot, or its flock is at its number on each machine with room (its error then says `flock <name> is at N of N on <machine>`). Compare `pastor machine list` (FLOCK, TAGS) with the task's flock and tags. The head logs a warning after an hour, and at once for a task pinned to a machine that has moved to another flock.
 - `failed` with `agent_pane_busy`: herdr refused to start the agent because the pane was not at an idle shell prompt.
 - `failed` with "agent t-N not found": the agent's pane vanished before it was done (closed by hand, herdr restarted, or the agent crashed).
 - `failed` soon after start: the agent is usually not installed, or not on the PATH herdr sees on that machine.

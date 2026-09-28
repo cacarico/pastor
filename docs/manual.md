@@ -432,19 +432,23 @@ pastor naming agents `t-N` on each herdr.
 
 ## Flocks
 
-A flock is a named group of machines. Every machine is in exactly one, and
+A flock is a named group of machines. A machine can be in many flocks, and
 every task and job targets one: only that flock's machines take its tasks.
 Flocks keep kinds of work apart, such as work and personal machines that run
-agents on different accounts. A flock can also say which agent its tasks run.
+agents on different accounts, or share one machine between projects so one
+project never takes every slot. A flock can also say which agent its tasks
+run.
 
 ```toml
 # flock.toml
 [[flock]]
 name = "personal"
 default = true            # tasks and jobs that name no flock go here
+machines = { desk = 2 }   # desk runs at most 2 of personal's tasks
 
 [[flock]]
 name = "work"
+machines = { desk = 1 }   # and at most 1 of work's
 agent = "claude"          # optional: the agent for this flock's tasks
 agent_args = ["--model", "claude-sonnet-5"]
 # model = "sonnet"        # optional: a [models] name, see Models below
@@ -454,18 +458,43 @@ agent_args = ["--model", "claude-sonnet-5"]
 
 [[machine]]
 name = "desk"
-local = true              # no `flock`: the default flock
+local = true
+max_agents = 3
 
 [[machine]]
 name = "pi-3"
 ssh = "user@pi-3"
-flock = "work"
+flock = "work"            # the old way: in work, with pi-3's own limits
 ```
+
+A flock's `machines` names the machines it may use, each with its number
+there: at most how many of the flock's live tasks that machine runs. Dispatch
+starts a task on a machine only when the machine has room for it
+(`max_agents`, and job slots and burst for the tasks that may take them) and
+the task's flock is under its number there; job slots and burst never take a
+flock past its number. A task whose flock is full everywhere waits, with
+`waiting for a machine: flock work is at 1 of 1 on desk` as its error in
+`pastor task list` and `pastor queue`, and the next task in the queue goes.
+Live tasks count by the flock each was created in.
+
+The `flock` key on a machine still works: it puts the machine in that flock
+with no number but the machine's own limits (`max_agents`, job slots and
+burst), as before. A machine that neither a `machines` table nor its own
+`flock` key places is in the default flock the same way. A machine is in
+every flock that places it, in file order; where one flock has to stand for
+it (a task pinned to it that names no flock, the machine's profile, FLOCK in
+older clients) that is the default flock if it is in it, else its first.
+`pastor machine list` shows every flock under FLOCK, with its number where
+it has one (`personal:2,work:1`), and `--json` carries them as `flocks`
+(`name`, `max`, `live`) next to `flock`. A flock's `machines` naming a
+machine the file lacks, a number of 0, or a machine placed in the same flock
+by both its `flock` key and the flock's `machines` fails the load. `pastor
+machine remove` takes the machine out of every flock's `machines` too.
 
 `[[flock]]` entries declare the flocks, so a flock can have no machines yet.
 Names are unique and exactly one has `default = true`. A machine naming an
-undeclared flock, two defaults, or none makes the file fail to load, like any
-other bad flock file: `pastor serve` refuses to start on it, `pastor tick`
+undeclared flock, a membership error above, two defaults, or none makes the
+file fail to load, like any other bad flock file: `pastor serve` refuses to start on it, `pastor tick`
 and `pastor job list` without a head refuse it too, and a running head keeps
 the previous version. A file with no `[[flock]]` entry at all is
 one flock named `default` holding every machine, so files from before flocks
@@ -499,10 +528,15 @@ tasks are queued in the implicit flock the machines stay there, so those
 tasks keep somewhere to run, and the output names the tasks. `flock add` says
 which flock those machines are in afterwards. `flock default set` writes the old
 default flock onto every machine that named none, so changing where new work goes moves no machine.
-AGENTS in `flock list` needs a running head and is `-` without one.
+`machine move` sets the machine's `flock` key and leaves the flocks' `machines`
+tables alone, so a machine they list stays in those flocks too; moving it into
+a flock whose `machines` table already lists it is a no-op, since it is
+already a member there and the `flock` key would only duplicate it.
+AGENTS in `flock list` counts the flock's own live tasks on its machines; it
+needs a running head and is `-` without one.
 
 A task's flock is fixed when it is created: `--flock` on `pastor task run`, or
-`flock` under a job's `[dispatch]`; else the flock of the machine it is pinned
+`flock` under a job's `[dispatch]`; else the flock that stands for the machine it is pinned
 to (`--machine`, a job's `machine`); else the default flock. `--machine` with
 a `--flock` the machine is not in is refused (`flock_mismatch`), as is a flock
 that does not exist (`unknown_flock`). A job whose flock does not fit, or

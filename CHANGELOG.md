@@ -35,6 +35,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it, `pastor watch` prints `outcome=` on their TASK lines, and a
   connector's `[finish]` stdin has `summary`. Needs a head speaking IPC
   protocol 17.
+- A machine can be in many flocks. A `[[flock]]` entry takes `machines = {
+  desk = 2 }`: the machines it may use and at most how many of its live tasks
+  each one runs. Dispatch starts a task on a machine only when the machine has
+  room and the task's flock is under its number there; job slots and burst
+  never pass it. A task whose flock is full waits with `flock <name> is at N
+  of N on <machine>` as its note, and the next task goes. `machine list`
+  shows every flock (`--json`: `flocks`), and an agent's `task list` through
+  the bridge covers all its machine's flocks. The machine's old `flock` key
+  still loads, as membership with the machine's own limits. A critical task
+  with `--preempt` pauses a task only where that makes room for it, its
+  flock's number included. Needs a head speaking IPC protocol 18 once
+  flock.toml gives a flock's machines a number.
 
 ### Fixed
 

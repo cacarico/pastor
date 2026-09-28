@@ -127,6 +127,26 @@ impl ChannelState {
     }
 }
 
+impl MachineStatus {
+    /// The flocks the machine is in: `flocks`, else the one `flock` a head
+    /// from before many flocks sends, else the default.
+    pub fn flock_names(&self) -> Vec<String> {
+        if !self.flocks.is_empty() {
+            self.flocks.iter().map(|f| f.name.clone()).collect()
+        } else {
+            vec![
+                self.flock
+                    .clone()
+                    .unwrap_or_else(|| crate::config::flock::DEFAULT_FLOCK.into()),
+            ]
+        }
+    }
+
+    pub fn in_flock(&self, flock: &str) -> bool {
+        self.flock_names().iter().any(|f| f == flock)
+    }
+}
+
 impl std::fmt::Display for ChannelState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -136,6 +156,25 @@ impl std::fmt::Display for ChannelState {
             ChannelState::Polling => "polling",
             ChannelState::Incompatible => "incompatible",
         })
+    }
+}
+
+/// One flock a machine is in: its number there (`None`: the machine's own
+/// limits, from the old `flock` key or the default) and how many of the
+/// flock's live tasks run on the machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlockSeat {
+    pub name: String,
+    #[serde(default)]
+    pub max: Option<u32>,
+    #[serde(default)]
+    pub live: usize,
+}
+
+impl FlockSeat {
+    /// Is the flock under its number here?
+    pub fn has_room(&self) -> bool {
+        self.max.is_none_or(|n| self.live < n as usize)
     }
 }
 
@@ -180,6 +219,17 @@ pub struct MachineStatus {
     /// from an actor, and from a head that predates flocks.
     #[serde(default)]
     pub flock: Option<String>,
+    /// Every flock the machine is in, the one in `flock` among them, with
+    /// its number and live tasks there. `Fleet::statuses` fills it in;
+    /// empty from an actor, and from a head that predates it (read it
+    /// through `flock_names`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flocks: Vec<FlockSeat>,
+    /// The actor's live tasks by the flock stored on each (`None`: a row
+    /// from before flocks, in the default flock), for `Fleet` to count each
+    /// flock's tasks against its number. Not sent: `flocks` carries it.
+    #[serde(skip)]
+    pub live_by_flock: Vec<(Option<String>, usize)>,
     /// The actor was stopped by a reload that took this machine out of the
     /// flock, but it has not ended yet (`Fleet::statuses` fills it in). A
     /// caller that grants access by flock membership must treat this machine
@@ -646,6 +696,8 @@ pub fn spawn_machine(
         tags: tags.clone(),
         orphans: vec![],
         flock: None,
+        flocks: vec![],
+        live_by_flock: vec![],
         shutting_down: false,
         profile: None,
     }));
@@ -1131,6 +1183,14 @@ impl Actor {
                 let mut s = self.status.write().unwrap();
                 s.live = v.len() + self.orphans.len();
                 s.live_jobs = v.iter().filter(|t| t.from_job()).count();
+                let mut by: Vec<(Option<String>, usize)> = Vec::new();
+                for t in &v {
+                    match by.iter_mut().find(|(f, _)| *f == t.flock) {
+                        Some((_, n)) => *n += 1,
+                        None => by.push((t.flock.clone(), 1)),
+                    }
+                }
+                s.live_by_flock = by;
                 s.orphans = self.orphans.iter().map(|(name, _)| name.clone()).collect();
             }
             Err(err) => {

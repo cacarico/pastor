@@ -1590,12 +1590,14 @@ impl Scheduler {
             // The task keeps the flock it was made for, so no pass places it
             // until the machine moves back.
             let wanted = self.fleet.flock();
+            let task_flock = t.flock.as_deref().unwrap_or(wanted.default_flock());
             if let Some((m, now_in)) = t
                 .spec
                 .machine
                 .as_deref()
-                .and_then(|m| Some((m, wanted.machine_flock(m)?)))
-                .filter(|(_, f)| Some(*f) != t.flock.as_deref())
+                .and_then(|m| wanted.get(m))
+                .filter(|m| !wanted.in_flock(m, task_flock))
+                .map(|m| (m.name.as_str(), wanted.primary_flock(m)))
             {
                 if self.warned_queued.insert(t.id) {
                     tracing::warn!(
@@ -1603,7 +1605,7 @@ impl Scheduler {
                         job = %t.job,
                         machine = m,
                         machine_flock = now_in,
-                        task_flock = t.flock.as_deref().unwrap_or(wanted.default_flock()),
+                        task_flock,
                         "queued for a machine that moved to another flock; it stays queued until the machine moves back"
                     );
                 }

@@ -615,6 +615,21 @@ fn main() {
                     needs_fleet_edit_protocol(&command),
                     if local_job_route {
                         None
+                    } else if remote.is_none() && multi_flock_declared(&paths) {
+                        // Per-flock `machines` is a field an older head's
+                        // `FlockEntry` (`deny_unknown_fields`) does not know;
+                        // its reload fails and it silently keeps the old,
+                        // single-flock membership, so refuse rather than let
+                        // the CLI dispatch, list or reload on that stale view.
+                        protocol_need(&command).map_or(
+                            Some((
+                                pastor::ipc::MULTI_FLOCK_PROTOCOL,
+                                "predates per-flock machine limits, and would silently drop flock.toml's `machines` on reload, keeping its old membership",
+                            )),
+                            |(p, why)| {
+                                Some((p.max(pastor::ipc::MULTI_FLOCK_PROTOCOL), why))
+                            },
+                        )
                     } else {
                         protocol_need(&command)
                     },
@@ -1261,6 +1276,15 @@ fn flocks_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).map_or(true, |f| !f.flocks.is_empty())
 }
 
+/// Whether flock.toml puts any machine in a flock with a number
+/// (`[[flock]] machines = { desk = 2 }`), the schema an older head's
+/// `FlockEntry` does not know (see `probe_head`'s `need` above). A
+/// flock.toml that does not load counts as not declaring it: a head that
+/// cannot read the file either is refused for other reasons first.
+fn multi_flock_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| !e.machines.is_empty()))
+}
+
 /// The prompt of `pastor task run`: the positional one as given, or the
 /// contents of `--prompt-file` (`-` is stdin) without the newlines an editor
 /// or `echo` leaves at the end.
@@ -1471,7 +1495,11 @@ fn probe_fields(
 fn own_profile(config: &PastorConfig, f: &Flock, m: &MachineConfig) -> Option<String> {
     config
         .defaults
-        .resolve_agent_on(&AgentChoice::default(), Some(m), f.entry(f.flock_of(m)))
+        .resolve_agent_on(
+            &AgentChoice::default(),
+            Some(m),
+            f.entry(f.primary_flock(m)),
+        )
         .profile
         .map(|(name, _)| name)
 }
@@ -1483,7 +1511,20 @@ async fn probe_machine(
     paths: &Paths,
     store: &Store,
 ) -> anyhow::Result<pastor::cli::MachineRow> {
-    let flock = f.flock_of(m);
+    let flock = f.primary_flock(m);
+    let on_machine = store.tasks_on_machine(&m.name)?;
+    let flocks = f
+        .flocks_of(m)
+        .into_iter()
+        .map(|(name, max)| pastor::machine::FlockSeat {
+            name: name.to_string(),
+            max,
+            live: on_machine
+                .iter()
+                .filter(|t| t.flock.as_deref().unwrap_or(f.default_flock()) == name)
+                .count(),
+        })
+        .collect();
     let ep = Endpoint::from_machine(m, paths);
     let ping = ep.ping().await;
     let agents = match &ping {
@@ -1491,7 +1532,7 @@ async fn probe_machine(
         Err(_) => None,
     };
     let orphans: Vec<String> = match &agents {
-        Some(Ok(list)) => pastor::machine::orphan_agents(list, &store.tasks_on_machine(&m.name)?)
+        Some(Ok(list)) => pastor::machine::orphan_agents(list, &on_machine)
             .into_iter()
             .map(|(name, _)| name)
             .collect(),
@@ -1511,6 +1552,7 @@ async fn probe_machine(
         host: ep.host(),
         endpoint: ep.describe(),
         flock: flock.to_string(),
+        flocks,
         channel: channel.into(),
         herdr_version,
         pastor_version,
@@ -1601,7 +1643,7 @@ async fn machine_list(
             for m in f
                 .machines
                 .iter()
-                .filter(|m| flock.is_none_or(|n| f.flock_of(m) == n))
+                .filter(|m| flock.is_none_or(|n| f.in_flock(m, n)))
             {
                 rows.push(probe_machine(m, &f, &config, paths, &store).await?);
             }
@@ -1613,7 +1655,7 @@ async fn machine_list(
     };
     let mut rows: Vec<pastor::cli::MachineRow> = rows
         .into_iter()
-        .filter(|m| flock.is_none_or(|n| m.flock == n))
+        .filter(|m| flock.is_none_or(|n| m.in_flock(n)))
         .collect();
     pastor::cli::head_machine_first(&mut rows);
     let head = match pastor::ipc::remote_head() {

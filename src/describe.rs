@@ -488,7 +488,7 @@ pub fn machine_text(m: &MachineDescription) -> String {
         ("description", description(&r.description)),
         ("host", r.host.clone()),
         ("endpoint", r.endpoint.clone()),
-        ("flock", r.flock.clone()),
+        ("flock", r.flock_label()),
         ("session", m.session.clone()),
         (
             "model",
