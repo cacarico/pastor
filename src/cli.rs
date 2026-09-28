@@ -1,5 +1,5 @@
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::flock::{DEFAULT_FLOCK, Flock};
 use crate::ipc::{RequestError, connect_error_means_no_daemon};
@@ -435,7 +435,7 @@ pub fn herdr_version_from(output: &str) -> Option<String> {
 /// a probe could not count the agents. `pastor_version` is the pastor
 /// installed on the machine, `null` when there is none or it cannot be known
 /// (always for a `command` machine).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineRow {
     pub name: String,
     pub host: String,

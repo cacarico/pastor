@@ -1,7 +1,8 @@
 //! `pastor job|machine|flock|connector describe`: one thing in full, for a human, or
-//! as JSON with `--json`. The CLI gathers the parts (from the head when one
-//! runs, else from the files and the store); this module holds their shape
-//! and how they read.
+//! as JSON with `--json`. A running head builds a machine's or a flock's
+//! description itself (`IpcRequest::MachineDescribe`, `FlockDescribe`); with
+//! none, the CLI gathers the parts from the files and the store. This module
+//! holds their shape, the parts both sides share, and how they read.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -11,13 +12,15 @@ use crate::cli::{
     JOB_HEADER, MachineRow, TASK_HEADER, age, in_, job_rows, one_line, table, task_rows,
 };
 use crate::config::Paths;
+use crate::config::flock::Flock;
 use crate::connector::install::Origin;
 use crate::edit::ConfigFile;
 use crate::events::EventRecord;
 use crate::herdr::shell_quote;
+use crate::machine::MachineStatus;
 use crate::scheduler::JobStatus;
 use crate::store::{Store, TaskFilter};
-use crate::task::Task;
+use crate::task::{LIVE_STATES, PANE_OWNING_STATES, Task};
 
 /// How many recent tasks and events a description lists.
 pub const RECENT: usize = 10;
@@ -111,7 +114,7 @@ pub fn job(
     })
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineDescription {
     #[serde(flatten)]
     pub row: MachineRow,
@@ -125,7 +128,7 @@ pub struct MachineDescription {
     pub recent_errors: Vec<EventRecord>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlockDescription {
     pub name: String,
     pub default: bool,
@@ -231,6 +234,65 @@ pub fn recent_events(
     let skip = kept.len().saturating_sub(RECENT);
     kept.drain(..skip);
     kept
+}
+
+/// The tasks `machine describe` lists: those whose agent holds a pane on
+/// `name`.
+pub fn machine_tasks(name: &str) -> TaskFilter {
+    TaskFilter {
+        machine: Some(name.to_string()),
+        states: Some(PANE_OWNING_STATES.to_vec()),
+        ..Default::default()
+    }
+}
+
+/// The tasks `flock describe` lists: the live ones in `name`.
+pub fn flock_tasks(name: &str) -> TaskFilter {
+    TaskFilter {
+        flock: Some(name.to_string()),
+        states: Some(LIVE_STATES.to_vec()),
+        ..Default::default()
+    }
+}
+
+/// `name`'s recent errors: its `machine.*` events that carried one, and
+/// the tasks that failed on it.
+pub fn machine_errors(events: Vec<EventRecord>, name: &str) -> Vec<EventRecord> {
+    recent_events(events, |e| {
+        let machine_error = e.kind.starts_with("machine.")
+            && e.machine
+                .as_ref()
+                .is_some_and(|s| s.name == name && s.error.is_some());
+        let failed_here = e.kind == "task.failed"
+            && e.task.as_ref().and_then(|t| t.machine.as_deref()) == Some(name);
+        machine_error || failed_here
+    })
+}
+
+/// Flock `name` of `flock`, with the live agents of `live` when a head
+/// knows them. `None` when `flock` has no such flock.
+pub fn flock_description(
+    flock: &Flock,
+    name: &str,
+    live: Option<&[MachineStatus]>,
+    tasks: Vec<Task>,
+) -> Option<FlockDescription> {
+    let row = crate::cli::flock_list(flock, live, &[])
+        .into_iter()
+        .find(|r| r.name == name)?;
+    let entry = flock.entry(name).cloned().unwrap_or_default();
+    Some(FlockDescription {
+        name: row.name,
+        default: row.default,
+        agent: entry.agent,
+        agent_args: entry.agent_args,
+        allow: entry.allow,
+        deny: entry.deny,
+        model: entry.model,
+        machines: row.machines,
+        agents: row.agents,
+        tasks,
+    })
 }
 
 /// `key: value` lines with the values in one column.

@@ -44,6 +44,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `pastor machine authorized-key <name> --key <file|->` prints the
   `authorized_keys` line that locks a machine's key to that bridge. It edits
   no file. The manual's "Agents on other machines" has the steps.
+- `pastor trust add <machine> <repo>` saves a folder trust without a blocked
+  task.
 
 ### Changed
 
@@ -59,6 +61,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   says the shape it prints, `machine add` refuses more than one of an ssh
   target, `--local` and `--command`, and a bad task id says both forms,
   `t-12` and `12`.
+- With a head running, `pastor trust list|add|remove`, `pastor flock
+  describe` and `pastor machine describe` ask it (new requests, IPC protocol
+  9) instead of reading the local store and `flock.toml`, so a CLI on
+  another machine gets the head's answer. The two describes show the flock
+  the head last applied. A head from before this is refused with
+  `head_too_old`; with no head the commands work as before. `trust add` and
+  `trust remove` now count as changing the fleet, so an agent pastor started
+  is refused them unless `agents_change_fleet` is on.
 
 ## 0.6.0 - 2026-09-26
 

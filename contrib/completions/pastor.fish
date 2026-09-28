@@ -319,17 +319,21 @@ complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from help" -f -a "describe" -d 'One connector in full: manifest, origin, commands, config, secrets, jobs'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from help" -f -a "try" -d 'Try a connector: run its command once for a job and print its items; creates no tasks and saves no cursor'
 complete -c pastor -n "__fish_pastor_using_subcommand connector; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list remove help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
-complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list remove help" -s h -l help -d 'Print help'
-complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list remove help" -f -a "list" -d 'Every saved trust: machine, repo, and when it was saved'
-complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list remove help" -f -a "remove" -d 'Forget a saved trust; the repo\'s next task asks again'
-complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list remove help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list add remove help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list add remove help" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list add remove help" -f -a "list" -d 'Every saved trust: machine, repo, and when it was saved'
+complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list add remove help" -f -a "add" -d 'Save a trust, so the repo\'s tasks on that machine are answered'
+complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list add remove help" -f -a "remove" -d 'Forget a saved trust; the repo\'s next task asks again'
+complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list add remove help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from list" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON array'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from list" -s h -l help -d 'Print help'
+complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from add" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from add" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from remove" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from remove" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "list" -d 'Every saved trust: machine, repo, and when it was saved'
+complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "add" -d 'Save a trust, so the repo\'s tasks on that machine are answered'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "remove" -d 'Forget a saved trust; the repo\'s next task asks again'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand bridge" -l machine -d 'The machine whose agents this bridge serves, as flock.toml names it' -r
@@ -411,6 +415,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from connector" -f -a "describe" -d 'One connector in full: manifest, origin, commands, config, secrets, jobs'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from connector" -f -a "try" -d 'Try a connector: run its command once for a job and print its items; creates no tasks and saves no cursor'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "list" -d 'Every saved trust: machine, repo, and when it was saved'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "add" -d 'Save a trust, so the repo\'s tasks on that machine are answered'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "remove" -d 'Forget a saved trust; the repo\'s next task asks again'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from head" -f -a "set" -d 'Use the head on another machine, reached over ssh; checked with one ping first'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from head" -f -a "show" -d 'Print the head this CLI uses'

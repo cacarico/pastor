@@ -391,6 +391,9 @@ _pastor() {
             pastor__subcmd__help__subcmd__task,send)
                 cmd="pastor__subcmd__help__subcmd__task__subcmd__send"
                 ;;
+            pastor__subcmd__help__subcmd__trust,add)
+                cmd="pastor__subcmd__help__subcmd__trust__subcmd__add"
+                ;;
             pastor__subcmd__help__subcmd__trust,list)
                 cmd="pastor__subcmd__help__subcmd__trust__subcmd__list"
                 ;;
@@ -577,6 +580,9 @@ _pastor() {
             pastor__subcmd__task__subcmd__help,send)
                 cmd="pastor__subcmd__task__subcmd__help__subcmd__send"
                 ;;
+            pastor__subcmd__trust,add)
+                cmd="pastor__subcmd__trust__subcmd__add"
+                ;;
             pastor__subcmd__trust,help)
                 cmd="pastor__subcmd__trust__subcmd__help"
                 ;;
@@ -585,6 +591,9 @@ _pastor() {
                 ;;
             pastor__subcmd__trust,remove)
                 cmd="pastor__subcmd__trust__subcmd__remove"
+                ;;
+            pastor__subcmd__trust__subcmd__help,add)
+                cmd="pastor__subcmd__trust__subcmd__help__subcmd__add"
                 ;;
             pastor__subcmd__trust__subcmd__help,help)
                 cmd="pastor__subcmd__trust__subcmd__help__subcmd__help"
@@ -2386,8 +2395,22 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__help__subcmd__trust)
-            opts="list remove"
+            opts="list add remove"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__help__subcmd__trust__subcmd__add)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -3584,7 +3607,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__trust)
-            opts="-h --head --help list remove help"
+            opts="-h --head --help list add remove help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3601,9 +3624,41 @@ _pastor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        pastor__subcmd__trust__subcmd__help)
-            opts="list remove help"
+        pastor__subcmd__trust__subcmd__add)
+            opts="-h --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__trust__subcmd__help)
+            opts="list add remove help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        pastor__subcmd__trust__subcmd__help__subcmd__add)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
