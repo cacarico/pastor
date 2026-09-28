@@ -53,6 +53,16 @@
       <li><span><b>stable.</b> It is young. Compatibility is best effort.</span></li>
     </ul>
   </section>
+
+  <section class="pane" style="grid-area: use">
+    <h2 class="t">how I use it</h2>
+    <ul class="uses">
+      <li><span><b>a Kanban board.</b> A job reads my notes' board every minute; a card tagged <code>#agent</code> becomes a task on its own branch, and the card moves to In Review when the agent is done.</span></li>
+      <li><span><b>a PR fix round.</b> <code>pastor task run "Address the review on #42" --repo '~/src/app' --worktree --model sonnet</code>, then <code>task read</code> when it stops.</span></li>
+      <li><span><b>another machine.</b> <code>pastor machine add server-1 user@server-1 --max-agents 3</code>: its tasks share the load with the head, over ssh.</span></li>
+    </ul>
+    <p><a href="{{ "docs/examples/" | relURL }}">the examples, with the config to copy</a></p>
+  </section>
 </main>
 {{ end }}
 

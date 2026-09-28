@@ -52,7 +52,7 @@ b, strong { font-weight: 700; color: var(--hot); }
 .cursor { background: var(--ink); color: var(--bg); }
 
 /* home */
-.home { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); grid-template-areas: "what install" "how first" "not first"; }
+.home { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); grid-template-areas: "what install" "how first" "not first" "use use"; }
 .steps { margin: 0; padding: 0; list-style: none; counter-reset: step; }
 .steps li { counter-increment: step; display: grid; grid-template-columns: 3ch 1fr; margin-bottom: 4px; }
 .steps li::before { content: counter(step); color: var(--accent); }
@@ -60,6 +60,10 @@ b, strong { font-weight: 700; color: var(--hot); }
 .not li { display: grid; grid-template-columns: 2ch 1fr; margin-bottom: 4px; }
 .not li::before { content: "×"; color: var(--bad); }
 .not b { color: var(--ink); }
+.uses { margin: 0 0 8px; padding: 0; list-style: none; }
+.uses li { display: grid; grid-template-columns: 2ch 1fr; margin-bottom: 4px; }
+.uses li::before { content: "›"; color: var(--accent); }
+.uses b { color: var(--ink); }
 
 /* docs */
 .docs { grid-template-columns: 22ch minmax(0, 1fr); }
@@ -113,7 +117,7 @@ h2:hover .anchor, h3:hover .anchor, h4:hover .anchor, .anchor:focus { opacity: 1
 .status .right { margin-left: auto; padding-right: 1ch; color: var(--dim); }
 
 @media (max-width: 760px) {
-  .home { grid-template-columns: minmax(0, 1fr); grid-template-areas: "what" "install" "first" "how" "not"; }
+  .home { grid-template-columns: minmax(0, 1fr); grid-template-areas: "what" "install" "first" "how" "use" "not"; }
   .docs { grid-template-columns: minmax(0, 1fr); }
   .list { position: relative; top: 0; display: flex; flex-wrap: wrap; gap: 0 1ch; }
   .list .grp { width: 100%; margin: 6px 0 0; }
