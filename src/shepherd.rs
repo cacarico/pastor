@@ -56,6 +56,36 @@ pub fn ask_remote(head: RemoteHead) -> Ask {
     })
 }
 
+/// What a job run's fleet sends each item through: a `JobTask` to the head,
+/// which answers the task it queued. A head older than `PROFILE_PROTOCOL`
+/// takes `JobTask` (it has since `SHEPHERD_PROTOCOL`) but `serde` drops
+/// `AgentChoice.profile` from it as a field it does not know, instead of
+/// refusing the request: a job with a profile would start unenforced rather
+/// than fail loudly. So each item is pinged and checked before it is sent,
+/// the same gate `probe_head` puts in front of the CLI's own commands.
+fn forward(ask: Ask) -> JobTaskForward {
+    Arc::new(move |req| {
+        let ask = ask.clone();
+        Box::pin(async move {
+            match ask(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => crate::ipc::check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::PROFILE_PROTOCOL,
+                    "permission profiles on jobs this machine forwards",
+                )?,
+                other => anyhow::bail!("the head answered ping with {other:?}"),
+            }
+            match ask(req).await? {
+                IpcResponse::Task(t) => Ok::<Task, anyhow::Error>(t),
+                other => anyhow::bail!("the head answered a job task with {other:?}"),
+            }
+        })
+    })
+}
+
 /// The shepherd's side of the socket: its own jobs, and a refusal for the
 /// rest, which is the head's.
 pub struct Shepherd {
@@ -514,5 +544,57 @@ mod tests {
                 .await,
         );
         assert_eq!(c, "agent_refused");
+    }
+
+    /// `forward` refuses a head older than `PROFILE_PROTOCOL` before it ever
+    /// sends the `JobTask`: such a head's `serde` drops `AgentChoice.profile`
+    /// from it instead of refusing the request, so a job with a profile
+    /// would start unenforced rather than fail loudly. This is the path a
+    /// headless `pastor serve` forwards every job item through
+    /// (`Fleet::headless`), which `Command::Serve` never runs `probe_head`
+    /// in front of.
+    #[tokio::test]
+    async fn forward_refuses_a_head_that_predates_profiles() {
+        let old_head: Ask = Arc::new(|req| {
+            Box::pin(async move {
+                assert!(matches!(req, IpcRequest::Ping), "{req:?}");
+                Ok(IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol: crate::ipc::PROFILE_PROTOCOL - 1,
+                    role: None,
+                })
+            })
+        });
+        let err = forward(old_head)(IpcRequest::JobTask {
+            job: "x".into(),
+            flock: None,
+            agent: crate::config::AgentChoice::default(),
+            item: serde_json::Value::Null,
+            prompt: "p".into(),
+            spec: crate::task::DispatchSpec {
+                agent: "claude".into(),
+                agent_args: Vec::new(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                repo: None,
+                worktree: false,
+                branch: None,
+                machine: None,
+                tags: Vec::new(),
+                timeout_secs: 60,
+                checkout: None,
+                reopen: None,
+                agent_source: None,
+                place: Default::default(),
+                session_id: None,
+            },
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliError>().map(|e| e.code.as_str()),
+            Some("head_too_old"),
+            "{err}"
+        );
     }
 }

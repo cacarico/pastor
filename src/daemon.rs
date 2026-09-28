@@ -1117,16 +1117,17 @@ impl Fleet {
             // The agent can depend on the machine: a machine whose agent
             // cannot run the task's model does not take it. A task from
             // before `agent_source` keeps the agent it was queued with.
+            // A profile it inherited (from a machine or flock, not its own
+            // ask) is pinned onto the ask here, so a re-settle that can no
+            // longer resolve it refuses instead of quietly dropping it.
             let settled_on = |machine: &str| {
                 let source = task.spec.agent_source.as_ref()?;
+                let mut ask = source.ask.clone();
+                if ask.profile.is_none() {
+                    ask.profile = source.profile.clone();
+                }
                 let mut spec = task.spec.clone();
-                let r = self.settle(
-                    &mut spec,
-                    &source.ask,
-                    target,
-                    Some(machine),
-                    &asked_by(&task),
-                );
+                let r = self.settle(&mut spec, &ask, target, Some(machine), &asked_by(&task));
                 Some(r.map(|()| spec))
             };
             let claim = Claim::of(&task);
@@ -4363,6 +4364,78 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::json!("dontAsk"))
+        );
+    }
+
+    /// A task that inherited its profile from `[defaults]` (not its own
+    /// ask) while queued for a busy machine keeps that profile pinned: once
+    /// `[defaults].profile` moves on and the profile itself is gone too, the
+    /// re-settle at placement holds the task rather than start it with none
+    /// of the profile's lists, silently, because the ask itself never named
+    /// one.
+    #[tokio::test]
+    async fn a_profile_inherited_from_defaults_is_pinned_while_queued() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 1)], &[("pi", 1, fake.clone())]).await;
+        let mut with_default_profile = profiles_config();
+        with_default_profile.defaults.profile = Some("ci".into());
+        apply_config(&d, &with_default_profile).await;
+
+        // Occupy pi's one slot so the new task must wait.
+        let IpcResponse::Task(busy) = d
+            .handle(IpcRequest::Run {
+                prompt: "busy".into(),
+                spec: spec(),
+                flock: None,
+                agent: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(busy.state, TaskState::Running);
+
+        let mut pinned = spec();
+        pinned.machine = Some("pi".into());
+        let t = d
+            .fleet()
+            .queue_run("x".into(), pinned, None, Some(&AgentChoice::default()))
+            .await
+            .unwrap();
+        let source = t.spec.agent_source.clone().unwrap();
+        assert_eq!(source.profile.as_deref(), Some("ci"));
+        assert_eq!(source.profile_from.as_deref(), Some("defaults"));
+        assert!(source.ask.profile.is_none(), "the ask itself named none");
+
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued, "pi is still busy");
+
+        // `[defaults]` moves on, and the profile it named is dropped too.
+        let mut without = profiles_config();
+        without.profiles.0.remove("ci");
+        apply_config(&d, &without).await;
+
+        // Free pi's slot.
+        fake.close_pane(busy.pane_id.as_deref().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.store.get_task(busy.id).unwrap().unwrap().state != TaskState::Closed {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        d.fleet().dispatch_queued().await;
+        let t = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued, "held rather than started bare");
+        let err = t.error.clone().unwrap_or_default();
+        assert!(err.contains("profile ci is not built in"), "{err}");
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|r| r.method == "agent.start")
+                .count(),
+            1,
+            "only the busy task ever started"
         );
     }
 
