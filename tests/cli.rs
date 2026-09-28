@@ -3484,6 +3484,13 @@ fn spec_example_plan_runs_its_first_task() {
     assert!(args.iter().any(|w| w == "--json"), "{args:?}");
 
     let env = start();
+    // The plan names its model from `[models]`, as a real head has it.
+    std::fs::write(
+        env.config.join("pastor.toml"),
+        "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n\
+         [models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n",
+    )
+    .unwrap();
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&refs))).unwrap();
     let prompt = std::fs::read_to_string(&file).unwrap();
