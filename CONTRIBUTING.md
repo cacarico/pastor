@@ -39,6 +39,12 @@ A good pull request includes:
 - The problem being solved and why it matters.
 - The design choice made, especially when it differs from existing docs.
 - Tests or a clear reason tests were not added.
+- A changelog entry for anything a user would notice, as its own file
+  `changes/<branch>.md` (slashes in the branch name as dashes), never a
+  line in `CHANGELOG.md`: every pull request adding a line under the same
+  heading made each merge conflict with the next. `changes/README.md` has
+  the format; `make check` fails on an Unreleased section in
+  `CHANGELOG.md` or a malformed change file.
 - Any compatibility, security, data migration, or operational risk.
 - Any AI assistance, generated code, copied snippets, or third-party material
   that needs provenance or license review.
@@ -68,9 +74,12 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   `-rc.N` prerelease for anything that touches the store schema, the IPC or
   the transport, and run `make smoke` on a fleet machine against it before
   the final tag. Prereleases never become `install.sh`'s "latest".
-- To release: bump the version in `Cargo.toml`, turn `Unreleased` in
-  `CHANGELOG.md` into `## X.Y.Z - date`, merge, and push the signed tag
-  `vX.Y.Z` on `main`. `.github/workflows/release.yml` builds the tarballs
+- To release: on a release branch, bump the version in `Cargo.toml` and
+  run `make changelog VERSION=X.Y.Z`, which writes `## X.Y.Z - <today>`
+  into `CHANGELOG.md` from `changes/*.md` (entries in the order their files
+  reached `main`) and deletes the files; commit both, merge, and push the
+  signed tag `vX.Y.Z` on `main`. A prerelease tag leaves the change files
+  in place and takes its notes from them (`scripts/changelog.sh notes`). `.github/workflows/release.yml` builds the tarballs
   and drafts the GitHub release with that section as notes. Before
   publishing the draft, check the tag's signature with `git tag -v vX.Y.Z`;
   an unsigned or unverified tag is deleted, not published. Publishing the
