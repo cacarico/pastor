@@ -654,6 +654,7 @@ mod tests {
                     job,
                     "default",
                     &serde_json::json!({"key": format!("k-{kind}-{n}"), "title": "an item"}),
+                    None,
                     |_| Ok(("p".into(), spec())),
                 )
                 .unwrap();
@@ -1200,9 +1201,13 @@ mod tests {
         );
         let store = Arc::new(Store::open_in_memory().unwrap());
         let rec = store
-            .insert_job_task("run", "default", &serde_json::json!({"key": "k"}), |_| {
-                Ok(("p".into(), spec()))
-            })
+            .insert_job_task(
+                "run",
+                "default",
+                &serde_json::json!({"key": "k"}),
+                None,
+                |_| Ok(("p".into(), spec())),
+            )
             .unwrap();
         let (tx, rx) = broadcast::channel(8);
         let (fwd, hooks_rx) = mpsc::channel(crate::events::HOOK_QUEUE_CAPACITY);

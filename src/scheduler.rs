@@ -623,6 +623,9 @@ pub struct JobStatus {
     /// when the file never parsed.
     #[serde(default)]
     pub flock: Option<String>,
+    /// The file's `description`, from its last good parse.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// A job as the scheduler holds it: the last good parse, plus the current
@@ -1309,6 +1312,7 @@ impl Scheduler {
                             .task_flock(j.flock.as_deref(), j.spec.machine.as_deref())
                             .unwrap_or_else(|_| j.flock.clone().unwrap_or_default())
                     }),
+                    description: e.job.as_ref().and_then(|j| j.description.clone()),
                 }
             })
             .collect();
@@ -1849,6 +1853,8 @@ mod tests {
 
     pub(super) fn job(name: &str) -> Job {
         Job {
+            task_description: None,
+            description: None,
             name: name.into(),
             schedule: Schedule::Every(Duration::from_secs(60)),
             enabled: true,
@@ -3063,6 +3069,7 @@ mod tests {
         // A running task left on "a" while its actor is wedged.
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),
@@ -4046,6 +4053,7 @@ mod tests {
         };
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),
@@ -4069,6 +4077,7 @@ mod tests {
         let (mut s, _tmp) = scheduler_with(&store);
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),
@@ -4095,6 +4104,7 @@ mod tests {
         let (mut s, _tmp) = scheduler_with(&store);
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),
@@ -4119,6 +4129,7 @@ mod tests {
         let (mut s, _tmp) = scheduler_with(&store);
         let t = store
             .insert_task(crate::store::NewTask {
+                description: None,
                 job: "run".into(),
                 item: Value::Null,
                 prompt: "p".into(),

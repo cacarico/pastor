@@ -72,6 +72,89 @@ pub fn table(header: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
+/// The fewest characters of a description `--wide` keeps on a narrow
+/// terminal; the table wraps rather than show less.
+const MIN_DESCRIPTION: usize = 20;
+
+/// `table` with a DESCRIPTION column last, one per row (`-` for none), each
+/// on one escaped line. With `width` (a terminal's), a description longer
+/// than what the other columns leave is cut to fit, ending in `…`; it keeps
+/// `MIN_DESCRIPTION` characters however narrow. Without it nothing is cut.
+pub fn wide_table(
+    header: &[&str],
+    rows: &[Vec<String>],
+    descriptions: &[Option<String>],
+    width: Option<usize>,
+) -> String {
+    let before: usize = (0..header.len())
+        .map(|i| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(|c| c.chars().count())
+                .chain([header[i].len()])
+                .max()
+                .unwrap_or(0)
+                + 2
+        })
+        .sum();
+    let room = width.map(|w| w.saturating_sub(before).max(MIN_DESCRIPTION));
+    let mut full_header = header.to_vec();
+    full_header.push("DESCRIPTION");
+    let full_rows: Vec<Vec<String>> = rows
+        .iter()
+        .zip(descriptions.iter().chain(std::iter::repeat(&None)))
+        .map(|(row, d)| {
+            let mut text = d.as_deref().map_or_else(|| "-".to_string(), one_line);
+            if let Some(room) = room
+                && text.chars().count() > room
+            {
+                text = text.chars().take(room - 1).chain(['…']).collect();
+            }
+            let mut row = row.clone();
+            row.push(text);
+            row
+        })
+        .collect();
+    table(&full_header, &full_rows)
+}
+
+/// A list command's table: `table`, or with `--wide` the `wide_table`
+/// cut to this terminal (`terminal_width`).
+pub fn list_table(
+    header: &[&str],
+    rows: &[Vec<String>],
+    wide: bool,
+    descriptions: &[Option<String>],
+) -> String {
+    if wide {
+        wide_table(header, rows, descriptions, terminal_width())
+    } else {
+        table(header, rows)
+    }
+}
+
+/// The width of the terminal stdout is, from the terminal itself, else
+/// `$COLUMNS`. `None` when stdout is not a terminal: piped or saved, a
+/// list is not cut.
+pub fn terminal_width() -> Option<usize> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    // SAFETY: TIOCGWINSZ only writes a `winsize` into the one we pass.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
+    {
+        return Some(ws.ws_col as usize);
+    }
+    std::env::var("COLUMNS")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)
+}
+
 pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
     tasks
         .iter()
@@ -249,6 +332,16 @@ pub fn task_detail(t: &Task) -> String {
         .into_iter()
         .map(|(k, v)| format!("{:<12}{}", format!("{k}:"), one_line(&v)))
         .collect();
+    // As written, bar control characters: `describe` is where a long or
+    // multi-line description is read whole.
+    out.insert(
+        1,
+        format!(
+            "description: {} (from {})",
+            printable(&t.description_text()),
+            t.description_from()
+        ),
+    );
     out.push("prompt:".into());
     out.extend(
         printable(&t.prompt)
@@ -322,6 +415,8 @@ pub struct FlockRow {
     pub machines: Vec<String>,
     pub agents: Option<usize>,
     pub queued: usize,
+    /// Its `[[flock]]` entry's `description`.
+    pub description: Option<String>,
 }
 
 pub const FLOCK_HEADER: [&str; 5] = ["NAME", "DEFAULT", "MACHINES", "AGENTS", "QUEUED"];
@@ -356,6 +451,9 @@ pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]
                 machines,
                 agents,
                 queued,
+                description: flock
+                    .entry(name)
+                    .and_then(|e| crate::config::clean_description(e.description.as_deref())),
             }
         })
         .collect()
@@ -474,6 +572,9 @@ pub struct MachineRow {
     /// pastor.toml and flock.toml.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Its `description` in flock.toml.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl From<&MachineStatus> for MachineRow {
@@ -496,6 +597,7 @@ impl From<&MachineStatus> for MachineRow {
             tags: m.tags.clone(),
             orphans: m.orphans.clone(),
             profile: m.profile.clone(),
+            description: m.description.clone(),
         }
     }
 }
@@ -710,6 +812,7 @@ mod tests {
     fn task_with(spec: crate::task::DispatchSpec) -> Task {
         let now = Utc::now();
         Task {
+            description: None,
             id: 3,
             job: "run".into(),
             item: serde_json::Value::Null,
@@ -740,6 +843,7 @@ mod tests {
 
     fn status(name: &str, host: &str) -> MachineStatus {
         MachineStatus {
+            description: None,
             name: name.into(),
             host: host.into(),
             endpoint: format!("ssh {host} (session default)"),
@@ -950,6 +1054,7 @@ mod tests {
         let flock = Flock {
             flocks: vec![],
             machines: vec![MachineConfig {
+                description: None,
                 name: "pi-1".into(),
                 local: true,
                 ssh: None,
@@ -1110,6 +1215,40 @@ mod tests {
         t.role = crate::task::TaskRole::Orchestrator;
         assert!(task_detail(&t).contains("role:       orchestrator\n"));
         assert_eq!(t.to_json()["role"], "orchestrator");
+    }
+
+    /// `task describe` says what the task is about and where that came
+    /// from, near the top.
+    #[test]
+    fn task_detail_shows_the_description_and_its_source() {
+        let mut t = task_with(crate::task::DispatchSpec {
+            agent: "claude".into(),
+            agent_args: vec![],
+            allow: vec![],
+            deny: vec![],
+            repo: None,
+            worktree: false,
+            branch: None,
+            machine: None,
+            tags: vec![],
+            timeout_secs: 60,
+            checkout: None,
+            reopen: None,
+            agent_source: None,
+            place: Default::default(),
+            session_id: None,
+        });
+        let out = task_detail(&t);
+        assert!(
+            out.starts_with("id:         t-3\ndescription: fix it (from the prompt)\n"),
+            "{out}"
+        );
+        t.description = Some("Fix the flaky test".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("\ndescription: Fix the flaky test (from --description)\n"),
+            "{out}"
+        );
     }
 
     /// An error can be raw multi-line stderr; it must stay one field on one
@@ -1277,11 +1416,46 @@ mod tests {
         assert_eq!(v[0]["schedule"], "every 1h");
     }
 
+    /// `--wide` adds DESCRIPTION last. On a terminal it is cut to what the
+    /// other columns leave, 20 characters at least; off one it is whole.
+    #[test]
+    fn wide_tables_add_a_description_cut_to_the_width() {
+        let rows = vec![
+            vec!["a".to_string(), "x".to_string()],
+            vec!["bb".to_string(), "".to_string()],
+        ];
+        let long = "Carry out the answers on the Pastor board's Answered list";
+        let descriptions = vec![Some(long.to_string()), None];
+        let whole = wide_table(&["A", "BB"], &rows, &descriptions, None);
+        assert_eq!(
+            whole,
+            format!("A   BB  DESCRIPTION\na   x   {long}\nbb      -")
+        );
+        // "a   x   " is 8 wide, so 40 columns leave 32.
+        let cut = wide_table(&["A", "BB"], &rows, &descriptions, Some(40));
+        let first = cut.lines().nth(1).unwrap();
+        assert_eq!(first.chars().count(), 40, "{first}");
+        assert!(first.ends_with('…'), "{first}");
+        assert!(
+            first.starts_with("a   x   Carry out the answers"),
+            "{first}"
+        );
+        let narrow = wide_table(&["A", "BB"], &rows, &descriptions, Some(10));
+        let first = narrow.lines().nth(1).unwrap();
+        assert_eq!(first.chars().count(), 8 + 20, "at least 20 kept: {first}");
+        // A description that fits is left alone; a newline shows escaped.
+        let short = vec![Some("two\nlines".to_string()), None];
+        let out = wide_table(&["A", "BB"], &rows, &short, Some(40));
+        assert!(out.contains("two\\nlines"), "{out}");
+        assert!(!out.contains('…'), "{out}");
+    }
+
     #[test]
     fn job_rows_show_errors_over_results_and_relative_next() {
         use crate::scheduler::JobStatus;
         let now = chrono::Utc::now();
         let ok = JobStatus {
+            description: None,
             name: "a".into(),
             schedule: Some("every 5m".into()),
             enabled: true,
@@ -1294,6 +1468,7 @@ mod tests {
             flock: Some("work".into()),
         };
         let broken = JobStatus {
+            description: None,
             name: "b".into(),
             schedule: None,
             enabled: false,

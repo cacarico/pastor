@@ -149,6 +149,7 @@ fn actor_config(m: &MachineConfig) -> MachineConfig {
         agent: None,
         agent_args: None,
         agents: Default::default(),
+        description: None,
         ..m.clone()
     }
 }
@@ -347,6 +348,9 @@ impl Fleet {
                     profile: self.own_profile(&flock, Some(&m.handle.name)),
                     flock: Some(flock),
                     shutting_down: m.shutting_down,
+                    description: wanted
+                        .get(&m.handle.name)
+                        .and_then(|c| crate::config::clean_description(c.description.as_deref())),
                     ..m.handle.snapshot()
                 }
             })
@@ -810,7 +814,7 @@ impl Fleet {
         ask: Option<&AgentChoice>,
         priority: Option<Priority>,
     ) -> Result<Task, QueueError> {
-        self.queue_run_as(prompt, spec, flock, ask, priority, TaskRole::Agent)
+        self.queue_run_as(prompt, spec, flock, ask, priority, TaskRole::Agent, None)
             .await
     }
 
@@ -823,6 +827,7 @@ impl Fleet {
         ask: Option<&AgentChoice>,
         priority: Option<Priority>,
         role: TaskRole,
+        description: Option<String>,
     ) -> Result<Task, QueueError> {
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
@@ -843,6 +848,7 @@ impl Fleet {
         self.store
             .insert_task_at(
                 NewTask {
+                    description,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt,
@@ -890,8 +896,9 @@ impl Fleet {
             &asked_by,
         );
         let level = (priority, from.as_deref());
+        let description = job.task_description_for(item);
         self.store
-            .insert_job_task_at(&job.name, &flock, item, level, |id| {
+            .insert_job_task_at(&job.name, &flock, item, level, description.as_deref(), |id| {
                 let (prompt, mut spec) = render(id)?;
                 spec.agent = settled.agent;
                 spec.agent_args = settled.agent_args;
@@ -1772,6 +1779,7 @@ impl Daemon {
                 agent,
                 priority,
                 role,
+                description,
             } => {
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
@@ -1801,6 +1809,7 @@ impl Daemon {
                         agent.as_ref(),
                         priority,
                         role,
+                        crate::config::clean_description(description.as_deref()),
                     )
                     .await
                 {
@@ -1924,17 +1933,27 @@ impl Daemon {
                     )),
                 }
             }
-            IpcRequest::FlockAdd { name, default } => {
+            IpcRequest::FlockAdd {
+                name,
+                default,
+                description,
+            } => {
                 let store = &self.store;
                 self.edit_flock_file("; ", |file| {
-                    crate::fleet_edit::add_flock(file, &name, default, || {
-                        Ok(store
-                            .queued_tasks()?
-                            .iter()
-                            .filter(|t| t.flock.as_deref() == Some(DEFAULT_FLOCK))
-                            .map(|t| t.display_id())
-                            .collect())
-                    })
+                    crate::fleet_edit::add_flock(
+                        file,
+                        &name,
+                        default,
+                        description.as_deref(),
+                        || {
+                            Ok(store
+                                .queued_tasks()?
+                                .iter()
+                                .filter(|t| t.flock.as_deref() == Some(DEFAULT_FLOCK))
+                                .map(|t| t.display_id())
+                                .collect())
+                        },
+                    )
                 })
                 .await
             }
@@ -2038,8 +2057,11 @@ impl Daemon {
                 prompt,
                 spec,
                 item,
+                description,
             } => {
                 let job = crate::config::job::Job {
+                    task_description: description,
+                    description: None,
                     name: job,
                     // A headless serve schedules the job; the head only
                     // queues what it found, so these are never read.
@@ -2625,6 +2647,7 @@ mod tests {
 
     fn machine(name: &str, max: u32) -> MachineConfig {
         MachineConfig {
+            description: None,
             name: name.into(),
             local: false,
             ssh: None,
@@ -2803,6 +2826,7 @@ mod tests {
         healthy(&fleet, "a").await;
         let t = store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "p".into(),
@@ -2856,6 +2880,7 @@ mod tests {
         for _ in 0..2 {
             let t = store
                 .insert_task(NewTask {
+                    description: None,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt: "p".into(),
@@ -2965,6 +2990,7 @@ mod tests {
         let put = |machine: &str, state: TaskState| {
             let mut t = store
                 .insert_task(NewTask {
+                    description: None,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt: "p".into(),
@@ -3000,6 +3026,7 @@ mod tests {
         let put = |machine: &str, state: TaskState| {
             let mut t = store
                 .insert_task(NewTask {
+                    description: None,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt: "p".into(),
@@ -3287,6 +3314,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
@@ -3337,6 +3365,7 @@ mod tests {
         let IpcResponse::Task(first) = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "1".into(),
                 spec: spec(),
                 flock: None,
@@ -3351,6 +3380,7 @@ mod tests {
         let IpcResponse::Task(second) = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "2".into(),
                 spec: spec(),
                 flock: None,
@@ -3570,6 +3600,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     machine: Some("zzz".into()),
@@ -3598,6 +3629,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     machine: Some("b".into()),
@@ -3652,6 +3684,7 @@ mod tests {
     fn run_in(flock: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
             role: Default::default(),
+            description: None,
             prompt: "x".into(),
             spec: DispatchSpec {
                 machine: machine.map(Into::into),
@@ -3678,6 +3711,7 @@ mod tests {
         .await;
         let run = |flock: &str, agent: Option<AgentChoice>| IpcRequest::Run {
             role: Default::default(),
+            description: None,
             prompt: "x".into(),
             spec: spec(),
             flock: Some(flock.into()),
@@ -3766,6 +3800,7 @@ mod tests {
         .await;
         let run = |agent: Option<&str>| IpcRequest::Run {
             role: Default::default(),
+            description: None,
             prompt: "x".into(),
             spec: spec(),
             flock: Some("work".into()),
@@ -3834,6 +3869,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: spec(),
                 flock: Some("work".into()),
@@ -3909,6 +3945,7 @@ mod tests {
     fn run_model(model: Option<&str>, agent: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
             role: Default::default(),
+            description: None,
             prompt: "x".into(),
             spec: DispatchSpec {
                 machine: machine.map(Into::into),
@@ -4648,6 +4685,7 @@ mod tests {
         .await;
         let run = || IpcRequest::Run {
             role: Default::default(),
+            description: None,
             prompt: "x".into(),
             spec: spec(),
             flock: None,
@@ -4835,6 +4873,7 @@ mod tests {
 
         let said = text(
             d.handle(IpcRequest::FlockAdd {
+                description: None,
                 name: "spare".into(),
                 default: false,
             })
@@ -4895,6 +4934,7 @@ mod tests {
         for (req, code) in [
             (
                 IpcRequest::FlockAdd {
+                    description: None,
                     name: "spare".into(),
                     default: false,
                 },
@@ -4946,6 +4986,7 @@ mod tests {
         let t = d
             .store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "p".into(),
@@ -4959,6 +5000,7 @@ mod tests {
             .unwrap();
         let IpcResponse::Text(said) = d
             .handle(IpcRequest::FlockAdd {
+                description: None,
                 name: "work".into(),
                 default: true,
             })
@@ -5178,6 +5220,7 @@ mod tests {
         let t = d
             .store()
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "p".into(),
@@ -5232,6 +5275,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: spec(),
                 flock: Some("home".into()),
@@ -5257,6 +5301,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     machine: Some("b".into()),
@@ -5330,6 +5375,7 @@ mod tests {
             &socket,
             &IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
@@ -5385,6 +5431,7 @@ mod tests {
     fn run_hi_as(role: TaskRole) -> IpcRequest {
         IpcRequest::Run {
             role,
+            description: None,
             prompt: "hi".into(),
             spec: spec(),
             flock: None,
@@ -5932,6 +5979,7 @@ mod tests {
             let store = Store::open(&paths.db_file()).unwrap();
             store
                 .insert_task(NewTask {
+                    description: None,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt: "p".into(),
@@ -5967,6 +6015,7 @@ mod tests {
         for p in ["1", "2"] {
             d.store()
                 .insert_task(NewTask {
+                    description: None,
                     job: "run".into(),
                     item: serde_json::Value::Null,
                     prompt: p.into(),
@@ -6117,6 +6166,7 @@ mod tests {
     async fn a_job_task_is_rendered_queued_and_dispatched_here() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let req = |key: &str, branch: Option<&str>| IpcRequest::JobTask {
+            description: None,
             job: "sweep".into(),
             flock: None,
             agent: AgentChoice::default(),
@@ -6157,6 +6207,7 @@ mod tests {
             panic!()
         };
         let keyless = IpcRequest::JobTask {
+            description: None,
             job: "sweep".into(),
             flock: None,
             agent: AgentChoice::default(),
@@ -6265,6 +6316,7 @@ mod tests {
         let mut t = d
             .store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "p".into(),
@@ -6337,6 +6389,7 @@ mod tests {
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "hi".into(),
                 spec: spec(),
                 flock: None,
@@ -6472,6 +6525,7 @@ mod tests {
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: spec(),
                 flock: None,
@@ -6505,6 +6559,7 @@ mod tests {
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: spec(),
                 flock: None,
@@ -6871,6 +6926,7 @@ mod tests {
         let resp = d
             .handle(IpcRequest::Run {
                 role: Default::default(),
+                description: None,
                 prompt: "x".into(),
                 spec: DispatchSpec {
                     worktree: true,

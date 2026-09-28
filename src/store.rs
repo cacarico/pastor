@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::queue::QueueSpot;
 use crate::task::{DispatchSpec, PANE_OWNING_STATES, Priority, Task, TaskState};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -172,6 +172,9 @@ pub struct NewTask {
     /// The flock the task targets, already resolved (see
     /// `Flock::task_flock`): only its machines take the task.
     pub flock: String,
+    /// `task run --description`, trimmed; `None` reads as the prompt's
+    /// first line (`Task::description_text`).
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -320,6 +323,7 @@ impl Store {
                         priority_from TEXT,
                         queue_pos INTEGER,
                         role TEXT NOT NULL DEFAULT 'agent',
+                        description TEXT,
                         created_at TEXT NOT NULL,
                         started_at TEXT,
                         finished_at TEXT,
@@ -412,6 +416,11 @@ impl Store {
                 if v < 10 {
                     add_column(&tx, "role", "role TEXT NOT NULL DEFAULT 'agent'")?;
                 }
+                // What the task is about (`Task::description`). Older rows
+                // get none and read as their prompt's first line.
+                if v < 11 {
+                    add_column(&tx, "description", "description TEXT")?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -446,8 +455,8 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?9)",
-            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, role.as_str(), now],
+            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, role, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?10, ?10)",
+            params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, role.as_str(), t.description, now],
         )?;
         let id = tx.last_insert_rowid();
         place_last(&tx, id)?;
@@ -616,10 +625,10 @@ impl Store {
         let tx = conn.transaction()?;
         // Check and copy in one statement, so a task closed, pruned or
         // finished by another writer in between is not retried. The copy
-        // keeps the level, its role, and where it came from, but queues
-        // last in it.
+        // keeps the level, its role, description and where it came from,
+        // but queues last in it.
         let n = tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, role, state, retry_of, priority, priority_from, created_at, updated_at)
+            "INSERT INTO tasks (job, item, prompt, spec, flock, role, description, state, retry_of, priority, priority_from, created_at, updated_at)
              SELECT job, item, prompt,
                     json_patch(json_remove(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
                          THEN json_remove(spec, '$.checkout', '$.reopen')
@@ -630,7 +639,7 @@ impl Store {
                                                    'agent', COALESCE(agent_name, 't-' || id)))
                          ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
                          '$.session_id'), ?3),
-                    flock, role, 'queued', id, priority, priority_from, ?2, ?2 FROM tasks
+                    flock, role, description, 'queued', id, priority, priority_from, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
         )?;
@@ -1059,15 +1068,24 @@ impl Store {
     /// it was given, and record `(job, key)` as seen: one transaction, so no
     /// reader ever sees an unrendered task and a render failure leaves the key
     /// unseen. A key already in `seen` violates the primary key and nothing is
-    /// written.
+    /// written. `description` is the task's, already rendered; `None` reads
+    /// as the prompt's first line.
     pub fn insert_job_task(
         &self,
         job: &str,
         flock: &str,
         item: &Value,
+        description: Option<&str>,
         render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
-        self.insert_job_task_at(job, flock, item, (Priority::Normal, None), render)
+        self.insert_job_task_at(
+            job,
+            flock,
+            item,
+            (Priority::Normal, None),
+            description,
+            render,
+        )
     }
 
     /// `insert_job_task` at a level, and what set it (`Task::priority_from`).
@@ -1077,6 +1095,7 @@ impl Store {
         flock: &str,
         item: &Value,
         (priority, from): (Priority, Option<&str>),
+        description: Option<&str>,
         render: impl FnOnce(i64) -> Result<(String, DispatchSpec), String>,
     ) -> anyhow::Result<Task> {
         let key = item
@@ -1088,8 +1107,8 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, 'queued', ?5, ?6, ?4, ?4)",
-            params![job, serde_json::to_string(item)?, flock, now, priority.as_str(), from],
+            "INSERT INTO tasks (job, item, prompt, spec, flock, description, state, priority, priority_from, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, ?7, 'queued', ?5, ?6, ?4, ?4)",
+            params![job, serde_json::to_string(item)?, flock, now, priority.as_str(), from, description],
         )?;
         let id = tx.last_insert_rowid();
         place_last(&tx, id)?;
@@ -1300,6 +1319,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
             .get::<_, Option<i64>>("queue_pos")?
             .unwrap_or(row.get("id")?),
         role: role.parse().map_err(conversion_failure::<String>)?,
+        description: row.get("description")?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -1424,6 +1444,7 @@ mod tests {
             prompt: "do it\nnow \"quoted\" {{ x }}".into(),
             spec: spec(),
             flock: "default".into(),
+            description: None,
         }
     }
 
@@ -1894,7 +1915,7 @@ mod tests {
         let item = serde_json::json!({"key": "k1", "title": "t"});
         assert!(!s.is_seen("j", "k1").unwrap());
         let t = s
-            .insert_job_task("j", "default", &item, |id| {
+            .insert_job_task("j", "default", &item, None, |id| {
                 Ok((
                     format!("prompt for t-{id}"),
                     DispatchSpec {
@@ -1918,7 +1939,7 @@ mod tests {
         // The same key again: refused, nothing written.
         let before = s.list_tasks(&TaskFilter::default()).unwrap().len();
         assert!(
-            s.insert_job_task("j", "default", &item, |_| Ok(("x".into(), spec())))
+            s.insert_job_task("j", "default", &item, None, |_| Ok(("x".into(), spec())))
                 .is_err()
         );
         assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), before);
@@ -1926,7 +1947,7 @@ mod tests {
         // A render failure rolls the whole thing back: no task, key still unseen.
         let item2 = serde_json::json!({"key": "k2"});
         let err = s
-            .insert_job_task("j", "default", &item2, |_| Err("nope".into()))
+            .insert_job_task("j", "default", &item2, None, |_| Err("nope".into()))
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
         assert_eq!(s.list_tasks(&TaskFilter::default()).unwrap().len(), before);
@@ -1938,6 +1959,7 @@ mod tests {
                 "j",
                 "default",
                 &serde_json::json!({"title": "no key"}),
+                None,
                 |_| Ok(("x".into(), spec()))
             )
             .is_err()
@@ -2003,7 +2025,7 @@ mod tests {
         assert_eq!(ids("default"), [home.id]);
         assert!(ids("nope").is_empty());
         let job = s
-            .insert_job_task("j", "work", &serde_json::json!({"key": "k"}), |_| {
+            .insert_job_task("j", "work", &serde_json::json!({"key": "k"}), None, |_| {
                 Ok(("p".into(), spec()))
             })
             .unwrap();
@@ -2062,6 +2084,76 @@ mod tests {
         set_state(&s, t.id, TaskState::Failed);
         let r = s.insert_retry(t.id).unwrap();
         assert_eq!(r.flock.as_deref(), Some("work"));
+    }
+
+    /// A task keeps the description it was queued with; one queued without
+    /// reads as its prompt's first line. A retry copies it.
+    #[test]
+    fn a_task_keeps_its_description_and_a_retry_copies_it() {
+        let s = Store::open_in_memory().unwrap();
+        let given = s
+            .insert_task(NewTask {
+                description: Some("Fix the flaky test".into()),
+                ..new_task("run")
+            })
+            .unwrap();
+        assert_eq!(given.description.as_deref(), Some("Fix the flaky test"));
+        assert_eq!(given.description_text(), "Fix the flaky test");
+        assert_eq!(given.description_from(), "--description");
+        let bare = s.insert_task(new_task("run")).unwrap();
+        assert_eq!(bare.description, None);
+        assert_eq!(bare.description_text(), "do it");
+        assert_eq!(bare.description_from(), "the prompt");
+        let json = bare.to_json();
+        assert_eq!(json["description"], "do it");
+        assert_eq!(json["description_from"], "the prompt");
+
+        let job = s
+            .insert_job_task(
+                "j",
+                "default",
+                &serde_json::json!({"key": "k"}),
+                Some("Card title"),
+                |_| Ok(("p".into(), spec())),
+            )
+            .unwrap();
+        assert_eq!(job.description.as_deref(), Some("Card title"));
+        assert_eq!(job.description_from(), "job j");
+
+        set_state(&s, given.id, TaskState::Failed);
+        let r = s.insert_retry(given.id).unwrap();
+        assert_eq!(r.description.as_deref(), Some("Fix the flaky test"));
+    }
+
+    /// A v8 database has no description column: opening it adds one, and
+    /// its rows read as their prompt's first line.
+    #[test]
+    fn a_v8_database_gains_the_description_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN description;
+                 UPDATE meta SET value = '8' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let old = s.get_task(1).unwrap().unwrap();
+        assert_eq!(old.description, None);
+        assert_eq!(old.description_text(), "do it");
+        let new = s
+            .insert_task(NewTask {
+                description: Some("d".into()),
+                ..new_task("run")
+            })
+            .unwrap();
+        assert_eq!(new.description.as_deref(), Some("d"));
     }
 
     /// `task retry --place` replaces where the copy's pane goes and keeps
@@ -2695,11 +2787,12 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN priority_from;
                  ALTER TABLE tasks DROP COLUMN queue_pos;
                  ALTER TABLE tasks DROP COLUMN role;
+                 ALTER TABLE tasks DROP COLUMN description;
                  DROP TABLE trusted_repos;
                  DROP TABLE event_seq;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '10' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '11' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -2728,7 +2821,8 @@ mod tests {
                 || c == "ended"
                 || c == "priority"
                 || c == "queue_pos"
-                || c == "role"),
+                || c == "role"
+                || c == "description"),
             "rolled back: {cols:?}"
         );
         drop(conn);
@@ -2788,7 +2882,7 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         let item = serde_json::json!({"key": "k1", "title": "t"});
         let old = s
-            .insert_job_task("j", "default", &item, |_| Ok(("p".into(), spec())))
+            .insert_job_task("j", "default", &item, None, |_| Ok(("p".into(), spec())))
             .unwrap();
         for state in [
             TaskState::Queued,
@@ -2950,7 +3044,7 @@ mod tests {
         let mk = |key: &str, state: TaskState, finished: Option<DateTime<Utc>>| {
             let item = serde_json::json!({ "key": key });
             let t = s
-                .insert_job_task("j", "default", &item, |_| Ok(("p".into(), spec())))
+                .insert_job_task("j", "default", &item, None, |_| Ok(("p".into(), spec())))
                 .unwrap();
             let mut t = set_state(&s, t.id, state);
             t.finished_at = finished;

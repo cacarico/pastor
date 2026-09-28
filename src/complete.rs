@@ -149,7 +149,13 @@ pub fn name_options(root: &Command) -> Vec<String> {
 /// to offer them. Anything unreadable is no names.
 pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
     match kind {
-        Kind::Job => dir_names(&paths.jobs_dir(), Some("toml")),
+        Kind::Job => dir_names(&paths.jobs_dir(), Some("toml"))
+            .into_iter()
+            .map(|(name, _)| {
+                let desc = job_description(&paths.jobs_dir(), &name);
+                (name, desc)
+            })
+            .collect(),
         Kind::Connector => dir_names(&paths.connectors_dir(), None),
         Kind::Flock => {
             let Ok(flock) = Flock::load(&paths.flock_file()) else {
@@ -159,7 +165,13 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
             flock
                 .flock_names()
                 .into_iter()
-                .map(|n| (n.to_string(), (n == default).then(|| "default".into())))
+                .map(|n| {
+                    let desc = flock
+                        .entry(n)
+                        .and_then(|e| crate::config::clean_description(e.description.as_deref()))
+                        .or_else(|| (n == default).then(|| "default".into()));
+                    (n.to_string(), desc)
+                })
                 .collect()
         }
         Kind::Machine => {
@@ -169,7 +181,11 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
             flock
                 .machines
                 .iter()
-                .map(|m| (m.name.clone(), Some(flock.flock_of(m).to_string())))
+                .map(|m| {
+                    let desc = crate::config::clean_description(m.description.as_deref())
+                        .unwrap_or_else(|| flock.flock_of(m).to_string());
+                    (m.name.clone(), Some(desc))
+                })
                 .collect()
         }
         Kind::Task => tasks(paths),
@@ -201,6 +217,14 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
                 .collect()
         }
     }
+}
+
+/// The `description` at the top of job `name`'s file, read as plain TOML:
+/// a file that no longer parses as a job still shows its line.
+fn job_description(dir: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crate::config::job::job_path(dir, name)).ok()?;
+    let table: toml::Table = toml::from_str(&text).ok()?;
+    crate::config::clean_description(table.get("description")?.as_str())
 }
 
 /// Live tasks first, then finished ones, newest first in each; the note

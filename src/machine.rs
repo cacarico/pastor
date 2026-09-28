@@ -193,6 +193,11 @@ pub struct MachineStatus {
     /// layer names one, and from a head that predates profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The machine's `description` in flock.toml, as the head last applied
+    /// it; `Fleet::statuses` fills it in. `None` from an actor, and from a
+    /// head that predates it.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -565,6 +570,7 @@ pub fn spawn_machine(
 ) -> MachineHandle {
     let (tx, rx) = mpsc::channel(32);
     let status = Arc::new(RwLock::new(MachineStatus {
+        description: None,
         name: name.clone(),
         host: connector.host(),
         endpoint: connector.describe(),
@@ -3024,6 +3030,7 @@ mod tests {
     fn new_task(store: &Store) -> Task {
         store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -3924,6 +3931,7 @@ mod tests {
     fn worktree_task(store: &Store) -> Task {
         store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -4346,6 +4354,7 @@ mod tests {
     fn placed_task(store: &Store, place: Place, worktree: bool) -> Task {
         store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -5064,6 +5073,7 @@ mod tests {
     fn repo_task(store: &Store, agent: &str, repo: Option<&str>) -> Task {
         store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -5691,6 +5701,7 @@ mod tests {
         .await;
         let task = store
             .insert_task(NewTask {
+                description: None,
                 job: "nightly".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),
@@ -7138,6 +7149,7 @@ mod tests {
         .await;
         let t = store
             .insert_task(NewTask {
+                description: None,
                 job: "run".into(),
                 item: serde_json::Value::Null,
                 prompt: "hi".into(),

@@ -842,6 +842,7 @@ mod tests {
     fn task(spec: DispatchSpec) -> Task {
         let now = Utc::now();
         Task {
+            description: None,
             id: 7,
             job: "run".into(),
             item: Value::Null,

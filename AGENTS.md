@@ -173,7 +173,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
-~/.local/state/pastor/pastor.db   tasks (schema 8), seen keys, event seq, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 9), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
