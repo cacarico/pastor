@@ -55,11 +55,11 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
-          curl -sSfL -o gitleaks.tgz "${base}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          curl -sSfL -o checksums.txt "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          curl -sSfL --retry 5 --retry-delay 5 --retry-all-errors -o gitleaks.tgz "${base}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL --retry 5 --retry-delay 5 --retry-all-errors -o checksums.txt "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
           grep "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" checksums.txt | sed 's/ .*/  gitleaks.tgz/' | sha256sum -c -
           tar -xzf gitleaks.tgz gitleaks
-          curl -sSfL -o gitleaks.toml "https://raw.githubusercontent.com/gitleaks/gitleaks/v${GITLEAKS_VERSION}/config/gitleaks.toml"
+          curl -sSfL --retry 5 --retry-delay 5 --retry-all-errors -o gitleaks.toml "https://raw.githubusercontent.com/gitleaks/gitleaks/v${GITLEAKS_VERSION}/config/gitleaks.toml"
           mkdir -p no-ignore
       - name: Scan every ref
         run: |
