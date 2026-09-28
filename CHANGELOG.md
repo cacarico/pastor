@@ -7,6 +7,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `pastor flock join <flock> <machine> [--max N]` puts a machine in a flock
+  with that number (by default the one it has there, else its
+  `max_agents`), keeping its other flocks; joining again with `--max`
+  changes the number. `pastor flock leave <flock> <machine>` takes it out;
+  out of its last flock the machine is back in the default one, and the
+  output names the queued tasks of that flock pinned to it, which wait with
+  a note. `pastor flock add <name> [machines...]` joins the machines named.
+  The first `join`, `leave` or `machine move` on a machine with the old
+  `flock = "..."` key moves it into the flock's `machines` with the
+  machine's `max_agents`, keeping comments. They go through the head like
+  the other fleet edits (IPC protocol 20; the CLI refuses an older head
+  with `head_too_old`), an agent pastor started may not run them, and tab
+  completion offers flocks and machines. A machine that is not in the flock
+  is `not_in_flock`.
 - A `critical` task started with `--preempt` (or `preempt = true` under a
   job's `[dispatch]`) that finds its machines full, job slots and burst
   included, pauses the newest running `low` Claude task on one and starts
@@ -84,6 +98,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `pastor machine move` takes the machine out of every flock and lists it
+  in the one named, with its `max_agents`, instead of setting its `flock`
+  key and leaving other flocks' `machines` alone.
+- `pastor machine list` heads its flocks column FLOCKS. `pastor flock list`
+  shows each machine with the flock's number and live tasks there
+  (`desk 1/2`), and `--json` adds `members` (`name`, `max`, `live`) beside
+  `machines`.
 - An orchestrator task may also close tasks (`pastor task close`) and enable
   a job (`pastor job enable`), so it can clean up tasks it sent wrong and turn
   back on a job it disabled without waiting for a person. A plain agent is

@@ -73,11 +73,20 @@ config. `pastor task describe` shows which agent a task got and where from.
 
 ```sh
 pastor flock list --wide  # with each flock's description
-pastor flock add lab --description "Test rigs"
+pastor flock add lab pi-1 --description "Test rigs"  # pi-1 joins it
+pastor flock join work here --max 2  # here runs at most 2 of work's tasks
+pastor flock leave work here  # out of its last flock, back in the default
 pastor flock describe work
-pastor machine move pi-1 work  # tasks already on it stay there
+pastor machine move pi-1 work  # leave every flock, join work; tasks on it stay
 pastor flock edit  # saved only once valid
 ```
+
+`flock join` keeps the machine in its other flocks; without `--max` it keeps
+the number it has there, or takes the machine's `max_agents`. The first
+`join`, `leave` or `move` on a machine with the old `flock` key moves it into
+that flock's `machines`, comments kept. `flock list` shows each machine with
+the flock's number and live tasks (`here 1/2`), and `machine list` its flocks
+(`personal:2,work:1`).
 
 ## room on a machine
 
