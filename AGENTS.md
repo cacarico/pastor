@@ -152,9 +152,9 @@ Still open as of the last review; none of them blocks normal use.
 - `tests/transport.rs` `command_transport_talks_to_fake_herdr` failed once
   under a loaded `make check` (the stdio fake-herdr closed before replying)
   and passed on every rerun.
-- A headless serve (`src/shepherd.rs`) is reachable only through its
-  socket: with the head set, `job list|run|reload` and `tick` still go to the
-  head. Its own `job.failed` and `task.queued` events are only logged, never
+- With the head set, `tick` and `job reload` go to the head only; the
+  headless serve (`src/shepherd.rs`) is reached by the other `job` commands
+  (`main.rs` `local_job`). Its own `job.failed` and `task.queued` events are only logged, never
   written to an events log or heard by its hooks. Its jobs share the head's
   seen table by name, so a head job of the same name with the same item key
   refuses the item (`job_task_refused`).

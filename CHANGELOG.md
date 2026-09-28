@@ -146,6 +146,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   so they hear the tasks of its own jobs, and a head event rotated out of
   the head's log before it was read is a `head_events_gap` warning, after
   which the hooks go on from the oldest record left.
+- With a head set, `pastor job list` shows the head's jobs under `head:
+  <dest>` and this machine's under `shepherd: <host> (this machine)`, a side
+  with none saying `no jobs`; `--json` is one flat array whose jobs carry
+  `where` (`head` or `shepherd`). This machine's jobs come from its headless
+  serve, or from the job files and `shepherd.db` when it is down; a serve that
+  does not answer is `shepherd_unresponsive`. `job
+  run|enable|disable|describe|edit` go to this machine when the job's file is
+  here, and to the head otherwise, so the last four no longer fail with
+  `remote_head_unsupported`.
 
 ### Changed
 

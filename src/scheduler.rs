@@ -868,6 +868,22 @@ impl Scheduler {
         })
     }
 
+    /// `standalone` for a headless serve's jobs while it is down, over its
+    /// own store (`Paths::shepherd_db_file`): flock.toml is the head's
+    /// business, so it is not read here.
+    pub fn standalone_headless(
+        paths: Paths,
+        config: &PastorConfig,
+        store: Arc<Store>,
+    ) -> Scheduler {
+        let fleet = Arc::new(Fleet::new(Vec::new(), store.clone()));
+        let (events, _) = broadcast::channel(1);
+        Scheduler {
+            standalone: true,
+            ..Scheduler::new(paths, config, store, fleet, events).headless()
+        }
+    }
+
     pub fn spawn(self) -> SchedulerHandle {
         let (tx, rx) = mpsc::channel(16);
         tokio::spawn(self.run(rx));

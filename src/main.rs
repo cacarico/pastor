@@ -66,7 +66,7 @@ enum Command {
     },
     /// Run one scheduler pass now and report what it did
     Tick(TickArgs),
-    /// Manage jobs (files in ~/.config/pastor/jobs/)
+    /// Manage jobs (files in ~/.config/pastor/jobs/). With a head elsewhere, a job whose file is here is this machine's; the rest are the head's
     Job {
         #[command(subcommand)]
         cmd: JobCmd,
@@ -139,9 +139,9 @@ struct TickArgs {
 
 #[derive(Subcommand, Debug)]
 enum JobCmd {
-    /// Every job file: schedule, enabled, last run, next run, last result
+    /// Every job file: schedule, enabled, last run, next run, last result. With a head elsewhere, the head's jobs, then this machine's
     List {
-        /// Print as a JSON array
+        /// Print as a JSON array; with a head elsewhere, each job says `where` it lives (head or shepherd)
         #[arg(long)]
         json: bool,
     },
@@ -564,12 +564,23 @@ fn main() {
         };
         let head = match head_use {
             Some(flocky) => {
+                // A job whose file is here, with a head elsewhere, is driven
+                // by this machine's serve: the head only supplies its recent
+                // tasks, so a protocol need that is only about the file
+                // request (`needs_file_protocol`) does not apply to it.
+                let local_job_route = remote.is_some()
+                    && matches!(&command, Command::Job { cmd }
+                        if job_name(cmd).is_some_and(|name| is_local_job(&paths, name)));
                 probe_head(
                     &paths,
                     // A remote head's flock.toml is not here to read.
                     flocky || remote.is_some() || flocks_declared(&paths),
                     needs_fleet_edit_protocol(&command),
-                    protocol_need(&command),
+                    if local_job_route {
+                        None
+                    } else {
+                        protocol_need(&command)
+                    },
                 )
                 .await?
             }
@@ -879,9 +890,8 @@ fn remote_route(command: &Command) -> RemoteRoute {
         }
         | Command::Events(_)
         | Command::Tick(_)
-        | Command::Job {
-            cmd: JobCmd::List { .. } | JobCmd::Run { .. } | JobCmd::Reload,
-        } => RemoteRoute::Head,
+        // The head's jobs through it, this machine's own here (`job`).
+        | Command::Job { .. } => RemoteRoute::Head,
         Command::Completions { .. }
         | Command::Setup { .. }
         | Command::Head { .. }
@@ -1385,10 +1395,10 @@ async fn probe_machine(
     })
 }
 
-/// The head's row: this machine's hostname and the herdr it has, if any. Read
-/// from the kernel and files rather than a new dependency for `gethostname`.
-fn head_row() -> pastor::cli::HeadRow {
-    let hostname = ["/proc/sys/kernel/hostname", "/etc/hostname"]
+/// This machine's hostname, read from the kernel and files rather than a
+/// new dependency for `gethostname`; `-` when none says.
+fn hostname() -> String {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
         .iter()
         .find_map(|p| {
             std::fs::read_to_string(p)
@@ -1397,7 +1407,12 @@ fn head_row() -> pastor::cli::HeadRow {
                 .filter(|s| !s.is_empty())
         })
         .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "-".into());
+        .unwrap_or_else(|| "-".into())
+}
+
+/// The head's row: this machine's hostname and the herdr it has, if any.
+fn head_row() -> pastor::cli::HeadRow {
+    let hostname = hostname();
     let herdr_version = std::process::Command::new("herdr")
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -2185,6 +2200,16 @@ async fn reload(paths: &Paths) -> anyhow::Result<()> {
 }
 
 async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
+    // With a head elsewhere, this machine's own jobs run in its headless
+    // serve: the list shows both, and a job whose file is here is driven here.
+    if let Some(remote) = pastor::ipc::remote_head() {
+        if let JobCmd::List { json } = cmd {
+            return shepherd_job_list(paths, &remote.ssh, json).await;
+        }
+        if job_name(&cmd).is_some_and(|name| is_local_job(paths, name)) {
+            return local_job(paths, cmd).await;
+        }
+    }
     match cmd {
         JobCmd::List { json } => {
             let jobs = if head.is_live() {
@@ -2215,6 +2240,169 @@ async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
         JobCmd::Describe { name, json } => job_describe(paths, &name, json, head).await?,
     }
     Ok(())
+}
+
+/// The job `cmd` names, if it names one.
+fn job_name(cmd: &JobCmd) -> Option<&str> {
+    match cmd {
+        JobCmd::Enable { name }
+        | JobCmd::Disable { name }
+        | JobCmd::Run { name }
+        | JobCmd::Edit { name }
+        | JobCmd::Describe { name, .. } => Some(name),
+        JobCmd::List { .. } | JobCmd::Reload => None,
+    }
+}
+
+/// Whether `name` is this machine's job, with a head elsewhere: its file is
+/// here. Job names are shared by the head and its shepherds, so a name on
+/// both is not expected; the file here wins, being the one this machine's
+/// serve runs.
+fn is_local_job(paths: &Paths, name: &str) -> bool {
+    ConfigFile::Job(name.to_string()).path(paths).is_ok()
+}
+
+/// `job list` with a head elsewhere: the head's jobs, then this machine's.
+async fn shepherd_job_list(paths: &Paths, head: &str, json: bool) -> anyhow::Result<()> {
+    let IpcResponse::Jobs(head_jobs) = ask(paths, IpcRequest::JobList).await? else {
+        unreachable!()
+    };
+    let here = local_jobs(paths).await?;
+    if json {
+        let jobs = pastor::cli::placed_jobs(&head_jobs, &here);
+        println!("{}", serde_json::to_string_pretty(&jobs)?);
+    } else {
+        let text = pastor::cli::job_sections(head, &head_jobs, &hostname(), &here);
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// This machine's jobs as its headless serve reports them, or with none
+/// running, the job files and the last state it saved.
+async fn local_jobs(paths: &Paths) -> anyhow::Result<Vec<JobStatus>> {
+    if local_serve(paths).await? {
+        let IpcResponse::Jobs(jobs) = ask_here(paths, IpcRequest::JobList).await? else {
+            unreachable!()
+        };
+        return Ok(jobs);
+    }
+    eprintln!(
+        "this machine's pastor serve is not running; showing its job files and the last known state"
+    );
+    let config = PastorConfig::load(&paths.config_file())?;
+    paths.ensure()?;
+    let store = Arc::new(Store::open(&paths.shepherd_db_file())?);
+    let mut s = Scheduler::standalone_headless(paths.clone(), &config, store).with_connectors();
+    s.reload();
+    Ok(s.statuses(chrono::Utc::now()))
+}
+
+/// Whether this machine's own `pastor serve` answers on its socket. One
+/// that listens but does not answer stops the command, as a head does.
+async fn local_serve(paths: &Paths) -> anyhow::Result<bool> {
+    let socket = paths.socket_file();
+    match pastor::ipc::ping_head(&socket).await {
+        HeadPing::NotRunning => Ok(false),
+        HeadPing::Pong {
+            role: Some(role), ..
+        } if role == pastor::ipc::SHEPHERD_ROLE => Ok(true),
+        HeadPing::Pong { .. } => Err(CliError::err(
+            "shepherd_unexpected",
+            format!(
+                "{} is a normal pastor head, not this machine's shepherd serve; this machine's own jobs cannot be read",
+                socket.display()
+            ),
+        )),
+        HeadPing::Unresponsive => Err(CliError::err(
+            "shepherd_unresponsive",
+            format!(
+                "this machine's pastor serve is listening on {} but not answering; nothing was done, run it again once it answers",
+                socket.display()
+            ),
+        )),
+    }
+}
+
+/// `ask` of this machine's own serve, never the head: for its own jobs
+/// while a head is set elsewhere.
+async fn ask_here(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
+    match request(&paths.socket_file(), &req).await {
+        Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
+        Ok(resp) => Ok(resp),
+        Err(err) => {
+            let (code, message) = request_failure(&err);
+            fail(&code, &message)
+        }
+    }
+}
+
+/// A job whose file is here, with a head elsewhere: this machine's serve
+/// runs it, so its file and state are here and only its tasks are the
+/// head's.
+async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
+    match cmd {
+        JobCmd::Run { name } => {
+            if !local_serve(paths).await? {
+                return Err(CliError::err(
+                    "shepherd_not_running",
+                    "this machine's pastor serve is not running; start it to run a job here",
+                ));
+            }
+            let IpcResponse::Text(msg) = ask_here(paths, IpcRequest::JobRun { name }).await? else {
+                unreachable!()
+            };
+            println!("{msg}");
+        }
+        JobCmd::Enable { name } => local_toggle(paths, &name, true).await?,
+        JobCmd::Disable { name } => local_toggle(paths, &name, false).await?,
+        JobCmd::Edit { name } => {
+            let file = ConfigFile::Job(name);
+            let path = file.path(paths)?;
+            let check = file.checker(paths)?;
+            let editor = pastor::edit::editor();
+            match pastor::edit::edit_here(&path, &editor, &check, &mut |_| ask_reopen()).await? {
+                Outcome::Unchanged => println!("no changes to {}", path.display()),
+                Outcome::Saved => {
+                    println!("saved {}; {}", path.display(), reload_here(paths).await?)
+                }
+            }
+        }
+        JobCmd::Describe { name, json } => {
+            let statuses = local_jobs(paths).await?;
+            let store = Store::open(&paths.shepherd_db_file())?;
+            let mut d = pastor::describe::job(paths, &name, statuses, &store)?;
+            let filter = TaskFilter {
+                job: Some(name),
+                ..Default::default()
+            };
+            let IpcResponse::Tasks(tasks) = ask(paths, IpcRequest::List { filter }).await? else {
+                unreachable!()
+            };
+            d.tasks = tasks.into_iter().take(pastor::describe::RECENT).collect();
+            print_description(&d, json, pastor::describe::job_text)?;
+        }
+        JobCmd::List { .. } | JobCmd::Reload => unreachable!("names no job"),
+    }
+    Ok(())
+}
+
+async fn local_toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> {
+    set_enabled(&ConfigFile::Job(name.to_string()).path(paths)?, enabled)?;
+    let verb = if enabled { "enabled" } else { "disabled" };
+    println!("{verb} {name}; {}", reload_here(paths).await?);
+    Ok(())
+}
+
+/// After a job file here changed: this machine's serve re-reads it now, or
+/// when it starts.
+async fn reload_here(paths: &Paths) -> anyhow::Result<&'static str> {
+    Ok(if local_serve(paths).await? {
+        ask_here(paths, IpcRequest::Reload).await?;
+        "this machine's pastor serve picked it up"
+    } else {
+        "applies when this machine's pastor serve starts"
+    })
 }
 
 /// Edit `file` in the user's editor, checked the way the head loads it.
