@@ -5062,33 +5062,178 @@ fn events_from_a_remote_head_match_the_local_log() {
     assert_eq!(kinds, local[..kinds.len()]);
 }
 
-/// A command not moved behind the head yet would act on this machine's
-/// files; it is refused instead, and `serve` would be a second head. The
-/// commands that are local on purpose still run.
+/// The flock, machine, trust, profile and config commands give the same
+/// stdout, stderr and exit code through a remote head as on the head's own
+/// machine. Two heads start alike; each step runs on one directly and on the
+/// other through the fake `ssh`, and the files they leave are the same. The
+/// client's own config dir holds nothing but client.toml.
+#[test]
+fn a_remote_head_runs_fleet_commands_as_the_local_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let here = start();
+    let there = start();
+    let c = client(Some(&there));
+    ok(c.head_set("head-up", &[]));
+    // An editor that changes nothing, and one that adds a comment.
+    let bin = c.tmp.path().join("editors");
+    std::fs::create_dir_all(&bin).unwrap();
+    let append = bin.join("append");
+    std::fs::write(&append, "#!/bin/sh\necho '# edited' >> \"$1\"\n").unwrap();
+    std::fs::set_permissions(&append, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let append = append.to_str().unwrap().to_string();
+    let steps: &[(&[&str], &str)] = &[
+        (&["flock", "list"], "true"),
+        (&["flock", "list", "--json"], "true"),
+        (&["flock", "default", "show"], "true"),
+        (
+            &["flock", "add", "work", "--description", "work boxes"],
+            "true",
+        ),
+        (&["flock", "add", "work"], "true"),
+        (&["flock", "default", "set", "work"], "true"),
+        (&["flock", "default", "show"], "true"),
+        (&["flock", "describe", "work"], "true"),
+        (&["flock", "describe", "work", "--json"], "true"),
+        (&["flock", "describe", "nope"], "true"),
+        (&["machine", "add", "pi-1", "--command", "false"], "true"),
+        (&["machine", "move", "pi-1", "work"], "true"),
+        (&["machine", "move", "nope", "work"], "true"),
+        (&["machine", "describe", "nope"], "true"),
+        (&["machine", "open", "fake"], "true"),
+        (&["machine", "open", "nope"], "true"),
+        (&["task", "attach", "t-9"], "true"),
+        (&["trust", "add", "fake", "/repo"], "true"),
+        (&["trust", "add", "fake", "/repo"], "true"),
+        (&["trust", "remove", "fake", "/repo"], "true"),
+        (&["trust", "remove", "fake", "/repo"], "true"),
+        (&["trust", "list"], "true"),
+        (&["trust", "list", "--json"], "true"),
+        (&["profile", "list"], "true"),
+        (&["profile", "list", "--json"], "true"),
+        (&["profile", "describe", "develop"], "true"),
+        (&["profile", "describe", "nope"], "true"),
+        (&["machine", "remove", "pi-1"], "true"),
+        (&["machine", "remove", "pi-1"], "true"),
+        (&["flock", "remove", "work"], "true"),
+        (&["flock", "edit"], "true"),
+        (&["config", "edit"], "true"),
+        (&["config", "edit"], &append),
+        (&["profile", "list"], "true"),
+    ];
+    let root = |e: &Env| e._tmp.path().to_str().unwrap().to_string();
+    let norm = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .replace(&root(&here), "<tmp>")
+            .replace(&root(&there), "<tmp>")
+    };
+    for (args, editor) in steps {
+        let local = pastor()
+            .args(*args)
+            .env("PASTOR_CONFIG_DIR", &here.config)
+            .env("PASTOR_STATE_DIR", &here.state)
+            .env_remove("VISUAL")
+            .env("EDITOR", editor)
+            .output()
+            .unwrap();
+        let remote = pastor()
+            .args(*args)
+            .env("PASTOR_CONFIG_DIR", &c.config)
+            .env("PASTOR_STATE_DIR", &c.state)
+            .env("PASTOR_DATA_DIR", &c.data)
+            .env("PATH", &c.path)
+            .env_remove("PASTOR_HEAD")
+            .env_remove("VISUAL")
+            .env("EDITOR", editor)
+            .output()
+            .unwrap();
+        assert_eq!(remote.status.code(), local.status.code(), "{args:?}");
+        assert_eq!(norm(&remote.stdout), norm(&local.stdout), "{args:?}");
+        assert_eq!(norm(&remote.stderr), norm(&local.stderr), "{args:?}");
+    }
+    for file in ["flock.toml", "pastor.toml"] {
+        let read = |e: &Env| {
+            norm(
+                std::fs::read_to_string(e.config.join(file))
+                    .unwrap()
+                    .as_bytes(),
+            )
+        };
+        assert_eq!(read(&there), read(&here), "{file}");
+    }
+    assert!(
+        std::fs::read_to_string(there.config.join("pastor.toml"))
+            .unwrap()
+            .contains("# edited")
+    );
+    let names: Vec<String> = std::fs::read_dir(&c.config)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["client.toml"], "nothing else written here");
+    assert!(!c.state.join("pastor.db").exists());
+}
+
+/// With a head set, every command reaches it or stays here on purpose; none
+/// falls back to this machine's flock.toml, pastor.toml or trust table. A
+/// head that does not answer stops them. `machine authorized-key` prints a
+/// line for the head's own authorized_keys, so it is refused here with the
+/// head named, and `serve` would be a second head. `config edit --local`
+/// edits this machine's pastor.toml.
 #[test]
 fn a_remote_head_refuses_what_would_act_on_local_files() {
     let c = client(None);
     ok(c.head_set("unreachable", &["--force"]));
     for args in [
         &["machine", "add", "pi-1", "--local"][..],
+        &["machine", "open", "pi-1"],
         &["flock", "list"],
+        &["flock", "default", "show"],
         &["trust", "list"],
         &["config", "edit"],
+        &["profile", "list"],
+        &["task", "attach", "t-1"],
     ] {
         let out = c.cmd(args);
-        assert_eq!(error_code(&out), "remote_head_unsupported", "{args:?}");
-        let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-        assert!(
-            v["message"]
-                .as_str()
-                .unwrap()
-                .contains(&args[..args.len().min(2)].join(" ")),
-            "{v}"
-        );
+        assert_eq!(error_code(&out), "head_unreachable", "{args:?}");
     }
+    let out = c.cmd(&["machine", "authorized-key", "pi-1", "--key", "-"]);
+    assert_eq!(error_code(&out), "remote_head_unsupported");
+    let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("machine authorized-key"), "{v}");
+    assert!(message.contains("unreachable"), "{v}");
     assert!(!c.config.join("flock.toml").exists());
+    assert!(!c.config.join("pastor.toml").exists());
     ok(c.cmd(&["completions", "bash"]));
     ok(c.cmd(&["connector", "list"]));
+
+    // `--local` is this machine's pastor.toml, checked as the head checks it.
+    let editor = c.tmp.path().join("tick-editor");
+    std::fs::write(&editor, "#!/bin/sh\necho 'tick = \"5s\"' > \"$1\"\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let out = pastor()
+        .args(["config", "edit", "--local"])
+        .env("PASTOR_CONFIG_DIR", &c.config)
+        .env("PASTOR_STATE_DIR", &c.state)
+        .env("PATH", &c.path)
+        .env_remove("PASTOR_HEAD")
+        .env_remove("VISUAL")
+        .env("EDITOR", &editor)
+        .output()
+        .unwrap();
+    let saved = ok(out);
+    assert!(saved.starts_with("saved "), "{saved}");
+    assert!(
+        saved.contains("applies when this machine's pastor serve starts"),
+        "{saved}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(c.config.join("pastor.toml")).unwrap(),
+        "tick = \"5s\"\n"
+    );
 
     ok(c.cmd(&["head", "unset"]));
     assert_eq!(ok(c.cmd(&["head", "show"])), "head: this machine\n");
