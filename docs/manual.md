@@ -1642,7 +1642,8 @@ It needs:
 it never falls back to this machine's files.
 
 These commands go to a remote head: `task run|list|describe|read|retry|priority|close|prune|send|done`,
-`machine list`, `tick`, `job list|run|reload`, `events`. `machine list`'s first line
+`machine list`, `tick`, `job reload`, `events`, and the `job` commands for
+the head's jobs (see [Jobs on a shepherd](#jobs-on-a-shepherd)). `machine list`'s first line
 names the head by its ssh destination and shows its herdr as `-`. `task run`
 fills what its flags leave out from the built-in defaults, not from the
 head's `[defaults]` (the head still resolves the agent with its own).
@@ -1688,9 +1689,8 @@ store, and never reads `flock.toml`.
   keys, and the event cursor. `pastor.db` is left alone.
 - On `pastor.sock` it answers `ping` (with `role: "shepherd"`), `tick` and
   `job list|run|reload` for its own jobs; anything else is
-  `shepherd_unsupported`. The CLI with the head set still sends those
-  commands to the head, so reach the shepherd with `pastor bridge` on this
-  machine, or unset the head for one command's sake.
+  `shepherd_unsupported`. The CLI's `job` commands ask it for this machine's
+  jobs (next section); `tick` and `job reload` still go to the head.
 - A head that does not answer is a warning in its log, `shepherd_needs_head`,
   not a reason to stop; it asks again each tick and says when the head
   answers again.
@@ -1704,6 +1704,42 @@ store, and never reads `flock.toml`.
 `pastor setup systemd` (or `launchd`) installs it the same way: the unit
 runs `pastor serve`, which reads the head from `client.toml`. The head
 needs this pastor's protocol (9) for `JobTask`.
+
+### Jobs on a shepherd
+
+With a head set, `pastor job list` shows two tables: the head's jobs under
+`head: <dest>`, then this machine's under `shepherd: <host> (this machine)`.
+The columns are those of a head's `job list`, and a side with no jobs
+prints its header and `no jobs`:
+
+```text
+head: user@head-1
+NAME     SCHEDULE  ENABLED  FLOCK    CONNECTOR  LAST RUN  NEXT    RESULT
+issues   every 1h  yes      default  github     3m ago    in 57m  ok: 1 items, 1 tasks
+
+shepherd: laptop (this machine)
+no jobs
+```
+
+`--json` stays one flat array, the head's jobs first, each with `where`:
+`head` or `shepherd`.
+
+This machine's jobs come from its headless serve. With none running,
+`job list` reads the job files here and the last state in `shepherd.db`,
+and says so on stderr. A serve that listens but does not answer stops the
+command with `shepherd_unresponsive`.
+
+`job run|enable|disable|describe|edit <name>` go to wherever the job lives.
+A job whose file is in this machine's `jobs/` is this machine's; any other
+name is the head's. For this machine's jobs:
+
+- `run` asks this machine's serve, so it must be running.
+- `enable`, `disable` and `edit` change the file here. A running serve
+  re-reads it at once; otherwise it applies when the serve starts.
+- `describe` reads the file and the state here, and asks the head for the
+  job's recent tasks.
+
+The head must answer for all of these, since `job list` shows its side too.
 
 ### Agents on other machines
 

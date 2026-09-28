@@ -4585,7 +4585,7 @@ fn a_remote_head_refuses_what_would_act_on_local_files() {
     for args in [
         &["machine", "add", "pi-1", "--local"][..],
         &["flock", "list"],
-        &["job", "enable", "x"],
+        &["trust", "list"],
         &["config", "edit"],
     ] {
         let out = c.cmd(args);
@@ -5088,4 +5088,162 @@ fn profile_list_and_describe_show_the_profiles() {
         out.starts_with("ci\tdevelop, plus docker\ndevelop\t"),
         "{out}"
     );
+}
+
+impl Client {
+    /// `cmd` with `editor` as $EDITOR.
+    fn edit(&self, editor: &std::path::Path, args: &[&str]) -> std::process::Output {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &self.config)
+            .env("PASTOR_STATE_DIR", &self.state)
+            .env("PASTOR_DATA_DIR", &self.data)
+            .env("PATH", &self.path)
+            .env_remove("PASTOR_HEAD")
+            .env_remove("VISUAL")
+            .env("EDITOR", editor)
+            .env("TMPDIR", self.tmp.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+}
+
+const SWEEP: &str = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nrepo = \"/tmp\"\nprompt = \"sweep {{ item.key }}\"\n";
+
+/// The two tables of `job list` on a shepherd: the head's, then this
+/// machine's, as `(header, body)`.
+fn job_sections(text: &str) -> Vec<(String, String)> {
+    text.split("\n\n")
+        .map(|s| {
+            let (header, body) = s.split_once('\n').unwrap_or((s, ""));
+            (header.to_string(), body.trim_end().to_string())
+        })
+        .collect()
+}
+
+/// With a head set, `job list` shows the head's jobs and this machine's in
+/// two tables, a side with none saying so, and `--json` one flat array whose
+/// jobs say `where` they live. `job run|enable|disable|describe|edit` go to
+/// wherever the job's file is: here, or the head.
+#[test]
+fn a_shepherd_lists_and_drives_its_jobs_and_the_head_s() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let head_job = env.config.join("jobs/nightly.toml");
+    let c = client(Some(&env));
+    ok(c.head_set("head-up", &[]));
+
+    let out = c.cmd(&["job", "list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let sections = job_sections(&ok(out));
+    assert_eq!(sections.len(), 2, "{sections:?}");
+    assert_eq!(sections[0].0, "head: head-up");
+    assert!(sections[0].1.starts_with("NAME"), "{sections:?}");
+    assert!(sections[0].1.contains("nightly"), "{sections:?}");
+    assert!(sections[1].0.starts_with("shepherd: "), "{sections:?}");
+    assert!(sections[1].0.ends_with(" (this machine)"), "{sections:?}");
+    assert_eq!(sections[1].1, "no jobs");
+    assert!(stderr.contains("not running"), "{stderr}");
+
+    std::fs::create_dir_all(c.config.join("jobs")).unwrap();
+    let here_job = c.config.join("jobs/sweep.toml");
+    std::fs::write(&here_job, SWEEP).unwrap();
+    let sections = job_sections(&ok(c.cmd(&["job", "list"])));
+    assert!(!sections[0].1.contains("sweep"), "{sections:?}");
+    assert!(sections[1].1.starts_with("NAME"), "{sections:?}");
+    assert!(sections[1].1.contains("sweep"), "{sections:?}");
+    assert!(!sections[1].1.contains("nightly"), "{sections:?}");
+    let jobs: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(c.cmd(&["job", "list", "--json"]))).unwrap();
+    let wheres: Vec<(&str, &str)> = jobs
+        .iter()
+        .map(|j| (j["name"].as_str().unwrap(), j["where"].as_str().unwrap()))
+        .collect();
+    assert_eq!(wheres, [("nightly", "head"), ("sweep", "shepherd")]);
+
+    // Each job where its file is, with no serve here.
+    let text = ok(c.cmd(&["job", "disable", "sweep"]));
+    assert!(text.contains("disabled sweep"), "{text}");
+    assert!(
+        std::fs::read_to_string(&here_job)
+            .unwrap()
+            .contains("enabled = false")
+    );
+    let text = ok(c.cmd(&["job", "disable", "nightly"]));
+    assert!(text.contains("disabled nightly"), "{text}");
+    assert!(
+        std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("enabled = false")
+    );
+    assert!(!c.config.join("jobs/nightly.toml").exists());
+    let d: serde_json::Value =
+        serde_json::from_str(&ok(c.cmd(&["job", "describe", "sweep", "--json"]))).unwrap();
+    assert!(
+        d["file"]
+            .as_str()
+            .unwrap()
+            .starts_with(c.config.to_str().unwrap()),
+        "{d}"
+    );
+    assert_eq!(d["enabled"], false, "{d}");
+    let d: serde_json::Value =
+        serde_json::from_str(&ok(c.cmd(&["job", "describe", "nightly", "--json"]))).unwrap();
+    assert!(
+        d["file"]
+            .as_str()
+            .unwrap()
+            .starts_with(env.config.to_str().unwrap()),
+        "{d}"
+    );
+    assert_eq!(
+        error_code(&c.cmd(&["job", "describe", "ghost"])),
+        "job_not_found"
+    );
+    // A job here runs in this machine's serve, which is down.
+    let out = c.cmd(&["job", "run", "sweep"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not running"));
+
+    let editor = c.tmp.path().join("ed.sh");
+    std::fs::write(&editor, "#!/bin/sh\necho '# edited' >> \"$1\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = ok(c.edit(&editor, &["job", "edit", "sweep"]));
+    assert!(text.contains("saved"), "{text}");
+    assert!(
+        std::fs::read_to_string(&here_job)
+            .unwrap()
+            .ends_with("# edited\n")
+    );
+    assert!(
+        !std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("# edited")
+    );
+
+    // With this machine's serve up, its jobs come from it.
+    let mut serve = c.serve();
+    serve.wait_log("headless");
+    let out = c.cmd(&["job", "list", "--json"]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("not running"));
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&ok(out)).unwrap();
+    assert_eq!(jobs[1]["name"], "sweep", "{jobs:?}");
+    assert_eq!(jobs[1]["where"], "shepherd", "{jobs:?}");
+    let text = ok(c.cmd(&["job", "enable", "sweep"]));
+    assert!(text.contains("enabled sweep"), "{text}");
+    assert!(text.contains("picked it up"), "{text}");
+    let jobs: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(c.cmd(&["job", "list", "--json"]))).unwrap();
+    assert_eq!(jobs[1]["enabled"], true, "{jobs:?}");
+    ok(c.cmd(&["job", "run", "sweep"]));
+    ok(c.cmd(&["job", "enable", "nightly"]));
+    assert!(
+        std::fs::read_to_string(&head_job)
+            .unwrap()
+            .contains("enabled = true")
+    );
+    let text = ok(c.edit(&editor, &["job", "edit", "sweep"]));
+    assert!(text.contains("picked it up"), "{text}");
+    assert!(serve.child.try_wait().unwrap().is_none(), "{}", serve.log());
 }

@@ -635,6 +635,42 @@ pub fn job_rows(jobs: &[JobStatus]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// A job in `job list --json` on a shepherd: its status, and `where` it
+/// lives, so a script need not read the two tables.
+#[derive(Debug, Serialize)]
+pub struct PlacedJob<'a> {
+    #[serde(flatten)]
+    pub job: &'a JobStatus,
+    /// `head` or `shepherd`.
+    #[serde(rename = "where")]
+    pub place: &'static str,
+}
+
+/// The head's jobs, then this machine's, each tagged with where it lives.
+pub fn placed_jobs<'a>(head: &'a [JobStatus], here: &'a [JobStatus]) -> Vec<PlacedJob<'a>> {
+    let tag = |jobs: &'a [JobStatus], place| jobs.iter().map(move |job| PlacedJob { job, place });
+    tag(head, "head").chain(tag(here, "shepherd")).collect()
+}
+
+/// `job list` on a shepherd: the head's jobs under `head: <head>`, then this
+/// machine's under `shepherd: <host> (this machine)`, a blank line between.
+/// A side with no jobs prints its header and `no jobs`.
+pub fn job_sections(head: &str, head_jobs: &[JobStatus], host: &str, here: &[JobStatus]) -> String {
+    let section = |header: String, jobs: &[JobStatus]| {
+        let body = if jobs.is_empty() {
+            "no jobs".to_string()
+        } else {
+            table(&JOB_HEADER, &job_rows(jobs))
+        };
+        format!("{header}\n{}", body.trim_end())
+    };
+    format!(
+        "{}\n\n{}",
+        section(format!("head: {head}"), head_jobs),
+        section(format!("shepherd: {host} (this machine)"), here)
+    )
+}
+
 pub const RUN_HEADER: [&str; 7] = [
     "JOB", "OUTCOME", "ITEMS", "CREATED", "SEEN", "DEFERRED", "ERROR",
 ];
@@ -1166,6 +1202,57 @@ mod tests {
             &[vec!["x".into(), "".into()], vec!["long".into(), "y".into()]],
         );
         assert_eq!(out, "A     BB\nx\nlong  y");
+    }
+
+    fn job_status(name: &str) -> JobStatus {
+        JobStatus {
+            name: name.into(),
+            schedule: Some("every 1h".into()),
+            enabled: true,
+            connector: Some("clock".into()),
+            error: None,
+            last_run_at: None,
+            last_result: None,
+            next_due: None,
+            running: false,
+            flock: None,
+        }
+    }
+
+    /// Two tables, the head's first; a side with none says `no jobs`.
+    #[test]
+    fn job_sections_show_the_head_then_this_machine() {
+        let text = job_sections("user@pi-1", &[job_status("a")], "laptop", &[]);
+        let (head, here) = text.split_once("\n\n").unwrap();
+        assert_eq!(
+            head,
+            format!(
+                "head: user@pi-1\n{}",
+                table(&JOB_HEADER, &job_rows(&[job_status("a")])).trim_end()
+            )
+        );
+        assert_eq!(here, "shepherd: laptop (this machine)\nno jobs");
+        let text = job_sections("user@pi-1", &[], "laptop", &[job_status("b")]);
+        assert!(
+            text.starts_with("head: user@pi-1\nno jobs\n\nshepherd: laptop (this machine)\nNAME"),
+            "{text}"
+        );
+    }
+
+    /// One flat array in `--json`, each job saying where it lives.
+    #[test]
+    fn placed_jobs_say_where_each_job_lives() {
+        let head = [job_status("a")];
+        let here = [job_status("b"), job_status("c")];
+        let v = serde_json::to_value(placed_jobs(&head, &here)).unwrap();
+        let got: Vec<(&str, &str)> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| (j["name"].as_str().unwrap(), j["where"].as_str().unwrap()))
+            .collect();
+        assert_eq!(got, [("a", "head"), ("b", "shepherd"), ("c", "shepherd")]);
+        assert_eq!(v[0]["schedule"], "every 1h");
     }
 
     #[test]
