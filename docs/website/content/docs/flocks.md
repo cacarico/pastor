@@ -28,6 +28,11 @@ description = "Paid work, on the work account"  # optional, for --wide and descr
 agent = "claude"
 agent_args = ["--model", "claude-sonnet-5"]
 summary = "require"  # optional: ask, require or off, before [defaults]
+model = "sonnet"     # optional: before the machine's and [defaults]
+profile = "develop"  # optional: likewise
+priority = "high"    # optional: likewise
+timeout = "1h"       # optional: before [defaults]
+place = "pastor"     # optional: likewise
 
 [[machine]]
 name = "here"
@@ -50,12 +55,29 @@ is under its number there; job slots and burst never pass it. A task whose
 flock is full waits, saying `flock work is at 1 of 1 on here`, and the next
 task in the queue goes.
 
+## what a flock sets
+
+A flock carries every per-task setting `[defaults]` has: `agent`,
+`agent_args`, `agents`, `model`, `profile`, `priority`, `allow`, `deny`,
+`timeout`, `place`, `label` and `summary`. A task gets its own flock's. For
+everything but the agent the flock comes before the machine: a task takes
+each from its own flags or job, then its flock, then the machine, then
+`[defaults]`. So on a machine shared by several projects, each project's flock
+sets its model, permissions, priority and timeout. A machine's own `profile`
+still decides whether a task may ask for `unrestricted` there.
+
 ## which agent
 
-`agent` and `agent_args` on a flock set the agent its tasks run when they name
-none. The same keys on a `[[machine]]` set it for that one machine. A task
-takes the first of: its own `--agent`, its machine, its flock, `[defaults]` in
-`pastor.toml`, then plain `claude`.
+The agent is the exception: the machine knows what is installed and logged in
+there, so it comes first. `agent` and `agent_args` on a flock set the agent
+its tasks run when they name none. The same keys on a `[[machine]]` set it for
+that one machine. A task takes the first of: its own `--agent`, its machine,
+its flock, `[defaults]` in `pastor.toml`, then plain `claude`.
+
+A flock that names an agent names its kind too. A machine whose agent is of
+another kind runs its `agents` entry for the flock's kind; a machine with none
+is skipped for the flock's tasks, and a task pinned there is refused
+(`agent_kind_missing`).
 
 An agent can be a definition in `pastor.toml`, such as a second Claude
 account:
