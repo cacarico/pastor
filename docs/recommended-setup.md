@@ -175,13 +175,12 @@ For a review, fetch and check out the pull request's branch.
 ## Keep slots free
 
 A `done` task holds its machine slot until its pane closes, which by default
-is 15 minutes later, so you can still attach and read its last screen. With
-many short tasks, that leaves machines full of finished work. When you'd
-rather have the slot:
+is 5 seconds later, so finished work does not keep machines full. When you
+want time to attach and read a task's last screen, keep the pane longer:
 
 ```toml
 # pastor.toml
-close_done_after = "5s"
+close_done_after = "15m"
 ```
 
 A task that goes `stale` keeps its slot until you close it, and so does a
