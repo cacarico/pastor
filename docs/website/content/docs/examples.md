@@ -128,20 +128,25 @@ task_state() {
 }
 live() { case "$1" in queued|starting|running|blocked|paused) return 0 ;; esac; return 1; }
 
+# Open review threads on a PR, over every page of them.
 unresolved() {
-  gh api graphql -F owner="${repo%/*}" -F name="${repo#*/}" -F pr="$1" -f query='
-    query($owner: String!, $name: String!, $pr: Int!) {
+  gh api graphql --paginate -F owner="${repo%/*}" -F name="${repo#*/}" -F pr="$1" -f query='
+    query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
       repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-        reviewThreads(first: 100) { nodes { isResolved } } } } }' \
-    --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length'
+        reviewThreads(first: 100, after: $endCursor) {
+          nodes { isResolved } pageInfo { hasNextPage endCursor } } } } }' \
+    --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' |
+    awk '{ n += $1 } END { print n + 0 }'
 }
 
 # One line per open PR: number, head sha, merge state, review, checks.
-gh pr list --repo "$repo" --search draft:false \
+# No checks reported yet counts as PENDING, never GREEN.
+gh pr list --repo "$repo" --search draft:false --limit 200 \
   --json number,headRefOid,mergeStateStatus,reviewDecision,statusCheckRollup \
   --jq '.[] | "\(.number) \(.headRefOid[0:7]) \(.mergeStateStatus) \(.reviewDecision // "" | if . == "" then "NONE" else . end) \(
     [.statusCheckRollup[] | (.conclusion // "") as $c | if $c != "" then $c else (.state // "PENDING") end]
-    | if any(. == "FAILURE" or . == "ERROR" or . == "TIMED_OUT" or . == "CANCELLED") then "FAILING"
+    | if length == 0 then "PENDING"
+      elif any(. == "FAILURE" or . == "ERROR" or . == "TIMED_OUT" or . == "CANCELLED") then "FAILING"
       elif all(. == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED") then "GREEN"
       else "PENDING" end)"' >"$dir/prs"
 
@@ -178,9 +183,12 @@ while read -r pr sha merge review checks <&3; do
       echo "PR #$pr: approved and green, but the merge was refused"
     fi
   elif [ "$merge" = BEHIND ] && [ -z "$rebasing" ]; then
-    gh pr update-branch "$pr" --repo "$repo" --rebase >&2
-    echo "$pr" >"$dir/rebasing"
-    rebasing=$pr
+    # A rebase that conflicts is refused; the PR shows DIRTY next round
+    # and gets a fix agent then.
+    if gh pr update-branch "$pr" --repo "$repo" --rebase >&2; then
+      echo "$pr" >"$dir/rebasing"
+      rebasing=$pr
+    fi
   elif [ "$merge" = BLOCKED ]; then
     echo "PR #$pr: approved and green, but GitHub still blocks the merge"
   fi
