@@ -185,6 +185,9 @@ impl RemoteHead {
             args.push("-o".to_string());
             args.push(opt);
         }
+        if self.control_path.is_none() {
+            args.extend(crate::herdr::transport::no_multiplexing());
+        }
         args.push("--".to_string());
         args.push(self.ssh.clone());
         args.push(crate::herdr::transport::posix_command(&format!(
@@ -538,8 +541,11 @@ mod tests {
 
         let p = Paths::new(tmp.path().join("c"), state(UNIX_PATH_MAX - 50));
         let args = RemoteHead::new(&p, "user@pi-1", None, HeadSource::File).ssh_args();
+        for opt in ["ControlMaster=no", "ControlPath=none"] {
+            assert!(args.windows(2).any(|w| w == ["-o", opt]), "{opt}: {args:?}");
+        }
         assert!(
-            !args.iter().any(|a| a.starts_with("Control")),
+            !args.iter().any(|a| a.starts_with("ControlPersist")),
             "no multiplexing when nothing fits: {args:?}"
         );
         assert!(
