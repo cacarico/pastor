@@ -2475,10 +2475,11 @@ mod tests {
     #[test]
     fn move_queued_lifts_and_lowers() {
         use crate::queue::QueueSpot::*;
+        use crate::task::TaskRole;
         use Priority::*;
         let s = Store::open_in_memory().unwrap();
         let at = |p: Priority| {
-            s.insert_task_at(new_task("run"), p, Some("task run"))
+            s.insert_task_at(new_task("run"), p, Some("task run"), TaskRole::Agent)
                 .unwrap()
                 .id
         };

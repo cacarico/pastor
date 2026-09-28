@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::age;
-use crate::dispatch::{MachineView, pick_machine_where};
+use crate::dispatch::{Claim, MachineView, pick_machine_where};
 use crate::task::Task;
 
 /// Where `pastor queue move` puts a task. Positions count from 1 over the
@@ -144,7 +144,8 @@ fn why_waiting(
     {
         return note.clone();
     }
-    if let Some(m) = pick_machine_where(views, flock, &task.spec, &|m| accepts(task, m)) {
+    let claim = Claim::of(task);
+    if let Some(m) = pick_machine_where(views, flock, &task.spec, claim, &|m| accepts(task, m)) {
         let v = views.iter_mut().find(|v| v.name == m).expect("picked");
         v.live += 1;
         return format!("next pass: {m} has room");
@@ -195,7 +196,7 @@ pub fn rows(entries: &[QueueEntry]) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::{DispatchSpec, Priority, TaskState};
+    use crate::task::{DispatchSpec, Priority, TaskRole, TaskState};
     use chrono::Utc;
 
     fn task(id: i64, flock: Option<&str>, machine: Option<&str>) -> Task {
@@ -210,6 +211,7 @@ mod tests {
                 ..serde_json::from_value(serde_json::json!({"agent": "claude"})).unwrap()
             },
             state: TaskState::Queued,
+            role: TaskRole::Agent,
             machine: None,
             workspace_id: None,
             pane_id: None,
@@ -235,8 +237,11 @@ mod tests {
         MachineView {
             name: name.into(),
             max_agents: max,
+            job_slots: 0,
+            burst: 0,
             tags: vec![],
             live,
+            live_jobs: 0,
             healthy,
             flock: flock.into(),
         }

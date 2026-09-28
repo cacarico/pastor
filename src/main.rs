@@ -3773,6 +3773,7 @@ mod tests {
             "task run" | "task describe" | "task read" | "task attach" | "task retry"
             | "task close" | "task done" | "job run" | "machine open" => &["x"],
             "task send" | "task priority" => &["x", "y"],
+            "queue move" => &["x", "--top"],
             "task prune" => &["--older-than", "1d", "--done"],
             "completions" => &["bash"],
             "setup" => &["systemd"],
