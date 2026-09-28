@@ -143,6 +143,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   refuses a task pinned to it (`agent_kind_missing`). A machine's own
   profile still decides whether `unrestricted` may run there; a flock's
   never lifts it.
+- The agent skill (`pastor --skill`) has a checklist for bringing a new
+  machine into a flock: herdr, pastor and the agent on the PATH of a
+  non-interactive ssh command, every repo cloned at the same path, `pastor
+  trust add` for each repo up front, the agent's first-run setup finished
+  once, and a pinned test task. "When something goes wrong" gains the
+  matching symptoms.
 - `pastor machine move` takes the machine out of every flock and lists it
   in the one named, with its `max_agents`, instead of setting its `flock`
   key and leaving other flocks' `machines` alone.
