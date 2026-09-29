@@ -610,9 +610,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("head.sock");
-        // A socket file with no permissions: connecting fails, but not with
-        // the "nothing is listening here" kind `relay`'s guard checks for.
-        std::fs::write(&socket, b"").unwrap();
+        // A live socket with no permissions: connecting fails with a
+        // permission error, not the "nothing is listening here" kind
+        // `relay`'s guard checks for.
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
         let err = run(&socket, b"{}\n".as_slice(), &mut Vec::new())
             .await
