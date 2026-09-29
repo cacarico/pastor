@@ -1751,6 +1751,7 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
             ..Default::default()
         },
         summary: Default::default(),
+        cwd: None,
     })
 }
 

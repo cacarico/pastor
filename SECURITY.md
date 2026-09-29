@@ -31,8 +31,13 @@ own `.env` and the `PASTOR_*` variables. It is not limited to its `.env`:
 every connector, and only the secrets its manifest declares are redacted from
 its run logs. It can read that machine's user's files, including other
 connectors' `.env` files, and `PASTOR_STATE_DIR` points it at that machine's
-`pastor.sock`; on the head, that also means the ssh ControlMaster sockets,
-which a headless serve's shepherd does not hold. Hooks that do not set
+`pastor.sock`; on the head, that also means the ssh ControlMaster sockets to
+every machine the head drives. A headless serve's shepherd holds one such
+socket too, but only to reach its own remote head (`ssh/head-%C` under its
+own state directory, not the fleet's machine masters, which only the head
+opens): a connector on a headless serve can reuse that one socket to act as
+the shepherd on the head, but cannot reach the other ssh machines directly.
+Hooks that do not set
 `only_own = true` hear every task's events, but get another connector's
 items, prompts and summaries blanked. Start `pastor serve` from a minimal
 environment, and review a connector as you would any program you run with

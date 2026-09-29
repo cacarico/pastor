@@ -447,6 +447,9 @@ async fn dispatch_steps(
         Some(repo) => Some(repo),
         None => no_repo_dir(conn, task.machine.as_deref()).await?,
     };
+    if repo.is_none() {
+        task.spec.cwd = dir.clone();
+    }
     task.spec.label.name = None;
     task.spec.label.note = None;
     let pane_id = match (host, repo.as_deref()) {
@@ -1213,6 +1216,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         }
     }
 
@@ -2296,13 +2300,22 @@ mod tests {
                     .into_iter()
                     .collect();
                 assert_eq!(fake.made_dirs(), made, "{place:?} with home {home:?}");
+                assert_eq!(
+                    t.spec.cwd,
+                    cwd.as_str().map(str::to_string),
+                    "{place:?} with home {home:?}"
+                );
             }
         }
     }
 
     /// A folder that cannot be made (a file in the way, no permission) is no
     /// reason to refuse the task: it starts in the home, as before this
-    /// folder, and Claude asks for trust there.
+    /// folder, and Claude asks for trust there. The home is also what gets
+    /// recorded on the task, so `pastor task attach` resumes there too
+    /// (`reopen::a_home_fallback_resumes_in_the_home_even_once_the_folder_can_be_made`),
+    /// instead of asking `no_repo_dir` again and getting a different answer
+    /// once the folder can be made.
     #[tokio::test]
     async fn a_task_with_no_repo_falls_back_to_home_when_the_folder_cannot_be_made() {
         let fake = FakeHerdr::new();
@@ -2321,6 +2334,7 @@ mod tests {
             .find(|r| r.method == "workspace.create" && r.params["label"] != "pastor")
             .unwrap();
         assert_eq!(req.params["cwd"], "/home/fake");
+        assert_eq!(t.spec.cwd.as_deref(), Some("/home/fake"));
     }
 
     /// Where `~` cannot be resolved the task fails up front with a reason,

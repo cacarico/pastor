@@ -1305,6 +1305,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -1374,6 +1375,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -1587,6 +1589,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         });
         let out = task_detail(&t);
         assert!(
@@ -1623,6 +1626,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);
@@ -1670,6 +1674,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
         let note = task_rows(std::slice::from_ref(&t))[0]
@@ -1701,6 +1706,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
         let out = task_detail(&t);

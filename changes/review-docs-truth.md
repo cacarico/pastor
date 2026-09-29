@@ -31,3 +31,11 @@
   tool prompts; and the skill's remote-head section now names `task
   attach`, `machine open` and `serve status`/`serve stop` among the
   commands that stay local.
+- A GPT (Codex) pass over the docs review: `SECURITY.md` now says a
+  headless serve's shepherd does hold one ssh ControlMaster socket, to its
+  own remote head, and that a connector on it can reuse that socket, not
+  that it holds none. `pastor task attach` on a repo-less task now resumes
+  in the directory dispatch actually started it in (`~/pastor-tasks`, or
+  the home if that folder could not be made), recorded on the task instead
+  of asked for again, which could answer differently once the folder is
+  fixed and leave `claude --resume` looking in the wrong place.

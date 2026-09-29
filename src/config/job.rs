@@ -390,6 +390,7 @@ impl Job {
                     ..Default::default()
                 },
                 summary: Default::default(),
+                cwd: None,
             },
         })
     }

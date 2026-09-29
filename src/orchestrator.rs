@@ -1639,6 +1639,7 @@ impl Runner {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         };
         let task = self
             .fleet
@@ -2942,6 +2943,7 @@ prompt = "You are the night orchestrator."
                         session_id: None,
                         label: Default::default(),
                         summary: Default::default(),
+                        cwd: None,
                     },
                     flock: "default".into(),
                 },
