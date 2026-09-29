@@ -2241,6 +2241,7 @@ mod tests {
             DESCRIPTION_PROTOCOL,
             QUEUE_PROTOCOL,
             PREEMPT_PROTOCOL,
+            NOW_PROTOCOL,
             SUMMARY_PROTOCOL,
             LABEL_PROTOCOL,
             SUMMARY_MODE_PROTOCOL,
