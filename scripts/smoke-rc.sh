@@ -15,7 +15,10 @@
 # PROFILES=1 with REPO and CLAUDE and/or OPENCODE also runs `make
 # smoke-profiles` (see scripts/smoke-profiles.sh). The head hands the agent
 # its profile, so it must run the tag under test: the script refuses unless
-# `pastor --version` on PATH is the tag's version.
+# the running head answers with the tag's version. It asks the head, not the
+# CLI: `$PASTOR serve status --json` here, or over ssh on the head that
+# `$PASTOR head show` names. PASTOR (default `pastor`) is the CLI that
+# smoke-profiles uses too, and is passed on to it.
 #
 # Prints one Markdown block: the tag, the label, the herdr version, pass or
 # fail per suite, and the last lines of each failure, with the worktree
@@ -27,10 +30,32 @@ TAG=${1:-}
 SESSION=${2:-default}
 LABEL=${3:-unnamed machine}
 PROFILES=${PROFILES:-}
+PASTOR=${PASTOR:-pastor}
 REMOTE=${REMOTE:-origin}
 TAIL=${TAIL:-30}
 
 say() { echo "smoke-rc: $*" >&2; }
+
+# The value of a string field in `head show --json` (one field per line).
+field() {
+    sed -n "s/^ *\"$1\": \"\(.*\)\",\{0,1\}\$/\1/p"
+}
+
+# The version of the head `$PASTOR task run` talks to, from its answer to a
+# ping; empty when no head answers, or when what answers is a headless serve.
+head_version() {
+    show=$("$PASTOR" head show --json 2>/dev/null) || return 0
+    if printf '%s\n' "$show" | grep -q '"remote": true'; then
+        dest=$(printf '%s\n' "$show" | field ssh)
+        bin=$(printf '%s\n' "$show" | field pastor)
+        [ -n "$dest" ] || return 0
+        status=$(ssh -o BatchMode=yes "$dest" "${bin:-pastor} serve status --json" 2>/dev/null)
+    else
+        status=$("$PASTOR" serve status --json 2>/dev/null)
+    fi
+    printf '%s\n' "$status" | grep -q '"role":"head"' || return 0
+    printf '%s\n' "$status" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p'
+}
 
 if [ -z "$TAG" ]; then
     say "usage: scripts/smoke-rc.sh <tag> [session] [label]"
@@ -56,9 +81,9 @@ if [ -n "$PROFILES" ]; then
         exit 2
     fi
     want=${TAG#v}
-    have=$(pastor --version 2>/dev/null | awk '{ print $2 }')
+    have=$(head_version)
     if [ "$have" != "$want" ]; then
-        say "smoke-profiles needs the head on $want; pastor --version says ${have:-nothing}"
+        say "smoke-profiles needs the head on $want; the head runs ${have:-nothing that answered}"
         exit 2
     fi
 fi
@@ -118,7 +143,7 @@ if [ "$build" = pass ]; then
     smoke=$(suite smoke smoke SESSION="$SESSION")
     if [ -n "$PROFILES" ]; then
         profiles=$(suite smoke-profiles smoke-profiles \
-            REPO="$REPO" CLAUDE="${CLAUDE:-}" OPENCODE="${OPENCODE:-}")
+            PASTOR="$PASTOR" REPO="$REPO" CLAUDE="${CLAUDE:-}" OPENCODE="${OPENCODE:-}")
     fi
 elif [ -n "$PROFILES" ]; then
     profiles="not run"

@@ -3200,6 +3200,8 @@ and runs `make smoke` there (`SESSION` picks the herdr session), then prints
 one Markdown block with the tag, the machine's `LABEL`, the herdr version,
 pass or fail per suite and the last lines of a failure, with paths and the
 hostname scrubbed. With `PROFILES=1` and `REPO`, `CLAUDE` and/or `OPENCODE`
-it runs `make smoke-profiles` too, and refuses unless `pastor --version`
-is the tag's version, since the head must run the candidate. The exit status
-is the result; the worktree is removed either way.
+it runs `make smoke-profiles` too, and refuses unless the running head
+answers with the tag's version (`serve status --json`, over ssh when `head
+show` names a remote head), since the head must run the candidate; `PASTOR`
+picks the CLI for both. The exit status is the result; the worktree is
+removed either way.

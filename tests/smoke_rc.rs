@@ -16,6 +16,27 @@ smoke:\n\t@echo smoke in session $(SESSION)\n\
 smoke-profiles:\n\t@echo \"profiles $(REPO) $(CLAUDE) $(OPENCODE)\"\n\
 \t@echo \"PASS claude on $(CLAUDE)\"\n";
 
+// A pastor whose own `--version` is always the tag's, so only asking the head
+// tells a stale head apart. The head it pings runs $FAKE_PASTOR_VERSION;
+// FAKE_REMOTE makes `head show` name a remote head, reached through ssh.
+const FAKE_PASTOR: &str = r#"case "$1 $2" in
+"head show")
+    if [ -n "${FAKE_REMOTE:-}" ]; then
+        printf '{\n  "remote": true,\n  "ssh": "user@head-1",\n  "pastor": "pastor",\n  "from": "file"\n}\n'
+    else
+        printf '{\n  "remote": false,\n  "ssh": null,\n  "pastor": null,\n  "from": null\n}\n'
+    fi ;;
+"serve status")
+    [ -n "${FAKE_REMOTE:-}" ] && [ -z "${FAKE_ON_HEAD:-}" ] && { echo 'not running' >&2; exit 1; }
+    printf '{"log":null,"pid":1,"protocol":22,"role":"head","running":true,"version":"%s"}\n' "$FAKE_PASTOR_VERSION" ;;
+*) echo "pastor 1.2.0-rc.1" ;;
+esac"#;
+
+// ssh runs its last argument here, as the head, recording where it went.
+const FAKE_SSH: &str = r#"for a; do last=$a; done
+echo "$@" >> "$TMPDIR/../ssh.log"
+FAKE_ON_HEAD=1 sh -c "$last""#;
+
 fn script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/smoke-rc.sh")
 }
@@ -68,7 +89,8 @@ impl Env {
         std::fs::create_dir(&bin).unwrap();
         for (name, body) in [
             ("herdr", "echo herdr 0.9.1"),
-            ("pastor", "echo \"pastor $FAKE_PASTOR_VERSION\""),
+            ("pastor", FAKE_PASTOR),
+            ("ssh", FAKE_SSH),
         ] {
             let p = bin.join(name);
             std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -101,6 +123,7 @@ impl Env {
             .env("TMPDIR", self.tmp())
             .env("FAKE_PASTOR_VERSION", "0.0.1")
             .env_remove("PROFILES")
+            .env_remove("PASTOR")
             .env_remove("REPO")
             .env_remove("CLAUDE")
             .env_remove("OPENCODE")
@@ -189,5 +212,52 @@ fn profiles_need_the_head_on_the_tag() {
     let text = stdout(&out);
     assert!(out.status.success(), "{out:?}");
     assert!(text.contains("| smoke-profiles | pass |"), "{text}");
+    env.assert_clean();
+}
+
+#[test]
+fn profiles_ask_a_remote_head_over_ssh() {
+    let env = Env::new();
+    let vars = [
+        ("PROFILES", "1"),
+        ("REPO", "~/src/app"),
+        ("CLAUDE", "m1"),
+        ("FAKE_REMOTE", "1"),
+    ];
+    let out = env.run(&[TAG, "s", "fleet-pi"], &vars);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    env.assert_clean();
+
+    let mut vars = vars.to_vec();
+    vars.push(("FAKE_PASTOR_VERSION", "1.2.0-rc.1"));
+    let out = env.run(&[TAG, "s", "fleet-pi"], &vars);
+    assert!(out.status.success(), "{out:?}");
+    let log = std::fs::read_to_string(env.root.path().join("ssh.log")).unwrap();
+    assert!(
+        log.contains("user@head-1 pastor serve status --json"),
+        "{log}"
+    );
+    env.assert_clean();
+}
+
+#[test]
+fn profiles_use_the_pastor_named_by_pastor() {
+    let env = Env::new();
+    let other = env.root.path().join("pastor-rc");
+    std::fs::write(
+        &other,
+        format!("#!/bin/sh\nFAKE_PASTOR_VERSION=1.2.0-rc.1\n{FAKE_PASTOR}\n"),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let vars = [
+        ("PROFILES", "1"),
+        ("REPO", "~/src/app"),
+        ("CLAUDE", "m1"),
+        ("PASTOR", other.to_str().unwrap()),
+    ];
+    let out = env.run(&[TAG, "s", "fleet-pi"], &vars);
+    assert!(out.status.success(), "{out:?}");
     env.assert_clean();
 }
