@@ -53,6 +53,17 @@ pub const QUEUE_HEADER: [&str; 7] = [
 /// agent its model suits; cleared once one takes it.
 pub const WAITING_FOR_MODEL: &str = "waiting for a machine";
 
+/// How a queued task's error starts while every model it may run is on an
+/// exhausted account: `waiting: claude-personal exhausted until 03:00
+/// (5-hour limit, seen by t-412)`; cleared once it starts.
+pub const WAITING_FOR_ACCOUNT: &str = "waiting";
+
+/// Whether `error` is a note dispatch left on a queued task about why it
+/// waits (`WAITING_FOR_MODEL`, `WAITING_FOR_ACCOUNT`), not a real error.
+pub fn is_waiting_note(error: &str) -> bool {
+    error.starts_with(WAITING_FOR_MODEL) || error.starts_with(&format!("{WAITING_FOR_ACCOUNT}: "))
+}
+
 impl QueueEntry {
     /// The machine it is pinned to (or paused on), else its flock.
     pub fn place(&self) -> String {
@@ -152,7 +163,7 @@ fn why_waiting(
     accepts: &dyn Fn(&Task, &str) -> bool,
 ) -> String {
     if let Some(note) = &task.error
-        && note.starts_with(WAITING_FOR_MODEL)
+        && is_waiting_note(note)
     {
         return note.clone();
     }

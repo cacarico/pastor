@@ -3215,6 +3215,7 @@ mod tests {
                         model_from: None,
                         fallback: vec![],
                         fallback_from: None,
+                        fallback_use: None,
                         profile: None,
                         profile_from: None,
                         timeout_from: None,

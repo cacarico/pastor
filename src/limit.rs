@@ -180,6 +180,20 @@ impl AccountLimit {
         }
     }
 
+    /// What ran out, as `Limit::what` says it.
+    pub fn what(&self) -> String {
+        what_of(&self.line, self.hard, self.no_credit)
+    }
+
+    /// `claude-personal exhausted until 03:00`: `note` without what ran out.
+    pub fn short_note(&self, now: DateTime<Utc>) -> String {
+        format!(
+            "{} exhausted until {}",
+            self.name(),
+            local_time(self.retry_at, now)
+        )
+    }
+
     /// `claude-personal exhausted until 03:00 (5-hour limit, seen by t-412)`:
     /// why a task does not start on it, with `retry_at` in local time.
     pub fn note(&self, now: DateTime<Utc>) -> String {
@@ -191,7 +205,7 @@ impl AccountLimit {
             "{} exhausted until {} ({}{seen})",
             self.name(),
             local_time(self.retry_at, now),
-            what_of(&self.line, self.hard, self.no_credit),
+            self.what(),
         )
     }
 }

@@ -296,9 +296,10 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
     let source = t.spec.agent_source.as_deref();
     let from = |label: Option<&String>| label.map(|l| format!(" (from {l})")).unwrap_or_default();
     let agent = format!("{}{}", t.spec.agent, from(source.map(|s| &s.agent)));
-    let model = match t.model() {
-        Some(m) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
-        None => "-".to_string(),
+    let model = match (t.model(), source.and_then(|s| s.fallback_use.as_ref())) {
+        (Some(m), Some(used)) => format!("{m} ({used})"),
+        (Some(m), None) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
+        (None, _) => "-".to_string(),
     };
     // `-` with where it came from: a layer's `[]` gave the task none.
     let fallback = match t.fallback() {
@@ -1479,6 +1480,7 @@ mod tests {
                 model_from: None,
                 fallback: vec![],
                 fallback_from: None,
+                fallback_use: None,
                 profile: None,
                 profile_from: None,
                 timeout_from: None,
@@ -1505,6 +1507,7 @@ mod tests {
                 model_from: None,
                 fallback: vec![],
                 fallback_from: None,
+                fallback_use: None,
                 profile: None,
                 profile_from: None,
                 timeout_from: None,
