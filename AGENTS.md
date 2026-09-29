@@ -119,9 +119,11 @@ down here because getting them wrong cost a day.
 - Vocabulary is fixed: machine, flock, head, job, task, connector, agent,
   shepherd (a headless `pastor serve` on a machine whose head is elsewhere),
   orchestrator (an agent pastor runs to drive the others, from
-  `orchestrators/<name>.toml`) and pull machine (`pull = true`: its
-  shepherd asks the head for work, the head never connects to it).
-  Agents are never renamed; hosts are not "sheep". "Plugin" is kept free
+  `orchestrators/<name>.toml`), pull machine (`pull = true`: its
+  shepherd asks the head for work, the head never connects to it) and
+  provisioner. What checks and sets up a machine for agents is a
+  provisioner; it is installed and run like a connector, and it is never
+  called a plugin. Agents are never renamed; hosts are not "sheep". "Plugin" is kept free
   for code that changes how pastor itself behaves; what installs a connector
   command or event hooks is a connector. The Claude Code plugin `pastor` that
   ships the skills is Claude Code's word, not pastor's.
