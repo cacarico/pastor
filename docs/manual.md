@@ -1692,7 +1692,7 @@ POS  TASK  LEVEL   WHERE          FROM         WAITED  WHY NOT YET
 POS numbers the whole queue, WHERE is the machine the task is pinned to or
 else its flock, FROM is `task run` or `job <name>`, and WAITED is how long
 since it was queued. A task that has aged shows the level it had before
-beside its own, as `high (was low)` (see Ageing below). WHY NOT YET
+beside its own, as `high (was low)` (see Ageing above). WHY NOT YET
 plays a dispatch pass through on the machines as the head sees them, each
 task that fits taking its slot, so a task behind the last free slot reads its
 flock as full: `flock <f> has no machines`, `no machine in flock <f> is
