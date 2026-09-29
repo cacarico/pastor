@@ -6,3 +6,6 @@
   `started` in `task list` and `task describe` now shows that latest start.
 - A `blocked` task no longer goes `stale` past its timeout; it waits for a
   person, however long that takes.
+- A task unblocked past its old deadline no longer goes `stale` the moment
+  it starts working again: the timeout restarts from when the block clears,
+  not from the dispatch or resume before it.

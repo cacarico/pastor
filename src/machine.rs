@@ -2856,6 +2856,12 @@ impl Actor {
                     if !still_pending(t) {
                         return false;
                     }
+                    if t.state == TaskState::Blocked {
+                        // Same as `apply`: a startup block cleared past the
+                        // old deadline gets a fresh timeout, not one already
+                        // spent waiting for a person.
+                        t.started_at = Some(Utc::now());
+                    }
                     t.prompt_pending = false;
                     t.state = TaskState::Running;
                     t.error = None;
@@ -3256,6 +3262,12 @@ impl Actor {
             // "agent blocked during startup; answer its prompt" was advice about
             // a state the task has left; it is not an error on a running task.
             task.error = None;
+        }
+        if from == TaskState::Blocked && to == TaskState::Running {
+            // The timeout counts the agent's own time, not a person's: a
+            // block cleared past the old deadline must not read as already
+            // timed out the moment it starts working again.
+            task.started_at = Some(Utc::now());
         }
         if to == TaskState::Failed && task.error.is_none() {
             task.error = Some("agent process exited".into());
@@ -4281,6 +4293,44 @@ mod tests {
             format!("hi\n\n{}", crate::task::SUMMARY_ASK),
             "our prompt, not a stray one, asking for a summary"
         );
+    }
+
+    /// A startup block cleared past the old deadline gets a fresh timeout
+    /// too: `deliver_pending_prompt` takes the same branch `apply` does for
+    /// a later block, not the time spent waiting for a person at launch.
+    #[tokio::test]
+    async fn a_startup_block_cleared_past_its_timeout_gets_fresh_time() {
+        let fake = FakeHerdr::new();
+        fake.set_ready_after(Duration::from_secs(2));
+        let watcher = fake.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(a) = watcher.agents().first() {
+                    watcher.set_status(&a.pane_id, AgentStatus::Blocked);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(t.prompt_pending);
+        start_an_hour_ago(&store, t.id);
+        fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
+        wait_for("running with the prompt sent", || {
+            let t = store.get_task(t.id).unwrap().unwrap();
+            t.state == TaskState::Running && !t.prompt_pending
+        })
+        .await;
+        // Some reconciles later, within the new timeout, not the old one.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
     /// A store error in reconcile is pastor's problem, not the machine's: the
@@ -8290,6 +8340,31 @@ mod tests {
         start_an_hour_ago(&store, t.id);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+    }
+
+    /// A block cleared past the old deadline gets a fresh timeout: the time
+    /// spent waiting for a person does not count against it.
+    #[tokio::test]
+    async fn a_block_cleared_past_its_timeout_gets_fresh_time() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Blocked);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        start_an_hour_ago(&store, t.id);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Blocked,
+            "still waiting on a person"
+        );
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        // Some reconciles later, within the new timeout, not the old one.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
     /// A running task past its timeout that a reconcile is the first to see
