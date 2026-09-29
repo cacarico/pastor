@@ -295,6 +295,70 @@ pub struct Fleet {
     /// Pull machines by name, since each was added or last heard from.
     pull_seen: std::sync::Mutex<HashMap<String, PullSeen>>,
     dispatch_lock: tokio::sync::Mutex<()>,
+    /// Tasks a pass has placed and not yet heard back about, by id. `views`
+    /// counts them on their machine, and a pass skips them, so a pass that
+    /// runs while another's sends are out neither places them again nor
+    /// fills the slots they are about to take.
+    in_flight: InFlightMap,
+    /// How long the fleet waits for an actor's reply (`bounded`).
+    reply_wait: RwLock<Duration>,
+}
+
+/// A task a dispatch pass placed, as `Fleet::views` counts it.
+#[derive(Debug, Clone)]
+struct InFlight {
+    machine: String,
+    flock: Option<String>,
+    from_job: bool,
+}
+
+type InFlightMap = Arc<std::sync::Mutex<HashMap<i64, InFlight>>>;
+
+/// Holds a task in `Fleet::in_flight` until the send for it is answered,
+/// fails, times out or is dropped.
+struct InFlightGuard {
+    map: InFlightMap,
+    id: i64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.map.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// An actor that gave no reply within `Fleet::bounded`'s wait.
+#[derive(Debug, thiserror::Error)]
+#[error("machine {machine} did not answer within {after:?}")]
+pub struct NoReply {
+    pub machine: String,
+    pub after: Duration,
+}
+
+/// The wait `Fleet::bounded` starts with, before a config sets it: twice
+/// the default `request_timeout`, which bounds the actor's own work on a
+/// request.
+fn reply_wait_for(request_timeout: Duration) -> Duration {
+    request_timeout * 2
+}
+
+/// A dispatch pass's decision, sent once the pass has let go of the lock.
+struct Placed {
+    task: Task,
+    /// Where it goes.
+    handle: MachineHandle,
+    what: PlaceKind,
+    _held: InFlightGuard,
+}
+
+enum PlaceKind {
+    Dispatch,
+    /// Pause `victim` on `on` first, then dispatch if that worked.
+    Preempt {
+        on: MachineHandle,
+        victim: i64,
+    },
+    Resume,
 }
 
 impl Fleet {
@@ -323,6 +387,8 @@ impl Fleet {
             forward: None,
             pull_seen: Default::default(),
             dispatch_lock: tokio::sync::Mutex::new(()),
+            in_flight: Default::default(),
+            reply_wait: RwLock::new(reply_wait_for(MachineSettings::default().request_timeout)),
         }
     }
 
@@ -365,6 +431,8 @@ impl Fleet {
             forward: None,
             pull_seen: Default::default(),
             dispatch_lock: tokio::sync::Mutex::new(()),
+            in_flight: Default::default(),
+            reply_wait: RwLock::new(reply_wait_for(MachineSettings::default().request_timeout)),
         }
     }
 
@@ -441,6 +509,27 @@ impl Fleet {
             config.max_orchestrators,
             std::sync::atomic::Ordering::Relaxed,
         );
+        *self.reply_wait.write().unwrap() = reply_wait_for(config.request_timeout_duration());
+    }
+
+    /// Set how long `bounded` waits, for a test.
+    #[cfg(test)]
+    pub fn set_reply_wait(&self, wait: Duration) {
+        *self.reply_wait.write().unwrap() = wait;
+    }
+
+    /// `request`, a request to `machine`'s actor, or `NoReply` once the
+    /// actor has not answered for twice `request_timeout`. The actor bounds
+    /// its own herdr calls; this bounds the wait for an actor that is stuck
+    /// or has a queue ahead of the request. The request itself stays in the
+    /// actor's queue and may still be carried out later.
+    pub async fn bounded<T>(
+        &self,
+        machine: &str,
+        request: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        let after = *self.reply_wait.read().unwrap();
+        bounded(machine, after, request).await
     }
 
     /// `max_orchestrators` in `pastor.toml` as last applied.
@@ -858,6 +947,27 @@ impl Fleet {
                 m.shutting_down = true;
             }
         }
+        // Every actor that goes is stopped at once, so a reload that drops
+        // several waits about one `SHUTDOWN_WAIT`, not one per machine.
+        let stops: Vec<_> = plan
+            .iter()
+            .filter_map(|s| match s {
+                Step::Replace(o) => Some(&o.handle),
+                _ => None,
+            })
+            .chain(gone.iter().map(|o| &o.handle))
+            .map(|h| {
+                let h = h.clone();
+                tokio::spawn(async move { h.shutdown().await })
+            })
+            .collect();
+        let mut outcomes = Vec::with_capacity(stops.len());
+        for stop in stops {
+            // A shutdown task that panicked says nothing about the actor:
+            // keep it held, and the next reload waits for it again.
+            outcomes.push(stop.await.unwrap_or(ShutdownOutcome::StillRunning));
+        }
+        let mut outcomes = outcomes.into_iter();
         let mut members: Vec<Member> = Vec::new();
         for (step, m) in plan.into_iter().zip(&flock.machines) {
             members.push(match step {
@@ -866,7 +976,7 @@ impl Fleet {
                     diff.added.push(m.name.clone());
                     self.spawn(spawner, m, settings)
                 }
-                Step::Replace(o) => match o.handle.shutdown().await {
+                Step::Replace(o) => match outcomes.next().expect("one outcome per stop") {
                     ShutdownOutcome::Finished => {
                         diff.retargeted.push(m.name.clone());
                         self.spawn(spawner, m, settings)
@@ -879,7 +989,7 @@ impl Fleet {
             });
         }
         for o in gone {
-            match o.handle.shutdown().await {
+            match outcomes.next().expect("one outcome per stop") {
                 ShutdownOutcome::Finished => diff.removed.push(o.handle.name.clone()),
                 ShutdownOutcome::StillRunning => {
                     diff.shutting_down.push(o.handle.name.clone());
@@ -948,14 +1058,25 @@ impl Fleet {
         }
     }
 
+    /// Every machine as a dispatch pass sees it: its live counts include
+    /// the tasks placed on it that are still in flight (`in_flight`).
     pub fn views(&self) -> Vec<MachineView> {
         let wanted = self.flock();
+        let in_flight: Vec<InFlight> = self.in_flight.lock().unwrap().values().cloned().collect();
         self.members
             .read()
             .unwrap()
             .iter()
             .map(|m| {
-                let s = m.handle.snapshot();
+                let mut s = m.handle.snapshot();
+                for f in in_flight.iter().filter(|f| f.machine == m.handle.name) {
+                    s.live += 1;
+                    s.live_jobs += usize::from(f.from_job);
+                    match s.live_by_flock.iter_mut().find(|(n, _)| *n == f.flock) {
+                        Some((_, n)) => *n += 1,
+                        None => s.live_by_flock.push((f.flock.clone(), 1)),
+                    }
+                }
                 MachineView {
                     name: m.handle.name.clone(),
                     max_agents: m.handle.max_agents,
@@ -1610,7 +1731,15 @@ impl Fleet {
             flocks: seats(&flock, &s),
             waiting_under_share: Vec::new(),
         };
-        let queued = self.store.queued_tasks()?;
+        // A task a pass has placed on a pushed machine is on its way there.
+        let queued: Vec<Task> = {
+            let in_flight = self.in_flight.lock().unwrap();
+            self.store
+                .queued_tasks()?
+                .into_iter()
+                .filter(|t| !in_flight.contains_key(&t.id))
+                .collect()
+        };
         let pinned = queued
             .iter()
             .filter(|t| t.spec.machine.as_deref() == Some(machine));
@@ -1895,21 +2024,70 @@ impl Fleet {
         lost
     }
 
-    /// Try to place every queued task, oldest first. Serialised: a pass sees the
-    /// live counts the previous pass left behind, because a machine actor
-    /// refreshes its count before it answers a dispatch (see
-    /// `Actor::handle_command`) and no two passes run at once. The claim inside
-    /// the actor (`Store::claim_task`) is the second line of defence: it makes a
-    /// double dispatch of one task impossible even if this lock were bypassed.
+    /// Try to place every queued task, oldest first. The placing is
+    /// serialised under the dispatch lock (`place_queued`); the dispatches,
+    /// pauses and resumes it decides are sent after the lock is let go
+    /// (`send_placed`), so a machine slow to answer holds up only its own
+    /// tasks, not `task run`, pull claims or the next pass. A pass sees what
+    /// the passes before it placed: a machine actor refreshes its count
+    /// before it answers a dispatch (see `Actor::handle_command`), and until
+    /// then `views` counts a placed task on its machine (`in_flight`), which
+    /// a later pass skips. The claim inside the actor (`Store::claim_task`)
+    /// is the second line of defence: it makes a double dispatch of one task
+    /// impossible even if both of those were bypassed.
+    ///
+    /// A pass counts every task it places as taken. One whose dispatch the
+    /// machine answers with a failure frees its slot only once the answer is
+    /// in, so the pass runs again, at most `DISPATCH_ROUNDS` times in all,
+    /// for the tasks behind it that would have taken that slot.
     pub async fn dispatch_queued(&self) {
-        let _pass = self.dispatch_lock.lock().await;
+        for _ in 0..DISPATCH_ROUNDS {
+            let placed = {
+                let _pass = self.dispatch_lock.lock().await;
+                self.place_queued()
+            };
+            if !self.send_placed(placed).await {
+                break;
+            }
+        }
+    }
+
+    /// Hold `task` on `machine` in `in_flight` until the guard drops.
+    fn hold_in_flight(&self, task: &Task, machine: &str) -> InFlightGuard {
+        self.in_flight.lock().unwrap().insert(
+            task.id,
+            InFlight {
+                machine: machine.to_string(),
+                flock: task.flock.clone(),
+                from_job: task.from_job(),
+            },
+        );
+        InFlightGuard {
+            map: self.in_flight.clone(),
+            id: task.id,
+        }
+    }
+
+    /// `dispatch_queued`'s decisions; the caller holds the dispatch lock.
+    fn place_queued(&self) -> Vec<Placed> {
+        let mut placed = Vec::new();
         let queued = match self.store.queued_tasks() {
             Ok(q) => q,
             Err(err) => {
                 tracing::error!(%err, "list queued");
-                return;
+                return placed;
             }
         };
+        // What an earlier pass placed is on its way and counted already.
+        let queued: Vec<Task> = {
+            let in_flight = self.in_flight.lock().unwrap();
+            queued
+                .into_iter()
+                .filter(|t| !in_flight.contains_key(&t.id))
+                .collect()
+        };
+        // Tasks this pass pauses: their slots count as free from here on.
+        let mut victims: Vec<Task> = Vec::new();
         let flock = self.flock();
         // Would `machine` take `task` as far as its agent goes? For the
         // tasks behind the one being placed (`mark_waiting_under_share`).
@@ -1918,15 +2096,29 @@ impl Fleet {
             self.settled_on(task, theirs, machine)
                 .is_none_or(|r| r.is_ok())
         };
+        let default = flock.default_flock();
+        let views_now = |victims: &[Task]| {
+            let mut views = self.views();
+            for v in victims {
+                if let Some(m) = views
+                    .iter_mut()
+                    .find(|m| Some(m.name.as_str()) == v.machine.as_deref())
+                {
+                    free_slot(m, v, default);
+                }
+            }
+            views
+        };
         for (i, task) in queued.iter().enumerate() {
             let later = &queued[i + 1..];
             if task.state == TaskState::Paused {
-                self.resume_paused(task, later, &takes).await;
+                if let Some(p) = self.place_paused(task, later, &takes, views_now(&victims)) {
+                    placed.push(p);
+                }
                 continue;
             }
             let target = task.flock.as_deref().unwrap_or(flock.default_flock());
-            let default = flock.default_flock();
-            let mut views = self.views();
+            let mut views = views_now(&victims);
             mark_waiting_under_share(&mut views, target, later, default, &takes);
             // The agent can depend on the machine: a machine whose agent
             // cannot run the task's model does not take it. A task from
@@ -1940,24 +2132,26 @@ impl Fleet {
             let mut picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
             // A critical task with `preempt` that finds no room pauses the
             // newest low Claude task on a machine it would fit once that one
-            // is gone, then takes the slot in the same pass.
+            // is gone, then takes the slot in the same pass: the pause is
+            // sent first, and the dispatch only once it has worked.
+            let mut preempt = None;
             if picked.is_none()
                 && task.pause.preempt
                 && task.priority == Priority::Critical
-                && let Some((machine, victim)) =
-                    self.pausable_for(&views, target, task, claim, &accepts, later, &takes)
+                && let Some((machine, victim)) = self.pausable_for(
+                    &views, target, task, claim, &accepts, later, &takes, &victims,
+                )
                 && let Some(handle) = self.get(&machine)
+                && let Ok(Some(v)) = self.store.get_task(victim)
             {
-                match handle.pause(victim, task.id).await {
-                    Ok(_) => {
-                        tracing::info!(task = %task.display_id(), paused = %Task::agent_name_for(victim), machine = %machine, "paused a low task");
-                        views = self.views();
-                        mark_waiting_under_share(&mut views, target, later, default, &takes);
-                        picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
-                    }
-                    Err(err) => {
-                        tracing::warn!(task = %task.display_id(), victim = %Task::agent_name_for(victim), machine = %machine, %err, "pause failed")
-                    }
+                victims.push(v);
+                views = views_now(&victims);
+                mark_waiting_under_share(&mut views, target, later, default, &takes);
+                picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
+                if picked.is_some() {
+                    preempt = Some(PlaceKind::Preempt { on: handle, victim });
+                } else {
+                    victims.pop();
                 }
             }
             let Some(name) = picked else {
@@ -2045,15 +2239,47 @@ impl Fleet {
                 tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
                 continue;
             }
-            match handle.dispatch(task.id).await {
-                Ok(t) => {
-                    tracing::info!(task = %t.display_id(), machine = %name, state = %t.state, "dispatched")
-                }
-                Err(err) => {
-                    tracing::warn!(task = %task.display_id(), machine = %name, %err, "dispatch failed")
-                }
+            placed.push(Placed {
+                task: task.clone(),
+                _held: self.hold_in_flight(task, &name),
+                handle,
+                what: preempt.unwrap_or(PlaceKind::Dispatch),
+            });
+        }
+        placed
+    }
+
+    /// Send what `place_queued` decided, outside the dispatch lock: one
+    /// machine's in order, the machines at once, each request bounded
+    /// (`bounded`). A task leaves `in_flight` as its request is answered.
+    /// Answers whether a machine answered any of them with a failure.
+    async fn send_placed(&self, placed: Vec<Placed>) -> bool {
+        let wait = *self.reply_wait.read().unwrap();
+        let mut by_machine: Vec<Vec<Placed>> = Vec::new();
+        for p in placed {
+            match by_machine
+                .iter_mut()
+                .find(|g| g[0].handle.name == p.handle.name)
+            {
+                Some(g) => g.push(p),
+                None => by_machine.push(vec![p]),
             }
         }
+        let mut sends = tokio::task::JoinSet::new();
+        for group in by_machine {
+            sends.spawn(async move {
+                let mut refused = false;
+                for p in group {
+                    refused |= send_one(p, wait).await;
+                }
+                refused
+            });
+        }
+        let mut refused = false;
+        while let Some(r) = sends.join_next().await {
+            refused |= r.unwrap_or(false);
+        }
+        refused
     }
 
     /// Where critical task `task` could start by pausing a task: the
@@ -2077,6 +2303,7 @@ impl Fleet {
         accepts: &dyn Fn(&str) -> bool,
         later: &[Task],
         takes: &dyn Fn(&Task, &str) -> bool,
+        pausing: &[Task],
     ) -> Option<(String, i64)> {
         let agents = self.agents.read().unwrap().clone();
         let default = self.flock().default_flock().to_string();
@@ -2098,16 +2325,10 @@ impl Fleet {
                     .ok()?
                     .into_iter()
                     .filter(|t| t.pausable(agents.kind(&t.spec.agent), now))
+                    .filter(|t| !pausing.iter().any(|p| p.id == t.id))
                     .filter(|t| {
-                        let mut after = MachineView {
-                            live: m.live.saturating_sub(1),
-                            live_jobs: m.live_jobs.saturating_sub(usize::from(t.from_job())),
-                            ..m.clone()
-                        };
-                        let freed = t.flock.as_deref().unwrap_or(&default);
-                        if let Some(s) = after.flocks.iter_mut().find(|s| s.name == freed) {
-                            s.live = s.live.saturating_sub(1);
-                        }
+                        let mut after = m.clone();
+                        free_slot(&mut after, t, &default);
                         // The pause can bring `flock` from its max to
                         // past its share, where waiters matter again.
                         mark_waiting_under_share(
@@ -2132,38 +2353,116 @@ impl Fleet {
     /// flock under its share there has a task in `later` for that slot, as
     /// a queued task would (`MachineView::flock_may_take`). It is not
     /// settled again: it goes back to the agent and session it had.
-    async fn resume_paused(
+    /// `views` is the machines as this pass sees them.
+    fn place_paused(
         &self,
         task: &Task,
         later: &[Task],
         takes: &(dyn Fn(&Task, &str) -> bool + Sync),
-    ) {
-        let Some(machine) = task.pinned_machine() else {
-            return;
-        };
+        mut views: Vec<MachineView>,
+    ) -> Option<Placed> {
+        let machine = task.pinned_machine()?;
         let flock = self.flock();
         let target = task.flock.as_deref().unwrap_or(flock.default_flock());
-        let mut views = self.views();
         mark_waiting_under_share(&mut views, target, later, flock.default_flock(), takes);
         let fits = views
             .iter()
             .find(|m| m.name == machine)
             .is_some_and(|m| m.healthy && m.has_room(Claim::of(task)) && m.flock_may_take(target));
         if !fits || !self.in_flock(machine) {
-            return;
+            return None;
         }
-        let Some(handle) = self.get(machine) else {
-            return;
-        };
-        match handle.resume(task.id).await {
+        let handle = self.get(machine)?;
+        Some(Placed {
+            task: task.clone(),
+            _held: self.hold_in_flight(task, machine),
+            handle,
+            what: PlaceKind::Resume,
+        })
+    }
+}
+
+/// `after` once task `t` on it is gone: one live task fewer, a job slot
+/// back if it came from a job, and one fewer in its flock's seat.
+fn free_slot(after: &mut MachineView, t: &Task, default: &str) {
+    after.live = after.live.saturating_sub(1);
+    after.live_jobs = after.live_jobs.saturating_sub(usize::from(t.from_job()));
+    let freed = t.flock.as_deref().unwrap_or(default);
+    if let Some(s) = after.flocks.iter_mut().find(|s| s.name == freed) {
+        s.live = s.live.saturating_sub(1);
+    }
+}
+
+/// `request` to `machine`'s actor, or `NoReply` after `after`.
+async fn bounded<T>(
+    machine: &str,
+    after: Duration,
+    request: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(after, request).await {
+        Ok(res) => res,
+        Err(_) => Err(NoReply {
+            machine: machine.to_string(),
+            after,
+        }
+        .into()),
+    }
+}
+
+/// How many times `dispatch_queued` places and sends at most.
+const DISPATCH_ROUNDS: usize = 3;
+
+/// Send one of `send_placed`'s decisions, each request bounded by `wait`.
+/// Answers whether the machine answered it with a failure; one that did not
+/// answer in time is not counted, since a pass again would only wait again.
+async fn send_one(p: Placed, wait: Duration) -> bool {
+    let (task, handle, name) = (&p.task, &p.handle, p.handle.name.as_str());
+    match &p.what {
+        PlaceKind::Resume => match bounded(name, wait, handle.resume(task.id)).await {
             Ok(t) => {
-                tracing::info!(task = %t.display_id(), machine = %machine, state = %t.state, "resumed")
+                tracing::info!(task = %t.display_id(), machine = %name, state = %t.state, "resumed");
+                false
             }
             Err(err) => {
-                tracing::warn!(task = %task.display_id(), machine = %machine, %err, "resume failed")
+                tracing::warn!(task = %task.display_id(), machine = %name, %err, "resume failed");
+                answered(&err)
             }
+        },
+        PlaceKind::Preempt { on, victim } => {
+            let victim = *victim;
+            match bounded(&on.name, wait, on.pause(victim, task.id)).await {
+                Ok(_) => {
+                    tracing::info!(task = %task.display_id(), paused = %Task::agent_name_for(victim), machine = %on.name, "paused a low task");
+                }
+                Err(err) => {
+                    tracing::warn!(task = %task.display_id(), victim = %Task::agent_name_for(victim), machine = %on.name, %err, "pause failed");
+                    return answered(&err);
+                }
+            }
+            dispatch_one(task, handle, wait).await
+        }
+        PlaceKind::Dispatch => dispatch_one(task, handle, wait).await,
+    }
+}
+
+/// `send_one` for a dispatch.
+async fn dispatch_one(task: &Task, handle: &MachineHandle, wait: Duration) -> bool {
+    let name = handle.name.as_str();
+    match bounded(name, wait, handle.dispatch(task.id)).await {
+        Ok(t) => {
+            tracing::info!(task = %t.display_id(), machine = %name, state = %t.state, "dispatched");
+            false
+        }
+        Err(err) => {
+            tracing::warn!(task = %task.display_id(), machine = %name, %err, "dispatch failed");
+            answered(&err)
         }
     }
+}
+
+/// Did the actor answer with `err`, rather than stop or not answer at all?
+fn answered(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NoReply>().is_none() && err.downcast_ref::<ActorStopped>().is_none()
 }
 
 /// How `AgentSource` and `Task::priority_from` name a layer: `asked_by`
@@ -2929,7 +3228,11 @@ impl Daemon {
                         format!("machine {} is shutting down; try again later", handle.name),
                     );
                 }
-                match handle.read(id, lines).await {
+                match self
+                    .fleet
+                    .bounded(&handle.name, handle.read(id, lines))
+                    .await
+                {
                     Ok(text) => IpcResponse::Text(text),
                     Err(err) if err.downcast_ref::<ActorStopped>().is_some() => {
                         IpcResponse::error("machine_shutting_down", err)
@@ -3398,7 +3701,11 @@ impl Daemon {
         }
         let what = describe_input(&input);
         let trust = input.trust;
-        match handle.send(id, input).await {
+        match self
+            .fleet
+            .bounded(&handle.name, handle.send(id, input))
+            .await
+        {
             Ok(t) if trust => IpcResponse::Text(match &t.spec.repo {
                 Some(repo) => format!(
                     "sent the trust keys to {}; {repo} on {} is trusted from now on",
@@ -3455,7 +3762,11 @@ impl Daemon {
                 Err(err) => cli_error(err),
             };
         }
-        match handle.end_by(id, summary, by).await {
+        match self
+            .fleet
+            .bounded(&handle.name, handle.end_by(id, summary, by))
+            .await
+        {
             Ok(t) => IpcResponse::Task(t),
             Err(err) => match err.downcast_ref::<SendRefused>() {
                 Some(r) => IpcResponse::error(r.code, r),
@@ -3624,7 +3935,11 @@ impl Daemon {
                     format!("{name}: no task row, and no machine reports an agent by that name"),
                 );
             };
-            return match handle.close(id, remove_worktree).await {
+            return match self
+                .fleet
+                .bounded(&handle.name, handle.close(id, remove_worktree))
+                .await
+            {
                 Err(err) if err.downcast_ref::<OrphanClosed>().is_some() => {
                     IpcResponse::Text(err.to_string())
                 }
@@ -3746,7 +4061,11 @@ impl Daemon {
                 format!("machine {machine} is shutting down; try again later"),
             );
         }
-        match handle.close(id, remove_worktree).await {
+        match self
+            .fleet
+            .bounded(&handle.name, handle.close(id, remove_worktree))
+            .await
+        {
             Ok(t) => IpcResponse::Task(t),
             Err(err) => stopped_or(err, "close_failed"),
         }
@@ -5214,7 +5533,9 @@ mod tests {
     #[tokio::test]
     async fn a_tasks_label_comes_from_its_layers() {
         use crate::config::flock::FlockEntry;
-        let mut a = machine("a", 4);
+        // Room for the retry's copy while the row failed by hand, below,
+        // still counts on a: only its actor would recount it.
+        let mut a = machine("a", 5);
         a.flock = Some("work".into());
         let mut b = machine("b", 4);
         b.flock = Some("bare".into());
@@ -5236,7 +5557,7 @@ mod tests {
         let fake_a = FakeHerdr::new();
         let (d, _tmp) = daemon_with_flock(
             flock,
-            &[("a", 4, fake_a.clone()), ("b", 4, FakeHerdr::new())],
+            &[("a", 5, fake_a.clone()), ("b", 4, FakeHerdr::new())],
         )
         .await;
         let mut config = test_config();
@@ -8324,6 +8645,160 @@ mod tests {
             1,
             "one agent on a max_agents = 1 machine"
         );
+    }
+
+    /// A pass decides under the dispatch lock and sends after it: while a
+    /// dispatch to `a` hangs in `agent.start`, a `task run` for `b` is
+    /// queued and dispatched without waiting for it, and the task in flight
+    /// to `a` is not placed a second time.
+    #[tokio::test]
+    async fn a_stalled_dispatch_does_not_hold_up_another_machine() {
+        let (slow, fast) = (FakeHerdr::new(), FakeHerdr::new());
+        let (d, _tmp) = daemon(&[("a", 2, slow.clone()), ("b", 2, fast.clone())]).await;
+        slow.hang_method("agent.start");
+        let pinned = |m: &str| DispatchSpec {
+            machine: Some(m.into()),
+            ..spec()
+        };
+        let stuck = d
+            .fleet()
+            .queue_run("a".into(), pinned("a"), None, None, None)
+            .await
+            .unwrap();
+        let fleet = d.fleet();
+        let first = tokio::spawn(async move { fleet.dispatch_queued().await });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !slow.requests().iter().any(|r| r.method == "agent.start") {
+            assert!(Instant::now() < deadline, "the dispatch to a never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let other = tokio::time::timeout(Duration::from_secs(2), async {
+            let t = d
+                .fleet()
+                .queue_run("b".into(), pinned("b"), None, None, None)
+                .await
+                .unwrap();
+            d.fleet().dispatch_queued().await;
+            t
+        })
+        .await
+        .expect("task run for b waited on the dispatch to a");
+        let state = |id: i64| d.store().get_task(id).unwrap().unwrap().state;
+        assert_eq!(state(other.id), TaskState::Running);
+        assert_eq!(state(stuck.id), TaskState::Starting, "still in flight to a");
+        assert_eq!(fast.agents().len(), 1);
+        first.abort();
+    }
+
+    /// Two passes racing for one task that either of two machines would
+    /// take: it is dispatched once.
+    #[tokio::test]
+    async fn racing_passes_dispatch_one_task_once() {
+        let (fa, fb) = (FakeHerdr::new(), FakeHerdr::new());
+        fa.set_ready_after(Duration::from_millis(200));
+        fb.set_ready_after(Duration::from_millis(200));
+        let (d, _tmp) = daemon(&[("a", 2, fa.clone()), ("b", 2, fb.clone())]).await;
+        let t = d
+            .store()
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "p".into(),
+                spec: spec(),
+                flock: "default".into(),
+            })
+            .unwrap();
+        let fleet = d.fleet();
+        tokio::join!(fleet.dispatch_queued(), fleet.dispatch_queued());
+        assert_eq!(fa.agents().len() + fb.agents().len(), 1);
+        assert_eq!(
+            d.store().get_task(t.id).unwrap().unwrap().state,
+            TaskState::Running
+        );
+    }
+
+    /// A dispatch to an actor that never answers gives up after the reply
+    /// bound: the pass returns, the task stays queued for a later pass, and
+    /// the slot it held while in flight is free again.
+    #[tokio::test]
+    async fn a_request_to_a_stuck_actor_fails_after_the_bound() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut h = crate::machine::pull_machine("x".into(), 1, vec![]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        h.tx = tx;
+        h.status.write().unwrap().channel = crate::machine::ChannelState::Connected;
+        let fleet = Fleet::new(vec![h.clone()], store.clone());
+        fleet.set_reply_wait(Duration::from_millis(200));
+        let t = store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "p".into(),
+                spec: spec(),
+                flock: "default".into(),
+            })
+            .unwrap();
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), fleet.dispatch_queued())
+            .await
+            .expect("the pass waited past the bound");
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(crate::machine::MachineCommand::Dispatch { .. })
+            ),
+            "the dispatch was sent"
+        );
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(fleet.views()[0].live, 0, "no slot held after the bound");
+        let err = fleet
+            .bounded(&h.name, h.read(t.id, 10))
+            .await
+            .expect_err("no reply");
+        assert!(format!("{err}").contains("did not answer"), "{err}");
+    }
+
+    /// A flock apply stops the actors it drops together: three that never
+    /// end take about one `SHUTDOWN_WAIT` (2s), not three.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn a_flock_apply_stops_its_actors_together() {
+        let fakes = [FakeHerdr::new(), FakeHerdr::new(), FakeHerdr::new()];
+        struct Unwedge(Vec<FakeHerdr>);
+        impl Drop for Unwedge {
+            fn drop(&mut self) {
+                for f in &self.0 {
+                    f.wedge_connects(false);
+                }
+            }
+        }
+        let _unwedge = Unwedge(fakes.to_vec());
+        let (fleet, _store) = managed(&[
+            ("a", fakes[0].clone()),
+            ("b", fakes[1].clone()),
+            ("c", fakes[2].clone()),
+        ]);
+        for f in &fakes {
+            f.wedge_connects(true);
+        }
+        fleet
+            .apply_flock(&flock_of(&[("a", 1), ("b", 1), ("c", 1)]), &fast())
+            .await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fakes.iter().any(|f| f.wedged() == 0) {
+            assert!(Instant::now() < deadline, "actors never reached connect");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let started = Instant::now();
+        let d = fleet.apply_flock(&Flock::default(), &fast()).await;
+        let took = started.elapsed();
+        assert_eq!(d.shutting_down.len(), 3, "{d:?}");
+        assert!(took < Duration::from_millis(3500), "took {took:?}");
     }
 
     /// A machine with max_agents = 1, one job slot and one burst: a second
