@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -138,7 +138,7 @@ demo: build ## record the README gifs with vhs against a demo head
 	@set -e; \
 	export PASTOR_CONFIG_DIR=$(CURDIR)/docs/demo/local PASTOR_STATE_DIR=$(CURDIR)/docs/demo/local/state \
 	  PASTOR_DATA_DIR=$(CURDIR)/docs/demo/local/data PATH=$(CURDIR)/target/debug:$$PATH; \
-	pastor serve & pid=$$!; trap 'kill $$pid' EXIT; \
+	pastor serve --foreground & pid=$$!; trap 'kill $$pid' EXIT; \
 	for i in $$(seq 1 100); do pastor task read t-1 2>&1 | grep -q 'not running' || break; sleep 0.3; done; \
 	for t in docs/demo/*.tape; do vhs $$t; done; \
 	for i in 1 2 3 4; do pastor task close t-$$i >/dev/null 2>&1 || true; done
@@ -161,6 +161,18 @@ cli-reference: ## regenerate the website's CLI reference page from the CLI
 # itself, mounted, so it cannot drift from the manual. Needs hugo from mise.
 site: ## build the website into docs/website/public
 	hugo --source docs/website --cleanDestinationDir
+
+# Internal links only (--offline): a link from one page to another, or to a
+# heading on it, must resolve. The built site is checked with pretty URLs
+# resolved to their index.html; the repo Markdown (README, docs/*.md, the
+# skills) as GitHub renders it. External links are not checked, so a site
+# that is down elsewhere never fails a build. Needs lychee on the PATH; CI
+# installs a pinned release (website.yml).
+links: site ## check internal links and anchors in the site and the repo Markdown
+	lychee --offline --include-fragments --no-progress --index-files index.html \
+	  --root-dir $(CURDIR)/docs/website/public docs/website/public
+	lychee --offline --include-fragments --no-progress \
+	  README.md 'docs/*.md' 'skills/**/*.md'
 
 site-serve: ## serve the website with live reload on http://127.0.0.1:1313
 	hugo server --source docs/website

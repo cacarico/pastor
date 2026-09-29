@@ -34,7 +34,7 @@ followed by the command, in a `bash` block of its own:
 ```bash
 pastor task run --prompt-file docs/superpowers/plans/YYYY-MM-DD-<name>/task-2.md \
   --flock default --repo '~/work/app' --worktree --branch pastor/<name>-2 \
-  --agent claude --agent-arg --model --agent-arg sonnet --timeout 45m --json
+  --model sonnet --timeout 45m --json
 ```
 
 Rules for the command:
@@ -43,7 +43,7 @@ Rules for the command:
 - `--flock`, `--tag` (repeat it) or `--machine`, exactly as the fleet was read. Pin a machine only when the task needs something only that machine has.
 - `--repo` is the path on the machine that runs the task, single-quoted when it starts with `~`.
 - `--worktree --branch pastor/<name>-<N>`: a fresh local branch per task. The prompt resets it to the plan branch and pushes to the plan branch, so the local name never matters after the task.
-- `--agent` and `--agent-arg`: the agent and its model, from the model table.
+- `--model`: a `[models]` name from the model table. Leave `--agent` and `--agent-arg` out, so the task keeps the agent its flock or machine gives it, on the right account.
 - `--timeout` from the timeout guide. `--json` so whoever runs it reads the task id from the output.
 - Keep it to plain words and single quotes: no `$`, no double quotes, no command substitution.
 

@@ -21,38 +21,45 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with `head_too_old`), an agent pastor started may not run them, and tab
   completion offers flocks and machines. A machine that is not in the flock
   is `not_in_flock`.
-- Every command works from a machine with a remote head set. The `flock`
-  commands, `machine add|remove|move|describe`, `trust`, `profile` and
-  `config edit` go to the head and print what they would print there;
-  `flock edit` and `config edit` edit the head's file. `task attach` and
-  `machine open` still go to the machine directly, but ask the head for the
-  task, its flock.toml and pastor.toml; the head's own machine is reached at
-  the head's ssh destination. `config edit --local` edits this machine's
-  pastor.toml. `machine authorized-key` stays on the head and is refused
-  here, naming it. `flock list`, `flock default show`, `profile`, `task
-  attach` and `machine open` need a remote head speaking IPC protocol 6.
+- Every command works from a machine with a remote head set.
+  - The `flock` commands, `machine add|remove|move|describe`, `trust`,
+    `profile` and `config edit` go to the head and print what they would
+    print there; `flock edit` and `config edit` edit the head's file, and
+    `config edit --local` this machine's `pastor.toml`.
+  - `task attach` and `machine open` still go to the machine directly, but
+    ask the head for the task, its `flock.toml` and `pastor.toml`; the
+    head's own machine is reached at the head's ssh destination.
+  - `machine authorized-key` stays on the head and is refused here, naming
+    it.
+  - `flock list`, `flock default show`, `profile`, `task attach` and
+    `machine open` need a remote head speaking IPC protocol 6.
 - The manual has a "Moving the head" runbook.
-- Orchestrators run from files. `~/.config/pastor/orchestrators/<name>.toml`
-  names its `kind` (required): a `scheduled` orchestrator runs its `pre`
-  script on `every` or `cron`, and only when the script prints lines that need
-  judgment does the head start one agent, with the `orchestrator` role, on its
-  own machine, with the file's `prompt`, `skill` and `model`, the handover
-  note and every line; its `post` script gets the agent's end state (`done`,
-  `failed` or `stale`), summary and lines. A run is skipped while the last
-  agent works or its post script waits, a pre script that fails or prints more
-  than 64 KiB of lines backs off as a failing job does, `max_orchestrators` in
-  pastor.toml (default 1, outside `max_agents`) holds agents back, and an
-  agent that stopped on a quota error holds the next until the reset.
-  `session` files are checked (a key of the other kind makes a file invalid)
-  but not run yet. New commands: `pastor orchestrator list | describe | run |
-  enable | disable | note`; events
-  `orchestrator.started|skipped|held|quota|failed`. The pre and post scripts
-  run with `PASTOR_ORCHESTRATOR`, which the CLI sends with each request, and
-  the head applies the orchestrator role's table to them; `PASTOR_TASK` wins
-  when both are set. An orchestrator's agent may keep its note (`pastor
-  orchestrator note`). `pastor task list` shows orchestrator tasks in a table
-  of their own first. The head's IPC protocol goes to 23; the store keeps its
-  schema (orchestrator state lives under `state/orchestrators/<name>/`).
+- Orchestrators run from files: `~/.config/pastor/orchestrators/<name>.toml`,
+  with a required `kind`.
+  - A `scheduled` orchestrator runs its `pre` script on `every` or `cron`.
+    Only when the script prints lines that need judgment does the head start
+    one agent, with the `orchestrator` role, on its own machine, with the
+    file's `prompt`, `skill` and `model`, the handover note and every line.
+    Its `post` script gets the agent's end state (`done`, `failed` or
+    `stale`), summary and lines.
+  - A run is skipped while the last agent works or its post script waits. A
+    pre script that fails or prints more than 64 KiB of lines backs off as a
+    failing job does. `max_orchestrators` in `pastor.toml` (default 1; each
+    also takes a slot under `max_agents`) holds agents back, and an agent
+    that stopped on a quota error holds the next until the reset.
+  - `session` files are checked (a key of the other kind makes a file
+    invalid) but not run yet.
+  - New commands `pastor orchestrator list | describe | run | enable |
+    disable | note`, and events
+    `orchestrator.started|skipped|held|quota|failed`.
+  - The pre and post scripts run with `PASTOR_ORCHESTRATOR`, which the CLI
+    sends with each request, and the head applies the orchestrator role's
+    table to them; `PASTOR_TASK` wins when both are set. The agent may keep
+    its note (`pastor orchestrator note`).
+  - `pastor task list` shows orchestrator tasks first, in a table of their
+    own.
+  - The head's IPC protocol goes to 23; the store keeps its schema
+    (orchestrator state lives under `state/orchestrators/<name>/`).
 - A `critical` task started with `--preempt` (or `preempt = true` under a
   job's `[dispatch]`) that finds its machines full, job slots and burst
   included, pauses the newest running `low` Claude task on one and starts
@@ -114,7 +121,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `task describe` shows the label and where it came from. `task run --label`
   needs a head of IPC protocol 19.
 - `pastor serve` starts the head in the background and returns once it
-  answers, logging to `~/.local/state/pastor/serve.log` (rotated at 10 MB,
+  answers, logging to `~/.local/state/pastor/serve.log` (rotated at 10 MiB,
   three old files kept). `pastor serve --foreground` (`-f`) keeps it in the
   terminal, as `pastor serve` did before. `pastor serve status` (with
   `--json`) says whether a head or headless serve runs here, its pid,
@@ -157,7 +164,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   none is skipped for the flock's tasks, with a note while they wait, or
   refuses a task pinned to it (`agent_kind_missing`). A machine's own
   profile still decides whether `unrestricted` may run there; a flock's
-  never lifts it.
+  never lifts it. A head needs IPC protocol 24 to read a flock's `timeout`
+  and `place`, and the CLI refuses an older one while flock.toml sets
+  them.
 - The agent skill (`pastor --skill`) has a checklist for bringing a new
   machine into a flock: herdr, pastor and the agent on the PATH of a
   non-interactive ssh command, every repo cloned at the same path, `pastor

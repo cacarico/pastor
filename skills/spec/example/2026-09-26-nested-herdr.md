@@ -69,7 +69,7 @@ Expected: FAIL, the code is `unknown_machine`, not `nested_herdr`.
 
 - [ ] **Step 3: Implement**
 
-At the top of `async fn open` in `src/main.rs`, before `Flock::load`:
+At the top of `async fn open` in `src/main.rs`, before `head_flock`:
 
 ```rust
     // herdr refuses to start inside one of its own panes, and says so only
@@ -109,7 +109,7 @@ with a body saying herdr would refuse anyway, after taking the terminal.
 ```bash
 pastor task run --prompt-file docs/superpowers/plans/2026-09-26-nested-herdr/task-1.md \
   --flock default --repo '~/work/pastor' --worktree --branch pastor/nested-herdr-1 \
-  --agent claude --agent-arg --model --agent-arg sonnet --timeout 45m --json
+  --model sonnet --timeout 45m --json
 ```
 
 ---
@@ -161,5 +161,5 @@ with a body saying the known gap is closed.
 ```bash
 pastor task run --prompt-file docs/superpowers/plans/2026-09-26-nested-herdr/task-2.md \
   --flock default --repo '~/work/pastor' --worktree --branch pastor/nested-herdr-2 \
-  --agent claude --agent-arg --model --agent-arg sonnet --timeout 30m --json
+  --model sonnet --timeout 30m --json
 ```

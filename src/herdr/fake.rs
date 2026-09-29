@@ -269,6 +269,11 @@ impl FakeHerdr {
             .unmakeable_dirs
             .insert(path.to_string());
     }
+    /// Undoes `set_unmakeable_dir`: `path` can be made from now on, as if
+    /// whatever was in the way had been cleared.
+    pub fn clear_unmakeable_dir(&self, path: &str) {
+        self.state.lock().unwrap().unmakeable_dirs.remove(path);
+    }
     /// The checkout at `path` has commits on no remote.
     pub fn set_unpushed(&self, path: &str) {
         self.state.lock().unwrap().unpushed.insert(path.to_string());

@@ -1,7 +1,7 @@
 # Contributing
 
-Thanks for helping make pastor better. pastor is early software; small,
-well-scoped changes with clear tests are easiest to review.
+Thanks for helping. pastor is young, and the changes I can review best are
+small ones with tests.
 
 ## Before you start
 
@@ -15,8 +15,8 @@ well-scoped changes with clear tests are easiest to review.
 
 ## Development checks
 
-`make check` is the pull request gate. It runs formatting checks, clippy with
-warnings as errors, and the full test suite.
+`make check` is the pull request gate. It runs the changelog check,
+formatting checks, clippy with warnings as errors, and the full test suite.
 
 Useful targets:
 
@@ -37,20 +37,20 @@ localhost port as you; it needs OpenSSH's server installed, and CI runs it.
 
 ## Pull requests
 
-A good pull request includes:
+A good pull request says:
 
-- The problem being solved and why it matters.
-- The design choice made, especially when it differs from existing docs.
-- Tests or a clear reason tests were not added.
-- A changelog entry for anything a user would notice, as its own file
-  `changes/<branch>.md` (slashes in the branch name as dashes), never a
-  line in `CHANGELOG.md`: every pull request adding a line under the same
-  heading made each merge conflict with the next. `changes/README.md` has
-  the format; `make check` fails on an Unreleased section in
-  `CHANGELOG.md` or a malformed change file.
-- Any compatibility, security, data migration, or operational risk.
-- Any AI assistance, generated code, copied snippets, or third-party material
-  that needs provenance or license review.
+- What it fixes and why that matters.
+- The design it picked, above all where that differs from the docs.
+- Which tests cover it, or why there are none.
+- Any compatibility, security, migration or operational risk.
+- Where AI help, generated code or copied material came in, when its
+  provenance or license needs a look.
+
+Anything a user would notice also gets a changelog entry, in its own file
+`changes/<branch>.md` (slashes in the branch name as dashes), never a line in
+`CHANGELOG.md`: lines under one heading made every merge conflict with the
+next. `changes/README.md` has the format, and `make check` fails on an
+Unreleased section in `CHANGELOG.md` or a malformed change file.
 
 Runtime CLI errors should stay JSON on stderr with stable `code` values and
 exit 1. Clap usage errors should stay plain text and exit 2.
@@ -68,9 +68,12 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   CLI and head from the same minor always work together and a mismatch is
   `head_too_old`; the connector protocol; and the minimum herdr version, which
   only rises in a minor bump, noted under Changed.
-- Platforms: the README lists the tiers. Tier 1 is built and tested on every
-  release, tier 2 built but not tested, tier 3 best effort. Moving a platform
-  down a tier is a breaking change.
+- Platforms: the tiers follow the README's Platforms table. Tier 1 is built,
+  tested in CI and released (Linux x86_64). Tier 2 is built and released;
+  Linux aarch64 and macOS arm64 are smoke-run on release too, armv7, riscv64
+  and macOS x86_64 are not tested at all. Tier 3 is best effort: compiled in
+  CI, no binaries (FreeBSD). Moving a platform down a tier is a breaking
+  change.
 - The minimum Rust version is `rust-version` in `Cargo.toml`. Raising it is
   a minor bump, never a patch.
 - Release when there is something worth shipping, not on a calendar. Cut an
@@ -81,25 +84,33 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   smoke-profiles` with `PROFILES=1`, once the head runs the rc) and prints
   a Markdown block for the release card; it never touches your checkout.
   Prereleases never become `install.sh`'s "latest".
-- To release: on a release branch, bump the version in `Cargo.toml` and
-  run `make changelog VERSION=X.Y.Z`, which writes `## X.Y.Z - <today>`
-  into `CHANGELOG.md` from `changes/*.md` (entries in the order their files
-  reached `main`) and deletes the files; commit both, merge, and push the
-  signed tag `vX.Y.Z` on `main`. A prerelease tag leaves the change files
-  in place and takes its notes from them (`scripts/changelog.sh notes`). `.github/workflows/release.yml` builds the tarballs
-  and drafts the GitHub release with that section as notes. Before
-  publishing the draft, check the tag's signature with `git tag -v vX.Y.Z`;
-  an unsigned or unverified tag is deleted, not published. Publishing the
-  draft is what publishes the crate too: the workflow's `publish-crate` job
-  fires on that event and runs `cargo publish` from the tag, using the
-  `CARGO_REGISTRY_TOKEN` repo secret. It goes to crates.io as `pastor-cli`,
-  since `pastor` is taken there, and installs the `pastor` binary only
-  (`fake-herdr` is left out of the package). A prerelease is skipped there
-  automatically; `cargo publish --dry-run` from the tag by hand shows what
-  a manual one would upload.
 - Artifacts are never replaced and a tag is never moved. A bad release gets
   a new patch release and a warning in its own notes.
 - Before 1.0, only the latest minor gets fixes.
+
+To release:
+
+1. On a release branch, bump the version in `Cargo.toml` and run `make
+   changelog VERSION=X.Y.Z`. It writes `## X.Y.Z - <today>` into
+   `CHANGELOG.md` from `changes/*.md`, in the order their files reached
+   `main`, and deletes the files. Commit both.
+2. Merge the release pull request, and merge nothing else until the tag is
+   pushed: a change merged in between would ship in the tag with no line in
+   its notes.
+3. Push the signed tag `vX.Y.Z` on the release pull request's merge commit.
+   `.github/workflows/release.yml` builds the tarballs and drafts the GitHub
+   release with that section as notes.
+4. Check the tag's signature with `git tag -v vX.Y.Z`. An unsigned or
+   unverified tag is deleted, not published.
+5. Publish the draft. That also publishes the crate: the workflow's
+   `publish-crate` job runs `cargo publish` from the tag with the
+   `CARGO_REGISTRY_TOKEN` repo secret. It goes to crates.io as `pastor-cli`,
+   since `pastor` is taken there, and installs the `pastor` binary only
+   (`fake-herdr` is left out of the package). `cargo publish --dry-run` from
+   the tag shows what a manual one would upload.
+
+A prerelease tag leaves the change files in place and takes its notes from
+them (`scripts/changelog.sh notes`), and is skipped by `publish-crate`.
 
 ## Commits
 

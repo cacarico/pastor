@@ -1,8 +1,8 @@
 # Security Policy
 
-pastor runs coding agents on machines you own and talks to herdr over local or
-SSH transports. Treat configuration, prompts, logs, task output, sockets, SSH
-control paths, and SQLite state as sensitive.
+pastor runs coding agents on your machines, over ssh or a local socket to
+herdr. Everything it keeps can hold secrets: config, prompts, logs, task
+output, its sockets, the ssh control paths and the SQLite store.
 
 ## Trust model
 
@@ -10,7 +10,7 @@ The user that runs `pastor serve` on the head is the fleet's trust boundary.
 Any process running as that user on the head controls every machine pastor
 drives: it can send any request to `pastor.sock` (queue tasks with any
 prompt and agent arguments, type into live tasks, edit the flock), rewrite
-`flock.toml`, the job files and the plugins, and reuse the ssh ControlMaster
+`flock.toml`, the job files and the connectors, and reuse the ssh ControlMaster
 sockets under the state directory to reach every ssh machine. The socket's
 0600 mode keeps other users out; it does not keep out other processes of the
 same user.
@@ -18,21 +18,30 @@ same user.
 That includes agents on a `local = true` machine, which run on the head as
 that user. Do not give a `local = true` machine untrusted work, such as jobs
 fed by issues or chat messages from outside your team; run herdr for that
-work as a separate user and add it as an ssh machine instead. Plugins also
+work as a separate user and add it as an ssh machine instead. Connectors also
 run as that user, so installing one grants it control of the fleet.
 
-## What plugins inherit
+## What connectors inherit
 
-A plugin command (connector or hook) runs on the head as the head's user and
-inherits the full environment of the pastor process that starts it, plus its
+A connector command (a connector's run or one of its hooks) runs on the head,
+or on the machine whose headless serve owns the job, as that machine's user.
+It inherits the full environment of the pastor process that starts it, plus its
 own `.env` and the `PASTOR_*` variables. It is not limited to its `.env`:
 `SSH_AUTH_SOCK`, API tokens and cloud credentials in that environment reach
-every plugin, and only the secrets its manifest declares are redacted from
-its run logs. It can read the head user's files, including other plugins'
-`.env` files, and `PASTOR_STATE_DIR` points it at `pastor.sock` and the ssh
-ControlMaster sockets. Hooks that do not set `only_own = true` receive every
-task's item and prompt. Start `pastor serve` from a minimal environment, and
-review a plugin as you would any program you run with your own account.
+every connector, and only the secrets its manifest declares are redacted from
+its run logs. It can read that machine's user's files, including other
+connectors' `.env` files, and `PASTOR_STATE_DIR` points it at that machine's
+`pastor.sock`; on the head, that also means the ssh ControlMaster sockets to
+every machine the head drives. A headless serve's shepherd holds one such
+socket too, but only to reach its own remote head (`ssh/head-%C` under its
+own state directory, not the fleet's machine masters, which only the head
+opens): a connector on a headless serve can reuse that one socket to act as
+the shepherd on the head, but cannot reach the other ssh machines directly.
+Hooks that do not set
+`only_own = true` hear every task's events, but get another connector's
+items, prompts and summaries blanked. Start `pastor serve` from a minimal
+environment, and review a connector as you would any program you run with
+your own account.
 
 Reports that need the head user's own access (writing its config, or running
 code as it) are in scope only where pastor makes that access easier to get
@@ -47,13 +56,9 @@ vulnerability" button under the repository's Security tab
 maintainers see the report, and the fix can be discussed and prepared in a
 private advisory before it is published.
 
-A useful report includes:
-
-- Affected version or commit.
-- Reproduction steps in a test or disposable environment.
-- Impact and attacker capabilities required.
-- Whether credentials, prompts, logs, workspaces, agents, or remote machines are
-  exposed.
+A useful report says which version or commit is affected, how to reproduce
+it somewhere disposable, what an attacker needs and gains, and whether
+credentials, prompts, logs, workspaces, agents or other machines are exposed.
 
 ## Handling secrets
 

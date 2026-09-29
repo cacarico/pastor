@@ -194,6 +194,7 @@ fn spec() -> DispatchSpec {
         session_id: None,
         label: Default::default(),
         summary: Default::default(),
+        cwd: None,
     }
 }
 

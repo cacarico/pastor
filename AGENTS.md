@@ -37,10 +37,8 @@ down here because getting them wrong cost a day.
   idle. The sequence alone is not proof of work: `unknown` bumps it too, so
   `idle -> unknown -> idle` would pass. herdr's own `agent.prompt --wait` makes
   the same two checks (`prompt_activity_statuses`, then
-  `after_state_change_seq`). The activity flag lives in the machine actor's
-  memory, not the store (a column would need a schema bump); after a restart
-  an agent found working or blocked counts again, one found idle stays running
-  until stale. Unreleased herdr adds `completion_seq` in the same sequence;
+  `after_state_change_seq`). The activity flag is stored with the task
+  (`tasks.activity_seen`, since schema 6), so a restart keeps it. Unreleased herdr adds `completion_seq` in the same sequence;
   pastor prefers it when present, with no activity needed.
 - herdr has no state for an agent that ended its turn on a question: it is
   idle, exactly like one that finished. So before confirming `done`,
@@ -73,11 +71,13 @@ down here because getting them wrong cost a day.
   full suite. Run it before every commit. `make help` lists the rest.
 - CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine` and
   `make test-ssh` (the CLI against a head over a real ssh, through a
-  throwaway sshd on localhost; `tests/real_ssh.rs`) on every pull request that touches code (`paths:` skips docs-only diffs), or
-  by hand (`workflow_dispatch`). Since this project merges by fast-forwarding
-  a PR's exact head sha to main, that sha was already checked on its PR, so
-  push-to-main does not run `check` again; a direct push that skips a PR goes
-  unchecked unless someone dispatches it by hand.
+  throwaway sshd on localhost; `tests/real_ssh.rs`) on every pull request
+  that touches code (`paths:` skips docs-only diffs), or by hand
+  (`workflow_dispatch`). Push to main does not run `check`. Pull requests
+  land as merge commits, so the merge sha on main is never checked itself:
+  only each PR's head was. Two PRs that pass alone can still break main
+  together, and a direct push that skips a PR goes unchecked, unless someone
+  dispatches CI on main by hand.
 - The repository is public. `.github/workflows/gitleaks.yml` scans the whole
   history of every ref on every pull request, on push to `main`, and weekly,
   and `make leaks` runs the same scan here. It does not run on push to other
@@ -114,7 +114,11 @@ down here because getting them wrong cost a day.
   Claude Code plugin `pastor` (`.claude-plugin/plugin.json`, whose version
   follows `Cargo.toml`). `tests/cli.rs` runs the spec skill's example plan's
   first task against the fake herdr.
-- Vocabulary is fixed: machine, flock, head, job, task, connector, agent.
+- Vocabulary is fixed: machine, flock, head, job, task, connector, agent,
+  shepherd (a headless `pastor serve` on a machine whose head is elsewhere),
+  orchestrator (an agent pastor runs to drive the others, from
+  `orchestrators/<name>.toml`) and pull machine (`pull = true`: its
+  shepherd asks the head for work, the head never connects to it).
   Agents are never renamed; hosts are not "sheep". "Plugin" is kept free
   for code that changes how pastor itself behaves; what installs a connector
   command or event hooks is a connector. The Claude Code plugin `pastor` that
@@ -176,7 +180,7 @@ Still open as of the last review; none of them blocks normal use.
   and passed on every rerun.
 - With the head set, `tick` and `job reload` go to the head only; the
   headless serve (`src/shepherd.rs`) is reached by the other `job` commands
-  (`main.rs` `local_job`). Its own `job.failed` and `task.queued` events are only logged, never
+  (`main.rs` `names_local_job`). Its own `job.failed` and `task.queued` events are only logged, never
   written to an events log or heard by its hooks. Its jobs share the head's
   seen table by name, so a head job of the same name with the same item key
   refuses the item (`job_task_refused`).
@@ -193,9 +197,20 @@ Still open as of the last review; none of them blocks normal use.
   spec's `orchestrator/<name>-<n>`.
 - With a remote head (`pastor head set`), `task run` fills what its flags
   leave out from the built-in defaults, not the head's `[defaults]` timeout
-  and place, and most commands that read or edit files (machine and flock
-  edits, job edits, `events`, `trust`, describes) fail with
-  `remote_head_unsupported` until they move behind the head.
+  and place: `settle_run` (`src/daemon.rs`) only overwrites a spec's timeout
+  and place when an ask or the flock sets one, trusting the spec's own
+  otherwise, which for a remote client is `PastorConfig::default()`
+  (`src/main.rs::run`), not the head's file. Every other command that reads
+  the fleet goes to the head (`remote_route` in `main.rs`); only `machine
+  authorized-key` fails with `remote_head_unsupported`.
+- A task pinned to a machine outside its flock (the machine was moved
+  with `pastor machine move`, or removed) stays queued forever: the
+  scheduler logs it once (`warned_queued` in `src/scheduler.rs`) and never
+  fails or re-flocks it.
+- A profiled opencode task runs with `OPENCODE_DISABLE_PROJECT_CONFIG=1`,
+  so it ignores the repo's own `opencode.json` and `.opencode/` (agents,
+  commands, MCP servers, not only permissions); only `AGENTS.md` or
+  `CLAUDE.md` are passed back as instructions.
 
 ## Where things live
 
@@ -205,7 +220,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
-~/.local/state/pastor/pastor.db   tasks (schema 9), seen keys, event seq, job state (SQLite)
+~/.local/state/pastor/pastor.db   tasks (schema 13), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/fleet.lock  offline fleet edits and a starting `pastor serve` take turns on it
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
@@ -229,6 +244,9 @@ changes/<branch>.md               a pull request's changelog entry, gathered at 
 scripts/changelog.sh              check, notes and gather for those files
 .claude-plugin/plugin.json        makes the repo a Claude Code plugin named pastor
 ```
+
+The schema number above is `SCHEMA_VERSION` in `src/store.rs`; a schema bump
+updates it here too.
 
 `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR` override these;
 tests always set them to temp dirs (`Paths::new` puts the data dir under the
