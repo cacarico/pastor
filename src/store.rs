@@ -3694,10 +3694,21 @@ mod tests {
         let t = s
             .insert_task_at(new_task("run"), Priority::Low, None, TaskRole::Agent)
             .unwrap();
-        let wait = std::time::Duration::from_millis(20);
+        // Queued two hours ago and aged half an hour later, so both its
+        // `created_at` and its `aged_at` are well past a 30 minute wait:
+        // only the hand change's reset keeps the next pass off it, with no
+        // timing in the test to race.
+        let queued = Utc::now() - chrono::Duration::hours(2);
+        s.execute_raw(&format!(
+            "UPDATE tasks SET created_at = '{}' WHERE id = {}",
+            queued.to_rfc3339(),
+            t.id
+        ));
+        let wait = std::time::Duration::from_secs(1800);
         let after = |_: &Task| Some(wait);
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        let aged = s.age_queued(Utc::now(), after).unwrap();
+        let aged = s
+            .age_queued(queued + chrono::Duration::minutes(30), after)
+            .unwrap();
         assert_eq!(aged.len(), 1);
         assert_eq!(aged[0].priority, Priority::Normal);
         let lowered = s
