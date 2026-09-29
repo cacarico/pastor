@@ -5535,6 +5535,70 @@ mod tests {
         assert_eq!(prompt["text"], crate::task::LIMIT_RESUME_PROMPT);
     }
 
+    /// An agy task that stops on its quota is not done either: it waits
+    /// for the reset its message names. agy has no session to resume, so
+    /// it starts again from its prompt, with the handover, at that time.
+    #[tokio::test(start_paused = true)]
+    async fn an_agy_task_at_its_quota_waits_and_starts_again_with_the_handover() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, mut events) = spawn_with_settings(&fake, &store, limits_kept(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task_of(&store, "agy").id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        assert_eq!(t.spec.session_id, None);
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        let before = Utc::now();
+        fake.set_pane_text(
+            &pane,
+            "  Half of the review is written.\n\n\
+             \u{20} RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your\n\
+             \u{20} subscription to increase your limits. Resets in 4h21m30s.\n\n\
+             ╭────────╮\n│ >      │\n╰────────╯\n ~/src/repo  gemini-3-pro\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.pane_id, None);
+        let limits = store.limits().unwrap();
+        assert_eq!(limits.len(), 1, "{limits:?}");
+        assert_eq!(limits[0].account, "m/agy");
+        assert!(limits[0].hard);
+        let until = limits[0].until.expect("the reset agy named");
+        let wait = until - before;
+        assert!(
+            (wait - chrono::Duration::seconds(4 * 3600 + 21 * 60 + 30))
+                .num_seconds()
+                .abs()
+                <= 2,
+            "{wait}"
+        );
+        assert_eq!(row.waiting_until, Some(limits[0].retry_at));
+        let mut kinds = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if ev.task_id == Some(t.id) {
+                kinds.push(ev.kind);
+            }
+        }
+        assert!(kinds.iter().any(|k| k == "task.limited"), "{kinds:?}");
+        assert!(!kinds.iter().any(|k| k == "task.done"), "{kinds:?}");
+
+        let t = h.resume(t.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(t.spec.session_id, None);
+        let start = calls(&fake, "agent.start").pop().unwrap();
+        assert_eq!(start["kind"], "agy");
+        let prompt = calls(&fake, "agent.prompt").pop().unwrap();
+        let text = prompt["text"].as_str().unwrap();
+        assert!(text.starts_with("hi"), "{text}");
+        assert!(text.ends_with(crate::task::LIMIT_HANDOVER), "{text}");
+    }
+
     /// A task with a fallback list whose agent stops on a limit that resets
     /// `in_mins` from now, and what it left: its row once `waiting`, and
     /// the task's events.
