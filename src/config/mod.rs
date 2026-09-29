@@ -1497,7 +1497,7 @@ pub struct ShepherdConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
     /// Take any task the head would place on this machine, not only those
-    /// pinned to it (`task run --machine <this one>`).
+    /// pinned to it (`task run --machine <this one>` or a job's `machine`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub takes_flock_work: bool,
     /// Developer option: argv speaking the herdr protocol on stdio, in
@@ -3771,6 +3771,50 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("pull_lost_after"), "{err}");
+    }
+
+    /// The manual's pastor.toml block shows every top-level key with its
+    /// default, and every `[shepherd]` key; its flock.toml example shows a
+    /// pull machine.
+    #[test]
+    fn manual_lists_every_pastor_toml_key() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/manual.md");
+        let text = std::fs::read_to_string(path).unwrap();
+        let start = "# pastor.toml, every key optional; these are the defaults\n";
+        let from = text.find(start).expect("no pastor.toml block");
+        let rest = &text[from..];
+        let block = &rest[..rest.find("```").unwrap()];
+        let lines: Vec<&str> = block
+            .lines()
+            .map(|l| l.trim_start_matches('#').trim())
+            .collect();
+        let defaults = toml::Value::try_from(PastorConfig::default()).unwrap();
+        for (key, value) in defaults.as_table().unwrap() {
+            if value.is_table() {
+                continue;
+            }
+            let want = format!("{key} = {value}");
+            assert!(
+                // Exact value: `max_orchestrators = 10` must not pass for 1.
+                lines.iter().any(|l| l
+                    .strip_prefix(&want)
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))),
+                "the manual's pastor.toml block has no `{want}`"
+            );
+        }
+        let shepherd = &block[block.find("[shepherd]").expect("no [shepherd]")..];
+        for key in ["machine", "takes_flock_work", "command"] {
+            assert!(
+                shepherd.lines().any(|l| l
+                    .trim_start_matches('#')
+                    .trim()
+                    .starts_with(&format!("{key} ="))),
+                "the manual's [shepherd] table has no {key}"
+            );
+        }
+        assert!(text.contains("\npull = true"), "no pull machine example");
+        let flag = ["--", "shepherd"].concat();
+        assert!(!text.contains(&flag), "the manual names {flag}");
     }
 
     #[test]

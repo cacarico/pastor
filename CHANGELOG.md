@@ -127,6 +127,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   setup systemd` (or `pastor setup launchd` on macOS) and restart the
   service, so its unit says `--foreground` and `pastor serve status` can
   report the service.
+- Pull machines: a machine the head cannot reach over ssh runs tasks all
+  the same. The head's flock.toml marks it `pull = true` in place of
+  `local`, `ssh` or `command`; the head never connects to it and runs no
+  actor for it, and `machine list` shows its HOST as `pull`. Its headless
+  serve claims tasks each tick (`TaskClaim`, IPC protocol 21), runs them on
+  its own herdr with the head's machine actor, and reports every change
+  back (`TaskReport`). It takes the tasks pinned to it (`task run --machine
+  <name>` or a job's `machine`), and also its flocks' other tasks when its
+  pastor.toml has `[shepherd] takes_flock_work = true` or the serve runs
+  with `PASTOR_SHEPHERD_FLOCK_WORK=1` (or `true`). `[shepherd] machine` is
+  its name in the head's flock.toml (default: the hostname), and
+  `[shepherd] command` is a developer option in place of its herdr. One
+  that neither claims nor reports for `pull_lost_after` (head's
+  pastor.toml, default `10m`) is lost, and its starting and running tasks
+  go stale.
 
 ### Changed
 
