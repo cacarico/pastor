@@ -1,4 +1,11 @@
 pub mod client;
+// The test double behind the unit tests, the integration tests and the
+// fake-herdr binary; a default build and the published crate leave it out.
+// Gated on the feature alone, not `cfg(test)` too: fake.rs is excluded from
+// the crates.io package (Cargo.toml `include`), so `cfg(test)` there would
+// make a plain `cargo test` on the downloaded crate fail with a missing
+// file. The modules that use it gate their own `mod tests` the same way.
+#[cfg(feature = "fake-herdr")]
 pub mod fake;
 pub mod protocol;
 pub mod transport;

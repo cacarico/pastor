@@ -574,7 +574,7 @@ impl Fleet {
     }
 
     /// Set `reply_wait` below any `request_timeout`, for a test.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fake-herdr"))]
     fn set_reply_wait(&self, wait: Duration) {
         self.reply_wait_ms.store(
             u64::try_from(wait.as_millis()).unwrap(),
@@ -4080,7 +4080,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     daemon.run_with_listener(listener).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     use super::*;
     use crate::config::flock::MachineConfig;

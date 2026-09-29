@@ -167,7 +167,7 @@ pub async fn reopen(
     Ok(name)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     use super::*;
     use crate::herdr::fake::FakeHerdr;

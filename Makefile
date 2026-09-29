@@ -7,7 +7,7 @@ help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
 
 build: ## debug build of pastor and fake-herdr
-	cargo build --all-targets
+	cargo build --all-targets --features fake-herdr
 
 release: ## optimised build
 	cargo build --release
@@ -30,22 +30,22 @@ fmt-check:
 	cargo fmt --check
 
 lint: ## clippy with warnings as errors
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --all-targets --features fake-herdr -- -D warnings
 
 test: ## whole suite, including the end-to-end CLI tests against the fake herdr
-	cargo test
+	cargo test --features fake-herdr
 
 # Once is enough: these tests run on tokio's paused clock, where a runner's
 # load changes nothing. Two shutdown tests need a second thread and keep the
 # wall clock; they only wait for something to happen, with seconds to spare.
 test-machine: ## the machine actor tests on their own
-	cargo test --lib machine:: -q
+	cargo test --lib --features fake-herdr machine:: -q
 
 # Starts an sshd of its own on a localhost port, as the user running it, and
 # drives the CLI against a head through the real ssh and `pastor bridge`;
 # see tests/real_ssh.rs. Needs OpenSSH's server (sshd) and ssh-keygen.
 test-ssh: ## the CLI against a head over a real ssh, through a throwaway sshd
-	cargo test --test real_ssh -- --ignored
+	cargo test --features fake-herdr --test real_ssh -- --ignored
 
 # The release builds are static musl binaries and FreeBSD builds from source,
 # so code that only compiles against glibc on x86_64 has to fail before the
@@ -66,8 +66,8 @@ portability: ## cargo check for the musl and FreeBSD targets, as CI does
 	done; \
 	if [ -n "$$missing" ]; then echo "make portability: missing $${missing#, }" >&2; exit 1; fi
 	@for target in $(PORTABILITY_TARGETS); do \
-	  echo "cargo-zigbuild check --locked --all-targets --target $$target"; \
-	  cargo-zigbuild check --locked --all-targets --target $$target || exit 1; \
+	  echo "cargo-zigbuild check --locked --all-targets --features fake-herdr --target $$target"; \
+	  cargo-zigbuild check --locked --all-targets --features fake-herdr --target $$target || exit 1; \
 	done
 
 # Line coverage of the whole suite, instrumented by cargo-llvm-cov (see
