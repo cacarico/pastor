@@ -26,6 +26,7 @@ use crate::machine::{
 use crate::queue::{QueueEntry, QueueSpot};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{MoveError, Moved, NewTask, PriorityError, RetryError, Store, TaskFilter};
+use crate::sync::Recover;
 use crate::task::{AgentSource, PANE_OWNING_STATES, Priority, Task, TaskRole, TaskState};
 
 /// How a headless serve's fleet reaches the head with the items a job run
@@ -340,7 +341,7 @@ impl Fleet {
     /// scheduler: nothing is dispatched from it, but the tasks it queues must
     /// land in the flocks flock.toml declares.
     pub fn with_flock(self, flock: Flock) -> Fleet {
-        *self.wanted.write().unwrap() = flock;
+        *self.wanted.write().recover() = flock;
         self
     }
 
@@ -372,7 +373,7 @@ impl Fleet {
     pub fn machines(&self) -> Vec<MachineHandle> {
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .map(|m| m.handle.clone())
             .collect()
@@ -387,7 +388,7 @@ impl Fleet {
         let wanted = self.flock();
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .map(|m| {
                 let flock = flock_of(&wanted, &m.handle.name);
@@ -412,7 +413,7 @@ impl Fleet {
     pub fn get(&self, name: &str) -> Option<MachineHandle> {
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .find(|m| m.handle.name == name)
             .map(|m| m.handle.clone())
@@ -423,16 +424,16 @@ impl Fleet {
     /// swap a machine that was shutting down held up. Empty for a fixed
     /// fleet.
     pub fn flock(&self) -> Flock {
-        self.wanted.read().unwrap().clone()
+        self.wanted.read().recover().clone()
     }
 
     /// Take `[defaults]` and `[agents]` from `pastor.toml` as now loaded;
     /// the scheduler calls it at start, and a reload through `apply_config`.
     pub fn set_config(&self, config: &PastorConfig) {
-        *self.defaults.write().unwrap() = config.defaults.clone();
-        *self.agents.write().unwrap() = config.agents.clone();
-        *self.models.write().unwrap() = config.models.clone();
-        *self.profiles.write().unwrap() = config.profiles.clone();
+        *self.defaults.write().recover() = config.defaults.clone();
+        *self.agents.write().recover() = config.agents.clone();
+        *self.models.write().recover() = config.models.clone();
+        *self.profiles.write().recover() = config.profiles.clone();
         self.agents_change_fleet.store(
             config.agents_change_fleet,
             std::sync::atomic::Ordering::Relaxed,
@@ -451,7 +452,7 @@ impl Fleet {
 
     /// `[defaults]` as last applied.
     pub fn defaults(&self) -> Defaults {
-        self.defaults.read().unwrap().clone()
+        self.defaults.read().recover().clone()
     }
 
     /// Whether `pastor.toml` as last applied lets an agent pastor started
@@ -471,8 +472,8 @@ impl Fleet {
         flock: &str,
         machine: Option<&str>,
     ) -> AgentPick {
-        let wanted = self.wanted.read().unwrap();
-        self.defaults.read().unwrap().resolve_agent_on(
+        let wanted = self.wanted.read().recover();
+        self.defaults.read().recover().resolve_agent_on(
             ask,
             machine.and_then(|m| wanted.get(m)),
             wanted.entry(flock),
@@ -483,10 +484,10 @@ impl Fleet {
     /// whether it may ask for `unrestricted` there: the machine's, else the
     /// flock's, else `[defaults]` (`Defaults::own_profile`).
     pub fn own_profile(&self, flock: &str, machine: Option<&str>) -> Option<String> {
-        let wanted = self.wanted.read().unwrap();
+        let wanted = self.wanted.read().recover();
         self.defaults
             .read()
-            .unwrap()
+            .recover()
             .own_profile(machine.and_then(|m| wanted.get(m)), wanted.entry(flock))
     }
 
@@ -505,11 +506,11 @@ impl Fleet {
         machine: Option<&str>,
         asked_by: &str,
     ) -> Result<(), AgentRefusal> {
-        let models = self.models.read().unwrap();
-        let agents = self.agents.read().unwrap();
+        let models = self.models.read().recover();
+        let agents = self.agents.read().recover();
         let pick = {
-            let wanted = self.wanted.read().unwrap();
-            self.defaults.read().unwrap().resolve_agent_for(
+            let wanted = self.wanted.read().recover();
+            self.defaults.read().recover().resolve_agent_for(
                 ask,
                 machine.and_then(|m| wanted.get(m)),
                 wanted.entry(flock),
@@ -556,7 +557,7 @@ impl Fleet {
         let own = self.own_profile(flock, machine);
         self.profiles
             .read()
-            .unwrap()
+            .recover()
             .apply(&pick, own.as_deref(), spec)
     }
 
@@ -571,8 +572,8 @@ impl Fleet {
         pinned: Option<&str>,
         asked_by: &str,
     ) -> (Priority, Option<String>) {
-        let wanted = self.wanted.read().unwrap();
-        let (priority, layer) = self.defaults.read().unwrap().resolve_priority(
+        let wanted = self.wanted.read().recover();
+        let (priority, layer) = self.defaults.read().recover().resolve_priority(
             ask,
             pinned.and_then(|m| wanted.get(m)),
             wanted.entry(flock),
@@ -589,11 +590,11 @@ impl Fleet {
     /// (`Defaults::resolve_label`). `asked_by` names the ask, as for
     /// `settle`. Dispatch renders it on the machine it picks.
     fn settle_label(&self, spec: &mut crate::task::DispatchSpec, flock: &str, asked_by: &str) {
-        let wanted = self.wanted.read().unwrap();
+        let wanted = self.wanted.read().recover();
         let picked = self
             .defaults
             .read()
-            .unwrap()
+            .recover()
             .resolve_label(spec.label.template.as_deref(), wanted.entry(flock));
         spec.label = crate::task::WorkspaceLabel {
             from: picked
@@ -617,9 +618,9 @@ impl Fleet {
         flock: &str,
         asked_by: &str,
     ) {
-        let wanted = self.wanted.read().unwrap();
+        let wanted = self.wanted.read().recover();
         let entry = wanted.entry(flock);
-        let defaults = self.defaults.read().unwrap();
+        let defaults = self.defaults.read().recover();
         let label = |layer| layer_label(layer, asked_by, flock, None);
         let (timeout, timeout_from) = defaults.resolve_timeout(ask.timeout_secs, entry);
         let (place, place_from) = defaults.resolve_place(ask.place.as_ref(), entry);
@@ -647,10 +648,10 @@ impl Fleet {
         ask: Option<crate::task::SummaryMode>,
         flock: &str,
     ) -> crate::task::SummaryMode {
-        let wanted = self.wanted.read().unwrap();
+        let wanted = self.wanted.read().recover();
         self.defaults
             .read()
-            .unwrap()
+            .recover()
             .resolve_summary(ask, wanted.entry(flock))
     }
 
@@ -698,7 +699,7 @@ impl Fleet {
                 }
             }
         }
-        let agents = self.agents.read().unwrap();
+        let agents = self.agents.read().recover();
         landings
             .iter()
             .try_for_each(|s| agents.launch_args(s).map(drop))
@@ -713,7 +714,7 @@ impl Fleet {
     pub fn shutting_down(&self, name: &str) -> bool {
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .any(|m| m.handle.name == name && m.shutting_down)
     }
@@ -724,7 +725,7 @@ impl Fleet {
     /// plus those of the flock file it was given (`with_flock`), which is
     /// all the daemon-less scheduler has.
     pub fn in_flock(&self, name: &str) -> bool {
-        let wanted = self.wanted.read().unwrap().get(name).is_some();
+        let wanted = self.wanted.read().recover().get(name).is_some();
         if self.spawner.is_some() {
             wanted
         } else {
@@ -757,7 +758,7 @@ impl Fleet {
     #[cfg(test)]
     pub async fn replace_flock(&self, flock: Flock) {
         let _pass = self.dispatch_lock.lock().await;
-        *self.wanted.write().unwrap() = flock;
+        *self.wanted.write().recover() = flock;
     }
 
     /// Hold the dispatch lock, as a dispatch pass does, for a test.
@@ -768,7 +769,11 @@ impl Fleet {
 
     /// Is any machine waiting for its old actor to end?
     pub fn any_shutting_down(&self) -> bool {
-        self.members.read().unwrap().iter().any(|m| m.shutting_down)
+        self.members
+            .read()
+            .recover()
+            .iter()
+            .any(|m| m.shutting_down)
     }
 
     /// Make the running set match `flock` and `settings`: spawn actors for
@@ -816,12 +821,12 @@ impl Fleet {
         flock: &Flock,
         settings: &MachineSettings,
     ) -> FlockDiff {
-        *self.wanted.write().unwrap() = flock.clone();
+        *self.wanted.write().recover() = flock.clone();
         let mut diff = FlockDiff::default();
         // A copy: readers keep seeing the old set until the new one is ready,
         // and the lock is not held across the waits below. The dispatch lock
         // keeps any other `apply_flock` out meanwhile.
-        let mut old: Vec<Member> = self.members.read().unwrap().clone();
+        let mut old: Vec<Member> = self.members.read().recover().clone();
         enum Step {
             Keep(Member),
             Add,
@@ -853,7 +858,7 @@ impl Fleet {
             })
             .chain(gone.iter().map(|o| o.handle.name.clone()))
             .collect();
-        for m in self.members.write().unwrap().iter_mut() {
+        for m in self.members.write().recover().iter_mut() {
             if stopping.contains(&m.handle.name) {
                 m.shutting_down = true;
             }
@@ -896,16 +901,16 @@ impl Fleet {
         }
         self.pull_seen
             .lock()
-            .unwrap()
+            .recover()
             .retain(|name, _| members.iter().any(|m| m.pull && &m.handle.name == name));
-        *self.members.write().unwrap() = members;
+        *self.members.write().recover() = members;
         diff
     }
 
     /// Keep `m` in the fleet, out of dispatch, until its actor ends.
     fn hold(mut m: Member) -> Member {
         m.shutting_down = true;
-        m.handle.status.write().unwrap().error =
+        m.handle.status.write().recover().error =
             Some("shutting down: the old actor has not stopped yet".into());
         m
     }
@@ -915,7 +920,7 @@ impl Fleet {
         if m.pull {
             // Heard from as of now: a head that starts gives the machine
             // `pull_lost_after` to claim before its tasks go stale.
-            self.pull_seen.lock().unwrap().insert(
+            self.pull_seen.lock().recover().insert(
                 m.name.clone(),
                 PullSeen {
                     at: tokio::time::Instant::now(),
@@ -952,7 +957,7 @@ impl Fleet {
         let wanted = self.flock();
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .map(|m| {
                 let s = m.handle.snapshot();
@@ -1306,7 +1311,7 @@ impl Fleet {
         doc.save(file)?;
         self.wanted
             .write()
-            .unwrap()
+            .recover()
             .flocks
             .retain(|f| f.name != name);
         Ok(())
@@ -1333,13 +1338,13 @@ impl Fleet {
             && let Ok(flock) = Flock::load_existing(file)
             && flock
                 .check_config(
-                    &self.models.read().unwrap(),
-                    &self.agents.read().unwrap(),
-                    &self.profiles.read().unwrap(),
+                    &self.models.read().recover(),
+                    &self.agents.read().recover(),
+                    &self.profiles.read().recover(),
                 )
                 .is_ok()
         {
-            *self.wanted.write().unwrap() = flock;
+            *self.wanted.write().recover() = flock;
         }
         Ok(done)
     }
@@ -1387,7 +1392,7 @@ impl Fleet {
                 None => {
                     self.agents
                         .read()
-                        .unwrap()
+                        .recover()
                         .launch_args(&t.spec)
                         .map_err(QueueError::Agent)?;
                 }
@@ -1493,7 +1498,7 @@ impl Fleet {
     pub fn is_pull(&self, name: &str) -> bool {
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .any(|m| m.pull && m.handle.name == name)
     }
@@ -1501,7 +1506,7 @@ impl Fleet {
     /// The handle of pull machine `name`, or why a claim or report from it
     /// is refused.
     fn pull_handle(&self, name: &str) -> anyhow::Result<MachineHandle> {
-        let members = self.members.read().unwrap();
+        let members = self.members.read().recover();
         match members.iter().find(|m| m.handle.name == name) {
             Some(m) if m.pull => Ok(m.handle.clone()),
             Some(_) => Err(crate::cli::CliError::err(
@@ -1518,7 +1523,7 @@ impl Fleet {
     /// A pull machine's live counts, from the store: no actor keeps them.
     fn count_pull(&self, handle: &MachineHandle) {
         match self.store.tasks_on_machine(&handle.name) {
-            Ok(tasks) => crate::machine::count_live(&mut handle.status.write().unwrap(), &tasks),
+            Ok(tasks) => crate::machine::count_live(&mut handle.status.write().recover(), &tasks),
             Err(err) => {
                 tracing::error!(machine = %handle.name, %err, "count a pull machine's tasks")
             }
@@ -1562,7 +1567,7 @@ impl Fleet {
     /// counted lost is announced back.
     fn heard(&self, handle: &MachineHandle) {
         let was_lost = {
-            let mut seen = self.pull_seen.lock().unwrap();
+            let mut seen = self.pull_seen.lock().recover();
             let e = seen.entry(handle.name.clone()).or_insert(PullSeen {
                 at: tokio::time::Instant::now(),
                 lost: false,
@@ -1571,7 +1576,7 @@ impl Fleet {
             std::mem::replace(&mut e.lost, false)
         };
         {
-            let mut s = handle.status.write().unwrap();
+            let mut s = handle.status.write().recover();
             s.channel = crate::machine::ChannelState::Connected;
             s.error = None;
         }
@@ -1847,7 +1852,7 @@ impl Fleet {
         let lost: Vec<String> = self
             .pull_seen
             .lock()
-            .unwrap()
+            .recover()
             .iter_mut()
             .filter(|(_, seen)| !seen.lost && now.duration_since(seen.at) >= after)
             .map(|(name, seen)| {
@@ -1864,7 +1869,7 @@ impl Fleet {
                 after.as_secs()
             );
             {
-                let mut s = handle.status.write().unwrap();
+                let mut s = handle.status.write().recover();
                 s.channel = crate::machine::ChannelState::Reconnecting;
                 s.error = Some(why.clone());
             }
@@ -1967,7 +1972,7 @@ impl Fleet {
                     let kind = self
                         .models
                         .read()
-                        .unwrap()
+                        .recover()
                         .get(task.model()?)
                         .ok()?
                         .kind
@@ -2078,7 +2083,7 @@ impl Fleet {
         later: &[Task],
         takes: &dyn Fn(&Task, &str) -> bool,
     ) -> Option<(String, i64)> {
-        let agents = self.agents.read().unwrap().clone();
+        let agents = self.agents.read().recover().clone();
         let default = self.flock().default_flock().to_string();
         let now = chrono::Utc::now();
         views
