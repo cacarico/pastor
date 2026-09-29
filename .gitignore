@@ -6,3 +6,5 @@ docs/website/resources/
 docs/website/.hugo_build.lock
 # Design mockups live in the private cacarico-layouts repo, not here.
 docs/website/mockups/
+# cargo-mutants output; see make mutants.
+mutants.out*/

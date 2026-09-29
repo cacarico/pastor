@@ -95,6 +95,11 @@ down here because getting them wrong cost a day.
   trusting a change to the transport or dispatch. `make smoke-profiles`
   runs a live review task per agent through a head running the build under
   test; do it before trusting a change to permission profiles.
+- `make mutants` runs cargo-mutants over the transport, head, dispatch and
+  config (`.cargo/mutants.toml`); a full run is hours, so it is not a PR
+  job. `make mutants-diff` runs only the mutants in a branch's own diff. An
+  equivalent mutant is skipped with `#[cfg_attr(test, mutants::skip)]` and a
+  comment saying why.
 - Work on a branch, open a pull request, never push `main`.
 - Commit messages: conventional prefix, plain subject, a body that explains
   the why. No `Co-Authored-By` or other trailers.
