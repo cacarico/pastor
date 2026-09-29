@@ -60,7 +60,7 @@ A task's state change is `task.` and the new state.
 | `task.failed` | it failed | |
 | `task.stale` | its timeout passed, or its pull machine was lost | |
 | `task.closed` | its pane was closed | |
-| `task.input` | someone ran `pastor task send` | `keys`, `text_len`, and `trust` with `--trust`; never the text |
+| `task.input` | someone ran `pastor task send`, or pastor answered Claude's limit picker with "Stop and wait" | `keys`, `text_len`, `trust` with `--trust`, `limit_picker` from the picker; never the text |
 | `task.trusted` | the head answered a folder-trust prompt from saved trust | `keys` |
 | `job.failed` | a job run failed | |
 | `connector.finish_failed` | a connector's finish command failed | `connector`, `reason` |

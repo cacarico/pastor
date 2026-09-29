@@ -1,0 +1,17 @@
+#! kind: claude
+#! source: made
+#! now: 2026-09-29T21:00:00Z
+#! picker: stop
+#! keys: Up Enter
+#! until: none
+> Read AGENTS.md, then fix the flaky transport test.
+
+● Bash(cargo test --test transport)
+  ⎿  running 14 tests
+
+ What do you want to do?
+
+   1. Stop and wait for limit to reset
+ ❯ 2. Use extra usage
+
+ Enter to confirm · Esc to cancel

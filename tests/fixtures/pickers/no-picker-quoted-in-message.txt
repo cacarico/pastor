@@ -1,0 +1,16 @@
+#! kind: claude
+#! source: made
+#! now: 2026-09-29T21:00:00Z
+#! picker: none
+> What does Claude show at its usage limit?
+
+● Some builds show a picker with three options:
+
+  1. Stop and wait for limit to reset
+  2. Upgrade your plan
+  3. Use extra usage
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

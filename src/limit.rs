@@ -454,6 +454,186 @@ fn scope_of(lower: &str) -> Option<Vec<&str>> {
         .then(|| scope.to_vec())
 }
 
+/// The option of Claude's limit picker pastor picks. It is the only one:
+/// the others spend money (extra usage) or change the plan, and that stays
+/// a person's call.
+pub const STOP_AND_WAIT: &str = "Stop and wait for limit to reset";
+
+/// Words that make a picker option one of Claude's limit picker's.
+const PICKER_WORDS: [&str; 3] = ["stop and wait", "extra usage", "upgrade your plan"];
+
+/// Claude's picker at a usage limit (stop and wait, upgrade, or use extra
+/// usage), which some builds show instead of ending the turn. herdr reports
+/// the agent `blocked` on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitPicker {
+    /// The options as the picker lists them, without their numbers.
+    pub options: Vec<String>,
+    /// The option the cursor is on.
+    pub selected: usize,
+    /// The limit it is about: the message above it when there is one, else
+    /// a hard limit with the reset the picker names, if any.
+    pub limit: Limit,
+}
+
+impl LimitPicker {
+    /// The keys that pick `STOP_AND_WAIT` from where the cursor is, found by
+    /// its text wherever it is in the list: `Up` or `Down` to it, then
+    /// `Enter`. `None` when the picker has no such option; then nothing
+    /// should be pressed.
+    pub fn stop_keys(&self) -> Option<Vec<String>> {
+        let want = STOP_AND_WAIT.to_ascii_lowercase();
+        let at = self
+            .options
+            .iter()
+            .position(|o| o.to_ascii_lowercase().starts_with(&want))?;
+        let (key, n) = if at >= self.selected {
+            ("Down", at - self.selected)
+        } else {
+            ("Up", self.selected - at)
+        };
+        let mut keys = vec![key.to_string(); n];
+        keys.push("Enter".into());
+        Some(keys)
+    }
+
+    /// `1. Upgrade your plan, 2. Use extra usage`: the options, for an
+    /// error that says what the picker offered.
+    pub fn listed(&self) -> String {
+        self.options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{}. {o}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Claude's limit picker, if an agent of `kind` shows one at the end of
+/// `text`, its pane.
+///
+/// As strict as `limit_in`: the picker has to be the last thing on the
+/// pane, under at most its key hints (`Enter to confirm · Esc to cancel`):
+/// a run of options numbered from 1, one of them under the cursor (`❯`).
+/// It is a limit picker when one of its options is one of Claude's limit
+/// options (`PICKER_WORDS`), or when the text just above it is a limit
+/// message. So a list in a message, which has no cursor, and another
+/// dialog (a permission prompt) are not one.
+pub fn limit_picker(kind: &str, text: &str, now: DateTime<Utc>) -> Option<LimitPicker> {
+    match kind {
+        "claude" => claude_picker(text, now),
+        _ => None,
+    }
+}
+
+fn claude_picker(text: &str, now: DateTime<Utc>) -> Option<LimitPicker> {
+    let text = text.replace('\u{a0}', " ");
+    let lines: Vec<&str> = text
+        .lines()
+        .map(unboxed)
+        .filter(|l| !l.is_empty() && !is_rule(l) && !is_box_edge(l))
+        .collect();
+    let mut end = lines.len();
+    // The key hints under the options.
+    while end > 0 && is_key_hint(lines[end - 1]) && lines.len() - end < 2 {
+        end -= 1;
+    }
+    let mut options = Vec::new();
+    let mut selected = None;
+    let mut start = end;
+    while start > 0 {
+        let Some((cursor, number, option)) = picker_option(lines[start - 1]) else {
+            break;
+        };
+        if cursor {
+            if selected.is_some() {
+                return None;
+            }
+            selected = Some(start - 1);
+        }
+        options.push((number, option));
+        start -= 1;
+    }
+    options.reverse();
+    let numbered = options.iter().enumerate().all(|(i, (n, _))| *n == i + 1);
+    if options.len() < 2 || !numbered {
+        return None;
+    }
+    let selected = selected? - start;
+    let options: Vec<String> = options.into_iter().map(|(_, o)| o.to_string()).collect();
+    let above: Vec<&str> = lines[..start].iter().rev().take(4).copied().collect();
+    let message = above.iter().find_map(|l| {
+        let said = l
+            .trim_start_matches(MESSAGE_MARKERS)
+            .trim_start_matches(OUTPUT_MARKER)
+            .trim();
+        read_claude(said, "", now)
+    });
+    let ours = options.iter().any(|o| {
+        let o = o.to_ascii_lowercase();
+        PICKER_WORDS.iter().any(|w| o.contains(w))
+    });
+    if !ours && message.is_none() {
+        return None;
+    }
+    let limit = message.unwrap_or_else(|| {
+        let near: Vec<&str> = above.iter().rev().copied().collect();
+        let near = near.join(" ");
+        Limit {
+            hard: true,
+            until: reset_in(&near, now),
+            model_scoped: false,
+            no_credit: false,
+            line: above
+                .first()
+                .map_or_else(|| STOP_AND_WAIT.to_string(), |l| l.to_string()),
+        }
+    });
+    Some(LimitPicker {
+        options,
+        selected,
+        limit,
+    })
+}
+
+/// `line` without the sides of a box Claude draws around a dialog, and
+/// without its indent.
+fn unboxed(line: &str) -> &str {
+    line.trim()
+        .trim_start_matches('│')
+        .trim_end_matches('│')
+        .trim()
+}
+
+/// The top or bottom of a box: `╭────╮`.
+fn is_box_edge(line: &str) -> bool {
+    line.chars().count() >= 3
+        && line
+            .chars()
+            .all(|c| matches!(c, '─' | '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘'))
+}
+
+/// A line of key hints under a picker: `Enter to confirm · Esc to cancel`.
+fn is_key_hint(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    ["to confirm", "to cancel", "to select", "to navigate"]
+        .iter()
+        .any(|h| lower.contains(h))
+}
+
+/// An option of a picker: `❯ 1. Stop and wait for limit to reset` or
+/// `2. Upgrade your plan`, as (under the cursor, number, text).
+fn picker_option(line: &str) -> Option<(bool, usize, &str)> {
+    let (cursor, rest) = match line.strip_prefix(['❯', '>']) {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, line),
+    };
+    let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+    let number = rest[..digits].parse().ok()?;
+    let option = rest[digits..].strip_prefix(". ")?.trim();
+    (!option.is_empty()).then_some((cursor, number, option))
+}
+
 /// When the limit `text` tells of resets, if it says: a unix time after
 /// `|`, a time from now (`try again in 2 hours 13 minutes`, `in 20s`), or a
 /// time of day after `reset` or `try again at`, alone (`resets 3am`,

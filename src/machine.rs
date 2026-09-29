@@ -895,6 +895,7 @@ pub fn spawn_machine(
         trust_answered: HashMap::new(),
         unseen_prompt: HashMap::new(),
         idle_agents: HashSet::new(),
+        picker_read: HashSet::new(),
         was_connected: false,
         failures: 0,
         lost_announced: false,
@@ -997,6 +998,10 @@ struct Actor {
     /// changes nothing). Decides what an exit means: an agent that ends
     /// between turns finished its task; see `Observed::PaneExited`.
     idle_agents: HashSet<i64>,
+    /// Tasks whose pane was read for Claude's limit picker since their
+    /// agent was last seen `blocked` (`answer_limit_picker`): once a
+    /// blocked spell. Cleared when the agent is seen out of `blocked`.
+    picker_read: HashSet<i64>,
     /// Has the actor connected successfully at least once (ever)?
     was_connected: bool,
     /// Consecutive connect-attempt failures since the last success. Only decides
@@ -3401,6 +3406,7 @@ impl Actor {
             }
             return Ok(());
         };
+        let id = task.id;
         let observed = if ev.is_pane_closed() {
             Observed::PaneClosed
         } else if ev.is_pane_exited() {
@@ -3446,6 +3452,7 @@ impl Actor {
                 ..
             }
         ) {
+            self.answer_limit_picker(id).await?;
             self.auto_trust().await?;
         }
         Ok(())
@@ -4007,8 +4014,12 @@ impl Actor {
         match status {
             AgentStatus::Idle | AgentStatus::Done => {
                 self.idle_agents.insert(id);
+                self.picker_read.remove(&id);
             }
             AgentStatus::Working | AgentStatus::Blocked => {
+                if status == AgentStatus::Working {
+                    self.picker_read.remove(&id);
+                }
                 self.idle_agents.remove(&id);
                 // It took its prompt, or stopped on something a person answers.
                 self.unseen_prompt.remove(&id);
@@ -4135,6 +4146,8 @@ impl Actor {
         let agents: Vec<AgentInfo> = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
             .map_err(|_| TimedOut("agent.list", timeout))??;
+        // Tasks whose agent this list shows blocked, for the limit picker.
+        let mut blocked = Vec::new();
         for task in self.store.tasks_on_machine(&self.name)? {
             let Some(pane_id) = task.pane_id.clone() else {
                 // Only a `Starting` task can occupy a pane slot with no pane recorded
@@ -4253,6 +4266,9 @@ impl Actor {
                 }
                 Some(agent) => {
                     self.note_status(task.id, agent.agent_status);
+                    if agent.agent_status == AgentStatus::Blocked {
+                        blocked.push(task.id);
+                    }
                     // Before the timeout check: a task that sat blocked past its
                     // timeout has not started its work yet.
                     if task.prompt_pending
@@ -4314,8 +4330,83 @@ impl Actor {
         }
         self.find_orphans(&agents)?;
         self.refresh_live();
+        for id in blocked {
+            self.answer_limit_picker(id).await?;
+        }
         self.auto_trust().await?;
         Ok(adopted)
+    }
+
+    /// Claude's limit picker: read the pane of task `id`, whose agent is
+    /// `blocked`, once a blocked spell (`picker_read`), and when it ends on
+    /// the picker (`limit::limit_picker`), pick "Stop and wait for limit to
+    /// reset" by its text and handle the limit as an agent that stopped on
+    /// it (`wait_on_limit`). The other options spend money or change the
+    /// plan, which stays a person's call, so a picker without that option,
+    /// or in words pastor does not know, gets no key: the task stays
+    /// `blocked` with an error saying what it looks like. A task blocked on
+    /// its startup (`prompt_pending`, see `auto_trust`), one its agent
+    /// ended, and any where no limits are kept are not read.
+    async fn answer_limit_picker(&mut self, id: i64) -> anyhow::Result<()> {
+        if self.settings.limits.is_none() || self.picker_read.contains(&id) {
+            return Ok(());
+        }
+        let Ok(Some(task)) = self.store.get_task(id) else {
+            return Ok(());
+        };
+        if task.state != TaskState::Blocked || task.prompt_pending || task.ended {
+            return Ok(());
+        }
+        let (Some(pane), Some(target)) = (task.pane_id.clone(), task.agent_name.clone()) else {
+            return Ok(());
+        };
+        let timeout = self.settings.request_timeout;
+        let text = match tokio::time::timeout(timeout, self.connector.agent_read(&target, 100))
+            .await
+        {
+            Ok(Ok(text)) => text,
+            Ok(Err(err)) if err.is_transport() => return Err(err.into()),
+            Ok(Err(err)) => {
+                tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a limit picker");
+                self.picker_read.insert(id);
+                return Ok(());
+            }
+            Err(_) => return Err(TimedOut("agent.read", timeout).into()),
+        };
+        self.picker_read.insert(id);
+        let kind = self.settings.agents.kind(&task.spec.agent);
+        let Some(picker) = crate::limit::limit_picker(kind, &text, Utc::now()) else {
+            return Ok(());
+        };
+        let Some(keys) = picker.stop_keys() else {
+            let message = format!(
+                "looks like a usage limit picker with no \"{}\" ({}); nothing was pressed",
+                crate::limit::STOP_AND_WAIT,
+                picker.listed()
+            );
+            tracing::warn!(machine = %self.name, task = %task.display_id(), "{message}");
+            let written = write_task(&self.store, task, |t| {
+                let blocked = t.state == TaskState::Blocked;
+                if blocked {
+                    t.error = Some(message.clone());
+                }
+                blocked
+            })?;
+            if written.is_some() {
+                self.refresh_live();
+            }
+            return Ok(());
+        };
+        tokio::time::timeout(timeout, self.connector.pane_send_keys(&pane, &keys))
+            .await
+            .map_err(|_| TimedOut("pane.send_keys", timeout))??;
+        tracing::info!(machine = %self.name, task = %task.display_id(), "answered the limit picker: stop and wait");
+        self.emit_with(
+            "task.input",
+            Some(id),
+            Some(serde_json::json!({"keys": keys, "limit_picker": true})),
+        );
+        self.wait_on_limit(task, &picker.limit, false).await
     }
 
     /// Answer the folder-trust prompt of every task blocked during startup
@@ -5196,6 +5287,129 @@ mod tests {
         );
         let prompt = calls(&fake, "agent.prompt").pop().unwrap();
         assert_eq!(prompt["text"], crate::task::LIMIT_RESUME_PROMPT);
+    }
+
+    /// A screen of `tests/fixtures/pickers/`, without its header.
+    fn picker_screen(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pickers")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with("#! "))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    /// A task whose agent goes `blocked` on `screen`, on a head that keeps
+    /// the limits: the fake, the store, the task and its pane.
+    async fn blocked_on(
+        screen: &str,
+    ) -> (
+        FakeHerdr,
+        Arc<Store>,
+        Task,
+        String,
+        broadcast::Receiver<PastorEvent>,
+    ) {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, events) =
+            spawn_with_settings(&fake, &store, limits_kept(Duration::from_millis(100)));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(&pane, screen);
+        fake.set_status(&pane, AgentStatus::Blocked);
+        // The handle has to outlive the test's waits.
+        std::mem::forget(h);
+        (fake, store, t, pane, events)
+    }
+
+    /// The keys pressed in `pane`, all of them.
+    fn keys_in(fake: &FakeHerdr, pane: &str) -> Vec<String> {
+        fake.pane_input(pane)
+            .into_iter()
+            .flat_map(|i| match i {
+                crate::herdr::fake::PaneInput::Keys(k) => k,
+                crate::herdr::fake::PaneInput::Text(t) => vec![format!("text:{t}")],
+            })
+            .collect()
+    }
+
+    /// Claude's limit picker: pastor picks "Stop and wait for limit to
+    /// reset" by its text, wherever it is in the list, and the task waits
+    /// for its reset as one that stopped on the limit does. Nothing else is
+    /// ever pressed: no key reaches extra usage or an upgrade.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_agent_at_the_limit_picker_stops_and_waits() {
+        for (screen, keys) in [
+            ("claude-picker.txt", vec!["Enter"]),
+            ("claude-picker-reordered.txt", vec!["Down", "Down", "Enter"]),
+        ] {
+            let (fake, store, t, pane, mut events) = blocked_on(&picker_screen(screen)).await;
+            wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+            let mut want: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+            want.push("esc".into());
+            assert_eq!(keys_in(&fake, &pane), want, "{screen}");
+            let row = store.get_task(t.id).unwrap().unwrap();
+            assert_eq!(row.pane_id, None, "{screen}");
+            assert!(row.waiting_until.is_some(), "{screen}");
+            let limits = store.limits().unwrap();
+            assert_eq!(limits.len(), 1, "{screen}: {limits:?}");
+            assert!(limits[0].hard, "{screen}");
+            assert!(saw(&mut events, "task.waiting", t.id), "{screen}");
+        }
+    }
+
+    /// A limit picker with no "Stop and wait" (or in words pastor does not
+    /// know) gets no key at all: the task stays `blocked`, its error saying
+    /// what it looks like, for a person to answer. The pane is read once
+    /// per blocked spell.
+    #[tokio::test(start_paused = true)]
+    async fn a_limit_picker_without_stop_and_wait_gets_no_key() {
+        for screen in [
+            "claude-picker-no-stop.txt",
+            "claude-picker-unknown-wording.txt",
+        ] {
+            let (fake, store, t, pane, _events) = blocked_on(&picker_screen(screen)).await;
+            wait_for("error", || {
+                store
+                    .get_task(t.id)
+                    .unwrap()
+                    .unwrap()
+                    .error
+                    .is_some_and(|e| e.contains("limit picker"))
+            })
+            .await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let row = store.get_task(t.id).unwrap().unwrap();
+            assert_eq!(row.state, TaskState::Blocked, "{screen}");
+            assert!(keys_in(&fake, &pane).is_empty(), "{screen}");
+            assert!(store.limits().unwrap().is_empty(), "{screen}");
+            let reads = calls(&fake, "agent.read").len();
+            assert_eq!(reads, 1, "{screen}: read once");
+        }
+    }
+
+    /// Blocked on anything else (a permission prompt), the task is left
+    /// for a person as before: nothing pressed, no error written.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_agent_on_another_dialog_is_left_alone() {
+        let (fake, store, t, pane, _events) =
+            blocked_on(&picker_screen("no-picker-permission-prompt.txt")).await;
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Blocked);
+        assert_eq!(row.error, None);
+        assert!(keys_in(&fake, &pane).is_empty());
     }
 
     /// A limit further up the pane than the last prompt is an old one:

@@ -1522,6 +1522,29 @@ one). `task retry` refuses it with `task_waiting`, since it goes on by
 itself and a retry would put a second agent on the same work, and so does
 `task attach`. `task send` answers `task_not_live`.
 
+#### Claude's limit picker
+
+Some Claude builds show a picker at the limit instead of ending the turn:
+stop and wait for the limit to reset, upgrade the plan, or use extra usage.
+herdr reports the agent `blocked`. Each time a task goes `blocked`, pastor
+reads the end of its pane once, as strictly as it reads a limit message:
+the picker has to be the last thing there, under at most its key hints, a
+list numbered from 1 with the cursor (`❯`) on one option, and either an
+option of Claude's limit picker or a limit message just above it. A
+numbered list in a message, or another dialog such as a permission prompt,
+is no picker.
+
+pastor picks "Stop and wait for limit to reset" by its text, wherever it
+sits in the list (the arrow keys to it, then Enter), emits `task.input`
+with the keys and `limit_picker: true`, and the task waits for its reset as
+above. A picker without that option, or in words pastor does not know,
+gets no key: the task stays `blocked` for a person, its error saying
+`looks like a usage limit picker with no "Stop and wait for limit to reset"
+(1. Upgrade your plan, 2. Use extra usage); nothing was pressed`.
+
+pastor never picks extra usage or an upgrade, and no setting makes it:
+spending money stays a person's call.
+
 A task with [fallback models](#fallback-models) waits all the same for now;
 moving it to the next model is to come. A headless serve keeps no table, so
 its own tasks settle as before, and a pull machine does not read limits from
@@ -2070,7 +2093,8 @@ A record, which is also what connector event hooks get on stdin:
   `task.limited` (its agent stopped on a usage limit; the detail is
   `agent.exhausted`'s) and `task.waiting` (it waits for the reset; see
   Usage limits),
-  `task.input` (`pastor task send`), `task.trusted` (the head answered a
+  `task.input` (`pastor task send`, or pastor at Claude's limit picker),
+  `task.trusted` (the head answered a
   trust prompt), `job.failed`, `connector.finish_failed` (a connector's
   `[finish]` command failed), `machine.connected`, `machine.lost`,
   `agent.exhausted` and `agent.reset` (see Usage limits), and
@@ -2094,7 +2118,8 @@ A record, which is also what connector event hooks get on stdin:
   A task's machine is `task.machine`.
 - `detail`: only on events that carry more, and absent otherwise. On
   `task.input`, `keys` (the key names pressed, Enter included), `text_len`
-  (the length of any text) and `trust` (sent by `--trust`); on
+  (the length of any text), `trust` (sent by `--trust`) and
+  `limit_picker` (pastor answered Claude's limit picker); on
   `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
   turn on a question, `question`; on `connector.finish_failed`, `connector`
   (its id) and `reason` (why: the exit status and stderr tail, or a timeout);

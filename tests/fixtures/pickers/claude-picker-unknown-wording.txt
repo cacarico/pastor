@@ -1,0 +1,13 @@
+#! kind: claude
+#! source: made
+#! now: 2026-09-29T21:00:00Z
+#! picker: no_stop
+#! until: none
+> Read AGENTS.md, then fix the flaky transport test.
+
+● You've reached your usage limit.
+
+ ❯ 1. Wait it out
+   2. Switch to an API key
+
+ Enter to confirm · Esc to cancel
