@@ -52,7 +52,9 @@ b, strong { font-weight: 700; color: var(--hot); }
 .cursor { background: var(--ink); color: var(--bg); }
 
 /* home */
-.home { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); grid-template-areas: "pastor live" "install live" "can why" "can not"; }
+.home { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); grid-template-areas: "pastor live" "install live" "can why" "can not"; grid-template-rows: 1fr auto auto auto; }
+/* the tall terminal's extra height goes to the pitch; install keeps its own height */
+.home > .pane.focus { padding-bottom: 28px; } /* install: a little of that room */
 .pitch { font-size: 1.1em; }
 .pitch b { color: var(--accent); }
 .feats b { display: inline-block; min-width: 8ch; }
@@ -67,7 +69,10 @@ b, strong { font-weight: 700; color: var(--hot); }
 
 /* the live terminal: term.js types the transcript into it */
 /* a fixed window that scrolls up as lines arrive, like a real terminal */
-.term { background: var(--code); padding: 8px 10px; margin: 6px 0 8px; font-size: 12px; line-height: 1.45; height: 26em; overflow: auto; }
+.term { background: var(--code); padding: 8px 10px; margin: 6px 0 8px; font-size: 12px; line-height: 1.55; height: 30em; overflow: auto; }
+/* on the home it fills its column, as tall as the panes beside it */
+.home .live { display: flex; flex-direction: column; }
+.home .live .term { flex: 1 1 auto; height: 0; min-height: 33em; }
 .term .p { color: var(--dim); user-select: none; }
 .term .lbl { color: var(--accent); }
 .term .in { color: var(--sel-ink); }
@@ -106,7 +111,11 @@ b, strong { font-weight: 700; color: var(--hot); }
 /* the docs nav: a tree of sections, the open one's pages, the page's topics */
 .docs { grid-template-columns: 35ch minmax(0, 1fr); }
 .list { align-self: start; position: sticky; top: 12px; }
-.list a { display: block; color: var(--ink); padding: 0 1ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* the nav reads as a list of names, easier in a proportional face than in
+   the monospace the rest of the site keeps */
+.list { line-height: 1.75; font-family: system-ui, -apple-system, "Segoe UI", Inter, "Helvetica Neue", Arial, sans-serif; font-size: 15px; }
+.list > .t { font-family: var(--mono); font-size: 14px; }
+.list a { display: block; color: var(--ink); padding: 1px 1ch; }
 .list a:hover, .list a:focus { background: var(--sel); color: var(--sel-ink); text-decoration: none; }
 .list .grp { margin: 2px 0; }
 .list .grp summary { list-style: none; cursor: pointer; color: var(--accent); padding: 0 1ch; }
@@ -114,16 +123,17 @@ b, strong { font-weight: 700; color: var(--hot); }
 .list .grp summary::before { content: "▸ "; color: var(--dim); }
 .list .grp[open] summary::before { content: "▾ "; }
 .list .grp summary:hover, .list .grp summary:focus-visible { background: var(--sel); outline: none; }
-.list .grp[open] { margin-bottom: 6px; }
+.list .grp { margin: 4px 0; }
+.list .grp[open] { margin-bottom: 8px; }
 .list a.top { color: var(--accent); margin-bottom: 4px; }
 .list a.top::before { content: "≡ "; color: var(--dim); }
 .list a.top.sel { background: var(--sel); box-shadow: inset 2px 0 0 var(--accent); }
-.list a.pg { padding-left: 3ch; }
+.list a.pg { padding-left: 2ch; margin-left: 1.5ch; border-left: 1px solid var(--line); }
 .list a.pg.sel { background: var(--sel); color: var(--sel-ink); box-shadow: inset 2px 0 0 var(--accent); }
 .list .topics { margin: 2px 0 6px; }
 .list .topics ul { list-style: none; margin: 0; padding: 0; }
-.list .topics a { padding-left: 5ch; color: var(--dim); font-size: 13px; }
-.list .topics a::before { content: "· "; color: var(--line); }
+.list .topics a { padding-left: 4ch; margin-left: 1.5ch; border-left: 1px solid var(--line); color: var(--bar-ink); }
+.list .topics a::before { content: "· "; color: var(--dim); }
 
 .doc { line-height: 1.6; }
 .doc p, .doc ul, .doc ol { margin: 0 0 10px; max-width: 88ch; }
@@ -176,7 +186,7 @@ h2:hover .anchor, h3:hover .anchor, h4:hover .anchor, .anchor:focus { opacity: 1
 
 @media (max-width: 760px) {
   .home { grid-template-columns: minmax(0, 1fr); grid-template-areas: "pastor" "live" "install" "can" "why" "not"; }
-  .term { font-size: 11px; height: 24em; }
+  .term, .home .live .term { font-size: 11px; height: 26em; min-height: 0; flex: none; }
   .term-big { width: 94vw; height: 70vh; }
   .docs { grid-template-columns: minmax(0, 1fr); }
   .list { position: relative; top: 0; }

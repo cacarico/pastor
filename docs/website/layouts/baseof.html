@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ if .IsHome }}pastor{{ else }}{{ .Title }} · pastor docs{{ end }}</title>
   <meta name="description" content="pastor is an agent orchestrator for a flock of machines: queue tasks, schedule jobs, and spread coding agents across your flock over ssh.">
+  {{- /* Relative, so under cacari.co/pastor/ it is /pastor/favicon.svg and
+         never replaces the main site's own favicon. */}}
+  <link rel="icon" type="image/svg+xml" href="{{ partial "asset.html" "favicon.svg" }}">
   <link rel="stylesheet" href="{{ partial "asset.html" "style.css" }}">
   <script src="{{ partial "asset.html" "keys.js" }}" defer></script>
 </head>
