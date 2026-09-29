@@ -215,3 +215,51 @@ fn make_help_lists_it() {
         "{stdout}"
     );
 }
+
+/// The `portability` job of ci.yml: from its name to the next job's, or to
+/// the end of the file.
+fn ci_job() -> String {
+    let ci = std::fs::read_to_string(root().join(".github/workflows/ci.yml")).unwrap();
+    let mut job = String::new();
+    for line in ci.lines().skip_while(|l| *l != "  portability:") {
+        let next_job = line.starts_with("  ") && !line.starts_with("   ") && line.ends_with(':');
+        if !job.is_empty() && next_job {
+            break;
+        }
+        job.push_str(line);
+        job.push('\n');
+    }
+    assert!(!job.is_empty(), "no portability job in ci.yml");
+    job
+}
+
+#[test]
+fn ci_runs_the_make_target() {
+    let job = ci_job();
+    assert!(job.contains("- run: make portability\n"), "{job}");
+    assert!(!job.contains("cargo-zigbuild check"), "{job}");
+}
+
+// The job's toolchain step installs the Rust targets by name, so the list is
+// in ci.yml too; a target added to the Makefile alone would fail there.
+#[test]
+fn ci_installs_the_targets_the_makefile_checks() {
+    let makefile = std::fs::read_to_string(root().join("Makefile")).unwrap();
+    let list = makefile
+        .lines()
+        .find_map(|l| l.strip_prefix("PORTABILITY_TARGETS"))
+        .expect("PORTABILITY_TARGETS in the Makefile");
+    let in_makefile: Vec<&str> = list
+        .trim_start_matches([' ', ':', '?', '='])
+        .split_whitespace()
+        .collect();
+    assert_eq!(in_makefile, TARGETS);
+
+    let job = ci_job();
+    let installed = job
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("targets: "))
+        .expect("targets: in the portability job");
+    let in_ci: Vec<&str> = installed.split(", ").collect();
+    assert_eq!(in_ci, in_makefile);
+}
