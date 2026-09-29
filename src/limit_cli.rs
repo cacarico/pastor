@@ -31,7 +31,7 @@ pub enum LimitCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Forget an account's limit, so queued tasks start on it on the next pass
+    /// Forget an account's limit, so queued and waiting tasks start on it on the next pass
     Clear {
         /// The account, as `limit list` shows it: an agent's `account`, or `<machine>/<agent>`
         account: String,

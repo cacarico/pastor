@@ -168,6 +168,15 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
                 && t.pane_id.is_some()
             {
                 format!("{} (kept)", t.state)
+            } else if t.state == crate::task::TaskState::Waiting
+                && let Some(until) = t.waiting_until
+            {
+                // When its usage limit resets and it goes on.
+                format!(
+                    "{} {}",
+                    t.state,
+                    crate::limit::local_time(until, chrono::Utc::now())
+                )
             } else {
                 t.state.to_string()
             };
@@ -185,6 +194,16 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
             ]
         })
         .collect()
+}
+
+/// `task list`'s order: the waiting tasks first, the soonest reset first
+/// (`waiting_until`), then the rest as they came, newest first.
+pub fn waiting_first(mut tasks: Vec<Task>) -> Vec<Task> {
+    tasks.sort_by_key(|t| match t.state {
+        crate::task::TaskState::Waiting => (0, t.waiting_until),
+        _ => (1, None),
+    });
+    tasks
 }
 
 /// The NOTE column of `task list`, one escaped line: the error, else the
@@ -420,8 +439,21 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
     if t.pause.resumed_at.is_some() {
         fields.push(("resumed", when(t.pause.resumed_at)));
     }
+    // A waiting task's error is the limit it waits on: which account,
+    // until when, what ran out and the task that saw it.
+    let waiting = t.state == crate::task::TaskState::Waiting;
+    if waiting && let Some(until) = t.waiting_until {
+        fields.push((
+            "waiting",
+            format!(
+                "until {} ({})",
+                crate::limit::local_time(until, Utc::now()),
+                until.format("%Y-%m-%d %H:%M:%S UTC")
+            ),
+        ));
+    }
     if let Some(e) = &t.error {
-        fields.push(("error", e.clone()));
+        fields.push((if waiting { "limit" } else { "error" }, e.clone()));
     }
     // Branch, repo and the prompt can come from an item; every field is
     // escaped the same way so none of them reaches the terminal raw.
@@ -1146,6 +1178,7 @@ mod tests {
             aged_from: None,
             aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
             summary: None,
             created_at: now,
             started_at: Some(now),
@@ -1652,6 +1685,47 @@ mod tests {
         assert_eq!(t.to_json()["spec"]["keep_pane_from"], "task run");
         t.state = TaskState::Running;
         assert_eq!(task_rows(std::slice::from_ref(&t))[0][1], "running");
+    }
+
+    /// A waiting task reads `waiting 03:00` in `task list`, and `task
+    /// describe` says until when and on which limit.
+    #[test]
+    fn a_waiting_task_shows_its_reset_and_its_limit() {
+        use crate::task::TaskState;
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        let until = chrono::Utc::now() + chrono::Duration::minutes(30);
+        t.state = TaskState::Waiting;
+        t.waiting_until = Some(until);
+        t.error = Some("me exhausted until 03:00 (5-hour limit, seen by t-4)".into());
+        let shown = crate::limit::local_time(until, chrono::Utc::now());
+        assert_eq!(
+            task_rows(std::slice::from_ref(&t))[0][1],
+            format!("waiting {shown}")
+        );
+        let out = task_detail(&t);
+        assert!(out.contains("\nwaiting:    until "), "{out}");
+        assert!(
+            out.contains("\nlimit:      me exhausted until 03:00 (5-hour limit, seen by t-4)\n"),
+            "{out}"
+        );
+        assert!(!out.contains("\nerror:"), "{out}");
+        // Listed first, the soonest reset first; the rest as they came.
+        let at = |id: i64, state: TaskState, mins: i64| {
+            let mut t = t.clone();
+            t.id = id;
+            t.state = state;
+            t.waiting_until = Some(until + chrono::Duration::minutes(mins));
+            t
+        };
+        let listed = waiting_first(vec![
+            at(5, TaskState::Running, 0),
+            at(4, TaskState::Waiting, 60),
+            at(3, TaskState::Queued, 0),
+            at(2, TaskState::Waiting, 5),
+        ]);
+        let ids: Vec<i64> = listed.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [2, 4, 5, 3]);
+        assert_eq!(t.to_json()["waiting_until"], serde_json::json!(until));
     }
 
     /// `task describe` gives the workspace label and where it came from:

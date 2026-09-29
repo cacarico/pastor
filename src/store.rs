@@ -854,7 +854,7 @@ impl Store {
             "UPDATE tasks SET machine = ?2, workspace_id = ?3, pane_id = ?4, agent_name = ?5, state = ?6, error = ?7,
                 last_completion_seq = ?8, started_at = ?9, finished_at = ?10, updated_at = ?11, prompt = ?12, spec = ?13,
                 prompt_pending = ?14, activity_seen = ?16, ended = ?17,
-                paused_at = ?18, paused_for = ?19, resumed_at = ?20
+                paused_at = ?18, paused_for = ?19, resumed_at = ?20, waiting_until = ?21
              WHERE id = ?1 AND updated_at = ?15",
             params![
                 t.id,
@@ -877,6 +877,7 @@ impl Store {
                 t.pause.paused_at.map(|d| d.to_rfc3339()),
                 t.pause.paused_for,
                 t.pause.resumed_at.map(|d| d.to_rfc3339()),
+                t.waiting_until.map(|d| d.to_rfc3339()),
             ],
         )?;
             if n == 1 {
@@ -918,16 +919,19 @@ impl Store {
         })
     }
 
-    /// `claim_task` for a paused task: `paused` -> `starting` on the machine
-    /// it was paused on, and only there, stamping `resumed_at`. `None` means
-    /// it was not paused there any more (closed meanwhile, or unknown).
+    /// `claim_task` for a paused or waiting task: `paused` or `waiting` ->
+    /// `starting` on the machine it was paused or waiting on, and only there,
+    /// stamping `resumed_at`. A waiting task keeps `waiting_until` for the
+    /// start to tell it went on from a limit (`dispatch::resume`). `None`
+    /// means it was not paused or waiting there any more (closed meanwhile,
+    /// or unknown).
     pub fn claim_paused(&self, id: i64, machine: &str) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
         blocking(|| {
             let conn = self.conn.lock().recover();
             let n = conn.execute(
             "UPDATE tasks SET state = 'starting', agent_name = ?3, error = NULL, resumed_at = ?4, updated_at = ?4
-             WHERE id = ?1 AND state = 'paused' AND machine = ?2",
+             WHERE id = ?1 AND state IN ('paused', 'waiting') AND machine = ?2",
             params![id, machine, Task::agent_name_for(id), now],
         )?;
             drop(conn);
@@ -1055,7 +1059,7 @@ impl Store {
             let conn = self.conn.lock().recover();
             let n = conn.execute(
             "UPDATE tasks SET state = 'closed', finished_at = COALESCE(finished_at, ?2), updated_at = ?2
-             WHERE id = ?1 AND state IN ('queued', 'paused')",
+             WHERE id = ?1 AND state IN ('queued', 'paused', 'waiting')",
             params![id, now],
         )?;
             drop(conn);
@@ -1244,6 +1248,33 @@ impl Store {
             let rows = stmt.query_map([], row_to_task)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
+    }
+
+    /// Bring waiting task `id`'s `waiting_until` forward to `now`, so the
+    /// next dispatch pass may resume it: its limit was cleared by hand.
+    /// False when it is not waiting any more.
+    pub fn wake_waiting(&self, id: i64, now: DateTime<Utc>) -> anyhow::Result<bool> {
+        let now = now.to_rfc3339();
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "UPDATE tasks SET waiting_until = ?2, updated_at = ?2
+                 WHERE id = ?1 AND state = 'waiting'",
+                params![id, now],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Waiting tasks (`TaskState::Waiting`), the soonest `waiting_until`
+    /// first, then oldest first.
+    pub fn waiting_tasks(&self) -> anyhow::Result<Vec<Task>> {
+        let mut tasks = self.list_tasks(&TaskFilter {
+            states: Some(vec![TaskState::Waiting]),
+            ..Default::default()
+        })?;
+        tasks.sort_by_key(|t| (t.waiting_until, t.id));
+        Ok(tasks)
     }
 
     /// Lift each queued task that has waited `age_after` a level
@@ -1982,6 +2013,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let role: String = row.get("role")?;
     let paused_at: Option<String> = row.get("paused_at")?;
     let resumed_at: Option<String> = row.get("resumed_at")?;
+    let waiting_until: Option<String> = row.get("waiting_until")?;
     let aged_from: Option<String> = row.get("aged_from")?;
     let aged_at: Option<String> = row.get("aged_at")?;
     Ok(Task {
@@ -2030,6 +2062,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
             paused_for: row.get("paused_for")?,
             resumed_at: resumed_at.as_deref().map(parse_dt).transpose()?,
         },
+        waiting_until: waiting_until.as_deref().map(parse_dt).transpose()?,
         summary: summary_of(row, &state)?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
@@ -3119,6 +3152,44 @@ mod tests {
         assert!(
             s.claim_paused(paused.id, "a").unwrap().is_none(),
             "claimed once"
+        );
+    }
+
+    /// A waiting task keeps `waiting_until`, is no queued task, lists by
+    /// its reset, is claimed back only on its machine, and closes like a
+    /// queued one.
+    #[test]
+    fn a_waiting_task_lists_by_its_reset_and_is_claimed_on_its_machine() {
+        let s = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let wait = |until: i64| {
+            let t = s.insert_task(new_task("run")).unwrap();
+            let mut t = s.claim_task(t.id, "a").unwrap().unwrap();
+            t.state = TaskState::Waiting;
+            t.waiting_until = Some(now + chrono::Duration::minutes(until));
+            s.update_task(&mut t).unwrap();
+            t
+        };
+        let later = wait(60);
+        let sooner = wait(5);
+        let closed = wait(1);
+        assert_eq!(
+            s.get_task(later.id).unwrap().unwrap().waiting_until,
+            later.waiting_until
+        );
+        assert!(s.queued_tasks().unwrap().is_empty());
+        let order: Vec<i64> = s.waiting_tasks().unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![closed.id, sooner.id, later.id]);
+        assert_eq!(
+            s.close_queued(closed.id).unwrap().unwrap().state,
+            TaskState::Closed
+        );
+        assert!(s.claim_paused(sooner.id, "b").unwrap().is_none());
+        let back = s.claim_paused(sooner.id, "a").unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Starting);
+        assert_eq!(
+            back.waiting_until, sooner.waiting_until,
+            "kept for the start"
         );
     }
 

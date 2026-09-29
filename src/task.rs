@@ -20,6 +20,12 @@ pub enum TaskState {
     /// `low` tasks, pinned to its machine, to resume its session there
     /// (`claude --resume`) when a slot frees.
     Paused,
+    /// A Claude task whose agent stopped on a usage limit: its pane is
+    /// closed as a pause closes it, its worktree kept, and it waits pinned
+    /// to its machine until `waiting_until`, or until its limit is cleared,
+    /// to resume its session there. Not `paused`: a paused task goes first
+    /// among the `low` tasks, a waiting one starts at its time.
+    Waiting,
 }
 
 /// States whose task holds a pane on its machine. Kept next to
@@ -36,12 +42,13 @@ pub const PANE_OWNING_STATES: [TaskState; 5] = [
 /// The states a task can be in while it still needs pastor or a human:
 /// what `pastor task list` shows by default. Done, failed, stale and closed tasks
 /// are finished; they appear only with `--all` (or `--done` for done ones).
-pub const LIVE_STATES: [TaskState; 5] = [
+pub const LIVE_STATES: [TaskState; 6] = [
     TaskState::Queued,
     TaskState::Starting,
     TaskState::Running,
     TaskState::Blocked,
     TaskState::Paused,
+    TaskState::Waiting,
 ];
 
 impl TaskState {
@@ -82,6 +89,7 @@ impl TaskState {
             TaskState::Failed => "failed",
             TaskState::Closed => "closed",
             TaskState::Paused => "paused",
+            TaskState::Waiting => "waiting",
         }
     }
 }
@@ -818,6 +826,10 @@ pub struct Task {
     /// paused itself (`Preemption`).
     #[serde(flatten, default)]
     pub pause: Preemption,
+    /// On a `waiting` task, when its usage limit resets and it goes on
+    /// (`TaskState::Waiting`). `None` on every other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_until: Option<DateTime<Utc>>,
     /// How the task's last round ended (`TaskSummary`), on a task that is
     /// done, failed or closed and has one. Not a column: the store reads it
     /// from `task_summaries` with the row.
@@ -849,6 +861,15 @@ pub fn prompt_to_send(task: &Task) -> String {
 }
 
 pub const RESUME_PROMPT: &str = "pastor paused this session for a critical task and has now resumed it; carry on where you left off.";
+
+/// What a waiting task's agent is told once its session is open again: it
+/// stopped on a usage limit, which has reset.
+pub const LIMIT_RESUME_PROMPT: &str = "pastor stopped this session on a usage limit, which has now reset, and has resumed it; carry on where you left off.";
+
+/// The paragraph after the prompt of a waiting task that starts again with
+/// no session to resume: it stopped on a usage limit before, and may have
+/// left work behind.
+pub const LIMIT_HANDOVER: &str = "pastor: this task started before and stopped on a usage limit before its conversation could be kept. Its checkout may already hold part of the work: look at what is there (git status, git log) before you begin, and carry on from it.";
 
 /// A task's part in pausing: whether it may pause a `low` task to start
 /// (`task run --preempt`, a job's `[dispatch] preempt`), and, on a task that
@@ -907,11 +928,11 @@ impl Task {
         why_not_pausable(self, kind, now).is_none()
     }
 
-    /// The machine the task must run on: the one it is paused on, else the
-    /// one its spec pins.
+    /// The machine the task must run on: the one it is paused or waiting
+    /// on, else the one its spec pins.
     pub fn pinned_machine(&self) -> Option<&str> {
         match self.state {
-            TaskState::Paused => self.machine.as_deref(),
+            TaskState::Paused | TaskState::Waiting => self.machine.as_deref(),
             _ => self.spec.machine.as_deref(),
         }
     }
@@ -1222,6 +1243,11 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
     if !task.state.is_open() {
         return None;
     }
+    // A waiting task holds no pane and no agent: nothing seen on a machine
+    // moves it. The dispatch pass resumes it (`Store::claim_paused`).
+    if task.state == Waiting {
+        return None;
+    }
     let to = match observed {
         Observed::DispatchStarting => {
             if task.state == Queued {
@@ -1460,6 +1486,7 @@ pub(crate) mod tests {
             aged_from: None,
             aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
             summary: None,
             created_at: now,
             started_at: Some(now),
@@ -1893,7 +1920,7 @@ pub(crate) mod tests {
     fn next_state_keeps_its_invariants_over_the_whole_table() {
         use TaskState::*;
         let states = [
-            Queued, Starting, Running, Blocked, Done, Stale, Failed, Closed, Paused,
+            Queued, Starting, Running, Blocked, Done, Stale, Failed, Closed, Paused, Waiting,
         ];
         let statuses = [
             AgentStatus::Idle,
@@ -1938,6 +1965,9 @@ pub(crate) mod tests {
                             t.ended, t.activity_seen, t.prompt_pending
                         );
                         assert_ne!(got, Some(state), "no-op must be None: {case}");
+                        if state == Waiting {
+                            assert_eq!(got, None, "a waiting task has no pane to see: {case}");
+                        }
                         if !state.is_open() {
                             assert_eq!(got, None, "closed states never move: {case}");
                         }
@@ -1986,7 +2016,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert_eq!(checked, 9 * 2 * 8 * (4 + 5 * 4 * 4));
+        assert_eq!(checked, 10 * 2 * 8 * (4 + 5 * 4 * 4));
     }
 
     #[test]

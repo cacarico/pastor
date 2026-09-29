@@ -54,6 +54,8 @@ A task's state change is `task.` and the new state.
 | `task.running` | its agent took the prompt, or picked the work back up | |
 | `task.blocked` | its agent waits on a person | `question`, when it ended its turn on one |
 | `task.paused` | a critical task took its slot; it resumes later | |
+| `task.limited` | its agent stopped on a usage limit | as `agent.exhausted` |
+| `task.waiting` | it waits for that limit to reset, its pane closed and its worktree kept | `why` (`no_fallback`), `account`, `model`, `until`, `shown` (`waiting 03:00`) |
 | `task.done` | it finished | |
 | `task.failed` | it failed | |
 | `task.stale` | its timeout passed, or its pull machine was lost | |

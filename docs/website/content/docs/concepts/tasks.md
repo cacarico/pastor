@@ -52,6 +52,7 @@ apart. `--label` changes that name.
 | `stale` | it ran past its timeout (2h by default), or its pull machine was lost; the agent is left running |
 | `failed` | it could not start, or the agent exited before it was done |
 | `paused` | a critical task took its slot; it resumes its session when there is room |
+| `waiting` | its agent stopped on a usage limit; it resumes its session when the limit resets, or when `pastor limit clear` clears it |
 | `closed` | finished for good; its pane is gone |
 
 `done` means the agent stopped, not that the work is right. Read what it
@@ -60,7 +61,7 @@ did.
 ## follow it
 
 ```sh
-pastor task list             # live tasks: queued, starting, running, blocked, paused
+pastor task list             # live tasks: queued, starting, running, blocked, paused, waiting
 pastor task list --all       # finished ones too
 pastor task list --wide      # adds how each ended (RESULT) and its description
 pastor task describe t-12    # one task in full: agent, model, profile and where each came from
