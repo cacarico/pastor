@@ -20,14 +20,14 @@ fix it before you open the pull request.
 
 ## When you run pastor
 
-pastor starts agents with the head's user's access on each machine, and it
-does decide part of what they may do: an agent it started cannot change the
-fleet unless you set `agents_change_fleet`, a task runs under the permission
-profile and the `allow` and `deny` lists you give it, and no task can start
-an orchestrator. What it cannot decide is what that user can reach: files,
-keys, tokens and the network. [Trust model](manual.md#trust-model) in the
-manual has the details, and [SECURITY.md](../SECURITY.md) what that means
-for connectors.
+pastor starts an agent as the user in that machine's `ssh = "user@host"`, or
+the head's own user for a machine it runs locally, and it does decide part of
+what they may do: an agent it started cannot change the fleet unless you set
+`agents_change_fleet`, a task runs under the permission profile and the
+`allow` and `deny` lists you give it, and no task can start an orchestrator.
+What it cannot decide is what that user can reach: files, keys, tokens and
+the network. [Trust model](manual.md#trust-model) in the manual has the
+details, and [SECURITY.md](../SECURITY.md) what that means for connectors.
 
 So run it on machines and repositories you trust, with keys that reach no
 more than the work needs, treat pane output, logs and the task store as

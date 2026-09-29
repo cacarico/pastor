@@ -193,7 +193,7 @@ The head picks up job file edits by itself. A file that stops parsing keeps its 
 | `session` | the herdr session, default `default` |
 | `max_agents` | how many live tasks it runs, default 2 |
 | `job_slots` | default 1: extra slots only tasks from jobs take, a free one first |
-| `burst` | default 1: how many past `max_agents` a `critical` task may start (`0` turns this or `job_slots` off) |
+| `burst` | default 1: how many past `max_agents` a `critical` task may start (setting either it or `job_slots` to `0` disables only that one) |
 | `tags`, `flock` | its tags, and a flock it joins |
 | `agent`, `agent_args` | what its tasks get when they name none, before the flock's |
 | `model`, `priority`, `profile` | the same, after the flock's |
@@ -205,7 +205,7 @@ The head picks up job file edits by itself. A file that stops parsing keeps its 
 | `name` | the flock's name |
 | `default = true` | on one of them |
 | `machines = { desk = 2 }` | the machines it may use, with at most how many of its live tasks each runs |
-| `desk = { share = 2, max = 4 }` | under its share the flock takes a free slot as usual; between share and max only while no task of a flock under its share there is waiting |
+| `machines = { desk = { share = 2, max = 4 } }` | under its share the flock takes a free slot as usual; between share and max only while no task of a flock under its share there is waiting |
 | `agent`, `agent_args`, `agents`, `model`, `profile`, `priority`, `timeout`, `place`, `label`, `summary` | optional, as in `[defaults]`: what its tasks and jobs get when they name none (`label` names the workspace) |
 | `allow`, `deny` | tool lists added to theirs |
 
