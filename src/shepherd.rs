@@ -494,6 +494,18 @@ impl Follower {
             if skip {
                 after = page.events.last().map_or(after, |r| r.seq);
                 self.store.set_meta(CURSOR_KEY, &after.to_string())?;
+            } else if let Some(end) = page.ends_before(after) {
+                // Never replayed: the hooks would fire again for records
+                // they may have heard under the old numbers.
+                tracing::warn!(
+                    code = "head_events_reset",
+                    head = %self.head,
+                    after,
+                    end,
+                    "the head's events log ends before this machine's cursor (the head moved or its state was wiped); the hooks go on from its end"
+                );
+                self.store.set_meta(CURSOR_KEY, &end.to_string())?;
+                return Ok(());
             } else {
                 // The records left still go to the hooks, from the oldest
                 // the head returned: a lost stretch is logged, not retried.
@@ -688,6 +700,37 @@ mod tests {
         log.lock().unwrap().push(rec(321));
         f.pass().await;
         assert_eq!(seqs(&mut rx), vec![321]);
+    }
+
+    /// A cursor past the head's newest event (the head moved, or its state
+    /// dir was wiped) moves to the head's end: nothing up to it is heard
+    /// again, what comes after is.
+    #[tokio::test]
+    async fn a_cursor_past_the_heads_log_goes_on_from_its_end() {
+        let log = Arc::new(Mutex::new((1..=20).map(rec).collect::<Vec<_>>()));
+        let (mut f, mut rx) = follower(head(log.clone(), Arc::new(Mutex::new(false))));
+        f.store.set_meta(CURSOR_KEY, "500").unwrap();
+        f.pass().await;
+        assert_eq!(f.reachable, Some(true));
+        assert!(seqs(&mut rx).is_empty(), "no replay");
+        assert_eq!(f.store.meta(CURSOR_KEY).unwrap().as_deref(), Some("20"));
+        f.pass().await;
+        assert!(seqs(&mut rx).is_empty());
+        log.lock().unwrap().extend((21..=22).map(rec));
+        f.pass().await;
+        assert_eq!(seqs(&mut rx), vec![21, 22]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_head_log_under_an_old_cursor_goes_on_from_zero() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, mut rx) = follower(head(log.clone(), Arc::new(Mutex::new(false))));
+        f.store.set_meta(CURSOR_KEY, "500").unwrap();
+        f.pass().await;
+        assert_eq!(f.store.meta(CURSOR_KEY).unwrap().as_deref(), Some("0"));
+        log.lock().unwrap().push(rec(1));
+        f.pass().await;
+        assert_eq!(seqs(&mut rx), vec![1]);
     }
 
     /// Head events reach this machine's hooks through the hook runner: an

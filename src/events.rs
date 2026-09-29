@@ -413,6 +413,23 @@ pub struct EventsPage {
     pub newest: Option<u64>,
 }
 
+impl EventsPage {
+    /// Where the head's log ends when that is before `after`: the log
+    /// restarted under a reader's cursor (the head moved, or its state dir
+    /// was wiped), which `gap` does not show. An empty log counts as ending
+    /// at 0. `None` for a cursor within the log, and for a head that predates
+    /// `newest` and holds records, which cannot tell.
+    pub fn ends_before(&self, after: u64) -> Option<u64> {
+        if after == 0 {
+            return None;
+        }
+        match self.newest {
+            Some(newest) => (newest < after).then_some(newest),
+            None => (self.oldest.is_none() && self.events.is_empty()).then_some(0),
+        }
+    }
+}
+
 /// The records numbered after `after`, oldest first, at most `limit`, only
 /// those about `task` if given. Lines from before numbering (seq 0) are never
 /// returned. `gap` is decided on the whole log, whatever `task` is: it is set
