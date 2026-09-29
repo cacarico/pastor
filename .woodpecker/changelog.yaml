@@ -1,0 +1,19 @@
+# Mirrors .github/workflows/changelog.yml: a cheap changelog-format check
+# that runs even on pull requests ci.yaml's path filter skips (see that
+# file's comment). No Rust build, just the shell script.
+when:
+  - event: pull_request
+    path:
+      include:
+        - "CHANGELOG.md"
+        - "changes/**"
+        - "scripts/changelog.sh"
+        - ".woodpecker/changelog.yaml"
+  - event: manual
+
+steps:
+  - name: changelog-check
+    image: alpine:3.20
+    commands:
+      - apk add --no-cache bash make git gawk
+      - make changelog-check
