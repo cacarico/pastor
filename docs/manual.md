@@ -1372,8 +1372,9 @@ flock.toml or the job file.
 keeps its position, so among the tasks of its new level it goes by when it
 was queued. A task a machine has taken, or is being sent to, has left the
 queue, and is refused with `not_queued`; an agent pastor started is refused, as for any change to
-the fleet (`agent_refused`). `pastor task retry` keeps the level of the task
-it copies, and the copy queues last in it.
+the fleet (`agent_refused`). `pastor task retry` keeps the level the task
+had before it aged (its current level, if it has not), and the copy queues
+last in it.
 
 #### Ageing
 

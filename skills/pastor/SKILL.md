@@ -76,7 +76,7 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 - `--fallback sonnet,gpt` names the `[models]` the task may fall back to, in order; `--no-fallback` names none. Without either: the `fallback` of its machine, then its flock, then `[defaults]`, then none; the first list wins whole, and `[]` means none. An unknown name is `unknown_model`. Nothing switches models yet; `task describe` shows the list.
 - `--priority LEVEL` (`low`, `normal`, `high`, `critical`) orders the queue when machines are full: by level, highest first, then by position, then age.
   - Without it: the `priority` of the task's flock, then the machine it is pinned to, then `[defaults]`, then `normal`. Another word is `unknown_priority`.
-  - `pastor task priority t-N LEVEL` changes a queued task's level (`not_queued` once a machine took it); `task retry` keeps it.
+  - `pastor task priority t-N LEVEL` changes a queued task's level (`not_queued` once a machine took it); `task retry` keeps the level from before it aged, or its current level if it has not aged.
   - A queued task that has waited `age_after` (default 30m, per flock or under `[defaults]`, `never` for off) goes up one level, never past `high`; `pastor queue` shows its original level (`high (was low)`, `aged_from` in `--json`).
   - `pastor queue` lists queued tasks in start order, with how long each waited and why it has not started (`--flock`, `--machine`, `--json`). `pastor queue move t-N` with `--top`, `--before t-M`, `--after t-M` or `--to N` moves one, at the level of where it lands.
 - `--preempt` (only on a `critical` task, else `preempt_needs_critical`): when no machine has room, pause the newest running `low` Claude task on a machine it may use and start in its slot.
