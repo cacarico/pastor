@@ -2127,6 +2127,29 @@ mod tests {
         assert!(parse_duration("300000000000000d").is_err());
     }
 
+    proptest::proptest! {
+        /// Any text, including numbers past `u64` and counts whose product
+        /// with the unit overflows, is a duration or an error, never a panic.
+        #[test]
+        fn prop_parse_duration_never_panics(s in "\\PC*|[0-9]{0,25}[smhd]?|\\s*[0-9]+\\s*[a-z]{0,3}") {
+            let _ = parse_duration(&s);
+        }
+
+        /// A count and a unit read back as count times the unit's seconds
+        /// when that fits in `u64`, and as an error when it does not.
+        #[test]
+        fn prop_parse_duration_is_count_times_unit(
+            n in proptest::prelude::any::<u64>(),
+            unit in proptest::sample::select(vec![("s", 1u64), ("m", 60), ("h", 3600), ("d", 86400)]),
+        ) {
+            let got = parse_duration(&format!("{n}{}", unit.0));
+            match n.checked_mul(unit.1) {
+                Some(secs) => proptest::prop_assert_eq!(got, Ok(Duration::from_secs(secs))),
+                None => proptest::prop_assert!(got.is_err()),
+            }
+        }
+    }
+
     /// A label comes from the first of the ask, the flock and `[defaults]`
     /// that sets one; none leaves the built-in.
     #[test]
@@ -3796,5 +3819,80 @@ mod tests {
         let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("settle"), "{err}");
         assert!(err.contains("must not be zero"), "{err}");
+    }
+
+    /// Tool patterns from a small pool, so the layers' lists often share
+    /// one, mixed with anything at all.
+    fn tool_patterns() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
+        use proptest::prelude::*;
+        let pattern = prop_oneof![
+            3 => proptest::sample::select(vec![
+                "Read", "Edit", "Bash", "Bash(git:*)", "Bash(rm:*)", "WebFetch", "Task",
+            ])
+            .prop_map(String::from),
+            1 => ".{0,12}",
+        ];
+        proptest::collection::vec(pattern, 0..6)
+    }
+
+    proptest::proptest! {
+        /// A pattern any layer denies is never in the resolved allow and
+        /// always in the resolved deny, whatever the layers hold and
+        /// whichever machine the task runs on. A machine has no tool
+        /// lists of its own; it is generated for its agent only.
+        #[test]
+        fn prop_a_denied_pattern_is_never_allowed(
+            d_allow in tool_patterns(), d_deny in tool_patterns(),
+            f_allow in tool_patterns(), f_deny in tool_patterns(),
+            a_allow in tool_patterns(), a_deny in tool_patterns(),
+            machine_agent in proptest::option::of("[a-z]{1,6}"),
+            flock_agent in proptest::option::of("[a-z]{1,6}"),
+            ask_agent in proptest::option::of("[a-z]{1,6}"),
+            with_flock in proptest::prelude::any::<bool>(),
+            with_machine in proptest::prelude::any::<bool>(),
+        ) {
+            let d = Defaults { allow: d_allow, deny: d_deny.clone(), ..Default::default() };
+            let flock = flock::FlockEntry {
+                name: "f".into(),
+                agent: flock_agent,
+                allow: f_allow,
+                deny: f_deny.clone(),
+                ..Default::default()
+            };
+            let mut machine: flock::MachineConfig =
+                toml::from_str("name = \"m\"\nlocal = true\n").unwrap();
+            machine.agent = machine_agent;
+            let ask = AgentChoice {
+                agent: ask_agent,
+                allow: a_allow,
+                deny: a_deny.clone(),
+                ..Default::default()
+            };
+            let pick = d.resolve_agent_on(
+                &ask,
+                with_machine.then_some(&machine),
+                with_flock.then_some(&flock),
+            );
+            let flock_deny = if with_flock { f_deny } else { vec![] };
+            for p in d_deny.iter().chain(&flock_deny).chain(&a_deny) {
+                proptest::prop_assert!(!pick.allow.contains(p), "{p:?} allowed: {pick:?}");
+                proptest::prop_assert!(pick.deny.contains(p), "{p:?} not denied: {pick:?}");
+            }
+        }
+
+        /// `check_tools` refuses a pattern exactly when it is blank or
+        /// starts with `-`.
+        #[test]
+        fn prop_check_tools_refuses_only_blank_and_dash_patterns(
+            p in proptest::prop_oneof![".*", "[ \t\n]*", "-.*", "[ \t]+-?.*"],
+        ) {
+            let refused = p.trim().is_empty() || p.starts_with('-');
+            proptest::prop_assert_eq!(
+                check_tools("allow", std::slice::from_ref(&p)).is_err(),
+                refused,
+                "{:?}",
+                p
+            );
+        }
     }
 }

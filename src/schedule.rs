@@ -45,7 +45,7 @@ impl Schedule {
     /// evaluated in the head's local time zone and converted back.
     pub fn next_after(&self, last: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
-            Schedule::Every(d) => Some(last + chrono::Duration::from_std(*d).ok()?),
+            Schedule::Every(d) => last.checked_add_signed(chrono::Duration::from_std(*d).ok()?),
             Schedule::Cron(c) => c
                 .next_after(last.with_timezone(&Local))
                 .map(|t| t.with_timezone(&Utc)),
@@ -282,6 +282,8 @@ fn parse_u32_strict(s: &str) -> Result<u32, String> {
 mod tests {
     use super::*;
     use chrono::FixedOffset;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
 
     #[test]
     fn a_cron_whose_days_never_fall_in_its_months_is_rejected() {
@@ -321,6 +323,14 @@ mod tests {
             Schedule::from_fields(Some("1d"), None).unwrap().describe(),
             "every 1d"
         );
+    }
+
+    /// An interval that fits `chrono::Duration` but not added to a date
+    /// (about 260,000 years) is never due; it used to panic the scheduler.
+    #[test]
+    fn an_every_past_the_calendar_is_never_due() {
+        let s = Schedule::from_fields(Some("8208878385025s"), None).unwrap();
+        assert_eq!(s.next_after(utc("2013-12-31T12:09:35Z")), None);
     }
 
     #[test]
@@ -661,5 +671,215 @@ mod tests {
             next.with_timezone(&GapZone),
             GapZone::local(2026, 3, 29, 3, 30)
         );
+    }
+
+    /// One comma-separated part of a cron field, rendered as text, with the
+    /// values it stands for worked out here rather than by `parse_field`.
+    fn cron_part(min: u32, max: u32) -> impl Strategy<Value = (String, Vec<u32>, bool)> {
+        let span = max - min + 1;
+        let stepped = |lo: u32, hi: u32, step: u32| (lo..=hi).step_by(step as usize).collect();
+        prop_oneof![
+            Just(("*".to_string(), (min..=max).collect(), true)),
+            (1..=span).prop_map(move |s| (format!("*/{s}"), stepped(min, max, s), true)),
+            (min..=max).prop_map(|n| (n.to_string(), vec![n], false)),
+            (min..=max, min..=max).prop_map(|(a, b)| {
+                let (a, b) = (a.min(b), a.max(b));
+                (format!("{a}-{b}"), (a..=b).collect(), false)
+            }),
+            (min..=max, min..=max, any::<u32>()).prop_map(move |(a, b, s)| {
+                let (a, b) = (a.min(b), a.max(b));
+                let s = s % (b - a + 1) + 1;
+                (format!("{a}-{b}/{s}"), stepped(a, b, s), false)
+            }),
+            (min..=max, any::<u32>()).prop_map(move |(n, s)| {
+                let s = s % (max - n + 1) + 1;
+                (format!("{n}/{s}"), stepped(n, max, s), false)
+            }),
+        ]
+    }
+
+    /// A whole field: its text, a membership table over `0..=max`, and
+    /// whether it counts as unrestricted, which Vixie cron (and pastor)
+    /// decide by a leading `*`.
+    fn cron_field(min: u32, max: u32) -> impl Strategy<Value = (String, Vec<bool>, bool)> {
+        proptest::collection::vec(cron_part(min, max), 1..4).prop_map(move |parts| {
+            let mut set = vec![false; max as usize + 1];
+            for v in parts.iter().flat_map(|p| p.1.iter()) {
+                set[*v as usize] = true;
+            }
+            let text: Vec<&str> = parts.iter().map(|p| p.0.as_str()).collect();
+            (text.join(","), set, parts[0].2)
+        })
+    }
+
+    /// A valid expression's text and an independent model of what it
+    /// matches.
+    #[derive(Debug, Clone)]
+    struct CronModel {
+        text: String,
+        minute: Vec<bool>,
+        hour: Vec<bool>,
+        dom: Vec<bool>,
+        dom_any: bool,
+        month: Vec<bool>,
+        dow: Vec<bool>,
+        dow_any: bool,
+    }
+
+    impl CronModel {
+        fn matches(&self, t: NaiveDateTime) -> bool {
+            self.minute[t.minute() as usize]
+                && self.hour[t.hour() as usize]
+                && self.month[t.month() as usize]
+                && self.day_matches(t.date())
+        }
+
+        fn day_matches(&self, d: NaiveDate) -> bool {
+            let dom = self.dom[d.day() as usize];
+            let wd = d.weekday().num_days_from_sunday() as usize;
+            // 7 is Sunday as well as 0.
+            let dow = self.dow[wd] || (wd == 0 && self.dow[7]);
+            match (self.dom_any, self.dow_any) {
+                (false, false) => dom || dow,
+                (false, true) => dom,
+                (true, false) => dow,
+                (true, true) => true,
+            }
+        }
+
+        /// The first matching wall-clock minute strictly after `t`, found by
+        /// stepping one minute at a time and skipping only whole days that
+        /// cannot match, so it shares nothing with `next_after_in`'s walk.
+        fn brute_next(&self, t: NaiveDateTime) -> NaiveDateTime {
+            let mut m = t.with_second(0).unwrap().with_nanosecond(0).unwrap()
+                + chrono::Duration::minutes(1);
+            loop {
+                if !(self.month[m.month() as usize] && self.day_matches(m.date())) {
+                    m = (m.date() + chrono::Duration::days(1))
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap();
+                } else if self.matches(m) {
+                    return m;
+                } else {
+                    m += chrono::Duration::minutes(1);
+                }
+            }
+        }
+    }
+
+    fn cron_model() -> impl Strategy<Value = CronModel> {
+        (
+            cron_field(0, 59),
+            cron_field(0, 23),
+            cron_field(1, 31),
+            cron_field(1, 12),
+            cron_field(0, 7),
+        )
+            .prop_map(|(mi, h, dom, mo, dow)| CronModel {
+                text: format!("{} {} {} {} {}", mi.0, h.0, dom.0, mo.0, dow.0),
+                minute: mi.1,
+                hour: h.1,
+                dom: dom.1,
+                dom_any: dom.2,
+                month: mo.1,
+                dow: dow.1,
+                dow_any: dow.2,
+            })
+            // `0 0 30 2 *` is rejected as never running; the generator leaves
+            // such expressions out rather than teaching the model that rule.
+            .prop_filter("some chosen month has a chosen day", |c| {
+                c.dom_any
+                    || !c.dow_any
+                    || (1..=12).any(|m| c.month[m] && (1..=MONTH_DAYS[m]).any(|d| c.dom[d]))
+            })
+    }
+
+    /// Instants from 1970 to about 2200, not aligned to the minute.
+    fn instant() -> impl Strategy<Value = DateTime<Utc>> {
+        (0i64..7_258_118_400, 0u32..1_000_000_000)
+            .prop_map(|(s, ns)| DateTime::from_timestamp(s, ns).unwrap())
+    }
+
+    /// UTC and fixed offsets from -14:00 to +14:00 in whole minutes. There
+    /// is no zone database in the tree, and `Local` depends on the host, so
+    /// spring-forward gaps and fall-back folds are left to the hand-built
+    /// zones above; the documented gap skip is not something this model
+    /// would agree with.
+    fn offset() -> impl Strategy<Value = FixedOffset> {
+        prop_oneof![
+            Just(FixedOffset::east_opt(0).unwrap()),
+            (-14 * 60..=14 * 60).prop_map(|m| FixedOffset::east_opt(m * 60).unwrap()),
+        ]
+    }
+
+    proptest! {
+        /// Any text parses or is an error; the cron alphabet reaches deeper
+        /// into `parse_field` than arbitrary Unicode does.
+        #[test]
+        fn prop_cron_parse_never_panics(
+            s in "\\PC*|[0-9*/,\\- ]{0,40}|([0-9*/,-]{1,12} ){4}[0-9*/,-]{1,12}"
+        ) {
+            let _ = CronExpr::parse(&s);
+        }
+
+        /// For a valid expression, the next run is strictly after `after`,
+        /// falls on a minute every field allows, and is the first such
+        /// minute: brute-force stepping finds nothing earlier.
+        #[test]
+        fn prop_cron_next_is_the_first_matching_minute_after(
+            c in cron_model(),
+            at in instant(),
+            tz in offset(),
+        ) {
+            let expr = CronExpr::parse(&c.text)
+                .map_err(|e| TestCaseError::fail(format!("{}: {e}", c.text)))?;
+            let after = at.with_timezone(&tz);
+            let next = expr.next_after_in(after);
+            prop_assert!(next.is_some(), "{} after {after}: no next run", c.text);
+            let next = next.unwrap();
+            prop_assert!(next > after, "{} after {after}: got {next}", c.text);
+            prop_assert_eq!(next.second(), 0);
+            prop_assert_eq!(next.nanosecond(), 0);
+            prop_assert!(c.matches(next.naive_local()), "{}: {next} does not match", c.text);
+            prop_assert_eq!(next.naive_local(), c.brute_next(after.naive_local()), "{}", c.text);
+        }
+
+        /// `every` fires exactly one interval after the last run, whatever
+        /// unit the interval is written in.
+        #[test]
+        fn prop_every_is_last_plus_interval(
+            n in 1u64..=100_000,
+            unit in proptest::sample::select(vec![("s", 1u64), ("m", 60), ("h", 3600), ("d", 86400)]),
+            last in instant(),
+        ) {
+            let s = Schedule::from_fields(Some(&format!("{n}{}", unit.0)), None).unwrap();
+            let d = chrono::Duration::seconds((n * unit.1) as i64);
+            prop_assert_eq!(s.next_after(last), Some(last + d));
+        }
+
+        /// An interval too long to add to the last run is no next run, not a
+        /// panic in the scheduler.
+        #[test]
+        fn prop_every_never_panics(
+            // Most of `u64` is too big for `chrono::Duration` at all; the
+            // middle band fits there but not added to a date.
+            n in prop_oneof![any::<u64>(), 1_000_000_000u64..10_000_000_000_000_000],
+            unit in proptest::sample::select(vec!["s", "m", "h", "d"]),
+            last in instant(),
+        ) {
+            if let Ok(s) = Schedule::from_fields(Some(&format!("{n}{unit}")), None) {
+                let _ = s.next_after(last);
+            }
+        }
+
+        /// `describe_duration` inverts `parse_duration` on whole seconds, the
+        /// only durations `parse_duration` makes. Sub-second parts would be
+        /// dropped, so they are not generated: the pair is an inverse on
+        /// whole seconds only.
+        #[test]
+        fn prop_describe_then_parse_is_identity(secs in any::<u64>()) {
+            let d = Duration::from_secs(secs);
+            prop_assert_eq!(parse_duration(&describe_duration(d)), Ok(d));
+        }
     }
 }

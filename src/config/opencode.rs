@@ -289,6 +289,43 @@ mod tests {
         assert_eq!(run(), "yes");
     }
 
+    proptest::proptest! {
+        /// Any string translates without a panic, and to nothing but
+        /// known permissions with at least one pattern each.
+        #[test]
+        fn prop_translate_never_panics(s in ".*") {
+            for (perm, patterns) in translate(&s) {
+                proptest::prop_assert!(!perm.is_empty());
+                proptest::prop_assert!(!patterns.is_empty(), "{:?}", s);
+            }
+        }
+
+        /// A pattern shaped like a Claude one, from any tool name and any
+        /// argument, never panics either, nor does the whole object.
+        #[test]
+        fn prop_translate_takes_any_tool_and_argument(
+            tool in "(Read|Edit|Bash|Task|.{0,6})",
+            arg in ".*",
+            deny in proptest::prelude::any::<bool>(),
+        ) {
+            let pattern = format!("{tool}({arg})");
+            translate(&pattern);
+            let list = vec![pattern];
+            let (allow, deny) = if deny { (vec![], list) } else { (list, vec![]) };
+            let json = permission_json(&allow, &deny, false);
+            proptest::prop_assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok(), "{}", json);
+        }
+
+        /// `Bash(x:*)` is bash on `x` and on `x *`, for any `x`.
+        #[test]
+        fn prop_bash_prefix_is_the_command_and_the_command_with_more_words(x in ".*") {
+            proptest::prop_assert_eq!(
+                translate(&format!("Bash({x}:*)")),
+                vec![("bash", vec![x.clone(), format!("{x} *")])]
+            );
+        }
+    }
+
     /// Runs the check command with `home` as `HOME` and `managed` as
     /// opencode's managed config directory, and its managed preferences
     /// under `managed/prefs`.

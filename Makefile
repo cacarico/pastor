@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh leaks smoke smoke-profiles mutants mutants-diff install install-completions completions demo site site-serve clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions demo site site-serve clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -92,6 +92,14 @@ smoke: ## opt-in test against a real herdr: make smoke SESSION=default
 # flock.toml; see scripts/smoke-profiles.sh. Starts real agents on them.
 smoke-profiles: ## live review task per agent: make smoke-profiles REPO='~/src/x' CLAUDE=m1 OPENCODE=m2
 	REPO="$(REPO)" CLAUDE="$(CLAUDE)" OPENCODE="$(OPENCODE)" scripts/smoke-profiles.sh
+
+# Checks the tag out in a scratch worktree under $TMPDIR, builds it there and
+# runs make smoke (and make smoke-profiles with PROFILES=1, which needs the
+# head on the tag); prints a Markdown block for the release card. LABEL names
+# the machine in it; see scripts/smoke-rc.sh.
+smoke-rc: ## smoke a release candidate: make smoke-rc TAG=v0.9.0-rc.1 SESSION=default LABEL=arm64
+	PROFILES="$(PROFILES)" REPO="$(REPO)" CLAUDE="$(CLAUDE)" OPENCODE="$(OPENCODE)" \
+	  scripts/smoke-rc.sh "$(TAG)" "$(or $(SESSION),default)" "$(LABEL)"
 
 install: ## install pastor into ~/.cargo/bin, with bash and fish completions
 	cargo install --path . --force --bin pastor

@@ -75,8 +75,12 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   a minor bump, never a patch.
 - Release when there is something worth shipping, not on a calendar. Cut an
   `-rc.N` prerelease for anything that touches the store schema, the IPC or
-  the transport, and run `make smoke` on a fleet machine against it before
-  the final tag. Prereleases never become `install.sh`'s "latest".
+  the transport, and smoke it on a fleet machine before the final tag:
+  `make smoke-rc TAG=vX.Y.Z-rc.N LABEL=<machine>` checks the tag out in a
+  scratch worktree, builds it, runs `make smoke` there (and `make
+  smoke-profiles` with `PROFILES=1`, once the head runs the rc) and prints
+  a Markdown block for the release card; it never touches your checkout.
+  Prereleases never become `install.sh`'s "latest".
 - To release: on a release branch, bump the version in `Cargo.toml` and
   run `make changelog VERSION=X.Y.Z`, which writes `## X.Y.Z - <today>`
   into `CHANGELOG.md` from `changes/*.md` (entries in the order their files

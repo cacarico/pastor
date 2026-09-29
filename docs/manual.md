@@ -3221,6 +3221,7 @@ make test             # unit tests plus an end-to-end run against fake-herdr
 make test-machine     # the machine actor tests five times, to catch timing flakes
 make smoke SESSION=s  # opt-in test against a real herdr running session s on this host
 make smoke-profiles REPO='~/src/app' CLAUDE=pi-1 OPENCODE=pi-2  # a live review task per agent through the head
+make smoke-rc TAG=v1.2.0-rc.1 LABEL=arm64  # make smoke against a tag, in a scratch worktree, as a Markdown report
 make build            # debug build of both binaries; cargo run -- --help works from there
 ```
 
@@ -3236,3 +3237,15 @@ without ever going `blocked`. It prints the end of each pane, to paste in a
 pull request, and closes the tasks. The head must run the pastor under test,
 since the head is what hands the agent its profile. Run it before trusting
 a change to profiles.
+
+`make smoke-rc TAG=<tag>` is what a release candidate gets before its final
+tag: it checks the tag out in a scratch worktree under `$TMPDIR`, builds it
+and runs `make smoke` there (`SESSION` picks the herdr session), then prints
+one Markdown block with the tag, the machine's `LABEL`, the herdr version,
+pass or fail per suite and the last lines of a failure, with paths and the
+hostname scrubbed. With `PROFILES=1` and `REPO`, `CLAUDE` and/or `OPENCODE`
+it runs `make smoke-profiles` too, and refuses unless the running head
+answers with the tag's version (`serve status --json`, over ssh when `head
+show` names a remote head), since the head must run the candidate; `PASTOR`
+picks the CLI for both. The exit status is the result; the worktree is
+removed either way.
