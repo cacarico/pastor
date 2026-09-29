@@ -36,8 +36,10 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `OrchestratorStop`). 26: a flock's share and max on a machine
 /// (`FlockNumber::Split`, `FlockSeat::share`). 27: fallback models
 /// (`AgentChoice::fallback`, a job's `[dispatch] fallback`). 28: `task run
-/// --now` (`Run::now`, `MachineStatus::now`).
-pub const IPC_PROTOCOL: u32 = 28;
+/// --now` (`Run::now`, `MachineStatus::now`). 29: keeping a task's pane
+/// (`DispatchSpec::keep_pane`, a job's `[dispatch] keep_pane`,
+/// `FlockEntry::keep_pane`).
+pub const IPC_PROTOCOL: u32 = 29;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -210,6 +212,12 @@ pub const SUMMARY_PROTOCOL: u32 = 17;
 /// terms, or refuse the job's dispatch table as unreadable.
 pub const SUMMARY_MODE_PROTOCOL: u32 = 20;
 
+/// The first protocol whose head keeps a task's pane once it ends
+/// (`task run --keep-pane`, a job's or flock's `keep_pane`). An older one
+/// would close it after `close_done_after` without a word, or refuse the
+/// job's dispatch table as unreadable.
+pub const KEEP_PANE_PROTOCOL: u32 = 29;
+
 /// The first protocol whose head runs orchestrator files and answers the
 /// `Orchestrator*` requests; an older one refuses them as unreadable.
 pub const ORCHESTRATOR_PROTOCOL: u32 = 23;
@@ -280,6 +288,8 @@ const JOB_PREEMPT: &str = "predates a job with preempt, and would refuse its dis
 const JOB_LABEL: &str =
     "predates a job naming a workspace label, and would name its workspaces t-N";
 const JOB_SUMMARY: &str = "predates a job with summary, and would refuse its dispatch table";
+const KEEP_PANE: &str = "predates keeping a task's pane, and would close it once the task is done";
+const JOB_KEEP_PANE: &str = "predates a job with keep_pane, and would refuse its dispatch table";
 const PULL: &str = "predates pull machines, and would refuse the claim or report";
 const ORCHESTRATOR: &str = "predates orchestrator files, and would refuse the request";
 const SESSION: &str = "predates session orchestrators, and would refuse the request";
@@ -787,6 +797,9 @@ impl IpcRequest {
                 if *now {
                     need.at(NOW_PROTOCOL, NOW);
                 }
+                if spec.keep_pane.is_some() {
+                    need.at(KEEP_PANE_PROTOCOL, KEEP_PANE);
+                }
             }
             R::Tick { dry_run, .. } => {
                 if !dry_run {
@@ -876,6 +889,10 @@ impl IpcRequest {
                 if has("summary") {
                     need.at(SUMMARY_MODE_PROTOCOL, JOB_SUMMARY);
                 }
+                // `false` too: an older head refuses the key whatever it says.
+                if dispatch.get("keep_pane").is_some_and(|v| !v.is_null()) {
+                    need.at(KEEP_PANE_PROTOCOL, JOB_KEEP_PANE);
+                }
             }
             R::JobTask {
                 agent,
@@ -898,6 +915,9 @@ impl IpcRequest {
                 }
                 if !spec.summary.is_ask() {
                     need.at(SUMMARY_MODE_PROTOCOL, JOB_SUMMARY);
+                }
+                if spec.keep_pane.is_some() {
+                    need.at(KEEP_PANE_PROTOCOL, JOB_KEEP_PANE);
                 }
             }
             R::TrustList
@@ -1509,6 +1529,8 @@ mod tests {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
             },
             machine: None,
             workspace_id: None,
@@ -2162,6 +2184,16 @@ mod tests {
                 "summary",
             ),
             (
+                run(serde_json::json!({"spec": {"agent": "claude", "keep_pane": true}})),
+                KEEP_PANE_PROTOCOL,
+                "keeping a task's pane",
+            ),
+            (
+                submit(serde_json::json!({"keep_pane": false})),
+                KEEP_PANE_PROTOCOL,
+                "keep_pane",
+            ),
+            (
                 req(serde_json::json!({"op": "task_claim", "machine": "m", "free_slots": 1})),
                 PULL_PROTOCOL,
                 "pull machines",
@@ -2250,6 +2282,7 @@ mod tests {
             ORCHESTRATOR_PROTOCOL,
             SESSION_PROTOCOL,
             FALLBACK_PROTOCOL,
+            KEEP_PANE_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }

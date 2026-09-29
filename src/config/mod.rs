@@ -511,6 +511,10 @@ pub struct Defaults {
     /// `resolve_label`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Whether tasks whose run flags, job and flock say nothing keep their
+    /// pane once they end; unset, no. See `resolve_keep_pane`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_pane: Option<bool>,
 }
 
 /// What `pastor task run` flags or a job file's `[dispatch]` say about the
@@ -1049,6 +1053,24 @@ impl Defaults {
         .into_iter()
         .find_map(|(layer, label)| Some((label?.to_string(), layer)))
     }
+
+    /// Whether a task keeps its pane once it ends: from the first of `ask`
+    /// (`task run --keep-pane`, a job's `keep_pane`), `flock` and these
+    /// defaults that sets it, and the layer that did; `None` is no. No
+    /// machine layer, for the reason `resolve_label` has none.
+    pub fn resolve_keep_pane(
+        &self,
+        ask: Option<bool>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> Option<(bool, Layer)> {
+        [
+            (Layer::Ask, ask),
+            (Layer::Flock, flock.and_then(|f| f.keep_pane)),
+            (Layer::Defaults, self.keep_pane),
+        ]
+        .into_iter()
+        .find_map(|(layer, keep)| Some((keep?, layer)))
+    }
 }
 
 impl Default for Defaults {
@@ -1069,6 +1091,7 @@ impl Default for Defaults {
             summary: None,
             place: crate::task::Place::Repo,
             label: None,
+            keep_pane: None,
         }
     }
 }
@@ -2294,6 +2317,47 @@ mod tests {
         assert_eq!(got(&Defaults::default(), None, &bare), None);
     }
 
+    /// `keep_pane` comes from the first of the ask, the flock and
+    /// `[defaults]` that sets it, so a job's `false` beats a flock's `true`;
+    /// none leaves it unset, which is no.
+    #[test]
+    fn keep_pane_comes_from_its_layers() {
+        let kept = flock::FlockEntry {
+            name: "kept".into(),
+            keep_pane: Some(true),
+            ..Default::default()
+        };
+        let bare = flock::FlockEntry {
+            name: "bare".into(),
+            ..Default::default()
+        };
+        let d = Defaults {
+            keep_pane: Some(true),
+            ..Default::default()
+        };
+        let got = |d: &Defaults, ask, f: &flock::FlockEntry| d.resolve_keep_pane(ask, Some(f));
+        assert_eq!(got(&d, Some(false), &kept), Some((false, Layer::Ask)));
+        assert_eq!(
+            got(&Defaults::default(), None, &kept),
+            Some((true, Layer::Flock))
+        );
+        assert_eq!(got(&d, None, &bare), Some((true, Layer::Defaults)));
+        assert_eq!(got(&Defaults::default(), None, &bare), None);
+    }
+
+    /// `[defaults] keep_pane` loads, and a misspelt key is a load error.
+    #[test]
+    fn a_defaults_keep_pane_loads_and_a_typo_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "[defaults]\nkeep_pane = true\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.keep_pane, Some(true));
+        std::fs::write(&path, "[defaults]\nkeep_panes = true\n").unwrap();
+        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        assert!(err.contains("keep_panes"), "{err}");
+    }
+
     /// `[defaults] label` is checked on load like any other template.
     #[test]
     fn a_defaults_label_is_checked_on_load() {
@@ -2994,6 +3058,8 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
         }
     }
 

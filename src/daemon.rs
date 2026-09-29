@@ -780,6 +780,20 @@ impl Fleet {
         };
     }
 
+    /// A task's `keep_pane` as it is queued in `flock`: what its run or job
+    /// asked for (the spec's own), else the flock's, else `[defaults]`
+    /// (`Defaults::resolve_keep_pane`), with where it came from.
+    fn settle_keep_pane(&self, spec: &mut crate::task::DispatchSpec, flock: &str, asked_by: &str) {
+        let wanted = self.wanted.read().recover();
+        let picked = self
+            .defaults
+            .read()
+            .recover()
+            .resolve_keep_pane(spec.keep_pane, wanted.entry(flock));
+        spec.keep_pane = picked.map(|(keep, _)| keep);
+        spec.keep_pane_from = picked.map(|(_, layer)| layer_label(layer, asked_by, flock, None));
+    }
+
     /// A task's timeout and place as it is queued in `flock`, from what its
     /// run or job asked for, else the flock's, else `[defaults]`
     /// (`Defaults::resolve_timeout`, `resolve_place`), with where each came
@@ -1296,6 +1310,7 @@ impl Fleet {
             self.settle_run(&mut spec, ask, &flock, "task run");
         }
         self.settle_label(&mut spec, &flock, "task run");
+        self.settle_keep_pane(&mut spec, &flock, "task run");
         let (priority, from) =
             self.settle_priority(priority, &flock, spec.machine.as_deref(), "task run");
         spec.summary = self.settle_summary(summary, &flock);
@@ -1357,6 +1372,7 @@ impl Fleet {
             .map_err(|e| anyhow::Error::msg(e.message))?;
         self.settle_run(&mut settled, &ask, &flock, &asked_by);
         self.settle_label(&mut settled, &flock, &asked_by);
+        self.settle_keep_pane(&mut settled, &flock, &asked_by);
         let (priority, from) = self.settle_priority(
             job.priority_for(item).map_err(anyhow::Error::msg)?,
             &flock,
@@ -1387,6 +1403,8 @@ impl Fleet {
                 spec.timeout_secs = settled.timeout_secs;
                 spec.place = settled.place;
                 spec.label = settled.label;
+                spec.keep_pane = settled.keep_pane;
+                spec.keep_pane_from = settled.keep_pane_from;
                 spec.summary = summary;
                 // Only a person's `task run --now` skips the queue.
                 spec.now = false;
@@ -4295,6 +4313,8 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
         }
     }
 
@@ -5093,6 +5113,43 @@ mod tests {
         assert_eq!(
             f.validate().unwrap_err(),
             "machine laptop: set exactly one of local, ssh, command, pull"
+        );
+    }
+
+    /// A done task that keeps its pane holds no slot: a machine at
+    /// `max_agents = 1` starts the next task while the kept pane stays.
+    #[tokio::test]
+    async fn a_kept_done_task_does_not_hold_a_slot() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+        let task = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let mut kept = run_at("1", None);
+        if let IpcRequest::Run { spec, .. } = &mut kept {
+            spec.keep_pane = Some(true);
+        }
+        let first = task(d.handle(kept).await);
+        assert_eq!(first.state, TaskState::Running);
+        let next = task(d.handle(run_at("2", None)).await);
+        assert_eq!(next.state, TaskState::Queued);
+        let done = task(
+            d.handle(IpcRequest::TaskDone {
+                id: first.id,
+                summary: Some("done".into()),
+            })
+            .await,
+        );
+        assert_eq!(done.state, TaskState::Done);
+        d.fleet().dispatch_queued().await;
+        let state = |id: i64| d.store.get_task(id).unwrap().unwrap().state;
+        assert_eq!(state(next.id), TaskState::Running);
+        assert_eq!(state(first.id), TaskState::Done);
+        assert!(
+            fake.agents()
+                .iter()
+                .any(|a| Some(&a.pane_id) == first.pane_id.as_ref())
         );
     }
 
@@ -8542,6 +8599,68 @@ mod tests {
             ))
             .await;
         assert_eq!(job_task(from_job), SummaryMode::Require);
+    }
+
+    /// A task's `keep_pane` comes from `task run --keep-pane`, else its
+    /// job's, else its flock's, else `[defaults]` (unset here: no layer),
+    /// and is stored on the task with where it came from.
+    #[tokio::test]
+    async fn keep_pane_is_settled_when_a_task_is_queued() {
+        let mut flock = home_and_work();
+        flock.flocks.push(crate::config::flock::FlockEntry {
+            name: "kept".into(),
+            keep_pane: Some(true),
+            ..Default::default()
+        });
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("h", 2, FakeHerdr::new()), ("w", 2, FakeHerdr::new())],
+        )
+        .await;
+        let settled = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => (t.spec.keep_pane, t.spec.keep_pane_from),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(settled(d.handle(run_in(None, None)).await), (None, None));
+        assert_eq!(
+            settled(d.handle(run_in(Some("kept"), None)).await),
+            (Some(true), Some("flock kept".into()))
+        );
+        let mut asked = run_in(None, None);
+        if let IpcRequest::Run { spec, .. } = &mut asked {
+            spec.keep_pane = Some(true);
+        }
+        assert_eq!(
+            settled(d.handle(asked).await),
+            (Some(true), Some("task run".into()))
+        );
+        let submit = |job: &str, dispatch: serde_json::Value| IpcRequest::JobSubmit {
+            job: job.into(),
+            dispatch,
+            prompt: "p".into(),
+            items: vec![serde_json::json!({"key": "k"})],
+        };
+        let job_task = |resp: IpcResponse| match resp {
+            IpcResponse::JobSubmitted { tasks, .. } => (
+                tasks[0].spec.keep_pane,
+                tasks[0].spec.keep_pane_from.clone(),
+            ),
+            other => panic!("{other:?}"),
+        };
+        let from_flock = d
+            .handle(submit("j1", serde_json::json!({"flock": "kept"})))
+            .await;
+        assert_eq!(
+            job_task(from_flock),
+            (Some(true), Some("flock kept".into()))
+        );
+        let from_job = d
+            .handle(submit(
+                "j2",
+                serde_json::json!({"flock": "kept", "keep_pane": false}),
+            ))
+            .await;
+        assert_eq!(job_task(from_job), (Some(false), Some("job j2".into())));
     }
 
     /// A task with no pane has nothing to end.

@@ -119,7 +119,10 @@ pastor closes a done task's pane after 5 seconds (`close_done_after` in
 changes and no unpushed commits. A failed or stale task, or an orphan, loses
 its pane 5 seconds after its agent stops (`close_failed_after`), but stays
 failed for `pastor task retry`, its worktree kept. Nothing else closes on its
-own.
+own. A task run with `--keep-pane` (or `keep_pane = true` in its job, flock or
+`[defaults]`) keeps its pane and worktree whatever it ends in, until `pastor
+task close`, so you can go on talking to its agent; while it is done it holds
+no slot.
 
 ```sh
 pastor task close t-12 --remove-worktree  # close it now, worktree too

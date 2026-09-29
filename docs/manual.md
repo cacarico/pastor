@@ -249,6 +249,32 @@ id cleared, and the other agent's pane is left alone. Blocked tasks need
 their prompt answered (`pastor task send` or `pastor task attach`) or
 `pastor task close`, and are never closed on their own.
 
+### Keeping a task's pane
+
+A task can keep its pane, so you can go on talking to its agent after it
+finishes: `pastor task run --keep-pane`, `keep_pane = true` in a job's
+`[dispatch]`, on a `[[flock]]` in `flock.toml`, or under `[defaults]` in
+`pastor.toml`. The first of the task's own, its job's, its flock's and
+`[defaults]` wins, so a job's `keep_pane = false` beats its flock's `true`;
+none of them is no. It is settled when the task is queued, and a retry keeps
+it. `pastor task describe` shows it with where it came from, and `--json`
+carries it as `spec.keep_pane` and `spec.keep_pane_from`.
+
+A kept task still goes `done` when its agent stops, but neither
+`close_done_after` nor `close_failed_after` closes its pane: done, failed or
+stale, it stays open, its row as it is, until `pastor task close`. Its
+worktree stays too, since removing the checkout under an open pane would
+break the follow-up. `task list` shows such a done task as `done (kept)`. It
+holds no slot while it is done: its agent is idle, and the machine takes new
+work. `pastor task send` makes it run again, and it holds a slot once more.
+A kept failed or stale task still holds its slot, as its agent may be at
+work.
+
+```toml
+[defaults]
+keep_pane = true
+```
+
 An agent says it is finished with `pastor task done` from its own pane (the
 task defaults to `PASTOR_TASK`; a human may name any task, `pastor task done
 t-3`). The task goes `done` at once, however herdr reads the agent, and stays
@@ -752,6 +778,7 @@ agent_args = ["--model", "claude-sonnet-5"]
 # timeout = "30m"         # optional: how long its tasks may run, before [defaults]
 # place = "pastor"        # optional: where its tasks' panes go, see Where a task's pane goes
 # summary = "require"     # optional: ask, require or off, see Asking for one
+# keep_pane = true        # optional: keep its tasks' panes, see Keeping a task's pane
 
 [[machine]]
 name = "desk"
@@ -3489,6 +3516,7 @@ place = "repo"               # where a task's pane goes: repo, own, pastor or pa
 # agents = { opencode = "opencode" }  # the agent for a model of another kind than agent's
 # profile = "develop"        # a permission profile for tasks that name none; unset: none
 # summary = "ask"            # ask for a summary in each prompt; require: also fail without one; off: neither
+# keep_pane = false          # true: tasks keep their pane once they end, until `pastor task close`
 [agents.claude]              # one table per agent that needs one
 kind = "claude"                  # the herdr agent it starts; default: the table's name
 env = {}                         # env for its pane, e.g. { CLAUDE_CONFIG_DIR = "~/.claude-personal" }

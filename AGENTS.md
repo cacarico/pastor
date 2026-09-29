@@ -275,7 +275,10 @@ own task, `IpcRequest::ends_own_task`); auto-close of done tasks after `close_do
 `Actor::auto_close_done`, run after each connected reconcile through the same
 `run_close` (`CloseBy::AutoClose`); the panes of failed and stale tasks and
 orphans whose agents stopped go after `close_failed_after` in
-`Actor::auto_close_stopped`, which keeps the rows failed; orphan detection is
+`Actor::auto_close_stopped`, which keeps the rows failed; both skip a task
+whose spec keeps its pane (`DispatchSpec::keeps_pane`, settled at queue time
+by `Fleet::settle_keep_pane`), and `machine::count_live` leaves such a task
+out while it is done; orphan detection is
 `machine::orphan_agents`, used by reconcile and by the head-less probe in
 `machine list`.
 

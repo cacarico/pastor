@@ -1902,6 +1902,11 @@ fn each_request_refuses_a_head_one_protocol_short_of_it() {
             ipc::SUMMARY_MODE_PROTOCOL,
             "summary setting",
         ),
+        (
+            &["task", "run", "hi", "--keep-pane"],
+            ipc::KEEP_PANE_PROTOCOL,
+            "keeping a task's pane",
+        ),
         (&["queue"], ipc::QUEUE_PROTOCOL, "pastor queue"),
         (
             &["queue", "move", "t-1", "--top"],
@@ -7191,6 +7196,45 @@ fn a_share_and_a_max_refuse_a_head_from_before_them() {
 
     std::fs::remove_file(&socket).unwrap();
     text_head(&socket, pastor::ipc::FLOCK_SHARE_PROTOCOL);
+    assert_eq!(ok(run(&["flock", "add", "spare"])), "said by the head\n");
+}
+
+/// A flock.toml that sets a flock's `keep_pane` needs a head that reads
+/// it, for the same reason as a share and a max.
+#[test]
+fn a_flock_keep_pane_refuses_a_head_from_before_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"work\"\ndefault = true\nkeep_pane = true\n\n\
+         [[machine]]\nname = \"pi-1\"\nlocal = true\n",
+    )
+    .unwrap();
+    let socket = state.join("pastor.sock");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let reqs = text_head(&socket, pastor::ipc::KEEP_PANE_PROTOCOL - 1);
+    let out = run(&["flock", "add", "spare"]);
+    assert_eq!(error_code(&out), "head_too_old");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("keep_pane"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(reqs.lock().unwrap().iter().all(|r| r["op"] == "ping"));
+
+    std::fs::remove_file(&socket).unwrap();
+    text_head(&socket, pastor::ipc::KEEP_PANE_PROTOCOL);
     assert_eq!(ok(run(&["flock", "add", "spare"])), "said by the head\n");
 }
 

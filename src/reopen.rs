@@ -204,6 +204,8 @@ mod tests {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w9".into()),

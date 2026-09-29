@@ -89,6 +89,10 @@ pub struct DispatchTable {
     /// The label template of each task's workspace; `None` takes the
     /// flock's, else `[defaults] label` (`Defaults::resolve_label`).
     pub label: Option<String>,
+    /// Whether the job's tasks keep their pane once they end; `None` takes
+    /// the flock's, else `[defaults] keep_pane`
+    /// (`Defaults::resolve_keep_pane`).
+    pub keep_pane: Option<bool>,
     pub max_tasks_per_run: Option<u32>,
     pub backfill: Option<String>,
     /// The template of each task's description; `None` is
@@ -414,6 +418,8 @@ impl Job {
                 },
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: d.keep_pane,
+                keep_pane_from: None,
             },
         })
     }
@@ -1159,6 +1165,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             profile: None,
             label: None,
             summary: None,
+            keep_pane: None,
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");
@@ -1191,6 +1198,33 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         assert_eq!(job.spec.place, Place::Own);
         let err = Job::parse(&text("place = \"elsewhere\"\n"), "j", &d, &Builtins).unwrap_err();
         assert!(err.contains("unknown place elsewhere"), "{err}");
+    }
+
+    /// `[dispatch] keep_pane` is the job's own ask, `false` included, so it
+    /// beats the flock's when each task is queued; a job without it leaves
+    /// it to the flock and `[defaults]`.
+    #[test]
+    fn keep_pane_is_the_job_s_own_ask() {
+        let text = |extra: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        let d = Defaults {
+            keep_pane: Some(true),
+            ..defaults()
+        };
+        let parse = |extra: &str| Job::parse(&text(extra), "j", &d, &Builtins);
+        assert_eq!(parse("").unwrap().spec.keep_pane, None);
+        assert_eq!(
+            parse("keep_pane = false\n").unwrap().spec.keep_pane,
+            Some(false)
+        );
+        assert_eq!(
+            parse("keep_pane = true\n").unwrap().spec.keep_pane,
+            Some(true)
+        );
+        assert!(parse("keep_panes = true\n").is_err());
     }
 
     /// `[dispatch] label` is the job's label template, kept unrendered for

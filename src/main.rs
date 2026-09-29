@@ -300,6 +300,12 @@ struct RunArgs {
     /// label`, else {{ flock }}/{{ task.id }}). The agent stays t-N
     #[arg(long, value_name = "TEMPLATE", value_parser = parse_label)]
     label: Option<String>,
+    /// Keep the agent's pane open once the task is done, failed or stale,
+    /// until `pastor task close`, so you can go on talking to the agent;
+    /// a kept done task holds no slot (default: the flock's `keep_pane`,
+    /// else `[defaults] keep_pane`, else no)
+    #[arg(long)]
+    keep_pane: bool,
     /// Where the agent's pane goes: repo (under the repo it works on), own
     /// (its own workspace), pastor (the `pastor` workspace) or
     /// pane:<workspace> (default: the flock's, else `[defaults] place`,
@@ -1290,7 +1296,12 @@ fn flocks_declared(paths: &Paths) -> bool {
 /// (`FLOCK_TIMEOUT_PLACE_PROTOCOL`), a share and a max
 /// (`FLOCK_SHARE_PROTOCOL`). The newest one the file uses wins.
 fn flock_file_need(paths: &Paths) -> Option<(u32, &'static str)> {
-    if flock_share_declared(paths) {
+    if flock_keep_pane_declared(paths) {
+        Some((
+            pastor::ipc::KEEP_PANE_PROTOCOL,
+            "predates a flock's keep_pane, and would silently drop flock.toml on reload, keeping its old flocks",
+        ))
+    } else if flock_share_declared(paths) {
         Some((
             pastor::ipc::FLOCK_SHARE_PROTOCOL,
             "predates a flock's share and max on a machine, and would silently drop flock.toml's `machines` on reload, keeping its old membership",
@@ -1331,6 +1342,12 @@ fn flock_share_declared(paths: &Paths) -> bool {
 /// cannot read the file either is refused for other reasons first.
 fn multi_flock_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| !e.machines.is_empty()))
+}
+
+/// Whether flock.toml sets `keep_pane` on any flock, a field an older
+/// head's `FlockEntry` does not know (see `KEEP_PANE_PROTOCOL`).
+fn flock_keep_pane_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| e.keep_pane.is_some()))
 }
 
 /// Whether flock.toml gives any flock its own `timeout` or `place`, the
@@ -1499,6 +1516,9 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
         },
         summary: Default::default(),
         cwd: None,
+        // Only the ask, like `label`.
+        keep_pane: a.keep_pane.then_some(true),
+        keep_pane_from: None,
     })
 }
 

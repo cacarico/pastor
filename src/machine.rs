@@ -772,8 +772,15 @@ impl MachineHandle {
 }
 
 /// `live`, `live_jobs` and `live_by_flock` of `status` from `tasks`, the
-/// pane-owning tasks on its machine (`Store::tasks_on_machine`).
+/// pane-owning tasks on its machine (`Store::tasks_on_machine`). A done
+/// task that keeps its pane is left out: its agent is idle and waits for a
+/// person, so the machine should take new work. `task send` makes it run,
+/// and count, again.
 pub fn count_live(status: &mut MachineStatus, tasks: &[Task]) {
+    let tasks: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| !(t.state == TaskState::Done && t.spec.keeps_pane()))
+        .collect();
     status.live = tasks.len();
     status.live_jobs = tasks.iter().filter(|t| t.from_job()).count();
     let mut by: Vec<(Option<String>, usize)> = Vec::new();
@@ -2708,7 +2715,8 @@ impl Actor {
     }
 
     /// Close the done tasks on this machine that finished `close_done_after`
-    /// ago or more, through the same path as `pastor task close`. Failed and
+    /// ago or more, through the same path as `pastor task close`, except
+    /// those that keep their pane (`DispatchSpec::keeps_pane`). Failed and
     /// stale tasks lose only their panes (`auto_close_stopped`); blocked
     /// tasks are never closed on their own. A task herdr
     /// will not close is logged and tried again at the next check; only a
@@ -2724,7 +2732,9 @@ impl Actor {
             .tasks_on_machine(&self.name)?
             .into_iter()
             .filter(|t| {
-                t.state == TaskState::Done && now - t.finished_at.unwrap_or(t.updated_at) >= grace
+                t.state == TaskState::Done
+                    && !t.spec.keeps_pane()
+                    && now - t.finished_at.unwrap_or(t.updated_at) >= grace
             })
             .collect();
         for t in due {
@@ -2788,9 +2798,16 @@ impl Actor {
         let Some(after) = self.settings.close_failed_after else {
             return Ok(());
         };
-        let candidates = self
+        // A task that keeps its pane is not a candidate at all: its pane
+        // stays, and so does its row, stale or failed, until `task close`.
+        // A failed task's agent also reads as an orphan, so its pane is
+        // kept out of the orphans below too.
+        let (kept, candidates): (Vec<Task>, Vec<Task>) = self
             .store
-            .tasks_holding_panes(&self.name, &[TaskState::Failed, TaskState::Stale])?;
+            .tasks_holding_panes(&self.name, &[TaskState::Failed, TaskState::Stale])?
+            .into_iter()
+            .partition(|t| t.spec.keeps_pane());
+        let kept_panes: HashSet<String> = kept.into_iter().filter_map(|t| t.pane_id).collect();
         if candidates.is_empty() && self.orphans.is_empty() {
             return Ok(());
         }
@@ -2833,6 +2850,9 @@ impl Actor {
         }
         let mut orphans_due: Vec<(String, String)> = vec![];
         for (agent, pane) in self.orphans.clone() {
+            if kept_panes.contains(&pane) {
+                continue;
+            }
             seen_panes.insert(pane.clone());
             if !stopped(&pane) {
                 self.stopped_since.remove(&pane);
@@ -4254,6 +4274,8 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
         }
     }
 
@@ -8121,6 +8143,116 @@ mod tests {
         }
         assert!(calls(&fake, "pane.close").is_empty());
         assert!(calls(&fake, "worktree.remove").is_empty());
+    }
+
+    fn kept_task(store: &Store) -> Task {
+        store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    keep_pane: Some(true),
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// A task that keeps its pane goes done like any other, but auto-close
+    /// leaves its pane and worktree, well past `close_done_after`, and it
+    /// holds no slot while done. `task close` still closes it, and `task
+    /// send` sets it running again, holding a slot once more.
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_done_task_keeps_its_pane_and_frees_its_slot() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = run_to_done(&h, &fake, &store, kept_task(&store)).await;
+        finished_an_hour_ago(&store, t.id);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        wait_for("no slot held", || h.snapshot().live == 0).await;
+        let sent = h
+            .send(
+                t.id,
+                SendInput {
+                    text: Some("one more thing".into()),
+                    enter: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.state, TaskState::Running);
+        wait_for("slot held again", || h.snapshot().live == 1).await;
+        let closed = h.close(t.id, false).await.unwrap();
+        assert_eq!(closed.state, TaskState::Closed);
+        assert_eq!(
+            calls(&fake, "pane.close"),
+            vec![serde_json::json!({"pane_id": t.pane_id.clone().unwrap()})]
+        );
+    }
+
+    /// A failed or stale task that keeps its pane keeps it past
+    /// `close_failed_after`, and its row is left as it is.
+    #[tokio::test]
+    async fn a_kept_failed_or_stale_tasks_pane_stays() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut kept = vec![];
+        for state in [TaskState::Failed, TaskState::Stale] {
+            let mut t = stopped_task(&fake, &store, state).await;
+            t.spec.keep_pane = Some(true);
+            store.update_task(&mut t).unwrap();
+            kept.push(t);
+        }
+        // A plain failed task beside them shows the check has run.
+        let plain = stopped_task(&fake, &store, TaskState::Failed).await;
+        let plain_pane = plain.pane_id.clone().unwrap();
+        let (_h, _events) = spawn_with_settings(&fake, &store, close_failed_settings());
+        wait_for("plain pane closed", || !pane_open(&fake, &plain_pane)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for t in kept {
+            let pane = t.pane_id.clone().unwrap();
+            assert!(pane_open(&fake, &pane), "{:?}", t.state);
+            let row = store.get_task(t.id).unwrap().unwrap();
+            assert_eq!(row.state, t.state);
+            assert_eq!(row.pane_id, Some(pane));
+        }
+        assert_eq!(calls(&fake, "pane.close").len(), 1);
+    }
+
+    /// A kept done task holds no slot; a kept task still at work, or a
+    /// done one that does not keep its pane, does.
+    #[test]
+    fn count_live_leaves_out_a_kept_done_task() {
+        let store = Store::open_in_memory().unwrap();
+        let task = |state, keep| {
+            let mut t = new_task(&store);
+            t.state = state;
+            t.spec.keep_pane = keep;
+            t
+        };
+        let mut s = pull_machine("m".into(), 4, vec![]).snapshot();
+        count_live(
+            &mut s,
+            &[
+                task(TaskState::Done, Some(true)),
+                task(TaskState::Done, None),
+                task(TaskState::Running, Some(true)),
+                task(TaskState::Stale, Some(true)),
+            ],
+        );
+        assert_eq!(s.live, 3);
     }
 
     #[tokio::test(start_paused = true)]
