@@ -2397,4 +2397,60 @@ tags = ["fast"]
         );
         assert!(f.machines.is_empty());
     }
+
+    /// Every char `pred` holds for, up to U+3000 where Unicode's last
+    /// whitespace sits, so a strategy can pick one without filtering.
+    fn chars_where(pred: fn(char) -> bool) -> Vec<char> {
+        (0..=0x3000)
+            .filter_map(char::from_u32)
+            .filter(|c| pred(*c))
+            .collect()
+    }
+
+    /// `s` with `c` put in at the char position `at` (modulo its length).
+    fn insert_at(s: &str, at: usize, c: char) -> String {
+        let n = s.chars().count();
+        let at = at % (n + 1);
+        s.chars()
+            .take(at)
+            .chain([c])
+            .chain(s.chars().skip(at))
+            .collect()
+    }
+
+    proptest::proptest! {
+        /// A target that ssh would read as an option is never accepted.
+        #[test]
+        fn prop_ssh_target_with_a_dash_prefix_is_refused(rest in ".*") {
+            let target = format!("-{rest}");
+            proptest::prop_assert!(ssh_target_problem(&target).is_some(), "{target:?}");
+        }
+
+        #[test]
+        fn prop_ssh_target_with_whitespace_is_refused(
+            s in ".*",
+            at in proptest::prelude::any::<usize>(),
+            c in proptest::sample::select(chars_where(char::is_whitespace)),
+        ) {
+            let target = insert_at(&s, at, c);
+            proptest::prop_assert!(ssh_target_problem(&target).is_some(), "{target:?}");
+        }
+
+        #[test]
+        fn prop_ssh_target_with_a_control_char_is_refused(
+            s in ".*",
+            at in proptest::prelude::any::<usize>(),
+            c in proptest::sample::select(chars_where(char::is_control)),
+        ) {
+            let target = insert_at(&s, at, c);
+            proptest::prop_assert!(ssh_target_problem(&target).is_some(), "{target:?}");
+        }
+
+        #[test]
+        fn prop_plain_user_at_host_is_accepted(
+            target in "([a-z_][a-z0-9_.-]{0,31}@)?[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}",
+        ) {
+            proptest::prop_assert_eq!(ssh_target_problem(&target), None, "{:?}", target);
+        }
+    }
 }
