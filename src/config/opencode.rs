@@ -4,7 +4,9 @@
 //! profile gets the profile's lists (in Claude Code's patterns, which the
 //! profiles are written in) translated into that object, and its pane gets
 //! it with the variables that point opencode at another config emptied
-//! (`Agents::launch`). Dispatch refuses a machine whose own opencode config
+//! and the repo's own config turned off (`Agents::launch`), the repo's
+//! instruction files passed back by path (`instructions_content`). Dispatch
+//! refuses a machine whose own opencode config
 //! already has permission rules (`OPENCODE_PERMISSIONS_CONFLICT`), since
 //! opencode would merge the two.
 
@@ -19,12 +21,41 @@ pub const PERMISSION_ENV: &str = "OPENCODE_PERMISSION";
 /// The variables that point opencode at a config of their own. A profiled
 /// task's pane gets each set empty, which opencode reads as unset, so an
 /// `[agents]` env or the machine's shell cannot add rules around the
-/// profile's.
+/// profile's; dispatch then fills `CONFIG_CONTENT_ENV` with instructions
+/// only.
 pub const CONFIG_ENV: [&str; 3] = [
     "OPENCODE_CONFIG",
     "OPENCODE_CONFIG_DIR",
     "OPENCODE_CONFIG_CONTENT",
 ];
+
+/// The variable that stops opencode reading the project's config: an
+/// `opencode.json` or `.opencode/` in the checkout, which a branch under
+/// review could fill with rules that lift the profile's denies. It stops
+/// opencode reading the repo's `AGENTS.md` and `CLAUDE.md` too, which
+/// `instructions_content` gives back.
+pub const DISABLE_PROJECT_CONFIG_ENV: &str = "OPENCODE_DISABLE_PROJECT_CONFIG";
+
+/// The variable that holds the config a profiled task's pane gets: only
+/// its instructions (`instructions_content`).
+pub const CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// The repo files opencode reads as instructions, which a profiled task
+/// gets back by path.
+const INSTRUCTION_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
+/// `OPENCODE_CONFIG_CONTENT` for a profiled task working in `dir`: its
+/// `AGENTS.md` and `CLAUDE.md` as `instructions`. By absolute path, since
+/// with the project config off opencode looks for a relative one in its
+/// global config dir; a file that is not there matches nothing.
+pub fn instructions_content(dir: &str) -> String {
+    let dir = dir.trim_end_matches('/');
+    let files: Vec<String> = INSTRUCTION_FILES
+        .iter()
+        .map(|f| format!("{dir}/{f}"))
+        .collect();
+    serde_json::json!({ "instructions": files }).to_string()
+}
 
 /// The code of a profiled opencode task sent to a machine whose own opencode
 /// config has permission rules.
@@ -131,13 +162,18 @@ pub fn permission_json(allow: &[String], deny: &[String], open: bool) -> String 
     out
 }
 
-/// The shell command that answers `yes` when the machine's own opencode
-/// config (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`: its
-/// `config.json`, `opencode.json` and `opencode.jsonc`) sets permission
-/// rules, `no` otherwise. Any `"permission"` key counts, top level or under
-/// an agent, and one in a comment too: a false yes refuses a task with the
-/// reason, a false no would run it under rules nobody chose.
-pub const CONFIG_CHECK_COMMAND: &str = r#"d="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"; if cat "$d/config.json" "$d/opencode.json" "$d/opencode.jsonc" 2>/dev/null | grep -q '"permission"[[:space:]]*:'; then printf yes; else printf no; fi"#;
+/// The shell command that answers `yes` when a config opencode reads
+/// besides the project's sets permission rules, `no` otherwise: its config
+/// dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`) and
+/// `~/.opencode`, each's `config.json`, `opencode.json` and
+/// `opencode.jsonc`, and the managed dir (`/etc/opencode`, on macOS
+/// `/Library/Application Support/opencode`, or opencode's own
+/// `OPENCODE_TEST_MANAGED_CONFIG_DIR`). Any `"permission"` key counts, top
+/// level or under an agent, and a `"tools"` one, which opencode turns into
+/// rules; one in a comment too: a false yes refuses a task with the reason,
+/// a false no would run it under rules nobody chose. The project's config
+/// is off for a profiled task (`DISABLE_PROJECT_CONFIG_ENV`).
+pub const CONFIG_CHECK_COMMAND: &str = r#"d="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"; h="$HOME/.opencode"; m="$OPENCODE_TEST_MANAGED_CONFIG_DIR"; if [ -z "$m" ]; then if [ "$(uname -s)" = Darwin ]; then m="/Library/Application Support/opencode"; else m=/etc/opencode; fi; fi; if cat "$d/config.json" "$d/opencode.json" "$d/opencode.jsonc" "$h/config.json" "$h/opencode.json" "$h/opencode.jsonc" "$m/opencode.json" "$m/opencode.jsonc" 2>/dev/null | grep -Eq '"(permission|tools)"[[:space:]]*:'; then printf yes; else printf no; fi"#;
 
 #[cfg(test)]
 mod tests {
@@ -221,15 +257,8 @@ mod tests {
     #[test]
     fn the_config_check_command_reads_the_opencode_config_dir() {
         let home = tempfile::tempdir().unwrap();
-        let run = || {
-            let out = std::process::Command::new("sh")
-                .args(["-c", CONFIG_CHECK_COMMAND])
-                .env("HOME", home.path())
-                .env_remove("XDG_CONFIG_HOME")
-                .output()
-                .unwrap();
-            String::from_utf8(out.stdout).unwrap()
-        };
+        let managed = tempfile::tempdir().unwrap();
+        let run = || check(home.path(), managed.path());
         assert_eq!(run(), "no");
         let dir = home.path().join(".config/opencode");
         std::fs::create_dir_all(&dir).unwrap();
@@ -245,5 +274,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(run(), "yes");
+    }
+
+    /// Runs the check command with `home` as `HOME` and `managed` as
+    /// opencode's managed config directory.
+    fn check(home: &std::path::Path, managed: &std::path::Path) -> String {
+        let out = std::process::Command::new("sh")
+            .args(["-c", CONFIG_CHECK_COMMAND])
+            .env("HOME", home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env("OPENCODE_TEST_MANAGED_CONFIG_DIR", managed)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// opencode also reads `~/.opencode`, whatever `XDG_CONFIG_HOME` says.
+    #[test]
+    fn the_config_check_command_reads_the_home_opencode_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        assert_eq!(check(home.path(), managed.path()), "no");
+        let dir = home.path().join(".opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("opencode.json"),
+            r#"{"permission": {"bash": "allow"}}"#,
+        )
+        .unwrap();
+        assert_eq!(check(home.path(), managed.path()), "yes");
+    }
+
+    /// The managed directory (`/etc/opencode`, on macOS `/Library/Application
+    /// Support/opencode`) is read too; opencode's own override for it points
+    /// the test at a temp dir.
+    #[test]
+    fn the_config_check_command_reads_the_managed_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            managed.path().join("opencode.jsonc"),
+            "// managed\n{ \"permission\": { \"edit\": \"deny\" } }",
+        )
+        .unwrap();
+        assert_eq!(check(home.path(), managed.path()), "yes");
+    }
+
+    /// opencode turns a legacy `tools` block into permission rules, so one
+    /// counts as rules.
+    #[test]
+    fn the_config_check_command_counts_a_tools_block() {
+        let home = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".config/opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"tools": {"bash": false}}"#).unwrap();
+        assert_eq!(check(home.path(), managed.path()), "yes");
+    }
+
+    /// The instructions a profiled task gets back: the repo's files by
+    /// their paths, as JSON.
+    #[test]
+    fn instructions_name_the_repo_files() {
+        assert_eq!(
+            instructions_content("/srv/a \"b\""),
+            r#"{"instructions":["/srv/a \"b\"/AGENTS.md","/srv/a \"b\"/CLAUDE.md"]}"#
+        );
     }
 }

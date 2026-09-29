@@ -1192,7 +1192,9 @@ impl Agents {
     /// its definition. Refused as `launch_args` is.
     /// An opencode agent under a profile gets its lists in the env instead
     /// (`opencode::permission_json`), over its definition's, with the
-    /// variables that would load another config emptied.
+    /// variables that would load another config emptied and the repo's
+    /// config turned off; dispatch gives it the repo's instructions back
+    /// once it knows the checkout (`opencode::instructions_content`).
     pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, AgentRefusal> {
         let mut env = self
             .0
@@ -1203,6 +1205,7 @@ impl Agents {
             for key in opencode::CONFIG_ENV {
                 env.insert(key.into(), String::new());
             }
+            env.insert(opencode::DISABLE_PROJECT_CONFIG_ENV.into(), "1".into());
             env.insert(
                 opencode::PERMISSION_ENV.into(),
                 opencode::permission_json(
@@ -2830,6 +2833,7 @@ mod tests {
             assert_eq!(launch.env[key], "", "{key}");
         }
         assert_eq!(launch.env["KEEP"], "1");
+        assert_eq!(launch.env[opencode::DISABLE_PROJECT_CONFIG_ENV], "1");
 
         // A definition of kind opencode is opencode.
         let mine: Agents = toml::from_str("[oc]\nkind = \"opencode\"\n").unwrap();
@@ -2847,6 +2851,7 @@ mod tests {
         assert_eq!(err.code, "agent_tools_unsupported");
         spec.allow.clear();
         spec.deny.clear();
+        // Nor is the repo's own config turned off.
         assert!(Agents::default().launch(&spec).unwrap().env.is_empty());
     }
 

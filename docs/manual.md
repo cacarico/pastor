@@ -1346,14 +1346,17 @@ so no other config file adds rules around the profile's.
 
 Before it makes anything on the machine, pastor checks the machine's own
 opencode config (`config.json`, `opencode.json` and `opencode.jsonc` in
-`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`): a `"permission"` key
-anywhere in them, even under an agent, fails the task
+`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`, and in
+`~/.opencode`, and the managed `/etc/opencode`, on macOS
+`/Library/Application Support/opencode`): a `"permission"` key anywhere in
+them, even under an agent, or a legacy `"tools"` one, fails the task
 (`opencode_permissions_conflict` in its `error`), since opencode would merge
 those rules with the profile's. Move them out, or run the task without a
-profile. A `command` machine cannot be checked, and goes ahead. The repo's
-own opencode config (an `opencode.json` in the checkout) is still read, and
-its rules would merge with the profile's too; keep permission rules out of
-repos that profiled opencode tasks run in.
+profile. A `command` machine cannot be checked, and goes ahead. pastor turns
+the repo's own opencode config (an `opencode.json` or `.opencode/` in the
+checkout) off for a profiled task (`OPENCODE_DISABLE_PROJECT_CONFIG=1`), so a
+branch cannot add rules to the profile's, and passes the checkout's
+`AGENTS.md` and `CLAUDE.md` back by path in `OPENCODE_CONFIG_CONTENT`.
 
 An agent of any other kind gets the lists through its `allow_flag` and
 `deny_flag`, as any list, and keeps its own permission mode.
