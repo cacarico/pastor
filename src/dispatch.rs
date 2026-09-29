@@ -1182,6 +1182,140 @@ mod tests {
         }
     }
 
+    /// True only when the named flock has a seat here and that seat is
+    /// under its max; a missing seat and a full one both come back false.
+    #[test]
+    fn flock_has_room_checks_the_named_seat() {
+        let m = MachineView {
+            flocks: vec![seat("work", Some(2), 1), seat("home", Some(1), 1)],
+            ..mv("desk", 4, 2, &[], true)
+        };
+        assert!(m.flock_has_room("work"), "1 of 2 taken");
+        assert!(!m.flock_has_room("home"), "at its max");
+        assert!(!m.flock_has_room("play"), "no seat at all");
+    }
+
+    /// One more live task of `flock`, counted on `live`, on `live_jobs`
+    /// when the claim comes from a job, and on that flock's own seat; a
+    /// flock the machine is not in leaves every count untouched.
+    #[test]
+    fn take_counts_the_task_on_live_and_its_seat() {
+        let mut m = MachineView {
+            flocks: vec![seat("work", Some(4), 0), seat("home", Some(4), 0)],
+            ..mv("desk", 4, 0, &[], true)
+        };
+        m.take("work", RUN);
+        assert_eq!(m.live, 1);
+        assert_eq!(m.live_jobs, 0, "not from a job");
+        assert_eq!(m.seat("work").unwrap().live, 1);
+        assert_eq!(m.seat("home").unwrap().live, 0, "the other flock is untouched");
+
+        m.take("work", JOB);
+        assert_eq!(m.live, 2);
+        assert_eq!(m.live_jobs, 1, "a job claim counts here too");
+        assert_eq!(m.seat("work").unwrap().live, 2);
+
+        m.take("play", RUN);
+        assert_eq!(m.live, 3, "live counts every task, seated or not");
+        assert_eq!(m.seat("play"), None, "no seat for a flock not on the machine");
+    }
+
+    /// `later`'s tasks join `waiting_under_share` only for a machine where
+    /// `flock` is past its share and under its max, and only when each is
+    /// itself queued, of a different flock under its own share here, with
+    /// no pin elsewhere, every tag the machine has, room for its claim,
+    /// and `accepts` it; a flock already in the list does not join twice.
+    #[test]
+    fn mark_waiting_under_share_filters_each_later_task() {
+        let work = |live: usize| FlockSeat::new("work", Some(FlockNumber::split(1, 3)), live);
+        let desk = |work_live: usize, home_live: usize| MachineView {
+            flocks: vec![work(work_live), seat("home", Some(2), home_live)],
+            tags: vec!["arm".into()],
+            ..mv("desk", 10, work_live + home_live, &[], true)
+        };
+        let home_task = |over: fn(&mut Task)| {
+            let mut t = Task {
+                flock: Some("home".into()),
+                ..task(spec())
+            };
+            over(&mut t);
+            t
+        };
+        let accepts_all = |_: &Task, _: &str| true;
+        let run = |views: &mut [MachineView], later: &[Task], accepts: &dyn Fn(&Task, &str) -> bool| {
+            mark_waiting_under_share(views, "work", later, "default", accepts);
+        };
+
+        // Under its share, no waiting is computed even for a task that
+        // would otherwise qualify.
+        let mut views = vec![desk(0, 1)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "under its share");
+
+        // At its max, none either.
+        let mut views = vec![desk(3, 1)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "at its max");
+
+        // Past its share, under its max: a plain queued task of another
+        // flock under its own share here joins the list.
+        let mut views = vec![desk(1, 1)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert_eq!(views[0].waiting_under_share, vec!["home".to_string()]);
+
+        // The flock being placed never joins, whatever else is true.
+        let mut views = vec![desk(1, 1)];
+        let same = Task {
+            flock: Some("work".into()),
+            ..task(spec())
+        };
+        run(&mut views, &[same], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "its own flock");
+
+        // A flock already in the list does not join twice.
+        let mut views = vec![desk(1, 1)];
+        let twice = [home_task(|_| {}), home_task(|_| {})];
+        run(&mut views, &twice, &accepts_all);
+        assert_eq!(views[0].waiting_under_share, vec!["home".to_string()]);
+
+        // Not queued.
+        let mut views = vec![desk(1, 1)];
+        let not_queued = home_task(|t| t.state = TaskState::Running);
+        run(&mut views, &[not_queued], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "not queued");
+
+        // Its own seat is not under share.
+        let mut views = vec![desk(1, 2)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "home is at its share");
+
+        // Pinned to another machine.
+        let mut views = vec![desk(1, 1)];
+        let pinned = home_task(|t| t.spec.machine = Some("elsewhere".into()));
+        run(&mut views, &[pinned], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "pinned elsewhere");
+
+        // Missing a tag the machine has.
+        let mut views = vec![desk(1, 1)];
+        let tagged = home_task(|t| t.spec.tags = vec!["gpu".into()]);
+        run(&mut views, &[tagged], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "missing tag");
+
+        // No room for its claim: the machine's own limit is already met.
+        let full = MachineView {
+            max_agents: 2,
+            ..desk(1, 1)
+        };
+        let mut views = vec![full];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "the machine has no room");
+
+        // `accepts` refuses it.
+        let mut views = vec![desk(1, 1)];
+        run(&mut views, &[home_task(|_| {})], &|_, _| false);
+        assert!(views[0].waiting_under_share.is_empty(), "accepts refused it");
+    }
+
     /// Only the task's flock takes it, whatever the others have free.
     #[test]
     fn pick_machine_keeps_to_the_tasks_flock() {
