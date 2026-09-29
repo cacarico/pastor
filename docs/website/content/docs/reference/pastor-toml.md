@@ -156,8 +156,8 @@ limit list` shows the accounts it holds back.
 | key | default | does |
 |---|---|---|
 | `wait_under` | `"1h"` | a limited task waits for a reset closer than this, and falls back past it; `"0s"` never waits |
-| `rate_retries` | `3` | a task stopped on a 429 or 529 is sent on this many times before it counts as limited |
-| `rate_backoff` | `"1m"` | the wait before the first of those; each next one doubles it |
+| `rate_retries` | `3` | a task stopped on a 429 or 529 is retried in its pane this many times before it counts as limited |
+| `rate_backoff` | `["1m", "5m", "15m"]` | the wait before each of those retries; the last one repeats |
 | `unknown_reset_wait` | `"1h"` | how long a limit whose message names no reset holds |
 | `retry_after_no_credit` | `"6h"` | how long a limit for no credit holds |
 | `handover_lines` | `100` | the pane lines a task moving to another model hands to it |

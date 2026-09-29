@@ -55,12 +55,13 @@ A task's state change is `task.` and the new state.
 | `task.blocked` | its agent waits on a person | `question`, when it ended its turn on one |
 | `task.paused` | a critical task took its slot; it resumes later | |
 | `task.limited` | its agent stopped on a usage limit | as `agent.exhausted` |
+| `task.rate_limited` | its agent stopped on a 429 or 529 past its own retries; pastor retries it in the pane | `line`, `attempt` (from 1), `retry_at` |
 | `task.waiting` | it waits for that limit to reset, its pane closed and its worktree kept | `why` (`no_fallback`), `account`, `model`, `until`, `shown` (`waiting 03:00`) |
 | `task.done` | it finished | |
 | `task.failed` | it failed | |
 | `task.stale` | its timeout passed, or its pull machine was lost | |
 | `task.closed` | its pane was closed | |
-| `task.input` | someone ran `pastor task send`, or pastor answered Claude's limit picker with "Stop and wait" | `keys`, `text_len`, `trust` with `--trust`, `limit_picker` from the picker; never the text |
+| `task.input` | someone ran `pastor task send`, or pastor answered Claude's limit picker with "Stop and wait" | `keys`, `text_len`, `trust` with `--trust`, `limit_picker` from the picker, `rate_retry` from a short-limit retry; never the text |
 | `task.trusted` | the head answered a folder-trust prompt from saved trust | `keys` |
 | `job.failed` | a job run failed | |
 | `connector.finish_failed` | a connector's finish command failed | `connector`, `reason` |

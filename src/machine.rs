@@ -896,6 +896,7 @@ pub fn spawn_machine(
         unseen_prompt: HashMap::new(),
         idle_agents: HashSet::new(),
         picker_read: HashSet::new(),
+        rate_retries: HashMap::new(),
         was_connected: false,
         failures: 0,
         lost_announced: false,
@@ -1002,6 +1003,10 @@ struct Actor {
     /// agent was last seen `blocked` (`answer_limit_picker`): once a
     /// blocked spell. Cleared when the agent is seen out of `blocked`.
     picker_read: HashSet<i64>,
+    /// task id -> its short limits in a row (`RateRetry`): a 429 or 529
+    /// past the agent's own retries, retried in its pane. Kept in memory
+    /// only: after a restart the count starts over.
+    rate_retries: HashMap<i64, RateRetry>,
     /// Has the actor connected successfully at least once (ever)?
     was_connected: bool,
     /// Consecutive connect-attempt failures since the last success. Only decides
@@ -1180,6 +1185,14 @@ const IDLE_TAIL_LINES: usize = 5;
 /// ends on the idle, as before.
 fn not_ended(task: &Task) -> bool {
     !task.ended && task.spec.summary != crate::task::SummaryMode::Off
+}
+
+/// A task's short limits in a row (`Actor::rate_retries`).
+struct RateRetry {
+    /// The retries scheduled so far, the one due included.
+    attempts: u32,
+    /// When `RATE_RETRY_PROMPT` goes into its pane; `None` once sent.
+    due: Option<Instant>,
 }
 
 /// Who asked for a close. `pastor task close` refuses what herdr refuses;
@@ -1393,6 +1406,10 @@ impl Actor {
                         if let Err(err) = self.deliver_held_prompts().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "held prompt delivery failed"); break; }
                             tracing::warn!(machine = %self.name, %err, "held prompt delivery failed; staying connected");
+                        }
+                        if let Err(err) = self.send_rate_retries().await {
+                            if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "short limit retry failed"); break; }
+                            tracing::warn!(machine = %self.name, %err, "short limit retry failed; staying connected");
                         }
                         if let Err(err) = self.confirm_pending_done().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "settle check failed"); break; }
@@ -1785,6 +1802,12 @@ impl Actor {
                             if is_outage(&err) {
                                 return PollExit::Reconnect(format!("poll reconcile failed: {err}"));
                             }
+                        }
+                    }
+                    if let Err(err) = self.send_rate_retries().await {
+                        tracing::warn!(machine = %self.name, %err, "short limit retry failed");
+                        if is_outage(&err) {
+                            return PollExit::Reconnect(format!("short limit retry failed: {err}"));
                         }
                     }
                     if let Err(err) = self.confirm_pending_done().await {
@@ -3695,7 +3718,10 @@ impl Actor {
                 continue;
             }
             let observed = observed_from(agent);
-            let end = if next_state(&task, &observed) == Some(TaskState::Done) {
+            // Only a turn whose end was read says anything about the short
+            // limits in a row: the others are not an end at all.
+            let read = next_state(&task, &observed) == Some(TaskState::Done);
+            let end = if read {
                 match self.pane_end(&task).await {
                     Ok(end) => end,
                     Err(err) => {
@@ -3709,8 +3735,18 @@ impl Actor {
             } else {
                 PaneEnd::Finished
             };
+            let short = matches!(&end, PaneEnd::Limit(l) if !l.hard);
+            if read && !short && !matches!(end, PaneEnd::ShellRunning) {
+                // A turn that ends on anything else than a short limit (one
+                // waiting on a shell has not ended): the count starts over.
+                self.rate_retries.remove(&id);
+            }
             match end {
+                PaneEnd::Limit(limit) if !limit.hard && self.retries_left(id) => {
+                    self.retry_later(task, &observed, &limit)?;
+                }
                 PaneEnd::Limit(limit) => {
+                    self.rate_retries.remove(&id);
                     if let Err(err) = self.wait_on_limit(task, &limit, false).await {
                         // The pane could not be closed: look again next window.
                         self.pending_done.insert(id, (seen_seq, Instant::now()));
@@ -3741,6 +3777,121 @@ impl Actor {
                 }
                 PaneEnd::Finished => self.apply(task, &observed),
             }
+        }
+        Ok(())
+    }
+
+    /// Whether task `id`, whose agent stopped on a short limit, is retried
+    /// in its pane again: fewer than `[limits] rate_retries` so far.
+    fn retries_left(&self, id: i64) -> bool {
+        let Some(limits) = &self.settings.limits else {
+            return false;
+        };
+        let done = self.rate_retries.get(&id).map_or(0, |r| r.attempts);
+        done < limits.rate_retries
+    }
+
+    /// `task`'s agent stopped on `limit`, a 429 or 529 past its own
+    /// retries: it keeps its pane, its slot and its state, and
+    /// `RATE_RETRY_PROMPT` goes into its pane after the next wait of
+    /// `[limits] rate_backoff`, or the wait the message names when that is
+    /// longer (`send_rate_retries`). The baseline moves to the idle it was
+    /// found at, as for a question (`block_on_question`), so that idle is
+    /// not read as done meanwhile. Emits `task.rate_limited`.
+    fn retry_later(
+        &mut self,
+        mut task: Task,
+        observed: &Observed,
+        limit: &crate::limit::Limit,
+    ) -> anyhow::Result<()> {
+        let limits = self.settings.limits.clone().unwrap_or_default();
+        let attempt = self.rate_retries.get(&task.id).map_or(0, |r| r.attempts) + 1;
+        let now = Utc::now();
+        let mut wait = limits.rate_backoff_for(attempt);
+        if let Some(named) = limit.until.and_then(|u| (u - now).to_std().ok()) {
+            wait = wait.max(named);
+        }
+        let retry_at = now
+            .checked_add_signed(chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::MAX))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        if let Observed::Status {
+            state_change_seq,
+            completion_seq,
+            ..
+        } = observed
+        {
+            task.last_completion_seq = completion_seq.or(*state_change_seq);
+        }
+        task.activity_seen = false;
+        self.store.update_task(&mut task)?;
+        self.rate_retries.insert(
+            task.id,
+            RateRetry {
+                attempts: attempt,
+                due: Some(Instant::now() + wait),
+            },
+        );
+        tracing::warn!(machine = %self.name, task = %task.display_id(), attempt, %retry_at, line = %limit.line, "short usage limit; retrying in the pane");
+        self.emit_with(
+            "task.rate_limited",
+            Some(task.id),
+            Some(serde_json::json!({
+                "line": limit.line,
+                "attempt": attempt,
+                "retry_at": retry_at,
+            })),
+        );
+        Ok(())
+    }
+
+    /// Send `RATE_RETRY_PROMPT`, then Enter, into the pane of each task
+    /// whose short-limit wait has passed (`retry_later`), as `task send`
+    /// would, with `task.input`. A task that is no longer running with a
+    /// pane is not sent anything. A send that fails is tried again on the
+    /// next tick.
+    async fn send_rate_retries(&mut self) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let due: Vec<i64> = self
+            .rate_retries
+            .iter()
+            .filter(|(_, r)| r.due.is_some_and(|d| d <= now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in due {
+            let task = match self.store.get_task(id) {
+                Ok(Some(t)) if t.state == TaskState::Running => t,
+                Ok(_) => {
+                    self.rate_retries.remove(&id);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let Some(pane) = task.pane_id.clone() else {
+                self.rate_retries.remove(&id);
+                continue;
+            };
+            let text = crate::task::RATE_RETRY_PROMPT;
+            let keys = ["Enter".to_string()];
+            let timeout = self.settings.request_timeout;
+            tokio::time::timeout(timeout, async {
+                self.connector.pane_send_text(&pane, text).await?;
+                self.connector.pane_send_keys(&pane, &keys).await
+            })
+            .await
+            .map_err(|_| TimedOut("pane input", timeout))??;
+            if let Some(r) = self.rate_retries.get_mut(&id) {
+                r.due = None;
+            }
+            tracing::info!(machine = %self.name, task = %task.display_id(), "sent the retry prompt after a short usage limit");
+            self.emit_with(
+                "task.input",
+                Some(id),
+                Some(serde_json::json!({
+                    "text_len": text.chars().count(),
+                    "keys": keys,
+                    "rate_retry": true,
+                })),
+            );
         }
         Ok(())
     }
@@ -5287,6 +5438,186 @@ mod tests {
         );
         let prompt = calls(&fake, "agent.prompt").pop().unwrap();
         assert_eq!(prompt["text"], crate::task::LIMIT_RESUME_PROMPT);
+    }
+
+    /// `limits_kept` with short limits retried after 1s, 2s, then 3s.
+    fn short_limits(rate_retries: u32) -> MachineSettings {
+        MachineSettings {
+            limits: Some(crate::config::LimitsConfig {
+                rate_retries,
+                rate_backoff: vec!["1s".into(), "2s".into(), "3s".into()],
+                ..Default::default()
+            }),
+            ..settings_with_settle(Duration::from_millis(100))
+        }
+    }
+
+    /// The end of a pane whose agent stopped on a 529 past its own retries.
+    const OVERLOADED: &str = "❯ fix it\n\n● Half of it is done.\n\n● API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n────────\n❯ \n────────\n";
+
+    /// The agent works again, then stops on `screen`.
+    async fn turn_ends_on(fake: &FakeHerdr, pane: &str, screen: &str) {
+        fake.set_status(pane, AgentStatus::Working);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fake.set_pane_text(pane, screen);
+        fake.set_status(pane, AgentStatus::Idle);
+    }
+
+    /// The next `task.rate_limited` about task `id`.
+    async fn next_rate_limited(
+        events: &mut broadcast::Receiver<PastorEvent>,
+        id: i64,
+    ) -> serde_json::Value {
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("a task.rate_limited")
+                .unwrap();
+            if ev.kind == "task.rate_limited" && ev.task_id == Some(id) {
+                return ev.detail.unwrap();
+            }
+        }
+    }
+
+    /// What pastor typed into `pane`: the retry prompt, then Enter.
+    fn retries_sent(fake: &FakeHerdr, pane: &str) -> usize {
+        fake.pane_input(pane)
+            .iter()
+            .filter(|i| {
+                matches!(i, crate::herdr::fake::PaneInput::Text(t) if t == crate::task::RATE_RETRY_PROMPT)
+            })
+            .count()
+    }
+
+    /// A 529 past Claude's own retries: the task keeps its pane, its slot
+    /// and its state, and after each wait of `rate_backoff` gets
+    /// `RATE_RETRY_PROMPT` in its pane, with `task.rate_limited` (`line`,
+    /// `attempt`, `retry_at`) before each. After `rate_retries` of them it
+    /// is handled as a hard limit with no reset: it waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_short_limit_is_retried_in_the_pane_then_handled_as_a_limit() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, short_limits(3));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        for (attempt, wait) in [(1, 1), (2, 2), (3, 3)] {
+            turn_ends_on(&fake, &pane, OVERLOADED).await;
+            let before = Utc::now();
+            let detail = next_rate_limited(&mut events, t.id).await;
+            assert_eq!(detail["attempt"], attempt, "{detail}");
+            assert!(
+                detail["line"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("API Error: 529"),
+                "{detail}"
+            );
+            let retry_at: chrono::DateTime<Utc> =
+                serde_json::from_value(detail["retry_at"].clone()).unwrap();
+            let secs = (retry_at - before).num_milliseconds();
+            assert!(
+                (wait * 1000 - 500..=wait * 1000 + 500).contains(&secs),
+                "{secs}ms"
+            );
+            let row = store.get_task(t.id).unwrap().unwrap();
+            assert_eq!(row.state, TaskState::Running, "no state change");
+            assert_eq!(row.pane_id.as_deref(), Some(pane.as_str()));
+            assert_eq!(
+                retries_sent(&fake, &pane),
+                attempt as usize - 1,
+                "not before the wait"
+            );
+            tokio::time::sleep(Duration::from_millis(wait as u64 * 1000 + 300)).await;
+            assert_eq!(
+                retries_sent(&fake, &pane),
+                attempt as usize,
+                "after the wait"
+            );
+            assert_eq!(state_of(&store, t.id), TaskState::Running);
+        }
+        turn_ends_on(&fake, &pane, OVERLOADED).await;
+        wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+        let limits = store.limits().unwrap();
+        assert_eq!(limits.len(), 1, "{limits:?}");
+        assert!(!limits[0].hard);
+        assert_eq!(limits[0].until, None);
+        assert_eq!(retries_sent(&fake, &pane), 3);
+    }
+
+    /// A message that names a wait (`try again in 20s`) is waited at least
+    /// that long, past a shorter `rate_backoff`.
+    #[tokio::test(start_paused = true)]
+    async fn a_short_limit_waits_at_least_the_time_it_names() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, short_limits(3));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        turn_ends_on(
+            &fake,
+            &pane,
+            "❯ fix it\n\n● API Error: 429 rate_limit_error, try again in 20s\n\n────────\n❯ \n────────\n",
+        )
+        .await;
+        let before = Utc::now();
+        let detail = next_rate_limited(&mut events, t.id).await;
+        let retry_at: chrono::DateTime<Utc> =
+            serde_json::from_value(detail["retry_at"].clone()).unwrap();
+        assert!((retry_at - before).num_seconds() >= 19, "{detail}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(retries_sent(&fake, &pane), 0, "the message's 20s, not 1s");
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        assert_eq!(retries_sent(&fake, &pane), 1);
+    }
+
+    /// A retry that works (the turn ends on anything but a short limit)
+    /// starts the count over: with one retry allowed, the next 529 of a
+    /// task sent more work is retried again, not a limit.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_that_works_starts_the_count_over() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, short_limits(1));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        turn_ends_on(&fake, &pane, OVERLOADED).await;
+        assert_eq!(next_rate_limited(&mut events, t.id).await["attempt"], 1);
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(retries_sent(&fake, &pane), 1);
+        turn_ends_on(
+            &fake,
+            &pane,
+            "❯ fix it\n\n● All done.\n\n────────\n❯ \n────────\n",
+        )
+        .await;
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        h.send(
+            t.id,
+            SendInput {
+                text: Some("one more thing".into()),
+                enter: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        turn_ends_on(&fake, &pane, OVERLOADED).await;
+        assert_eq!(next_rate_limited(&mut events, t.id).await["attempt"], 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert!(store.limits().unwrap().is_empty());
     }
 
     /// A screen of `tests/fixtures/pickers/`, without its header.

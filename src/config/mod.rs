@@ -1641,11 +1641,12 @@ pub struct LimitsConfig {
     /// further off goes on under its next model. `0s` never waits.
     pub wait_under: String,
     /// How many times a task stopped on a 429 or 529 is sent on again
-    /// before it counts as limited.
+    /// in its pane before it counts as limited.
     pub rate_retries: u32,
-    /// How long to wait before the first of those tries; each next one
-    /// waits twice as long.
-    pub rate_backoff: String,
+    /// How long to wait before each of those tries, the first wait first;
+    /// the last one repeats. One wait alone (`"1m"`) is a list of one.
+    #[serde(deserialize_with = "one_or_many")]
+    pub rate_backoff: Vec<String>,
     /// How long a limit whose message names no reset holds.
     pub unknown_reset_wait: String,
     /// How long a limit for no credit holds before the account is tried
@@ -1661,7 +1662,7 @@ impl Default for LimitsConfig {
         LimitsConfig {
             wait_under: "1h".into(),
             rate_retries: 3,
-            rate_backoff: "1m".into(),
+            rate_backoff: vec!["1m".into(), "5m".into(), "15m".into()],
             unknown_reset_wait: "1h".into(),
             retry_after_no_credit: "6h".into(),
             handover_lines: 100,
@@ -1676,8 +1677,14 @@ impl LimitsConfig {
     pub fn wait_under_duration(&self) -> Duration {
         duration_or_default(&self.wait_under, &LimitsConfig::default().wait_under)
     }
-    pub fn rate_backoff_duration(&self) -> Duration {
-        duration_or_default(&self.rate_backoff, &LimitsConfig::default().rate_backoff)
+    /// The wait before retry `attempt` (from 1) of a short limit: that
+    /// entry of `rate_backoff`, else its last.
+    pub fn rate_backoff_for(&self, attempt: u32) -> Duration {
+        let at = (attempt.max(1) - 1) as usize;
+        match self.rate_backoff.get(at).or(self.rate_backoff.last()) {
+            Some(wait) => duration_or_default(wait, "1m"),
+            None => Duration::from_secs(60),
+        }
     }
     pub fn unknown_reset_wait_duration(&self) -> Duration {
         duration_or_default(
@@ -1850,7 +1857,6 @@ impl PastorConfig {
             ("close_failed_after", &cfg.close_failed_after, false),
             ("pull_lost_after", &cfg.pull_lost_after, false),
             ("limits.wait_under", &cfg.limits.wait_under, true),
-            ("limits.rate_backoff", &cfg.limits.rate_backoff, true),
             (
                 "limits.unknown_reset_wait",
                 &cfg.limits.unknown_reset_wait,
@@ -1870,6 +1876,16 @@ impl PastorConfig {
             if !zero_ok && d.is_zero() {
                 anyhow::bail!("{}: {name}: must not be zero", path.display());
             }
+        }
+        if cfg.limits.rate_backoff.is_empty() {
+            anyhow::bail!(
+                "{}: limits.rate_backoff: name at least one wait",
+                path.display()
+            );
+        }
+        for v in &cfg.limits.rate_backoff {
+            parse_duration(v)
+                .map_err(|e| anyhow::anyhow!("{}: limits.rate_backoff: {e}", path.display()))?;
         }
         if let Some(v) = &cfg.defaults.age_after {
             check_age_after(v)
@@ -2063,6 +2079,20 @@ pub fn check_age_after(v: &str) -> Result<(), String> {
 }
 
 /// Parse `value`, falling back to `default` (assumed valid) if `value` is bad.
+/// A list of strings, or one string alone as a list of one.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
 fn duration_or_default(value: &str, default: &str) -> Duration {
     parse_duration(value)
         .or_else(|_| parse_duration(default))
@@ -2114,7 +2144,9 @@ mod tests {
         let l = &cfg.limits;
         assert_eq!(l.wait_under_duration(), Duration::from_secs(1800));
         assert_eq!(l.rate_retries, 5);
-        assert_eq!(l.rate_backoff_duration(), Duration::from_secs(10));
+        // One wait alone is a list of one, which repeats.
+        assert_eq!(l.rate_backoff_for(1), Duration::from_secs(10));
+        assert_eq!(l.rate_backoff_for(4), Duration::from_secs(10));
         assert_eq!(l.unknown_reset_wait_duration(), Duration::from_secs(7200));
         assert_eq!(
             l.retry_after_no_credit_duration(),
@@ -2138,11 +2170,32 @@ mod tests {
             ),
             ("wait_under = \"5\"", "limits.wait_under"),
             ("rate_backoff = \"1y\"", "limits.rate_backoff"),
+            ("rate_backoff = [\"1m\", \"soon\"]", "limits.rate_backoff"),
+            ("rate_backoff = []", "limits.rate_backoff"),
             ("handover = 3", "handover"),
         ] {
             let err = PastorConfig::parse(path, &format!("[limits]\n{bad}\n")).unwrap_err();
             assert!(err.to_string().contains(key), "{bad}: {err}");
         }
+    }
+
+    /// `rate_backoff` is a list of waits, one per retry of a short limit,
+    /// the last one repeating: `1m, 5m, 15m` unless set.
+    #[test]
+    fn rate_backoff_is_a_list_whose_last_wait_repeats() {
+        let path = Path::new("pastor.toml");
+        let d = PastorConfig::default().limits;
+        let mins = |m: u64| Duration::from_secs(60 * m);
+        assert_eq!(d.rate_backoff_for(1), mins(1));
+        assert_eq!(d.rate_backoff_for(2), mins(5));
+        assert_eq!(d.rate_backoff_for(3), mins(15));
+        assert_eq!(d.rate_backoff_for(9), mins(15));
+        let l = PastorConfig::parse(path, "[limits]\nrate_backoff = [\"30s\", \"2m\"]\n")
+            .unwrap()
+            .limits;
+        assert_eq!(l.rate_backoff_for(1), Duration::from_secs(30));
+        assert_eq!(l.rate_backoff_for(2), mins(2));
+        assert_eq!(l.rate_backoff_for(3), mins(2));
     }
 
     /// An agent's `account` names who shares its limits: every machine

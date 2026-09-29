@@ -872,6 +872,11 @@ pub const RESUME_PROMPT: &str = "pastor paused this session for a critical task 
 /// stopped on a usage limit, which has reset.
 pub const LIMIT_RESUME_PROMPT: &str = "pastor stopped this session on a usage limit, which has now reset, and has resumed it; carry on where you left off.";
 
+/// What the agent of a task that stopped on a 429 or 529, past its own
+/// retries, is told in its pane once pastor's backoff has passed
+/// (`[limits] rate_backoff`).
+pub const RATE_RETRY_PROMPT: &str = "pastor: the API was busy; carry on where you left off.";
+
 /// The paragraph after the prompt of a waiting task that starts again with
 /// no session to resume: it stopped on a usage limit before, and may have
 /// left work behind.
