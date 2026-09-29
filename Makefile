@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh portability leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -43,6 +43,29 @@ test-machine: ## the machine actor tests five times, to catch timing flakes
 # see tests/real_ssh.rs. Needs OpenSSH's server (sshd) and ssh-keygen.
 test-ssh: ## the CLI against a head over a real ssh, through a throwaway sshd
 	cargo test --test real_ssh -- --ignored
+
+# The release builds are static musl binaries and FreeBSD builds from source,
+# so code that only compiles against glibc on x86_64 has to fail before the
+# tag. A `cargo check` per target finds it at compile time. This is the one
+# list of targets to check; ci.yml's toolchain step installs the same ones.
+# Not part of `make check`: it would add three cross checks to every local
+# run. Needs cargo-zigbuild, zig (libsqlite3-sys wants a C compiler that
+# knows the target) and the Rust targets; it says which are missing and
+# installs nothing. CARGO_ZIGBUILD_ZIG_PATH is where cargo-zigbuild looks for
+# zig before the PATH.
+PORTABILITY_TARGETS := x86_64-unknown-linux-musl armv7-unknown-linux-musleabihf x86_64-unknown-freebsd
+portability: ## cargo check for the musl and FreeBSD targets, as CI does
+	@missing=; \
+	command -v cargo-zigbuild >/dev/null 2>&1 || missing="$$missing, cargo-zigbuild (cargo install --locked cargo-zigbuild)"; \
+	[ -n "$$CARGO_ZIGBUILD_ZIG_PATH" ] || command -v zig >/dev/null 2>&1 || missing="$$missing, zig (the version in .github/actions/zig/action.yml, from ziglang.org/download)"; \
+	for target in $(PORTABILITY_TARGETS); do \
+	  [ -d "$$(rustc --print target-libdir --target $$target 2>/dev/null)" ] || missing="$$missing, the Rust target $$target (rustup target add $$target)"; \
+	done; \
+	if [ -n "$$missing" ]; then echo "make portability: missing $${missing#, }" >&2; exit 1; fi
+	@for target in $(PORTABILITY_TARGETS); do \
+	  echo "cargo-zigbuild check --locked --all-targets --target $$target"; \
+	  cargo-zigbuild check --locked --all-targets --target $$target || exit 1; \
+	done
 
 # The repository is public; CI runs this same scan. The rules are gitleaks'
 # own defaults at the pinned version, fetched outside the checkout; the scan
