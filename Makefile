@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh leaks smoke smoke-profiles smoke-rc install install-completions completions demo site site-serve links clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh leaks smoke smoke-profiles smoke-rc install install-completions completions cli-reference demo site site-serve links clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -131,6 +131,11 @@ completions: ## regenerate contrib/completions/pastor.{bash,fish} from the CLI
 	mkdir -p contrib/completions
 	target/debug/pastor completions bash > contrib/completions/pastor.bash
 	target/debug/pastor completions fish > contrib/completions/pastor.fish
+
+# Rendered from the clap definitions like the completions; the page's prose
+# above the generated marker is kept. `make check` fails when it is stale.
+cli-reference: ## regenerate the website's CLI reference page from the CLI
+	PASTOR_WRITE_CLI_REFERENCE=1 cargo test -q --bin pastor website_cli_reference_is_current
 
 # The website is a Hugo site in docs/website; the docs page is docs/manual.md
 # itself, mounted, so it cannot drift from the manual. Needs hugo from mise.
