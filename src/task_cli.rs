@@ -2,14 +2,12 @@
 //! holds one `TaskCmd` variant per command and calls these.
 use clap::{ArgGroup, Args};
 
-use crate::cli::{CliError, TASK_HEADER, request_failure, table, task_rows};
+use crate::cli::{CliError, ask, print_task, unexpected};
 use crate::config::{Paths, parse_duration};
-use crate::ipc::{
-    Head, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, request_head,
-};
+use crate::ipc::{Head, IpcRequest, IpcResponse};
 use crate::machine::SendInput;
 use crate::store::{PruneOutcome, Store};
-use crate::task::{Priority, Task, TaskState, UNKNOWN_PRIORITY, parse_task_id};
+use crate::task::{Priority, TaskState, UNKNOWN_PRIORITY, parse_task_id};
 
 #[derive(Args, Debug)]
 pub struct RetryArgs {
@@ -168,48 +166,6 @@ pub fn parse_priority(s: &str) -> anyhow::Result<Priority> {
 
 fn task_id(s: &str) -> anyhow::Result<i64> {
     parse_task_id(s).ok_or_else(|| CliError::err("usage_error", crate::task::bad_task_id(s)))
-}
-
-/// A request that got no reply, classified as `request_failure` does for
-/// the rest of the CLI. These commands answer `daemon_not_running` where
-/// that says `runtime_error`, and only for a refused or missing socket: a
-/// timed-out retry may still land, and a connect denied for permissions may
-/// hide a live head.
-pub(crate) fn request_error(err: &RequestError) -> anyhow::Error {
-    let (code, message) = request_failure(err);
-    let code = match err {
-        RequestError::Connect(e) if connect_error_means_no_daemon(e) => "daemon_not_running".into(),
-        _ => code,
-    };
-    CliError::err(&code, message)
-}
-
-/// One request to the daemon. Retry and close need it: one dispatches, the
-/// other talks to herdr on the task's machine.
-async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    let resp = request_head(paths, &req)
-        .await
-        .map_err(|e| request_error(&e))?;
-    match resp {
-        IpcResponse::Error { code, message } => Err(CliError::err(&code, message)),
-        other => Ok(other),
-    }
-}
-
-fn print_task(t: &Task, json: bool) -> anyhow::Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&t.to_json())?);
-    } else {
-        println!(
-            "{}",
-            table(&TASK_HEADER, &task_rows(std::slice::from_ref(t)))
-        );
-    }
-    Ok(())
-}
-
-fn unexpected(resp: IpcResponse) -> anyhow::Error {
-    CliError::err("internal", format!("unexpected daemon reply: {resp:?}"))
 }
 
 /// `pastor task retry t-N`: a new task copying t-N, dispatched now.
@@ -376,6 +332,7 @@ fn prune_summary(a: &PruneArgs, out: &PruneOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::RequestError;
     use clap::Parser;
 
     #[derive(Parser, Debug)]
@@ -412,9 +369,8 @@ mod tests {
     #[test]
     fn request_failures_keep_their_own_codes() {
         let code_and_message = |err: RequestError| {
-            let err = request_error(&err);
-            let e = err.downcast_ref::<CliError>().unwrap();
-            (e.code.clone(), e.message.clone())
+            let e = crate::cli::request_error(&err);
+            (e.code, e.message)
         };
         let (code, message) =
             code_and_message(RequestError::Timeout(std::time::Duration::from_secs(120)));

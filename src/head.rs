@@ -10,7 +10,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-use crate::cli::{CliError, request_failure};
+use crate::cli::{CliError, request_error};
 use crate::config::Paths;
 use crate::ipc::{IpcRequest, IpcResponse, RequestError};
 
@@ -278,8 +278,7 @@ impl RemoteHead {
 
 /// What a failed request to a remote head tells the user.
 pub fn failure(err: &RequestError) -> anyhow::Error {
-    let (code, message) = request_failure(err);
-    CliError::err(&code, message)
+    request_error(err).into()
 }
 
 #[derive(Subcommand, Debug)]

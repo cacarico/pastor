@@ -6742,3 +6742,35 @@ fn a_share_and_a_max_refuse_a_head_from_before_them() {
     text_head(&socket, pastor::ipc::FLOCK_SHARE_PROTOCOL);
     assert_eq!(ok(run(&["flock", "add", "spare"])), "said by the head\n");
 }
+
+/// A head of another version may answer a request with a variant this CLI
+/// does not expect. The command stops with the usual JSON error on stderr,
+/// code `internal`, and exit 1, never a Rust panic (exit 101).
+#[test]
+fn an_unexpected_head_reply_is_a_json_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let _reqs = text_head(&state.join("pastor.sock"), pastor::ipc::IPC_PROTOCOL);
+    for args in [
+        &["job", "list"][..],
+        &["task", "list"],
+        &["task", "describe", "t-1"],
+        &["task", "retry", "t-1"],
+        &["queue"],
+    ] {
+        let out = pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        let err: serde_json::Value = serde_json::from_str(stderr.trim())
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {stderr}"));
+        assert_eq!(err["code"], "internal", "{args:?}: {err}");
+    }
+}
