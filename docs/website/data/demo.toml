@@ -1,0 +1,131 @@
+# The homepage's live terminal: two acts that static/term.js types out, and
+# that read as a plain transcript without it. The output copies pastor's own
+# tables with placeholder names. Every `cmd` must be a real pastor command:
+# website_demo_commands_are_real checks them as the docs' commands are.
+
+[[act]]
+name = "by hand"
+label = "by hand"
+kind = "shell"
+
+[[act.step]]
+cmd = "pastor flock list"
+
+[[act.step]]
+out = '''
+NAME     DEFAULT  MACHINES                AGENTS  QUEUED
+default  yes      desk 1/2, server-1 2/3  3       0
+sandbox  no       sandbox-1 0/1           0       0'''
+
+[[act.step]]
+cmd = '''
+pastor task run "Fix the flaky login test" --repo '~/src/app' --worktree --profile develop'''
+
+[[act.step]]
+out = '''
+ID    STATE   PRIORITY  MACHINE  FLOCK    AGENT   MODEL   JOB  AGE  NOTE
+t-12  queued  normal    -        default  claude  sonnet  run  0s   Fix the flaky login test'''
+
+[[act.step]]
+cmd = '''
+pastor task run "Triage the new issues" --repo '~/src/tracker' --flock sandbox --priority high'''
+
+[[act.step]]
+out = '''
+ID    STATE   PRIORITY  MACHINE  FLOCK    AGENT           MODEL  JOB  AGE  NOTE
+t-13  queued  high      -        sandbox  claude-sandbox  -      run  0s   Triage the new issues'''
+
+[[act.step]]
+cmd = "pastor job run morning"
+
+[[act.step]]
+out = "started job morning"
+
+[[act.step]]
+cmd = "pastor queue"
+
+[[act.step]]
+out = '''
+POS  TASK  LEVEL   WHERE          FROM         WAITED  WHY NOT YET
+1    t-15  normal  flock default  job morning  6s      flock default is full
+2    t-16  normal  flock default  job morning  6s      flock default is full'''
+
+[[act.step]]
+cmd = "pastor task list"
+
+[[act.step]]
+out = '''
+ID    STATE    PRIORITY  MACHINE    FLOCK    AGENT           MODEL   JOB      AGE  NOTE
+t-12  running  normal    server-1   default  claude          sonnet  run      1m   Fix the flaky login test
+t-13  blocked  high      sandbox-1  sandbox  claude-sandbox  -       run      1m   agent asked: 2 issues look like spam, skip them?
+t-14  running  normal    desk       default  claude          -       morning  40s  Update the dependencies
+t-15  queued   normal    -          default  claude          -       morning  40s  Run the test suite
+t-16  queued   normal    -          default  claude          -       morning  40s  Sort the inbox notes'''
+
+[[act]]
+name = "an agent drives pastor"
+label = "Running commands by hand is cool, but pastor is even more powerful in the hands of agents."
+kind = "agent"
+
+[[act.step]]
+ask = "keep the PRs on app moving, and tell me if anything is stuck"
+
+[[act.step]]
+say = "I'll start with anything that is waiting on an answer."
+
+[[act.step]]
+cmd = "pastor task list --blocked --json | jq -c '.[] | {id, state, error}'"
+
+[[act.step]]
+out = '''
+{"id":13,"state":"blocked","error":"agent asked: 2 issues look like spam, skip them?"}'''
+
+[[act.step]]
+cmd = "pastor task read t-13 --lines 3"
+
+[[act.step]]
+out = '''
+Read 6 new issues: 4 bugs with steps to reproduce, summarised above.
+2 look like spam (a link and no details). Skip them?'''
+
+[[act.step]]
+say = "t-13 is triaging issues in the sandbox. Skipping spam is safe, so I'll answer it."
+
+[[act.step]]
+cmd = '''
+pastor task send t-13 "yes, skip them"'''
+
+[[act.step]]
+out = "sent text and 1 key to t-13"
+
+[[act.step]]
+say = "Next, the open review on #42, in a worktree of its own."
+
+[[act.step]]
+cmd = '''
+pastor task run "Address the review on #42" --repo '~/src/app' --worktree'''
+
+[[act.step]]
+out = '''
+ID    STATE   PRIORITY  MACHINE  FLOCK    AGENT   MODEL   JOB  AGE  NOTE
+t-17  queued  normal    -        default  claude  sonnet  run  0s   Address the review on #42'''
+
+[[act.step]]
+say = "CI is red on main. That should not wait behind the rest."
+
+[[act.step]]
+cmd = '''
+pastor task run "CI is red on main: find out why" --repo '~/src/app' --priority critical --preempt'''
+
+[[act.step]]
+out = '''
+ID    STATE   PRIORITY  MACHINE  FLOCK    AGENT   MODEL  JOB  AGE  NOTE
+t-18  queued  critical  -        default  claude  -      run  0s   CI is red on main: find out why'''
+
+[[act.step]]
+report = '''
+Where things stand:
+- t-13 asked about two spam issues; I told it to skip them.
+- The review on #42 is being addressed in t-17.
+- t-18 is looking at the red CI; it jumped the queue and paused a low task.
+Nothing needs you yet.'''

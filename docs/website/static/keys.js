@@ -4,6 +4,30 @@
 //   h l        scroll left, right      gg G  top, bottom
 // Every target is a plain link too, so the site works without this file.
 
+// The docs nav: a section you open, or read a page of, stays open on the
+// next page until you close it. Storage can be missing or refuse (a private
+// window); then only the current section opens, as without this file.
+const OPEN_KEY = 'pastor-docs-open';
+let openSections = [];
+try { openSections = JSON.parse(localStorage.getItem(OPEN_KEY)) || []; } catch { /* none kept */ }
+const keepOpen = () => {
+  try { localStorage.setItem(OPEN_KEY, JSON.stringify(openSections)); } catch { /* not kept */ }
+};
+for (const sec of document.querySelectorAll('.list details[data-section]')) {
+  // The section being read counts as opened: it stays open once you leave.
+  if (sec.hasAttribute('data-here') && !openSections.includes(sec.dataset.section)) {
+    openSections.push(sec.dataset.section);
+    keepOpen();
+  }
+  if (openSections.includes(sec.dataset.section)) sec.open = true;
+  sec.addEventListener('toggle', () => {
+    const name = sec.dataset.section;
+    openSections = openSections.filter((n) => n !== name);
+    if (sec.open) openSections.push(name);
+    keepOpen();
+  });
+}
+
 const STEP = 60;  // pixels per j/k/h/l, Vimium's default
 const dialog = document.getElementById('confirm');
 let pending = null;

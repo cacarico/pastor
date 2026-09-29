@@ -584,7 +584,14 @@ max_agents = 3
 name = "pi-3"
 ssh = "user@pi-3"
 flock = "work"            # the old way: in work, with pi-3's own limits
+
+[[machine]]
+name = "laptop"
+pull = true               # never connected to: its headless serve claims tasks
 ```
+
+Each machine sets exactly one of `local`, `ssh`, `command` and `pull` (see
+[Pull machines](#pull-machines)).
 
 A flock's `machines` names the machines it may use, each with its number
 there: at most how many of the flock's live tasks that machine runs. Dispatch
@@ -600,6 +607,7 @@ A plain number is a hard ceiling. A flock can instead have a share and a max
 on a machine, so a busy project uses slots the quiet ones leave idle:
 
 ```toml
+# fragment of flock.toml
 [[flock]]
 name = "code"
 machines = { desk = { share = 2, max = 4 } }
@@ -771,6 +779,7 @@ timeout = "1h"
 
 [[flock]]
 name = "life"
+default = true
 machines = { desk = 1 }
 model = "haiku"
 place = "pastor"
@@ -880,7 +889,7 @@ deny = ["WebFetch", "Bash(rm:*)"]
 ```
 
 ```toml
-# flock.toml
+# fragment of flock.toml
 [[flock]]
 name = "work"
 allow = ["Bash(make:*)"]
@@ -888,7 +897,7 @@ deny = ["Bash(git push:*)"]
 ```
 
 ```toml
-# a job file
+# fragment of a job file
 [dispatch]
 allow = ["Bash(gh pr view:*)"]
 prompt = "..."
@@ -953,7 +962,7 @@ env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
 ```
 
 ```toml
-# flock.toml: every task of the personal flock runs it
+# fragment of flock.toml: every task of the personal flock runs it
 [[flock]]
 name = "personal"
 agent = "claude-personal"
@@ -1012,7 +1021,7 @@ model = "opus"
 ```
 
 ```toml
-# flock.toml: the personal flock runs sonnet unless a task says otherwise
+# fragment of flock.toml: the personal flock runs sonnet unless a task says otherwise
 [[flock]]
 name = "personal"
 agent = "claude-personal"
@@ -1124,8 +1133,10 @@ unpinned task never takes a machine's, since no machine is picked yet),
 # pastor.toml
 [defaults]
 priority = "low"            # tasks that set none
+```
 
-# flock.toml
+```toml
+# fragment of flock.toml
 [[flock]]
 name = "work"
 machines = { pi-3 = 2 }
@@ -1150,8 +1161,8 @@ flock.toml or the job file.
 
 `pastor task priority t-4 critical` puts a queued task at another level; it
 keeps its position, so among the tasks of its new level it goes by when it
-was queued. A task a machine has taken has left the queue, and is refused
-with `not_queued`; an agent pastor started is refused, as for any change to
+was queued. A task a machine has taken, or is being sent to, has left the
+queue, and is refused with `not_queued`; an agent pastor started is refused, as for any change to
 the fleet (`agent_refused`). `pastor task retry` keeps the level of the task
 it copies, and the copy queues last in it.
 
@@ -1323,8 +1334,10 @@ not a template.
 # pastor.toml
 [defaults]
 profile = "review"
+```
 
-# flock.toml
+```toml
+# fragment of flock.toml
 [[flock]]
 name = "work"
 profile = "develop"
@@ -1465,8 +1478,8 @@ t-8 is 1 of 3 in the queue; lifted from low to high
 ```
 
 `task describe` then names `queue move` as what set the level. `--json`
-prints `pos`, `of`, `priority_was` and the `task`. A task that is not queued,
-or a `--before` or `--after` task that is not, is refused with `not_queued`,
+prints `pos`, `of`, `priority_was` and the `task`. A task that is not queued
+or is being sent to a machine, or a `--before` or `--after` task that is not, is refused with `not_queued`,
 an unknown one with `task_not_found`, and an agent pastor started, as for
 `task priority`, with `agent_refused`; reading the queue is fine from
 anywhere. A head from before the queue refuses both as unreadable, so the
@@ -2479,6 +2492,7 @@ notifier has no need to see. Its `PASTOR_CONNECTOR_STATE_DIR` is then its own
 `PASTOR_JOB` still names the job.
 
 ```toml
+# fragment of pastor-connector.toml
 [[events]]
 on = ["task.done", "task.blocked"]
 only_own = true
@@ -2613,6 +2627,14 @@ It needs:
 `bridge` or speaks an older protocol. Any command fails the same way later;
 it never falls back to this machine's files.
 
+Every request to a head, from the CLI or from a headless serve, is checked
+against the head's IPC protocol before it goes out: a request that carries
+something the head predates (a field it would drop without a word, or a
+request it does not know) is refused `head_too_old`, naming what the head
+lacks, and is not sent. The check uses one ping per head, kept for a minute,
+so a command pings once and a headless serve sees a restarted head within a
+minute. A request every head takes sends no ping for it.
+
 These commands go to a remote head: `task run|list|describe|read|retry|priority|close|prune|send|done`,
 `queue` and `queue move`, `machine list|add|remove|move|describe`, `flock list|add|remove|describe|default|edit`,
 `trust list|add|remove`, `profile list|describe`, `config edit`, `tick`, `job reload`, `events`, and job commands for
@@ -2657,8 +2679,10 @@ store, and never reads `flock.toml`.
   the id it gives the task, checks its paths and the flock, and queues and
   dispatches the tasks under the job's name. The keys it queued, and those
   it had seen already (a run whose reply was lost), are marked seen here.
-- A head that does not answer fails the run with `head_unreachable`, and a
-  head with a job file of that name with `job_name_taken`: either counts as
+- A head that does not answer fails the run with `head_unreachable`, a head
+  too old for what the job's `[dispatch]` names (a model, a priority, a
+  profile, a label, `preempt`, `summary`, a description) with `head_too_old`, and a
+  head with a job file of that name with `job_name_taken`: each counts as
   a failed run, backing the job off as a failing connector does, and no item
   is kept, so the next run asks the connector for them again. An item the
   head refuses for its paths is reported and skipped; one past its cap waits
@@ -2700,6 +2724,33 @@ runs `pastor serve --foreground`, which reads the head from `client.toml`.
 Without a service, `pastor serve` starts it in the background, and `pastor
 serve status` and `stop` work on it as on a head. The head
 needs IPC protocol 7 or later for `job_submit`.
+
+### Pull machines
+
+A machine the head cannot reach over ssh, a laptop behind NAT say, can still
+run tasks: the head's flock.toml has it as `pull = true`, and its own
+headless serve asks the head for work. The head never connects to it and
+runs no actor for it; `machine list` shows its HOST as `pull`.
+
+- Each tick the headless serve sends `task_claim` to ask for more work, a
+  few tasks at most. The head decides how many from its own view of the
+  machine (`max_agents`, job slots, burst, flock room) and hands out the
+  queued tasks pinned to it first, then, when it takes flock work, any task
+  its flocks would place there now; each is `starting` on the machine before
+  the reply. The serve runs them on this machine's
+  herdr with the same machine actor the head runs, and sends every change
+  back as `task_report`. The head needs IPC protocol 21 or later.
+- `task run --machine <name>` (or a job's `machine`) sends a task to a pull
+  machine as to any other. There is no `task run` flag of its own for this.
+- A pull machine takes only the tasks pinned to it unless `[shepherd]
+  takes_flock_work = true` in its pastor.toml, or `PASTOR_SHEPHERD_FLOCK_WORK`
+  is `1` or `true` in the serve's environment.
+- `[shepherd] machine` is its name in the head's flock.toml, the hostname
+  when unset.
+- A pull machine that sends neither a claim nor a report for
+  `pull_lost_after` (head's pastor.toml, default `10m`) is lost, and its
+  `starting` and `running` tasks go stale, as for any lost machine. The
+  clock starts when the head does.
 
 ### Jobs on a shepherd
 
@@ -3094,6 +3145,7 @@ reconcile_every = "60s"
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "5s"      # a done task's pane closes after this; "never" keeps it
+pull_lost_after = "10m"      # a pull machine silent this long is lost, its tasks stale
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
 max_orchestrators = 1        # orchestrator agents at once, outside max_agents
 # head_address = "user@head.example"  # unset by default; see below
@@ -3127,6 +3179,10 @@ allow = ["Bash(docker:*)"]       # added to what it extends
 deny = []                        # added too; wins over any allow
 [[watch.connector]]          # connectors `pastor watch` runs; none by default
 name = "prs"
+[shepherd]                   # read by this machine's headless serve; see Pull machines
+# machine = "laptop"         # its name in the head's flock.toml; unset: the hostname
+takes_flock_work = false     # true: also its flocks' unpinned tasks, not only those pinned here
+# command = ["fake-herdr"]   # developer option: argv speaking herdr on stdio; unset: this herdr
 ```
 
 `head_address` is the ssh destination other machines reach the head by. When

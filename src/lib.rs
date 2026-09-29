@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod cli;
+pub mod cli_reference;
 pub mod complete;
 pub mod config;
 pub mod connector;

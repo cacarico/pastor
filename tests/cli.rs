@@ -1818,6 +1818,137 @@ fn description_flags_refuse_a_head_from_before_descriptions() {
     ok(run(&["flock", "add", "work"]));
 }
 
+/// Each command's request is checked against the head as it is sent
+/// (`IpcRequest::min_protocol`): a head one protocol short of what the
+/// request needs gets only the ping, and the command answers `head_too_old`
+/// naming what the head lacks.
+#[test]
+fn each_request_refuses_a_head_one_protocol_short_of_it() {
+    use pastor::ipc;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[machine]]\nname = \"pi-1\"\nlocal = true\n",
+    )
+    .unwrap();
+    let socket = state.join("pastor.sock");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .env("EDITOR", "true")
+            .output()
+            .unwrap()
+    };
+    let cases: &[(&[&str], u32, &str)] = &[
+        (
+            &["task", "run", "hi"],
+            ipc::PROFILE_PROTOCOL,
+            "permission profiles",
+        ),
+        (
+            &["task", "retry", "t-1"],
+            ipc::PROFILE_PROTOCOL,
+            "permission profiles",
+        ),
+        (
+            &["task", "retry", "t-1", "--place", "pastor"],
+            ipc::PROFILE_PROTOCOL,
+            "--place",
+        ),
+        (
+            &["job", "run", "j"],
+            ipc::PROFILE_PROTOCOL,
+            "permission profiles",
+        ),
+        (&["tick"], ipc::PROFILE_PROTOCOL, "permission profiles"),
+        (
+            &["task", "run", "hi", "--role", "orchestrator"],
+            ipc::PROFILE_PROTOCOL,
+            "roles",
+        ),
+        (
+            &["task", "priority", "t-1", "low"],
+            ipc::PRIORITY_PROTOCOL,
+            "priority",
+        ),
+        (
+            &["task", "priority", "t-1", "critical", "--preempt"],
+            ipc::PREEMPT_PROTOCOL,
+            "pausing",
+        ),
+        (
+            &["task", "run", "hi", "--priority", "critical", "--preempt"],
+            ipc::PREEMPT_PROTOCOL,
+            "pausing",
+        ),
+        (
+            &["task", "run", "hi", "--label", "x"],
+            ipc::LABEL_PROTOCOL,
+            "labels",
+        ),
+        (
+            &["task", "run", "hi", "--summary", "require"],
+            ipc::SUMMARY_MODE_PROTOCOL,
+            "summary setting",
+        ),
+        (&["queue"], ipc::QUEUE_PROTOCOL, "pastor queue"),
+        (
+            &["queue", "move", "t-1", "--top"],
+            ipc::QUEUE_PROTOCOL,
+            "pastor queue",
+        ),
+        (&["flock", "edit"], ipc::FILE_PROTOCOL, "edits"),
+        (&["config", "edit"], ipc::FILE_PROTOCOL, "edits"),
+        (&["job", "edit", "j"], ipc::FILE_PROTOCOL, "edits"),
+        (
+            &["job", "describe", "j"],
+            ipc::FILE_PROTOCOL,
+            "job requests",
+        ),
+        (&["job", "enable", "j"], ipc::FILE_PROTOCOL, "job requests"),
+        (&["trust", "list"], ipc::HEAD_READS_PROTOCOL, "trust"),
+        (
+            &["flock", "describe", "f"],
+            ipc::HEAD_READS_PROTOCOL,
+            "describe",
+        ),
+        (
+            &["machine", "describe", "pi-1"],
+            ipc::HEAD_READS_PROTOCOL,
+            "describe",
+        ),
+        (
+            &["orchestrator", "list"],
+            ipc::ORCHESTRATOR_PROTOCOL,
+            "orchestrator",
+        ),
+        (
+            &["orchestrator", "start", "o"],
+            ipc::SESSION_PROTOCOL,
+            "session",
+        ),
+    ];
+    for (args, protocol, feature) in cases {
+        let _ = std::fs::remove_file(&socket);
+        let reqs = text_head(&socket, protocol - 1);
+        let out = run(args);
+        assert_eq!(error_code(&out), "head_too_old", "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(feature), "{args:?}: {stderr}");
+        let reqs = reqs.lock().unwrap();
+        assert!(
+            reqs.iter().all(|r| r["op"] == "ping"),
+            "{args:?}: only pings: {reqs:?}"
+        );
+    }
+}
+
 /// A head at `socket` that speaks IPC protocol `protocol`: it answers ping
 /// with a pong, and every other request with the text `said by the head`. It
 /// records each request whole.
@@ -6833,15 +6964,25 @@ fn spare_flock(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf
 /// Returns once process `pid` has `fleet.lock` in `state` open: an offline
 /// edit opens it only after its ping found no head, just before it waits on
 /// the lock. Linux only, from `/proc`, like CI.
+///
+/// Until it execs, the child is a fork of this test and still holds the
+/// test's own lock descriptor, so the fd alone can show up before the ping;
+/// under load that let the test listen first and the ping found a head that
+/// never answers. Only the fds of the pastor binary count.
 fn wait_for_fleet_lock_open(pid: u32, state: &std::path::Path) {
     let lock = state.canonicalize().unwrap().join("fleet.lock");
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pastor"))
+        .canonicalize()
+        .unwrap();
     let deadline = Instant::now() + WAIT;
     loop {
-        let open = std::fs::read_dir(format!("/proc/{pid}/fd"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock));
+        let exec = std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p == bin);
+        let open = exec
+            && std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock));
         if open {
             return;
         }

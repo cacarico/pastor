@@ -1,0 +1,8 @@
+{{- /* Every docs page in reading order: the sections by weight, then each
+       section's pages by weight. The nav, the pager and the status bar all
+       count from this one list. */ -}}
+{{- $out := slice -}}
+{{- range (site.GetPage "/docs").Sections.ByWeight -}}
+  {{- range .Pages.ByWeight -}}{{- $out = $out | append . -}}{{- end -}}
+{{- end -}}
+{{- return $out -}}

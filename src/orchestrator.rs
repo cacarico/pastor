@@ -2040,7 +2040,11 @@ impl Runner {
                 },
                 s if s.occupies_pane() => {
                     match t.machine.as_deref().and_then(|m| self.fleet.get(m)) {
-                        Some(h) => h.close(t.id, false).await.map(|_| ()),
+                        Some(h) => self
+                            .fleet
+                            .bounded(&h.name, h.close(t.id, false))
+                            .await
+                            .map(|_| ()),
                         None => self.store.close_task(t.id).map(|_| ()),
                     }
                 }
@@ -3361,8 +3365,8 @@ prompt = "You are the night orchestrator."
         let (mut files, mut scripts) = (0, 0);
         for doc in [
             "docs/manual.md",
-            "docs/website/content/docs/orchestrators.md",
-            "docs/website/content/docs/examples.md",
+            "docs/website/content/docs/concepts/orchestrators.md",
+            "docs/website/content/docs/examples/overnight.md",
         ] {
             let text = std::fs::read_to_string(repo.join(doc)).unwrap();
             for fence in text.split("```").skip(1).step_by(2) {

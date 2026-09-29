@@ -685,41 +685,23 @@ fn main() {
             _ => head_use(&command),
         };
         let head = match head_use {
+            // What each request needs of the head is checked as it goes
+            // (`IpcRequest::min_protocol`); the probe checks what the files
+            // here need of it.
             Some(flocky) => {
-                // A job whose file is here, with a head elsewhere, is driven
-                // by this machine's serve: the head only supplies its recent
-                // tasks, so a protocol need that is only about the file
-                // request (`needs_file_protocol`) does not apply to it.
-                let local_job_route = remote.is_some() && names_local_job(&paths, &command);
                 probe_head(
                     &paths,
                     // A remote head's flock.toml is not here to read.
                     flocky || remote.is_some() || flocks_declared(&paths),
-                    needs_fleet_edit_protocol(&command),
-                    if local_job_route {
-                        None
-                    } else if remote.is_none()
-                        && let Some(file_need) = flock_file_need(&paths)
-                    {
-                        // flock.toml uses a field an older head's
-                        // `FlockEntry` (`deny_unknown_fields`) does not
-                        // know; its reload fails and it silently keeps the
-                        // old flocks, so refuse rather than let the CLI
-                        // dispatch, list or reload on that stale view.
-                        Some(protocol_need(&command).map_or(file_need, |(p, why)| {
-                            if p >= file_need.0 {
-                                (p, why)
-                            } else {
-                                file_need
-                            }
-                        }))
-                    } else if remote.is_some() && reads_head_files(&command) {
-                        protocol_need(&command).or(Some((
-                            pastor::ipc::FILE_PROTOCOL,
-                            "predates reading its files through the head",
-                        )))
+                    // flock.toml uses a field an older head's `FlockEntry`
+                    // (`deny_unknown_fields`) does not know; its reload
+                    // fails and it silently keeps the old flocks, so refuse
+                    // rather than let the CLI dispatch, list or reload on
+                    // that stale view.
+                    if remote.is_none() {
+                        flock_file_need(&paths)
                     } else {
-                        protocol_need(&command)
+                        None
                     },
                 )
                 .await?
@@ -900,22 +882,13 @@ fn fail(code: &str, message: &str) -> ! {
 /// (serde skips unknown fields) and reads flock.toml as one flock, so it
 /// would dispatch, list or reload across every flock.
 ///
-/// `fleet_edit` is for a flock or machine edit the head makes itself
-/// (`needs_fleet_edit_protocol`): a head before `FLEET_EDIT_PROTOCOL` does
-/// not know the request, so it is refused before anything is sent.
-///
-/// `need` is the protocol the command needs of the head, with what an older
-/// head would do instead (`protocol_need`); such a head is refused too. This
-/// covers `task retry --place` (`needs_place_protocol`), flock agents and
-/// tool lists (`needs_agent_protocol`), edits and job requests
-/// (`needs_file_protocol`), and reads the head used to answer locally
-/// (`needs_head_reads_protocol`, `HEAD_READS_PROTOCOL`): a head that
-/// predates one of these does not know the request, or would answer it in
-/// the old, less complete way, so it is refused rather than let through.
+/// `need` is the protocol flock.toml here needs of the head, with what an
+/// older head would do instead (`flock_file_need`); such a head is refused
+/// too. What each request needs is checked as it is sent
+/// (`IpcRequest::min_protocol`), against the pong kept here.
 async fn probe_head(
     paths: &Paths,
     flocks: bool,
-    fleet_edit: bool,
     need: Option<(u32, &str)>,
 ) -> anyhow::Result<Head> {
     let socket = paths.socket_file();
@@ -945,6 +918,12 @@ async fn probe_head(
         }
         None => pastor::ipc::ping_head(&socket).await,
     };
+    if let HeadPing::Pong {
+        version, protocol, ..
+    } = &ping
+    {
+        pastor::ipc::head_gate(paths).remember(version, *protocol);
+    }
     match ping {
         HeadPing::NotRunning => Ok(Head::Absent),
         HeadPing::Pong {
@@ -969,16 +948,6 @@ async fn probe_head(
                 socket.display()
             ),
         )),
-        HeadPing::Pong {
-            version, protocol, ..
-        } if fleet_edit && protocol < pastor::ipc::FLEET_EDIT_PROTOCOL => {
-            Err(pastor::cli::CliError::err(
-                "head_too_old",
-                format!(
-                    "the running pastor serve ({version}) predates flock and machine edits through the head; restart it, or stop it to edit flock.toml without a head"
-                ),
-            ))
-        }
         HeadPing::Pong {
             version, protocol, ..
         } if let Some((needed, why)) = need
@@ -1275,272 +1244,9 @@ fn local_caller_role(paths: &Paths, task: &str) -> TaskRole {
         .map_or(TaskRole::Agent, |t| t.role)
 }
 
-/// Whether `command` can make the head queue a task, whose agent and model
-/// the head resolves: it needs a head at `PROFILE_PROTOCOL` or later. A tick or a job
-/// run queues through the head's own jobs, so they count too; a dry run
-/// writes nothing, and a reload only re-reads the job files.
-fn needs_agent_protocol(command: &Command) -> bool {
-    match command {
-        Command::Task { cmd } => matches!(cmd, TaskCmd::Run(_) | TaskCmd::Retry { .. }),
-        Command::Tick(a) => !a.dry_run,
-        Command::Job { cmd } => matches!(cmd, JobCmd::Run { .. }),
-        _ => false,
-    }
-}
-
-/// Whether `command` is a flock.toml edit the head makes itself, which only
-/// a head of `FLEET_EDIT_PROTOCOL` or later knows. `flock remove` and `flock
-/// edit` are not: the first is older, the second edits here and reloads.
-fn needs_fleet_edit_protocol(command: &Command) -> bool {
-    match command {
-        Command::Flock { cmd } => matches!(
-            cmd,
-            FlockCmd::Add { .. }
-                | FlockCmd::Join { .. }
-                | FlockCmd::Leave { .. }
-                | FlockCmd::Default { .. }
-        ),
-        Command::Machine { cmd } => matches!(
-            cmd,
-            MachineCmd::Add { .. } | MachineCmd::Remove { .. } | MachineCmd::Move { .. }
-        ),
-        _ => false,
-    }
-}
-
-/// Whether `command` sends a request only a head of `PRIORITY_PROTOCOL` or
-/// later honours: `task run --priority` and `task priority`.
-fn needs_priority_protocol(command: &Command) -> bool {
-    match command {
-        Command::Task { cmd } => match cmd {
-            TaskCmd::Run(a) => a.priority.is_some(),
-            TaskCmd::Priority(_) => true,
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// Whether `command` sends `--preempt`, which only a head of
-/// `PREEMPT_PROTOCOL` or later honours.
-fn needs_preempt_protocol(command: &Command) -> bool {
-    match command {
-        Command::Task { cmd } => match cmd {
-            TaskCmd::Run(a) => a.preempt,
-            TaskCmd::Priority(a) => a.preempt,
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// Whether `command` sends `task run --summary`, which only a head of
-/// `SUMMARY_MODE_PROTOCOL` or later honours.
-fn needs_summary_mode_protocol(command: &Command) -> bool {
-    matches!(command, Command::Task { cmd: TaskCmd::Run(a) } if a.summary.is_some())
-}
-
-/// Whether `command` sends a summary, or asks for every round's, which only
-/// a head of `SUMMARY_PROTOCOL` or later keeps or knows: `task done
-/// --summary|--summary-file` and `task describe --all-summaries`.
-fn needs_summary_protocol(command: &Command) -> bool {
-    match command {
-        Command::Task {
-            cmd: TaskCmd::Done(a),
-        } => a.has_summary(),
-        Command::Task {
-            cmd: TaskCmd::Describe { all_summaries, .. },
-        } => *all_summaries,
-        _ => false,
-    }
-}
-
-/// Whether `command` sends a description only a head of
-/// `DESCRIPTION_PROTOCOL` or later keeps: `task run`, `flock add` or
-/// `machine add` with `--description`.
-fn needs_description_protocol(command: &Command) -> bool {
-    match command {
-        Command::Task {
-            cmd: TaskCmd::Run(a),
-        } => a.description.is_some(),
-        Command::Flock {
-            cmd: FlockCmd::Add { description, .. },
-        }
-        | Command::Machine {
-            cmd: MachineCmd::Add { description, .. },
-        } => description.is_some(),
-        _ => false,
-    }
-}
-
 /// `--label`, checked before anything is sent (`task::check_label`).
 fn parse_label(s: &str) -> Result<String, String> {
     pastor::task::check_label(s).map(|()| s.to_string())
-}
-
-/// Whether `command` sends a label only a head of `LABEL_PROTOCOL` or later
-/// renders: `task run --label`.
-fn needs_label_protocol(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Task {
-            cmd: TaskCmd::Run(a)
-        } if a.label.is_some()
-    )
-}
-
-/// Whether `command` sends a request only a head of `PLACE_PROTOCOL` or later
-/// honours: `task retry --place`.
-fn needs_place_protocol(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Task {
-            cmd: TaskCmd::Retry(a)
-        } if a.place.is_some()
-    )
-}
-
-/// Whether `command` sends a request only a head of `FILE_PROTOCOL` or later
-/// takes: the edits, and `job describe|enable|disable`.
-fn needs_file_protocol(command: &Command) -> bool {
-    match command {
-        Command::Flock { cmd } => matches!(cmd, FlockCmd::Edit),
-        Command::Job { cmd } => matches!(
-            cmd,
-            JobCmd::Edit { .. }
-                | JobCmd::Describe { .. }
-                | JobCmd::Enable { .. }
-                | JobCmd::Disable { .. }
-        ),
-        Command::Config { .. } => true,
-        _ => false,
-    }
-}
-
-/// Whether `command` sends a request only a head of `JOIN_PROTOCOL` or later
-/// knows or honours: `flock join|leave`, and `flock add` with machines.
-fn needs_join_protocol(command: &Command) -> bool {
-    match command {
-        Command::Flock { cmd } => match cmd {
-            FlockCmd::Join { .. } | FlockCmd::Leave { .. } => true,
-            FlockCmd::Add { machines, .. } => !machines.is_empty(),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// Whether `command` asks the head a request only a head of
-/// `HEAD_READS_PROTOCOL` or later knows: the trust commands and `flock|machine
-/// describe`.
-fn needs_head_reads_protocol(command: &Command) -> bool {
-    match command {
-        Command::Trust { .. } => true,
-        Command::Flock { cmd } => matches!(cmd, FlockCmd::Describe { .. }),
-        Command::Machine { cmd } => matches!(cmd, MachineCmd::Describe { .. }),
-        _ => false,
-    }
-}
-
-/// The protocol `command` needs of the head, and what an older head would
-/// do with it, for `probe_head`'s refusal. Checked from the newest protocol
-/// down, so a command that needs two gets the higher: `task retry --place`
-/// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
-/// command, and a head between the two would drop its named model.
-fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if matches!(
-        command,
-        Command::Orchestrator {
-            cmd: pastor::orchestrator_cli::OrchestratorCmd::Start { .. }
-                | pastor::orchestrator_cli::OrchestratorCmd::Stop { .. }
-        }
-    ) {
-        Some((
-            pastor::ipc::SESSION_PROTOCOL,
-            "predates session orchestrators, and would refuse the request",
-        ))
-    } else if matches!(command, Command::Orchestrator { .. }) {
-        Some((
-            pastor::ipc::ORCHESTRATOR_PROTOCOL,
-            "predates orchestrator files, and would refuse the request",
-        ))
-    } else if needs_join_protocol(command) {
-        Some((
-            pastor::ipc::JOIN_PROTOCOL,
-            "predates `flock join` and `flock leave`, and would refuse them or add the flock without its machines",
-        ))
-    } else if needs_summary_mode_protocol(command) {
-        Some((
-            pastor::ipc::SUMMARY_MODE_PROTOCOL,
-            "predates the summary setting, and would queue the task without --summary",
-        ))
-    } else if needs_label_protocol(command) {
-        Some((
-            pastor::ipc::LABEL_PROTOCOL,
-            "predates workspace labels and would name the workspace t-N",
-        ))
-    } else if needs_summary_protocol(command) {
-        Some((
-            pastor::ipc::SUMMARY_PROTOCOL,
-            "predates task summaries, and would drop the summary or refuse the request",
-        ))
-    } else if needs_preempt_protocol(command) {
-        Some((
-            pastor::ipc::PREEMPT_PROTOCOL,
-            "predates pausing a low task, and would queue the task without --preempt",
-        ))
-    } else if needs_description_protocol(command) {
-        Some((
-            pastor::ipc::DESCRIPTION_PROTOCOL,
-            "predates descriptions and would drop --description",
-        ))
-    } else if needs_agent_protocol(command) {
-        Some((
-            pastor::ipc::PROFILE_PROTOCOL,
-            if needs_place_protocol(command) {
-                "predates permission profiles and `task retry --place`, and would retry the task where it was, without them"
-            } else {
-                "predates permission profiles (or named models, flock agents and tool allow and deny lists), and would start the agent without them"
-            },
-        ))
-    } else if makes_orchestrator(command) {
-        Some((
-            pastor::ipc::ROLE_PROTOCOL,
-            "predates task roles, and would start a plain agent instead of an orchestrator",
-        ))
-    } else if matches!(command, Command::Queue(_)) {
-        Some((
-            pastor::ipc::QUEUE_PROTOCOL,
-            "predates `pastor queue`, and would refuse the request",
-        ))
-    } else if needs_priority_protocol(command) {
-        Some((
-            pastor::ipc::PRIORITY_PROTOCOL,
-            "predates task priority, and would queue the task at its own level or refuse the request",
-        ))
-    } else if needs_head_reads_protocol(command) {
-        Some((
-            pastor::ipc::HEAD_READS_PROTOCOL,
-            "predates this request through the head",
-        ))
-    } else if needs_file_protocol(command) {
-        Some((
-            pastor::ipc::FILE_PROTOCOL,
-            "predates edits and job requests through the head, and would refuse them",
-        ))
-    } else if matches!(command, Command::Events(_)) {
-        Some((
-            pastor::ipc::EVENTS_PROTOCOL,
-            "predates reading the events log through the head",
-        ))
-    } else if needs_place_protocol(command) {
-        Some((
-            pastor::ipc::PLACE_PROTOCOL,
-            "predates `task retry --place` and would retry the task where it was",
-        ))
-    } else {
-        None
-    }
 }
 
 /// Whether flock.toml declares named flocks, so a command with no `--flock`
@@ -3449,24 +3155,16 @@ mod tests {
         }
     }
 
-    /// `task run --role orchestrator` needs a head that knows roles, and is
-    /// what no task may send; from a task's pane, the commands an
-    /// orchestrator may make are left to the head, which knows its role.
+    /// `task run --role orchestrator` is what no task may send; from a
+    /// task's pane, the commands an orchestrator may make are left to the
+    /// head, which knows its role.
     #[test]
-    fn an_orchestrator_run_needs_the_role_protocol() {
+    fn only_a_person_makes_an_orchestrator() {
         let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
         let orch = parse(&["pastor", "task", "run", "x", "--role", "orchestrator"]);
         assert!(makes_orchestrator(&orch));
-        assert_eq!(
-            protocol_need(&orch).map(|(p, _)| p),
-            Some(pastor::ipc::PROFILE_PROTOCOL)
-        );
         let plain = parse(&["pastor", "task", "run", "x"]);
         assert!(!makes_orchestrator(&plain));
-        assert_eq!(
-            protocol_need(&plain).map(|(p, _)| p),
-            Some(pastor::ipc::PROFILE_PROTOCOL)
-        );
         assert!(Cli::try_parse_from(["pastor", "task", "run", "x", "--role", "boss"]).is_err());
         for argv in [
             &["pastor", "task", "run", "x"][..],
@@ -3486,7 +3184,6 @@ mod tests {
             assert!(!orchestrator_may(&parse(argv)), "{argv:?}");
         }
     }
-
     /// An agent flag starts with `-`, so `--agent-arg` must take it as its
     /// value in both spellings rather than read it as a pastor flag.
     #[test]
@@ -3534,96 +3231,17 @@ mod tests {
         assert_eq!(spec.agent_args, vec!["--verbose"]);
     }
 
-    /// The head resolves the agent with the task's flock, so the request
-    /// carries only what the flags said: nothing, when they said nothing.
-    /// A head from before `AGENT_PROTOCOL` would drop a task's deny list
-    /// without a word, so every command that makes it queue a task refuses
-    /// it; other commands still work with it.
-    #[tokio::test]
-    async fn queueing_a_task_refuses_a_head_before_tool_lists() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        paths.ensure().unwrap();
-        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (r, mut w) = stream.into_split();
-                let mut line = String::new();
-                tokio::io::BufReader::new(r)
-                    .read_line(&mut line)
-                    .await
-                    .unwrap();
-                let pong = IpcResponse::Pong {
-                    version: "0.4.0".into(),
-                    protocol: 1,
-                    role: None,
-                };
-                let mut out = serde_json::to_string(&pong).unwrap();
-                out.push('\n');
-                w.write_all(out.as_bytes()).await.unwrap();
-            }
-        });
-        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        let run = protocol_need(&parse(&["pastor", "task", "run", "hi"]));
-        let err = probe_head(&paths, false, false, run).await.unwrap_err();
-        let err = err.downcast::<pastor::cli::CliError>().unwrap();
-        assert_eq!(err.code, "head_too_old");
-        assert!(
-            err.message.contains("tool allow and deny"),
-            "{}",
-            err.message
-        );
-        assert_eq!(
-            probe_head(&paths, true, false, None).await.unwrap(),
-            Head::Live
-        );
-
-        assert!(needs_agent_protocol(&parse(&[
-            "pastor", "task", "run", "hi"
-        ])));
-        assert!(needs_agent_protocol(&parse(&[
-            "pastor", "task", "retry", "t-1"
-        ])));
-        assert!(needs_agent_protocol(&parse(&["pastor", "tick"])));
-        assert!(needs_agent_protocol(&parse(&[
-            "pastor", "tick", "--job", "j"
-        ])));
-        assert!(needs_agent_protocol(&parse(&["pastor", "job", "run", "j"])));
-        assert!(!needs_agent_protocol(&parse(&["pastor", "task", "list"])));
-        assert!(!needs_agent_protocol(&parse(&[
-            "pastor",
-            "tick",
-            "--dry-run"
-        ])));
-        assert!(!needs_agent_protocol(&parse(&["pastor", "job", "list"])));
-        assert!(!needs_agent_protocol(&parse(&["pastor", "job", "reload"])));
-    }
-
-    /// `pastor queue` and `queue move` need a head that knows the queue;
-    /// only the move changes the fleet.
+    /// Only `queue move` changes the fleet.
     #[test]
-    fn the_queue_needs_a_head_that_knows_it() {
+    fn only_a_queue_move_changes_the_fleet() {
         let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        for argv in [
-            &["pastor", "queue"][..],
-            &["pastor", "queue", "move", "t-1", "--top"],
-        ] {
-            assert_eq!(
-                protocol_need(&parse(argv)).map(|n| n.0),
-                Some(pastor::ipc::QUEUE_PROTOCOL),
-                "{argv:?}"
-            );
-        }
         assert!(!changes_fleet(&parse(&["pastor", "queue", "--flock", "w"])));
         assert!(changes_fleet(&parse(&[
             "pastor", "queue", "move", "t-1", "--to", "2"
         ])));
     }
-
     /// `flock join|leave` are fleet edits: an agent pastor started may not
-    /// run them, and they need a head that knows them.
+    /// run them.
     #[test]
     fn flock_join_and_leave_change_the_fleet() {
         let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
@@ -3634,61 +3252,18 @@ mod tests {
             &["pastor", "flock", "add", "work", "desk"],
         ] {
             assert!(changes_fleet(&parse(argv)), "{argv:?}");
-            assert_eq!(
-                protocol_need(&parse(argv)).map(|n| n.0),
-                Some(pastor::ipc::JOIN_PROTOCOL),
-                "{argv:?}"
-            );
         }
-        assert_ne!(
-            protocol_need(&parse(&["pastor", "flock", "add", "work"])).map(|n| n.0),
-            Some(pastor::ipc::JOIN_PROTOCOL)
-        );
     }
-
-    /// `--preempt` needs a head that knows pausing; without it the task
-    /// would wait behind low work.
+    /// `task run --summary` takes the modes a task can have, not `always`.
     #[test]
-    fn preempt_needs_a_head_that_knows_it() {
-        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
-        assert_eq!(
-            need(&[
-                "pastor",
-                "task",
-                "run",
-                "hi",
-                "--priority",
-                "critical",
-                "--preempt"
-            ]),
-            Some(pastor::ipc::PREEMPT_PROTOCOL)
-        );
-        assert_eq!(
-            need(&["pastor", "task", "priority", "t-1", "critical", "--preempt"]),
-            Some(pastor::ipc::PREEMPT_PROTOCOL)
-        );
-    }
-
-    /// `task run --summary` needs a head that knows the setting; a run
-    /// without it does not.
-    #[test]
-    fn summary_setting_needs_a_head_that_knows_it() {
-        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
-        assert_eq!(
-            need(&["pastor", "task", "run", "hi", "--summary", "require"]),
-            Some(pastor::ipc::SUMMARY_MODE_PROTOCOL)
-        );
-        assert_ne!(
-            need(&["pastor", "task", "run", "hi"]),
-            Some(pastor::ipc::SUMMARY_MODE_PROTOCOL)
+    fn summary_setting_takes_only_task_modes() {
+        assert!(
+            Cli::try_parse_from(["pastor", "task", "run", "hi", "--summary", "require"]).is_ok()
         );
         assert!(
             Cli::try_parse_from(["pastor", "task", "run", "hi", "--summary", "always"]).is_err()
         );
     }
-
     /// `task attach` refuses a paused task: its session resumes on its own,
     /// and a second resume would put two agents on one conversation.
     #[test]
@@ -3710,17 +3285,11 @@ mod tests {
         assert!(why.contains("pi-1"), "{why}");
     }
 
-    /// `task run --label` needs a head that settles and renders labels: an
-    /// older one would name the workspace `t-N` without a word. A bad
-    /// template is refused before anything is sent.
+    /// `task run --label` sends its template; a bad one is refused before
+    /// anything is sent.
     #[test]
-    fn a_label_needs_a_head_that_knows_it() {
+    fn a_label_is_checked_before_it_is_sent() {
         let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
-        assert_eq!(
-            need(&["pastor", "task", "run", "hi", "--label", "{{ machine }}"]),
-            Some(pastor::ipc::LABEL_PROTOCOL)
-        );
         let Command::Task {
             cmd: TaskCmd::Run(a),
         } = parse(&["pastor", "task", "run", "hi", "--label", "x/{{ task.id }}"])
@@ -3729,250 +3298,26 @@ mod tests {
         };
         let spec = run_spec(&a, &PastorConfig::default()).unwrap();
         assert_eq!(spec.label.template.as_deref(), Some("x/{{ task.id }}"));
+        let spec = run_spec(&run_args(&["hi"]), &PastorConfig::default()).unwrap();
+        assert_eq!(spec.label.template, None);
         let err = Cli::try_parse_from(["pastor", "task", "run", "hi", "--label", "{{ nope }}"])
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown placeholder"), "{err}");
     }
-
-    /// `task run --priority` and `task priority` need a head that knows
-    /// levels: an older one would queue at its own level, or refuse the
-    /// request as unreadable. A run without the flag does not.
+    /// `task priority` changes the fleet.
     #[test]
-    fn a_priority_needs_a_head_that_knows_it() {
+    fn a_priority_changes_the_fleet() {
         let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
-        assert_eq!(
-            need(&["pastor", "task", "run", "hi", "--priority", "high"]),
-            Some(pastor::ipc::PROFILE_PROTOCOL)
-        );
-        assert_eq!(
-            need(&["pastor", "task", "priority", "t-1", "low"]),
-            Some(pastor::ipc::PRIORITY_PROTOCOL)
-        );
-        assert_eq!(
-            need(&["pastor", "task", "run", "hi"]),
-            Some(pastor::ipc::PROFILE_PROTOCOL)
-        );
         assert!(changes_fleet(&parse(&[
             "pastor", "task", "priority", "t-1", "low"
         ])));
     }
-
-    /// A head from just before `PROFILE_PROTOCOL` knows every other
-    /// request, but would read `--profile`, a job's or a flock's profile as
-    /// nothing and start the agent asking, or with fewer denies. Every
-    /// command that can make it queue a task refuses it; a read does not.
-    #[tokio::test]
-    async fn queueing_a_task_refuses_a_head_before_profiles() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        paths.ensure().unwrap();
-        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (r, mut w) = stream.into_split();
-                let mut line = String::new();
-                tokio::io::BufReader::new(r)
-                    .read_line(&mut line)
-                    .await
-                    .unwrap();
-                let pong = IpcResponse::Pong {
-                    version: "0.5.0".into(),
-                    protocol: pastor::ipc::PROFILE_PROTOCOL - 1,
-                    role: None,
-                };
-                let mut out = serde_json::to_string(&pong).unwrap();
-                out.push('\n');
-                w.write_all(out.as_bytes()).await.unwrap();
-            }
-        });
+    /// The trust and describe commands ask the head, never a copy here,
+    /// and only a trust change counts against an agent.
+    #[test]
+    fn trust_and_describe_ask_the_head() {
         let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        for argv in [
-            &["pastor", "task", "run", "hi", "--profile", "develop"][..],
-            &["pastor", "task", "run", "hi"],
-            &["pastor", "task", "retry", "t-1"],
-            &["pastor", "job", "run", "j"],
-        ] {
-            let need = protocol_need(&parse(argv));
-            let err = probe_head(&paths, false, false, need).await.unwrap_err();
-            let err = err.downcast::<pastor::cli::CliError>().unwrap();
-            assert_eq!(err.code, "head_too_old", "{argv:?}");
-            assert!(
-                err.message.contains("permission profiles"),
-                "{argv:?}: {}",
-                err.message
-            );
-        }
-        let list = protocol_need(&parse(&["pastor", "task", "list"]));
-        assert_eq!(
-            probe_head(&paths, false, false, list).await.unwrap(),
-            Head::Live
-        );
-    }
-
-    /// A head from before `PLACE_PROTOCOL` reads `task retry --place`
-    /// without the place (serde skips the unknown field) and retries the
-    /// task where it was, answering success. The CLI refuses to send it
-    /// there, and says so.
-    #[tokio::test]
-    async fn retry_with_a_place_refuses_a_head_before_it() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        paths.ensure().unwrap();
-        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (r, mut w) = stream.into_split();
-                let mut line = String::new();
-                tokio::io::BufReader::new(r)
-                    .read_line(&mut line)
-                    .await
-                    .unwrap();
-                let pong = IpcResponse::Pong {
-                    version: "0.5.0".into(),
-                    protocol: pastor::ipc::AGENT_PROTOCOL,
-                    role: None,
-                };
-                let mut out = serde_json::to_string(&pong).unwrap();
-                out.push('\n');
-                w.write_all(out.as_bytes()).await.unwrap();
-            }
-        });
-        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        let place = protocol_need(&parse(&[
-            "pastor", "task", "retry", "t-1", "--place", "pastor",
-        ]));
-        // --place needs less than any queueing command: the retry asks for
-        // `PROFILE_PROTOCOL`, and the refusal still names the flag.
-        assert_eq!(place.map(|n| n.0), Some(pastor::ipc::PROFILE_PROTOCOL));
-        let err = probe_head(&paths, false, false, place).await.unwrap_err();
-        let err = err.downcast::<pastor::cli::CliError>().unwrap();
-        assert_eq!(err.code, "head_too_old");
-        assert!(err.message.contains("--place"), "{}", err.message);
-        // A retry without it is refused only for what every queueing
-        // command needs (`PROFILE_PROTOCOL`), not for --place.
-        let retry = protocol_need(&parse(&["pastor", "task", "retry", "t-1"]));
-        assert_eq!(retry.map(|n| n.0), Some(pastor::ipc::PROFILE_PROTOCOL));
-        let err = probe_head(&paths, false, false, retry).await.unwrap_err();
-        let err = err.downcast::<pastor::cli::CliError>().unwrap();
-        assert!(!err.message.contains("--place"), "{}", err.message);
-
-        assert!(needs_place_protocol(&parse(&[
-            "pastor", "task", "retry", "t-1", "--place", "pastor"
-        ])));
-        assert!(!needs_place_protocol(&parse(&[
-            "pastor", "task", "retry", "t-1"
-        ])));
-        assert!(!needs_place_protocol(&parse(&["pastor", "task", "list"])));
-    }
-
-    /// A head from before `FILE_PROTOCOL` does not know `FileGet`,
-    /// `FilePut`, `JobDescribe` or `JobSetEnabled`. The CLI refuses to go
-    /// on with it rather than edit the local copy behind its back; commands
-    /// that send none of them still work with it.
-    #[tokio::test]
-    async fn edits_and_job_requests_refuse_a_head_before_them() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        paths.ensure().unwrap();
-        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (r, mut w) = stream.into_split();
-                let mut line = String::new();
-                tokio::io::BufReader::new(r)
-                    .read_line(&mut line)
-                    .await
-                    .unwrap();
-                let pong = IpcResponse::Pong {
-                    version: "0.6.0".into(),
-                    protocol: pastor::ipc::PLACE_PROTOCOL,
-                    role: None,
-                };
-                let mut out = serde_json::to_string(&pong).unwrap();
-                out.push('\n');
-                w.write_all(out.as_bytes()).await.unwrap();
-            }
-        });
-        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        for argv in [
-            &["pastor", "flock", "edit"][..],
-            &["pastor", "config", "edit"],
-            &["pastor", "job", "edit", "j"],
-            &["pastor", "job", "describe", "j"],
-            &["pastor", "job", "enable", "j"],
-            &["pastor", "job", "disable", "j"],
-        ] {
-            let need = protocol_need(&parse(argv));
-            assert_eq!(
-                need.map(|n| n.0),
-                Some(pastor::ipc::FILE_PROTOCOL),
-                "{argv:?}"
-            );
-            let err = probe_head(&paths, false, false, need).await.unwrap_err();
-            let err = err.downcast::<pastor::cli::CliError>().unwrap();
-            assert_eq!(err.code, "head_too_old", "{argv:?}");
-        }
-        for argv in [
-            &["pastor", "job", "list"][..],
-            &["pastor", "job", "reload"],
-            &["pastor", "flock", "list"],
-        ] {
-            let need = protocol_need(&parse(argv));
-            assert_eq!(need, None, "{argv:?}");
-            assert_eq!(
-                probe_head(&paths, false, false, need).await.unwrap(),
-                Head::Live
-            );
-        }
-    }
-
-    /// A head from before `HEAD_READS_PROTOCOL` does not know the trust
-    /// and describe requests. The CLI refuses it with `head_too_old` instead
-    /// of reading its own copy, which may not be the head's.
-    #[tokio::test]
-    async fn trust_and_describe_refuse_a_head_before_them() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
-        paths.ensure().unwrap();
-        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (r, mut w) = stream.into_split();
-                let mut line = String::new();
-                tokio::io::BufReader::new(r)
-                    .read_line(&mut line)
-                    .await
-                    .unwrap();
-                let pong = IpcResponse::Pong {
-                    version: "0.6.0".into(),
-                    protocol: pastor::ipc::PLACE_PROTOCOL,
-                    role: None,
-                };
-                let mut out = serde_json::to_string(&pong).unwrap();
-                out.push('\n');
-                w.write_all(out.as_bytes()).await.unwrap();
-            }
-        });
-        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
-        let reads = protocol_need(&parse(&["pastor", "trust", "list"]));
-        let err = probe_head(&paths, false, false, reads).await.unwrap_err();
-        let err = err.downcast::<pastor::cli::CliError>().unwrap();
-        assert_eq!(err.code, "head_too_old");
-        assert_eq!(
-            probe_head(&paths, false, false, None).await.unwrap(),
-            Head::Live
-        );
-
         for argv in [
             &["pastor", "trust", "list"][..],
             &["pastor", "trust", "add", "m", "/r"][..],
@@ -3980,17 +3325,8 @@ mod tests {
             &["pastor", "flock", "describe", "f"][..],
             &["pastor", "machine", "describe", "m"][..],
         ] {
-            let cmd = parse(argv);
-            assert!(needs_head_reads_protocol(&cmd), "{argv:?}");
-            assert_eq!(head_use(&cmd), Some(false), "{argv:?}");
+            assert_eq!(head_use(&parse(argv)), Some(false), "{argv:?}");
         }
-        assert!(!needs_head_reads_protocol(&parse(&[
-            "pastor", "flock", "list"
-        ])));
-        assert!(!needs_head_reads_protocol(&parse(&[
-            "pastor", "job", "describe", "j"
-        ])));
-        // Only a trust change counts against an agent.
         assert!(!changes_fleet(&parse(&["pastor", "trust", "list"])));
         assert!(changes_fleet(&parse(&[
             "pastor", "trust", "add", "m", "/r"
@@ -3999,7 +3335,6 @@ mod tests {
             "pastor", "trust", "remove", "m", "/r"
         ])));
     }
-
     #[test]
     fn run_sends_only_the_agent_its_flags_name() {
         assert_eq!(agent_choice(&run_args(&["hi"])), AgentChoice::default());
@@ -4654,31 +3989,277 @@ mod tests {
         assert!(check_commands(SKILL).0 > 20);
     }
 
-    /// The website's examples page is reached from the docs index, from the
-    /// pages its examples belong to, and from the home's "how I use it" pane,
-    /// so a rename or a lost link shows here rather than as a dead page.
+    /// Every ```toml fence in the docs parses, and one that is a whole file
+    /// loads with the loader of the file it shows, in a temp config dir, so a
+    /// renamed key cannot leave an example that fails for whoever copies it.
+    /// A fence that is deliberately partial starts with `# fragment` and is
+    /// only parsed.
     #[test]
-    fn website_examples_page_is_linked() {
+    fn docs_toml_examples_load_as_config() {
+        let repo = skills_dir().parent().unwrap().to_path_buf();
+        let mut files = vec![
+            repo.join("README.md"),
+            repo.join("docs/manual.md"),
+            repo.join("docs/recommended-setup.md"),
+        ];
+        markdown_files(&skills_dir(), &mut files);
+        markdown_files(&repo.join("docs/website/content"), &mut files);
+        let mut wrong = Vec::new();
+        let mut loaded = 0;
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (line, fence) in toml_fences(&text) {
+                let at = format!("{}:{line}", file.display());
+                if let Err(e) = toml::from_str::<toml::Table>(&fence) {
+                    wrong.push(format!("{at}: {e}"));
+                    continue;
+                }
+                if fence.trim_start().starts_with("# fragment") {
+                    continue;
+                }
+                match load_example(&fence) {
+                    Ok(()) => loaded += 1,
+                    Err(e) => wrong.push(format!("{at}: {e}")),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        assert!(loaded > 40, "only {loaded} whole-file examples loaded");
+    }
+
+    /// The ```toml fences of a Markdown text with the line each opens on,
+    /// an indented one (in a list item) with its indent taken off.
+    fn toml_fences(text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut open: Option<(usize, usize, String)> = None;
+        for (n, line) in text.lines().enumerate() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            match open.as_mut() {
+                None => {
+                    if trimmed.strip_prefix("```").map(str::trim) == Some("toml") {
+                        open = Some((n + 1, indent, String::new()));
+                    }
+                }
+                Some(_) if trimmed.starts_with("```") => {
+                    let (at, _, block) = open.take().unwrap();
+                    out.push((at, block));
+                }
+                Some((_, pad, block)) => {
+                    block.push_str(line.get(*pad..).unwrap_or(trimmed));
+                    block.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    /// Loads a whole-file example as the file its content shows: a flock
+    /// file (`[[machine]]` or `[[flock]]`), a job (`[connector]` with
+    /// `use`), an orchestrator (`kind`), a connector manifest (`id`), a
+    /// client.toml (`[head]`), or else pastor.toml.
+    fn load_example(text: &str) -> Result<(), String> {
+        use pastor::connector::Catalog;
+        use serde_json::Value;
+        /// Every connector exists: the examples name ones installed apart.
+        struct Any;
+        impl Catalog for Any {
+            fn source(&self, _: &str) -> Option<std::sync::Arc<dyn pastor::connector::ItemSource>> {
+                None
+            }
+            fn check(&self, _: &str, _: &Value) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("config"), tmp.path().join("state"));
+        let write = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let err = |e: anyhow::Error| format!("{e:#}");
+        if table.contains_key("machine") || table.contains_key("flock") {
+            write(&paths.flock_file());
+            Flock::load_existing(&paths.flock_file()).map_err(err)?;
+        } else if table
+            .get("connector")
+            .is_some_and(|c| c.get("use").is_some())
+        {
+            let name = table
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("example");
+            let path = pastor::config::job::job_path(&paths.jobs_dir(), name);
+            write(&path);
+            let defaults = PastorConfig::default().defaults;
+            match pastor::config::job::load_file(&path, name, &defaults, &Any) {
+                pastor::config::job::Loaded::Valid(_) => {}
+                pastor::config::job::Loaded::Invalid { error, .. } => return Err(error),
+            }
+        } else if table.contains_key("kind") {
+            let path = paths.orchestrators_dir().join("example.toml");
+            write(&path);
+            match pastor::orchestrator::load_file(&path, "example") {
+                pastor::orchestrator::Loaded::Valid(_) => {}
+                pastor::orchestrator::Loaded::Invalid { error, .. } => return Err(error),
+            }
+        } else if let Some(id) = table.get("id").and_then(|i| i.as_str()) {
+            let dir = paths.connectors_dir().join(id);
+            write(&dir.join(pastor::connector::manifest::MANIFEST_FILE));
+            pastor::connector::load_manifest(&dir, Some(id))?;
+        } else if table.contains_key("head") {
+            let path = pastor::head::client_file(&paths);
+            write(&path);
+            pastor::head::load(&path).map_err(err)?;
+        } else {
+            write(&paths.config_file());
+            PastorConfig::load_existing(&paths.config_file()).map_err(err)?;
+        }
+        Ok(())
+    }
+
+    /// The homepage's live terminal types the commands in
+    /// `docs/website/data/demo.toml`; each must be a real command with real
+    /// long flags, as the docs' commands are, or the demo would show a CLI
+    /// that does not exist.
+    #[test]
+    fn website_demo_commands_are_real() {
+        let path = skills_dir()
+            .parent()
+            .unwrap()
+            .join("docs/website/data/demo.toml");
+        let demo: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let cmds: Vec<&str> = demo["act"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|act| act["step"].as_array().unwrap())
+            .filter_map(|step| step.get("cmd").and_then(|c| c.as_str()))
+            .collect();
+        assert!(cmds.len() > 10, "only {} commands in {path:?}", cmds.len());
+        for cmd in &cmds {
+            assert!(
+                cmd.starts_with("pastor "),
+                "{cmd:?} is not a pastor command"
+            );
+        }
+        let (checked, wrong) = check_commands(&format!("```sh\n{}\n```\n", cmds.join("\n")));
+        assert_eq!(checked, cmds.len(), "{cmds:?}");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The website's CLI reference is rendered from this command tree. It
+    /// fails when the checked-in page is stale; `make cli-reference` runs it
+    /// with PASTOR_WRITE_CLI_REFERENCE=1, which writes the page instead.
+    #[test]
+    fn website_cli_reference_is_current() {
+        let path = skills_dir()
+            .parent()
+            .unwrap()
+            .join("docs/website/content/docs/reference/cli.md");
+        let page = std::fs::read_to_string(&path).unwrap();
+        let fresh = pastor::cli_reference::refresh(&completion_tree(), &page);
+        if std::env::var_os("PASTOR_WRITE_CLI_REFERENCE").is_some() {
+            std::fs::write(&path, &fresh).unwrap();
+            return;
+        }
+        assert!(
+            page == fresh,
+            "{} is stale: run make cli-reference",
+            path.display()
+        );
+    }
+
+    /// `llms.txt` is the home page in a second output format, so Hugo writes
+    /// it at the site's root from `layouts/home.llms.txt`.
+    #[test]
+    fn website_serves_llms_txt_at_its_root() {
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let config: toml::Table =
+            toml::from_str(&std::fs::read_to_string(site.join("hugo.toml")).unwrap()).unwrap();
+        let llms = &config["outputFormats"]["llms"];
+        assert_eq!(llms["baseName"].as_str(), Some("llms"));
+        assert_eq!(llms["mediaType"].as_str(), Some("text/plain"));
+        let home = config["outputs"]["home"].as_array().unwrap();
+        assert!(home.iter().any(|f| f.as_str() == Some("llms")), "{home:?}");
+        let template = std::fs::read_to_string(site.join("layouts/home.llms.txt")).unwrap();
+        assert!(template.contains("# pastor\n"), "{template}");
+    }
+
+    /// A subpath `baseURL` (the site is served at cacari.co/pastor/) makes
+    /// `.RelPermalink` absolute under that subpath, so `llms.txt`'s docs
+    /// links must be trimmed relative to the home page, not just its
+    /// leading slash, or they resolve one `docs/` level too deep. Needs
+    /// hugo from mise; skips where it is not installed.
+    #[test]
+    fn website_llms_txt_links_resolve_under_a_subpath_base_url() {
+        if std::process::Command::new("hugo")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: hugo not found in PATH");
+            return;
+        }
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let out = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("hugo")
+            .arg("--source")
+            .arg(&site)
+            .arg("--destination")
+            .arg(out.path())
+            .args(["--baseURL", "https://cacari.co/pastor/"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let llms = std::fs::read_to_string(out.path().join("llms.txt")).unwrap();
+        for line in llms.lines().filter(|l| l.starts_with("- [")) {
+            let link = line.split('(').nth(1).unwrap().split(')').next().unwrap();
+            if link.starts_with("http") {
+                continue; // the Optional section links out to github.com
+            }
+            assert!(
+                link.starts_with("docs/"),
+                "link should be relative to llms.txt, not doubled under the subpath: {line}"
+            );
+        }
+    }
+
+    /// The docs are five sections, each an index with its pages, and every
+    /// docs link on the homepage lands on one of them, so a moved or renamed
+    /// page shows here rather than as a dead link.
+    #[test]
+    fn website_sections_and_home_links_resolve() {
         let site = skills_dir().parent().unwrap().join("docs/website");
         let docs = site.join("content/docs");
-        assert!(docs.join("examples.md").is_file(), "no examples.md");
-        for page in [
-            "_index.md",
-            "jobs.md",
-            "tasks.md",
-            "flocks.md",
-            "remote-head.md",
-            "orchestrators.md",
-        ] {
-            let text = std::fs::read_to_string(docs.join(page)).unwrap();
-            assert!(text.contains("examples/"), "{page} does not link examples");
+        for section in ["start", "concepts", "deploy", "examples", "reference"] {
+            let dir = docs.join(section);
+            assert!(dir.join("_index.md").is_file(), "no {section}/_index.md");
+            let pages = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name() != "_index.md")
+                .count();
+            assert!(pages > 0, "{section} has no pages");
         }
         let home = std::fs::read_to_string(site.join("layouts/home.html")).unwrap();
-        assert!(home.contains("how I use it"), "no \"how I use it\" pane");
         assert!(
-            home.contains("docs/examples/"),
-            "home does not link examples"
+            home.contains("what you can do"),
+            "no \"what you can do\" pane"
         );
+        let mut links = 0;
+        for link in home.split("\"docs/").skip(1) {
+            let path = link.split('"').next().unwrap().trim_end_matches('/');
+            let path = path.split('#').next().unwrap();
+            let page = docs.join(format!("{path}.md"));
+            let index = docs.join(path).join("_index.md");
+            assert!(
+                path.is_empty() || page.is_file() || index.is_file(),
+                "home links docs/{path}/, which is no page"
+            );
+            links += 1;
+        }
+        assert!(links > 5, "only {links} docs links on the home");
     }
 
     /// The manual's remote head section lists which commands go to the head,
