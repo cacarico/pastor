@@ -1380,8 +1380,10 @@ last in it.
 
 A queued task that has waited `age_after` goes up one level, and again
 after each further `age_after`, so a `low` task behind a steady stream of
-higher ones still runs in the end. Ageing stops at `high`: it never makes a
-task `critical`, so it never lets one burst or pause another. `high` and
+`normal` and `high` tasks still runs in the end. Ageing stops at `high`: it
+never makes a task `critical`, so it never lets one burst or pause another,
+and it promises nothing against `critical` work: a steady stream of
+`critical` tasks still goes first, for as long as it keeps coming. `high` and
 `critical` tasks, and paused ones, do not age. The wait is the flock's
 `age_after`, else `[defaults] age_after`, else 30 minutes; `never` turns
 ageing off for that flock, or for every flock that sets none:

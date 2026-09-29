@@ -2072,7 +2072,8 @@ impl Fleet {
 
     /// Lift the queued tasks that have waited their flock's `age_after` a
     /// level (`Store::age_queued`), so a `low` task still runs behind a
-    /// steady stream of higher ones. Each dispatch pass does it first,
+    /// steady stream of `normal` and `high` ones (never `critical` ones:
+    /// ageing stops at `high`). Each dispatch pass does it first,
     /// under the dispatch lock, so a hand change never races it.
     /// A task in flight has left the queue though its row still says
     /// `queued`, and keeps the level it was placed at.

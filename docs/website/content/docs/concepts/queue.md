@@ -23,8 +23,14 @@ in `pastor.toml`. With none it is `normal`.
 pastor task run "Look at the failing deploy" --repo '~/src/app' --priority high
 ```
 
-Levels do not age. A `low` task can wait for ever behind a steady stream of
-higher ones; the WAITED column is how you notice.
+A queued task that has waited `age_after` (30 minutes unless its flock or
+`[defaults]` in `pastor.toml` says otherwise; `never` turns it off) goes up
+one level, and again after each further wait, so a `low` task behind a
+steady stream of `normal` and `high` tasks still runs in the end. Ageing
+stops at `high`: it never makes a task `critical`, so a steady stream of
+`critical` tasks still goes first, and a task can wait behind it for as long
+as it keeps coming; the WAITED column is how you notice. `pastor queue`
+shows an aged task's original level, such as `high (was low)`.
 
 A level also changes room: only a `critical` task may use a machine's
 burst slot, past `max_agents` (see [machines](../machines/#slots)).
