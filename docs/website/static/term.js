@@ -27,14 +27,6 @@ function play(term) {
   term.after(copy);
   term.setAttribute('aria-hidden', 'true');
 
-  // As tall as the tallest act, so the page does not jump as lines arrive.
-  let tallest = 0;
-  for (const act of acts) {
-    show(act);
-    tallest = Math.max(tallest, term.offsetHeight);
-  }
-  term.style.height = `${tallest}px`;
-
   // Controls on the pane's top border: a dot per act (the one playing is
   // filled; click one to jump to it), pause, and replay from the start.
   const ctl = term.parentElement.querySelector('.term-ctl');
@@ -42,10 +34,18 @@ function play(term) {
   const pauseBtn = ctl?.querySelector('[data-term-pause]');
   const replayBtn = ctl?.querySelector('[data-term-replay]');
   if (ctl) ctl.hidden = false;
-  const mark = (i) => actBtns.forEach((b, j) => {
-    b.classList.toggle('on', i === j);
-    b.setAttribute('aria-pressed', String(i === j));
-  });
+  // The pane's title names the act on screen, so a switch reads as one.
+  const title = term.parentElement.querySelector('[data-term-title]');
+  const mark = (i) => {
+    actBtns.forEach((b, j) => {
+      b.classList.toggle('on', i === j);
+      b.setAttribute('aria-pressed', String(i === j));
+    });
+    if (title && actBtns[i]) title.textContent = `· ${actBtns[i].title}`;
+  };
+
+  // The window keeps its newest line in view, as a terminal scrolls.
+  const follow = () => { term.scrollTop = term.scrollHeight; };
 
   let paused = false;
   let run = 0; // bumped by replay or a dot: an older loop sees it and stops
@@ -106,6 +106,7 @@ function play(term) {
       if (!(await wait(pause, mine))) return false;
       if (line.hasAttribute('data-gap')) term.append('\n');
       term.append(el, '\n');
+      follow();
       return wait(line.dataset.kind === 'lbl' ? 900 : 250, mine);
     }
     const prompt = el.querySelector('.p');
@@ -118,6 +119,7 @@ function play(term) {
     cursor.textContent = ' ';
     el.append(typed, cursor);
     term.append(el);
+    follow();
     if (!(await wait(500, mine))) return false;
     for (const ch of text) {
       typed.data += ch;
@@ -127,14 +129,6 @@ function play(term) {
     cursor.remove();
     term.append('\n');
     return true;
-  }
-
-  function show(act) {
-    term.textContent = '';
-    for (const line of act) {
-      if (line.hasAttribute('data-gap')) term.append('\n');
-      term.append(line.cloneNode(true), '\n');
-    }
   }
 
   const setPaused = (p) => {

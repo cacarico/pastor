@@ -23,7 +23,7 @@
   {{/* The transcript comes from data/demo.toml. All of it is here as text,
        so it reads without scripts; term.js replays it as a live session. */}}
   <section class="pane live" style="grid-area: live">
-    <h2 class="t">live <span>· a scripted session</span></h2>
+    <h2 class="t">live <span data-term-title>· a scripted session</span></h2>
     <div class="term-ctl" hidden>
       {{- range $i, $act := hugo.Data.demo.act }}
       <button type="button" class="act" data-term-act="{{ $i }}" aria-label="play act {{ add $i 1 }}: {{ $act.name }}" title="{{ $act.name }}"></button>
