@@ -11,6 +11,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, Month, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 
+use serde::{Deserialize, Serialize};
+
+use crate::config::LimitsConfig;
 use crate::task::MESSAGE_MARKERS;
 
 /// How long to wait after a limit whose message names no reset time, before
@@ -37,6 +40,9 @@ pub struct Limit {
     /// The limit is one model's (`Opus weekly limit reached`): the
     /// account's other models still work.
     pub model_scoped: bool,
+    /// The account has no credit left (`Credit balance is too low`): no
+    /// reset is coming, someone has to pay.
+    pub no_credit: bool,
     /// The line it was read from, without its marker.
     pub line: String,
 }
@@ -47,6 +53,160 @@ impl Limit {
     pub fn retry_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
         self.until
             .unwrap_or(now + chrono::Duration::from_std(UNKNOWN_RESET_WAIT).expect("an hour fits"))
+    }
+
+    /// When the account is tried again, as `[limits]` says: at the reset,
+    /// else `retry_after_no_credit` from `now` for no credit, else
+    /// `unknown_reset_wait` from `now`.
+    pub fn retry_at_under(&self, now: DateTime<Utc>, limits: &LimitsConfig) -> DateTime<Utc> {
+        let wait = if self.no_credit {
+            limits.retry_after_no_credit_duration()
+        } else {
+            limits.unknown_reset_wait_duration()
+        };
+        self.until.unwrap_or_else(|| {
+            now.checked_add_signed(
+                chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::MAX),
+            )
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+        })
+    }
+
+    /// What ran out, in a few words: `5-hour limit`, `Opus weekly limit`,
+    /// `no credit`, `rate limit`.
+    pub fn what(&self) -> String {
+        what_of(&self.line, self.hard, self.no_credit)
+    }
+}
+
+/// `Limit::what` from a limit's parts, for a row that kept only those.
+pub fn what_of(line: &str, hard: bool, no_credit: bool) -> String {
+    if no_credit {
+        return "no credit".into();
+    }
+    if !hard {
+        return "rate limit".into();
+    }
+    let lower = line.replace('’', "'").to_ascii_lowercase();
+    match scope_of(&lower) {
+        Some(words) if !words.is_empty() => {
+            // The words as the message wrote them, capitals kept.
+            let first = lower.find(words[0]).unwrap_or(0);
+            let said: Vec<&str> = line
+                .get(first..)
+                .unwrap_or("")
+                .split_whitespace()
+                .take(words.len())
+                .collect();
+            format!("{} limit", said.join(" "))
+        }
+        _ => "usage limit".into(),
+    }
+}
+
+/// A limit the head keeps (`Store::record_limit`): an account, or one model
+/// of it, that no task starts on before `retry_at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountLimit {
+    /// The agent's `account`, else `<machine>/<agent>` (`Agents::limit_key`).
+    pub account: String,
+    /// The `[models]` name the limit is for, when it is one model's; `None`
+    /// stops every model of the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub hard: bool,
+    pub no_credit: bool,
+    /// The reset the message named, if it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+    /// When the account is tried again: `until`, or a wait from `[limits]`.
+    pub retry_at: DateTime<Utc>,
+    /// The line the limit was read from.
+    pub line: String,
+    /// The task it was seen on, the machine and the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub seen_at: DateTime<Utc>,
+}
+
+impl AccountLimit {
+    /// The row for `limit`, seen at `now` on `task`'s agent `agent` on
+    /// `machine`, kept under `account`. A limit that is one model's keeps
+    /// `model`, the task's `[models]` name; with none it stops the account.
+    #[allow(clippy::too_many_arguments)]
+    pub fn of(
+        account: &str,
+        model: Option<&str>,
+        limit: &Limit,
+        task_id: Option<i64>,
+        machine: Option<&str>,
+        agent: Option<&str>,
+        now: DateTime<Utc>,
+        limits: &LimitsConfig,
+    ) -> AccountLimit {
+        AccountLimit {
+            account: account.to_string(),
+            model: model.filter(|_| limit.model_scoped).map(str::to_string),
+            hard: limit.hard,
+            no_credit: limit.no_credit,
+            until: limit.until,
+            retry_at: limit.retry_at_under(now, limits),
+            line: limit.line.clone(),
+            task_id,
+            machine: machine.map(str::to_string),
+            agent: agent.map(str::to_string),
+            seen_at: now,
+        }
+    }
+
+    /// Whether the row stops `model` (a `[models]` name, or none).
+    pub fn stops(&self, model: Option<&str>) -> bool {
+        match &self.model {
+            None => true,
+            Some(m) => model == Some(m.as_str()),
+        }
+    }
+
+    /// The account, and the model when the row is one model's:
+    /// `claude-personal`, `claude-personal opus`.
+    pub fn name(&self) -> String {
+        match &self.model {
+            Some(m) => format!("{} {m}", self.account),
+            None => self.account.clone(),
+        }
+    }
+
+    /// `claude-personal exhausted until 03:00 (5-hour limit, seen by t-412)`:
+    /// why a task does not start on it, with `retry_at` in local time.
+    pub fn note(&self, now: DateTime<Utc>) -> String {
+        let seen = self
+            .task_id
+            .map(|id| format!(", seen by t-{id}"))
+            .unwrap_or_default();
+        format!(
+            "{} exhausted until {} ({}{seen})",
+            self.name(),
+            local_time(self.retry_at, now),
+            what_of(&self.line, self.hard, self.no_credit),
+        )
+    }
+}
+
+/// `at` in local time as a person reads it next to `now`: `03:00` today,
+/// `Tue 03:00` within the week, `Oct 6 03:00` further off.
+pub fn local_time(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let at = at.with_timezone(&Local);
+    let now = now.with_timezone(&Local);
+    if at.date_naive() == now.date_naive() {
+        at.format("%H:%M").to_string()
+    } else if (at - now).num_days().abs() < 6 {
+        at.format("%a %H:%M").to_string()
+    } else {
+        at.format("%b %-d %H:%M").to_string()
     }
 }
 
@@ -179,6 +339,7 @@ const WINDOW_WORDS: [&str; 12] = [
 /// read for the reset only.
 fn read_claude(said: &str, more: &str, now: DateTime<Utc>) -> Option<Limit> {
     let lower = said.replace('’', "'").to_ascii_lowercase();
+    let mut no_credit = false;
     let (hard, model_scoped) = if let Some(rest) = lower.strip_prefix("api error: ") {
         // While Claude retries, the agent is at work and the turn goes on.
         let code: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -190,6 +351,7 @@ fn read_claude(said: &str, more: &str, now: DateTime<Utc>) -> Option<Limit> {
         if !ends_a_phrase(rest) {
             return None;
         }
+        no_credit = true;
         (true, false)
     } else {
         (
@@ -202,6 +364,7 @@ fn read_claude(said: &str, more: &str, now: DateTime<Utc>) -> Option<Limit> {
         hard,
         until: reset_in(&whole, now),
         model_scoped,
+        no_credit,
         line: said.to_string(),
     })
 }
@@ -486,6 +649,7 @@ mod tests {
                 hard: true,
                 until: utc(9, 30, 3, 0),
                 model_scoped: false,
+                no_credit: false,
                 line: "You've hit your limit · resets 3am (UTC)".into(),
             }
         );
@@ -503,6 +667,82 @@ mod tests {
             assert_eq!(limit.until, None, "{said}");
             assert_eq!(limit.line, said.trim_start_matches(['⏺', '●', '⎿', ' ']));
         }
+    }
+
+    /// A row's retry is the reset, else the wait `[limits]` sets for a
+    /// limit that names none, else the one for no credit.
+    #[test]
+    fn the_retry_is_the_reset_else_the_wait_limits_sets() {
+        let limits = LimitsConfig {
+            unknown_reset_wait: "2h".into(),
+            retry_after_no_credit: "1d".into(),
+            ..Default::default()
+        };
+        let reset = claude("● You've hit your limit · resets 3am (UTC)\n").unwrap();
+        assert_eq!(
+            reset.retry_at_under(now(), &limits),
+            utc(9, 30, 3, 0).unwrap()
+        );
+        let unknown = claude("● You've hit your limit\n").unwrap();
+        assert!(!unknown.no_credit);
+        assert_eq!(
+            unknown.retry_at_under(now(), &limits),
+            utc(9, 29, 14, 0).unwrap()
+        );
+        let broke = claude("● Credit balance is too low\n").unwrap();
+        assert!(broke.no_credit);
+        assert_eq!(
+            broke.retry_at_under(now(), &limits),
+            utc(9, 30, 12, 0).unwrap()
+        );
+    }
+
+    /// What a waiting task says: the account (and model), the time it is
+    /// tried again, what ran out and the task that saw it.
+    #[test]
+    fn a_row_says_what_ran_out_and_who_saw_it() {
+        let limit = claude("● 5-hour limit reached ∙ resets 3am (UTC)\n").unwrap();
+        assert_eq!(limit.what(), "5-hour limit");
+        let row = AccountLimit::of(
+            "claude-personal",
+            Some("opus"),
+            &limit,
+            Some(412),
+            Some("pi-1"),
+            Some("claude-personal"),
+            now(),
+            &LimitsConfig::default(),
+        );
+        assert_eq!(row.model, None, "not one model's: the account's");
+        assert!(row.stops(Some("opus")) && row.stops(None));
+        let at = local_time(row.retry_at, now());
+        assert_eq!(
+            row.note(now()),
+            format!("claude-personal exhausted until {at} (5-hour limit, seen by t-412)")
+        );
+        let opus = claude("● Opus weekly limit reached\n").unwrap();
+        assert_eq!(opus.what(), "Opus weekly limit");
+        let row = AccountLimit::of(
+            "me",
+            Some("opus"),
+            &opus,
+            None,
+            None,
+            None,
+            now(),
+            &LimitsConfig::default(),
+        );
+        assert_eq!(row.model.as_deref(), Some("opus"));
+        assert!(row.stops(Some("opus")) && !row.stops(Some("sonnet")) && !row.stops(None));
+        assert!(row.note(now()).starts_with("me opus exhausted until "));
+        assert_eq!(
+            claude("● Credit balance is too low\n").unwrap().what(),
+            "no credit"
+        );
+        assert_eq!(
+            claude("● You've hit your limit\n").unwrap().what(),
+            "usage limit"
+        );
     }
 
     #[test]

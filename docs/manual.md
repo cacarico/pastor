@@ -3837,10 +3837,11 @@ not answer is refused whether flocks are in play or not
 
 ### The store
 
-`pastor.db` is at schema 14. Its tasks table has, among others, `retry_of`,
+`pastor.db` is at schema 15. Its tasks table has, among others, `retry_of`,
 `flock`, `trust_sent`, `activity_seen`, `ended`, `priority`,
 `priority_from`, `queue_pos`, `aged_from`, `aged_at` (since schema 14),
 `role`, `description` (since schema 11), `preempt`, `paused_at`,
-`paused_for` and `resumed_at`. Summaries are in the `task_summaries` table
-(schema 13). A new pastor adds what it needs in place
+`paused_for`, `resumed_at` and `waiting_until` (schema 15). Summaries are in
+the `task_summaries` table (schema 13), usage limits in the `limits` table
+(schema 15). A new pastor adds what it needs in place
 when it first opens an older store.
