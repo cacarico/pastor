@@ -6,6 +6,8 @@
 
 const term = document.querySelector('[data-term]');
 const READ_PAUSE = 6000; // ms a finished act stays on screen
+const PAUSE_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="3" width="3" height="10" rx="1"/><rect x="9" y="3" width="3" height="10" rx="1"/></svg>';
+const PLAY_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3v10l8-5z"/></svg>';
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 
 if (term && !still.matches) play(term);
@@ -138,8 +140,9 @@ function play(term) {
   const setPaused = (p) => {
     paused = p;
     if (!pauseBtn) return;
-    pauseBtn.textContent = p ? 'play' : 'pause';
+    pauseBtn.innerHTML = p ? PLAY_ICON : PAUSE_ICON;
     pauseBtn.setAttribute('aria-label', p ? 'play' : 'pause');
+    pauseBtn.title = p ? 'play' : 'pause';
   };
   // Start act `i` over: the old loop's parked or running wait sees the new
   // run and ends.

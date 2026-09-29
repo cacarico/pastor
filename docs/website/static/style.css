@@ -81,11 +81,12 @@ b, strong { font-weight: 700; color: var(--hot); }
 /* its controls sit on the pane's top border, like the title on the left */
 .term-ctl { position: absolute; top: -.85em; right: 1ch; display: flex; align-items: center; gap: 1ch; padding: 0 1ch; background: var(--bg); }
 .term-ctl[hidden] { display: none; }
-.term-ctl .act { width: 11px; height: 11px; padding: 0; border: 1px solid var(--dim); border-radius: 50%; background: transparent; cursor: pointer; }
+.term-ctl .act { width: 11px; height: 11px; padding: 0; border: 1.5px solid var(--ink); border-radius: 50%; background: transparent; cursor: pointer; }
 .term-ctl .act.on { background: var(--accent); border-color: var(--accent); }
 .term-ctl .act:hover, .term-ctl .act:focus-visible { border-color: var(--accent); outline: none; }
-.term-ctl .btn { font: inherit; font-size: 12px; line-height: 1.5; min-width: 7ch; text-align: center; color: var(--ink); background: var(--sel); border: 1px solid var(--line); border-radius: 4px; padding: 0 .8ch; cursor: pointer; }
-.term-ctl .btn:hover, .term-ctl .btn:focus-visible { border-color: var(--accent); color: var(--sel-ink); outline: none; }
+.term-ctl .btn { display: grid; place-items: center; width: 22px; height: 20px; padding: 0; color: var(--dim); background: var(--code); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+.term-ctl .btn svg { width: 12px; height: 12px; fill: currentColor; }
+.term-ctl .btn:hover, .term-ctl .btn:focus-visible { color: var(--accent); border-color: var(--accent); outline: none; }
 .term-ctl .act + .btn { margin-left: 1ch; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
