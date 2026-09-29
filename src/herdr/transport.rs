@@ -1285,6 +1285,17 @@ mod tests {
         );
         assert_eq!(remote_restore_answer("t", &out(128, "")).unwrap(), None);
         assert!(remote_restore_answer("t", &out(255, "")).is_err());
+        // "added" or "no-branch" only count when the shell that printed them
+        // also exited zero: a nonzero exit with that word on stdout (a `set
+        // -e` shell can still print before failing) is neither outcome.
+        assert_eq!(
+            remote_restore_answer("t", &out(1, "added\n")).unwrap(),
+            None
+        );
+        assert_eq!(
+            remote_restore_answer("t", &out(1, "no-branch\n")).unwrap(),
+            None
+        );
     }
 
     /// Everything that reaches the remote shell is quoted.
@@ -1324,6 +1335,8 @@ mod tests {
         );
         assert_eq!(remote_unpushed_answer("t", &out(128, "")).unwrap(), None);
         assert!(remote_unpushed_answer("t", &out(255, "")).is_err());
+        // A parseable count on a nonzero exit is not a real answer either.
+        assert_eq!(remote_unpushed_answer("t", &out(1, "2\n")).unwrap(), None);
     }
 
     /// Against a real git: a commit is unpushed until a remote has it.
@@ -1369,6 +1382,55 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// Against a real git: an existing branch gets its worktree back, a
+    /// gone branch is reported rather than failing.
+    #[tokio::test]
+    async fn a_local_checkout_restores_a_removed_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{args:?}: {st:?}");
+        };
+        git(&["init", "-q", "work"]);
+        git(&["-C", "work", "commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&["-C", "work", "branch", "feature"]);
+        let ep = Endpoint::Local {
+            session: "s".into(),
+        };
+        let repo = dir.path().join("work");
+        let repo = repo.to_str().unwrap();
+        let wt = dir.path().join("wt");
+        assert_eq!(
+            ep.restore_worktree(repo, wt.to_str().unwrap(), "feature")
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert!(wt.join(".git").exists());
+        let wt2 = dir.path().join("wt2");
+        assert_eq!(
+            ep.restore_worktree(repo, wt2.to_str().unwrap(), "no-such-branch")
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert!(!wt2.exists());
     }
 
     /// Only ssh itself failing (255, or killed) means the machine was not
