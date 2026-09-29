@@ -584,7 +584,14 @@ max_agents = 3
 name = "pi-3"
 ssh = "user@pi-3"
 flock = "work"            # the old way: in work, with pi-3's own limits
+
+[[machine]]
+name = "laptop"
+pull = true               # never connected to: its headless serve claims tasks
 ```
+
+Each machine sets exactly one of `local`, `ssh`, `command` and `pull` (see
+[Pull machines](#pull-machines)).
 
 A flock's `machines` names the machines it may use, each with its number
 there: at most how many of the flock's live tasks that machine runs. Dispatch
@@ -2701,6 +2708,33 @@ Without a service, `pastor serve` starts it in the background, and `pastor
 serve status` and `stop` work on it as on a head. The head
 needs IPC protocol 7 or later for `job_submit`.
 
+### Pull machines
+
+A machine the head cannot reach over ssh, a laptop behind NAT say, can still
+run tasks: the head's flock.toml has it as `pull = true`, and its own
+headless serve asks the head for work. The head never connects to it and
+runs no actor for it; `machine list` shows its HOST as `pull`.
+
+- Each tick the headless serve sends `task_claim` to ask for more work, a
+  few tasks at most. The head decides how many from its own view of the
+  machine (`max_agents`, job slots, burst, flock room) and hands out the
+  queued tasks pinned to it first, then, when it takes flock work, any task
+  its flocks would place there now; each is `starting` on the machine before
+  the reply. The serve runs them on this machine's
+  herdr with the same machine actor the head runs, and sends every change
+  back as `task_report`. The head needs IPC protocol 21 or later.
+- `task run --machine <name>` (or a job's `machine`) sends a task to a pull
+  machine as to any other. There is no `task run` flag of its own for this.
+- A pull machine takes only the tasks pinned to it unless `[shepherd]
+  takes_flock_work = true` in its pastor.toml, or `PASTOR_SHEPHERD_FLOCK_WORK`
+  is `1` or `true` in the serve's environment.
+- `[shepherd] machine` is its name in the head's flock.toml, the hostname
+  when unset.
+- A pull machine that sends neither a claim nor a report for
+  `pull_lost_after` (head's pastor.toml, default `10m`) is lost, and its
+  `starting` and `running` tasks go stale, as for any lost machine. The
+  clock starts when the head does.
+
 ### Jobs on a shepherd
 
 With a head set, `pastor job list` shows two tables: the head's jobs under
@@ -3094,6 +3128,7 @@ reconcile_every = "60s"
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "5s"      # a done task's pane closes after this; "never" keeps it
+pull_lost_after = "10m"      # a pull machine silent this long is lost, its tasks stale
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
 max_orchestrators = 1        # orchestrator agents at once, outside max_agents
 # head_address = "user@head.example"  # unset by default; see below
@@ -3127,6 +3162,10 @@ allow = ["Bash(docker:*)"]       # added to what it extends
 deny = []                        # added too; wins over any allow
 [[watch.connector]]          # connectors `pastor watch` runs; none by default
 name = "prs"
+[shepherd]                   # read by this machine's headless serve; see Pull machines
+# machine = "laptop"         # its name in the head's flock.toml; unset: the hostname
+takes_flock_work = false     # true: also its flocks' unpinned tasks, not only those pinned here
+# command = ["fake-herdr"]   # developer option: argv speaking herdr on stdio; unset: this herdr
 ```
 
 `head_address` is the ssh destination other machines reach the head by. When
