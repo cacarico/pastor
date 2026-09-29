@@ -81,6 +81,7 @@ see the [`task run` flags](../cli/#task) and
 | `place` | `"repo"` | where a task's pane goes: `repo`, `own`, `pastor` or `pane:<workspace>` |
 | `label` | unset | the task's workspace name template; unset is `"{{ flock }}/{{ task.id }}"` |
 | `summary` | unset | `ask`, `require` or `off`; unset is `ask` |
+| `keep_pane` | unset | `true` keeps a task's pane once it ends, until `pastor task close`; unset is no |
 
 `allow` and `deny` add up across layers instead of replacing each other:
 `[defaults]`, then the flock, then the task or job. A pattern denied in any

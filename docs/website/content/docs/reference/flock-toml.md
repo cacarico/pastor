@@ -91,6 +91,7 @@ Set exactly one of `ssh`, `local`, `pull` and `command`. Unknown keys in a
 | `place` | unset | where its tasks' panes go: `repo`, `own`, `pastor` or `pane:<workspace>` |
 | `label` | unset | the workspace name template for its tasks |
 | `summary` | unset | `ask`, `require` or `off` for its tasks |
+| `keep_pane` | unset | `true` keeps its tasks' panes once they end, until `pastor task close` |
 | `description` | unset | one line on what it is for, for `pastor flock list --wide` |
 
 Unknown keys in a `[[flock]]` are refused. Each key applies when the task or

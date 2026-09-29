@@ -253,6 +253,10 @@ pub struct FlockEntry {
     /// `[defaults] summary`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<crate::task::SummaryMode>,
+    /// Whether this flock's tasks keep their pane once they end, when the
+    /// task and its job say nothing; before `[defaults] keep_pane`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_pane: Option<bool>,
     /// One line on what the flock is for (`flock list --wide`, `describe`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -2334,6 +2338,31 @@ tags = ["fast"]
         std::fs::write(&path, "").unwrap();
         let f = Flock::load_existing(&path).unwrap();
         assert!(f.machines.is_empty());
+    }
+
+    /// A flock's `keep_pane` is a yes or no; a flock without it leaves it
+    /// to `[defaults]`, and a misspelt key is a load error.
+    #[test]
+    fn a_flock_keep_pane_is_a_bool() {
+        let flock = |extra: &str| {
+            Flock::parse(
+                Path::new("flock.toml"),
+                &format!(
+                    "[[flock]]\nname = \"p\"\ndefault = true\n{extra}\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"p\"\n"
+                ),
+            )
+        };
+        assert_eq!(flock("").unwrap().entry("p").unwrap().keep_pane, None);
+        assert_eq!(
+            flock("keep_pane = true")
+                .unwrap()
+                .entry("p")
+                .unwrap()
+                .keep_pane,
+            Some(true)
+        );
+        assert!(flock("keep_pane = \"yes\"").is_err());
+        assert!(flock("keep_panes = true").is_err());
     }
 
     /// A flock's `summary` is one of its words; a flock without it leaves

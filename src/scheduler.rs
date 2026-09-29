@@ -1892,6 +1892,8 @@ mod tests {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
             },
             agent: Default::default(),
             flock: None,

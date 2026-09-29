@@ -244,6 +244,17 @@ pub struct DispatchSpec {
     /// false, so a spec from before it reads as a plain task.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub now: bool,
+    /// Whether pastor leaves the task's pane open once the task is done,
+    /// failed or stale, until someone runs `pastor task close`. Before the
+    /// task is queued, what `task run --keep-pane` or a job's `[dispatch]
+    /// keep_pane` asked for; once queued, what the first of those, the
+    /// flock and `[defaults]` said (`Defaults::resolve_keep_pane`). `None`
+    /// when no layer set it, which is no.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_pane: Option<bool>,
+    /// Where `keep_pane` came from, labelled like `AgentSource::agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_pane_from: Option<String>,
 }
 
 /// The label template a task's own workspace gets when no layer sets one.
@@ -561,6 +572,11 @@ impl DispatchSpec {
     /// The permission profile the task runs under, if it runs one.
     pub fn profile(&self) -> Option<&str> {
         self.agent_source.as_ref()?.profile.as_deref()
+    }
+
+    /// Whether auto-close leaves the task's pane alone (`keep_pane`).
+    pub fn keeps_pane(&self) -> bool {
+        self.keep_pane == Some(true)
     }
 }
 
@@ -1402,6 +1418,8 @@ pub(crate) mod tests {
                 label: Default::default(),
                 summary: Default::default(),
                 cwd: None,
+                keep_pane: None,
+                keep_pane_from: None,
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),

@@ -161,9 +161,19 @@ pub fn task_rows(tasks: &[Task]) -> Vec<Vec<String>> {
         .iter()
         .map(|t| {
             let note = task_note(t);
+            // A done task whose pane pastor left open on purpose: someone
+            // may still be talking to its agent.
+            let state = if t.state == crate::task::TaskState::Done
+                && t.spec.keeps_pane()
+                && t.pane_id.is_some()
+            {
+                format!("{} (kept)", t.state)
+            } else {
+                t.state.to_string()
+            };
             vec![
                 t.display_id(),
-                t.state.to_string(),
+                state,
                 t.priority.to_string(),
                 t.machine.clone().unwrap_or_else(|| "-".into()),
                 t.flock.clone().unwrap_or_else(|| "-".into()),
@@ -375,6 +385,14 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
             ),
         ),
         ("label", label),
+        (
+            "keep pane",
+            format!(
+                "{}{}",
+                if t.spec.keeps_pane() { "yes" } else { "no" },
+                from(t.spec.keep_pane_from.as_ref())
+            ),
+        ),
         ("tags", tags),
         (
             "timeout",
@@ -1343,6 +1361,8 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -1415,6 +1435,8 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -1606,6 +1628,29 @@ mod tests {
         );
     }
 
+    /// `task describe` says whether the task keeps its pane and where that
+    /// came from, `--json` carries both, and `task list` marks a done task
+    /// whose pane was kept.
+    #[test]
+    fn keep_pane_shows_with_where_it_came_from_and_marks_the_list() {
+        use crate::task::TaskState;
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        t.state = TaskState::Done;
+        t.pane_id = Some("p1".into());
+        let out = task_detail(&t);
+        assert!(out.contains("keep pane:  no\n"), "{out}");
+        assert_eq!(task_rows(std::slice::from_ref(&t))[0][1], "done");
+        t.spec.keep_pane = Some(true);
+        t.spec.keep_pane_from = Some("task run".into());
+        let out = task_detail(&t);
+        assert!(out.contains("keep pane:  yes (from task run)\n"), "{out}");
+        assert_eq!(task_rows(std::slice::from_ref(&t))[0][1], "done (kept)");
+        assert_eq!(t.to_json()["spec"]["keep_pane"], true);
+        assert_eq!(t.to_json()["spec"]["keep_pane_from"], "task run");
+        t.state = TaskState::Running;
+        assert_eq!(task_rows(std::slice::from_ref(&t))[0][1], "running");
+    }
+
     /// `task describe` gives the workspace label and where it came from:
     /// the template until dispatch names the workspace, then that name,
     /// with a note when it joined a workspace or fell back to `t-N`.
@@ -1700,6 +1745,8 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
         });
         let out = task_detail(&t);
         assert!(
@@ -1738,6 +1785,8 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);
@@ -1787,6 +1836,8 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
         let note = task_rows(std::slice::from_ref(&t))[0]
@@ -1820,6 +1871,8 @@ mod tests {
             label: Default::default(),
             summary: Default::default(),
             cwd: None,
+            keep_pane: None,
+            keep_pane_from: None,
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
         let out = task_detail(&t);
