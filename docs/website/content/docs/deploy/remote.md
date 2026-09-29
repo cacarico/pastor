@@ -125,10 +125,12 @@ machine:
    `pastor setup systemd --stop`.
 2. Copy `flock.toml`, `pastor.toml`, `jobs/`, `orchestrators/` and each
    `connectors/<id>/.env` from `~/.config/pastor/`, and `pastor.db`,
-   `orchestrators/` and, for the history, `events.jsonl` from
-   `~/.local/state/pastor/`, to the same places on `server-1`. Without
-   `orchestrators/` in both, the new head has no orchestrators, or starts
-   them with no state or note. Install the connectors the jobs use there.
+   `orchestrators/`, `connectors/` and, for the history, `events.jsonl` and
+   `events.jsonl.1` (if present) from `~/.local/state/pastor/`, to the same
+   places on `server-1`. Without `orchestrators/` in both, the new head has
+   no orchestrators, or starts them with no state or note; without
+   `connectors/` in both, a connector loses whatever scratch it kept in
+   `PASTOR_CONNECTOR_STATE_DIR`. Install the connectors the jobs use there.
    Delete the job files from `laptop`, or they run there as well.
 3. On `server-1`, in the copied flock.toml, make `server-1` `local = true`
    and `laptop` `pull = true`. In pastor.toml, set `head_address` to the

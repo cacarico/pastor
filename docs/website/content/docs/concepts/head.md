@@ -84,10 +84,13 @@ is whole in one file. Then keep:
 | `~/.config/pastor/` | flocks, settings, jobs, orchestrators, and each connector's `.env` |
 | `~/.local/state/pastor/pastor.db` | tasks, summaries, seen items, job state, saved trust |
 | `~/.local/state/pastor/orchestrators/` | each orchestrator's state and handover note |
-| `~/.local/state/pastor/events.jsonl` | the history, if you want it |
+| `~/.local/state/pastor/connectors/` | each connector's own scratch (`PASTOR_CONNECTOR_STATE_DIR`), kept across uninstall/reinstall |
+| `~/.local/state/pastor/events.jsonl` and `events.jsonl.1` | the history, if you want it |
 
-Connectors themselves reinstall with `pastor connector install`. The same
-list is what a move to another machine copies: see
+Connector checkouts themselves reinstall with `pastor connector install`, but
+their scratch under `~/.local/state/pastor/connectors/` does not come back on
+its own; back it up if a connector keeps state there it can't rebuild. The
+same list is what a move to another machine copies: see
 [move the head](../../deploy/remote/#move-the-head).
 
 ## one head, or a headless serve
