@@ -1873,6 +1873,7 @@ mod tests {
             backfill: Duration::from_secs(600),
             summary: None,
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],

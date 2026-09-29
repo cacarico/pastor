@@ -31,6 +31,7 @@ fn task(id: i64) -> Task {
             item: serde_json::json!({"key": "k"}),
             prompt: "p".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],
@@ -256,12 +257,14 @@ async fn the_daemon_writes_the_events_log() {
     let resp = pastor::ipc::request(
         &socket,
         &IpcRequest::Run {
+            now: false,
             role: Default::default(),
             preempt: false,
             summary: None,
             description: None,
             prompt: "hi".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],

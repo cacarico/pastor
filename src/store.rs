@@ -947,7 +947,8 @@ impl Store {
             // finished by another writer in between is not retried. The copy
             // keeps the level (the one it had before it aged: the copy waits
             // afresh), its role, description and where it came from,
-            // but queues last in it.
+            // but queues last in it, and waits for a slot even when the task
+            // it copies ran with `--now`.
             let n = tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, role, description, state, retry_of, priority, priority_from, preempt, created_at, updated_at)
              SELECT job, item, prompt,
@@ -959,7 +960,7 @@ impl Store {
                                                    'path', json_extract(spec, '$.checkout.path'),
                                                    'agent', COALESCE(agent_name, 't-' || id)))
                          ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
-                         '$.session_id', '$.label.name', '$.label.note'), ?3),
+                         '$.session_id', '$.label.name', '$.label.note', '$.now'), ?3),
                     flock, role, description, 'queued', id, COALESCE(aged_from, priority), priority_from, preempt, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
@@ -2011,6 +2012,7 @@ mod tests {
 
     fn spec() -> DispatchSpec {
         DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec!["--model".into(), "x".into()],
             allow: vec![],
@@ -2962,6 +2964,19 @@ mod tests {
             .unwrap();
         set_state(&s, t.id, TaskState::Failed);
         assert!(s.insert_retry(t.id).unwrap().pause.preempt);
+    }
+
+    /// A retry of a `task run --now` task goes through the queue: only
+    /// the person's own run skips it.
+    #[test]
+    fn a_retry_drops_now() {
+        let s = Store::open_in_memory().unwrap();
+        let mut new = new_task("run");
+        new.spec.now = true;
+        let t = s.insert_task(new).unwrap();
+        assert!(t.spec.now);
+        set_state(&s, t.id, TaskState::Failed);
+        assert!(!s.insert_retry(t.id).unwrap().spec.now);
     }
 
     /// A v8 database has no description column: opening it adds one, and

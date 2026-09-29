@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 /// Where a code is written right after: the constructors of an error with a
 /// code, and the `(code, message)` pairs that become one.
-const CODE_SITES: [&str; 7] = [
+const CODE_SITES: [&str; 8] = [
     "CliError::err(",
     "IpcResponse::error(",
     "ReopenError::new(",
@@ -12,6 +12,7 @@ const CODE_SITES: [&str; 7] = [
     " fail(",
     "Err((",
     "unwrap_or((",
+    "refuse(",
 ];
 
 /// Where a `(code, message)` pair may start, in a match arm or a closure.

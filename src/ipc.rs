@@ -35,8 +35,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// `FlockEntry::place`). 25: session orchestrators (`OrchestratorStart`,
 /// `OrchestratorStop`). 26: a flock's share and max on a machine
 /// (`FlockNumber::Split`, `FlockSeat::share`). 27: fallback models
-/// (`AgentChoice::fallback`, a job's `[dispatch] fallback`).
-pub const IPC_PROTOCOL: u32 = 27;
+/// (`AgentChoice::fallback`, a job's `[dispatch] fallback`). 28: `task run
+/// --now` (`Run::now`, `MachineStatus::now`).
+pub const IPC_PROTOCOL: u32 = 28;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -195,6 +196,10 @@ pub const QUEUE_PROTOCOL: u32 = 14;
 /// and it would wait behind low work, without a word.
 pub const PREEMPT_PROTOCOL: u32 = 16;
 
+/// The first protocol whose head honours `Run::now`. An older one would
+/// queue the task behind the machine's limits without a word.
+pub const NOW_PROTOCOL: u32 = 28;
+
 /// The first protocol whose head keeps what `task done --summary` sends and
 /// knows `TaskSummaries`. An older one would drop the summary without a
 /// word, or refuse the request as unreadable.
@@ -247,6 +252,7 @@ const PRIORITY: &str =
 const ROLE: &str = "predates task roles and permission profiles, and would start a plain agent without them instead of an orchestrator";
 const DESCRIPTION: &str = "predates descriptions and would drop the description";
 const PREEMPT: &str = "predates pausing a low task, and would queue the task without --preempt";
+const NOW: &str = "predates --now, and would queue the task behind the machine's limits";
 const LABEL: &str = "predates workspace labels and would name the workspace t-N";
 const SUMMARY_MODE: &str =
     "predates the summary setting, and would queue the task without --summary";
@@ -406,6 +412,13 @@ pub enum IpcRequest {
         /// `SUMMARY_MODE_PROTOCOL` or later.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<crate::task::SummaryMode>,
+        /// `task run --now`: start the task at once on its pinned machine,
+        /// past that machine's limits. The head sets `DispatchSpec::now`
+        /// from this alone, whatever `spec` says. Left out when not given,
+        /// so an older head still reads the request; given, the CLI sends
+        /// it only to a head of `NOW_PROTOCOL` or later.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        now: bool,
     },
     List {
         filter: TaskFilter,
@@ -734,6 +747,7 @@ impl IpcRequest {
                 preempt,
                 summary,
                 spec,
+                now,
                 ..
             } => {
                 // A run with a role needs roles as much as profiles, and
@@ -769,6 +783,9 @@ impl IpcRequest {
                 }
                 if summary.is_some() {
                     need.at(SUMMARY_MODE_PROTOCOL, SUMMARY_MODE);
+                }
+                if *now {
+                    need.at(NOW_PROTOCOL, NOW);
                 }
             }
             R::Tick { dry_run, .. } => {
@@ -1473,6 +1490,7 @@ mod tests {
             item: serde_json::Value::Null,
             prompt: "hi".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],
@@ -1731,6 +1749,7 @@ mod tests {
     fn fleet_changes() -> Vec<IpcRequest> {
         vec![
             IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 description: None,
@@ -1906,6 +1925,7 @@ mod tests {
     #[test]
     fn run_names_its_role_only_when_not_a_plain_agent() {
         let run = |role| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt: "p".into(),
@@ -2115,6 +2135,7 @@ mod tests {
                 PREEMPT_PROTOCOL,
                 "preempt",
             ),
+            (run(serde_json::json!({"now": true})), NOW_PROTOCOL, "--now"),
             (
                 req(serde_json::json!({"op": "task_done", "id": 1, "summary": "s"})),
                 SUMMARY_PROTOCOL,
@@ -2220,6 +2241,7 @@ mod tests {
             DESCRIPTION_PROTOCOL,
             QUEUE_PROTOCOL,
             PREEMPT_PROTOCOL,
+            NOW_PROTOCOL,
             SUMMARY_PROTOCOL,
             LABEL_PROTOCOL,
             SUMMARY_MODE_PROTOCOL,

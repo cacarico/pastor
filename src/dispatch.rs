@@ -151,6 +151,33 @@ pub fn pick_machine_where(
         .map(|m| m.name.clone())
 }
 
+/// Where a `task run --now` task (`DispatchSpec::now`) goes: its pinned
+/// machine, if it is healthy, is still in the task's flock, has the task's
+/// tags and `accepts` it, however many tasks it runs. `max_agents`, job
+/// slots, burst and the flock's number there are not looked at: the person
+/// who pinned it chose to run past them, but not to run in another flock.
+/// `queue_run_as` checked membership before the row was inserted, under a
+/// lock it releases before placement, so it is checked again here in case a
+/// flock edit moved the machine in between.
+pub fn now_machine(
+    machines: &[MachineView],
+    flock: &str,
+    spec: &DispatchSpec,
+    accepts: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let pinned = spec.machine.as_ref()?;
+    machines
+        .iter()
+        .find(|m| &m.name == pinned)
+        .filter(|m| {
+            m.healthy
+                && m.in_flock(flock)
+                && spec.tags.iter().all(|t| m.tags.contains(t))
+                && accepts(&m.name)
+        })
+        .map(|m| m.name.clone())
+}
+
 /// Fill each view's `waiting_under_share` for placing a task of `flock`: on
 /// a machine where `flock` is past its share and under its max, the other
 /// flocks under their share there that have a task in `later` the machine
@@ -1202,6 +1229,7 @@ mod tests {
 
     fn spec() -> DispatchSpec {
         DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec!["--model".into(), "opus".into()],
             allow: vec![],
@@ -1476,6 +1504,89 @@ mod tests {
             pick_machine(&ms, "default", &spec(), JOB).as_deref(),
             Some("a"),
             "a's job slot is room for a job task, and a has fewest live"
+        );
+    }
+
+    /// `task run --now` takes its pinned machine whatever its count, even
+    /// past `max_agents`, burst and the flock's number there, so long as it
+    /// is healthy, has the task's tags and `accepts` it.
+    #[test]
+    fn now_machine_takes_the_pin_past_its_limits() {
+        let full = MachineView {
+            flocks: vec![seat("default", Some(1), 3)],
+            ..mv("a", 2, 3, &["fast"], true)
+        };
+        let ms = vec![full, mv("b", 2, 0, &[], false)];
+        let now = |machine: &str, tags: &[&str]| DispatchSpec {
+            machine: Some(machine.into()),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            now: true,
+            ..spec()
+        };
+        assert_eq!(
+            pick_machine(&ms, "default", &now("a", &[]), Claim::default()),
+            None,
+            "the queue would wait"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("a", &["fast"]), &|_| true).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("b", &[]), &|_| true),
+            None,
+            "unhealthy"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("a", &["gpu"]), &|_| true),
+            None,
+            "tags"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("a", &[]), &|_| false),
+            None,
+            "refused"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now("zzz", &[]), &|_| true),
+            None
+        );
+        let unpinned = DispatchSpec {
+            machine: None,
+            ..now("a", &[])
+        };
+        assert_eq!(
+            now_machine(&ms, "default", &unpinned, &|_| true),
+            None,
+            "needs a pin"
+        );
+    }
+
+    /// A `--now` task still needs its pinned machine to be in its flock: a
+    /// flock edit between `queue_run_as` (which checked membership before
+    /// the row was inserted) and placement must not start it in a flock it
+    /// no longer belongs to (GPT review on #103, finding 2).
+    #[test]
+    fn now_machine_requires_the_pin_still_be_in_the_flock() {
+        let a = MachineView {
+            flocks: vec![seat("work", Some(1), 3)],
+            ..mv("a", 2, 3, &["fast"], true)
+        };
+        let ms = vec![a];
+        let now = DispatchSpec {
+            machine: Some("a".into()),
+            now: true,
+            ..spec()
+        };
+        assert_eq!(
+            now_machine(&ms, "work", &now, &|_| true).as_deref(),
+            Some("a"),
+            "a is in work"
+        );
+        assert_eq!(
+            now_machine(&ms, "default", &now, &|_| true),
+            None,
+            "a moved out of default, or was never in it"
         );
     }
 

@@ -1563,6 +1563,7 @@ impl Runner {
             })
             .as_secs();
         let spec = DispatchSpec {
+            now: false,
             agent: pick.agent,
             agent_args: pick.agent_args,
             allow: pick.allow,
@@ -2834,6 +2835,7 @@ prompt = "You are the night orchestrator."
                     item: serde_json::Value::Null,
                     prompt: "plan".into(),
                     spec: DispatchSpec {
+                        now: false,
                         agent: "claude".into(),
                         agent_args: vec![],
                         allow: vec![],

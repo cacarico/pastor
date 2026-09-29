@@ -269,6 +269,11 @@ struct RunArgs {
     /// task there (its session resumes when a slot frees) and take its slot
     #[arg(long)]
     preempt: bool,
+    /// Start at once on --machine (which it needs), skipping the queue and
+    /// running past that machine's max_agents, job slots, burst and flock
+    /// number; for a person at the CLI, never a task or an orchestrator
+    #[arg(long, conflicts_with = "preempt")]
+    now: bool,
     /// Run under this permission profile, built in or from `[profiles]` in
     /// pastor.toml: a Claude agent gets its allow and deny lists and never
     /// asks (default: the flock's, else the machine's, else `[defaults]
@@ -1421,6 +1426,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
             description: pastor::config::clean_description(a.description.as_deref()),
             preempt: a.preempt,
             summary: a.summary,
+            now: a.now,
         },
     )
     .await?;
@@ -1466,6 +1472,7 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
         .unwrap_or(config.timeout_duration());
     let pick = config.defaults.resolve_agent(&agent_choice(a), None);
     Ok(DispatchSpec {
+        now: false,
         agent: pick.agent,
         agent_args: pick.agent_args,
         allow: pick.allow,
@@ -1591,6 +1598,7 @@ async fn probe_machine(
     // there, rather than probing whatever herdr runs here.
     if m.pull {
         return Ok(pastor::cli::MachineRow {
+            now: Vec::new(),
             name: m.name.clone(),
             host: "pull".into(),
             endpoint: pastor::machine::PULL_ENDPOINT.into(),
@@ -1634,6 +1642,7 @@ async fn probe_machine(
     };
     let (channel, herdr_version, protocol, live, error) = probe_fields(ping, agent_count);
     Ok(pastor::cli::MachineRow {
+        now: Vec::new(),
         name: m.name.clone(),
         host: ep.host(),
         endpoint: ep.describe(),
@@ -3313,6 +3322,26 @@ mod tests {
         ] {
             assert!(changes_fleet(&parse(argv)), "{argv:?}");
         }
+    }
+    /// `task run --now` does not go with `--preempt`, which only matters to
+    /// a task that waits.
+    #[test]
+    fn now_does_not_go_with_preempt() {
+        assert!(
+            Cli::try_parse_from([
+                "pastor",
+                "task",
+                "run",
+                "hi",
+                "--now",
+                "--machine",
+                "a",
+                "--priority",
+                "critical",
+                "--preempt"
+            ])
+            .is_err()
+        );
     }
     /// `task run --summary` takes the modes a task can have, not `always`.
     #[test]

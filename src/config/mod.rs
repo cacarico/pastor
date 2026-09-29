@@ -2975,6 +2975,7 @@ mod tests {
 
     fn spec_with(agent: &str, allow: &[&str], deny: &[&str]) -> crate::task::DispatchSpec {
         crate::task::DispatchSpec {
+            now: false,
             agent: agent.into(),
             agent_args: vec!["--model".into(), "m".into()],
             allow: allow.iter().map(|s| s.to_string()).collect(),

@@ -182,6 +182,7 @@ const SUMMARY: &[(&str, &str)] = &[
 
 fn spec() -> DispatchSpec {
     DispatchSpec {
+        now: false,
         agent: "claude".into(),
         agent_args: vec![],
         allow: vec![],
@@ -436,6 +437,7 @@ const MACHINE: &[(&str, &str)] = &[
     ("live", "number|null"),
     ("max_agents", "number"),
     ("name", "string"),
+    ("now", "array"),
     ("orphans", "array"),
     ("pastor_version", "string|null"),
     ("profile", "string|null"),
@@ -443,11 +445,13 @@ const MACHINE: &[(&str, &str)] = &[
     ("tags", "array"),
 ];
 
-/// Left out of a machine's JSON when it is in no named flock.
-const MACHINE_MAY_BE_ABSENT: &[&str] = &["flocks"];
+/// Left out of a machine's JSON when it is in no named flock, or starts
+/// no `--now` task.
+const MACHINE_MAY_BE_ABSENT: &[&str] = &["flocks", "now"];
 
 fn machine_row() -> MachineRow {
     MachineRow {
+        now: vec!["t-9".into()],
         name: "pi-1".into(),
         host: "user@pi-1".into(),
         endpoint: "ssh user@pi-1".into(),
@@ -477,6 +481,7 @@ fn machine_row() -> MachineRow {
 /// A machine never reached, in no named flock, with nothing optional set.
 fn bare_machine_row() -> MachineRow {
     MachineRow {
+        now: Vec::new(),
         name: "pi-1".into(),
         host: "user@pi-1".into(),
         endpoint: "ssh user@pi-1".into(),

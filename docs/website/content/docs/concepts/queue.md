@@ -107,6 +107,27 @@ flock under its number there, the task resumes its own Claude session.
 Only a running `low` Claude task with a recorded session is ever paused; a
 `normal` task, another agent, or a blocked or done task never is.
 
+## start it now
+
+When a task cannot wait and you know where it should go, `--now` skips the
+queue altogether:
+
+```sh
+pastor task run "Prod is down: find out why" --machine server-1 --now
+```
+
+It starts on `server-1` at once, past its `max_agents`, job slots, burst
+and its flock's number there, and pauses nothing. It needs `--machine`
+(`now_needs_machine` without it), and that machine connected
+(`machine_not_connected`). If the machine still does not take it, the task
+is closed rather than queued (`now_not_started`). While it runs it counts on
+the machine, so the queue waits until the count is back under the limits;
+`machine list` shows it as `4/3 now:t-22`, and `task list` starts its NOTE
+with `now:`.
+
+Only a person may: a job has no such key, a retry of the task queues as
+usual, and an agent or orchestrator gets `now_refused`.
+
 Read on: [urgent work first](../../examples/urgent-first/) puts levels and
 preempting to work; the commands are in the
 [cli reference](../../reference/cli/#queue).
