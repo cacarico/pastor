@@ -51,3 +51,15 @@ target = "data"
 [[module.mounts]]
 source = "../../Cargo.toml"
 target = "data/cargo.toml"
+
+# llms.txt (https://llmstxt.org) at the site's root, for agents: the docs
+# pages in reading order, rendered from layouts/home.llms.txt, so it lists
+# the same pages the nav does and cannot drift from them.
+[outputFormats.llms]
+mediaType = "text/plain"
+baseName = "llms"
+isPlainText = true
+notAlternative = true
+
+[outputs]
+home = ["html", "llms"]

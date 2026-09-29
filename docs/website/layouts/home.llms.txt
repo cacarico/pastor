@@ -1,0 +1,17 @@
+{{- /* Links are relative to this file, which sits at the site's root, so
+       they work under cacari.co/pastor/ and anywhere else it is served. */ -}}
+# pastor
+
+> An agent orchestrator for a flock of machines: queue tasks, schedule jobs, and let pastor spread coding agents (Claude Code, Codex, opencode) across machines you own over ssh, through herdr.
+
+Every page below is short, one topic each. For driving pastor as an agent, `pastor --skill` prints the guide for the installed version, and `--json` on every `list` and `describe` gives machine-readable output.
+{{ range (site.GetPage "/docs").Sections.ByWeight }}
+## {{ .Title }}
+{{ range .Pages.ByWeight }}
+- [{{ .Title }}]({{ strings.TrimPrefix "/" .RelPermalink }}): {{ .Params.summary }}
+{{- end }}
+{{ end }}
+## Optional
+
+- [Manual]({{ site.Params.repo }}/blob/main/docs/manual.md): the full manual, one page, kept in the repo for agents
+- [Source]({{ site.Params.repo }}): the repository
