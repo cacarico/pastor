@@ -1862,6 +1862,21 @@ pub(crate) mod tests {
                                 "done needs activity or completion_seq: {case}"
                             );
                             assert!(!t.prompt_pending, "prompt_pending is never done: {case}");
+                            // A status only completes on a sequence strictly
+                            // past the baseline: the completion one when the
+                            // agent gave it, the state-change one otherwise.
+                            if let Observed::Status {
+                                state_change_seq,
+                                completion_seq,
+                                ..
+                            } = seen
+                            {
+                                let seq = completion_seq.or(*state_change_seq);
+                                assert!(
+                                    seq.is_some_and(|s| s > baseline.unwrap_or(0)),
+                                    "done needs a sequence past the baseline: {case}"
+                                );
+                            }
                         }
                         checked += 1;
                     }
