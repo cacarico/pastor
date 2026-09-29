@@ -2672,10 +2672,12 @@ run tasks: the head's flock.toml has it as `pull = true`, and its own
 headless serve asks the head for work. The head never connects to it and
 runs no actor for it; `machine list` shows its HOST as `pull`.
 
-- Each tick the headless serve sends `task_claim` with its free slots. The
-  head hands out the queued tasks pinned to it first, then, when it takes
-  flock work, any task its flocks would place there now; each is `starting`
-  on the machine before the reply. The serve runs them on this machine's
+- Each tick the headless serve sends `task_claim` to ask for more work, a
+  few tasks at most. The head decides how many from its own view of the
+  machine (`max_agents`, job slots, burst, flock room) and hands out the
+  queued tasks pinned to it first, then, when it takes flock work, any task
+  its flocks would place there now; each is `starting` on the machine before
+  the reply. The serve runs them on this machine's
   herdr with the same machine actor the head runs, and sends every change
   back as `task_report`. The head needs IPC protocol 21 or later.
 - `task run --machine <name>` (or a job's `machine`) sends a task to a pull

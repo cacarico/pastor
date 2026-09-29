@@ -3651,7 +3651,10 @@ mod tests {
             }
             let want = format!("{key} = {value}");
             assert!(
-                lines.iter().any(|l| l.starts_with(&want)),
+                // Exact value: `max_orchestrators = 10` must not pass for 1.
+                lines.iter().any(|l| l
+                    .strip_prefix(&want)
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))),
                 "the manual's pastor.toml block has no `{want}`"
             );
         }
