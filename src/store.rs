@@ -681,6 +681,19 @@ impl Store {
         self.insert_round(id, row)
     }
 
+    /// `end_round` for a round that ended on a usage limit and handed the
+    /// task to another model: `no summary`, with `limit: <line>` for text.
+    pub fn end_round_on_limit(&self, id: i64, line: &str) -> anyhow::Result<TaskSummary> {
+        let row = TaskSummary {
+            round: 0,
+            outcome: Outcome::NoSummary,
+            text: format!("limit: {line}"),
+            source: SummarySource::Pane,
+            at: Utc::now(),
+        };
+        self.insert_round(id, row)
+    }
+
     /// Store `row` as task `id`'s next round.
     fn insert_round(&self, id: i64, row: TaskSummary) -> anyhow::Result<TaskSummary> {
         blocking(|| {
@@ -2305,6 +2318,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 

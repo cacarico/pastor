@@ -387,6 +387,17 @@ async fn dispatch_steps(
     // checkout.
     let limited = resume && task.waiting_until.take().is_some();
     let restart = limited && spec.session_id.is_none();
+    // What the round that stopped on the limit left; one that went to
+    // another model says how that model learns what it did.
+    let stop = if limited {
+        task.spec.rounds.stop.take()
+    } else {
+        None
+    };
+    let moved = stop.as_deref().filter(|s| s.handover.is_some()).map(|s| {
+        let from = crate::task::agent_and_model(&s.agent, s.model.as_deref());
+        (from, s.tail.clone())
+    });
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
@@ -575,7 +586,16 @@ async fn dispatch_steps(
         }
     };
     // A resumed session already has the line asking for a summary.
-    let prompt = if restart {
+    let to = crate::task::agent_and_model(&task.spec.agent, task.model());
+    let prompt = if let Some((from, tail)) = moved.as_ref().filter(|_| restart) {
+        format!(
+            "{}\n\n{}",
+            crate::task::prompt_to_send(task).trim_end(),
+            crate::task::limit_handover(from, tail)
+        )
+    } else if let Some((from, _)) = &moved {
+        crate::task::switch_prompt(from, &to)
+    } else if restart {
         format!(
             "{}\n\n{}",
             crate::task::prompt_to_send(task).trim_end(),
@@ -1311,6 +1331,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 
@@ -2613,6 +2634,75 @@ mod tests {
         assert!(prompt.ends_with(crate::task::LIMIT_HANDOVER), "{prompt}");
         assert_eq!(t.waiting_until, None);
         assert!(t.spec.session_id.is_some(), "a new session to resume next");
+    }
+
+    /// A waiting task that moved to another model: in the same session with
+    /// the switch line, or, with none, from its prompt with the handover and
+    /// the last agent's pane. Either way the stop is taken.
+    #[tokio::test]
+    async fn a_task_moved_to_another_model_gets_its_handover() {
+        let started = |fake: &FakeHerdr| {
+            let reqs = fake.requests();
+            let find = |m: &str| reqs.iter().rev().find(|r| r.method == m).unwrap().clone();
+            (
+                find("agent.start").params["args"].to_string(),
+                find("agent.prompt").params["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        };
+        let stop = |handover| {
+            Some(Box::new(crate::task::LimitStop {
+                agent: "claude".into(),
+                model: Some("opus".into()),
+                why: "limit".into(),
+                line: "You've hit your limit".into(),
+                until: Utc::now(),
+                tail: "● Half of it is done.\n● You've hit your limit".into(),
+                then: crate::task::NextRound::Own,
+                waited: None,
+                handover: Some(handover),
+            }))
+        };
+        let session = "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21";
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            session_id: Some(session.into()),
+            ..spec()
+        });
+        t.spec.rounds.stop = stop(crate::task::Handover::Session);
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let (args, prompt) = started(&fake);
+        assert!(args.contains(session), "{args}");
+        assert_eq!(
+            prompt,
+            crate::task::switch_prompt("claude (opus)", "claude")
+        );
+        assert_eq!(t.spec.rounds.stop, None);
+
+        let fake = FakeHerdr::new();
+        let mut t = task(spec());
+        t.spec.rounds.stop = stop(crate::task::Handover::PaneTail);
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let (args, prompt) = started(&fake);
+        assert!(args.contains("--session-id"), "{args}");
+        assert!(prompt.starts_with("line one"), "{prompt}");
+        assert!(
+            prompt.ends_with(&crate::task::limit_handover(
+                "claude (opus)",
+                "● Half of it is done.\n● You've hit your limit"
+            )),
+            "{prompt}"
+        );
+        assert!(prompt.contains("git status"), "{prompt}");
+        assert_eq!(t.spec.rounds.stop, None);
     }
 
     /// An agent that dies at its start leaves the end of its pane on the

@@ -371,7 +371,7 @@ enum TaskCmd {
     Run(Box<RunArgs>),
     /// List live tasks across the flock; --all adds finished ones
     List(ListArgs),
-    /// One task in full: state, machine, agent, prompt, error, summary
+    /// One task in full: state, machine, agent, the models it moved through on usage limits, prompt, error, summary
     Describe {
         /// A task, like t-12 or 12
         task: String,
@@ -1527,6 +1527,7 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
         // Only the ask, like `label`.
         keep_pane: a.keep_pane.then_some(true),
         keep_pane_from: None,
+        rounds: Default::default(),
     })
 }
 

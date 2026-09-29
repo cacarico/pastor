@@ -1326,8 +1326,9 @@ settles the model's args again from pastor.toml as it stands.
 #### Fallback models
 
 `fallback` names, in order, the `[models]` a task may go on under when its
-own model runs out. Nothing switches models yet: pastor settles and keeps
-the list, and shows it.
+own model runs out: a new task starts on the first that is free, and a
+running one moves down the list when its model hits a usage limit (see
+[Usage limits](#usage-limits)).
 
 ```toml
 # fragment of flock.toml
@@ -1377,8 +1378,9 @@ from before fallback models refuses `--fallback`, `--no-fallback` and a
 job's `fallback` (`head_too_old`).
 
 A new task goes on under its fallback list when its own model is on an
-exhausted account where it would run; see [Usage limits](#usage-limits).
-A task that is already running does not switch models yet.
+exhausted account where it would run, and a running one moves to its next
+model when it stops on a limit whose reset is not near; see [A limited task
+moves to its next model](#a-limited-task-moves-to-its-next-model).
 
 ### Usage limits
 
@@ -1449,15 +1451,12 @@ clear one only with `agents_change_fleet`.
 
 | key | default | does |
 |---|---|---|
-| `wait_under` | `"1h"` | a limited task waits for a reset closer than this, and falls back past it; `"0s"` never waits |
+| `wait_under` | `"30m"` | a limited task waits for a reset closer than this, and moves to its next model past it; `"0"` never waits when it can move |
 | `rate_retries` | `3` | a task stopped on a 429 or 529 is retried in its pane this many times before it counts as limited |
 | `rate_backoff` | `["1m", "5m", "15m"]` | the wait before each of those retries; the last one repeats |
 | `unknown_reset_wait` | `"1h"` | how long a limit whose message names no reset holds |
 | `retry_after_no_credit` | `"6h"` | how long a limit for no credit holds |
-| `handover_lines` | `100` | the pane lines a task moving to another model hands to it |
-
-`wait_under` and `handover_lines` are read and checked, for a limited
-task's move to its next model, which is to come; the others are used below.
+| `handover_lines` | `60` | the pane lines a task moving to another agent hands to it |
 
 A pull machine's serve reports a limit with its task's state, and the head
 keeps it under the account the task's agent names on that machine. The
@@ -1490,9 +1489,21 @@ The limit goes in the table as above, with `agent.exhausted` and
   until 03:00 (5-hour limit, seen by t-412)`. `task list` shows `waiting
   03:00`; `task describe` has `waiting: until 03:00` and the error as
   `limit:`.
-- `task.waiting` goes out with `why: no_fallback`, the account, the model,
-  `until`, and `shown`, the `waiting 03:00` a board or a notification can
-  print as it is.
+- `task.waiting` goes out with `why` (`no_fallback` for a task with no
+  [fallback models](#fallback-models), `reset_soon` for one whose reset is
+  within `wait_under`), the account, the model, `until`, and `shown`, the
+  `waiting 03:00` a board or a notification can print as it is.
+
+A task with a fallback list waits only when the reset is known and within
+`wait_under` (`30m` by default): a short wait keeps the model and the
+conversation. `task describe` then says why it did not move on:
+
+```text
+waited:     reset in 12m, under wait_under 30m
+```
+
+Any other limit moves it to its next model (below). With no list the task
+waits, whatever the reset: pastor builds no list of its own.
 
 Each dispatch pass looks at the waiting tasks, the soonest first and before
 the queue. One goes on once its `waiting_until` has passed and no live limit
@@ -1510,6 +1521,50 @@ reached it) starts again in the same checkout with its prompt and a
 paragraph saying that an earlier start stopped on a limit and may have left
 work there. If the limit still holds, the agent stops on it again and the
 task waits again.
+
+#### A limited task moves to its next model
+
+A task with [fallback models](#fallback-models) whose reset is unknown or
+further off than `wait_under` goes on under the next model of its list,
+on the same machine, in the same worktree and branch. It is a new round of
+the same task, not a retry: the same id, one row. `wait_under = "0"` never
+waits when a move is possible.
+
+Its pane is closed as for a wait, and the next dispatch pass, which is due
+at once, picks the model: the first after the one it stopped on that its
+machine can run (an agent of the model's kind, as for any model) and whose
+account is not exhausted. The task restarts there once there is room:
+
+- On an agent of the same kind and account (Opus to Sonnet on one Claude
+  login), in the same session: `claude --resume <session>` with the new
+  model's args, and a line telling the agent it hit the limit on the old
+  model and runs on the new one now.
+- Otherwise (Claude to opencode's GPT), a new session with the task's
+  prompt, then a paragraph saying another agent started the task in this
+  worktree and stopped at its limit, to read `git status` and `git log`
+  first, and the last `handover_lines` of that agent's pane.
+
+`task.agent_switched` goes out with `from` and `to` (each an `agent` and a
+`model`), `why` (`limit`, or `rate_limit` for short limits that counted as
+hard), `until` (when the old model is tried again) and `handover`
+(`session` or `pane_tail`). The round that ended gets `limit: <line>` for
+its summary, and `task describe` lists the rounds:
+
+```text
+rounds:     1 claude-personal (opus): limit: Opus weekly limit reached; 2 claude-personal (sonnet): running
+```
+
+A task that moved stays on its new model when the old one resets; only new
+tasks start on the first choice again. A limit on the new model is handled
+the same way, with the rest of the list; past its end the task goes back to
+the first model before it that is free. When no other model of its list is
+free, it waits: `task.waiting` with `why: all_exhausted`, until the earliest
+reset among all the models of its list. At that time it starts on the first
+model of its list that is free: its own session when that is the model it
+stopped on, the handover above otherwise. When no other model of its list
+runs on its machine, it waits on its own model as a task with no list does:
+`why: no_fallback` with the account and model, until that model's reset,
+and it resumes on it.
 
 `waiting` is not `paused`: they share the closing and the resuming, not the
 meaning. A paused task goes first among the `low` tasks when a slot frees;
@@ -1536,8 +1591,8 @@ so the conversation goes on where it stopped:
 - A turn that ends on anything else starts the count over.
 - After `rate_retries` retries (3 by default) whose turns still end on a
   short limit, the next one is handled as a hard limit with no reset: the
-  task waits `unknown_reset_wait`, as above. `rate_retries = 0` does that
-  at once.
+  task moves to its next model with `why: rate_limit`, or waits
+  `unknown_reset_wait`, as above. `rate_retries = 0` does that at once.
 
 The count is kept in memory: after a restart of the head it starts over.
 
@@ -1564,10 +1619,8 @@ gets no key: the task stays `blocked` for a person, its error saying
 pastor never picks extra usage or an upgrade, and no setting makes it:
 spending money stays a person's call.
 
-A task with [fallback models](#fallback-models) waits all the same for now;
-moving it to the next model is to come. A headless serve keeps no table, so
-its own tasks settle as before, and a pull machine does not read limits from
-its panes yet.
+A headless serve keeps no table, so its own tasks settle as before, and a
+pull machine does not read limits from its panes yet.
 
 ### Permission profiles
 
@@ -2126,7 +2179,8 @@ A record, which is also what connector event hooks get on stdin:
 - `at`: when the daemon received the event, RFC 3339 UTC.
 - `type`: `task.queued|running|blocked|done|stale|failed|closed|paused`,
   `task.limited` (its agent stopped on a usage limit; the detail is
-  `agent.exhausted`'s), `task.waiting` (it waits for the reset) and
+  `agent.exhausted`'s), `task.waiting` (it waits for the reset),
+  `task.agent_switched` (it moved to its next model) and
   `task.rate_limited` (a 429 or 529 it retries in its pane; see Usage
   limits),
   `task.input` (`pastor task send`, or pastor at Claude's limit picker),
@@ -3834,12 +3888,12 @@ name = "prs"
 takes_flock_work = false     # true: also its flocks' unpinned tasks, not only those pinned here
 # command = ["fake-herdr"]   # developer option: argv speaking herdr on stdio; unset: this herdr
 [limits]                     # usage limits; see Usage limits
-wait_under = "1h"            # a limited task waits for a reset closer than this, else falls back; "0s": never waits
+wait_under = "30m"           # a limited task waits for a reset closer than this, else moves on; "0": never waits
 rate_retries = 3             # a 429 or 529 is retried in its pane this many times before it counts as a limit
 rate_backoff = ["1m", "5m", "15m"]  # the wait before each of those retries; the last one repeats
 unknown_reset_wait = "1h"    # how long a limit whose message names no reset holds
 retry_after_no_credit = "6h" # how long a no-credit limit holds
-handover_lines = 100         # pane lines a task moving to another model hands over
+handover_lines = 60          # pane lines a task moving to another agent hands over
 ```
 
 `head_address` is the ssh destination other machines reach the head by. When

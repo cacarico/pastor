@@ -263,6 +263,113 @@ pub struct DispatchSpec {
     /// Where `keep_pane` came from, labelled like `AgentSource::agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_pane_from: Option<String>,
+    /// The agents and models the task ran before this one, each round ended
+    /// by a usage limit, and the limit it waits on now, if it does.
+    #[serde(default, skip_serializing_if = "Rounds::is_empty")]
+    pub rounds: Rounds,
+}
+
+/// A task's rounds on other models (`DispatchSpec::rounds`): those that
+/// ended on a usage limit, and what the next one needs of the last.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rounds {
+    /// Rounds that ended on a limit and handed the task to another model,
+    /// the first first. The round running now is the spec's own agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ended: Vec<AgentRound>,
+    /// The limit the task stopped on, set while it waits and taken when it
+    /// starts again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Box<LimitStop>>,
+}
+
+impl Rounds {
+    pub fn is_empty(&self) -> bool {
+        self.ended.is_empty() && self.stop.is_none()
+    }
+}
+
+/// One round of a task on an agent and model, and why it ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRound {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `limit: <line>`, as the round's summary slot has it.
+    pub ended: String,
+}
+
+impl std::fmt::Display for AgentRound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", agent_and_model(&self.agent, self.model.as_deref()))
+    }
+}
+
+/// `claude-personal (sonnet)`, or the agent alone when it runs no model.
+pub fn agent_and_model(agent: &str, model: Option<&str>) -> String {
+    match model {
+        Some(m) => format!("{agent} ({m})"),
+        None => agent.to_string(),
+    }
+}
+
+/// A usage limit a task stopped on, kept with it while it waits, with what
+/// its next round needs: the model it stopped on, the limit's line, and
+/// the end of its pane for an agent that cannot resume its session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitStop {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `limit`, or `rate_limit` for short limits that counted as hard.
+    pub why: String,
+    pub line: String,
+    /// When the limit it stopped on is tried again.
+    pub until: DateTime<Utc>,
+    /// The last `[limits] handover_lines` of its pane.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tail: String,
+    /// What the dispatch pass does with it once its time has come.
+    pub then: NextRound,
+    /// Why it waits when it could have gone on under another model:
+    /// `reset in 12m, under wait_under 30m`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waited: Option<String>,
+    /// Set once the next round is on another model: how that agent learns
+    /// what the last one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handover: Option<Handover>,
+}
+
+/// Which model a limited task goes on with (`LimitStop::then`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NextRound {
+    /// The next model in its list that is free, now.
+    Switch,
+    /// Its own model, at its reset: a short wait, or no list.
+    Own,
+    /// The first model in its list that is free, at `waiting_until`.
+    First,
+}
+
+/// How the agent of a task's next round learns what the last one did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Handover {
+    /// The same Claude session, resumed under the new model.
+    Session,
+    /// The prompt again, with the end of the last agent's pane.
+    PaneTail,
+}
+
+impl Handover {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Handover::Session => "session",
+            Handover::PaneTail => "pane_tail",
+        }
+    }
 }
 
 /// The label template a task's own workspace gets when no layer sets one.
@@ -885,6 +992,24 @@ pub const RATE_RETRY_PROMPT: &str = "pastor: the API was busy; carry on where yo
 /// no session to resume: it stopped on a usage limit before, and may have
 /// left work behind.
 pub const LIMIT_HANDOVER: &str = "pastor: this task started before and stopped on a usage limit before its conversation could be kept. Its checkout may already hold part of the work: look at what is there (git status, git log) before you begin, and carry on from it.";
+
+/// What the agent of a task that moved to another model in its own Claude
+/// session is told (`Handover::Session`).
+pub fn switch_prompt(from: &str, to: &str) -> String {
+    format!(
+        "pastor: you were running on {from} and hit its usage limit; you now run on {to}. Carry on where you left off."
+    )
+}
+
+/// The paragraph after the prompt of a task that moved to another agent
+/// (`Handover::PaneTail`): who started it, where to look, and the end of
+/// that agent's pane.
+pub fn limit_handover(from: &str, tail: &str) -> String {
+    format!(
+        "pastor: another agent ({from}) started this task in this worktree and stopped at its usage limit. Read `git status` and `git log` first. Its last lines were:\n\n{}",
+        tail.trim_end()
+    )
+}
 
 /// A task's part in pausing: whether it may pause a `low` task to start
 /// (`task run --preempt`, a job's `[dispatch] preempt`), and, on a task that
@@ -1539,6 +1664,7 @@ pub(crate) mod tests {
                 cwd: None,
                 keep_pane: None,
                 keep_pane_from: None,
+                rounds: Default::default(),
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),

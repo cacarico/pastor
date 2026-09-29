@@ -56,7 +56,8 @@ A task's state change is `task.` and the new state.
 | `task.paused` | a critical task took its slot; it resumes later | |
 | `task.limited` | its agent stopped on a usage limit | as `agent.exhausted` |
 | `task.rate_limited` | its agent stopped on a 429 or 529 past its own retries; pastor retries it in the pane | `line`, `attempt` (from 1), `retry_at` |
-| `task.waiting` | it waits for that limit to reset, its pane closed and its worktree kept | `why` (`no_fallback`), `account`, `model`, `until`, `shown` (`waiting 03:00`) |
+| `task.waiting` | it waits for that limit to reset, its pane closed and its worktree kept | `why` (`no_fallback`, `reset_soon` or `all_exhausted`), `until`, `shown` (`waiting 03:00`); `account`, `model` and `waited` (`reset in 12m, under wait_under 30m`) for a wait on its own model, `models` (each `account`, `model`, `until`) for one on every model of its list |
+| `task.agent_switched` | it moved to its next model after a usage limit, in the same worktree | `from` and `to` (each `agent`, `model`), `why` (`limit` or `rate_limit`), `until` (the old model's reset), `handover` (`session` or `pane_tail`) |
 | `task.done` | it finished | |
 | `task.failed` | it failed | |
 | `task.stale` | its timeout passed, or its pull machine was lost | |

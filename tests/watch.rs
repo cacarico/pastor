@@ -181,6 +181,7 @@ fn task(id: i64, state: TaskState) -> Task {
                 cwd: None,
                 keep_pane: None,
                 keep_pane_from: None,
+                rounds: Default::default(),
             },
             flock: "default".into(),
             description: None,

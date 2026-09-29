@@ -87,8 +87,8 @@ refused with `unknown_model`.
 `fallback = ["sonnet", "gpt"]` names, in order, the models a task may fall
 back to when its own runs out, each finding its agent on the machine as
 above. A new task whose model is on an exhausted account starts on the
-first free one (see [usage limits](#usage-limits)); a running task does not
-switch yet. The list comes from `--fallback` or the job's `fallback`, then the
+first free one, and a running task moves down it when its model hits a
+usage limit (see [usage limits](#usage-limits)). The list comes from `--fallback` or the job's `fallback`, then the
 machine, then the flock, then `[defaults]`; the first list wins whole, and
 `[]` means none. `pastor task run --no-fallback` gives one task none.
 
@@ -107,15 +107,20 @@ of its `fallback` list, or stays queued, and `pastor queue` says why, like
 A Claude task whose agent stops on a limit (`You've hit your limit ·
 resets 3am`) goes `waiting`, not `done`: pastor closes its pane, keeps its
 worktree, and resumes its session on the same machine at the reset.
-`pastor task list` shows it as `waiting 03:00`. Where Claude shows its
+`pastor task list` shows it as `waiting 03:00`. With a `fallback` list, it
+waits only for a reset within `wait_under` (30 minutes); otherwise it goes
+on under the next free model of its list in the same worktree: in the same
+Claude session when the model runs on the same login (Opus to Sonnet), else
+from its prompt with the end of the last agent's pane (Claude to opencode).
+It stays on that model; new tasks start on the first choice. Where Claude shows its
 limit picker instead, pastor picks "Stop and wait for limit to reset" by
 its text and the task waits the same way; it never picks extra usage or an
 upgrade, and a picker without "Stop and wait" is left `blocked` for you.
 
 `pastor limit list` shows the rows, and `pastor limit clear <account>`
 forgets one, which wakes the tasks waiting on it on the next pass. The
-events are `agent.exhausted`, `agent.reset`, `task.limited` and
-`task.waiting`, and
+events are `agent.exhausted`, `agent.reset`, `task.limited`,
+`task.waiting` and `task.agent_switched`, and
 [`[limits]`](../../reference/pastor-toml/#limits) sets how long a limit
 with no reset holds.
 

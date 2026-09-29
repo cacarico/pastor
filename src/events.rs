@@ -713,6 +713,7 @@ mod tests {
                     cwd: None,
                     keep_pane: None,
                     keep_pane_from: None,
+                    rounds: Default::default(),
                 },
                 flock: "work".into(),
             })
