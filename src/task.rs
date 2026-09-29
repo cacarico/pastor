@@ -835,6 +835,12 @@ pub struct Task {
     /// from `task_summaries` with the row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<TaskSummary>,
+    /// What the task's Claude session used, read from its session file on
+    /// its machine when a round ended (`usage::TaskUsage`). `None` for
+    /// another kind of agent, and until pastor has read it. Not a column:
+    /// the store reads it from `task_usage` with the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::usage::TaskUsage>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -1543,6 +1549,7 @@ pub(crate) mod tests {
             aged_at: None,
             pause: Default::default(),
             waiting_until: None,
+            usage: None,
             summary: None,
             created_at: now,
             started_at: Some(now),

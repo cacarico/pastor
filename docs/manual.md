@@ -670,6 +670,33 @@ Prune works without `pastor serve`, but not behind one that holds the socket
 and does not answer (`head_unresponsive`): that head may still be writing
 tasks. Retry and close need it.
 
+### Tokens a task used
+
+When a round of a Claude task ends (done, failed, or `task done`), pastor
+reads the task's session from the machine it ran on and keeps the totals:
+the model of the session's last reply, the number of API calls, and the
+input, cache write, cache read and output tokens. The files are
+`<config>/projects/*/<session>.jsonl` and the subagents' files under
+`<config>/projects/*/<session>/subagents/`, `<config>` being the agent's
+`CLAUDE_CONFIG_DIR` from `[agents.<name>] env` (`~` is the machine's home),
+or `~/.claude`. `awk` on the machine adds them up, one call per message id,
+and only the totals come back, over ssh for an ssh machine. The session
+holds every round, so each read replaces the one before.
+
+- `pastor task describe t-4` prints `used: claude-opus-4-5, 42 API calls`
+  and `tokens: input 1,234, cache write 56,000, cache read 3,400,500,
+  output 12`. The model is the one the session ran on, which the `model`
+  line leaves as `-` for a task that took its agent's default.
+- `--json` of `task list` and `task describe` carries `usage` (`model`,
+  `api_calls`, `input`, `cache_write`, `cache_read`, `output`, `read_at`),
+  absent until pastor has read one.
+
+A task shows nothing when it has no session id (another kind of agent, or
+agent args that pick the session), on a `command` machine or a pull machine
+(the head cannot read their files), and when the read failed; the head's log
+says why. The read runs in the background, so `usage` can lag the `done` by
+the time the machine takes to answer.
+
 ### Where a task's pane goes
 
 `place` decides where on its machine's herdr a task's agent gets its pane.
@@ -4041,11 +4068,12 @@ not answer is refused whether flocks are in play or not
 
 ### The store
 
-`pastor.db` is at schema 15. Its tasks table has, among others, `retry_of`,
+`pastor.db` is at schema 16. Its tasks table has, among others, `retry_of`,
 `flock`, `trust_sent`, `activity_seen`, `ended`, `priority`,
 `priority_from`, `queue_pos`, `aged_from`, `aged_at` (since schema 14),
 `role`, `description` (since schema 11), `preempt`, `paused_at`,
 `paused_for`, `resumed_at` and `waiting_until` (schema 15). Summaries are in
 the `task_summaries` table (schema 13), usage limits in the `limits` table
-(schema 15). A new pastor adds what it needs in place
+(schema 15), what Claude tasks used in the `task_usage` table (schema 16).
+A new pastor adds what it needs in place
 when it first opens an older store.

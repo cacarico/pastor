@@ -16,7 +16,7 @@ use crate::task::{
     TaskSummary,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -87,13 +87,31 @@ const V15_TABLES: &str = "CREATE TABLE IF NOT EXISTS limits (
         PRIMARY KEY (account, model)
      );";
 
-/// A task row with its last round's summary as JSON (`summary_json`), which
-/// `row_to_task` reads when the query has it.
+/// Schema 16: what each Claude task's session used (`TaskUsage`), one row
+/// per task, replaced each time pastor reads the session again.
+const V16_TABLES: &str = "CREATE TABLE IF NOT EXISTS task_usage (
+        task_id INTEGER PRIMARY KEY,
+        model TEXT,
+        api_calls INTEGER NOT NULL,
+        input INTEGER NOT NULL,
+        cache_write INTEGER NOT NULL,
+        cache_read INTEGER NOT NULL,
+        output INTEGER NOT NULL,
+        read_at TEXT NOT NULL
+     );";
+
+/// A task row with its last round's summary as JSON (`summary_json`) and
+/// its usage (`usage_json`), which `row_to_task` reads when the query has
+/// them.
 const TASK_WITH_SUMMARY: &str = "SELECT tasks.*,
         (SELECT json_object('round', s.round, 'outcome', s.outcome, 'text', s.text,
                             'source', s.source, 'at', s.at)
            FROM task_summaries s WHERE s.task_id = tasks.id
-          ORDER BY s.round DESC LIMIT 1) AS summary_json
+          ORDER BY s.round DESC LIMIT 1) AS summary_json,
+        (SELECT json_object('model', u.model, 'api_calls', u.api_calls, 'input', u.input,
+                            'cache_write', u.cache_write, 'cache_read', u.cache_read,
+                            'output', u.output, 'read_at', u.read_at)
+           FROM task_usage u WHERE u.task_id = tasks.id) AS usage_json
      FROM tasks";
 
 /// One saved trust, as `pastor trust list` shows it.
@@ -415,6 +433,7 @@ impl Store {
                 tx.execute_batch(V8_TABLES)?;
                 tx.execute_batch(V13_TABLES)?;
                 tx.execute_batch(V15_TABLES)?;
+                tx.execute_batch(V16_TABLES)?;
                 tx.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
                     params![SCHEMA_VERSION.to_string()],
@@ -428,6 +447,7 @@ impl Store {
                 tx.execute_batch(V8_TABLES)?;
                 tx.execute_batch(V13_TABLES)?;
                 tx.execute_batch(V15_TABLES)?;
+                tx.execute_batch(V16_TABLES)?;
             }
             Some(v) if v < SCHEMA_VERSION => {
                 // One `if v < N` block per migration. The job tables go in
@@ -530,6 +550,11 @@ impl Store {
                     tx.execute_batch(V15_TABLES)?;
                     add_column(&tx, "waiting_until", "waiting_until TEXT")?;
                 }
+                // What Claude tasks used (`Task::usage`). Nothing was read
+                // before.
+                if v < 16 {
+                    tx.execute_batch(V16_TABLES)?;
+                }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -625,6 +650,7 @@ impl Store {
             let mut conn = self.conn.lock().recover();
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM task_summaries WHERE task_id = ?1", params![id])?;
+            tx.execute("DELETE FROM task_usage WHERE task_id = ?1", params![id])?;
             tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(())
@@ -705,6 +731,31 @@ impl Store {
                 Some(round) => Ok(TaskSummary { round, ..row }),
                 None => self.end_round(id, Some(summary)),
             }
+        })
+    }
+
+    /// Keep `usage` as what task `id`'s session used, in place of what was
+    /// read before: the session file holds every round, so the last read
+    /// counts them all.
+    pub fn set_usage(&self, id: i64, usage: &crate::usage::TaskUsage) -> anyhow::Result<()> {
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
+                "INSERT OR REPLACE INTO task_usage
+                   (task_id, model, api_calls, input, cache_write, cache_read, output, read_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    id,
+                    usage.model,
+                    to_sql_int(usage.api_calls)?,
+                    to_sql_int(usage.input)?,
+                    to_sql_int(usage.cache_write)?,
+                    to_sql_int(usage.cache_read)?,
+                    to_sql_int(usage.output)?,
+                    usage.read_at.to_rfc3339()
+                ],
+            )?;
+            Ok(())
         })
     }
 
@@ -1131,6 +1182,10 @@ impl Store {
             )?;
             tx.execute(
                 "DELETE FROM task_summaries WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM task_usage WHERE task_id NOT IN (SELECT id FROM tasks)",
                 [],
             )?;
             tx.commit()?;
@@ -1996,6 +2051,21 @@ fn summary_of(row: &Row<'_>, state: &str) -> rusqlite::Result<Option<TaskSummary
         .transpose()
 }
 
+/// A count as SQLite stores it, refused past `i64::MAX`.
+fn to_sql_int(n: u64) -> anyhow::Result<i64> {
+    i64::try_from(n).context("count too large to store")
+}
+
+/// The task's usage from `usage_json`; `None` from a query without the
+/// column, or for a task pastor has read none for.
+fn usage_of(row: &Row<'_>) -> rusqlite::Result<Option<crate::usage::TaskUsage>> {
+    let Ok(json) = row.get::<_, Option<String>>("usage_json") else {
+        return Ok(None);
+    };
+    json.map(|j| serde_json::from_str(&j).map_err(conversion_failure))
+        .transpose()
+}
+
 fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let parse_dt = |s: &str| -> rusqlite::Result<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(s)
@@ -2064,6 +2134,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         },
         waiting_until: waiting_until.as_deref().map(parse_dt).transpose()?,
         summary: summary_of(row, &state)?,
+        usage: usage_of(row)?,
         created_at: parse_dt(&created_at)?,
         started_at: started_at.as_deref().map(parse_dt).transpose()?,
         finished_at: finished_at.as_deref().map(parse_dt).transpose()?,
@@ -2521,6 +2592,62 @@ mod tests {
         assert_eq!(s.get_task(t.id).unwrap().unwrap().summary, None, "running");
     }
 
+    /// A task's usage is read back with its row, in the list too, the last
+    /// read replacing the one before; forgetting the task drops it.
+    #[test]
+    fn a_tasks_usage_is_kept_and_replaced() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s.insert_task(new_task("run")).unwrap();
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().usage, None);
+        let at = DateTime::parse_from_rfc3339("2026-09-29T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut usage = crate::usage::TaskUsage {
+            model: None,
+            api_calls: 3,
+            input: 12,
+            cache_write: 3_400,
+            cache_read: 1_250_000,
+            output: 900,
+            read_at: at,
+        };
+        s.set_usage(t.id, &usage).unwrap();
+        assert_eq!(
+            s.get_task(t.id).unwrap().unwrap().usage,
+            Some(usage.clone())
+        );
+        usage.model = Some("claude-opus-4-5".into());
+        usage.api_calls = 5;
+        s.set_usage(t.id, &usage).unwrap();
+        let listed = s.list_tasks(&TaskFilter::default()).unwrap();
+        assert_eq!(listed[0].usage, Some(usage));
+        s.forget_task(t.id).unwrap();
+        let left: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM task_usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn a_v15_database_gains_the_usage_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "DROP TABLE task_usage;
+                 UPDATE meta SET value = '15' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "16");
+        assert_eq!(s.get_task(1).unwrap().unwrap().usage, None);
+    }
+
     /// A round that ends with no summary keeps the pane's last lines, and
     /// leaves them for the finish command.
     #[test]
@@ -2656,6 +2783,7 @@ mod tests {
                 "limits",
                 "meta",
                 "task_summaries",
+                "task_usage",
                 "tasks",
                 "trusted_repos"
             ]
@@ -2670,6 +2798,7 @@ mod tests {
                 "meta",
                 "seen",
                 "task_summaries",
+                "task_usage",
                 "tasks",
                 "trusted_repos"
             ]
@@ -2712,6 +2841,7 @@ mod tests {
                 "meta",
                 "seen",
                 "task_summaries",
+                "task_usage",
                 "tasks",
                 "trusted_repos"
             ]
@@ -4214,9 +4344,10 @@ mod tests {
                  DROP TABLE event_seq;
                  DROP TABLE task_summaries;
                  DROP TABLE limits;
+                 DROP TABLE task_usage;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '15' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '16' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -4259,7 +4390,8 @@ mod tests {
             !tables.contains(&"trusted_repos".to_string())
                 && !tables.contains(&"event_seq".to_string())
                 && !tables.contains(&"task_summaries".to_string())
-                && !tables.contains(&"limits".to_string()),
+                && !tables.contains(&"limits".to_string())
+                && !tables.contains(&"task_usage".to_string()),
             "rolled back: {tables:?}"
         );
     }
