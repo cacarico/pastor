@@ -1786,6 +1786,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         }
     }
 

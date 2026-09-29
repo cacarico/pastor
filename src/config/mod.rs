@@ -1459,9 +1459,9 @@ pub struct PastorConfig {
     /// as the same user, so it is not a security boundary.
     pub agents_change_fleet: bool,
     /// How many orchestrator agents (`role = "orchestrator"`) the head runs
-    /// at once, of both kinds, outside `max_agents` and job slots. A
-    /// scheduled orchestrator's run past it starts no agent
-    /// (`orchestrator.held`).
+    /// at once, of both kinds. Each also takes a slot under `max_agents` on
+    /// its machine, like any task. A scheduled orchestrator's run past it
+    /// starts no agent (`orchestrator.held`).
     pub max_orchestrators: u32,
     /// The ssh destination other machines reach the head by. Agents on
     /// machines other than the head's own get it as `ipc::HEAD_ENV`.
@@ -2809,6 +2809,7 @@ mod tests {
             session_id: None,
             label: Default::default(),
             summary: Default::default(),
+            cwd: None,
         }
     }
 

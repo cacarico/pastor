@@ -53,8 +53,8 @@ someone else's cloud. The longer story is in [the blog post](https://cacari.co/p
     clock, GitHub issues, ...)          move the card, notify you
 ```
 
-- **The head** is one machine that runs `pastor serve`. It holds the queue,
-  the schedule and the history.
+- **The head** is the machine whose `pastor serve` holds the queue, the
+  schedule and the history.
 - **Machines** take the tasks. The head can be one of them. Others are
   reached over ssh, and each runs herdr.
 - **A task** is one agent, one prompt, in a repo or, with `--worktree`, in a
@@ -113,7 +113,7 @@ Give it something to do, then check on it:
 
 ```sh
 pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --worktree
-pastor task list                       # queued, running, blocked, done ...
+pastor task list                       # live tasks: queued, running, blocked ...
 pastor task read t-1                   # the agent's recent output
 pastor task attach t-1                 # sit in its terminal; ctrl+b q detaches
 pastor task send t-1 "yes, go ahead"   # answer it without attaching
@@ -190,7 +190,9 @@ Work test first, commit, and push the branch.
 ```
 
 Each piece of work has a stable key, so pastor never starts the same issue
-twice. Without `backfill`, the first run only sees issues updated from then on. Connectors in [pastor-connectors](https://github.com/cacarico/pastor-connectors):
+twice. Without `backfill`, the first run only sees issues updated from then on.
+
+Connectors in [pastor-connectors](https://github.com/cacarico/pastor-connectors):
 
 | Connector | Turns into tasks |
 |---|---|
@@ -231,20 +233,20 @@ Put machines in flocks, and give a flock or a single machine its own agent:
 [[flock]]
 name = "personal"
 default = true
+machines = { laptop = 2 }   # laptop runs at most 2 personal tasks
 
 [[flock]]
 name = "work"
+machines = { pi-1 = 2 }
 
 [[machine]]
 name = "laptop"
 local = true
-flock = "personal"
 agent = "claude-personal"   # this machine's plain `claude` is a work login
 
 [[machine]]
 name = "pi-1"
 ssh = "pi-1"
-flock = "work"
 ```
 
 ```toml
@@ -268,9 +270,10 @@ machine names.
   retry, send to and close tasks, enable or disable a job and keep its
   handover note, and nothing more; no task can start one. An orchestrator's
   scripts get the same rights.
-- **Agents keep their permission prompts.** pastor passes the allow and deny
-  lists you set for each flock. Turning the prompts off is your decision, and
-  [the manual](docs/manual.md#trust-model) says when not to.
+- **Permission prompts stay on unless you pick a profile.** pastor passes the
+  allow and deny lists you set. A profile (`review`, `develop`,
+  `unrestricted`) turns Claude's prompts off and refuses whatever its lists
+  don't allow. [The manual](docs/manual.md#trust-model) says when not to.
 - **Nothing is closed that pastor didn't open.** pastor closes only the panes
   and workspaces it created, and keeps a worktree with unpushed commits or
   another agent in it.
@@ -282,7 +285,8 @@ machine names.
 
 | Platform | Support |
 |---|---|
-| Linux x86_64, aarch64 | built, tested in CI and released |
+| Linux x86_64 | built, tested in CI and released |
+| Linux aarch64 | built, smoke-run and released |
 | Linux armv7, riscv64 | built and released |
 | macOS arm64, x86_64 | built and released; `pastor setup launchd` for the service |
 | FreeBSD x86_64 | compiled on every pull request, no binaries |
@@ -306,8 +310,9 @@ Issues and pull requests are welcome, especially when they fit the direction
 above. pastor is still my personal workflow tool first, so I may decline good
 ideas that would pull it away from that shape.
 
-`make check` runs formatting, clippy and the whole test suite against a fake
-herdr, so you don't need a flock of machines to work on pastor; `make help` lists the rest.
+`make check` runs the changelog check, formatting, clippy and the whole test
+suite against a fake herdr, so you don't need a flock of machines to work on
+pastor; `make help` lists the rest.
 Start with [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Rules
 for AI contributors are in [docs/AI_GOVERNANCE.md](docs/AI_GOVERNANCE.md).
 

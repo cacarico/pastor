@@ -43,7 +43,7 @@ run coding agents on machines you own
 
 ## serve
 
-Run the daemon in the background: scheduler, machine channels, dispatch. With a head set on another machine, run headless: only this machine's jobs and hooks
+Run the daemon in the background: scheduler, machine channels, dispatch. With a head set on another machine, run headless: this machine's jobs and hooks, and the head's tasks for it as a pull machine
 
 A bare `pastor serve` starts the head in the background, logging to serve.log in the state dir, and returns once it answers; --foreground keeps it in this terminal. One started by systemd or launchd stays in the foreground either way.
 
@@ -80,10 +80,10 @@ Create a one-off task and dispatch it
 | `--machine <MACHINE>` | Run it on this machine (a name from flock.toml) instead of any free one |  |
 | `--agent <AGENT>` | The agent command to start, like claude or codex (default: the machine's, else its flock's, else `[defaults]`, else claude) |  |
 | `--agent-arg <ARG>` | One argument for the agent; repeat it, in order, for more. Replaces the flock's and `[defaults]` agent_args. The next word is always the value, dashes and all |  |
-| `--model <NAME>` | Run this model, a name from `[models]` in pastor.toml; its args go before the agent's (default: the machine's, else its flock's, else `[defaults] model`, else none) |  |
-| `--priority <LEVEL>` | Queue at this level: low, normal, high or critical; dispatch takes higher levels first (default: the pinned machine's, else its flock's, else `[defaults] priority`, else normal) |  |
+| `--model <NAME>` | Run this model, a name from `[models]` in pastor.toml; its args go before the agent's (default: the flock's, else the machine's, else `[defaults] model`, else none) |  |
+| `--priority <LEVEL>` | Queue at this level: low, normal, high or critical; dispatch takes higher levels first (default: the flock's, else the pinned machine's, else `[defaults] priority`, else normal) |  |
 | `--preempt` | A critical task only: on a full machine, pause the newest low Claude task there (its session resumes when a slot frees) and take its slot |  |
-| `--profile <NAME>` | Run under this permission profile, built in or from `[profiles]` in pastor.toml: a Claude agent gets its allow and deny lists and never asks (default: the machine's, else its flock's, else `[defaults] profile`, else none) |  |
+| `--profile <NAME>` | Run under this permission profile, built in or from `[profiles]` in pastor.toml: a Claude agent gets its allow and deny lists and never asks (default: the flock's, else the machine's, else `[defaults] profile`, else none) |  |
 | `--worktree` | A git worktree per task, branched from --repo (so it needs --repo) |  |
 | `--branch <BRANCH>` | Branch for the worktree (needs --worktree; a plain workspace has no branch) |  |
 | `--tag <TAGS>` | Only a machine with this tag takes the task; repeat for more, and it needs them all |  |

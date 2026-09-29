@@ -118,7 +118,7 @@ demo: build ## record the README gifs with vhs against a demo head
 	@set -e; \
 	export PASTOR_CONFIG_DIR=$(CURDIR)/docs/demo/local PASTOR_STATE_DIR=$(CURDIR)/docs/demo/local/state \
 	  PASTOR_DATA_DIR=$(CURDIR)/docs/demo/local/data PATH=$(CURDIR)/target/debug:$$PATH; \
-	pastor serve & pid=$$!; trap 'kill $$pid' EXIT; \
+	pastor serve --foreground & pid=$$!; trap 'kill $$pid' EXIT; \
 	for i in $$(seq 1 100); do pastor task read t-1 2>&1 | grep -q 'not running' || break; sleep 0.3; done; \
 	for t in docs/demo/*.tape; do vhs $$t; done; \
 	for i in 1 2 3 4; do pastor task close t-$$i >/dev/null 2>&1 || true; done

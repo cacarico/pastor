@@ -371,7 +371,7 @@ pub enum IpcRequest {
         /// client that predates it: `spec` already holds the agent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<AgentChoice>,
-        /// `--priority`; `None` lets the pinned machine, the flock or
+        /// `--priority`; `None` lets the flock, the pinned machine or
         /// `[defaults]` set the level. Left out when not given, so an older
         /// head still reads the request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1472,6 +1472,7 @@ mod tests {
                 session_id: None,
                 label: Default::default(),
                 summary: Default::default(),
+                cwd: None,
             },
             machine: None,
             workspace_id: None,

@@ -7,7 +7,7 @@
 //! `t-<id>` counts), and a second attach goes back to it while it lives.
 
 use crate::config::Agents;
-use crate::dispatch::{DispatchError, expand_home};
+use crate::dispatch::{DispatchError, expand_home, no_repo_dir};
 use crate::herdr::{CallError, Connector, ConnectorExt};
 use crate::task::Task;
 
@@ -60,7 +60,8 @@ pub fn why_not(task: &Task, agents: &Agents) -> Option<String> {
 /// The agent `pastor task attach` should attach to for `task`, whose pane
 /// pastor holds closed: its own agent while herdr still lists it, else an
 /// earlier resume that is still open, else a new pane in the task's working
-/// directory, with its agent definition's env, running
+/// directory (the directory dispatch recorded on it for a task with no
+/// repo, `task.spec.cwd`), with its agent definition's env, running
 /// `claude --resume <session>`. A worktree removed at close is put back
 /// first, at the same path on the same branch, since Claude files its
 /// sessions by directory.
@@ -130,7 +131,13 @@ pub async fn reopen(
             }
             Some(checkout.path.clone())
         }
-        (_, repo) => repo.clone(),
+        (_, Some(repo)) => Some(repo.clone()),
+        (_, None) => match task.spec.cwd.clone() {
+            Some(cwd) => Some(cwd),
+            // A task from before `cwd` was recorded: best effort, as at
+            // dispatch, which may now answer differently.
+            None => no_repo_dir(conn, Some(machine)).await?,
+        },
     };
     if let Some(dir) = cwd.as_deref()
         && conn.dir_exists(dir).await.map_err(CallError::from)? == Some(false)
@@ -195,6 +202,7 @@ mod tests {
                 session_id: session.map(String::from),
                 label: Default::default(),
                 summary: Default::default(),
+                cwd: None,
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w9".into()),
@@ -278,6 +286,43 @@ mod tests {
             .filter(|r| r.method == "agent.start")
             .count();
         assert_eq!(starts, 1);
+    }
+
+    /// A task with no repo ran in `~/pastor-tasks`, and Claude files its
+    /// sessions by directory, so the resume opens there too, not wherever
+    /// herdr's focused pane happens to be.
+    #[tokio::test]
+    async fn a_task_with_no_repo_resumes_in_the_no_repo_folder() {
+        let fake = FakeHerdr::new();
+        let mut t = closed("claude", Some(SESSION));
+        t.spec.repo = None;
+        reopen(&fake, &t, &Agents::default()).await.unwrap();
+        let reqs = fake.requests();
+        let ws = reqs
+            .iter()
+            .find(|r| r.method == "workspace.create")
+            .unwrap();
+        assert_eq!(ws.params["cwd"], "/home/fake/pastor-tasks");
+    }
+
+    /// Dispatch fell back to the home directory because `~/pastor-tasks`
+    /// could not be made, and recorded that on the task. Even though the
+    /// folder can be made now, the resume must still open in the home,
+    /// where Claude actually filed the session, not wherever `no_repo_dir`
+    /// would put a fresh task today.
+    #[tokio::test]
+    async fn a_home_fallback_resumes_in_the_home_even_once_the_folder_can_be_made() {
+        let fake = FakeHerdr::new();
+        let mut t = closed("claude", Some(SESSION));
+        t.spec.repo = None;
+        t.spec.cwd = Some("/home/fake".into());
+        reopen(&fake, &t, &Agents::default()).await.unwrap();
+        let reqs = fake.requests();
+        let ws = reqs
+            .iter()
+            .find(|r| r.method == "workspace.create")
+            .unwrap();
+        assert_eq!(ws.params["cwd"], "/home/fake");
     }
 
     /// While the task's own agent is still listed, attach goes to it.

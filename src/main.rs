@@ -47,7 +47,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the daemon in the background: scheduler, machine channels, dispatch. With a head set on another machine, run headless: only this machine's jobs and hooks
+    /// Run the daemon in the background: scheduler, machine channels, dispatch. With a head set on another machine, run headless: this machine's jobs and hooks, and the head's tasks for it as a pull machine
     ///
     /// A bare `pastor serve` starts the head in the background, logging to
     /// serve.log in the state dir, and returns once it answers; --foreground
@@ -241,13 +241,13 @@ struct RunArgs {
     #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
     agent_args: Vec<String>,
     /// Run this model, a name from `[models]` in pastor.toml; its args go
-    /// before the agent's (default: the machine's, else its flock's, else
+    /// before the agent's (default: the flock's, else the machine's, else
     /// `[defaults] model`, else none)
     #[arg(long, value_name = "NAME")]
     model: Option<String>,
     /// Queue at this level: low, normal, high or critical; dispatch takes
-    /// higher levels first (default: the pinned machine's, else its
-    /// flock's, else `[defaults] priority`, else normal)
+    /// higher levels first (default: the flock's, else the pinned
+    /// machine's, else `[defaults] priority`, else normal)
     #[arg(long, value_name = "LEVEL")]
     priority: Option<String>,
     /// A critical task only: on a full machine, pause the newest low Claude
@@ -256,7 +256,7 @@ struct RunArgs {
     preempt: bool,
     /// Run under this permission profile, built in or from `[profiles]` in
     /// pastor.toml: a Claude agent gets its allow and deny lists and never
-    /// asks (default: the machine's, else its flock's, else `[defaults]
+    /// asks (default: the flock's, else the machine's, else `[defaults]
     /// profile`, else none)
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
@@ -1457,6 +1457,7 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
             ..Default::default()
         },
         summary: Default::default(),
+        cwd: None,
     })
 }
 
@@ -3917,6 +3918,36 @@ mod tests {
         }
     }
 
+    /// `task run` help names the layers in the order the code reads them:
+    /// the agent from the machine before its flock
+    /// (`Defaults::resolve_agent_on`), the model, profile and priority from
+    /// the flock before the machine (`resolve_agent_on`,
+    /// `Defaults::resolve_priority`).
+    #[test]
+    fn run_help_names_the_layers_in_the_order_they_apply() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let run = root
+            .find_subcommand("task")
+            .and_then(|t| t.find_subcommand("run"))
+            .unwrap();
+        let help = |id: &str| {
+            let arg = run.get_arguments().find(|a| a.get_id() == id).unwrap();
+            arg.get_help().unwrap().to_string().replace('\n', " ")
+        };
+        let order = |text: &str, first: &str, then: &str| {
+            let (a, b) = (text.find(first), text.find(then));
+            assert!(
+                a.is_some() && b.is_some() && a < b,
+                "{first:?} should come before {then:?} in {text:?}"
+            );
+        };
+        order(&help("agent"), "machine's", "flock's");
+        for id in ["model", "profile", "priority"] {
+            order(&help(id), "flock's", "machine's");
+        }
+    }
+
     #[test]
     fn job_reload_help_names_every_file_it_rereads() {
         use clap::CommandFactory;
@@ -4295,7 +4326,7 @@ mod tests {
         for words in spans(&between("Local on purpose, as with no head set:", "\n\n")) {
             assert_eq!(route(&words), RemoteRoute::Here, "{words}");
         }
-        let refused = between("Every other command runs on the head only.", "\n\n");
+        let refused = between("Only one command is refused with a remote head:", "\n\n");
         let refused = spans(&refused);
         assert_eq!(refused[0], "machine authorized-key");
         assert!(matches!(route(&refused[0]), RemoteRoute::Unsupported(_)));
@@ -4347,15 +4378,14 @@ mod tests {
             "machine add" => &["x", "--local"],
             "machine authorized-key" => &["x", "--key", "-"],
             "flock default" => &["show"],
-            "task send" | "task priority" | "machine move" | "trust add" | "trust remove" => {
-                &["x", "y"]
-            }
+            "task send" | "task priority" | "machine move" | "trust add" | "trust remove"
+            | "flock join" | "flock leave" => &["x", "y"],
             "queue move" => &["x", "--top"],
             "task prune" => &["--older-than", "1d", "--done"],
             "completions" => &["bash"],
             "setup" => &["systemd"],
             "head" => &["show"],
-            "connector" => &["list"],
+            "connector" | "orchestrator" => &["list"],
             _ => &[],
         };
         let argv = std::iter::once("pastor")
