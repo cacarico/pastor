@@ -3,7 +3,8 @@
 # pages under docs/website) or Cargo.toml (the header shows the version),
 # and by hand. It also checks internal links (`make links`): the built site,
 # and README.md, docs/*.md and skills/**/*.md, which is why those paths
-# trigger it too. Hugo and lychee are pinned releases checked against their
+# trigger it too, and so does the Makefile that defines the `links` and
+# `site` recipes. Hugo and lychee are pinned releases checked against their
 # published checksums, and every action is pinned to a commit, as in
 # release.yml.
 #
@@ -25,6 +26,7 @@ on:
       - "README.md"
       - "skills/**"
       - "Cargo.toml"
+      - "Makefile"
       - ".github/workflows/website.yml"
   pull_request:
     paths:
@@ -32,6 +34,7 @@ on:
       - "README.md"
       - "skills/**"
       - "Cargo.toml"
+      - "Makefile"
       - ".github/workflows/website.yml"
   workflow_dispatch:
 
