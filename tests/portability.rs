@@ -124,7 +124,7 @@ fn checks_each_target_as_ci_did() {
     assert!(out.status.success(), "{out:?}");
     let want: Vec<String> = TARGETS
         .iter()
-        .map(|t| format!("check --locked --all-targets --target {t}"))
+        .map(|t| format!("check --locked --all-targets --features fake-herdr --target {t}"))
         .collect();
     assert_eq!(env.calls(), want);
 }

@@ -1,4 +1,7 @@
 pub mod client;
+// The test double behind the unit tests, the integration tests and the
+// fake-herdr binary; a default build and the published crate leave it out.
+#[cfg(any(test, feature = "fake-herdr"))]
 pub mod fake;
 pub mod protocol;
 pub mod transport;

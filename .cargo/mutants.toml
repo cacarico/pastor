@@ -34,3 +34,7 @@ exclude_re = [
 # for the default five baselines; three still leaves room for a loaded host
 # running several jobs at once.
 timeout_multiplier = 3.0
+
+# The integration tests that run the fake herdr need its feature, or every
+# mutant would skip them.
+features = ["fake-herdr"]

@@ -3380,7 +3380,9 @@ touches code, and it tells you what to install when something is missing.
 
 To try pastor without herdr, run the fake one. It comes in the same two
 pieces the real thing does, a server and a bridge per request, because state
-has to outlive a single request. `make build` leaves it at
+has to outlive a single request. It builds only with the `fake-herdr` cargo
+feature, which the Makefile turns on (a bare `cargo test` skips the
+integration tests that need it). `make build` leaves it at
 `target/debug/fake-herdr`; `make install` does not install it, only `pastor`:
 
 ```bash

@@ -15,11 +15,13 @@ readme = "README.md"
 keywords = ["agents", "herdr", "fleet", "daemon", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 # What `cargo publish` uploads: what the pastor binary builds from, and
-# nothing else. fake-herdr (src/bin) is a test double for the suite, so it
-# stays out and `cargo install pastor-cli` installs pastor alone.
+# nothing else. fake-herdr (src/bin and src/herdr/fake.rs) is a test double
+# for the suite, so it stays out and `cargo install pastor-cli` installs
+# pastor alone.
 include = [
     "/src/**/*.rs",
     "!/src/bin/**",
+    "!/src/herdr/fake.rs",
     "/skills/pastor/SKILL.md",
     "/contrib/systemd/*.service",
     "/contrib/launchd/*.plist",
@@ -37,6 +39,39 @@ path = "src/lib.rs"
 [[bin]]
 name = "pastor"
 path = "src/main.rs"
+
+# The fake herdr: the `fake-herdr` binary and `pastor::herdr::fake`. The
+# library's unit tests get the module through cfg(test) without it; the
+# Makefile turns it on for the binary and the integration tests below.
+[features]
+fake-herdr = []
+
+[[bin]]
+name = "fake-herdr"
+path = "src/bin/fake-herdr.rs"
+required-features = ["fake-herdr"]
+
+# The integration tests that run the fake herdr; a plain `cargo test` skips
+# them with a note naming the feature.
+[[test]]
+name = "cli"
+required-features = ["fake-herdr"]
+
+[[test]]
+name = "connector"
+required-features = ["fake-herdr"]
+
+[[test]]
+name = "events"
+required-features = ["fake-herdr"]
+
+[[test]]
+name = "real_ssh"
+required-features = ["fake-herdr"]
+
+[[test]]
+name = "transport"
+required-features = ["fake-herdr"]
 
 [dependencies]
 anyhow = "1.0.104"
