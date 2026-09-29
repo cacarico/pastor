@@ -8548,6 +8548,93 @@ mod tests {
         );
     }
 
+    /// A profiled agy task is refused before it starts while its agent has
+    /// no flags and no `own_permissions`, the message naming the field; with
+    /// the field it starts with no permission flag or mode added, and `task
+    /// describe` says its own settings hold, not the profile's lists.
+    #[tokio::test]
+    async fn an_agy_task_under_a_profile_needs_its_own_permissions() {
+        let run_agy = || {
+            let IpcRequest::Run {
+                now,
+                preempt,
+                summary,
+                prompt,
+                spec,
+                flock,
+                priority,
+                role,
+                description,
+                agent: Some(choice),
+            } = run_profile(Some("develop"), None)
+            else {
+                unreachable!()
+            };
+            IpcRequest::Run {
+                now,
+                preempt,
+                summary,
+                prompt,
+                spec,
+                flock,
+                priority,
+                role,
+                description,
+                agent: Some(AgentChoice {
+                    agent: Some("agy".into()),
+                    ..choice
+                }),
+            }
+        };
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
+        let resp = d.handle(run_agy()).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "agent_tools_unsupported");
+        assert!(message.contains("own_permissions"), "{message}");
+        assert!(
+            !fake.requests().iter().any(|r| r.method == "agent.start"),
+            "{:?}",
+            fake.requests()
+        );
+
+        let mut config = profiles_config();
+        config.agents.0.insert(
+            "agy".into(),
+            crate::config::AgentDef {
+                own_permissions: true,
+                ..Default::default()
+            },
+        );
+        apply_config(&d, &config).await;
+        let resp = d.handle(run_agy()).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.profile(), Some("develop"));
+        assert!(!t.spec.deny.is_empty());
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        assert_eq!(start.params["kind"], "agy", "{:?}", start.params);
+        let args: Vec<&str> = start.params["args"]
+            .as_array()
+            .map(|a| a.iter().map(|a| a.as_str().unwrap()).collect())
+            .unwrap_or_default();
+        assert_eq!(args, t.spec.agent_args, "{args:?}");
+        for d in &t.spec.deny {
+            assert!(!args.contains(&d.as_str()), "{args:?}");
+        }
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains(
+                "(not applied: agent agy's permissions are in its own settings on the machine)"
+            ),
+            "{text}"
+        );
+    }
+
     /// A machine's profile reaches its tasks, before its flock's; a name
     /// that is no profile is refused, and so are agent args that pick a
     /// permission mode while a profile applies.

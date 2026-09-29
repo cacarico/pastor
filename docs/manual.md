@@ -1242,6 +1242,8 @@ one, the name itself), and `task describe` and `task list` keep the name
 definition gets Claude's trust keys and marker and its `--allowedTools` and
 `--disallowedTools` flags unless it sets `trust_keys`, `trust_marker`, `allow_flag` or
 `deny_flag` of its own. It does not inherit what `[agents.claude]` sets.
+`own_permissions = true` says the agent's permissions are in its own
+settings on the machine instead (see [Permission profiles](#permission-profiles)).
 
 `env` values are passed as written, except that a value of `~` or one that
 starts with `~/` is expanded against the home of the machine the task runs
@@ -2050,6 +2052,32 @@ its agent args; the profile does not turn it on.
 
 An agent of any other kind gets the lists through its `allow_flag` and
 `deny_flag`, as any list, and keeps its own permission mode.
+
+An agent whose permissions are in its own settings on the machine, such as
+agy with an allow list in its settings, says so with `own_permissions`:
+
+```toml
+# pastor.toml
+[agents.agy-builder]
+kind = "agy"
+own_permissions = true
+```
+
+A task of that agent under a profile starts with its args alone: pastor
+adds no permission flag and no mode, and the profile's lists are not passed.
+The agent's own settings on the machine decide what it may run, so they
+must hold at least what the profile would: pastor cannot check them.
+`pastor task describe` shows the lists with `(not applied: agent
+agy-builder's permissions are in its own settings on the machine)` after
+them. Without `own_permissions`, such a task is refused before it starts
+(`agent_tools_unsupported`), and the message names the field. The field
+cannot stand beside an `allow_flag` or `deny_flag`, and without a profile
+the lists still need flags. The unrestricted rule below holds for it as for
+any agent. To give it to some machines only, define it under its own name
+and name it on those machines (`agent = "agy-builder"`, or `agents = { agy
+= "agy-builder" }` for a model of kind agy). An older pastor refuses a
+pastor.toml with the key, so set it only once every machine runs a release
+that has it.
 
 Patterns are passed as written. Claude reads a `~/` path in a pattern
 (`Read(~/.ssh/**)`) as the home of the machine it runs on, so pastor does not
@@ -3885,6 +3913,7 @@ trust_keys = ["Down", "Enter"]   # accept its folder-trust prompt; [] for none
 trust_marker = "Yes, I trust this folder"  # saved trust presses them only while the pane shows this
 allow_flag = "--allowedTools"    # the flag before each allow pattern
 deny_flag = "--disallowedTools"  # the flag before each deny pattern
+# own_permissions = false       # true: its own settings hold its permissions; a profiled task gets no flags
 # account = "me-personal"       # a label: machines naming it share its usage limits; unset: none
 [models.sonnet]              # one table per model; none are built in
 kind = "claude"                  # the herdr agent kind that runs it (required)
