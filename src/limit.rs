@@ -4,8 +4,8 @@
 //! finished, so the text it left is the only place the difference shows.
 //! `limit_in` reads that text, and is strict about where it looks: pastor's
 //! own source, tests and notes carry the messages it looks for, and an agent
-//! that greps them must not read as limited. Claude's and agy's messages
-//! are known; any other kind reads as no limit.
+//! that greps them must not read as limited. Claude's, agy's and
+//! opencode's messages are known; any other kind reads as no limit.
 
 use std::time::Duration;
 
@@ -27,6 +27,17 @@ const TURN_LINES: usize = 15;
 /// What starts the output of a tool call, and Claude's own notices under a
 /// prompt.
 const OUTPUT_MARKER: char = '⎿';
+
+/// What starts the line opencode draws under each of its turns:
+/// `▣  Build · GPT-4.1 · 2.1s`.
+const OPENCODE_TURN_END: char = '▣';
+
+/// The side of a block opencode draws: a prompt, a tool call's output, an
+/// error, its input box.
+const OPENCODE_BAR: char = '┃';
+
+/// The bottom edge of opencode's input box: `╹▀▀▀▀`.
+const OPENCODE_BOX_EDGE: char = '╹';
 
 /// A limit an agent stopped on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,10 +285,14 @@ pub fn local_time(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 ///
 /// agy draws no marker before its messages, so for agy the end of the turn
 /// is its last paragraph (`agy_limit`).
+///
+/// For opencode (`opencode_limit`) it is the error block its last turn
+/// ended on, read from the block's first line.
 pub fn limit_in(kind: &str, text: &str, now: DateTime<Utc>) -> Option<Limit> {
     match kind {
         "claude" => claude_limit(text, now),
         "agy" => agy_limit(text, now),
+        "opencode" => opencode_limit(text, now),
         _ => None,
     }
 }
@@ -379,6 +394,100 @@ fn read_agy(said: &str, more: &str, now: DateTime<Utc>) -> Option<Limit> {
         no_credit: false,
         line: said.to_string(),
     })
+}
+
+/// The limit opencode's last turn ended on. opencode shows a provider's
+/// error, once its own retries are over, as a `┃` block right above the
+/// `▣` line that closes the turn, and the pane is read there only: the
+/// last `▣` line has to be the last thing above the input box (nothing
+/// sent since, nothing at work), and the block right above it has to start
+/// with a message on its first line. A tool call's output is a `┃` block
+/// too, but its first line is the call (`$ grep ...`), and a reply to the
+/// turn is not a block at all, so neither is a limit. So is a limit above
+/// the last prompt: that turn's `▣` is not the last one.
+fn opencode_limit(text: &str, now: DateTime<Utc>) -> Option<Limit> {
+    let text = text.replace('\u{a0}', " ");
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let end = lines
+        .iter()
+        .rposition(|l| l.starts_with(OPENCODE_TURN_END))?;
+    // Under the turn: the input box, as a run of `┃` lines on its bottom
+    // edge, and the footer under that.
+    let edge = (end + 1..lines.len()).find(|i| lines[*i].starts_with(OPENCODE_BOX_EDGE));
+    let boxed = edge.map_or(lines.len(), |e| {
+        (end + 1..e)
+            .rev()
+            .take_while(|i| lines[*i].starts_with(OPENCODE_BAR))
+            .last()
+            .unwrap_or(e)
+    });
+    if lines[end + 1..boxed].iter().any(|l| !l.is_empty()) {
+        return None;
+    }
+    let bottom = lines[..end].iter().rposition(|l| !l.is_empty())?;
+    let block: Vec<&str> = lines[..=bottom]
+        .iter()
+        .rev()
+        .take_while(|l| l.starts_with(OPENCODE_BAR))
+        .map(|l| l.trim_start_matches(OPENCODE_BAR).trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let (said, more) = block.split_first()?;
+    read_opencode(said, &more.join(" "), now)
+}
+
+/// The limit `said`, the first line of an error opencode showed, starts
+/// with, if it is one of the providers' messages. `more` is the rest of
+/// the error, read for the reset only.
+fn read_opencode(said: &str, more: &str, now: DateTime<Utc>) -> Option<Limit> {
+    let lower = said.replace('’', "'").to_ascii_lowercase();
+    let starts = |words: &str| lower.strip_prefix(words).is_some_and(ends_a_phrase);
+    let mut no_credit = false;
+    let mut model_scoped = false;
+    let hard = if starts("you exceeded your current quota") || starts("quota exceeded") {
+        // OpenAI's `insufficient_quota`, which opencode words the second
+        // way when it comes in the stream: no credit, no reset.
+        no_credit = true;
+        true
+    } else if lower.starts_with("rate limit reached for ")
+        || lower.starts_with("this request would exceed the rate limit")
+        || starts("overloaded")
+        || anthropic_short(&lower)
+    {
+        // OpenAI's rate limit, and Anthropic's 429 and 529, which opencode
+        // shows as their message, or as the JSON when it could not read one.
+        false
+    } else if starts("the usage limit has been reached") {
+        // A ChatGPT sign-in's usage limit.
+        true
+    } else {
+        model_scoped = scope_of(&lower)?.iter().any(|w| !WINDOW_WORDS.contains(w));
+        true
+    };
+    let whole = format!("{said} {more}");
+    Some(Limit {
+        hard,
+        until: reset_in(&whole, now),
+        model_scoped,
+        no_credit,
+        line: said.to_string(),
+    })
+}
+
+/// Whether `lower` is Anthropic's error JSON for a 429 or a 529:
+/// `{"type":"error","error":{"type":"overloaded_error",...}}`.
+fn anthropic_short(lower: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(lower) else {
+        return false;
+    };
+    let kind = value
+        .get("error")
+        .and_then(|e| e.get("type"))
+        .and_then(|t| t.as_str());
+    matches!(kind, Some("rate_limit_error" | "overloaded_error"))
 }
 
 fn claude_limit(text: &str, now: DateTime<Utc>) -> Option<Limit> {
@@ -1259,11 +1368,18 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_and_agy_are_read() {
+    fn only_claude_agy_and_opencode_are_read() {
         let pane = "● You've hit your limit · resets 3am\n";
         assert!(limit_in("claude", pane, now()).is_some());
-        for kind in ["agy", "opencode", "codex", "claude-personal", ""] {
+        assert!(opencode(&error_turn("Overloaded")).is_some());
+        assert_eq!(limit_in("opencode", pane, now()), None);
+        for kind in ["codex", "claude-personal", "agy", ""] {
             assert_eq!(limit_in(kind, pane, now()), None, "{kind}");
+            assert_eq!(
+                limit_in(kind, &error_turn("Overloaded"), now()),
+                None,
+                "{kind}"
+            );
         }
         let pane = "RESOURCE_EXHAUSTED (code 429): Individual quota reached.\n";
         assert!(limit_in("agy", pane, now()).is_some());
@@ -1326,6 +1442,126 @@ mod tests {
         let limit = "  RESOURCE_EXHAUSTED (code 429): Individual quota reached.";
         let pane = format!("╭──────────╮\n│ > review │\n╰──────────╯\n\n{limit}\n");
         assert!(limit_in("agy", &pane, now()).is_some(), "{pane}");
+    }
+
+    fn opencode(text: &str) -> Option<Limit> {
+        limit_in("opencode", text, now())
+    }
+
+    /// An opencode input box and footer, as it draws them under a turn.
+    const OPENCODE_BOX: &str = "  ┃\n  ┃\n  ┃  Build · GPT-4.1 OpenAI\n  ╹▀▀▀▀▀▀▀▀\n   work/pastor   tab agents  ctrl+p commands\n";
+
+    /// A turn that ended on `error`, opencode's error block, over the
+    /// input box.
+    fn error_turn(error: &str) -> String {
+        let block: String = error.lines().map(|l| format!("  ┃  {l}\n")).collect();
+        format!(
+            "  ┃\n  ┃  Fix the flaky test\n  ┃\n\n  ┃\n{block}  ┃\n\n     ▣  Build · GPT-4.1\n\n\n{OPENCODE_BOX}"
+        )
+    }
+
+    #[test]
+    fn opencodes_last_error_block_is_a_limit() {
+        for (said, hard, no_credit) in [
+            (
+                "You exceeded your current quota, please check your plan",
+                true,
+                true,
+            ),
+            (
+                "Quota exceeded. Check your plan and billing details.",
+                true,
+                true,
+            ),
+            (
+                "Rate limit reached for gpt-4.1 in organization org-x",
+                false,
+                false,
+            ),
+            (
+                "This request would exceed the rate limit for your organization",
+                false,
+                false,
+            ),
+            ("Overloaded", false, false),
+            (
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"x"}}"#,
+                false,
+                false,
+            ),
+            (
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"x"}}"#,
+                false,
+                false,
+            ),
+            ("The usage limit has been reached", true, false),
+            (
+                "You've hit your usage limit. Try again in 2 hours.",
+                true,
+                false,
+            ),
+        ] {
+            let limit = opencode(&error_turn(said)).expect(said);
+            assert_eq!((limit.hard, limit.no_credit), (hard, no_credit), "{said}");
+            assert_eq!(limit.line, said);
+        }
+        let quota = opencode(&error_turn("You exceeded your current quota.")).unwrap();
+        assert_eq!((quota.until, quota.what().as_str()), (None, "no credit"));
+        let rate = opencode(&error_turn("Overloaded")).unwrap();
+        assert_eq!(rate.what(), "rate limit");
+    }
+
+    /// The reset can be on a later line of the block, and a line can break
+    /// where the terminal did.
+    #[test]
+    fn opencodes_reset_is_read_from_the_whole_block() {
+        let limit = opencode(&error_turn(
+            "Rate limit reached for gpt-4.1 in organization org-x on tokens. Please try\nagain in 20s. Visit https://platform.openai.\ncom/account/rate-limits",
+        ))
+        .unwrap();
+        assert_eq!(limit.until, Some(now() + chrono::Duration::seconds(20)));
+        assert_eq!(
+            limit.line,
+            "Rate limit reached for gpt-4.1 in organization org-x on tokens. Please try"
+        );
+    }
+
+    #[test]
+    fn an_opencode_block_that_does_not_start_with_the_message_is_no_limit() {
+        for said in [
+            "$ grep -rn \"You exceeded your current quota\" src\nYou exceeded your current quota",
+            "The agent said: You exceeded your current quota",
+            "Overloaded servers are slow",
+            "Quota exceeded for this repo is fine",
+            r#"{"type":"error","error":{"type":"invalid_request_error"}}"#,
+            "All done, merged #31",
+        ] {
+            assert_eq!(opencode(&error_turn(said)), None, "{said}");
+        }
+    }
+
+    #[test]
+    fn only_opencodes_last_turn_is_read() {
+        let limited = error_turn("Overloaded");
+        assert!(opencode(&limited).is_some());
+        // A reply ended the turn: the error above it is an older one.
+        let replied = limited.replace(
+            "\n     ▣  Build · GPT-4.1",
+            "\n     All green.\n\n     ▣  Build · GPT-4.1 · 2s",
+        );
+        assert_eq!(opencode(&replied), None);
+        // A prompt sent since the turn ended, and the agent at work on it.
+        let (above, below) = limited.split_once("\n\n\n").unwrap();
+        let sent = format!("{above}\n\n  ┃\n  ┃  Carry on\n  ┃\n\n{below}");
+        assert_eq!(opencode(&sent), None);
+        // Something typed in the box is still the box.
+        let typed = limited.replace("  ┃\n  ┃  Build", "  ┃  carry on\n  ┃\n  ┃  Build");
+        assert!(opencode(&typed).is_some());
+        // No turn has ended: nothing is read.
+        assert_eq!(opencode("  ┃\n  ┃  Overloaded\n  ┃\n"), None);
+        // With nothing under it, the turn still ended there.
+        let bare = "  ┃\n  ┃  Overloaded\n  ┃\n\n     ▣  Build · GPT-4.1\n";
+        assert!(opencode(bare).is_some());
     }
 
     #[test]

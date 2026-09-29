@@ -1,0 +1,19 @@
+#! kind: opencode
+#! source: made
+#! now: 2026-09-29T21:00:00Z
+#! limit: none
+  ┃
+  ┃  Fix the flaky transport test
+  ┃
+
+     ▣  Build · GPT-4.1
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · GPT-4.1 OpenAI
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ■You⬝exceeded your current quota, please check your plan and billing details. For… (click to expa
+    retrying in 3s attempt #3]

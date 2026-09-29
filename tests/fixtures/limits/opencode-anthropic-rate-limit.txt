@@ -1,0 +1,43 @@
+#! kind: opencode
+#! source: real
+#! now: 2026-09-29T21:00:00Z
+#! limit: short
+#! model_scoped: no
+#! until: none
+  ┃
+  ┃  Fix the flaky transport test
+  ┃
+
+  ┃
+  ┃  This request would exceed the rate limit for your organization of 30,000 input tokens per
+  ┃  minute. For details, refer to: https://docs.claude.com/en/api/rate-limits.
+  ┃
+
+     ▣  Build · Claude Sonnet 4.5 (latest)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Claude Sonnet 4.5 (latest) Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   work/pastor                                                              tab agents  ctrl+p commands

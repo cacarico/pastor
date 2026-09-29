@@ -1,0 +1,44 @@
+#! kind: opencode
+#! source: real
+#! now: 2026-09-29T21:00:00Z
+#! limit: hard
+#! no_credit: yes
+#! model_scoped: no
+#! until: none
+  ┃
+  ┃  Fix the flaky transport test
+  ┃
+
+  ┃
+  ┃  You exceeded your current quota, please check your plan and billing details. For more
+  ┃  information on this error, read the docs: https://platform.openai.com/docs/guides/error-
+  ┃  codes/api-errors.
+  ┃
+
+     ▣  Build · GPT-4.1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · GPT-4.1 OpenAI
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   work/pastor                                                              tab agents  ctrl+p commands

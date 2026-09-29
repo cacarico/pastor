@@ -1,0 +1,24 @@
+#! kind: opencode
+#! source: spec
+#! now: 2026-09-29T21:00:00Z
+#! limit: short
+#! model_scoped: no
+#! until: none
+  ┃
+  ┃  Fix the flaky transport test
+  ┃
+
+  ┃
+  ┃  {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+  ┃
+
+     ▣  Build · Claude Sonnet 4.5 (latest)
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Claude Sonnet 4.5 (latest) Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   work/pastor                                                              tab agents  ctrl+p commands

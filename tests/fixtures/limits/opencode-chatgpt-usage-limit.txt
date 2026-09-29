@@ -1,0 +1,43 @@
+#! kind: opencode
+#! source: spec
+#! now: 2026-09-29T21:00:00Z
+#! limit: hard
+#! model_scoped: no
+#! until: none
+  ┃
+  ┃  Fix the flaky transport test
+  ┃
+
+  ┃
+  ┃  The usage limit has been reached
+  ┃
+
+     ▣  Build · GPT-4.1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · GPT-4.1 OpenAI
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   work/pastor                                                              tab agents  ctrl+p commands
