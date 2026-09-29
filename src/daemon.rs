@@ -2094,6 +2094,13 @@ impl Fleet {
                 None => by_machine.push((p.handle.name.clone(), vec![p])),
             }
         }
+        // A `--now` placement is urgent: send it ahead of this pass's other
+        // placements for the same machine, so an earlier queued task's
+        // dispatch (up to `reply_wait`) never makes it wait. `sort_by_key`
+        // is stable, so it does not reorder within either group.
+        for (_, sends) in &mut by_machine {
+            sends.sort_by_key(|p| !p.task.spec.now);
+        }
         let mut sending = tokio::task::JoinSet::new();
         for (_, sends) in by_machine {
             sending.spawn(async move {
@@ -2181,7 +2188,7 @@ impl Fleet {
             // A `--now` task takes its pinned machine past its limits, or
             // nothing: it neither waits for a slot nor pauses another task.
             if task.spec.now {
-                let Some(name) = now_machine(&views, &task.spec, &accepts) else {
+                let Some(name) = now_machine(&views, target, &task.spec, &accepts) else {
                     continue;
                 };
                 let Some(handle) = self.get(&name) else {
@@ -3215,8 +3222,23 @@ impl Daemon {
                                 t.spec.machine.as_deref().unwrap_or("its machine")
                             )
                         });
-                        if let Err(err) = self.store.close_queued(t.id) {
-                            tracing::warn!(task = %t.display_id(), %err, "close a --now task");
+                        match self.store.close_queued(t.id) {
+                            Ok(Some(closed)) => {
+                                let _ = self.events.send(PastorEvent {
+                                    detail: None,
+                                    kind: "task.closed".into(),
+                                    task_id: Some(closed.id),
+                                    machine: None,
+                                    job: Some(closed.job.clone()),
+                                    summary: None,
+                                });
+                            }
+                            // A claim or another close won the race since
+                            // the read above: whichever did it says so.
+                            Ok(None) => {}
+                            Err(err) => {
+                                tracing::warn!(task = %t.display_id(), %err, "close a --now task");
+                            }
                         }
                         IpcResponse::error(
                             "now_not_started",
@@ -5995,6 +6017,32 @@ mod tests {
                 assert_eq!(error_code(resp), "now_refused", "{caller:?}");
             }
             assert_eq!(d.store.list_tasks(&TaskFilter::default()).unwrap().len(), 1);
+        }
+
+        /// A `--now` task whose pinned machine will not take it (its tags
+        /// do not match) never waits in the queue: it is closed at once,
+        /// and that close is announced like any other, not left silent
+        /// (GPT review on #103, finding 3).
+        #[tokio::test]
+        async fn a_now_task_that_cannot_start_is_closed_and_announced() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            let mut req = run_now("urgent", Some("a"));
+            if let IpcRequest::Run { spec, .. } = &mut req {
+                spec.tags = vec!["gpu".into()];
+            }
+            let mut events = d.subscribe();
+            let resp = d.handle(req).await;
+            assert_eq!(error_code(resp), "now_not_started");
+            let rows = d.store.list_tasks(&TaskFilter::default()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].state, TaskState::Closed);
+            let events = events_of(&mut events);
+            assert!(
+                events
+                    .iter()
+                    .any(|(kind, id, _)| kind == "task.closed" && *id == Some(rows[0].id)),
+                "{events:?}"
+            );
         }
 
         /// The head sets `spec.now` from `Run::now` alone: a spec that
@@ -10903,6 +10951,56 @@ mod tests {
                 flock: "default".into(),
             })
             .unwrap()
+    }
+
+    /// A queued `--now` task pinned to `machine`, straight into the store,
+    /// as the head would have set `DispatchSpec::now` from `Run::now`.
+    fn queue_now_on(store: &Store, prompt: &str, machine: &str) -> Task {
+        store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: prompt.into(),
+                spec: DispatchSpec {
+                    now: true,
+                    machine: Some(machine.into()),
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// A `--now` placement is urgent: queued behind a slower placement for
+    /// the same machine in one pass, its own dispatch must start without
+    /// waiting for that placement to finish (`dispatch_queued` sorts a
+    /// machine's sends so `now` goes first; GPT review on #103, finding 1).
+    #[tokio::test]
+    async fn now_starts_ahead_of_a_slower_placement_on_the_same_machine() {
+        let slow = FakeHerdr::new();
+        slow.set_ready_after(Duration::from_millis(300));
+        let (d, _tmp) = daemon(&[("a", 1, slow.clone())]).await;
+        let first = queue_on(&d.store(), "slow", Some("a"));
+        let urgent = queue_now_on(&d.store(), "urgent", "a");
+        let fleet = d.fleet();
+        let pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_millis(150);
+        while state_of(&d, &urgent) != TaskState::Starting {
+            assert!(Instant::now() < deadline, "the --now task never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            state_of(&d, &first),
+            TaskState::Queued,
+            "a slower placement for the same machine must not go out ahead of --now"
+        );
+        pass.await.unwrap();
+        assert_eq!(state_of(&d, &urgent), TaskState::Running);
+        assert_eq!(state_of(&d, &first), TaskState::Running);
     }
 
     /// A pass sends outside the dispatch lock: while `a` is still starting
