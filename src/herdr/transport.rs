@@ -820,6 +820,38 @@ mod tests {
         assert_eq!(command.describe(), "command fake-herdr --connect /h.sock");
     }
 
+    /// `Endpoint`'s `Connector` impl (used through `&dyn Connector`, unlike
+    /// the tests above that call the inherent methods directly) matches the
+    /// inherent methods it delegates to.
+    #[test]
+    fn the_connector_impl_matches_endpoint_directly() {
+        let paths = Paths::new("/c", "/s");
+        let ep = Endpoint::from_machine(&ssh_machine("pi-3"), &paths);
+        let c: &dyn Connector = &ep;
+        assert_eq!(c.describe(), ep.describe());
+        assert_eq!(c.host(), ep.host());
+    }
+
+    /// A `Connector` that does not override `host` falls back to `describe`.
+    struct DescribeOnly;
+    impl Connector for DescribeOnly {
+        fn connect(&self) -> ConnectFuture<'_> {
+            Box::pin(async {
+                Err(ConnectError {
+                    message: "no".into(),
+                })
+            })
+        }
+        fn describe(&self) -> String {
+            "described".into()
+        }
+    }
+
+    #[test]
+    fn a_connector_with_no_host_of_its_own_falls_back_to_describe() {
+        assert_eq!(DescribeOnly.host(), "described");
+    }
+
     /// The machine name in the ControlPath is only there to be recognisable;
     /// `%C` is the identity. A name that would push the socket name past
     /// `sun_path` must be shortened, not cost every request a full handshake.
