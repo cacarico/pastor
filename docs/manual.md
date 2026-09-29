@@ -332,6 +332,8 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `not_running` | `serve stop` or `serve status` with no serve running here |
 | `not_trusted` | `trust remove` of a repo that is not trusted on that machine |
 | `nothing_to_send` | `task send` with no text, `--key` or `--trust` |
+| `now_not_started` | `task run --now` could not start the task at once; it is closed, not left queued |
+| `now_refused` | `task run --now` from an agent or an orchestrator's script; only a person may use it |
 | `opencode_permissions_conflict` | a profiled opencode task on a machine whose opencode config has permission rules |
 | `orchestrator_held` | a session orchestrator's state could not be read or kept |
 | `orchestrator_invalid` | the orchestrator's file has never been valid |
