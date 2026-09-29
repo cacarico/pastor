@@ -4002,6 +4002,7 @@ mod tests {
             repo.join("docs/manual.md"),
             repo.join("docs/recommended-setup.md"),
         ];
+        markdown_files(&skills_dir(), &mut files);
         markdown_files(&repo.join("docs/website/content"), &mut files);
         let mut wrong = Vec::new();
         let mut loaded = 0;
