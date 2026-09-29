@@ -1,7 +1,7 @@
 # pastor
 
-**An agent orchestrator for the machines you own.** Queue tasks, schedule
-jobs, and let pastor spread coding agents across your machines over ssh.
+**An agent orchestrator for a flock of machines.** Queue tasks, schedule
+jobs, and let pastor spread coding agents across your flock over ssh.
 
 [![CI](https://github.com/cacarico/pastor/actions/workflows/ci.yml/badge.svg)](https://github.com/cacarico/pastor/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/cacarico/pastor)](https://github.com/cacarico/pastor/releases)
