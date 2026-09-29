@@ -243,6 +243,120 @@ runs again as any done task does. `task describe --json` prints `"ended": true`.
 Runtime errors print JSON on stderr with a stable `code` and exit 1; a
 malformed command line gets clap's plain usage text and exit 2.
 
+Scripts, skills and orchestrators branch on the code, so every one pastor
+uses is here (a test fails when one is missing). A code from herdr itself,
+such as `pane_not_found`, is passed on as herdr gave it.
+
+| Code | When |
+| --- | --- |
+| `agent_kind_missing` | the task's flock names an agent of a kind the machine has none of |
+| `agent_pane_busy` | herdr kept saying the agent's pane was busy after pastor's retries |
+| `agent_refused` | a task or an orchestrator's script asks for a fleet change agents may not make |
+| `agent_tools_unsupported` | the task has tool lists and its agent has no setting to pass them |
+| `already_seen` | a job's key was queued before and its task row is gone |
+| `branch_gone` | reopening a closed task: its worktree and its branch are both gone |
+| `close_failed` | `task close` could not close one or more of the tasks |
+| `config_error` | a config file (pastor.toml, flock.toml, a job, the head file) does not read |
+| `connector_failed` | a connector command exited non-zero or printed what pastor cannot read |
+| `connector_not_found` | no installed or linked connector has that id |
+| `daemon_not_running` | nothing listens on the daemon socket; start `pastor serve` |
+| `edit_conflict` | the file changed while an `edit` had it open; it is left as it is now |
+| `editor_failed` | `$EDITOR` would not run or exited non-zero; nothing changed |
+| `events_read_failed` | the head could not read its events log |
+| `fleet_locked` | another pastor held flock.toml too long (a head starting or another edit) |
+| `flock_exists` | `flock add` of a flock that exists |
+| `flock_has_tasks` | `flock remove` of a flock with open tasks |
+| `flock_is_default` | `flock remove` of the default flock |
+| `flock_mismatch` | the task names a machine outside its flock |
+| `flock_not_empty` | `flock remove` of a flock that still has machines |
+| `head_running` | `pastor serve` while a head already runs here |
+| `head_started` | a head started while a head-less edit waited; run the command again |
+| `head_too_old` | the head predates something the request needs; upgrade it |
+| `head_unreachable` | ssh to the remote head failed |
+| `head_unresponsive` | something holds the socket but does not answer a ping |
+| `herdr_error` | herdr could not be run, or answered a request with an error |
+| `internal` | the daemon sent a reply of a kind the CLI did not expect |
+| `invalid_dispatch` | a headless job submission has an invalid dispatch configuration |
+| `invalid_edit` | the edited file does not check; `edit` asks to reopen it, and the edit is kept either way |
+| `invalid_file` | a request for a file pastor does not edit (only flock, config or `job:<name>`) |
+| `invalid_key` | `bridge` was given something other than one public key line |
+| `invalid_machine` | `bridge`: a machine name that cannot go in authorized_keys unquoted |
+| `invalid_name` | a name (such as `watch --name`) with characters pastor refuses |
+| `invalid_path` | `bridge`: a pastor path that cannot go in authorized_keys unquoted |
+| `invalid_report` | a pull machine reported a state it may not set |
+| `invalid_request` | a line that is not a request, on the daemon socket or the bridge; a headless job submission with an invalid job name or an item with no string key |
+| `item_rejected` | a job item has no usable key or prompt |
+| `job_name_taken` | a headless serve's job has the name of one of the head's |
+| `job_not_found` | no job by that name |
+| `job_task_refused` | the head would not queue a headless serve's job task |
+| `machine_exists` | `machine add` of a machine that exists |
+| `machine_shutting_down` | the machine's actor is stopping; try again |
+| `model_kind_mismatch` | the task's model is for another kind of agent |
+| `no_agent` | `task attach` to a task that has no agent yet |
+| `no_head` | the bridge found no `pastor serve` on its machine |
+| `no_machine` | the task is not on any machine |
+| `no_session` | reopening a closed task with no session to resume |
+| `no_terminal` | `task attach` to a task on a command machine |
+| `no_trust_keys` | `task send --trust` and the agent has no `trust_keys` |
+| `no_worktree` | `task close --remove-worktree` of a task with no worktree |
+| `not_allowed_for_agent` | an agent's bridge will not pass the request on |
+| `not_an_orchestrator` | an orchestrator note from a task no orchestrator file started |
+| `not_at_trust_prompt` | `task send --trust` to a task not blocked on its startup prompt |
+| `not_in_flock` | the machine is not in that flock |
+| `not_on_machine` | a pull machine reported a task that is not on it |
+| `not_prunable` | `task prune` of a state other than done, failed or closed |
+| `not_pull_machine` | a pull machine request from a machine that is not one |
+| `not_queued` | `task priority` or `queue move` of a task that is not waiting in the queue |
+| `not_retryable` | `task retry` of a task in a state that cannot be retried |
+| `not_running` | `serve stop` or `serve status` with no serve running here |
+| `not_trusted` | `trust remove` of a repo that is not trusted on that machine |
+| `nothing_to_send` | `task send` with no text, `--key` or `--trust` |
+| `opencode_permissions_conflict` | a profiled opencode task on a machine whose opencode config has permission rules |
+| `orchestrator_held` | a session orchestrator's state could not be read or kept |
+| `orchestrator_invalid` | the orchestrator's file has never been valid |
+| `orchestrator_kind` | `run` of a session orchestrator, or `start`/`stop` of a scheduled one |
+| `orchestrator_not_found` | no orchestrator by that name |
+| `orchestrator_not_running` | `orchestrator stop` of one that is not running |
+| `preempt_needs_critical` | `--preempt` on a task below critical |
+| `profile_args_conflict` | the profile meets agent args that pick a permission mode of their own |
+| `profile_cycle` | permission profiles that extend each other in a loop |
+| `profile_not_allowed` | `unrestricted` asked for on a machine whose own profile is not |
+| `prompt_file_empty` | `--prompt-file` names an empty file |
+| `prompt_file_unreadable` | `--prompt-file` names a file pastor cannot read |
+| `pull_machine_task` | read, send or attach to a pull machine's task from the head |
+| `read_failed` | `task read` could not read the agent's pane |
+| `remote_head_unsupported` | a command that runs on the head only, with a remote head set |
+| `reopen_failed` | reopening a closed task could not start its agent again |
+| `request_too_large` | a request over the daemon's size limit |
+| `role_refused` | a task or a script asks for what only a person may, such as `--role orchestrator` |
+| `runtime_error` | any other failure; the message says what |
+| `scheduler_error` | the scheduler could not run, list or reload jobs |
+| `serve_failed` | `pastor serve` in the background exited before answering |
+| `serve_slow` | `pastor serve` started one that has not answered yet |
+| `service_managed` | `serve stop` of a serve that systemd or launchd would restart |
+| `shepherd_not_running` | a job command for this machine's headless serve, which is not running |
+| `shepherd_running` | `pastor serve` as a head while a headless serve runs here |
+| `shepherd_unexpected` | this machine's socket belongs to a head, not a headless serve |
+| `shepherd_unresponsive` | this machine's headless serve does not answer |
+| `shepherd_unsupported` | a request a headless serve does not answer; ask the head |
+| `stop_failed` | `serve stop` could not tell which process holds the socket |
+| `stop_timeout` | the serve still runs after SIGTERM and the wait |
+| `store_error` | the task database failed or kept changing under the request |
+| `summary_empty` | `task done --summary` or `--summary-file` is blank or whitespace-only |
+| `summary_file_unreadable` | `task done --summary-file` could not read the file |
+| `summary_required` | `task done` without a summary on a `summary = "require"` task |
+| `task_not_found` | no task with that id |
+| `task_not_live` | the task has no live agent to send to or act on |
+| `task_paused` | `task attach` to a paused task |
+| `timeout` | the daemon did not answer in time; the request may still land |
+| `unknown_flock` | no flock by that name |
+| `unknown_machine` | no machine by that name |
+| `unknown_model` | no model by that name in `[models]` |
+| `unknown_priority` | a priority level that is not low, normal, high or critical |
+| `unknown_profile` | no permission profile by that name |
+| `usage_error` | arguments clap accepts but pastor does not, such as a bad task id |
+| `worktree_needs_repo` | a worktree task with no repo to branch from |
+
 ### After an upgrade
 
 After an upgrade, restart `pastor serve`. A CLI newer than its head refuses
