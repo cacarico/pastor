@@ -103,4 +103,6 @@ pastor setup launchd --start
 
 On a machine with a head set elsewhere, `pastor setup systemd` installs the
 same unit. `pastor serve --foreground` reads the head from `client.toml` and
-runs headless: see [remote](../remote/#a-headless-serve).
+runs headless: it runs that machine's jobs and hooks, and the tasks the
+head gives it when the head lists it as `pull = true`. See
+[remote](../remote/#a-headless-serve).

@@ -34,9 +34,9 @@ extends = "develop"
 allow = ["Bash(docker:*)"]
 ```
 
-A duration is a whole number and one unit: `30s`, `5m`, `2h`, `1d`. Unknown
-keys at the top level, in `[defaults]` and in `[agents.<name>]` are ignored
-without a word, so check the spelling. The other tables refuse them.
+A duration is a whole number and one unit: `30s`, `5m`, `2h`, `1d`. An
+unknown key, at the top level or in any table, is refused: the file does not
+load, and the error names the key.
 
 ## top-level keys
 

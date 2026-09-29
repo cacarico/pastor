@@ -1,6 +1,6 @@
 ---
 title: head
-summary: the one machine that keeps track
+summary: the one pastor serve that keeps track
 weight: 1
 ---
 The head is the `pastor serve` process that owns your flocks. It holds the
@@ -15,6 +15,10 @@ machines, and keeps the history. Everything else, the CLI included, asks it.
 | every event, one JSON line each | `~/.local/state/pastor/events.jsonl` |
 | its own log, when it runs in the background | `~/.local/state/pastor/serve.log` |
 | the unix socket the CLI talks to | `~/.local/state/pastor/pastor.sock` |
+
+Each orchestrator's state, note and run logs are in
+`~/.local/state/pastor/orchestrators/<name>/`; the
+[files table](../../reference/pastor-toml/#files) has the rest.
 
 It reads its config from `~/.config/pastor/`: `flock.toml`, `pastor.toml`,
 `jobs/` and `orchestrators/`. It picks up edits on its next tick, every 10
@@ -57,6 +61,11 @@ say so on stderr:
   last known state.
 - `pastor events` reads the events file.
 
+That is a head on this machine. With a head set elsewhere (see
+[remote](../../deploy/remote/)), nothing falls back: every one of these,
+`pastor events` included, asks that head and fails with `head_unreachable`
+or `no_head` while it is down.
+
 Commands that change work need the head: `pastor task run` fails with
 "pastor serve is not running". `pastor tick` runs one pass on its own, but
 the tasks it makes stay queued until a head starts.
@@ -64,6 +73,22 @@ the tasks it makes stay queued until a head starts.
 A head that holds the socket but does not answer within two seconds is
 treated as busy, not gone. Commands then stop with `head_unresponsive`
 instead of working around it, so two schedulers never run side by side.
+
+## back it up
+
+Stop the head first (`pastor serve stop`, or its service), so `pastor.db`
+is whole in one file. Then keep:
+
+| what | why |
+|---|---|
+| `~/.config/pastor/` | flocks, settings, jobs, orchestrators, and each connector's `.env` |
+| `~/.local/state/pastor/pastor.db` | tasks, summaries, seen items, job state, saved trust |
+| `~/.local/state/pastor/orchestrators/` | each orchestrator's state and handover note |
+| `~/.local/state/pastor/events.jsonl` | the history, if you want it |
+
+Connectors themselves reinstall with `pastor connector install`. The same
+list is what a move to another machine copies: see
+[move the head](../../deploy/remote/#move-the-head).
 
 ## one head, or a headless serve
 

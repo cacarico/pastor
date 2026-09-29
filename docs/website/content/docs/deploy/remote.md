@@ -78,8 +78,11 @@ These stay on this machine:
 With a head set, `pastor serve` on this machine does not start a second
 head. It runs headless: it runs the jobs in this machine's `jobs/` and hands
 the work they find to the head, and it runs this machine's connector hooks
-on the head's events. `pastor serve status` says `headless`, and `pastor
-setup systemd` installs it as a service the same way.
+on the head's events. When the head lists this machine as `pull = true`, it
+also runs the tasks the head gives it: see
+[a laptop that takes tasks](#a-laptop-that-takes-tasks). `pastor serve
+status` says `headless`, and `pastor setup systemd` installs it as a service
+the same way.
 
 ## a laptop that takes tasks
 
@@ -111,7 +114,7 @@ there. `[shepherd] machine` names it when its name in flock.toml is not its
 hostname. The laptop keeps its copy of those tasks in `shepherd.db`, in its
 state folder. A pull
 machine the head has not heard from in 10 minutes (`pull_lost_after`) is
-counted lost, and its running tasks go `stale`.
+counted lost, and its starting and running tasks go `stale`.
 
 ## move the head
 
@@ -120,11 +123,13 @@ machine:
 
 1. On `laptop`, stop the head: `pastor serve stop`, or its service with
    `pastor setup systemd --stop`.
-2. Copy `flock.toml`, `pastor.toml`, `jobs/` and `orchestrators/` from
-   `~/.config/pastor/`, and `pastor.db` and `orchestrators/` from
-   `~/.local/state/pastor/`, to the same places on `server-1`. Install the
-   connectors the jobs use there. Delete the job files from `laptop`, or
-   they run there as well.
+2. Copy `flock.toml`, `pastor.toml`, `jobs/`, `orchestrators/` and each
+   `connectors/<id>/.env` from `~/.config/pastor/`, and `pastor.db`,
+   `orchestrators/` and, for the history, `events.jsonl` from
+   `~/.local/state/pastor/`, to the same places on `server-1`. Without
+   `orchestrators/` in both, the new head has no orchestrators, or starts
+   them with no state or note. Install the connectors the jobs use there.
+   Delete the job files from `laptop`, or they run there as well.
 3. On `server-1`, in the copied flock.toml, make `server-1` `local = true`
    and `laptop` `pull = true`. In pastor.toml, set `head_address` to the
    ssh destination the machines reach `server-1` by.

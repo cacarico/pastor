@@ -68,7 +68,7 @@ flock lists is in the default flock.
 | `flock` | unset | the old way to join one flock, with the machine's own limits; `machines` on the flock is the current way |
 
 Set exactly one of `ssh`, `local`, `pull` and `command`. Unknown keys in a
-`[[machine]]` are ignored, so check the spelling. `model`, `agents` and
+`[[machine]]` are refused, as everywhere in the file. `model`, `agents` and
 `profile` must exist in [pastor.toml](../pastor-toml/).
 
 ## flock

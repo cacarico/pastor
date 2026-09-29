@@ -74,7 +74,7 @@ Orchestrator events all carry `orchestrator`, its name, in `detail`. See
 | `orchestrator.skipped` | a run was skipped | `reason`: `busy` or `post_pending` |
 | `orchestrator.held` | a run was held back | `reason`: `max_orchestrators` (with `max`), `quota` (with `until`) or `restarts` (with `max`, `until`) |
 | `orchestrator.quota` | its agent stopped on a usage limit | `until` |
-| `orchestrator.failed` | a script failed, or its agent could not start or failed | `stage` (`pre`, `agent` or `post`), `error`; `failures` on `pre` |
+| `orchestrator.failed` | a script failed, its agent could not start or failed, or its saved state could not be read | `stage` (`pre`, `agent`, `post` or `state`), `error`; `failures` on `pre` |
 | `orchestrator.restarted` | a session's agent ended early and a new one took over | `after`, the old task; `restarts` in the last hour |
 | `orchestrator.stopping` | a session's agent got its last message | `reason` (`hours` or `hand`), `grace` |
 | `orchestrator.stopped` | the session ended | `reason` |
