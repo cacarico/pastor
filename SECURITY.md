@@ -76,7 +76,10 @@ Dependabot watches the crates in `Cargo.lock` and the GitHub Actions the
 workflows use (`.github/dependabot.yml`): it opens security updates as soon as
 an advisory lands, and version updates weekly, grouping minor and patch bumps
 into one pull request per ecosystem. Its pull requests go through CI like any
-other. Its malware alerts flag a dependency version that has been reported as
+other. Work happens in a private copy of the repository, which publishes to
+the public one, so in the public repository Dependabot's pull requests are
+closed by a workflow (`.github/workflows/dependabot-close.yml`): the same
+update is merged in the private copy and arrives with the next sync. Its malware alerts flag a dependency version that has been reported as
 malicious.
 
 New dependencies should be justified in the pull request. Reviewers should
