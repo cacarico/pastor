@@ -1321,6 +1321,24 @@ mod tests {
         );
     }
 
+    /// `flock_held` clears a seat under its share on its own, whatever
+    /// `waiting_under_share` says: that list only matters to a seat past
+    /// its share (`mark_waiting_under_share` never fills it otherwise, but
+    /// `flock_held` reads it as given).
+    #[test]
+    fn flock_held_clears_a_seat_under_share_even_with_others_waiting() {
+        let v = MachineView {
+            flocks: vec![seat("work", Some(4), 1)],
+            waiting_under_share: vec!["home".to_string()],
+            ..mv("desk", 4, 1, &[], true)
+        };
+        assert_eq!(
+            flock_held(&v, "work"),
+            None,
+            "under its share holds nothing off"
+        );
+    }
+
     /// Only the task's flock takes it, whatever the others have free.
     #[test]
     fn pick_machine_keeps_to_the_tasks_flock() {
