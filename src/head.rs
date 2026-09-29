@@ -467,6 +467,7 @@ mod tests {
             pastor: None,
         };
         assert!(save(&path, Some(&h)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0xFF, 0xFE, 0x00, 0xFF]);
     }
 
     #[test]
