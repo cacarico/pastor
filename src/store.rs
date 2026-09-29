@@ -85,6 +85,21 @@ pub struct TrustedRepo {
     pub trusted_at: DateTime<Utc>,
 }
 
+/// Runs a call that may wait on SQLite (the connection's lock, then up to
+/// `BUSY_TIMEOUT` for another connection's) without holding up the tokio
+/// worker it was made on: `block_in_place` hands the worker's other tasks to
+/// another thread first. Store methods are called straight from async code
+/// all over the head, so wrapping them here spares every call site a
+/// `spawn_blocking`. Outside a multi-thread runtime (a CLI, a
+/// `current_thread` test) the call runs as it is.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     /// The last lines read from a finishing task's pane, by task id; in
@@ -523,17 +538,19 @@ impl Store {
         preempt: bool,
     ) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        tx.execute(
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, role, description, preempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?11, ?10, ?10)",
             params![t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, priority.as_str(), from, role.as_str(), t.description, now, preempt],
         )?;
-        let id = tx.last_insert_rowid();
-        place_last(&tx, id)?;
-        tx.commit()?;
-        drop(conn);
-        self.get_task(id)?.context("task vanished after insert")
+            let id = tx.last_insert_rowid();
+            place_last(&tx, id)?;
+            tx.commit()?;
+            drop(conn);
+            self.get_task(id)?.context("task vanished after insert")
+        })
     }
 
     /// A task the head handed this machine (`IpcRequest::TaskClaim`), as a
@@ -543,29 +560,33 @@ impl Store {
     /// serve took before a restart) is left as it is and returned.
     pub fn adopt_claimed(&self, t: &Task) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        let n = tx.execute(
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            let n = tx.execute(
             "INSERT OR IGNORE INTO tasks (id, job, item, prompt, spec, flock, state, priority, priority_from, role, description, preempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
             params![t.id, t.job, serde_json::to_string(&t.item)?, t.prompt, serde_json::to_string(&t.spec)?, t.flock, t.priority.as_str(), t.priority_from, t.role.as_str(), t.description, t.pause.preempt, now],
         )?;
-        if n == 1 {
-            place_last(&tx, t.id)?;
-        }
-        tx.commit()?;
-        drop(conn);
-        self.get_task(t.id)?.context("task vanished after insert")
+            if n == 1 {
+                place_last(&tx, t.id)?;
+            }
+            tx.commit()?;
+            drop(conn);
+            self.get_task(t.id)?.context("task vanished after insert")
+        })
     }
 
     /// Delete task `id`'s row and its summaries: a claimed task whose end
     /// the head has heard of (`shepherd`), so the rows here do not pile up.
     pub fn forget_task(&self, id: i64) -> anyhow::Result<()> {
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM task_summaries WHERE task_id = ?1", params![id])?;
-        tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
-        tx.commit()?;
-        Ok(())
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM task_summaries WHERE task_id = ?1", params![id])?;
+            tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// End a round of task `id`: a new summary row, numbered one past its
@@ -594,36 +615,13 @@ impl Store {
 
     /// Store `row` as task `id`'s next round.
     fn insert_round(&self, id: i64, row: TaskSummary) -> anyhow::Result<TaskSummary> {
-        let conn = self.conn.lock().recover();
-        let round: u32 = conn.query_row(
-            "INSERT INTO task_summaries (task_id, round, outcome, text, source, at)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let round: u32 = conn.query_row(
+                "INSERT INTO task_summaries (task_id, round, outcome, text, source, at)
              SELECT ?1, COALESCE(MAX(round), 0) + 1, ?2, ?3, ?4, ?5
                FROM task_summaries WHERE task_id = ?1
              RETURNING round",
-            params![
-                id,
-                row.outcome.as_str(),
-                row.text,
-                row.source.as_str(),
-                row.at.to_rfc3339()
-            ],
-            |r| r.get(0),
-        )?;
-        Ok(TaskSummary { round, ..row })
-    }
-
-    /// Put `summary` in place of task `id`'s last round's, for an agent
-    /// that says what it did after pastor already found the task done. A
-    /// task with no rounds yet gets its first.
-    pub fn replace_last_summary(&self, id: i64, summary: &str) -> anyhow::Result<TaskSummary> {
-        let row = self.summary_row(id, Some(summary));
-        let conn = self.conn.lock().recover();
-        let round: Option<u32> = conn
-            .query_row(
-                "UPDATE task_summaries SET outcome = ?2, text = ?3, source = ?4, at = ?5
-                  WHERE task_id = ?1
-                    AND round = (SELECT MAX(round) FROM task_summaries WHERE task_id = ?1)
-                 RETURNING round",
                 params![
                     id,
                     row.outcome.as_str(),
@@ -632,41 +630,72 @@ impl Store {
                     row.at.to_rfc3339()
                 ],
                 |r| r.get(0),
-            )
-            .optional()?;
-        drop(conn);
-        match round {
-            Some(round) => Ok(TaskSummary { round, ..row }),
-            None => self.end_round(id, Some(summary)),
-        }
+            )?;
+            Ok(TaskSummary { round, ..row })
+        })
+    }
+
+    /// Put `summary` in place of task `id`'s last round's, for an agent
+    /// that says what it did after pastor already found the task done. A
+    /// task with no rounds yet gets its first.
+    pub fn replace_last_summary(&self, id: i64, summary: &str) -> anyhow::Result<TaskSummary> {
+        let row = self.summary_row(id, Some(summary));
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let round: Option<u32> = conn
+                .query_row(
+                    "UPDATE task_summaries SET outcome = ?2, text = ?3, source = ?4, at = ?5
+                  WHERE task_id = ?1
+                    AND round = (SELECT MAX(round) FROM task_summaries WHERE task_id = ?1)
+                 RETURNING round",
+                    params![
+                        id,
+                        row.outcome.as_str(),
+                        row.text,
+                        row.source.as_str(),
+                        row.at.to_rfc3339()
+                    ],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            drop(conn);
+            match round {
+                Some(round) => Ok(TaskSummary { round, ..row }),
+                None => self.end_round(id, Some(summary)),
+            }
+        })
     }
 
     /// Every round's summary of task `id`, the first first.
     pub fn summaries(&self, id: i64) -> anyhow::Result<Vec<TaskSummary>> {
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare(
-            "SELECT round, outcome, text, source, at FROM task_summaries
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(
+                "SELECT round, outcome, text, source, at FROM task_summaries
               WHERE task_id = ?1 ORDER BY round",
-        )?;
-        let rows = stmt.query_map(params![id], |r| {
-            let outcome: String = r.get(1)?;
-            let source: String = r.get(3)?;
-            let at: String = r.get(4)?;
-            Ok(TaskSummary {
-                round: r.get(0)?,
-                outcome: outcome.parse().map_err(conversion_failure)?,
-                text: r.get(2)?,
-                source: match source.as_str() {
-                    "agent" => SummarySource::Agent,
-                    "pane" => SummarySource::Pane,
-                    other => return Err(conversion_failure(format!("unknown source {other:?}"))),
-                },
-                at: DateTime::parse_from_rfc3339(&at)
-                    .map(|d| d.with_timezone(&Utc))
-                    .map_err(conversion_failure)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            )?;
+            let rows = stmt.query_map(params![id], |r| {
+                let outcome: String = r.get(1)?;
+                let source: String = r.get(3)?;
+                let at: String = r.get(4)?;
+                Ok(TaskSummary {
+                    round: r.get(0)?,
+                    outcome: outcome.parse().map_err(conversion_failure)?,
+                    text: r.get(2)?,
+                    source: match source.as_str() {
+                        "agent" => SummarySource::Agent,
+                        "pane" => SummarySource::Pane,
+                        other => {
+                            return Err(conversion_failure(format!("unknown source {other:?}")));
+                        }
+                    },
+                    at: DateTime::parse_from_rfc3339(&at)
+                        .map(|d| d.with_timezone(&Utc))
+                        .map_err(conversion_failure)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
     }
 
     /// The row `end_round` writes for task `id`, round not yet numbered.
@@ -734,32 +763,38 @@ impl Store {
     /// saved before it is returned, so no number is given twice, across
     /// restarts too. The first is 1.
     pub fn next_event_seq(&self) -> anyhow::Result<u64> {
-        let conn = self.conn.lock().recover();
-        let seq: i64 = conn.query_row(
-            "UPDATE event_seq SET last = last + 1 WHERE id = 1 RETURNING last",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(seq as u64)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let seq: i64 = conn.query_row(
+                "UPDATE event_seq SET last = last + 1 WHERE id = 1 RETURNING last",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(seq as u64)
+        })
     }
 
     /// The last event sequence number given; 0 before the first.
     pub fn last_event_seq(&self) -> anyhow::Result<u64> {
-        let conn = self.conn.lock().recover();
-        let seq: i64 =
-            conn.query_row("SELECT last FROM event_seq WHERE id = 1", [], |r| r.get(0))?;
-        Ok(seq as u64)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let seq: i64 =
+                conn.query_row("SELECT last FROM event_seq WHERE id = 1", [], |r| r.get(0))?;
+            Ok(seq as u64)
+        })
     }
 
     pub fn get_task(&self, id: i64) -> anyhow::Result<Option<Task>> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row(
-                &format!("{TASK_WITH_SUMMARY} WHERE id = ?1"),
-                params![id],
-                row_to_task,
-            )
-            .optional()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    &format!("{TASK_WITH_SUMMARY} WHERE id = ?1"),
+                    params![id],
+                    row_to_task,
+                )
+                .optional()?)
+        })
     }
 
     /// Optimistic: the write lands only if the row still carries `t.updated_at`.
@@ -771,8 +806,9 @@ impl Store {
         // clock tick still produce distinct stamps and the next check can tell
         // them apart.
         let now = Utc::now().max(t.updated_at + chrono::Duration::nanoseconds(1));
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "UPDATE tasks SET machine = ?2, workspace_id = ?3, pane_id = ?4, agent_name = ?5, state = ?6, error = ?7,
                 last_completion_seq = ?8, started_at = ?9, finished_at = ?10, updated_at = ?11, prompt = ?12, spec = ?13,
                 prompt_pending = ?14, activity_seen = ?16, ended = ?17,
@@ -801,20 +837,21 @@ impl Store {
                 t.pause.resumed_at.map(|d| d.to_rfc3339()),
             ],
         )?;
-        if n == 1 {
-            t.updated_at = now;
-            return Ok(());
-        }
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE id = ?1",
-            params![t.id],
-            |r| r.get::<_, i64>(0),
-        )? > 0;
-        if exists {
-            Err(Conflict { id: t.id }.into())
-        } else {
-            anyhow::bail!("task {} not found", t.id)
-        }
+            if n == 1 {
+                t.updated_at = now;
+                return Ok(());
+            }
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+                params![t.id],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
+            if exists {
+                Err(Conflict { id: t.id }.into())
+            } else {
+                anyhow::bail!("task {} not found", t.id)
+            }
+        })
     }
 
     /// The one transition dispatch is allowed to make on its own, done in SQL so
@@ -824,17 +861,19 @@ impl Store {
     /// as a conditional UPDATE; `task::next_state` keeps the rule readable.
     pub fn claim_task(&self, id: i64, machine: &str) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "UPDATE tasks SET state = 'starting', machine = ?2, agent_name = ?3, error = NULL, updated_at = ?4
              WHERE id = ?1 AND state = 'queued'",
             params![id, machine, Task::agent_name_for(id), now],
         )?;
-        drop(conn);
-        if n == 0 {
-            return Ok(None);
-        }
-        self.get_task(id)
+            drop(conn);
+            if n == 0 {
+                return Ok(None);
+            }
+            self.get_task(id)
+        })
     }
 
     /// `claim_task` for a paused task: `paused` -> `starting` on the machine
@@ -842,17 +881,19 @@ impl Store {
     /// it was not paused there any more (closed meanwhile, or unknown).
     pub fn claim_paused(&self, id: i64, machine: &str) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "UPDATE tasks SET state = 'starting', agent_name = ?3, error = NULL, resumed_at = ?4, updated_at = ?4
              WHERE id = ?1 AND state = 'paused' AND machine = ?2",
             params![id, machine, Task::agent_name_for(id), now],
         )?;
-        drop(conn);
-        if n == 0 {
-            return Ok(None);
-        }
-        self.get_task(id)
+            drop(conn);
+            if n == 0 {
+                return Ok(None);
+            }
+            self.get_task(id)
+        })
     }
 
     /// Queue a fresh task that copies job, item, prompt, spec and flock from
@@ -885,13 +926,14 @@ impl Store {
             None => serde_json::json!({}),
         }
         .to_string();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        // Check and copy in one statement, so a task closed, pruned or
-        // finished by another writer in between is not retried. The copy
-        // keeps the level, its role, description and where it came from,
-        // but queues last in it.
-        let n = tx.execute(
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            // Check and copy in one statement, so a task closed, pruned or
+            // finished by another writer in between is not retried. The copy
+            // keeps the level, its role, description and where it came from,
+            // but queues last in it.
+            let n = tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, role, description, state, retry_of, priority, priority_from, preempt, created_at, updated_at)
              SELECT job, item, prompt,
                     json_patch(json_remove(CASE WHEN COALESCE(json_extract(spec, '$.worktree'), 0) = 0
@@ -907,36 +949,37 @@ impl Store {
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
         )?;
-        if n == 0 {
-            let state: Option<String> = tx
-                .query_row("SELECT state FROM tasks WHERE id = ?1", params![of], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            return Err(match state {
-                None => RetryError::NotFound(of),
-                Some(state) => RetryError::NotRetryable {
-                    id: of,
-                    state: state.parse().map_err(anyhow::Error::msg)?,
-                },
-            });
-        }
-        let id = tx.last_insert_rowid();
-        place_last(&tx, id)?;
-        if place.is_some() {
-            // `agent_source.place_from` is read by `task describe`: an
-            // overridden place explains itself as `task retry`, not as
-            // whatever placed the failed run. A task queued before
-            // `agent_source` existed has none to update.
-            tx.execute(
+            if n == 0 {
+                let state: Option<String> = tx
+                    .query_row("SELECT state FROM tasks WHERE id = ?1", params![of], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                return Err(match state {
+                    None => RetryError::NotFound(of),
+                    Some(state) => RetryError::NotRetryable {
+                        id: of,
+                        state: state.parse().map_err(anyhow::Error::msg)?,
+                    },
+                });
+            }
+            let id = tx.last_insert_rowid();
+            place_last(&tx, id)?;
+            if place.is_some() {
+                // `agent_source.place_from` is read by `task describe`: an
+                // overridden place explains itself as `task retry`, not as
+                // whatever placed the failed run. A task queued before
+                // `agent_source` existed has none to update.
+                tx.execute(
                 "UPDATE tasks SET spec = json_set(spec, '$.agent_source.place_from', 'task retry')
                  WHERE id = ?1 AND json_extract(spec, '$.agent_source') IS NOT NULL",
                 params![id],
             )?;
-        }
-        tx.commit()?;
-        drop(conn);
-        Ok(self.get_task(id)?.context("task vanished after insert")?)
+            }
+            tx.commit()?;
+            drop(conn);
+            Ok(self.get_task(id)?.context("task vanished after insert")?)
+        })
     }
 
     /// Mark task `id` closed, keeping the finish time of a task that already
@@ -964,17 +1007,19 @@ impl Store {
     /// go through that machine. The counterpart of `claim_task`.
     pub fn close_queued(&self, id: i64) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "UPDATE tasks SET state = 'closed', finished_at = COALESCE(finished_at, ?2), updated_at = ?2
              WHERE id = ?1 AND state IN ('queued', 'paused')",
             params![id, now],
         )?;
-        drop(conn);
-        if n == 0 {
-            return Ok(None);
-        }
-        self.get_task(id)
+            drop(conn);
+            if n == 0 {
+                return Ok(None);
+            }
+            self.get_task(id)
+        })
     }
 
     /// Delete tasks in `states` that finished more than `older_than` ago
@@ -1023,26 +1068,28 @@ impl Store {
              AND workspace_id IS NOT NULL";
         // List and delete under one lock and transaction, so the list
         // matches what the delete left behind.
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        let kept_worktrees = tx
-            .prepare(&format!(
-                "SELECT id FROM tasks WHERE {old} AND {on_disk} ORDER BY id"
-            ))?
-            .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
-            .collect::<Result<Vec<i64>, _>>()?;
-        let pruned = tx.execute(
-            &format!("DELETE FROM tasks WHERE {old} AND NOT ({on_disk})"),
-            rusqlite::params_from_iter(args.iter()),
-        )?;
-        tx.execute(
-            "DELETE FROM task_summaries WHERE task_id NOT IN (SELECT id FROM tasks)",
-            [],
-        )?;
-        tx.commit()?;
-        Ok(PruneOutcome {
-            pruned,
-            kept_worktrees,
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            let kept_worktrees = tx
+                .prepare(&format!(
+                    "SELECT id FROM tasks WHERE {old} AND {on_disk} ORDER BY id"
+                ))?
+                .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
+                .collect::<Result<Vec<i64>, _>>()?;
+            let pruned = tx.execute(
+                &format!("DELETE FROM tasks WHERE {old} AND NOT ({on_disk})"),
+                rusqlite::params_from_iter(args.iter()),
+            )?;
+            tx.execute(
+                "DELETE FROM task_summaries WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            tx.commit()?;
+            Ok(PruneOutcome {
+                pruned,
+                kept_worktrees,
+            })
         })
     }
 
@@ -1072,13 +1119,15 @@ impl Store {
             sql.push_str(&format!(" AND state IN ({})", placeholders.join(",")));
         }
         sql.push_str(" ORDER BY id DESC");
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
-            row_to_task,
-        )?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+                row_to_task,
+            )?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
     }
 
     /// Open tasks that hold a pane on this machine (for capacity and reconciliation).
@@ -1116,12 +1165,14 @@ impl Store {
     /// highest first, a paused task first in its level, then by position,
     /// then oldest first.
     pub fn queued_tasks(&self) -> anyhow::Result<Vec<Task>> {
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT * FROM tasks WHERE state IN ('queued', 'paused') ORDER BY {QUEUE_ORDER}"
-        ))?;
-        let rows = stmt.query_map([], row_to_task)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT * FROM tasks WHERE state IN ('queued', 'paused') ORDER BY {QUEUE_ORDER}"
+            ))?;
+            let rows = stmt.query_map([], row_to_task)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
     }
 
     /// Put queued task `id` at `priority`, set by `from`. Refused unless the
@@ -1148,28 +1199,30 @@ impl Store {
         preempt: bool,
     ) -> Result<Task, PriorityError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
-            "UPDATE tasks SET priority = ?2, priority_from = ?3, preempt = ?5, updated_at = ?4
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "UPDATE tasks SET priority = ?2, priority_from = ?3, preempt = ?5, updated_at = ?4
              WHERE id = ?1 AND state = 'queued'",
-            params![id, priority.as_str(), from, now, preempt],
-        )?;
-        if n == 0 {
-            let state: Option<String> = conn
-                .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            return Err(match state {
-                None => PriorityError::NotFound(id),
-                Some(state) => PriorityError::NotQueued {
-                    id,
-                    state: state.parse().map_err(anyhow::Error::msg)?,
-                },
-            });
-        }
-        drop(conn);
-        Ok(self.get_task(id)?.context("task vanished after update")?)
+                params![id, priority.as_str(), from, now, preempt],
+            )?;
+            if n == 0 {
+                let state: Option<String> = conn
+                    .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                return Err(match state {
+                    None => PriorityError::NotFound(id),
+                    Some(state) => PriorityError::NotQueued {
+                        id,
+                        state: state.parse().map_err(anyhow::Error::msg)?,
+                    },
+                });
+            }
+            drop(conn);
+            Ok(self.get_task(id)?.context("task vanished after update")?)
+        })
     }
 
     /// Move queued task `id` to `spot` (`pastor queue move`). It takes the
@@ -1191,102 +1244,105 @@ impl Store {
         exclude: &[i64],
     ) -> Result<Moved, MoveError> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        let mut queue: Vec<(i64, Priority, i64)> = {
-            let mut stmt = tx.prepare(&format!(
-                "SELECT id, priority, COALESCE(queue_pos, id) FROM tasks
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            let mut queue: Vec<(i64, Priority, i64)> = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT id, priority, COALESCE(queue_pos, id) FROM tasks
                  WHERE state = 'queued' ORDER BY {QUEUE_ORDER}"
-            ))?;
-            let rows = stmt.query_map([], |r| {
-                let p: String = r.get(1)?;
-                Ok((r.get(0)?, p.parse().unwrap_or_default(), r.get(2)?))
-            })?;
-            rows.collect::<Result<_, _>>()?
-        };
-        queue.retain(|(qid, ..)| !exclude.contains(qid));
-        let refusal = |tx: &rusqlite::Transaction, id: i64| -> MoveError {
-            if exclude.contains(&id) {
-                return MoveError::InFlight(id);
+                ))?;
+                let rows = stmt.query_map([], |r| {
+                    let p: String = r.get(1)?;
+                    Ok((r.get(0)?, p.parse().unwrap_or_default(), r.get(2)?))
+                })?;
+                rows.collect::<Result<_, _>>()?
+            };
+            queue.retain(|(qid, ..)| !exclude.contains(qid));
+            let refusal = |tx: &rusqlite::Transaction, id: i64| -> MoveError {
+                if exclude.contains(&id) {
+                    return MoveError::InFlight(id);
+                }
+                let state: rusqlite::Result<Option<String>> = tx
+                    .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
+                        r.get(0)
+                    })
+                    .optional();
+                match state {
+                    Err(err) => err.into(),
+                    Ok(None) => MoveError::NotFound(id),
+                    Ok(Some(state)) => match state.parse() {
+                        Ok(state) => MoveError::NotQueued { id, state },
+                        Err(err) => MoveError::Store(anyhow::anyhow!(err)),
+                    },
+                }
+            };
+            let index =
+                |queue: &[(i64, Priority, i64)], id: i64| queue.iter().position(|q| q.0 == id);
+            let Some(at) = index(&queue, id) else {
+                return Err(refusal(&tx, id));
+            };
+            if let QueueSpot::Before(other) | QueueSpot::After(other) = spot
+                && index(&queue, other).is_none()
+            {
+                return Err(refusal(&tx, other));
             }
-            let state: rusqlite::Result<Option<String>> = tx
-                .query_row("SELECT state FROM tasks WHERE id = ?1", params![id], |r| {
-                    r.get(0)
-                })
-                .optional();
-            match state {
-                Err(err) => err.into(),
-                Ok(None) => MoveError::NotFound(id),
-                Ok(Some(state)) => match state.parse() {
-                    Ok(state) => MoveError::NotQueued { id, state },
-                    Err(err) => MoveError::Store(anyhow::anyhow!(err)),
-                },
+            let (_, was, own) = queue.remove(at);
+            let i = match spot {
+                QueueSpot::Top => 0,
+                QueueSpot::To(n) => n.saturating_sub(1).min(queue.len()),
+                QueueSpot::Before(other) | QueueSpot::After(other) if other == id => at,
+                QueueSpot::Before(other) => index(&queue, other).expect("checked"),
+                QueueSpot::After(other) => index(&queue, other).expect("checked") + 1,
+            };
+            let mut level = was;
+            if let Some(behind) = queue.get(i)
+                && behind.1 > level
+            {
+                level = behind.1;
             }
-        };
-        let index = |queue: &[(i64, Priority, i64)], id: i64| queue.iter().position(|q| q.0 == id);
-        let Some(at) = index(&queue, id) else {
-            return Err(refusal(&tx, id));
-        };
-        if let QueueSpot::Before(other) | QueueSpot::After(other) = spot
-            && index(&queue, other).is_none()
-        {
-            return Err(refusal(&tx, other));
-        }
-        let (_, was, own) = queue.remove(at);
-        let i = match spot {
-            QueueSpot::Top => 0,
-            QueueSpot::To(n) => n.saturating_sub(1).min(queue.len()),
-            QueueSpot::Before(other) | QueueSpot::After(other) if other == id => at,
-            QueueSpot::Before(other) => index(&queue, other).expect("checked"),
-            QueueSpot::After(other) => index(&queue, other).expect("checked") + 1,
-        };
-        let mut level = was;
-        if let Some(behind) = queue.get(i)
-            && behind.1 > level
-        {
-            level = behind.1;
-        }
-        if i > 0 && queue[i - 1].1 < level {
-            level = queue[i - 1].1;
-        }
-        queue.insert(i, (id, level, own));
-        let mine: Vec<(i64, i64)> = queue
-            .iter()
-            .filter(|q| q.1 == level)
-            .map(|q| (q.0, q.2))
-            .collect();
-        let mut slots: Vec<i64> = mine.iter().map(|m| m.1).collect();
-        slots.sort_unstable();
-        // Ties (a hand edit) would leave the order to age: make them strict.
-        for k in 1..slots.len() {
-            slots[k] = slots[k].max(slots[k - 1] + 1);
-        }
-        for ((task, pos), slot) in mine.iter().zip(slots) {
-            if *pos != slot {
+            if i > 0 && queue[i - 1].1 < level {
+                level = queue[i - 1].1;
+            }
+            queue.insert(i, (id, level, own));
+            let mine: Vec<(i64, i64)> = queue
+                .iter()
+                .filter(|q| q.1 == level)
+                .map(|q| (q.0, q.2))
+                .collect();
+            let mut slots: Vec<i64> = mine.iter().map(|m| m.1).collect();
+            slots.sort_unstable();
+            // Ties (a hand edit) would leave the order to age: make them strict.
+            for k in 1..slots.len() {
+                slots[k] = slots[k].max(slots[k - 1] + 1);
+            }
+            for ((task, pos), slot) in mine.iter().zip(slots) {
+                if *pos != slot {
+                    tx.execute(
+                        "UPDATE tasks SET queue_pos = ?2 WHERE id = ?1",
+                        params![task, slot],
+                    )?;
+                }
+            }
+            if level != was {
                 tx.execute(
-                    "UPDATE tasks SET queue_pos = ?2 WHERE id = ?1",
-                    params![task, slot],
+                    "UPDATE tasks SET priority = ?2, priority_from = 'queue move' WHERE id = ?1",
+                    params![id, level.as_str()],
                 )?;
             }
-        }
-        if level != was {
             tx.execute(
-                "UPDATE tasks SET priority = ?2, priority_from = 'queue move' WHERE id = ?1",
-                params![id, level.as_str()],
+                "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+                params![id, now],
             )?;
-        }
-        tx.execute(
-            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
-            params![id, now],
-        )?;
-        tx.commit()?;
-        drop(conn);
-        let task = self.get_task(id)?.context("task vanished after move")?;
-        Ok(Moved {
-            task,
-            was,
-            pos: i + 1,
-            of: queue.len(),
+            tx.commit()?;
+            drop(conn);
+            let task = self.get_task(id)?.context("task vanished after move")?;
+            Ok(Moved {
+                task,
+                was,
+                pos: i + 1,
+                of: queue.len(),
+            })
         })
     }
 
@@ -1296,11 +1352,13 @@ impl Store {
     /// such a row is only ever seen flockless between a migration and the
     /// first read of flock.toml. Returns how many rows it changed.
     pub fn adopt_default_flock(&self, default: &str) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().recover();
-        Ok(conn.execute(
-            "UPDATE tasks SET flock = ?1 WHERE flock IS NULL",
-            params![default],
-        )?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn.execute(
+                "UPDATE tasks SET flock = ?1 WHERE flock IS NULL",
+                params![default],
+            )?)
+        })
     }
 
     pub fn find_by_pane(&self, machine: &str, pane_id: &str) -> anyhow::Result<Option<Task>> {
@@ -1311,26 +1369,31 @@ impl Store {
     }
 
     pub fn job_state(&self, name: &str) -> anyhow::Result<Option<JobState>> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row(
-                "SELECT * FROM job_state WHERE name = ?1",
-                params![name],
-                row_to_job_state,
-            )
-            .optional()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    "SELECT * FROM job_state WHERE name = ?1",
+                    params![name],
+                    row_to_job_state,
+                )
+                .optional()?)
+        })
     }
 
     pub fn job_states(&self) -> anyhow::Result<Vec<JobState>> {
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare("SELECT * FROM job_state ORDER BY name")?;
-        let rows = stmt.query_map([], row_to_job_state)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare("SELECT * FROM job_state ORDER BY name")?;
+            let rows = stmt.query_map([], row_to_job_state)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
     }
 
     pub fn save_job_state(&self, s: &JobState) -> anyhow::Result<()> {
-        let conn = self.conn.lock().recover();
-        conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
             "INSERT OR REPLACE INTO job_state (name, last_run_at, last_ok_at, last_result, last_error, cursor, failures, backoff_until)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -1344,30 +1407,35 @@ impl Store {
                 s.backoff_until.map(|d| d.to_rfc3339()),
             ],
         )?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The task `(job, key)` was seen as: `None` when it is unseen,
     /// `Some(None)` when seen with no task id recorded.
     pub fn seen_task(&self, job: &str, key: &str) -> anyhow::Result<Option<Option<i64>>> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row(
-                "SELECT task_id FROM seen WHERE job = ?1 AND key = ?2",
-                params![job, key],
-                |r| r.get(0),
-            )
-            .optional()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    "SELECT task_id FROM seen WHERE job = ?1 AND key = ?2",
+                    params![job, key],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
     }
 
     pub fn is_seen(&self, job: &str, key: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM seen WHERE job = ?1 AND key = ?2",
-            params![job, key],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM seen WHERE job = ?1 AND key = ?2",
+                params![job, key],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
     }
 
     /// Insert a queued task for `item`, render its prompt and spec with the id
@@ -1413,27 +1481,29 @@ impl Store {
             .context("item has no string key")?
             .to_string();
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().recover();
-        let tx = conn.transaction()?;
-        tx.execute(
+        blocking(|| {
+            let mut conn = self.conn.lock().recover();
+            let tx = conn.transaction()?;
+            tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, description, state, priority, priority_from, preempt, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, ?7, 'queued', ?5, ?6, ?8, ?4, ?4)",
             params![job, serde_json::to_string(item)?, flock, now, priority.as_str(), from, description, preempt],
         )?;
-        let id = tx.last_insert_rowid();
-        place_last(&tx, id)?;
-        let (prompt, spec) =
-            render(id).map_err(|e| anyhow::anyhow!("render task t-{id} for job {job}: {e}"))?;
-        tx.execute(
-            "UPDATE tasks SET prompt = ?2, spec = ?3 WHERE id = ?1",
-            params![id, prompt, serde_json::to_string(&spec)?],
-        )?;
-        tx.execute(
-            "INSERT INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
-            params![job, key, id, now],
-        )?;
-        tx.commit()?;
-        drop(conn);
-        self.get_task(id)?.context("task vanished after insert")
+            let id = tx.last_insert_rowid();
+            place_last(&tx, id)?;
+            let (prompt, spec) =
+                render(id).map_err(|e| anyhow::anyhow!("render task t-{id} for job {job}: {e}"))?;
+            tx.execute(
+                "UPDATE tasks SET prompt = ?2, spec = ?3 WHERE id = ?1",
+                params![id, prompt, serde_json::to_string(&spec)?],
+            )?;
+            tx.execute(
+                "INSERT INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
+                params![job, key, id, now],
+            )?;
+            tx.commit()?;
+            drop(conn);
+            self.get_task(id)?.context("task vanished after insert")
+        })
     }
 
     /// Test-only escape hatch to corrupt rows directly and check that reads
@@ -1445,75 +1515,87 @@ impl Store {
 
     /// Save `repo` on `machine` as trusted. Returns whether it was new.
     pub fn trust_repo(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
             "INSERT OR IGNORE INTO trusted_repos (machine, repo, trusted_at) VALUES (?1, ?2, ?3)",
             params![machine, repo, Utc::now().to_rfc3339()],
         )?;
-        Ok(n == 1)
+            Ok(n == 1)
+        })
     }
 
     pub fn is_trusted(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        Ok(conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM trusted_repos WHERE machine = ?1 AND repo = ?2)",
-            params![machine, repo],
-            |r| r.get(0),
-        )?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM trusted_repos WHERE machine = ?1 AND repo = ?2)",
+                params![machine, repo],
+                |r| r.get(0),
+            )?)
+        })
     }
 
     /// Every saved trust, by machine then repo.
     pub fn trusted_repos(&self) -> anyhow::Result<Vec<TrustedRepo>> {
-        let conn = self.conn.lock().recover();
-        let mut stmt = conn.prepare(
-            "SELECT machine, repo, trusted_at FROM trusted_repos ORDER BY machine, repo",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let at: String = r.get(2)?;
-            Ok(TrustedRepo {
-                machine: r.get(0)?,
-                repo: r.get(1)?,
-                trusted_at: DateTime::parse_from_rfc3339(&at)
-                    .map(|d| d.with_timezone(&Utc))
-                    .map_err(conversion_failure)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let mut stmt = conn.prepare(
+                "SELECT machine, repo, trusted_at FROM trusted_repos ORDER BY machine, repo",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let at: String = r.get(2)?;
+                Ok(TrustedRepo {
+                    machine: r.get(0)?,
+                    repo: r.get(1)?,
+                    trusted_at: DateTime::parse_from_rfc3339(&at)
+                        .map(|d| d.with_timezone(&Utc))
+                        .map_err(conversion_failure)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     /// Forget a saved trust. Returns whether there was one.
     pub fn untrust(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
-            "DELETE FROM trusted_repos WHERE machine = ?1 AND repo = ?2",
-            params![machine, repo],
-        )?;
-        Ok(n == 1)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "DELETE FROM trusted_repos WHERE machine = ?1 AND repo = ?2",
+                params![machine, repo],
+            )?;
+            Ok(n == 1)
+        })
     }
 
     /// Whether task `id` has had its trust keys sent. False for no such row.
     pub fn trust_sent(&self, id: i64) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row(
-                "SELECT trust_sent FROM tasks WHERE id = ?1",
-                params![id],
-                |r| r.get::<_, bool>(0),
-            )
-            .optional()?
-            .unwrap_or(false))
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row(
+                    "SELECT trust_sent FROM tasks WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false))
+        })
     }
 
     /// Mark task `id` as having had its trust keys sent. True only for the
     /// call that set it, so the keys go to a task once, across restarts.
     /// `update_task` never writes the column, so no stale copy resets it.
     pub fn claim_trust_sent(&self, id: i64) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().recover();
-        let n = conn.execute(
-            "UPDATE tasks SET trust_sent = 1 WHERE id = ?1 AND trust_sent = 0",
-            params![id],
-        )?;
-        Ok(n == 1)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "UPDATE tasks SET trust_sent = 1 WHERE id = ?1 AND trust_sent = 0",
+                params![id],
+            )?;
+            Ok(n == 1)
+        })
     }
 
     /// Record `key` as seen for `job` without a task row here: a headless
@@ -1521,32 +1603,38 @@ impl Store {
     /// the row, or `None` when the head no longer has it. Seen already is
     /// not an error.
     pub fn mark_seen(&self, job: &str, key: &str, task_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.conn.lock().recover();
-        conn.execute(
-            "INSERT OR IGNORE INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
-            params![job, key, task_id, Utc::now().to_rfc3339()],
-        )?;
-        Ok(())
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
+                "INSERT OR IGNORE INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
+                params![job, key, task_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Set `key` in the meta table, where the schema version lives too.
     pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
         anyhow::ensure!(key != "schema_version", "schema_version is not a setting");
-        let conn = self.conn.lock().recover();
-        conn.execute(
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
             params![key, value],
         )?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock().recover();
-        Ok(conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
-                r.get(0)
-            })
-            .optional()?)
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            Ok(conn
+                .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                    r.get(0)
+                })
+                .optional()?)
+        })
     }
 }
 
@@ -1711,6 +1799,39 @@ mod tests {
         assert!(s.conn.is_poisoned());
         s.mark_seen("j", "k", None).unwrap();
         assert!(s.is_seen("j", "k").unwrap());
+    }
+
+    /// A store call stuck on a busy database (here another connection's
+    /// write lock, which `busy_timeout` waits out for up to 5s) leaves the
+    /// tokio worker it was called on free for other tasks. With one worker,
+    /// an inline wait would hold back every other request until it ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_store_call_does_not_stall_other_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        let s = std::sync::Arc::new(Store::open(&path).unwrap());
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let writer = {
+            let s = std::sync::Arc::clone(&s);
+            tokio::spawn(async move {
+                started_tx.send(()).unwrap();
+                s.trust_repo("a", "/r")
+            })
+        };
+        started_rx.await.unwrap();
+        // The wall clock, not tokio's: its timers stall with the worker.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let asked = std::time::Instant::now();
+        assert_eq!(tokio::spawn(async { 7 }).await.unwrap(), 7);
+        let waited = asked.elapsed();
+        other.execute_batch("COMMIT").unwrap();
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "an unrelated task waited {waited:?} for the store"
+        );
+        assert!(writer.await.unwrap().unwrap());
     }
 
     /// A headless serve keeps seen keys and its event cursor with no task
