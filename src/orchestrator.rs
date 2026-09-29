@@ -1312,13 +1312,23 @@ impl Runner {
     /// they are read apart, since a prompt in the pane would put the error
     /// above the turn. A 429 or 529 is no quota: the agent is restarted like
     /// any other that ended.
+    ///
+    /// A weekday, date or time of day in the message is resolved against
+    /// `task.finished_at`, not `now`: this can run well after the agent
+    /// actually ended, and reading a message that says `resets Mon 9am`
+    /// after that Monday 9am has come and gone would otherwise pick next
+    /// week's, or next year's `resets Oct 6` once Oct 6 has passed. A reset
+    /// resolved that way, but already behind `now` by the time this runs,
+    /// means the quota is not held back at all.
     fn quota_until(&self, task: &Task, pane: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let agents = self.fleet.agents();
         let kind = agents.kind(&task.spec.agent);
+        let read_at = task.finished_at.unwrap_or(now);
         [pane, task.error.as_deref().unwrap_or("")]
             .iter()
-            .find_map(|said| crate::limit::limit_in(kind, said, now).filter(|limit| limit.hard))
+            .find_map(|said| crate::limit::limit_in(kind, said, read_at).filter(|limit| limit.hard))
             .map(|limit| limit.retry_at(now))
+            .filter(|until| *until > now)
     }
 
     fn emit(&self, kind: &str, name: &str, task: Option<i64>, extra: serde_json::Value) {
@@ -2958,6 +2968,52 @@ prompt = "You are the night orchestrator."
             wait >= chrono::Duration::hours(1) && wait < chrono::Duration::minutes(61),
             "{wait}"
         );
+    }
+
+    /// The head handles a finished agent later than it actually ended
+    /// (`finished`): its message's weekday or date must resolve against
+    /// that, not the head's own `now`, or a reset already behind `now`
+    /// (`processed`) is read as next week's or next year's instead of
+    /// already passed.
+    async fn finished_late(pane: &str, finished: DateTime<Utc>, processed: DateTime<Utc>) -> State {
+        let head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        let id = head.run().await.task.unwrap();
+        head.store.note_pane_tail(id, pane);
+        let mut t = head.store.get_task(id).unwrap().unwrap();
+        t.state = TaskState::Done;
+        t.finished_at = Some(finished);
+        head.store.update_task(&mut t).unwrap();
+        head.runner.finish(&head.orch(), processed).await;
+        head.state()
+    }
+
+    #[tokio::test]
+    async fn a_delayed_finish_does_not_push_a_weekday_reset_to_next_week() {
+        // The agent's turn ended just before the reset it named; the head
+        // handles it a minute later, after that Monday 9am has come.
+        let finished = Utc.with_ymd_and_hms(2026, 10, 5, 8, 59, 0).unwrap();
+        let processed = Utc.with_ymd_and_hms(2026, 10, 5, 9, 1, 0).unwrap();
+        let state = finished_late(
+            "● Weekly limit reached ∙ resets Mon 9am (UTC)\n",
+            finished,
+            processed,
+        )
+        .await;
+        assert_eq!(state.quota_until, None);
+    }
+
+    #[tokio::test]
+    async fn a_delayed_finish_does_not_push_a_date_reset_to_next_year() {
+        // Same, a minute past a named date instead of a weekday.
+        let finished = Utc.with_ymd_and_hms(2026, 10, 6, 8, 59, 0).unwrap();
+        let processed = Utc.with_ymd_and_hms(2026, 10, 6, 9, 1, 0).unwrap();
+        let state = finished_late(
+            "● Opus weekly limit reached ∙ resets Oct 6, 9am (UTC)\n",
+            finished,
+            processed,
+        )
+        .await;
+        assert_eq!(state.quota_until, None);
     }
 
     #[tokio::test]
