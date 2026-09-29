@@ -3555,4 +3555,57 @@ mod tests {
         );
         assert!(!made.iter().any(|m| m == "agent.start"), "{made:?}");
     }
+
+    /// A paused worktree task resumes in its own checkout through
+    /// `worktree.open`, never a new one. A checkout that is gone fails the
+    /// task with a reason; any other `worktree.open` failure fails it as
+    /// it is.
+    #[tokio::test]
+    async fn a_worktree_task_resumes_only_in_its_own_checkout() {
+        let worktree_task = || {
+            task(DispatchSpec {
+                worktree: true,
+                branch: Some("pastor/k1".into()),
+                ..spec()
+            })
+        };
+
+        let fake = FakeHerdr::new();
+        let mut t = worktree_task();
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.checkout.as_ref().unwrap().branch, "pastor/k1");
+        let before = methods(&fake).len();
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let again = methods(&fake).split_off(before);
+        assert!(again.iter().any(|m| m == "worktree.open"), "{again:?}");
+        assert!(!again.iter().any(|m| m == "worktree.create"), "{again:?}");
+
+        // Gone: herdr answers `worktree_not_found`.
+        let fake = FakeHerdr::new();
+        let mut t = worktree_task();
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        t.spec.checkout.as_mut().unwrap().branch = "pastor/gone".into();
+        let err = resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nowhere to resume"), "{err}");
+
+        // Any other failure is not reported as a gone checkout.
+        let fake = FakeHerdr::new();
+        let mut t = worktree_task();
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        fake.set_malformed_reply("worktree.open");
+        let err = resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("nowhere to resume"), "{err}");
+    }
 }
