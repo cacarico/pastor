@@ -1182,6 +1182,167 @@ mod tests {
         }
     }
 
+    /// One more live task of `flock`, counted on `live`, on `live_jobs`
+    /// when the claim comes from a job, and on that flock's own seat; for
+    /// a flock the machine is not in, `live` still counts it and no seat
+    /// changes.
+    #[test]
+    fn take_counts_the_task_on_live_and_its_seat() {
+        let mut m = MachineView {
+            flocks: vec![seat("work", Some(4), 0), seat("home", Some(4), 0)],
+            ..mv("desk", 4, 0, &[], true)
+        };
+        m.take("work", RUN);
+        assert_eq!(m.live, 1);
+        assert_eq!(m.live_jobs, 0, "not from a job");
+        assert_eq!(m.seat("work").unwrap().live, 1);
+        assert_eq!(
+            m.seat("home").unwrap().live,
+            0,
+            "the other flock is untouched"
+        );
+
+        m.take("work", JOB);
+        assert_eq!(m.live, 2);
+        assert_eq!(m.live_jobs, 1, "a job claim counts here too");
+        assert_eq!(m.seat("work").unwrap().live, 2);
+
+        m.take("play", RUN);
+        assert_eq!(m.live, 3, "live counts every task, seated or not");
+        assert_eq!(
+            m.seat("play"),
+            None,
+            "no seat for a flock not on the machine"
+        );
+    }
+
+    /// `later`'s tasks join `waiting_under_share` only for a machine where
+    /// `flock` is past its share and under its max, and only when each is
+    /// itself queued, of a different flock under its own share here, with
+    /// no pin elsewhere, no tag the machine lacks, room for its claim,
+    /// and `accepts` it; a flock already in the list does not join twice.
+    #[test]
+    fn mark_waiting_under_share_filters_each_later_task() {
+        let work = |live: usize| FlockSeat::new("work", Some(FlockNumber::split(1, 3)), live);
+        let desk = |work_live: usize, home_live: usize| MachineView {
+            flocks: vec![work(work_live), seat("home", Some(2), home_live)],
+            tags: vec!["arm".into()],
+            ..mv("desk", 10, work_live + home_live, &[], true)
+        };
+        let home_task = |over: fn(&mut Task)| {
+            let mut t = Task {
+                flock: Some("home".into()),
+                ..task(spec())
+            };
+            over(&mut t);
+            t
+        };
+        let accepts_all = |_: &Task, _: &str| true;
+        let run =
+            |views: &mut [MachineView], later: &[Task], accepts: &dyn Fn(&Task, &str) -> bool| {
+                mark_waiting_under_share(views, "work", later, "default", accepts);
+            };
+
+        // Under its share, no waiting is computed even for a task that
+        // would otherwise qualify.
+        let mut views = vec![desk(0, 1)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "under its share");
+
+        // At its max, none either.
+        let mut views = vec![desk(3, 1)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "at its max");
+
+        // Past its share, under its max: a plain queued task of another
+        // flock under its own share here joins the list.
+        let mut views = vec![desk(1, 1)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert_eq!(views[0].waiting_under_share, vec!["home".to_string()]);
+
+        // The flock being placed never joins, whatever else is true.
+        let mut views = vec![desk(1, 1)];
+        let same = Task {
+            flock: Some("work".into()),
+            ..task(spec())
+        };
+        run(&mut views, &[same], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "its own flock");
+
+        // A flock already in the list does not join twice.
+        let mut views = vec![desk(1, 1)];
+        let twice = [home_task(|_| {}), home_task(|_| {})];
+        run(&mut views, &twice, &accepts_all);
+        assert_eq!(views[0].waiting_under_share, vec!["home".to_string()]);
+
+        // Not queued.
+        let mut views = vec![desk(1, 1)];
+        let not_queued = home_task(|t| t.state = TaskState::Running);
+        run(&mut views, &[not_queued], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "not queued");
+
+        // Its own seat is not under share.
+        let mut views = vec![desk(1, 2)];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "home is at its share"
+        );
+
+        // Pinned to another machine.
+        let mut views = vec![desk(1, 1)];
+        let pinned = home_task(|t| t.spec.machine = Some("elsewhere".into()));
+        run(&mut views, &[pinned], &accepts_all);
+        assert!(views[0].waiting_under_share.is_empty(), "pinned elsewhere");
+
+        // Asks for a tag the machine lacks.
+        let mut views = vec![desk(1, 1)];
+        let tagged = home_task(|t| t.spec.tags = vec!["gpu".into()]);
+        run(&mut views, &[tagged], &accepts_all);
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "tag the machine lacks"
+        );
+
+        // No room for its claim: the machine's own limit is already met.
+        let full = MachineView {
+            max_agents: 2,
+            ..desk(1, 1)
+        };
+        let mut views = vec![full];
+        run(&mut views, &[home_task(|_| {})], &accepts_all);
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "the machine has no room"
+        );
+
+        // `accepts` refuses it.
+        let mut views = vec![desk(1, 1)];
+        run(&mut views, &[home_task(|_| {})], &|_, _| false);
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "accepts refused it"
+        );
+    }
+
+    /// `flock_held` clears a seat under its share on its own, whatever
+    /// `waiting_under_share` says: that list only matters to a seat past
+    /// its share (`mark_waiting_under_share` never fills it otherwise, but
+    /// `flock_held` reads it as given).
+    #[test]
+    fn flock_held_clears_a_seat_under_share_even_with_others_waiting() {
+        let v = MachineView {
+            flocks: vec![seat("work", Some(4), 1)],
+            waiting_under_share: vec!["home".to_string()],
+            ..mv("desk", 4, 1, &[], true)
+        };
+        assert_eq!(
+            flock_held(&v, "work"),
+            None,
+            "under its share holds nothing off"
+        );
+    }
+
     /// Only the task's flock takes it, whatever the others have free.
     #[test]
     fn pick_machine_keeps_to_the_tasks_flock() {
@@ -2205,7 +2366,7 @@ mod tests {
 
     /// `[agents.claude-personal] kind = "claude"` with an env: herdr starts
     /// a claude, with Claude's tool flags, in a pane that has the env, `~`
-    /// expanded against the machine's home.
+    /// expanded against the machine's home, a bare `~` too.
     fn personal() -> Agents {
         let mut agents = Agents::default();
         agents.0.insert(
@@ -2218,6 +2379,7 @@ mod tests {
                         "~/.claude-personal".to_string(),
                     ),
                     ("PLAIN".to_string(), "a~b".to_string()),
+                    ("BARE".to_string(), "~".to_string()),
                 ]
                 .into(),
                 ..Default::default()
@@ -2243,6 +2405,7 @@ mod tests {
             .find(|r| r.method == "workspace.create")
             .unwrap();
         let want = serde_json::json!({
+            "BARE": "/home/fake",
             "CLAUDE_CONFIG_DIR": "/home/fake/.claude-personal",
             "PASTOR_TASK": "t-7",
             "PLAIN": "a~b",
@@ -2728,6 +2891,30 @@ mod tests {
             assert!(tail.contains("You've hit your limit"), "{tail}");
             assert_eq!(t.error.as_deref(), Some(message.as_str()));
         }
+    }
+
+    /// Only a resume keeps the directory recorded on the task: a fresh
+    /// dispatch of a task with no repo asks `no_repo_dir`, whatever `cwd`
+    /// the task already carries.
+    #[tokio::test]
+    async fn a_fresh_dispatch_with_no_repo_asks_again_whatever_cwd_it_carries() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            repo: None,
+            place: Place::Own,
+            cwd: Some("/home/fake/elsewhere".into()),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.cwd.as_deref(), Some("/home/fake/pastor-tasks"));
+        let req = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "workspace.create" && r.params["label"] != "pastor")
+            .unwrap();
+        assert_eq!(req.params["cwd"], "/home/fake/pastor-tasks");
     }
 
     /// Where `~` cannot be resolved the task fails up front with a reason,
@@ -3342,5 +3529,83 @@ mod tests {
                 "{made:?}"
             );
         }
+    }
+
+    /// Only `workspace_not_found` from `pane.list` means the workspace
+    /// closed and is worth a second look; any other failure fails the
+    /// task as it is, with no second `pane.list`.
+    #[tokio::test]
+    async fn a_pane_list_failure_other_than_not_found_is_not_retried() {
+        let fake = FakeHerdr::new();
+        fake.open_user_workspace("work", None);
+        fake.set_malformed_reply("pane.list");
+        let mut t = task(DispatchSpec {
+            place: Place::Pane("work".into()),
+            ..spec()
+        });
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("closed while"), "{err}");
+        let made = methods(&fake);
+        assert_eq!(
+            made.iter().filter(|m| *m == "pane.list").count(),
+            1,
+            "{made:?}"
+        );
+        assert!(!made.iter().any(|m| m == "agent.start"), "{made:?}");
+    }
+
+    /// A paused worktree task resumes in its own checkout through
+    /// `worktree.open`, never a new one. A checkout that is gone fails the
+    /// task with a reason; any other `worktree.open` failure fails it as
+    /// it is.
+    #[tokio::test]
+    async fn a_worktree_task_resumes_only_in_its_own_checkout() {
+        let worktree_task = || {
+            task(DispatchSpec {
+                worktree: true,
+                branch: Some("pastor/k1".into()),
+                ..spec()
+            })
+        };
+
+        let fake = FakeHerdr::new();
+        let mut t = worktree_task();
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.checkout.as_ref().unwrap().branch, "pastor/k1");
+        let before = methods(&fake).len();
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let again = methods(&fake).split_off(before);
+        assert!(again.iter().any(|m| m == "worktree.open"), "{again:?}");
+        assert!(!again.iter().any(|m| m == "worktree.create"), "{again:?}");
+
+        // Gone: herdr answers `worktree_not_found`.
+        let fake = FakeHerdr::new();
+        let mut t = worktree_task();
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        t.spec.checkout.as_mut().unwrap().branch = "pastor/gone".into();
+        let err = resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nowhere to resume"), "{err}");
+
+        // Any other failure is not reported as a gone checkout.
+        let fake = FakeHerdr::new();
+        let mut t = worktree_task();
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        fake.set_malformed_reply("worktree.open");
+        let err = resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("nowhere to resume"), "{err}");
     }
 }
