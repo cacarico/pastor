@@ -1,0 +1,13 @@
+#! kind: claude
+#! source: made
+#! now: 2026-09-29T21:00:00Z
+#! limit: none
+> Read AGENTS.md, then fix the flaky transport test.
+  ⎿  API Error: 529 Overloaded · Retrying in 12s… (attempt 4/10)
+
+✻ Cooking… (2m 51s · esc to interrupt)
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

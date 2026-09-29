@@ -14,6 +14,7 @@ pub mod head;
 pub mod herdr;
 pub mod hooks;
 pub mod ipc;
+pub mod limit;
 pub mod machine;
 pub mod orchestrator;
 pub mod orchestrator_cli;

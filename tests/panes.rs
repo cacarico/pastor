@@ -18,7 +18,7 @@
 //!
 //! The repository is public, so the fixtures are scrubbed: `fixtures_are_scrubbed`
 //! fails on a home path, an IPv4 address, this host's name or a machine of the
-//! local flock.
+//! local flock, here and in `tests/fixtures/limits/` (`tests/limits.rs`).
 
 use std::path::{Path, PathBuf};
 
@@ -277,7 +277,19 @@ fn fleet_names() -> Vec<String> {
 #[test]
 fn fixtures_are_scrubbed() {
     let fleet = fleet_names();
-    for name in FILES {
+    // The screens of `tests/limits.rs` are published with these.
+    let limits = dir().with_file_name("limits");
+    let limits: Vec<String> = std::fs::read_dir(&limits)
+        .expect("tests/fixtures/limits")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .map(|name| format!("../limits/{name}"))
+        .collect();
+    assert!(!limits.is_empty(), "no fixture under tests/fixtures/limits");
+    for name in FILES
+        .iter()
+        .copied()
+        .chain(limits.iter().map(String::as_str))
+    {
         let text = std::fs::read_to_string(dir().join(name)).expect("fixture");
         for path in ["/home/", "/Users/", "/root/"] {
             assert!(!text.contains(path), "{name}: contains {path}");

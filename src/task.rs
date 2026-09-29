@@ -1084,7 +1084,7 @@ fn completed_since_prompt(
 /// What starts an agent's message in its pane: Claude draws `●` (`⏺` in
 /// older releases) in the first column, and indents the rest of the message
 /// by two spaces.
-const MESSAGE_MARKERS: [char; 2] = ['●', '⏺'];
+pub(crate) const MESSAGE_MARKERS: [char; 2] = ['●', '⏺'];
 
 /// The question an agent's last message ends with, if it ends with one.
 /// herdr reports an agent that stopped to ask the same way as one that
