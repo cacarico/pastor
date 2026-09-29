@@ -5712,6 +5712,32 @@ fn head_set_refuses_a_head_that_does_not_answer() {
     assert_eq!(error_code(&c.cmd(&["task", "describe", "t-1"])), "no_head");
 }
 
+/// `shepherd_running` is only for a role of exactly `SHEPHERD_ROLE`; any
+/// other role a pong carries is an ordinary head that answers as usual.
+#[test]
+fn head_set_treats_an_unfamiliar_role_as_an_ordinary_head() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = client(None);
+    let fake = c.tmp.path().join("fake-pastor");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nread line\necho '{\"kind\":\"pong\",\"data\":{\"version\":\"9.9.9\",\"protocol\":999999,\"role\":\"orchestrator\"}}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = c.cmd(&["head", "set", "no-head", "--pastor", fake.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("9.9.9"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// `--model` offers the `[models]` names, with their kind.
 #[test]
 fn complete_offers_model_names_after_model() {
