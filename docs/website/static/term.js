@@ -12,9 +12,48 @@ const BIGGER_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2
 const SMALLER_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2v4H2M14 6h-4V2M10 14v-4h4M2 10h4v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 
-if (term && !still.matches) play(term);
+if (term) {
+  const ctl = term.parentElement.querySelector('.term-ctl');
+  if (still.matches) {
+    // Reduced motion: the transcript stays as it is; only the bigger view.
+    ctl?.querySelectorAll('[data-term-act], [data-term-pause], [data-term-replay]')
+      .forEach((b) => { b.hidden = true; });
+    bigger(term, ctl, [], () => {});
+  } else {
+    play(term, ctl);
+  }
+  if (ctl) ctl.hidden = false;
+}
 
-function play(term) {
+// The bigger view: the pane's title, controls and terminal (and `extra`)
+// move into a centred dialog and back, so nothing restarts. Esc, a click
+// outside it or the button again closes it.
+function bigger(term, ctl, extra, follow) {
+  const bigBtn = ctl?.querySelector('[data-term-big]');
+  const big = document.querySelector('.term-big');
+  if (!bigBtn) return;
+  if (!big) { bigBtn.hidden = true; return; }
+  const pane = term.parentElement;
+  const moved = [pane.querySelector('.t'), ctl, term, ...extra].filter(Boolean);
+  const box = big.querySelector('.pane');
+  const setBig = (on) => {
+    bigBtn.innerHTML = on ? SMALLER_ICON : BIGGER_ICON;
+    bigBtn.setAttribute('aria-label', on ? 'smaller' : 'bigger');
+    bigBtn.title = on ? 'smaller' : 'bigger';
+  };
+  bigBtn.addEventListener('click', () => (big.open ? big.close() : (box.append(...moved), big.showModal(), setBig(true), follow())));
+  big.addEventListener('close', () => {
+    // Back where they were: the title, controls and terminal first in the
+    // pane, anything extra right after the terminal.
+    pane.prepend(...moved.filter((el) => !extra.includes(el)));
+    term.after(...extra);
+    setBig(false);
+    follow();
+  });
+  big.addEventListener('click', (e) => { if (e.target === big) big.close(); });
+}
+
+function play(term, ctl) {
   // Acts, each a list of lines; a label line starts a new act.
   const acts = [];
   for (const line of term.querySelectorAll('.l')) {
@@ -23,6 +62,8 @@ function play(term) {
   }
 
   // Screen readers get the whole transcript once, not a screen being typed.
+  // It travels into the bigger view with the terminal, since a modal dialog
+  // hides everything outside it.
   const copy = term.cloneNode(true);
   copy.removeAttribute('data-term');
   copy.className = 'sr-only';
@@ -31,11 +72,9 @@ function play(term) {
 
   // Controls on the pane's top border: a dot per act (the one playing is
   // filled; click one to jump to it), pause, and replay from the start.
-  const ctl = term.parentElement.querySelector('.term-ctl');
   const actBtns = [...(ctl?.querySelectorAll('[data-term-act]') ?? [])];
   const pauseBtn = ctl?.querySelector('[data-term-pause]');
   const replayBtn = ctl?.querySelector('[data-term-replay]');
-  if (ctl) ctl.hidden = false;
   // The pane's title names the act on screen, so a switch reads as one.
   const title = term.parentElement.querySelector('[data-term-title]');
   const mark = (i) => {
@@ -148,27 +187,7 @@ function play(term) {
     wake();
     loop(run, i);
   };
-  // The bigger view: the pane's title, controls and terminal move into a
-  // centred dialog and back, so nothing restarts. Esc, a click outside it or
-  // the button again closes it.
-  const bigBtn = ctl?.querySelector('[data-term-big]');
-  const big = document.querySelector('.term-big');
-  const pane = term.parentElement;
-  const moved = [pane.querySelector('.t'), ctl, term].filter(Boolean);
-  const setBig = (on) => {
-    if (!bigBtn) return;
-    bigBtn.innerHTML = on ? SMALLER_ICON : BIGGER_ICON;
-    bigBtn.setAttribute('aria-label', on ? 'smaller' : 'bigger');
-    bigBtn.title = on ? 'smaller' : 'bigger';
-  };
-  if (big && bigBtn) {
-    const box = big.querySelector('.pane');
-    bigBtn.addEventListener('click', () => (big.open ? big.close() : (box.append(...moved), big.showModal(), setBig(true), follow())));
-    big.addEventListener('close', () => { pane.prepend(...moved); setBig(false); follow(); });
-    big.addEventListener('click', (e) => { if (e.target === big) big.close(); });
-  } else if (bigBtn) {
-    bigBtn.hidden = true;
-  }
+  bigger(term, ctl, [copy], follow);
 
   pauseBtn?.addEventListener('click', () => { setPaused(!paused); wake(); });
   replayBtn?.addEventListener('click', () => restart(0));

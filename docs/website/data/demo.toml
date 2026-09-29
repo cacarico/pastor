@@ -19,7 +19,7 @@ sandbox  no       sandbox-1 0/1           0       0'''
 
 [[act.step]]
 cmd = '''
-pastor task run "Fix the flaky login test" --repo '~/src/app' --worktree --model sonnet --profile develop'''
+pastor task run "Fix the flaky login test" --repo '~/src/app' --worktree --profile develop'''
 
 [[act.step]]
 out = '''
@@ -103,7 +103,7 @@ say = "Next, the open review on #42, in a worktree of its own."
 
 [[act.step]]
 cmd = '''
-pastor task run "Address the review on #42" --repo '~/src/app' --worktree --model sonnet'''
+pastor task run "Address the review on #42" --repo '~/src/app' --worktree'''
 
 [[act.step]]
 out = '''
