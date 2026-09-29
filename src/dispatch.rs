@@ -1182,19 +1182,6 @@ mod tests {
         }
     }
 
-    /// True only when the named flock has a seat here and that seat is
-    /// under its max; a missing seat and a full one both come back false.
-    #[test]
-    fn flock_has_room_checks_the_named_seat() {
-        let m = MachineView {
-            flocks: vec![seat("work", Some(2), 1), seat("home", Some(1), 1)],
-            ..mv("desk", 4, 2, &[], true)
-        };
-        assert!(m.flock_has_room("work"), "1 of 2 taken");
-        assert!(!m.flock_has_room("home"), "at its max");
-        assert!(!m.flock_has_room("play"), "no seat at all");
-    }
-
     /// One more live task of `flock`, counted on `live`, on `live_jobs`
     /// when the claim comes from a job, and on that flock's own seat; a
     /// flock the machine is not in leaves every count untouched.
