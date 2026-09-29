@@ -4057,6 +4057,45 @@ mod tests {
         assert!(template.contains("# pastor\n"), "{template}");
     }
 
+    /// A subpath `baseURL` (the site is served at cacari.co/pastor/) makes
+    /// `.RelPermalink` absolute under that subpath, so `llms.txt`'s docs
+    /// links must be trimmed relative to the home page, not just its
+    /// leading slash, or they resolve one `docs/` level too deep. Needs
+    /// hugo from mise; skips where it is not installed.
+    #[test]
+    fn website_llms_txt_links_resolve_under_a_subpath_base_url() {
+        if std::process::Command::new("hugo")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: hugo not found in PATH");
+            return;
+        }
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let out = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("hugo")
+            .arg("--source")
+            .arg(&site)
+            .arg("--destination")
+            .arg(out.path())
+            .args(["--baseURL", "https://cacari.co/pastor/"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let llms = std::fs::read_to_string(out.path().join("llms.txt")).unwrap();
+        for line in llms.lines().filter(|l| l.starts_with("- [")) {
+            let link = line.split('(').nth(1).unwrap().split(')').next().unwrap();
+            if link.starts_with("http") {
+                continue; // the Optional section links out to github.com
+            }
+            assert!(
+                link.starts_with("docs/"),
+                "link should be relative to llms.txt, not doubled under the subpath: {line}"
+            );
+        }
+    }
+
     /// The docs are five sections, each an index with its pages, and every
     /// docs link on the homepage lands on one of them, so a moved or renamed
     /// page shows here rather than as a dead link.

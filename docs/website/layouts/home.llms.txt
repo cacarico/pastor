@@ -8,7 +8,7 @@ Every page below is short, one topic each. For driving pastor as an agent, `past
 {{ range (site.GetPage "/docs").Sections.ByWeight }}
 ## {{ .Title }}
 {{ range .Pages.ByWeight }}
-- [{{ .Title }}]({{ strings.TrimPrefix "/" .RelPermalink }}): {{ .Params.summary }}
+- [{{ .Title }}]({{ strings.TrimPrefix site.Home.RelPermalink .RelPermalink }}): {{ .Params.summary }}
 {{- end }}
 {{ end }}
 ## Optional
