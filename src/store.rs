@@ -1741,28 +1741,27 @@ impl Store {
 
     /// Delete the limits whose `retry_at` is not after `now`, answering
     /// them. The times are compared parsed, not as text: a row written in
-    /// another offset still sorts right.
+    /// another offset still sorts right. Each row is deleted by the
+    /// `retry_at` text it was read with, not one written again, so a row
+    /// kept as `Z` or `+02:00` goes too, while one replaced meanwhile by a
+    /// later limit stays.
     pub fn expire_limits(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<AccountLimit>> {
-        let gone: Vec<AccountLimit> = self
-            .limits()?
+        let rows = self.select_limits_raw("SELECT * FROM limits ORDER BY account, model", [])?;
+        let gone: Vec<(AccountLimit, String)> = rows
             .into_iter()
-            .filter(|l| l.retry_at <= now)
+            .filter(|(l, _)| l.retry_at <= now)
             .collect();
         blocking(|| {
             let conn = self.conn.lock().recover();
-            for l in &gone {
+            for (l, retry_at) in &gone {
                 conn.execute(
                     "DELETE FROM limits WHERE account = ?1 AND model = ?2 AND retry_at = ?3",
-                    params![
-                        l.account,
-                        l.model.as_deref().unwrap_or(""),
-                        l.retry_at.to_rfc3339()
-                    ],
+                    params![l.account, l.model.as_deref().unwrap_or(""), retry_at],
                 )?;
             }
             anyhow::Ok(())
         })?;
-        Ok(gone)
+        Ok(gone.into_iter().map(|(l, _)| l).collect())
     }
 
     /// Delete `account`'s limits, answering them: only `model`'s row when
@@ -1796,6 +1795,19 @@ impl Store {
         sql: &str,
         args: impl rusqlite::Params,
     ) -> anyhow::Result<Vec<AccountLimit>> {
+        Ok(self
+            .select_limits_raw(sql, args)?
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect())
+    }
+
+    /// `select_limits`, each row with its `retry_at` as stored.
+    fn select_limits_raw(
+        &self,
+        sql: &str,
+        args: impl rusqlite::Params,
+    ) -> anyhow::Result<Vec<(AccountLimit, String)>> {
         blocking(|| {
             let conn = self.conn.lock().recover();
             let mut stmt = conn.prepare(sql)?;
@@ -1806,19 +1818,21 @@ impl Store {
             };
             let rows = stmt.query_map(args, |r| {
                 let model: String = r.get("model")?;
-                Ok(AccountLimit {
+                let retry_at: String = r.get("retry_at")?;
+                let limit = AccountLimit {
                     account: r.get("account")?,
                     model: (!model.is_empty()).then_some(model),
                     hard: r.get("hard")?,
                     no_credit: r.get("no_credit")?,
                     until: r.get::<_, Option<String>>("until")?.map(time).transpose()?,
-                    retry_at: time(r.get("retry_at")?)?,
+                    retry_at: time(retry_at.clone())?,
                     line: r.get("line")?,
                     task_id: r.get("task_id")?,
                     machine: r.get("machine")?,
                     agent: r.get("agent")?,
                     seen_at: time(r.get("seen_at")?)?,
-                })
+                };
+                Ok((limit, retry_at))
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
@@ -4286,6 +4300,43 @@ mod tests {
         assert_eq!(gone, ["gone"]);
         assert_eq!(s.limits().unwrap().len(), 1);
         assert!(s.expire_limits(now).unwrap().is_empty());
+    }
+
+    /// A row whose `retry_at` was kept in another form than `+00:00` still
+    /// expires: it is deleted by the text it was read with.
+    #[test]
+    fn a_limit_kept_in_another_offset_expires() {
+        let s = Store::open_in_memory().unwrap();
+        for (account, retry_at) in [
+            ("zulu", "2026-09-29T10:00:00Z"),
+            ("plus-two", "2026-09-29T12:00:00+02:00"),
+            ("held", "2099-01-01T00:00:00Z"),
+        ] {
+            let conn = s.conn.lock().recover();
+            conn.execute(
+                "INSERT INTO limits (account, hard, retry_at, line, seen_at)
+                 VALUES (?1, 1, ?2, 'You''ve hit your limit', ?2)",
+                params![account, retry_at],
+            )
+            .unwrap();
+        }
+        let now = DateTime::parse_from_rfc3339("2026-09-29T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut gone: Vec<String> = s
+            .expire_limits(now)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.account)
+            .collect();
+        gone.sort();
+        assert_eq!(gone, ["plus-two", "zulu"]);
+        let left: Vec<String> = s.limits().unwrap().into_iter().map(|l| l.account).collect();
+        assert_eq!(
+            left,
+            ["held"],
+            "the expired rows are deleted, not only answered"
+        );
     }
 
     /// Clearing an account takes all its rows; with a model, only that

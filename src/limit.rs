@@ -91,12 +91,15 @@ pub fn what_of(line: &str, hard: bool, no_credit: bool) -> String {
     let lower = line.replace('’', "'").to_ascii_lowercase();
     match scope_of(&lower) {
         Some(words) if !words.is_empty() => {
-            // The words as the message wrote them, capitals kept.
-            let first = lower.find(words[0]).unwrap_or(0);
+            // The words as the message wrote them, capitals kept. `lower`
+            // and `line` differ in bytes (`’` is three, `'` one) but not
+            // in words, so the scope is found by word index, not offset.
+            // `words` borrow from `lower`, which gives where they start.
+            let first = words[0].as_ptr() as usize - lower.as_ptr() as usize;
+            let skip = lower[..first].split_whitespace().count();
             let said: Vec<&str> = line
-                .get(first..)
-                .unwrap_or("")
                 .split_whitespace()
+                .skip(skip)
                 .take(words.len())
                 .collect();
             format!("{} limit", said.join(" "))
@@ -758,6 +761,23 @@ mod tests {
             claude("● You've hit your limit\n").unwrap().what(),
             "usage limit"
         );
+    }
+
+    /// A curly apostrophe is longer in bytes than the straight one the
+    /// scope is read with; the words said still come out whole.
+    #[test]
+    fn what_ran_out_survives_words_and_apostrophes_before_it() {
+        for (line, what) in [
+            ("You’ve hit your 5-hour limit", "5-hour limit"),
+            (
+                "You’ve reached your Opus weekly limit · resets 7pm",
+                "Opus weekly limit",
+            ),
+            ("You've hit your Sonnet limit · resets 3am", "Sonnet limit"),
+            ("Opus weekly limit reached", "Opus weekly limit"),
+        ] {
+            assert_eq!(what_of(line, true, false), what, "{line}");
+        }
     }
 
     #[test]
