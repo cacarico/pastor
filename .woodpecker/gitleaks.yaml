@@ -1,0 +1,44 @@
+# Mirrors .github/workflows/gitleaks.yml: gitleaks runs directly (not
+# gitleaks-action, which only scans the triggering event's commits), pinned
+# by version and checksum, against its own default rules fetched outside the
+# checkout. The checkout's own gitleaks config is deleted first and
+# --ignore-gitleaks-allow is set, so a pull request cannot loosen the policy
+# it is checked against; --log-opts="--all" scans the full history of every
+# ref the clone step already fetched. `event: cron` needs its schedule set
+# on the repo in the Woodpecker server (see the spec); this file only says
+# what runs then.
+#
+# Behavioral difference from GitHub Actions: the GitHub workflow adds
+# `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` after checkout so
+# --all also covers every other branch's history, not just the one
+# triggering the run. That fetch needs authenticated HTTPS access to a
+# private repo, and Woodpecker's clone credentials live only in the clone
+# step's own container, not in this one. Scanning just the triggering ref's
+# full history (still a full depth-0 clone) is the trade made here; a
+# secret this step could use for `git fetch` would close the gap.
+when:
+  - event: pull_request
+  - event: push
+    branch: main
+  - event: cron
+  - event: manual
+
+steps:
+  - name: scan
+    image: alpine:3.20
+    commands:
+      - apk add --no-cache bash git curl
+      - curl -sSLo /tmp/gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_arm64.tar.gz"
+      - echo "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080  /tmp/gitleaks.tar.gz" | sha256sum -c -
+      - tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+      - curl -sSLo /tmp/gitleaks.toml "https://raw.githubusercontent.com/gitleaks/gitleaks/v8.30.1/config/gitleaks.toml"
+      - rm -f .gitleaksignore .gitleaks.toml
+      - mkdir -p /tmp/no-ignore
+      - gitleaks git --redact --no-banner --exit-code 1 --ignore-gitleaks-allow --config /tmp/gitleaks.toml --gitleaks-ignore-path /tmp/no-ignore --log-opts=--all .
+
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      partial: false
+      depth: 0
