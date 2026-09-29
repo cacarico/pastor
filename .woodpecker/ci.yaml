@@ -4,9 +4,19 @@
 # one at a time (depends_on) so only one Rust build competes for the Pi's
 # 4 cores and 8GB at once, per the spec's caution for this phase.
 #
+# check runs as a non-root user, not the step's default root, and this is
+# not cosmetic: several tests assert that an ancestor directory owned by
+# someone else, or world-writable, is refused (create_private_dir_*), and
+# others exercise git worktree/checkout behavior. Running as root broke
+# both categories for real on this cluster (confirmed): the app code's own
+# "root-owned means trusted" logic and git's own root-vs-owner assumptions
+# both only diverge from the GitHub Actions runner (a normal user) when
+# the whole test process is uid 0. A `builder` user, owning the checkout,
+# matches the runner's user model and is what actually goes green.
+#
 # test-ssh: the GitHub job needs sudo to install and run its own sshd,
-# because the runner isn't root. A Woodpecker step already runs as root,
-# so openssh-server installs and /run/sshd is created with no sudo.
+# because the runner isn't root; installing openssh-server needs root
+# regardless, so that part still runs before dropping to `builder`.
 #
 # portability: needs zig and cargo-zigbuild, as .github/actions/zig
 # installs for GitHub Actions; the same pinned version and checksum,
@@ -67,10 +77,12 @@ steps:
       - apt-get update -qq
       - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev openssh-server make
       - rustup component add rustfmt clippy
-      - make check
-      - make test-machine
+      - useradd --create-home --shell /bin/bash builder
       - mkdir -p /run/sshd
-      - make test-ssh
+      - chown -R builder:builder /woodpecker
+      - su builder -c 'export HOME=/home/builder PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:"$PATH"; cd /woodpecker/src/github.com/cacarico/pastor-private && make check'
+      - su builder -c 'export HOME=/home/builder PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:"$PATH"; cd /woodpecker/src/github.com/cacarico/pastor-private && make test-machine'
+      - su builder -c 'export HOME=/home/builder PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:"$PATH"; cd /woodpecker/src/github.com/cacarico/pastor-private && make test-ssh'
 
   - name: msrv
     image: rust:1.88-slim
