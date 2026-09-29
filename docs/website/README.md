@@ -33,7 +33,10 @@ tab is also a plain link.
 - The version in the header comes from `Cargo.toml`.
 
 `make site` builds into `docs/website/public/`; `make site-serve` serves it
-with live reload. Both need `hugo` (from mise).
+with live reload. Both need `hugo` (from mise). `make links` builds it and
+checks every internal link and anchor in it, and in `README.md`,
+`docs/*.md` and `skills/**/*.md`, with `lychee --offline`; it needs
+`lychee` on the PATH, and the website workflow runs it.
 
 `.github/workflows/website.yml` builds it on pushes to main and on pull
 requests that touch the docs, but publishes it to GitHub Pages only from

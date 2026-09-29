@@ -1,8 +1,11 @@
 # Builds docs/website with Hugo. It runs on pushes to main and on pull
 # requests that touch the docs (the site renders docs/manual.md and the
 # pages under docs/website) or Cargo.toml (the header shows the version),
-# and by hand. Hugo is a pinned release checked against its published
-# checksums, and every action is pinned to a commit, as in release.yml.
+# and by hand. It also checks internal links (`make links`): the built site,
+# and README.md, docs/*.md and skills/**/*.md, which is why those paths
+# trigger it too. Hugo and lychee are pinned releases checked against their
+# published checksums, and every action is pinned to a commit, as in
+# release.yml.
 #
 # The site deploys to GitHub Pages only from cacarico/pastor, where Pages
 # is set to "GitHub Actions". In any other copy of the repo (the private
@@ -19,11 +22,15 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "README.md"
+      - "skills/**"
       - "Cargo.toml"
       - ".github/workflows/website.yml"
   pull_request:
     paths:
       - "docs/**"
+      - "README.md"
+      - "skills/**"
       - "Cargo.toml"
       - ".github/workflows/website.yml"
   workflow_dispatch:
@@ -40,6 +47,7 @@ concurrency:
 
 env:
   HUGO_VERSION: 0.166.0
+  LYCHEE_VERSION: 0.24.2
 
 jobs:
   build:
@@ -60,7 +68,21 @@ jobs:
           mkdir -p "$RUNNER_TEMP/hugo"
           tar -xzf "$tarball" -C "$RUNNER_TEMP/hugo" hugo
           echo "$RUNNER_TEMP/hugo" >> "$GITHUB_PATH"
+      - name: Install lychee
+        run: |
+          set -eu
+          base="https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}"
+          tarball="lychee-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSLO --retry 5 --retry-delay 5 --retry-all-errors "$base/$tarball"
+          curl -fsSLO --retry 5 --retry-delay 5 --retry-all-errors "$base/$tarball.sha256"
+          sha256sum -c "$tarball.sha256"
+          mkdir -p "$RUNNER_TEMP/lychee"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/lychee" --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee
+          echo "$RUNNER_TEMP/lychee" >> "$GITHUB_PATH"
       - run: make site
+      # Builds the site again (fast) and checks its links and the repo
+      # Markdown's; internal links and anchors only, nothing external.
+      - run: make links
       - if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
