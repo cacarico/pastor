@@ -808,6 +808,61 @@ mod tests {
         assert_eq!(Endpoint::Command { argv: vec![] }.host(), "-");
     }
 
+    /// `describe` names the target and session, unlike `host`'s short form.
+    #[test]
+    fn describe_names_the_target_and_session() {
+        let paths = Paths::new("/c", "/s");
+        assert_eq!(
+            Endpoint::from_machine(&ssh_machine("pi-3"), &paths).describe(),
+            "ssh fleet@host (session default)"
+        );
+        let local = MachineConfig {
+            local: true,
+            ssh: None,
+            ..ssh_machine("here")
+        };
+        assert_eq!(
+            Endpoint::from_machine(&local, &paths).describe(),
+            "local herdr session default"
+        );
+        let command = Endpoint::Command {
+            argv: vec!["fake-herdr".into(), "--connect".into(), "/h.sock".into()],
+        };
+        assert_eq!(command.describe(), "command fake-herdr --connect /h.sock");
+    }
+
+    /// `Endpoint`'s `Connector` impl (used through `&dyn Connector`, unlike
+    /// the tests above that call the inherent methods directly) matches the
+    /// inherent methods it delegates to.
+    #[test]
+    fn the_connector_impl_matches_endpoint_directly() {
+        let paths = Paths::new("/c", "/s");
+        let ep = Endpoint::from_machine(&ssh_machine("pi-3"), &paths);
+        let c: &dyn Connector = &ep;
+        assert_eq!(c.describe(), ep.describe());
+        assert_eq!(c.host(), ep.host());
+    }
+
+    /// A `Connector` that does not override `host` falls back to `describe`.
+    struct DescribeOnly;
+    impl Connector for DescribeOnly {
+        fn connect(&self) -> ConnectFuture<'_> {
+            Box::pin(async {
+                Err(ConnectError {
+                    message: "no".into(),
+                })
+            })
+        }
+        fn describe(&self) -> String {
+            "described".into()
+        }
+    }
+
+    #[test]
+    fn a_connector_with_no_host_of_its_own_falls_back_to_describe() {
+        assert_eq!(DescribeOnly.host(), "described");
+    }
+
     /// The machine name in the ControlPath is only there to be recognisable;
     /// `%C` is the identity. A name that would push the socket name past
     /// `sun_path` must be shortened, not cost every request a full handshake.
@@ -1128,6 +1183,9 @@ mod tests {
             Some("0.2.0")
         );
         assert_eq!(v(0, "welcome\nnone"), None);
+        // "none" wins even when it happens to follow "pastor": read as the
+        // no-pastor answer, never as a version literal spelled "none".
+        assert_eq!(v(0, "pastor none"), None);
         assert_eq!(v(0, "pastor 0.2.0\nmotd after"), None);
         assert_eq!(v(0, "pastor 0.2\u{1b}[0m"), None);
         assert!(remote_pastor_version("t", &out(255, "")).is_err());
@@ -1219,6 +1277,68 @@ mod tests {
         assert_eq!(command.ensure_dir("/").await.unwrap(), None);
     }
 
+    /// The command itself (every real source of "yes") is
+    /// `config::opencode`'s own to test; this only proves the wiring here
+    /// runs it and passes its answer through. The command reads opencode's
+    /// config under `$HOME` and `$XDG_CONFIG_HOME`, and the environment is
+    /// the whole test binary's, which other tests read, so the local half
+    /// runs in a child of this binary with its own empty `HOME` and managed
+    /// dir: a real config on the host running the suite cannot turn the
+    /// first answer into a yes.
+    #[tokio::test]
+    async fn opencode_permission_rules_per_endpoint() {
+        const CHILD: &str = "PASTOR_TEST_OPENCODE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let managed = std::path::PathBuf::from(
+                std::env::var_os("OPENCODE_TEST_MANAGED_CONFIG_DIR").unwrap(),
+            );
+            let local = Endpoint::Local {
+                session: "s".into(),
+            };
+            assert_eq!(
+                local.opencode_permission_rules().await.unwrap(),
+                Some(false)
+            );
+            std::fs::write(
+                managed.join("opencode.json"),
+                r#"{"permission": {"bash": "allow"}}"#,
+            )
+            .unwrap();
+            assert_eq!(local.opencode_permission_rules().await.unwrap(), Some(true));
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "herdr::transport::tests::opencode_permission_rules_per_endpoint",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env("OPENCODE_TEST_MANAGED_CONFIG_DIR", managed.path())
+            .env(
+                "PASTOR_TEST_MANAGED_PREFERENCES_DIR",
+                managed.path().join("prefs"),
+            )
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The filter matched and the child really ran the local half.
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.opencode_permission_rules().await.unwrap(), None);
+    }
+
     /// Only ssh failing to reach the machine is an error. rc-file noise comes
     /// before the answer, so the answer is read from the end of stdout.
     #[test]
@@ -1258,6 +1378,17 @@ mod tests {
         );
         assert_eq!(remote_restore_answer("t", &out(128, "")).unwrap(), None);
         assert!(remote_restore_answer("t", &out(255, "")).is_err());
+        // "added" or "no-branch" only count when the shell that printed them
+        // also exited zero: a nonzero exit with that word on stdout (a `set
+        // -e` shell can still print before failing) is neither outcome.
+        assert_eq!(
+            remote_restore_answer("t", &out(1, "added\n")).unwrap(),
+            None
+        );
+        assert_eq!(
+            remote_restore_answer("t", &out(1, "no-branch\n")).unwrap(),
+            None
+        );
     }
 
     /// Everything that reaches the remote shell is quoted.
@@ -1297,6 +1428,8 @@ mod tests {
         );
         assert_eq!(remote_unpushed_answer("t", &out(128, "")).unwrap(), None);
         assert!(remote_unpushed_answer("t", &out(255, "")).is_err());
+        // A parseable count on a nonzero exit is not a real answer either.
+        assert_eq!(remote_unpushed_answer("t", &out(1, "2\n")).unwrap(), None);
     }
 
     /// Against a real git: a commit is unpushed until a remote has it.
@@ -1344,6 +1477,55 @@ mod tests {
         );
     }
 
+    /// Against a real git: an existing branch gets its worktree back, a
+    /// gone branch is reported rather than failing.
+    #[tokio::test]
+    async fn a_local_checkout_restores_a_removed_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{args:?}: {st:?}");
+        };
+        git(&["init", "-q", "work"]);
+        git(&["-C", "work", "commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&["-C", "work", "branch", "feature"]);
+        let ep = Endpoint::Local {
+            session: "s".into(),
+        };
+        let repo = dir.path().join("work");
+        let repo = repo.to_str().unwrap();
+        let wt = dir.path().join("wt");
+        assert_eq!(
+            ep.restore_worktree(repo, wt.to_str().unwrap(), "feature")
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert!(wt.join(".git").exists());
+        let wt2 = dir.path().join("wt2");
+        assert_eq!(
+            ep.restore_worktree(repo, wt2.to_str().unwrap(), "no-such-branch")
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert!(!wt2.exists());
+    }
+
     /// Only ssh itself failing (255, or killed) means the machine was not
     /// reached. An unset or relative `$HOME`, or a remote command that fails,
     /// comes from a reachable machine and must not mark it lost.
@@ -1363,6 +1545,10 @@ mod tests {
         assert!(err.message.contains("more than"), "{}", err.message);
         let err = probe_output(&argv("yes >&2")).await.unwrap_err();
         assert!(err.message.contains("more than"), "{}", err.message);
+        // Pinned against a literal, not the constant itself: every other
+        // assertion here uses `PROBE_OUTPUT_LIMIT` symbolically, so a wrong
+        // value for it would still pass them.
+        assert_eq!(PROBE_OUTPUT_LIMIT, 65536);
         // Exactly at the cap is fine.
         let out = probe_output(&argv(&format!("head -c {PROBE_OUTPUT_LIMIT} /dev/zero")))
             .await
