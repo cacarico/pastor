@@ -7,12 +7,16 @@ version.
 
 `pastor serve` runs on one machine, the head: the one whose serve holds the
 queue. Other machines may run a headless serve (see [A headless
-serve](#a-headless-serve)). The head keeps the queue, runs the jobs and
-watches every agent. For each task it picks a machine, reaches that machine's
-herdr over ssh, opens a workspace, starts an agent named after the task,
-waits for the agent to come up, types the prompt and watches the agent's
-status. Task state lives in SQLite under `~/.local/state/pastor/`. How the
-connections work is under [Internals](#internals).
+serve](#a-headless-serve)). The head keeps the queue and runs the jobs. For
+each task it picks a machine and, for an `ssh`, `local` or `command` one (see
+[Flocks](#flocks)), reaches that machine's herdr itself, opens a workspace,
+starts an agent named after the task, waits for the agent to come up, types
+the prompt and watches the agent's status; for a `pull` machine it hands the
+task to that machine's own headless serve instead, which does the same
+against its own herdr and reports back (see [Pull
+machines](#pull-machines)). Task state lives in SQLite under
+`~/.local/state/pastor/`. How the connections work is under
+[Internals](#internals).
 
 An agent that never becomes ready within 30s fails the task; one that exits
 on start fails it straight away, usually because the agent is not installed
@@ -3298,11 +3302,12 @@ a real herdr, so run `make smoke` on a fleet machine before trusting it there.
 
 To try pastor without herdr, run the fake one. It comes in the same two
 pieces the real thing does, a server and a bridge per request, because state
-has to outlive a single request:
+has to outlive a single request. `make build` leaves it at
+`target/debug/fake-herdr`; `make install` does not install it, only `pastor`:
 
 ```bash
-FAKE_HERDR_AUTO_DONE_MS=500 fake-herdr --listen /tmp/fake-herdr.sock &
-pastor machine add fake --command "fake-herdr --connect /tmp/fake-herdr.sock"
+FAKE_HERDR_AUTO_DONE_MS=500 target/debug/fake-herdr --listen /tmp/fake-herdr.sock &
+pastor machine add fake --command "target/debug/fake-herdr --connect /tmp/fake-herdr.sock"
 pastor serve --foreground            # its log in this terminal; ctrl-c stops it
 ```
 
