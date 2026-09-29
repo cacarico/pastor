@@ -4149,6 +4149,83 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// The website's CLI reference is rendered from this command tree. It
+    /// fails when the checked-in page is stale; `make cli-reference` runs it
+    /// with PASTOR_WRITE_CLI_REFERENCE=1, which writes the page instead.
+    #[test]
+    fn website_cli_reference_is_current() {
+        let path = skills_dir()
+            .parent()
+            .unwrap()
+            .join("docs/website/content/docs/reference/cli.md");
+        let page = std::fs::read_to_string(&path).unwrap();
+        let fresh = pastor::cli_reference::refresh(&completion_tree(), &page);
+        if std::env::var_os("PASTOR_WRITE_CLI_REFERENCE").is_some() {
+            std::fs::write(&path, &fresh).unwrap();
+            return;
+        }
+        assert!(
+            page == fresh,
+            "{} is stale: run make cli-reference",
+            path.display()
+        );
+    }
+
+    /// `llms.txt` is the home page in a second output format, so Hugo writes
+    /// it at the site's root from `layouts/home.llms.txt`.
+    #[test]
+    fn website_serves_llms_txt_at_its_root() {
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let config: toml::Table =
+            toml::from_str(&std::fs::read_to_string(site.join("hugo.toml")).unwrap()).unwrap();
+        let llms = &config["outputFormats"]["llms"];
+        assert_eq!(llms["baseName"].as_str(), Some("llms"));
+        assert_eq!(llms["mediaType"].as_str(), Some("text/plain"));
+        let home = config["outputs"]["home"].as_array().unwrap();
+        assert!(home.iter().any(|f| f.as_str() == Some("llms")), "{home:?}");
+        let template = std::fs::read_to_string(site.join("layouts/home.llms.txt")).unwrap();
+        assert!(template.contains("# pastor\n"), "{template}");
+    }
+
+    /// A subpath `baseURL` (the site is served at cacari.co/pastor/) makes
+    /// `.RelPermalink` absolute under that subpath, so `llms.txt`'s docs
+    /// links must be trimmed relative to the home page, not just its
+    /// leading slash, or they resolve one `docs/` level too deep. Needs
+    /// hugo from mise; skips where it is not installed.
+    #[test]
+    fn website_llms_txt_links_resolve_under_a_subpath_base_url() {
+        if std::process::Command::new("hugo")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: hugo not found in PATH");
+            return;
+        }
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let out = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("hugo")
+            .arg("--source")
+            .arg(&site)
+            .arg("--destination")
+            .arg(out.path())
+            .args(["--baseURL", "https://cacari.co/pastor/"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let llms = std::fs::read_to_string(out.path().join("llms.txt")).unwrap();
+        for line in llms.lines().filter(|l| l.starts_with("- [")) {
+            let link = line.split('(').nth(1).unwrap().split(')').next().unwrap();
+            if link.starts_with("http") {
+                continue; // the Optional section links out to github.com
+            }
+            assert!(
+                link.starts_with("docs/"),
+                "link should be relative to llms.txt, not doubled under the subpath: {line}"
+            );
+        }
+    }
+
     /// The docs are five sections, each an index with its pages, and every
     /// docs link on the homepage lands on one of them, so a moved or renamed
     /// page shows here rather than as a dead link.
