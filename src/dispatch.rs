@@ -2366,7 +2366,7 @@ mod tests {
 
     /// `[agents.claude-personal] kind = "claude"` with an env: herdr starts
     /// a claude, with Claude's tool flags, in a pane that has the env, `~`
-    /// expanded against the machine's home.
+    /// expanded against the machine's home, a bare `~` too.
     fn personal() -> Agents {
         let mut agents = Agents::default();
         agents.0.insert(
@@ -2379,6 +2379,7 @@ mod tests {
                         "~/.claude-personal".to_string(),
                     ),
                     ("PLAIN".to_string(), "a~b".to_string()),
+                    ("BARE".to_string(), "~".to_string()),
                 ]
                 .into(),
                 ..Default::default()
@@ -2404,6 +2405,7 @@ mod tests {
             .find(|r| r.method == "workspace.create")
             .unwrap();
         let want = serde_json::json!({
+            "BARE": "/home/fake",
             "CLAUDE_CONFIG_DIR": "/home/fake/.claude-personal",
             "PASTOR_TASK": "t-7",
             "PLAIN": "a~b",
@@ -2889,6 +2891,30 @@ mod tests {
             assert!(tail.contains("You've hit your limit"), "{tail}");
             assert_eq!(t.error.as_deref(), Some(message.as_str()));
         }
+    }
+
+    /// Only a resume keeps the directory recorded on the task: a fresh
+    /// dispatch of a task with no repo asks `no_repo_dir`, whatever `cwd`
+    /// the task already carries.
+    #[tokio::test]
+    async fn a_fresh_dispatch_with_no_repo_asks_again_whatever_cwd_it_carries() {
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            repo: None,
+            place: Place::Own,
+            cwd: Some("/home/fake/elsewhere".into()),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.cwd.as_deref(), Some("/home/fake/pastor-tasks"));
+        let req = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "workspace.create" && r.params["label"] != "pastor")
+            .unwrap();
+        assert_eq!(req.params["cwd"], "/home/fake/pastor-tasks");
     }
 
     /// Where `~` cannot be resolved the task fails up front with a reason,
