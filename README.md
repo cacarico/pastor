@@ -91,7 +91,7 @@ You also need:
 Each connector says what else it needs: `github-issues`, for example, uses an
 authenticated `gh`, `jq` and `sh` on the head.
 
-For a fleet you'll run for a while, [docs/recommended-setup.md](docs/recommended-setup.md)
+For a flock you'll run for a while, [docs/recommended-setup.md](docs/recommended-setup.md)
 says how to put it together: flocks per account, least-privilege credentials
 for agent machines, permissions, and the settings that keep agents moving.
 
@@ -207,7 +207,7 @@ notification. Writing one takes a manifest and a script in any language. See
 
 | To... | Run |
 |---|---|
-| see the fleet | `pastor machine list`, `pastor machine describe pi-1` |
+| see your machines | `pastor machine list`, `pastor machine describe pi-1` |
 | start one task | `pastor task run "..." --repo DIR [--worktree] [--machine M]` |
 | follow tasks | `pastor task list`, `pastor task describe t-3`, `pastor events --follow` |
 | talk to an agent | `pastor task read t-3`, `pastor task send t-3 "..."`, `pastor task attach t-3` |
@@ -259,7 +259,7 @@ machine names.
 
 ## Safety
 
-- **Agents can't take over the fleet.** Every agent pastor starts is marked.
+- **Agents can't take over your flocks.** Every agent pastor starts is marked.
   From its terminal it can read (`task list`, `describe`) and end its own
   task with `pastor task done`, but it can't start tasks, stop other tasks,
   edit machines, jobs or settings, or start its own head, unless you allow it
@@ -307,7 +307,7 @@ above. pastor is still my personal workflow tool first, so I may decline good
 ideas that would pull it away from that shape.
 
 `make check` runs formatting, clippy and the whole test suite against a fake
-herdr, so you don't need a fleet to work on pastor; `make help` lists the rest.
+herdr, so you don't need a flock of machines to work on pastor; `make help` lists the rest.
 Start with [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Rules
 for AI contributors are in [docs/AI_GOVERNANCE.md](docs/AI_GOVERNANCE.md).
 

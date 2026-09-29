@@ -9,7 +9,7 @@
     <ul class="uses feats">
       <li><span><b>queue</b> tasks wait their turn, by priority</span></li>
       <li><span><b>jobs</b> cron or a board turns into tasks</span></li>
-      <li><span><b>fleet</b> any box you can ssh to runs agents</span></li>
+      <li><span><b>flocks</b> any box you can ssh to runs agents</span></li>
     </ul>
     <p>Every agent is a real terminal you can attach to. You check back later: done, stuck, or waiting on you.</p>
   </section>
@@ -24,19 +24,35 @@
        so it reads without scripts; term.js replays it as a live session. */}}
   <section class="pane live" style="grid-area: live">
     <h2 class="t">live <span>· a scripted session</span></h2>
+    <div class="term-ctl" hidden>
+      {{- range $i, $act := hugo.Data.demo.act }}
+      <button type="button" class="act" data-term-act="{{ $i }}" aria-label="play act {{ add $i 1 }}: {{ $act.name }}" title="{{ $act.name }}"></button>
+      {{- end }}
+      <button type="button" class="btn" data-term-pause aria-label="pause">pause</button>
+      <button type="button" class="btn" data-term-replay aria-label="replay from the start">replay</button>
+    </div>
 <pre class="term" data-term aria-label="A pastor session: by hand, then with an agent driving it">
 {{- range $i, $act := hugo.Data.demo.act }}
 {{- $agent := eq $act.kind "agent" }}
 {{- if $i }}{{ "\n" }}{{ end -}}
 <span class="l lbl" data-kind="lbl"># {{ $act.label }}</span>{{ "\n" }}
 {{- range $act.step }}
-{{- with .cmd }}<span class="l in" data-kind="in"><span class="p">{{ cond $agent "● " "$ " }}</span>{{ . }}</span>{{ "\n" }}{{ end }}
+{{- if $agent }}
+{{- /* Drawn as a Claude Code session: your prompt after >, the assistant's
+       blocks after ● with a blank line between them, each pastor call as
+       Bash(...) and its result under ⎿. */}}
 {{- with .ask }}<span class="l in ask" data-kind="in"><span class="p">&gt; </span>{{ . }}</span>{{ "\n" }}{{ end }}
+{{- with .say }}{{ "\n" }}<span class="l say" data-kind="out" data-gap data-pause="900"><span class="dot">●</span> {{ . }}</span>{{ "\n" }}{{ end }}
+{{- with .cmd }}{{ "\n" }}<span class="l call" data-kind="out" data-gap data-pause="700"><span class="dot">●</span> Bash(<span class="in">{{ . }}</span>)</span>{{ "\n" }}{{ end }}
+{{- with .out }}<span class="l res" data-kind="out" data-pause="400"><span class="p">  ⎿  </span>{{ replace . "\n" "\n     " }}</span>{{ "\n" }}{{ end }}
+{{- with .report }}{{ "\n" }}<span class="l say rep" data-kind="out" data-gap data-pause="1200"><span class="dot">●</span> {{ replace . "\n" "\n  " }}</span>{{ "\n" }}{{ end }}
+{{- else }}
+{{- with .cmd }}<span class="l in" data-kind="in"><span class="p">$ </span>{{ . }}</span>{{ "\n" }}{{ end }}
 {{- with .out }}<span class="l out" data-kind="out">{{ . }}</span>{{ "\n" }}{{ end }}
-{{- with .report }}<span class="l rep" data-kind="out"><span class="p">✓ </span>{{ . }}</span>{{ "\n" }}{{ end }}
+{{- end }}
 {{- end }}
 {{- end }}</pre>
-    <p class="term-bar"><span class="ctl" hidden><button type="button" data-term-pause>pause</button> <button type="button" data-term-replay>replay</button> · </span><a href="{{ "docs/first-run/" | relURL }}">the first run, step by step</a></p>
+    <p class="term-bar"><a href="{{ "docs/first-run/" | relURL }}">the first run, step by step →</a></p>
   </section>
 
   <section class="pane" style="grid-area: can">

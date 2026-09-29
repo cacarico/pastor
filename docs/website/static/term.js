@@ -33,19 +33,32 @@ function play(term) {
   }
   term.style.height = `${tallest}px`;
 
-  const ctl = term.parentElement.querySelector('.ctl');
+  // Controls on the pane's top border: a dot per act (the one playing is
+  // filled; click one to jump to it), pause, and replay from the start.
+  const ctl = term.parentElement.querySelector('.term-ctl');
+  const actBtns = [...(ctl?.querySelectorAll('[data-term-act]') ?? [])];
   const pauseBtn = ctl?.querySelector('[data-term-pause]');
   const replayBtn = ctl?.querySelector('[data-term-replay]');
   if (ctl) ctl.hidden = false;
+  const mark = (i) => actBtns.forEach((b, j) => {
+    b.classList.toggle('on', i === j);
+    b.setAttribute('aria-pressed', String(i === j));
+  });
 
   let paused = false;
-  let seen = true;
-  let run = 0; // bumped by replay: an older loop sees it and stops
+  let run = 0; // bumped by replay or a dot: an older loop sees it and stops
+
+  // On screen, read from the page each time rather than kept in a flag, so a
+  // missed observer callback can never leave the clock stopped for good.
+  const onScreen = () => {
+    const r = term.getBoundingClientRect();
+    return r.bottom > 0 && r.top < innerHeight;
+  };
 
   // Waits `ms` of playing time: the clock stops while paused, scrolled away
   // or in a hidden tab. A stopped wait parks in `parked` with no timer
   // running, and `wake` restarts it when playing resumes.
-  const active = () => !paused && seen && !document.hidden;
+  const active = () => !paused && !document.hidden && onScreen();
   let parked = [];
   const wake = () => {
     if (!active()) return;
@@ -68,16 +81,15 @@ function play(term) {
     tick();
   });
 
-  async function loop(mine) {
-    for (;;) {
-      for (const act of acts) {
-        term.textContent = '';
-        for (const line of act) {
-          if (!(await put(line, mine))) return;
-        }
-        // A full screen stays up long enough to read before it clears.
-        if (!(await wait(READ_PAUSE, mine))) return;
+  async function loop(mine, start = 0) {
+    for (let i = start; ; i = (i + 1) % acts.length) {
+      mark(i);
+      term.textContent = '';
+      for (const line of acts[i]) {
+        if (!(await put(line, mine))) return;
       }
+      // A full screen stays up long enough to read before it clears.
+      if (!(await wait(READ_PAUSE, mine))) return;
     }
   }
 
@@ -86,7 +98,11 @@ function play(term) {
   async function put(line, mine) {
     const el = line.cloneNode(true);
     if (line.dataset.kind !== 'in') {
-      if (!(await wait(line.dataset.kind === 'lbl' ? 300 : 350, mine))) return false;
+      // An assistant block waits a moment, as if thinking, and starts after a
+      // blank line, as Claude Code draws it.
+      const pause = Number(line.dataset.pause) || (line.dataset.kind === 'lbl' ? 300 : 350);
+      if (!(await wait(pause, mine))) return false;
+      if (line.hasAttribute('data-gap')) term.append('\n');
       term.append(el, '\n');
       return wait(line.dataset.kind === 'lbl' ? 900 : 250, mine);
     }
@@ -113,26 +129,33 @@ function play(term) {
 
   function show(act) {
     term.textContent = '';
-    for (const line of act) term.append(line.cloneNode(true), '\n');
+    for (const line of act) {
+      if (line.hasAttribute('data-gap')) term.append('\n');
+      term.append(line.cloneNode(true), '\n');
+    }
   }
 
-  pauseBtn?.addEventListener('click', () => {
-    paused = !paused;
-    pauseBtn.textContent = paused ? 'play' : 'pause';
-    wake();
-  });
-  replayBtn?.addEventListener('click', () => {
-    paused = false;
-    if (pauseBtn) pauseBtn.textContent = 'pause';
+  const setPaused = (p) => {
+    paused = p;
+    if (!pauseBtn) return;
+    pauseBtn.textContent = p ? 'play' : 'pause';
+    pauseBtn.setAttribute('aria-label', p ? 'play' : 'pause');
+  };
+  // Start act `i` over: the old loop's parked or running wait sees the new
+  // run and ends.
+  const restart = (i) => {
+    setPaused(false);
     run++;
-    wake(); // the old loop's parked wait sees the new run and ends
-    loop(run);
-  });
-
-  new IntersectionObserver(([entry]) => {
-    seen = entry.isIntersecting;
     wake();
-  }).observe(term);
+    loop(run, i);
+  };
+  pauseBtn?.addEventListener('click', () => { setPaused(!paused); wake(); });
+  replayBtn?.addEventListener('click', () => restart(0));
+  actBtns.forEach((b, i) => b.addEventListener('click', () => restart(i)));
+
+  new IntersectionObserver(wake).observe(term);
+  addEventListener('scroll', wake, { passive: true });
+  addEventListener('resize', wake);
   document.addEventListener('visibilitychange', wake);
   loop(run);
 }

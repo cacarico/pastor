@@ -4,6 +4,7 @@
 # website_demo_commands_are_real checks them as the docs' commands are.
 
 [[act]]
+name = "by hand"
 label = "by hand"
 kind = "shell"
 
@@ -62,11 +63,15 @@ t-15  queued   normal    -          default  claude          -       morning  40
 t-16  queued   normal    -          default  claude          -       morning  40s  Sort the inbox notes'''
 
 [[act]]
+name = "an agent drives pastor"
 label = "Running commands by hand is cool, but pastor is even more powerful in the hands of agents."
 kind = "agent"
 
 [[act.step]]
 ask = "keep the PRs on app moving, and tell me if anything is stuck"
+
+[[act.step]]
+say = "I'll start with anything that is waiting on an answer."
 
 [[act.step]]
 cmd = "pastor task list --blocked --json | jq -c '.[] | {id, state, error}'"
@@ -80,8 +85,11 @@ cmd = "pastor task read t-13 --lines 3"
 
 [[act.step]]
 out = '''
-  Read 6 new issues: 4 bugs with steps to reproduce, summarised above.
-  2 look like spam (a link and no details). Skip them?'''
+Read 6 new issues: 4 bugs with steps to reproduce, summarised above.
+2 look like spam (a link and no details). Skip them?'''
+
+[[act.step]]
+say = "t-13 is triaging issues in the sandbox. Skipping spam is safe, so I'll answer it."
 
 [[act.step]]
 cmd = '''
@@ -91,6 +99,9 @@ pastor task send t-13 "yes, skip them"'''
 out = "sent text and 1 key to t-13"
 
 [[act.step]]
+say = "Next, the open review on #42, in a worktree of its own."
+
+[[act.step]]
 cmd = '''
 pastor task run "Address the review on #42" --repo '~/src/app' --worktree --model sonnet'''
 
@@ -98,6 +109,9 @@ pastor task run "Address the review on #42" --repo '~/src/app' --worktree --mode
 out = '''
 ID    STATE   PRIORITY  MACHINE  FLOCK    AGENT   MODEL   JOB  AGE  NOTE
 t-17  queued  normal    -        default  claude  sonnet  run  0s   Address the review on #42'''
+
+[[act.step]]
+say = "CI is red on main. That should not wait behind the rest."
 
 [[act.step]]
 cmd = '''
@@ -110,6 +124,8 @@ t-18  queued  critical  -        default  claude  -      run  0s   CI is red on 
 
 [[act.step]]
 report = '''
-t-13 asked about two spam issues in the sandbox; I told it to skip them.
-The review on #42 is being addressed in t-17.
-CI on main is red: t-18 jumped the queue and paused a low task. Nothing needs you yet.'''
+Where things stand:
+- t-13 asked about two spam issues; I told it to skip them.
+- The review on #42 is being addressed in t-17.
+- t-18 is looking at the red CI; it jumped the queue and paused a low task.
+Nothing needs you yet.'''
