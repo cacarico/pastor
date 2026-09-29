@@ -190,6 +190,14 @@ Still open as of the last review; none of them blocks normal use.
   (`max_orchestrators` is read on each run).
 - An orchestrator agent's branch is pastor's usual `pastor/t-<n>`, not the
   spec's `orchestrator/<name>-<n>`.
+- With a remote head (`pastor head set`), `task run` fills what its flags
+  leave out from the built-in defaults, not the head's `[defaults]` timeout
+  and place: `settle_run` (`src/daemon.rs`) only overwrites a spec's timeout
+  and place when an ask or the flock sets one, trusting the spec's own
+  otherwise, which for a remote client is `PastorConfig::default()`
+  (`src/main.rs::run`), not the head's file. Every other command that reads
+  the fleet goes to the head (`remote_route` in `main.rs`); only `machine
+  authorized-key` fails with `remote_head_unsupported`.
 - A task pinned to a machine outside its flock (the machine was moved
   with `pastor machine move`, or removed) stays queued forever: the
   scheduler logs it once (`warned_queued` in `src/scheduler.rs`) and never
