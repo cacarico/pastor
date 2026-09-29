@@ -35,8 +35,11 @@ lint: ## clippy with warnings as errors
 test: ## whole suite, including the end-to-end CLI tests against the fake herdr
 	cargo test
 
-test-machine: ## the machine actor tests five times, to catch timing flakes
-	@for i in 1 2 3 4 5; do cargo test --lib machine:: -q || exit 1; done
+# Once is enough: these tests run on tokio's paused clock, where a runner's
+# load changes nothing. Two shutdown tests need a second thread and keep the
+# wall clock; they only wait for something to happen, with seconds to spare.
+test-machine: ## the machine actor tests on their own
+	cargo test --lib machine:: -q
 
 # Starts an sshd of its own on a localhost port, as the user running it, and
 # drives the CLI against a head through the real ssh and `pastor bridge`;

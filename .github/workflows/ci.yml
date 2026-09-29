@@ -86,7 +86,7 @@ jobs:
       # fmt-check, clippy -D warnings and the whole suite, including
       # tests/cli.rs against fake-herdr.
       - run: make check
-      # The machine actor tests five times over, to catch timing flakes.
+      # The machine actor tests on their own.
       - run: make test-machine
       # The CLI against a head over a real ssh: every other test runs a fake
       # ssh, which let a ControlPath too long for a unix socket through in
