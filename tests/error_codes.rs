@@ -45,17 +45,14 @@ fn every_error_code_is_in_the_manual() {
 fn every_code_in_the_manual_is_used() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manual = std::fs::read_to_string(root.join("docs/manual.md")).unwrap();
-    let text: String = rust_files(&root.join("src"))
-        .iter()
-        .map(|f| non_test(&std::fs::read_to_string(f).unwrap()).to_string())
-        .collect();
+    let used = source_codes(&root.join("src"));
     let stale: Vec<_> = table_codes(&manual)
         .into_iter()
-        .filter(|c| !text.contains(&format!("\"{c}\"")))
+        .filter(|c| !used.contains_key(c))
         .collect();
     assert!(
         stale.is_empty(),
-        "codes in the manual no code uses: {stale:?}"
+        "codes in the manual no error site emits: {stale:?}"
     );
 }
 

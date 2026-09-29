@@ -276,14 +276,14 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `head_unresponsive` | something holds the socket but does not answer a ping |
 | `herdr_error` | herdr could not be run, or answered a request with an error |
 | `internal` | the daemon sent a reply of a kind the CLI did not expect |
-| `invalid_edit` | the edited file does not check; the `edit` command opens it again |
+| `invalid_edit` | the edited file does not check; `edit` asks to reopen it, and the edit is kept either way |
 | `invalid_file` | a request for a file pastor does not edit (only flock, config or `job:<name>`) |
 | `invalid_key` | `bridge` was given something other than one public key line |
 | `invalid_machine` | `bridge`: a machine name that cannot go in authorized_keys unquoted |
 | `invalid_name` | a name (such as `watch --name`) with characters pastor refuses |
 | `invalid_path` | `bridge`: a pastor path that cannot go in authorized_keys unquoted |
 | `invalid_report` | a pull machine reported a state it may not set |
-| `invalid_request` | the bridge got a line that is not a request |
+| `invalid_request` | a line that is not a request, on the daemon socket or the bridge; a headless job submission with an invalid job name or an item with no string key |
 | `item_rejected` | a job item has no usable key or prompt |
 | `job_name_taken` | a headless serve's job has the name of one of the head's |
 | `job_not_found` | no job by that name |
@@ -340,7 +340,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `stop_failed` | `serve stop` could not tell which process holds the socket |
 | `stop_timeout` | the serve still runs after SIGTERM and the wait |
 | `store_error` | the task database failed or kept changing under the request |
-| `summary_empty` | `task done --summary-file` read nothing |
+| `summary_empty` | `task done --summary` or `--summary-file` is blank or whitespace-only |
 | `summary_file_unreadable` | `task done --summary-file` could not read the file |
 | `summary_required` | `task done` without a summary on a `summary = "require"` task |
 | `task_not_found` | no task with that id |
