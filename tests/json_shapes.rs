@@ -22,6 +22,8 @@ use pastor::scheduler::JobStatus;
 use pastor::store::{NewTask, Store};
 use pastor::task::{DispatchSpec, Task, TaskState};
 
+mod common;
+
 /// What a failing test says: the skill documents these shapes.
 const UPDATE_SKILL: &str = "agents parse this --json; if the change is on purpose, update \
      skills/pastor/SKILL.md (and anything it tells agents to read) with it";
@@ -277,10 +279,8 @@ fn bare_task_json_has_the_task_shape(what: &str, v: &Value) {
 }
 
 fn pastor(config: &Path, state: &Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
-    c.env_remove("PASTOR_TASK")
-        .env_remove("PASTOR_HEAD")
-        .env("PASTOR_CONFIG_DIR", config)
+    let mut c = common::pastor();
+    c.env("PASTOR_CONFIG_DIR", config)
         .env("PASTOR_STATE_DIR", state)
         .env("PASTOR_DATA_DIR", state.join("data"));
     c
@@ -607,7 +607,7 @@ fn job_list_json_is_an_array_of_jobs() {
 const FLOCK_TOML: &str = "[[flock]]\nname = \"work\"\ndefault = true\ndescription = \"work \
      things\"\nagent = \"claude\"\nagent_args = [\"-v\"]\nallow = [\"Bash\"]\ndeny = \
      [\"Web\"]\nmodel = \"opus\"\nprofile = \"safe\"\ntimeout = \"1h\"\nplace = \"own\"\n\n\
-     [[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\nflocks = [\"work\"]\n";
+     [[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\nflock = \"work\"\n";
 
 #[test]
 fn flock_describe_json_is_the_flock_and_its_tasks() {
@@ -640,7 +640,7 @@ fn flock_describe_json_is_the_flock_and_its_tasks() {
 
     // A flock that sets nothing but its name.
     let bare = "[[flock]]\nname = \"work\"\ndefault = true\n\n[[machine]]\nname = \"pi-1\"\nssh = \
-         \"user@pi-1\"\nflocks = [\"work\"]\n";
+         \"user@pi-1\"\nflock = \"work\"\n";
     let f = Flock::parse(Path::new("flock.toml"), bare).unwrap();
     let d = flock_description(&f, "work", None, vec![]).unwrap();
     let v = serde_json::to_value(&d).unwrap();
