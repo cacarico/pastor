@@ -112,11 +112,12 @@ runs `pastor --version` in a shell that has `~/.cargo/bin` and
 `~/.local/bin` on its PATH, since ssh's non-login shell often lacks them. A
 `local` machine is the head's own pastor; a `command` machine, one with no
 pastor, or one that gives an odd answer shows `-`. The head asks when it
-connects, then at the first reconcile (`reconcile_every`, 60s by default)
-once ten minutes have passed since it last asked, so an upgrade shows within
-about eleven minutes without a restart. A probe that gets no answer keeps the
-version last read. `machine list` itself never probes while the head is
-running.
+connects, then again after each successful reconcile once ten minutes have
+passed since it last asked — a connected machine's own `reconcile_every`
+(60s by default), a polling one's `poll_every` (10s by default, normally
+every tick) — so an upgrade shows within about eleven minutes without a
+restart either way. A probe that gets no answer keeps the version last read.
+`machine list` itself never probes while the head is running.
 
 With `pastor serve` running, CHANNEL is the head's live channel state and
 AGENTS counts pastor's tasks and orphans (see below) against the machine's
@@ -1927,9 +1928,12 @@ first: which credentials each machine gets, and the settings that keep
 unattended agents moving. The README's Install section has the other ways to
 install pastor (`install.sh`, `cargo binstall`).
 
-Each machine needs herdr 0.9 or newer with its server running, and SSH
-access from the head without a passphrase prompt (a key in ssh-agent won't be
-there for a service; use a dedicated key or Tailscale SSH). From a checkout:
+Each machine needs herdr 0.9 or newer with its server running. An `ssh`
+machine also needs SSH access from the head without a passphrase prompt (a
+key in ssh-agent won't be there for a service; use a dedicated key or
+Tailscale SSH); a `local` machine needs none, since the head is that
+machine, and a `command` machine needs whatever its own bridge program
+requires. From a checkout:
 
 ```bash
 make install                         # pastor into ~/.cargo/bin
@@ -3341,24 +3345,31 @@ debugging it. Nothing here is needed to use it.
 ### Connections to herdr
 
 herdr answers one request per connection and then closes it, so pastor opens
-a connection per request: an `ssh` running `herdr --session <s>
-remote-api-bridge`, which pipes herdr's socket protocol over stdio. Every
-command pastor runs over ssh (this one, the probes, `task attach`) goes as
-`sh -c '<command>'`, so a remote login shell that is not POSIX, such as
-fish, only parses one quoted word; sh parses the rest. For the same reason a
-machine's `session` may not contain a backslash, and a repo path with one
-needs a POSIX login shell.
+a connection per request, and how it opens one follows the machine's kind: a
+`local` machine dials herdr's unix socket directly; a `command` machine
+spawns its configured bridge program; an `ssh` machine runs `herdr --session
+<s> remote-api-bridge` over ssh, which pipes herdr's socket protocol over
+stdio. A pull machine's own headless serve reaches its herdr the same way,
+as whichever of those three kinds it is in its own flock.toml; the head
+never opens a connection to it at all (see [Pull
+machines](#pull-machines)). Every command pastor runs over ssh (this one,
+the probes, `task attach`) goes as `sh -c '<command>'`, so a remote login
+shell that is not POSIX, such as fish, only parses one quoted word; sh
+parses the rest. For the same reason a machine's `session` may not contain a
+backslash, and a repo path with one needs a POSIX login shell.
 
-Those connections are cheap because all of a machine's share one
-multiplexed ssh master (`ControlMaster=auto`,
+For an `ssh` machine those connections are cheap because all of them share
+one multiplexed ssh master (`ControlMaster=auto`,
 `ControlPath=~/.local/state/pastor/ssh/<machine>-%C`, `ControlPersist=600`),
 so only the first one authenticates. A long machine name is shortened inside
 that socket name so it stays under the unix socket path limit; `%C` is what
 tells machines apart. A master lingers for up to 10 minutes after `pastor
 serve` exits; end one by hand with `ssh -O exit -o
-ControlPath=~/.local/state/pastor/ssh/<machine>-%C <target>`. Alongside them
-each machine keeps one long-lived connection for `events.subscribe`, the one
-thing herdr holds open.
+ControlPath=~/.local/state/pastor/ssh/<machine>-%C <target>`. A `local` or
+`command` machine pays no such per-connection cost: the socket dial or the
+spawned bridge is already as direct as it gets. Alongside the per-request
+connections, whatever their kind, each machine keeps one long-lived
+connection open for `events.subscribe`, the one thing herdr holds open.
 
 Each machine needs herdr protocol 22 or newer (herdr 0.9).
 
