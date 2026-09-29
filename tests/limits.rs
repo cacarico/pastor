@@ -18,7 +18,8 @@
 //!
 //! `source` says where the message comes from. `real`: Claude Code 2.1.281
 //! wrote it in a transcript when the account reached its limit, and only the
-//! time zone's name was changed. `spec`: from the list in the spec, written
+//! time zone's name was changed; for agy, agy's own log held it from a
+//! print-mode run at its quota, word for word. `spec`: from the list in the spec, written
 //! from memory of the tool. `made`: written for the test. The pane around
 //! the message is laid out like the fixtures of `tests/panes.rs` in every
 //! case; none is a captured screen.
@@ -224,6 +225,12 @@ limits! {
     no_limit_quoted_in_the_last_message: "no-limit-quoted-in-the-last-message.txt",
     no_limit_before_the_last_message: "no-limit-before-the-last-message.txt",
     no_limit_while_claude_retries: "no-limit-retrying.txt",
+    agy_quota_reached: "agy-quota-reached.txt",
+    agy_quota_reached_in_print_mode: "agy-quota-reached-print-mode.txt",
+    agy_rate_limit: "agy-rate-limit.txt",
+    no_agy_limit_above_the_last_prompt: "no-limit-agy-above-the-last-prompt.txt",
+    no_agy_limit_before_the_last_message: "no-limit-agy-before-the-last-message.txt",
+    no_agy_limit_in_a_grep_of_the_parser: "no-limit-agy-grep-of-the-parser.txt",
 }
 
 #[test]
@@ -238,14 +245,17 @@ fn every_fixture_has_a_test() {
     assert_eq!(on_disk, listed, "tests/fixtures/limits and limits! differ");
 }
 
-/// Every fixture is a Claude screen for now, and the same screen under
-/// another kind reads as no limit until that kind's messages are known.
+/// Every fixture is a Claude or an agy screen, and the same screen under
+/// another kind reads as no limit: each kind reads only its own messages.
 #[test]
 fn another_kind_reads_no_limit() {
     for name in FILES {
         let f = load(name);
-        assert_eq!(f.kind, "claude", "{name}");
-        for kind in ["opencode", "codex", "claude-personal"] {
+        assert!(["claude", "agy"].contains(&f.kind.as_str()), "{name}");
+        for kind in ["claude", "agy", "opencode", "codex", "claude-personal"] {
+            if kind == f.kind {
+                continue;
+            }
             assert_eq!(
                 pastor::limit::limit_in(kind, &f.pane, f.now),
                 None,

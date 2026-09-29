@@ -1,0 +1,7 @@
+#! kind: agy
+#! source: real
+#! now: 2026-09-29T12:00:00Z
+#! limit: hard
+#! model_scoped: no
+#! until: 2026-09-29T16:21:30Z
+RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h21m30s.
