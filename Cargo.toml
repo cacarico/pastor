@@ -56,6 +56,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+proptest = "1.11.0"
 tempfile = "3.27.0"
 
 # The daemon mostly waits on sockets, so build time is cheap to spend on a

@@ -1485,4 +1485,52 @@ mod tests {
         }
         assert!(err.message.contains("herdr.sock"), "{}", err.message);
     }
+
+    /// Run `script` in a real `/bin/sh` and return what it printed.
+    fn sh_output(script: &str) -> Vec<u8> {
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("run /bin/sh");
+        assert!(out.status.success(), "{script:?}: {out:?}");
+        out.stdout
+    }
+
+    /// The words `/bin/sh` passes to `name` when it runs `command`, with
+    /// `name` defined as a function that prints its arguments NUL-separated.
+    fn words_for(name: &str, command: &str) -> Vec<String> {
+        let script = format!("{name}() {{ printf '%s\\0' \"$@\"; }}\n{command}");
+        let out = String::from_utf8(sh_output(&script)).expect("utf-8");
+        out.split_terminator('\0').map(String::from).collect()
+    }
+
+    proptest::proptest! {
+        // Each case spawns a shell.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// A shell prints back exactly what was quoted: NUL aside (no argv
+        /// can hold one), no input escapes its single word.
+        #[test]
+        fn prop_shell_quote_round_trips_through_sh(s in "[^\\x00]*") {
+            let out = sh_output(&format!("printf %s {}", shell_quote(&s)));
+            proptest::prop_assert_eq!(out, s.as_bytes());
+        }
+
+        #[test]
+        fn prop_posix_command_keeps_the_command_one_word(command in "[^\\x00]*") {
+            proptest::prop_assert_eq!(
+                words_for("sh", &posix_command(&command)),
+                vec!["-c".to_string(), command]
+            );
+        }
+
+        #[test]
+        fn prop_bridge_command_keeps_the_session_one_word(session in "[^\\x00]*") {
+            proptest::prop_assert_eq!(
+                words_for("herdr", &bridge_command(&session)),
+                vec!["--session".to_string(), session, "remote-api-bridge".to_string()]
+            );
+        }
+    }
 }
