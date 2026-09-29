@@ -12,11 +12,11 @@ use pastor::connector::{Connector, Discovered, discover};
 use pastor::connector::{ItemSource, RunInput};
 use serde_json::json;
 
+mod common;
+
 /// How long a test waits for the daemon or the fake herdr to do something.
 /// Generous on purpose: a CI runner under load has taken more than 10s to
 /// bring a daemon up, and a wait that ends early only ever fails a good run.
-mod common;
-
 const WAIT: Duration = Duration::from_secs(60);
 
 fn fixture(name: &str) -> PathBuf {
