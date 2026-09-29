@@ -689,6 +689,17 @@ machine's `max_agents`, for setups with one flock per machine, so it stays
 there whichever flock is the default later. A machine whose only membership
 is already that flock's `machines` table is left as it is.
 
+With no head running, `flock add|join|leave|remove` and `machine remove`
+hold a lock (`fleet.lock` in the state dir) from their read of the queued
+tasks to the save, and `pastor serve` holds the same lock from before it
+reads flock.toml until it listens. So a head starting meanwhile waits for the
+edit and reads the edited file, never queueing a task in a flock the edit
+just removed. An edit that finds a head listening once the lock is free stops
+with `head_started`; run it again and it goes through the head. Either side
+gives up after 30 seconds with `fleet_locked`. A bare `pastor serve` waits
+for the lock before it starts the head and begins its own 30 seconds, so it
+reports `fleet_locked` too rather than `serve_slow`.
+
 pastor never rewrites a machine's old `flock` key on its own. The first of
 `flock join`, `flock leave` or `machine move` on that machine (a move even to
 the flock the key names) moves the key into that flock's `machines`, with the
@@ -3039,6 +3050,7 @@ sends nothing. A head from before these requests is refused
 ~/.local/state/pastor/pastor.db   tasks (schema 13, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role, description, preempt, paused_at, paused_for and resumed_at), task summaries, seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/fleet.lock  held by a fleet edit with no head, and by `pastor serve` while it starts
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/watch/<name>.json   a `pastor watch` cursor
 ~/.local/state/pastor/orchestrators/<name>/  an orchestrator's state.json, note, scripts' scratch/ and runs/
