@@ -373,14 +373,21 @@ impl When {
     }
 
     /// The next time after `now` that is this one in `zone`. A day with no
-    /// time is its first minute.
+    /// time is its first minute. A time the clocks go back over is on the
+    /// clock twice, and the second is still next once the first has passed.
     fn next<Z: TimeZone>(&self, zone: &Z, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let time = self.time.unwrap_or(NaiveTime::MIN);
         let at = |day: NaiveDate| {
-            zone.from_local_datetime(&day.and_time(time))
-                .earliest()
+            let (first, second) = match zone.from_local_datetime(&day.and_time(time)) {
+                chrono::LocalResult::Single(t) => (Some(t), None),
+                chrono::LocalResult::Ambiguous(a, b) => (Some(a), Some(b)),
+                chrono::LocalResult::None => (None, None),
+            };
+            [first, second]
+                .into_iter()
+                .flatten()
                 .map(|t| t.with_timezone(&Utc))
-                .filter(|t| *t > now)
+                .find(|t| *t > now)
         };
         let today = now.with_timezone(zone).date_naive();
         if let Some((month, day)) = self.date {
@@ -840,5 +847,26 @@ mod tests {
             reset_in("resets Sun 1:30am (Europe/Lisbon)", now),
             Utc.with_ymd_and_hms(2027, 4, 4, 0, 30, 0).single()
         );
+    }
+
+    #[test]
+    fn the_hour_a_clock_change_repeats_is_next_on_its_second_pass() {
+        // Clocks in New York go from 02:00 EDT back to 01:00 EST on
+        // 2026-11-01: 01:30 is 05:30 UTC and again 06:30 UTC.
+        let before = Utc.with_ymd_and_hms(2026, 11, 1, 5, 0, 0).unwrap();
+        let between = Utc.with_ymd_and_hms(2026, 11, 1, 6, 10, 0).unwrap();
+        for (said, now, want) in [
+            ("resets 1:30am (America/New_York)", before, (5, 30)),
+            ("resets 1:30am (America/New_York)", between, (6, 30)),
+            ("resets Sun 1:30am (America/New_York)", between, (6, 30)),
+            ("resets Nov 1, 1:30am (America/New_York)", between, (6, 30)),
+        ] {
+            assert_eq!(
+                reset_in(said, now),
+                Utc.with_ymd_and_hms(2026, 11, 1, want.0, want.1, 0)
+                    .single(),
+                "{said} at {now}"
+            );
+        }
     }
 }
