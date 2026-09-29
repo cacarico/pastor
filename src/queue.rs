@@ -62,6 +62,14 @@ impl QueueEntry {
         }
     }
 
+    /// Its level, and the one it had before it aged: `high (was low)`.
+    pub fn level(&self) -> String {
+        match self.task.aged_from {
+            Some(was) => format!("{} (was {was})", self.task.priority),
+            None => self.task.priority.to_string(),
+        }
+    }
+
     /// Who queued it: `task run` or `job <name>`.
     pub fn from(&self) -> String {
         asked_by(&self.task)
@@ -82,6 +90,7 @@ impl QueueEntry {
             "pos": self.pos,
             "id": self.task.display_id(),
             "priority": self.task.priority,
+            "aged_from": self.task.aged_from,
             "where": self.place(),
             "flock": self.flock,
             "machine": self.task.pinned_machine(),
@@ -222,7 +231,7 @@ pub fn rows(entries: &[QueueEntry]) -> Vec<Vec<String>> {
             vec![
                 e.pos.to_string(),
                 e.task.display_id(),
-                e.task.priority.to_string(),
+                e.level(),
                 e.place(),
                 e.from(),
                 age(e.task.created_at),
@@ -266,6 +275,8 @@ mod tests {
             priority: Priority::Normal,
             priority_from: None,
             queue_pos: id,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
             summary: None,
             created_at: now,
@@ -494,5 +505,20 @@ mod tests {
         assert_eq!(json["from"], "job nightly");
         assert!(json["waited_secs"].as_i64().unwrap() >= 90);
         assert_eq!(json["task"]["id"], 2);
+        assert_eq!(json["aged_from"], serde_json::Value::Null);
+    }
+
+    /// An aged task shows its level with the one it had before it aged.
+    #[test]
+    fn an_aged_task_shows_its_own_level() {
+        let mut t = task(1, None, None);
+        t.priority = Priority::High;
+        t.aged_from = Some(Priority::Low);
+        let e = entries(vec![t], &[], "default", &|_, _| true);
+        assert_eq!(rows(&e)[0][2], "high (was low)");
+        let json = e[0].to_json();
+        assert_eq!(json["priority"], "high");
+        assert_eq!(json["aged_from"], "low");
+        assert_eq!(json["task"]["aged_from"], "low");
     }
 }

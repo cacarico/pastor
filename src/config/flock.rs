@@ -235,6 +235,11 @@ pub struct FlockEntry {
     /// sets none, before `[defaults] timeout` (`Defaults::resolve_timeout`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// How long this flock's queued tasks wait before they go up a level,
+    /// or `never`, before `[defaults] age_after`
+    /// (`Defaults::resolve_age_after`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_after: Option<String>,
     /// Where this flock's tasks put their pane when the task or job sets
     /// none, before `[defaults] place` (`Defaults::resolve_place`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,6 +372,10 @@ impl Flock {
             if let Some(t) = &f.timeout {
                 crate::config::parse_duration(t)
                     .map_err(|e| format!("flock {}: timeout: {e}", f.name))?;
+            }
+            if let Some(v) = &f.age_after {
+                crate::config::check_age_after(v)
+                    .map_err(|e| format!("flock {}: age_after: {e}", f.name))?;
             }
         }
         if !self.flocks.is_empty() {

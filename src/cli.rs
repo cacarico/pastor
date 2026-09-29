@@ -292,7 +292,14 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         [] => "-".to_string(),
         names => names.join(", "),
     } + &from(source.and_then(|s| s.fallback_from.as_ref()));
-    let mut priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
+    let mut priority = match t.aged_from {
+        Some(was) => format!(
+            "{}, aged from {was}{}",
+            t.priority,
+            from(t.priority_from.as_ref())
+        ),
+        None => format!("{}{}", t.priority, from(t.priority_from.as_ref())),
+    };
     if t.pause.preempt {
         priority.push_str(", preempt: pauses a low task on a full machine");
     }
@@ -1097,6 +1104,8 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
             summary: None,
             created_at: now,
@@ -1530,6 +1539,13 @@ mod tests {
         let json = t.to_json();
         assert_eq!(json["priority"], "high");
         assert_eq!(json["priority_from"], "flock work");
+        t.priority = crate::task::Priority::High;
+        t.aged_from = Some(crate::task::Priority::Low);
+        let out = task_detail(&t);
+        assert!(
+            out.contains("priority:   high, aged from low (from flock work)\n"),
+            "{out}"
+        );
     }
 
     /// `task describe` gives the workspace label and where it came from:

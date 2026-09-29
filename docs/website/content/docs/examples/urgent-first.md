@@ -52,8 +52,10 @@ POS  TASK  LEVEL   WHERE          FROM        WAITED  WHY NOT YET
 ```
 
 POS is the order the tasks will start in. FROM says who asked: `task run`
-or a job. Levels do not age, so a `low` task can wait for ever; WAITED shows
-how long it has.
+or a job. WAITED shows how long each has waited. After `age_after` (30
+minutes by default) a queued task goes up a level, never past `high`, so
+`t-16` runs in the end behind `normal` and `high` work; a steady stream of
+`critical` tasks would still go first.
 
 ## reorder
 

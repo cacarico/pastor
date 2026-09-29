@@ -120,6 +120,8 @@ fn assert_sparse_keys(what: &str, v: &Value, want: &[(&str, &str)], may_be_absen
 
 /// `Task::to_json`, as `task list` and `task describe` print each task.
 const TASK: &[(&str, &str)] = &[
+    ("aged_at", "string"),
+    ("aged_from", "string"),
     ("agent_name", "string|null"),
     ("created_at", "string"),
     ("description", "string"),
@@ -158,6 +160,8 @@ const TASK: &[(&str, &str)] = &[
 
 /// Left out of a task's JSON unless set.
 const TASK_MAY_BE_ABSENT: &[&str] = &[
+    "aged_at",
+    "aged_from",
     "ended",
     "paused_at",
     "paused_for",
@@ -235,6 +239,8 @@ fn full_task() -> Task {
     t.ended = true;
     t.retry_of = Some(1);
     t.priority_from = Some("task run".into());
+    t.aged_from = Some(pastor::task::Priority::Low);
+    t.aged_at = Some(now);
     t.description = Some("fix the suite".into());
     t.pause.preempt = true;
     t.pause.paused_at = Some(now);
@@ -387,6 +393,7 @@ fn queue_json_is_entries_with_their_task() {
         task,
     };
     let want = [
+        ("aged_from", "string|null"),
         ("flock", "string"),
         ("from", "string"),
         ("id", "string"),

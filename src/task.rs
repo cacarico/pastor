@@ -134,6 +134,17 @@ impl Priority {
             Priority::Critical => "critical",
         }
     }
+
+    /// The level a queued task ages to after `age_after`: one up, never
+    /// past `high`, so ageing never makes a task critical and lets it burst.
+    /// `None` at `high` and `critical`, which do not age.
+    pub fn aged(self) -> Option<Priority> {
+        match self {
+            Priority::Low => Some(Priority::Normal),
+            Priority::Normal => Some(Priority::High),
+            Priority::High | Priority::Critical => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Priority {
@@ -738,6 +749,15 @@ pub struct Task {
     /// its id unless something has moved it.
     #[serde(default)]
     pub queue_pos: i64,
+    /// The level the task had before it aged (`Store::age_queued`): set on
+    /// its first step up, kept through later ones, cleared when someone sets
+    /// its level by hand. `None` on a task that has not aged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aged_from: Option<Priority>,
+    /// When the task last aged a level; its next step is `age_after` from
+    /// this, or from when it was queued before its first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aged_at: Option<DateTime<Utc>>,
     /// What the head lets the task's agent change (`TaskRole`). `agent` on
     /// every row from before roles.
     #[serde(default)]
@@ -1389,6 +1409,8 @@ pub(crate) mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
             summary: None,
             created_at: now,
@@ -1398,6 +1420,16 @@ pub(crate) mod tests {
             flock: None,
             role: Default::default(),
         }
+    }
+
+    /// Ageing lifts one level at a time and stops at high: it never makes
+    /// a task critical.
+    #[test]
+    fn a_level_ages_one_up_to_high() {
+        assert_eq!(Priority::Low.aged(), Some(Priority::Normal));
+        assert_eq!(Priority::Normal.aged(), Some(Priority::High));
+        assert_eq!(Priority::High.aged(), None);
+        assert_eq!(Priority::Critical.aged(), None);
     }
 
     /// A task its agent ended (`pastor task done`) stays done whatever the

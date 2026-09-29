@@ -76,10 +76,11 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
 - `--fallback sonnet,gpt` names the `[models]` the task may fall back to, in order; `--no-fallback` names none. Without either: the `fallback` of its machine, then its flock, then `[defaults]`, then none; the first list wins whole, and `[]` means none. An unknown name is `unknown_model`. Nothing switches models yet; `task describe` shows the list.
 - `--priority LEVEL` (`low`, `normal`, `high`, `critical`) orders the queue when machines are full: by level, highest first, then by position, then age.
   - Without it: the `priority` of the task's flock, then the machine it is pinned to, then `[defaults]`, then `normal`. Another word is `unknown_priority`.
-  - `pastor task priority t-N LEVEL` changes a queued task's level (`not_queued` once a machine took it); `task retry` keeps it.
+  - `pastor task priority t-N LEVEL` changes a queued task's level (`not_queued` once a machine took it); `task retry` keeps the level from before it aged, or its current level if it has not aged.
+  - A queued task that has waited `age_after` (default 30m, per flock or under `[defaults]`, `never` for off) goes up one level, never past `high`, so it runs in the end behind `normal` and `high` work but never ahead of `critical` work; `pastor queue` shows its original level (`high (was low)`, `aged_from` in `--json`).
   - `pastor queue` lists queued tasks in start order, with how long each waited and why it has not started (`--flock`, `--machine`, `--json`). `pastor queue move t-N` with `--top`, `--before t-M`, `--after t-M` or `--to N` moves one, at the level of where it lands.
 - `--preempt` (only on a `critical` task, else `preempt_needs_critical`): when no machine has room, pause the newest running `low` Claude task on a machine it may use and start in its slot.
-  - The paused task's agent is interrupted and its pane closed, its worktree kept. It goes `paused`, first among `low` tasks and pinned to its machine, and resumes its own session (`claude --resume`) there when a slot frees.
+  - The paused task's agent is interrupted and its pane closed, its worktree kept. It goes `paused`, first among `low` tasks (it ages like a queued task, from when it was paused) and pinned to its machine, and resumes its own session (`claude --resume`) there when a slot frees.
   - A normal task, an opencode task, a done one or one resumed in the last 10 minutes is never paused.
   - `pastor task priority t-N critical --preempt` sets it on a queued task (the same command without it drops it); a job sets `preempt = true` under `[dispatch]`.
 - Without `--agent` and `--agent-arg`, the task takes the `agent` and `agent_args` of its machine in `flock.toml`, then its flock's, then `[defaults]` in `pastor.toml`, then `claude`. The agent is the one setting where the machine comes before the flock.
@@ -207,7 +208,7 @@ The head picks up job file edits by itself. A file that stops parsing keeps its 
 | `default = true` | on one of them |
 | `machines = { desk = 2 }` | the machines it may use, with at most how many of its live tasks each runs |
 | `machines = { desk = { share = 2, max = 4 } }` | under its share the flock takes a free slot as usual; between share and max only while no task of a flock under its share there is waiting |
-| `agent`, `agent_args`, `agents`, `model`, `profile`, `priority`, `timeout`, `place`, `label`, `summary` | optional, as in `[defaults]`: what its tasks and jobs get when they name none (`label` names the workspace) |
+| `agent`, `agent_args`, `agents`, `model`, `profile`, `priority`, `age_after`, `timeout`, `place`, `label`, `summary` | optional, as in `[defaults]`: what its tasks and jobs get when they name none (`label` names the workspace) |
 | `allow`, `deny` | tool lists added to theirs |
 
 A task gets its own flock's settings; they come before the machine's for everything but the agent. A machine's own `flock` key also puts it in that flock, with no number but the machine's limits; a machine nothing places is in the default one, and a file with no `[[flock]]` has a single flock named `default`. A task starts on a machine only when the machine has room and the task's flock is under its number there (job slots and burst never pass it).

@@ -925,17 +925,17 @@ that flock has been removed.
 ### What a flock sets
 
 A `[[flock]]` entry takes every per-task setting `[defaults]` has: `agent`,
-`agent_args`, `agents`, `model`, `fallback`, `profile`, `priority`, `allow`, `deny`,
-`timeout`, `place`, `label` and `summary` (`max_tasks_per_run` stays a job
-setting). A task gets the settings of its own flock, the one it is queued
+`agent_args`, `agents`, `model`, `fallback`, `profile`, `priority`,
+`age_after`, `allow`, `deny`, `timeout`, `place`, `label` and `summary`
+(`max_tasks_per_run` stays a job setting). A task gets the settings of its own flock, the one it is queued
 in; a machine in many flocks does not mix them.
 
 For everything but the agent, the flock comes before the machine: a task
 takes each setting from the first of its run flags (or job's `[dispatch]`),
 its flock, the machine it runs on, and `[defaults]` that sets it. Only
 `model`, `fallback`, `profile` and `priority` have a machine layer; a
-machine has no `timeout`, `place`, `label` or `summary`. `allow` and `deny`
-add up instead (see [Tool allow and deny lists](#tool-allow-and-deny-lists)).
+machine has no `timeout`, `place`, `label`, `summary` or `age_after`. `allow`
+and `deny` add up instead (see [Tool allow and deny lists](#tool-allow-and-deny-lists)).
 
 ```toml
 # flock.toml: desk is shared; each project's flock sets its own
@@ -1372,8 +1372,49 @@ flock.toml or the job file.
 keeps its position, so among the tasks of its new level it goes by when it
 was queued. A task a machine has taken, or is being sent to, has left the
 queue, and is refused with `not_queued`; an agent pastor started is refused, as for any change to
-the fleet (`agent_refused`). `pastor task retry` keeps the level of the task
-it copies, and the copy queues last in it.
+the fleet (`agent_refused`). `pastor task retry` keeps the level the task
+had before it aged (its current level, if it has not), and the copy queues
+last in it.
+
+#### Ageing
+
+A queued task that has waited `age_after` goes up one level, and again
+after each further `age_after`, so a `low` task behind a steady stream of
+`normal` and `high` tasks still runs in the end. Ageing stops at `high`: it
+never makes a task `critical`, so it never lets one burst or pause another,
+and it promises nothing against `critical` work: a steady stream of
+`critical` tasks still goes first, for as long as it keeps coming. `high` and
+`critical` tasks do not age. A task `--preempt` paused ages like a queued
+one, its wait counted from when it was paused, so a `low` task queued after
+it never ages past it. The wait is the flock's
+`age_after`, else `[defaults] age_after`, else 30 minutes; `never` turns
+ageing off for that flock, or for every flock that sets none:
+
+```toml
+# pastor.toml
+[defaults]
+age_after = "1h"
+```
+
+```toml
+# fragment of flock.toml
+[[flock]]
+name = "batch"
+age_after = "never"         # its low tasks stay low
+```
+
+Each dispatch pass ages the queue first, so a task steps up at most once a
+pass. The first step counts from when the task was queued, each later one
+from the last step. A level set by hand (`task priority`, or a `queue move`
+that lifts or lowers the task) is the task's own from then on: it forgets
+the level it aged from, and ages on from there like any other; a task
+placed by `queue move` ages the same as any other. `pastor queue` shows the
+level an aged task had before (`high (was low)`, `aged_from` in `--json`),
+`task describe` too (`priority: high, aged from low (from task run)`), and
+the task's JSON has `aged_from` and `aged_at`. A retry of an aged task
+queues at the level it had before it aged, and waits afresh. The level the
+task had when a dispatch pass placed it is the one it keeps: it does not age
+while its machine is still starting it.
 
 `pastor task describe` prints the level and the layer that set it, such as
 `priority: high (from flock work)` (`task priority` when set by hand);
@@ -1439,8 +1480,9 @@ worktree stays on disk. The task goes
 and for which task (`paused: ... for t-9` in `task describe`, `paused_at`
 and `paused_for` in its JSON).
 
-A paused task waits in the queue first among the `low` tasks and pinned to
-the machine it was paused on, whatever its pin: `pastor queue` shows it
+A paused task waits in the queue first among the `low` tasks (first in its
+level, once it has aged; see [Ageing](#ageing)) and pinned to the machine it
+was paused on, whatever its pin: `pastor queue` shows it
 there with `paused for t-9; machine pi-3 is full (2/2)`. When that machine is
 still in the task's flock and has room for it, and the flock is under its
 number there, a dispatch pass resumes it: the same steps as a
@@ -1649,8 +1691,8 @@ POS  TASK  LEVEL   WHERE          FROM         WAITED  WHY NOT YET
 
 POS numbers the whole queue, WHERE is the machine the task is pinned to or
 else its flock, FROM is `task run` or `job <name>`, and WAITED is how long
-since it was queued. A level does not age, so a `low` task can wait for ever
-behind a steady stream of higher ones; WAITED is how you see it. WHY NOT YET
+since it was queued. A task that has aged shows the level it had before
+beside its own, as `high (was low)` (see Ageing above). WHY NOT YET
 plays a dispatch pass through on the machines as the head sees them, each
 task that fits taking its slot, so a task behind the last free slot reads its
 flock as full: `flock <f> has no machines`, `no machine in flock <f> is
@@ -1664,7 +1706,7 @@ share on <m>, ... while flock <g> waits under its share` when another flock
 under its share goes first. A paused task reads `paused for t-N;` and then
 why its machine can't take it yet, or `next pass: resumes on <m>`. `--flock <f>` keeps the tasks waiting in a flock,
 `--machine <m>` the ones pinned to a machine, both keeping their POS in the
-whole queue; `--json` gives each as `pos`, `id`, `priority`, `where`,
+whole queue; `--json` gives each as `pos`, `id`, `priority`, `aged_from`, `where`,
 `flock`, `machine`, `from`, `waited_secs`, `why` and the whole `task`. With
 no head running it shows the store's queue, and each WHY NOT YET says so.
 
@@ -3402,6 +3444,7 @@ place = "repo"               # where a task's pane goes: repo, own, pastor or pa
 # model = "sonnet"           # a [models] name for tasks that name none; unset: no model
 # fallback = ["haiku"]       # [models] names tasks may fall back to; [] or unset: none
 # priority = "normal"        # the level of tasks that set none: low, normal, high or critical
+# age_after = "30m"          # a queued task waits this long per level it ages, up to high; "never" turns it off
 # agents = { opencode = "opencode" }  # the agent for a model of another kind than agent's
 # profile = "develop"        # a permission profile for tasks that name none; unset: none
 # summary = "ask"            # ask for a summary in each prompt; require: also fail without one; off: neither
@@ -3717,9 +3760,10 @@ not answer is refused whether flocks are in play or not
 
 ### The store
 
-`pastor.db` is at schema 13. Its tasks table has, among others, `retry_of`,
+`pastor.db` is at schema 14. Its tasks table has, among others, `retry_of`,
 `flock`, `trust_sent`, `activity_seen`, `ended`, `priority`,
-`priority_from`, `queue_pos`, `role`, `description` (since schema 11),
-`preempt`, `paused_at`, `paused_for` and `resumed_at`. Summaries are in the
-`task_summaries` table (schema 13). A new pastor adds what it needs in place
+`priority_from`, `queue_pos`, `aged_from`, `aged_at` (since schema 14),
+`role`, `description` (since schema 11), `preempt`, `paused_at`,
+`paused_for` and `resumed_at`. Summaries are in the `task_summaries` table
+(schema 13). A new pastor adds what it needs in place
 when it first opens an older store.
