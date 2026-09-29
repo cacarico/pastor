@@ -747,8 +747,31 @@ fn rows(path: &Path) -> BTreeMap<String, Vec<Vec<Value>>> {
         .collect()
 }
 
+/// Each column a migration adds to `tasks`: the schema that added it, a
+/// value unlike its default for a database that already had it, and the
+/// raw value the migration should leave in the row of one that did not.
+const ADDED: [(usize, &str, &str, &str); 15] = [
+    (2, "prompt_pending", "1", "0"),
+    (3, "retry_of", "5", "NULL"),
+    (4, "flock", "'home'", "NULL"),
+    (5, "trust_sent", "1", "0"),
+    (6, "activity_seen", "1", "0"),
+    (7, "ended", "1", "0"),
+    (9, "priority", "'high'", "'normal'"),
+    (9, "priority_from", "'job'", "NULL"),
+    // placed by id when schema 9 adds it: the row's id is 7
+    (9, "queue_pos", "3", "7"),
+    (10, "role", "'orchestrator'", "'agent'"),
+    (11, "description", "'the fix'", "NULL"),
+    (12, "preempt", "1", "0"),
+    (12, "paused_at", "'2026-09-01T11:00:00+00:00'", "NULL"),
+    (12, "paused_for", "9", "NULL"),
+    (12, "resumed_at", "'2026-09-01T11:05:00+00:00'", "NULL"),
+];
+
 /// A database at schema `v`, as that pastor would have left it, holding
-/// one task written with the columns every schema has.
+/// one task written with the columns every schema has, and a value unlike
+/// the default in each column schema `v` already added.
 fn old_database(path: &Path, v: usize) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(OLD[v - 1]).unwrap();
@@ -761,6 +784,21 @@ fn old_database(path: &Path, v: usize) {
         [r#"{"agent":"claude","agent_args":[],"repo":"/srv/repo","worktree":false,"branch":null,"machine":null,"tags":[],"timeout_secs":3600}"#],
     )
     .unwrap();
+    for (since, col, seeded, _) in ADDED {
+        if since <= v {
+            conn.execute(
+                &format!("UPDATE tasks SET {col} = {seeded} WHERE id = 7"),
+                [],
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// The raw value of `sql` (a literal) as SQLite stores it.
+fn literal(conn: &Connection, sql: &str) -> Value {
+    conn.query_row(&format!("SELECT {sql}"), [], |r| r.get(0))
+        .unwrap()
 }
 
 #[test]
@@ -791,8 +829,21 @@ fn every_old_schema_migrates_to_the_fresh_one() {
         assert_eq!(task.machine.as_deref(), Some("pi-1"), "v{v}");
         assert_eq!(task.state.to_string(), "running", "v{v}");
         assert_eq!(task.last_completion_seq, Some(42), "v{v}");
-        assert_eq!(task.queue_pos, 7, "v{v}");
         drop(store);
+
+        // The raw row, not `get_task`: that reads a NULL `queue_pos` as the
+        // id, so a missing backfill would pass through it unseen.
+        let conn = Connection::open(&path).unwrap();
+        for (since, col, seeded, default) in ADDED {
+            let want = literal(&conn, if since <= v { seeded } else { default });
+            let got: Value = conn
+                .query_row(&format!("SELECT {col} FROM tasks WHERE id = 7"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(got, want, "v{v}: {col}");
+        }
+        drop(conn);
 
         assert_eq!(shape(&path), want, "v{v} migrated is not the fresh schema");
 
