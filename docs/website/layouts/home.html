@@ -30,6 +30,7 @@
       {{- end }}
       <button type="button" class="btn" data-term-pause aria-label="pause" title="pause"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="3" width="3" height="10" rx="1"/><rect x="9" y="3" width="3" height="10" rx="1"/></svg></button>
       <button type="button" class="btn" data-term-replay aria-label="replay from the start" title="replay from the start"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5a5.5 5.5 0 1 1-5.2 3.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M1.6 2.2 2.4 6.6 6.6 5.4Z"/></svg></button>
+      <button type="button" class="btn" data-term-big aria-label="bigger" title="bigger"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
     </div>
 <pre class="term" data-term aria-label="A pastor session: by hand, then with an agent driving it">
 {{- range $i, $act := hugo.Data.demo.act }}
@@ -84,6 +85,12 @@
     </ul>
   </section>
 </main>
+{{- /* The terminal's bigger view: term.js moves the live pane's title,
+       controls and terminal in here while it is open, so the session keeps
+       playing where it was. */}}
+<dialog class="term-big" aria-label="the scripted session, bigger">
+  <div class="pane live focus"></div>
+</dialog>
 <script type="module" src="{{ partial "asset.html" "term.js" }}"></script>
 {{ end }}
 

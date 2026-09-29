@@ -8,6 +8,8 @@ const term = document.querySelector('[data-term]');
 const READ_PAUSE = 6000; // ms a finished act stays on screen
 const PAUSE_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="3" width="3" height="10" rx="1"/><rect x="9" y="3" width="3" height="10" rx="1"/></svg>';
 const PLAY_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3v10l8-5z"/></svg>';
+const BIGGER_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const SMALLER_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2v4H2M14 6h-4V2M10 14v-4h4M2 10h4v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 
 if (term && !still.matches) play(term);
@@ -146,6 +148,28 @@ function play(term) {
     wake();
     loop(run, i);
   };
+  // The bigger view: the pane's title, controls and terminal move into a
+  // centred dialog and back, so nothing restarts. Esc, a click outside it or
+  // the button again closes it.
+  const bigBtn = ctl?.querySelector('[data-term-big]');
+  const big = document.querySelector('.term-big');
+  const pane = term.parentElement;
+  const moved = [pane.querySelector('.t'), ctl, term].filter(Boolean);
+  const setBig = (on) => {
+    if (!bigBtn) return;
+    bigBtn.innerHTML = on ? SMALLER_ICON : BIGGER_ICON;
+    bigBtn.setAttribute('aria-label', on ? 'smaller' : 'bigger');
+    bigBtn.title = on ? 'smaller' : 'bigger';
+  };
+  if (big && bigBtn) {
+    const box = big.querySelector('.pane');
+    bigBtn.addEventListener('click', () => (big.open ? big.close() : (box.append(...moved), big.showModal(), setBig(true), follow())));
+    big.addEventListener('close', () => { pane.prepend(...moved); setBig(false); follow(); });
+    big.addEventListener('click', (e) => { if (e.target === big) big.close(); });
+  } else if (bigBtn) {
+    bigBtn.hidden = true;
+  }
+
   pauseBtn?.addEventListener('click', () => { setPaused(!paused); wake(); });
   replayBtn?.addEventListener('click', () => restart(0));
   actBtns.forEach((b, i) => b.addEventListener('click', () => restart(i)));
