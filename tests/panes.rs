@@ -12,8 +12,9 @@
 //! ```
 //!
 //! and the pane follows. The header gives the right answer, not what the
-//! parsers happen to say: a screen they read wrong keeps its right answer
-//! and its test is `#[ignore]`d with the reason, until the parser is fixed.
+//! parsers happen to say: a screen a parser reads wrong keeps its right
+//! answer and that parser's test for it is `#[ignore]`d with the reason,
+//! until the parser is fixed.
 //!
 //! The repository is public, so the fixtures are scrubbed: `fixtures_are_scrubbed`
 //! fails on a home path, an IPv4 address, this host's name or a machine of the
@@ -71,7 +72,7 @@ fn load(name: &str) -> Fixture {
     }
 }
 
-fn check(name: &str) {
+fn check_question(name: &str) {
     let f = load(name);
     let question = pastor::task::trailing_question(&f.pane);
     assert_eq!(
@@ -79,11 +80,19 @@ fn check(name: &str) {
         f.question,
         "{name}: trailing_question gave {question:?}"
     );
+}
+
+fn check_shell(name: &str) {
+    let f = load(name);
     assert_eq!(
         pastor::task::background_shell_running(&f.pane),
         f.shell,
         "{name}: background_shell_running"
     );
+}
+
+fn check_trust(name: &str) {
+    let f = load(name);
     assert_eq!(
         pastor::config::shows_trust_marker(&f.pane, CLAUDE_TRUST_MARKER),
         f.trust,
@@ -91,15 +100,37 @@ fn check(name: &str) {
     );
 }
 
-/// One test per fixture, so a screen read wrong can be ignored on its own.
-/// `every_fixture_has_a_test` keeps this list and the directory in step.
+/// One module per fixture and one test per heuristic in it, so a screen one
+/// parser reads wrong is ignored for that parser only and the other two keep
+/// guarding it. `every_fixture_has_a_test` keeps this list and the directory
+/// in step.
 macro_rules! panes {
-    ($($(#[$attr:meta])* $test:ident: $file:literal,)*) => {
+    ($(
+        $test:ident: $file:literal {
+            $(#[$q:meta])* question,
+            $(#[$s:meta])* shell,
+            $(#[$t:meta])* trust,
+        },
+    )*) => {
         $(
-            #[test]
-            $(#[$attr])*
-            fn $test() {
-                check($file);
+            mod $test {
+                #[test]
+                $(#[$q])*
+                fn question() {
+                    super::check_question($file);
+                }
+
+                #[test]
+                $(#[$s])*
+                fn shell() {
+                    super::check_shell($file);
+                }
+
+                #[test]
+                $(#[$t])*
+                fn trust() {
+                    super::check_trust($file);
+                }
             }
         )*
         const FILES: &[&str] = &[$($file),*];
@@ -107,25 +138,63 @@ macro_rules! panes {
 }
 
 panes! {
-    numbered_options_then_question: "numbered-options-then-question.txt",
-    #[ignore = "trailing_question reads only the last paragraph; options after the question hide it"]
-    question_then_numbered_options: "question-then-numbered-options.txt",
-    question_in_bold: "question-in-bold.txt",
-    question_then_tool_call: "question-then-tool-call.txt",
-    #[ignore = "trailing_question counts tool output under a `●` call as the agent speaking"]
-    tool_output_ending_in_question_mark: "tool-output-ending-in-question-mark.txt",
-    #[ignore = "trailing_question cannot tell a code block from prose"]
-    code_block_ending_in_question_mark: "code-block-ending-in-question-mark.txt",
-    one_shell_running_wrapped_footer: "one-shell-running-wrapped-footer.txt",
-    #[ignore = "background_shell_running wants the count on the same line as the phrase"]
-    one_shell_running_split_count: "one-shell-running-split-count.txt",
-    two_shells_running: "two-shells-running.txt",
-    shell_phrase_quoted_in_message: "shell-phrase-quoted-in-message.txt",
-    trust_dialog_fresh: "trust-dialog-fresh.txt",
-    trust_dialog_in_scrollback: "trust-dialog-in-scrollback.txt",
-    opencode_finished: "opencode-finished.txt",
-    #[ignore = "trailing_question needs the message's `●` line, which a 100-line read cut off"]
-    cut_mid_message_at_100_lines: "cut-mid-message-at-100-lines.txt",
+    numbered_options_then_question: "numbered-options-then-question.txt" {
+        question, shell, trust,
+    },
+    question_then_numbered_options: "question-then-numbered-options.txt" {
+        #[ignore = "trailing_question reads only the last paragraph; options after the question hide it"]
+        question,
+        shell,
+        trust,
+    },
+    question_in_bold: "question-in-bold.txt" {
+        question, shell, trust,
+    },
+    question_then_tool_call: "question-then-tool-call.txt" {
+        question, shell, trust,
+    },
+    tool_output_ending_in_question_mark: "tool-output-ending-in-question-mark.txt" {
+        #[ignore = "trailing_question counts tool output under a `●` call as the agent speaking"]
+        question,
+        shell,
+        trust,
+    },
+    code_block_ending_in_question_mark: "code-block-ending-in-question-mark.txt" {
+        #[ignore = "trailing_question cannot tell a code block from prose"]
+        question,
+        shell,
+        trust,
+    },
+    one_shell_running_wrapped_footer: "one-shell-running-wrapped-footer.txt" {
+        question, shell, trust,
+    },
+    one_shell_running_split_count: "one-shell-running-split-count.txt" {
+        question,
+        #[ignore = "background_shell_running wants the count on the same line as the phrase"]
+        shell,
+        trust,
+    },
+    two_shells_running: "two-shells-running.txt" {
+        question, shell, trust,
+    },
+    shell_phrase_quoted_in_message: "shell-phrase-quoted-in-message.txt" {
+        question, shell, trust,
+    },
+    trust_dialog_fresh: "trust-dialog-fresh.txt" {
+        question, shell, trust,
+    },
+    trust_dialog_in_scrollback: "trust-dialog-in-scrollback.txt" {
+        question, shell, trust,
+    },
+    opencode_finished: "opencode-finished.txt" {
+        question, shell, trust,
+    },
+    cut_mid_message_at_100_lines: "cut-mid-message-at-100-lines.txt" {
+        #[ignore = "trailing_question needs the message's `●` line, which a 100-line read cut off"]
+        question,
+        shell,
+        trust,
+    },
 }
 
 #[test]
@@ -168,8 +237,8 @@ fn is_ipv4(word: &str) -> bool {
 }
 
 /// Names the fixtures must not carry: this host's, and every machine name,
-/// ssh user and ssh host of the local flock (`PASTOR_CONFIG_DIR`, else
-/// `~/.config/pastor`), when there is one. On CI there is none, and only the
+/// ssh user and ssh host of the local flock, found where pastor itself looks
+/// (`Paths::from_env`), when there is one. On CI there is none, and only the
 /// fixed checks run.
 fn fleet_names() -> Vec<String> {
     let mut names = Vec::new();
@@ -182,9 +251,7 @@ fn fleet_names() -> Vec<String> {
     {
         names.extend(words(&host).map(str::to_string));
     }
-    let config = std::env::var_os("PASTOR_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| dirs::config_dir().map(|d| d.join("pastor")));
+    let config = pastor::config::Paths::from_env().ok().map(|p| p.config_dir);
     let flock = config.and_then(|d| std::fs::read_to_string(d.join("flock.toml")).ok());
     if let Some(value) = flock.and_then(|t| t.parse::<toml::Table>().ok()) {
         for machine in value
