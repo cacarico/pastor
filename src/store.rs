@@ -15,7 +15,7 @@ use crate::task::{
     TaskSummary,
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// The tables schema 2 added: created on a fresh database and by the v1
 /// migration.
@@ -374,6 +374,8 @@ impl Store {
                         priority TEXT NOT NULL DEFAULT 'normal',
                         priority_from TEXT,
                         queue_pos INTEGER,
+                        aged_from TEXT,
+                        aged_at TEXT,
                         role TEXT NOT NULL DEFAULT 'agent',
                         description TEXT,
                         preempt INTEGER NOT NULL DEFAULT 0,
@@ -493,6 +495,12 @@ impl Store {
                 // and show no summary.
                 if v < 13 {
                     tx.execute_batch(V13_TABLES)?;
+                }
+                // Queue ageing (`age_queued`): the level a task had before it
+                // aged, and when it last did. Older rows have not aged.
+                if v < 14 {
+                    add_column(&tx, "aged_from", "aged_from TEXT")?;
+                    add_column(&tx, "aged_at", "aged_at TEXT")?;
                 }
                 tx.execute(
                     "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -937,7 +945,8 @@ impl Store {
             let tx = conn.transaction()?;
             // Check and copy in one statement, so a task closed, pruned or
             // finished by another writer in between is not retried. The copy
-            // keeps the level, its role, description and where it came from,
+            // keeps the level (the one it had before it aged: the copy waits
+            // afresh), its role, description and where it came from,
             // but queues last in it.
             let n = tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, role, description, state, retry_of, priority, priority_from, preempt, created_at, updated_at)
@@ -951,7 +960,7 @@ impl Store {
                                                    'agent', COALESCE(agent_name, 't-' || id)))
                          ELSE json_remove(spec, '$.branch', '$.checkout', '$.reopen') END,
                          '$.session_id', '$.label.name', '$.label.note'), ?3),
-                    flock, role, description, 'queued', id, priority, priority_from, preempt, ?2, ?2 FROM tasks
+                    flock, role, description, 'queued', id, COALESCE(aged_from, priority), priority_from, preempt, ?2, ?2 FROM tasks
              WHERE id = ?1 AND state IN ('failed', 'stale')",
             params![of, now, patch],
         )?;
@@ -1208,6 +1217,50 @@ impl Store {
         })
     }
 
+    /// Lift each queued task that has waited `age_after` a level
+    /// (`Priority::aged`): since it last aged, else since it was queued.
+    /// `age_after` gives a task's wait, `None` when its flock does not age.
+    /// One level a call, never past `high`; a paused task does not age.
+    /// Returns the tasks lifted, as they are now.
+    pub fn age_queued(
+        &self,
+        now: DateTime<Utc>,
+        age_after: impl Fn(&Task) -> Option<std::time::Duration>,
+    ) -> anyhow::Result<Vec<Task>> {
+        let due: Vec<Task> = self
+            .queued_tasks()?
+            .into_iter()
+            .filter(|t| t.state == TaskState::Queued && t.priority.aged().is_some())
+            .filter(|t| {
+                let Some(wait) = age_after(t).and_then(|d| chrono::Duration::from_std(d).ok())
+                else {
+                    return false;
+                };
+                now - t.aged_at.unwrap_or(t.created_at) >= wait
+            })
+            .collect();
+        let mut aged = Vec::new();
+        for t in due {
+            let to = t.priority.aged().expect("filtered");
+            let n = {
+                let conn = self.conn.lock().recover();
+                // Only while it is still queued at the level it was read at:
+                // a claim or a hand change in between wins.
+                conn.execute(
+                    "UPDATE tasks SET priority = ?3, aged_from = COALESCE(aged_from, ?2), aged_at = ?4
+                     WHERE id = ?1 AND state = 'queued' AND priority = ?2",
+                    params![t.id, t.priority.as_str(), to.as_str(), now.to_rfc3339()],
+                )?
+            };
+            if n == 1
+                && let Some(t) = self.get_task(t.id)?
+            {
+                aged.push(t);
+            }
+        }
+        Ok(aged)
+    }
+
     /// Put queued task `id` at `priority`, set by `from`. Refused unless the
     /// task is queued: one a machine took has left the queue. It keeps its
     /// position, so among its new level's tasks it goes by when it was
@@ -1235,7 +1288,8 @@ impl Store {
         blocking(|| {
             let conn = self.conn.lock().recover();
             let n = conn.execute(
-                "UPDATE tasks SET priority = ?2, priority_from = ?3, preempt = ?5, updated_at = ?4
+                "UPDATE tasks SET priority = ?2, priority_from = ?3, preempt = ?5, updated_at = ?4,
+                    aged_from = NULL
              WHERE id = ?1 AND state = 'queued'",
                 params![id, priority.as_str(), from, now, preempt],
             )?;
@@ -1359,7 +1413,8 @@ impl Store {
             }
             if level != was {
                 tx.execute(
-                    "UPDATE tasks SET priority = ?2, priority_from = 'queue move' WHERE id = ?1",
+                    "UPDATE tasks SET priority = ?2, priority_from = 'queue move', aged_from = NULL
+                     WHERE id = ?1",
                     params![id, level.as_str()],
                 )?;
             }
@@ -1734,6 +1789,8 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let role: String = row.get("role")?;
     let paused_at: Option<String> = row.get("paused_at")?;
     let resumed_at: Option<String> = row.get("resumed_at")?;
+    let aged_from: Option<String> = row.get("aged_from")?;
+    let aged_at: Option<String> = row.get("aged_at")?;
     Ok(Task {
         id: row.get("id")?,
         job: row.get("job")?,
@@ -1765,6 +1822,13 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         queue_pos: row
             .get::<_, Option<i64>>("queue_pos")?
             .unwrap_or(row.get("id")?),
+        aged_from: aged_from
+            .map(|p| {
+                p.parse()
+                    .map_err(|_| conversion_failure(format!("unknown task priority {p:?}")))
+            })
+            .transpose()?,
+        aged_at: aged_at.as_deref().map(parse_dt).transpose()?,
         role: role.parse().map_err(conversion_failure::<String>)?,
         description: row.get("description")?,
         pause: crate::task::Preemption {
@@ -2189,7 +2253,10 @@ mod tests {
             );
         }
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.meta("schema_version").unwrap().unwrap(), "13");
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
         assert_eq!(s.get_task(1).unwrap().unwrap().summary, None);
         assert_eq!(s.end_round(1, Some("done")).unwrap().round, 1);
     }
@@ -3516,6 +3583,150 @@ mod tests {
         assert_eq!((m.pos, m.of), (2, 2));
     }
 
+    /// A queued task that waited `age_after` goes up one level per wait,
+    /// counted from its last step, never past high; high, critical and a
+    /// task whose flock does not age stay where they are.
+    #[test]
+    fn age_queued_lifts_a_level_per_wait_up_to_high() {
+        let s = Store::open_in_memory().unwrap();
+        let at = |p: Priority| {
+            s.insert_task_at(new_task("run"), p, Some("defaults"), TaskRole::Agent)
+                .unwrap()
+        };
+        let low = at(Priority::Low);
+        let high = at(Priority::High);
+        let critical = at(Priority::Critical);
+        let never = at(Priority::Low);
+        let wait = std::time::Duration::from_secs(1800);
+        let after = |t: &Task| (t.id != never.id).then_some(wait);
+        let t0 = low.created_at;
+        let mins = |m: i64| t0 + chrono::Duration::minutes(m);
+        assert!(s.age_queued(mins(29), after).unwrap().is_empty());
+        let aged = s.age_queued(mins(30), after).unwrap();
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].id, low.id);
+        assert_eq!(aged[0].priority, Priority::Normal);
+        assert_eq!(aged[0].aged_from, Some(Priority::Low));
+        assert_eq!(aged[0].aged_at, Some(mins(30)));
+        assert_eq!(aged[0].priority_from.as_deref(), Some("defaults"));
+        // The next step counts from the last one, not from the queue.
+        assert!(s.age_queued(mins(59), after).unwrap().is_empty());
+        let aged = s.age_queued(mins(60), after).unwrap();
+        assert_eq!(aged[0].priority, Priority::High);
+        assert_eq!(aged[0].aged_from, Some(Priority::Low));
+        assert!(s.age_queued(mins(600), after).unwrap().is_empty());
+        for (t, p) in [
+            (&high, Priority::High),
+            (&critical, Priority::Critical),
+            (&never, Priority::Low),
+        ] {
+            let t = s.get_task(t.id).unwrap().unwrap();
+            assert_eq!((t.priority, t.aged_from), (p, None));
+        }
+    }
+
+    /// A task a machine took, or one paused, has left the queue's ageing.
+    #[test]
+    fn age_queued_passes_over_what_is_not_queued() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task_at(new_task("run"), Priority::Low, None, TaskRole::Agent)
+            .unwrap();
+        s.claim_task(t.id, "m").unwrap().unwrap();
+        let later = t.created_at + chrono::Duration::hours(1);
+        let wait = |_: &Task| Some(std::time::Duration::from_secs(60));
+        assert!(s.age_queued(later, wait).unwrap().is_empty());
+        let mut t = s.get_task(t.id).unwrap().unwrap();
+        t.state = TaskState::Paused;
+        s.update_task(&mut t).unwrap();
+        assert!(s.age_queued(later, wait).unwrap().is_empty());
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().priority, Priority::Low);
+    }
+
+    /// A level set by hand (`task priority`, a `queue move` that changes
+    /// it) is the task's own: it forgets what it aged from, and ages on
+    /// from there like any other.
+    #[test]
+    fn a_level_set_by_hand_forgets_ageing() {
+        use crate::queue::QueueSpot::*;
+        let s = Store::open_in_memory().unwrap();
+        let at = |p: Priority| {
+            s.insert_task_at(new_task("run"), p, None, TaskRole::Agent)
+                .unwrap()
+        };
+        let a = at(Priority::Low);
+        let b = at(Priority::Low);
+        let high = at(Priority::High);
+        let wait = |_: &Task| Some(std::time::Duration::from_secs(60));
+        let later = a.created_at + chrono::Duration::minutes(5);
+        assert_eq!(s.age_queued(later, wait).unwrap().len(), 2);
+        let t = s
+            .set_priority(a.id, Priority::Low, "task priority")
+            .unwrap();
+        assert_eq!((t.priority, t.aged_from), (Priority::Low, None));
+        let m = s.move_queued(b.id, Top, &[]).unwrap();
+        assert_eq!(m.task.priority, Priority::High);
+        assert_eq!(m.task.aged_from, None);
+        let aged = s
+            .age_queued(later + chrono::Duration::minutes(1), wait)
+            .unwrap();
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].id, a.id);
+        assert_eq!(aged[0].aged_from, Some(Priority::Low));
+        let _ = high;
+    }
+
+    /// A retry of an aged task queues at the level it had before it aged:
+    /// the copy waits afresh.
+    #[test]
+    fn a_retry_of_an_aged_task_starts_from_its_own_level() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task_at(
+                new_task("run"),
+                Priority::Low,
+                Some("defaults"),
+                TaskRole::Agent,
+            )
+            .unwrap();
+        let later = t.created_at + chrono::Duration::hours(1);
+        s.age_queued(later, |_| Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        s.claim_task(t.id, "m").unwrap().unwrap();
+        let mut t = s.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.priority, Priority::Normal);
+        t.state = TaskState::Failed;
+        s.update_task(&mut t).unwrap();
+        let r = s.insert_retry(t.id).unwrap();
+        assert_eq!(
+            (r.priority, r.aged_from, r.aged_at),
+            (Priority::Low, None, None)
+        );
+    }
+
+    /// A v13 database gains the ageing columns; its rows have not aged.
+    #[test]
+    fn a_v13_database_gains_ageing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.insert_task(new_task("run")).unwrap();
+            s.execute_raw(
+                "ALTER TABLE tasks DROP COLUMN aged_from;
+                 ALTER TABLE tasks DROP COLUMN aged_at;
+                 UPDATE meta SET value = '13' WHERE key = 'schema_version'",
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.meta("schema_version").unwrap().unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        let t = &s.queued_tasks().unwrap()[0];
+        assert_eq!((t.aged_from, t.aged_at), (None, None));
+    }
+
     /// Only a queued task's level changes; the refusal names the state.
     #[test]
     fn set_priority_changes_only_a_queued_task() {
@@ -3641,12 +3852,14 @@ mod tests {
                  ALTER TABLE tasks DROP COLUMN paused_at;
                  ALTER TABLE tasks DROP COLUMN paused_for;
                  ALTER TABLE tasks DROP COLUMN resumed_at;
+                 ALTER TABLE tasks DROP COLUMN aged_from;
+                 ALTER TABLE tasks DROP COLUMN aged_at;
                  DROP TABLE trusted_repos;
                  DROP TABLE event_seq;
                  DROP TABLE task_summaries;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';
                  CREATE TRIGGER no_bump BEFORE UPDATE ON meta
-                   WHEN NEW.value = '13' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                   WHEN NEW.value = '14' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
             );
         }
         assert!(Store::open(&path).is_err());
@@ -3678,6 +3891,7 @@ mod tests {
                 || c == "role"
                 || c == "description"
                 || c == "preempt"
+                || c == "aged_from"
                 || c == "paused_at"),
             "rolled back: {cols:?}"
         );

@@ -482,6 +482,11 @@ pub struct Defaults {
     /// name none; unset, `normal`. See `resolve_priority`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::task::Priority>,
+    /// How long a queued task waits before it goes up a level (`"30m"`), or
+    /// `never`, for flocks that set none; unset, `DEFAULT_AGE_AFTER`. See
+    /// `resolve_age_after`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_after: Option<String>,
     /// The agent that runs a model of another kind than `agent`'s, by kind
     /// (`{ opencode = "opencode" }`). See `resolve_agent_for`.
     #[serde(skip_serializing_if = "KindAgents::is_empty")]
@@ -939,6 +944,22 @@ impl Defaults {
         .unwrap_or_default()
     }
 
+    /// How long a queued task of `flock` waits before it ages a level
+    /// (`Store::age_queued`): the flock's `age_after`, else these defaults',
+    /// else `DEFAULT_AGE_AFTER`; `None` when that is `never`. Both files are
+    /// checked on load; one that no longer parses is passed over.
+    pub fn resolve_age_after(&self, flock: Option<&flock::FlockEntry>) -> Option<Duration> {
+        let set = [
+            flock.and_then(|f| f.age_after.as_deref()),
+            self.age_after.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|v| check_age_after(v).is_ok())
+        .unwrap_or(DEFAULT_AGE_AFTER);
+        (set.trim() != AGE_NEVER).then(|| duration_or_default(set, DEFAULT_AGE_AFTER))
+    }
+
     /// A task's timeout in seconds: from the first of `ask` (`--timeout`, a
     /// job's `[dispatch] timeout`), its flock and these defaults, and the
     /// layer that set it. No machine layer: a machine has no `timeout`.
@@ -1040,6 +1061,7 @@ impl Default for Defaults {
             model: None,
             fallback: None,
             priority: None,
+            age_after: None,
             agents: KindAgents::new(),
             profile: None,
             max_tasks_per_run: 5,
@@ -1696,6 +1718,10 @@ impl PastorConfig {
                 anyhow::bail!("{}: {name}: must not be zero", path.display());
             }
         }
+        if let Some(v) = &cfg.defaults.age_after {
+            check_age_after(v)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.age_after: {e}", path.display()))?;
+        }
         for (key, list) in [
             ("defaults.allow", &cfg.defaults.allow),
             ("defaults.deny", &cfg.defaults.deny),
@@ -1855,6 +1881,25 @@ impl PastorConfig {
 /// The `close_done_after` or `close_failed_after` value that turns that
 /// auto-close off.
 const CLOSE_NEVER: &str = "never";
+
+/// How long a queued task waits before it ages a level when neither its
+/// flock nor `[defaults]` says (`Defaults::resolve_age_after`).
+pub const DEFAULT_AGE_AFTER: &str = "30m";
+
+/// `age_after = "never"`: queued tasks keep their level however long they
+/// wait.
+const AGE_NEVER: &str = "never";
+
+/// Whether `v` is an `age_after`: `never`, or a duration above zero.
+pub fn check_age_after(v: &str) -> Result<(), String> {
+    if v.trim() == AGE_NEVER {
+        return Ok(());
+    }
+    if parse_duration(v)?.is_zero() {
+        return Err("must not be zero; `never` turns ageing off".into());
+    }
+    Ok(())
+}
 
 /// Parse `value`, falling back to `default` (assumed valid) if `value` is bad.
 fn duration_or_default(value: &str, default: &str) -> Duration {
@@ -3934,6 +3979,61 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("pull_lost_after"), "{err}");
+    }
+
+    /// A queued task ages after its flock's `age_after`, else `[defaults]`,
+    /// else 30 minutes; `never` at either turns it off, and zero or a bad
+    /// duration is refused on load.
+    #[test]
+    fn age_after_layers_flock_over_defaults() {
+        let path = Path::new("pastor.toml");
+        let d = Defaults::default();
+        assert_eq!(d.resolve_age_after(None), Some(Duration::from_secs(1800)));
+        let cfg = PastorConfig::parse(path, "[defaults]\nage_after = \"2h\"").unwrap();
+        let d = cfg.defaults;
+        assert_eq!(d.resolve_age_after(None), Some(Duration::from_secs(7200)));
+        let fast = flock::FlockEntry {
+            name: "fast".into(),
+            age_after: Some("5m".into()),
+            ..Default::default()
+        };
+        let still = flock::FlockEntry {
+            name: "still".into(),
+            age_after: Some("never".into()),
+            ..Default::default()
+        };
+        let bare = flock::FlockEntry {
+            name: "bare".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            d.resolve_age_after(Some(&fast)),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(d.resolve_age_after(Some(&still)), None);
+        assert_eq!(
+            d.resolve_age_after(Some(&bare)),
+            Some(Duration::from_secs(7200))
+        );
+        let off = PastorConfig::parse(path, "[defaults]\nage_after = \"never\"").unwrap();
+        assert_eq!(off.defaults.resolve_age_after(None), None);
+        assert_eq!(
+            off.defaults.resolve_age_after(Some(&fast)),
+            Some(Duration::from_secs(300))
+        );
+        for bad in ["0m", "soon"] {
+            let err = PastorConfig::parse(path, &format!("[defaults]\nage_after = {bad:?}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("defaults.age_after"), "{err}");
+        }
+        let err = flock::Flock::parse(
+            Path::new("flock.toml"),
+            "[[flock]]\nname = \"f\"\ndefault = true\nage_after = \"0s\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("flock f: age_after"), "{err}");
     }
 
     /// The manual's pastor.toml block shows every top-level key with its

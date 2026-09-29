@@ -1506,6 +1506,8 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            aged_from: None,
+            aged_at: None,
             pause: Default::default(),
             summary: None,
             created_at: now,

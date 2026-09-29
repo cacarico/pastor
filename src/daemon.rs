@@ -2070,11 +2070,38 @@ impl Fleet {
         while sending.join_next().await.is_some() {}
     }
 
+    /// Lift the queued tasks that have waited their flock's `age_after` a
+    /// level (`Store::age_queued`), so a `low` task still runs behind a
+    /// steady stream of higher ones. Each dispatch pass does it first,
+    /// under the dispatch lock, so a hand change never races it.
+    fn age_queued(&self, now: chrono::DateTime<chrono::Utc>) {
+        let flock = self.flock();
+        let defaults = self.defaults.read().recover().clone();
+        let after = |t: &Task| {
+            let theirs = t.flock.as_deref().unwrap_or(flock.default_flock());
+            defaults.resolve_age_after(flock.entry(theirs))
+        };
+        match self.store.age_queued(now, after) {
+            Ok(aged) => {
+                for t in aged {
+                    tracing::info!(
+                        task = t.id,
+                        aged_from = %t.aged_from.unwrap_or(t.priority),
+                        to = %t.priority,
+                        "queued task aged a level"
+                    );
+                }
+            }
+            Err(err) => tracing::error!(%err, "age queued"),
+        }
+    }
+
     /// `dispatch_queued`'s decisions, under the dispatch lock: every task
     /// placed is reserved on its machine before the next one is looked at.
     async fn place_queued(&self) -> Vec<Placement> {
         let _pass = self.dispatch_lock.lock().await;
         let mut placed = Vec::new();
+        self.age_queued(chrono::Utc::now());
         let queued = match self.store.queued_tasks() {
             Ok(q) => q,
             Err(err) => {
@@ -10489,6 +10516,65 @@ mod tests {
             let left = fake.worktree_list("/srv/app").await.unwrap();
             assert!(!left.iter().any(|w| w.path == checkout.path), "{left:?}");
         }
+    }
+
+    /// Each dispatch pass first ages the queue: a task that waited its
+    /// flock's `age_after` goes up a level, and one in a flock that never
+    /// ages keeps its own.
+    #[tokio::test]
+    async fn a_dispatch_pass_ages_the_queue_by_flock() {
+        use crate::config::flock::FlockEntry;
+        let flock = Flock {
+            flocks: vec![
+                FlockEntry {
+                    name: "work".into(),
+                    default: true,
+                    age_after: Some("5m".into()),
+                    ..Default::default()
+                },
+                FlockEntry {
+                    name: "still".into(),
+                    age_after: Some("never".into()),
+                    ..Default::default()
+                },
+            ],
+            machines: vec![],
+        };
+        let (d, _tmp) = daemon_with_flock(flock, &[]).await;
+        let store = d.store();
+        let at = |flock: &str| {
+            store
+                .insert_task_at(
+                    NewTask {
+                        description: None,
+                        job: "run".into(),
+                        item: serde_json::Value::Null,
+                        prompt: "p".into(),
+                        spec: spec(),
+                        flock: flock.into(),
+                    },
+                    Priority::Low,
+                    Some("task run"),
+                    crate::task::TaskRole::Agent,
+                )
+                .unwrap()
+        };
+        let work = at("work");
+        let still = at("still");
+        let fresh = at("work");
+        let ago = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        store.execute_raw(&format!(
+            "UPDATE tasks SET created_at = '{ago}' WHERE id IN ({}, {})",
+            work.id, still.id
+        ));
+        d.fleet().dispatch_queued().await;
+        let level = |id| {
+            let t = store.get_task(id).unwrap().unwrap();
+            (t.priority, t.aged_from)
+        };
+        assert_eq!(level(work.id), (Priority::Normal, Some(Priority::Low)));
+        assert_eq!(level(still.id), (Priority::Low, None));
+        assert_eq!(level(fresh.id), (Priority::Low, None));
     }
 
     /// A queued task pinned to `machine`, straight into the store.
