@@ -1247,6 +1247,36 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         );
     }
 
+    /// `[connector]` passes every key but `use` to the connector, so the
+    /// only key pastor can call misspelt there is `use` itself: the load
+    /// fails and names the file (the job) and the key.
+    #[test]
+    fn a_typo_of_connector_use_is_a_load_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = job_path(tmp.path(), "nightly");
+        std::fs::write(
+            &path,
+            "every = \"1h\"\n[connector]\nuse_ = \"clock\"\n[dispatch]\nprompt = \"p\"\n",
+        )
+        .unwrap();
+        let Loaded::Invalid { name, error } = load_file(&path, "nightly", &defaults(), &Builtins)
+        else {
+            panic!("a misspelt use must not load")
+        };
+        assert_eq!(name, "nightly");
+        assert!(error.contains("`use`"), "{error}");
+        // A typo beside `use` is the connector's config, not pastor's.
+        std::fs::write(
+            &path,
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\nchanel = \"C1\"\n[dispatch]\nprompt = \"p\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load_file(&path, "nightly", &defaults(), &Builtins),
+            Loaded::Valid(_)
+        ));
+    }
+
     #[test]
     fn load_dir_sorts_and_reports_invalid_files() {
         let tmp = tempfile::tempdir().unwrap();

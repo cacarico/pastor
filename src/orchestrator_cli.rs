@@ -8,7 +8,7 @@ use std::io::Read;
 
 use clap::Subcommand;
 
-use crate::cli::{CliError, request_failure};
+use crate::cli::{CliError, request_error};
 use crate::config::Paths;
 use crate::ipc::{Head, IpcRequest, IpcResponse};
 use crate::orchestrator::{OrchestratorDescription, OrchestratorStatus};
@@ -183,10 +183,7 @@ async fn on_head(paths: &Paths, cmd: OrchestratorCmd) -> anyhow::Result<()> {
         }
         Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
         Ok(other) => anyhow::bail!("unexpected reply to an orchestrator request: {other:?}"),
-        Err(err) => {
-            let (code, message) = request_failure(&err);
-            Err(CliError::err(&code, message))
-        }
+        Err(err) => Err(request_error(&err).into()),
     }
 }
 

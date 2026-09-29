@@ -11,7 +11,7 @@ use std::path::Path;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::cli::{CliError, request_failure};
+use crate::cli::{CliError, request_error};
 use crate::ipc::{
     IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, parse_request_line,
     relay_line, request_line,
@@ -75,10 +75,7 @@ async fn relay(socket: &Path, line: &[u8]) -> anyhow::Result<Vec<u8>> {
             "no_head",
             format!("no pastor serve is running on this machine ({e})"),
         )),
-        Err(err) => {
-            let (code, message) = request_failure(&err);
-            Err(CliError::err(&code, message))
-        }
+        Err(err) => Err(request_error(&err).into()),
     }
 }
 

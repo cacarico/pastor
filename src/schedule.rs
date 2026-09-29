@@ -539,4 +539,127 @@ mod tests {
             "local 01:20 on its second pass, not its first (which is before `after`)"
         );
     }
+
+    /// A time zone whose offset rises from +01:00 to +02:00 at 2026-03-29
+    /// 01:00 UTC, so local wall-clock 02:00-03:00 that day never happens - a
+    /// "spring forward" gap, the mirror of `FoldingZone`.
+    #[derive(Clone, Copy, Debug)]
+    struct GapZone;
+
+    impl GapZone {
+        fn transition() -> NaiveDateTime {
+            NaiveDate::from_ymd_opt(2026, 3, 29)
+                .unwrap()
+                .and_hms_opt(1, 0, 0)
+                .unwrap()
+        }
+
+        fn before() -> FixedOffset {
+            FixedOffset::east_opt(3600).unwrap()
+        }
+
+        fn after() -> FixedOffset {
+            FixedOffset::east_opt(2 * 3600).unwrap()
+        }
+
+        /// A wall-clock time in this zone; panics on one inside the gap.
+        fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<GapZone> {
+            GapZone
+                .from_local_datetime(
+                    &NaiveDate::from_ymd_opt(y, mo, d)
+                        .unwrap()
+                        .and_hms_opt(h, mi, 0)
+                        .unwrap(),
+                )
+                .single()
+                .unwrap()
+        }
+    }
+
+    impl TimeZone for GapZone {
+        type Offset = FixedOffset;
+
+        fn from_offset(_offset: &FixedOffset) -> Self {
+            GapZone
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> LocalResult<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<FixedOffset> {
+            let gap_start = Self::transition() + chrono::Duration::hours(1);
+            let gap_end = Self::transition() + chrono::Duration::hours(2);
+            if *local < gap_start {
+                LocalResult::Single(Self::before())
+            } else if *local < gap_end {
+                LocalResult::None
+            } else {
+                LocalResult::Single(Self::after())
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            if *utc < Self::transition() {
+                Self::before()
+            } else {
+                Self::after()
+            }
+        }
+    }
+
+    #[test]
+    fn a_cron_minute_inside_a_spring_forward_gap_is_skipped() {
+        // 02:30 does not exist on the gap day: no run that day, and the next
+        // is 02:30 the day after, not 03:30 or 03:00 as a stand-in.
+        let daily = CronExpr::parse("30 2 * * *").unwrap();
+        assert_eq!(
+            daily.next_after_in(GapZone::local(2026, 3, 29, 1, 0)),
+            Some(GapZone::local(2026, 3, 30, 2, 30))
+        );
+        assert_eq!(
+            daily.next_after_in(GapZone::local(2026, 3, 28, 2, 30)),
+            Some(GapZone::local(2026, 3, 30, 2, 30)),
+            "from the day before's run, the gap day is skipped whole"
+        );
+
+        // A quarter-hourly job fires at 01:45 and resumes at 03:00, which
+        // is only 15 real minutes later.
+        let quarterly = CronExpr::parse("*/15 * * * *").unwrap();
+        let last_before = GapZone::local(2026, 3, 29, 1, 45);
+        let resumed = quarterly.next_after_in(last_before).unwrap();
+        assert_eq!(resumed, GapZone::local(2026, 3, 29, 3, 0));
+        assert_eq!(resumed - last_before, chrono::Duration::minutes(15));
+
+        // Every minute: `after` just before the gap gives the first real
+        // minute after it.
+        let minutely = CronExpr::parse("* * * * *").unwrap();
+        assert_eq!(
+            minutely.next_after_in(GapZone::local(2026, 3, 29, 1, 59)),
+            Some(GapZone::local(2026, 3, 29, 3, 0))
+        );
+        let hourly = CronExpr::parse("0 * * * *").unwrap();
+        assert_eq!(
+            hourly.next_after_in(GapZone::local(2026, 3, 29, 1, 59)),
+            Some(GapZone::local(2026, 3, 29, 3, 0))
+        );
+    }
+
+    #[test]
+    fn every_is_unaffected_by_a_spring_forward_gap() {
+        // `every` adds its interval in UTC, so an hourly job keeps a real
+        // hour between runs even though local time reads 01:30 then 03:30.
+        let s = Schedule::from_fields(Some("1h"), None).unwrap();
+        let last = GapZone::local(2026, 3, 29, 1, 30);
+        let next = s.next_after(last.with_timezone(&Utc)).unwrap();
+        assert_eq!(next - last.with_timezone(&Utc), chrono::Duration::hours(1));
+        assert_eq!(
+            next.with_timezone(&GapZone),
+            GapZone::local(2026, 3, 29, 3, 30)
+        );
+    }
 }

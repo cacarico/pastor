@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::queue::QueueSpot;
+use crate::sync::Recover;
 use crate::task::{
     DispatchSpec, Outcome, PANE_OWNING_STATES, Priority, SummarySource, Task, TaskState,
     TaskSummary,
@@ -522,7 +523,7 @@ impl Store {
         preempt: bool,
     ) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().recover();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, state, priority, priority_from, role, description, preempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?11, ?10, ?10)",
@@ -542,7 +543,7 @@ impl Store {
     /// serve took before a restart) is left as it is and returned.
     pub fn adopt_claimed(&self, t: &Task) -> anyhow::Result<Task> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().recover();
         let tx = conn.transaction()?;
         let n = tx.execute(
             "INSERT OR IGNORE INTO tasks (id, job, item, prompt, spec, flock, state, priority, priority_from, role, description, preempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
@@ -559,7 +560,7 @@ impl Store {
     /// Delete task `id`'s row and its summaries: a claimed task whose end
     /// the head has heard of (`shepherd`), so the rows here do not pile up.
     pub fn forget_task(&self, id: i64) -> anyhow::Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().recover();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM task_summaries WHERE task_id = ?1", params![id])?;
         tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
@@ -593,7 +594,7 @@ impl Store {
 
     /// Store `row` as task `id`'s next round.
     fn insert_round(&self, id: i64, row: TaskSummary) -> anyhow::Result<TaskSummary> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let round: u32 = conn.query_row(
             "INSERT INTO task_summaries (task_id, round, outcome, text, source, at)
              SELECT ?1, COALESCE(MAX(round), 0) + 1, ?2, ?3, ?4, ?5
@@ -616,7 +617,7 @@ impl Store {
     /// task with no rounds yet gets its first.
     pub fn replace_last_summary(&self, id: i64, summary: &str) -> anyhow::Result<TaskSummary> {
         let row = self.summary_row(id, Some(summary));
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let round: Option<u32> = conn
             .query_row(
                 "UPDATE task_summaries SET outcome = ?2, text = ?3, source = ?4, at = ?5
@@ -642,7 +643,7 @@ impl Store {
 
     /// Every round's summary of task `id`, the first first.
     pub fn summaries(&self, id: i64) -> anyhow::Result<Vec<TaskSummary>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let mut stmt = conn.prepare(
             "SELECT round, outcome, text, source, at FROM task_summaries
               WHERE task_id = ?1 ORDER BY round",
@@ -703,7 +704,7 @@ impl Store {
     pub fn note_pane_tail(&self, task_id: i64, text: &str) {
         let lines: Vec<&str> = text.trim_end().lines().collect();
         let tail = lines[lines.len().saturating_sub(PANE_TAIL_LINES)..].join("\n");
-        let mut tails = self.pane_tails.lock().unwrap_or_else(|p| p.into_inner());
+        let mut tails = self.pane_tails.lock().recover();
         tails.0.retain(|(id, _)| *id != task_id);
         if tails.0.len() >= PANE_TAILS_MAX {
             tails.0.pop_front();
@@ -714,7 +715,7 @@ impl Store {
     /// The tail `note_pane_tail` kept for `task_id`, left for the finish
     /// command to take (an orchestrator's post script reads it too).
     pub fn pane_tail(&self, task_id: i64) -> Option<String> {
-        let tails = self.pane_tails.lock().unwrap_or_else(|p| p.into_inner());
+        let tails = self.pane_tails.lock().recover();
         tails
             .0
             .iter()
@@ -724,7 +725,7 @@ impl Store {
 
     /// The tail `note_pane_tail` kept for `task_id`, once.
     pub fn take_pane_tail(&self, task_id: i64) -> Option<String> {
-        let mut tails = self.pane_tails.lock().unwrap_or_else(|p| p.into_inner());
+        let mut tails = self.pane_tails.lock().recover();
         let at = tails.0.iter().position(|(id, _)| *id == task_id)?;
         tails.0.remove(at).map(|(_, t)| t)
     }
@@ -733,7 +734,7 @@ impl Store {
     /// saved before it is returned, so no number is given twice, across
     /// restarts too. The first is 1.
     pub fn next_event_seq(&self) -> anyhow::Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let seq: i64 = conn.query_row(
             "UPDATE event_seq SET last = last + 1 WHERE id = 1 RETURNING last",
             [],
@@ -744,14 +745,14 @@ impl Store {
 
     /// The last event sequence number given; 0 before the first.
     pub fn last_event_seq(&self) -> anyhow::Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let seq: i64 =
             conn.query_row("SELECT last FROM event_seq WHERE id = 1", [], |r| r.get(0))?;
         Ok(seq as u64)
     }
 
     pub fn get_task(&self, id: i64) -> anyhow::Result<Option<Task>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         Ok(conn
             .query_row(
                 &format!("{TASK_WITH_SUMMARY} WHERE id = ?1"),
@@ -770,7 +771,7 @@ impl Store {
         // clock tick still produce distinct stamps and the next check can tell
         // them apart.
         let now = Utc::now().max(t.updated_at + chrono::Duration::nanoseconds(1));
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let n = conn.execute(
             "UPDATE tasks SET machine = ?2, workspace_id = ?3, pane_id = ?4, agent_name = ?5, state = ?6, error = ?7,
                 last_completion_seq = ?8, started_at = ?9, finished_at = ?10, updated_at = ?11, prompt = ?12, spec = ?13,
@@ -823,7 +824,7 @@ impl Store {
     /// as a conditional UPDATE; `task::next_state` keeps the rule readable.
     pub fn claim_task(&self, id: i64, machine: &str) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let n = conn.execute(
             "UPDATE tasks SET state = 'starting', machine = ?2, agent_name = ?3, error = NULL, updated_at = ?4
              WHERE id = ?1 AND state = 'queued'",
@@ -841,7 +842,7 @@ impl Store {
     /// it was not paused there any more (closed meanwhile, or unknown).
     pub fn claim_paused(&self, id: i64, machine: &str) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let n = conn.execute(
             "UPDATE tasks SET state = 'starting', agent_name = ?3, error = NULL, resumed_at = ?4, updated_at = ?4
              WHERE id = ?1 AND state = 'paused' AND machine = ?2",
@@ -884,7 +885,7 @@ impl Store {
             None => serde_json::json!({}),
         }
         .to_string();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().recover();
         let tx = conn.transaction()?;
         // Check and copy in one statement, so a task closed, pruned or
         // finished by another writer in between is not retried. The copy
@@ -963,7 +964,7 @@ impl Store {
     /// go through that machine. The counterpart of `claim_task`.
     pub fn close_queued(&self, id: i64) -> anyhow::Result<Option<Task>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let n = conn.execute(
             "UPDATE tasks SET state = 'closed', finished_at = COALESCE(finished_at, ?2), updated_at = ?2
              WHERE id = ?1 AND state IN ('queued', 'paused')",
@@ -1022,7 +1023,7 @@ impl Store {
              AND workspace_id IS NOT NULL";
         // List and delete under one lock and transaction, so the list
         // matches what the delete left behind.
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().recover();
         let tx = conn.transaction()?;
         let kept_worktrees = tx
             .prepare(&format!(
@@ -1071,7 +1072,7 @@ impl Store {
             sql.push_str(&format!(" AND state IN ({})", placeholders.join(",")));
         }
         sql.push_str(" ORDER BY id DESC");
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
@@ -1115,7 +1116,7 @@ impl Store {
     /// highest first, a paused task first in its level, then by position,
     /// then oldest first.
     pub fn queued_tasks(&self) -> anyhow::Result<Vec<Task>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let mut stmt = conn.prepare(&format!(
             "SELECT * FROM tasks WHERE state IN ('queued', 'paused') ORDER BY {QUEUE_ORDER}"
         ))?;
@@ -1147,7 +1148,7 @@ impl Store {
         preempt: bool,
     ) -> Result<Task, PriorityError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let n = conn.execute(
             "UPDATE tasks SET priority = ?2, priority_from = ?3, preempt = ?5, updated_at = ?4
              WHERE id = ?1 AND state = 'queued'",
@@ -1181,7 +1182,7 @@ impl Store {
     /// before or after are queued.
     pub fn move_queued(&self, id: i64, spot: QueueSpot) -> Result<Moved, MoveError> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().recover();
         let tx = conn.transaction()?;
         let mut queue: Vec<(i64, Priority, i64)> = {
             let mut stmt = tx.prepare(&format!(
@@ -1282,7 +1283,7 @@ impl Store {
     /// such a row is only ever seen flockless between a migration and the
     /// first read of flock.toml. Returns how many rows it changed.
     pub fn adopt_default_flock(&self, default: &str) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         Ok(conn.execute(
             "UPDATE tasks SET flock = ?1 WHERE flock IS NULL",
             params![default],
@@ -1297,7 +1298,7 @@ impl Store {
     }
 
     pub fn job_state(&self, name: &str) -> anyhow::Result<Option<JobState>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         Ok(conn
             .query_row(
                 "SELECT * FROM job_state WHERE name = ?1",
@@ -1308,14 +1309,14 @@ impl Store {
     }
 
     pub fn job_states(&self) -> anyhow::Result<Vec<JobState>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let mut stmt = conn.prepare("SELECT * FROM job_state ORDER BY name")?;
         let rows = stmt.query_map([], row_to_job_state)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn save_job_state(&self, s: &JobState) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         conn.execute(
             "INSERT OR REPLACE INTO job_state (name, last_run_at, last_ok_at, last_result, last_error, cursor, failures, backoff_until)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1336,7 +1337,7 @@ impl Store {
     /// The task `(job, key)` was seen as: `None` when it is unseen,
     /// `Some(None)` when seen with no task id recorded.
     pub fn seen_task(&self, job: &str, key: &str) -> anyhow::Result<Option<Option<i64>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         Ok(conn
             .query_row(
                 "SELECT task_id FROM seen WHERE job = ?1 AND key = ?2",
@@ -1347,7 +1348,7 @@ impl Store {
     }
 
     pub fn is_seen(&self, job: &str, key: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM seen WHERE job = ?1 AND key = ?2",
             params![job, key],
@@ -1399,7 +1400,7 @@ impl Store {
             .context("item has no string key")?
             .to_string();
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().recover();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO tasks (job, item, prompt, spec, flock, description, state, priority, priority_from, preempt, created_at, updated_at) VALUES (?1, ?2, '', '{}', ?3, ?7, 'queued', ?5, ?6, ?8, ?4, ?4)",
@@ -1426,12 +1427,12 @@ impl Store {
     /// surface it instead of reinterpreting it.
     #[cfg(test)]
     pub(crate) fn execute_raw(&self, sql: &str) {
-        self.conn.lock().unwrap().execute_batch(sql).unwrap();
+        self.conn.lock().recover().execute_batch(sql).unwrap();
     }
 
     /// Save `repo` on `machine` as trusted. Returns whether it was new.
     pub fn trust_repo(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let n = conn.execute(
             "INSERT OR IGNORE INTO trusted_repos (machine, repo, trusted_at) VALUES (?1, ?2, ?3)",
             params![machine, repo, Utc::now().to_rfc3339()],
@@ -1440,7 +1441,7 @@ impl Store {
     }
 
     pub fn is_trusted(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         Ok(conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM trusted_repos WHERE machine = ?1 AND repo = ?2)",
             params![machine, repo],
@@ -1450,7 +1451,7 @@ impl Store {
 
     /// Every saved trust, by machine then repo.
     pub fn trusted_repos(&self) -> anyhow::Result<Vec<TrustedRepo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let mut stmt = conn.prepare(
             "SELECT machine, repo, trusted_at FROM trusted_repos ORDER BY machine, repo",
         )?;
@@ -1469,7 +1470,7 @@ impl Store {
 
     /// Forget a saved trust. Returns whether there was one.
     pub fn untrust(&self, machine: &str, repo: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let n = conn.execute(
             "DELETE FROM trusted_repos WHERE machine = ?1 AND repo = ?2",
             params![machine, repo],
@@ -1479,7 +1480,7 @@ impl Store {
 
     /// Whether task `id` has had its trust keys sent. False for no such row.
     pub fn trust_sent(&self, id: i64) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         Ok(conn
             .query_row(
                 "SELECT trust_sent FROM tasks WHERE id = ?1",
@@ -1494,7 +1495,7 @@ impl Store {
     /// call that set it, so the keys go to a task once, across restarts.
     /// `update_task` never writes the column, so no stale copy resets it.
     pub fn claim_trust_sent(&self, id: i64) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         let n = conn.execute(
             "UPDATE tasks SET trust_sent = 1 WHERE id = ?1 AND trust_sent = 0",
             params![id],
@@ -1507,7 +1508,7 @@ impl Store {
     /// the row, or `None` when the head no longer has it. Seen already is
     /// not an error.
     pub fn mark_seen(&self, job: &str, key: &str, task_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         conn.execute(
             "INSERT OR IGNORE INTO seen (job, key, task_id, seen_at) VALUES (?1, ?2, ?3, ?4)",
             params![job, key, task_id, Utc::now().to_rfc3339()],
@@ -1518,7 +1519,7 @@ impl Store {
     /// Set `key` in the meta table, where the schema version lives too.
     pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
         anyhow::ensure!(key != "schema_version", "schema_version is not a setting");
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
             params![key, value],
@@ -1527,7 +1528,7 @@ impl Store {
     }
 
     pub fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().recover();
         Ok(conn
             .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
                 r.get(0)
@@ -1681,6 +1682,23 @@ fn row_to_job_state(row: &Row<'_>) -> rusqlite::Result<JobState> {
 mod tests {
     use super::*;
     use crate::task::{Checkout, Reopen, TaskRole};
+
+    /// A panic while a request holds the connection poisons its lock; later
+    /// requests still get the connection instead of panicking until restart.
+    #[test]
+    fn store_works_after_a_panic_under_its_lock() {
+        let s = std::sync::Arc::new(Store::open_in_memory().unwrap());
+        let held = std::sync::Arc::clone(&s);
+        let r = std::thread::spawn(move || {
+            let _conn = held.conn.lock().unwrap();
+            panic!("panic while holding the store lock");
+        })
+        .join();
+        assert!(r.is_err());
+        assert!(s.conn.is_poisoned());
+        s.mark_seen("j", "k", None).unwrap();
+        assert!(s.is_seen("j", "k").unwrap());
+    }
 
     /// A headless serve keeps seen keys and its event cursor with no task
     /// rows of its own.

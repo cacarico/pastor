@@ -10,7 +10,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-use crate::cli::{CliError, request_failure};
+use crate::cli::{CliError, request_error};
 use crate::config::Paths;
 use crate::ipc::{IpcRequest, IpcResponse, RequestError};
 
@@ -36,6 +36,7 @@ const STDERR_LIMIT: usize = 4096;
 
 /// `[head]` in client.toml.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeadSetting {
     /// An ssh destination, as ssh takes it (`user@pi-1`, a Host alias).
     pub ssh: String,
@@ -278,8 +279,7 @@ impl RemoteHead {
 
 /// What a failed request to a remote head tells the user.
 pub fn failure(err: &RequestError) -> anyhow::Error {
-    let (code, message) = request_failure(err);
-    CliError::err(&code, message)
+    request_error(err).into()
 }
 
 #[derive(Subcommand, Debug)]
@@ -417,6 +417,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
         (tmp, p)
+    }
+
+    /// A misspelt key under `[head]` fails the load, naming the file and
+    /// the key; other tables in client.toml are left alone.
+    #[test]
+    fn a_typo_under_head_is_a_load_error() {
+        let (_tmp, p) = paths();
+        let path = client_file(&p);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[head]\nssh = \"user@pi-1\"\npastr = \"~/bin/pastor\"\n",
+        )
+        .unwrap();
+        let err = load(&path).unwrap_err();
+        let e = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(e.code, "config_error");
+        assert!(e.message.contains("client.toml"), "{}", e.message);
+        assert!(e.message.contains("pastr"), "{}", e.message);
+        std::fs::write(&path, "[other]\nx = 1\n[head]\nssh = \"user@pi-1\"\n").unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().ssh, "user@pi-1");
     }
 
     #[test]
