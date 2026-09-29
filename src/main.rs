@@ -4420,29 +4420,45 @@ mod tests {
         assert!(links > 5, "only {links} docs links on the home");
     }
 
-    /// Each use in the home's "what you can do" pane is also linked from
-    /// the docs start page, so a reader who lands on the docs finds the same
-    /// ways in as one who lands on the home.
+    /// The home's "what you can do" pane and the docs start page's "pick
+    /// what you came for" list link the same pages, in the same order, and
+    /// each is a page on disk. A fragment is kept as part of the link, so a
+    /// pane entry that points at a section cannot pass on the start page's
+    /// link to the whole page.
     #[test]
     fn website_uses_on_docs_start_page() {
         let site = skills_dir().parent().unwrap().join("docs/website");
+        let docs = site.join("content/docs");
         let home = std::fs::read_to_string(site.join("layouts/home.html")).unwrap();
         let pane = home
             .split("what you can do</h2>")
             .nth(1)
             .and_then(|rest| rest.split("</ul>").next())
             .expect("no \"what you can do\" list");
-        let linked: Vec<&str> = pane
+        let from_home: Vec<&str> = pane
             .split("{{ \"docs/")
             .skip(1)
-            .map(|rest| rest.split(['#', '"']).next().unwrap())
+            .map(|rest| rest.split('"').next().unwrap())
             .collect();
-        assert!(linked.len() >= 6, "only {linked:?} in the pane");
-        let start = std::fs::read_to_string(site.join("content/docs/_index.md")).unwrap();
-        for page in &linked {
+        assert!(from_home.len() >= 6, "only {from_home:?} in the pane");
+        let start = std::fs::read_to_string(docs.join("_index.md")).unwrap();
+        let list = start
+            .split("Then pick what you came for.")
+            .nth(1)
+            .and_then(|rest| rest.split("\n\n").next())
+            .expect("no \"pick what you came for\" list on the start page");
+        let from_start: Vec<&str> = list
+            .split("](")
+            .skip(1)
+            .map(|rest| rest.split(')').next().unwrap())
+            .collect();
+        assert_eq!(from_home, from_start, "the pane and the start page differ");
+        for link in &from_start {
+            let path = link.split('#').next().unwrap().trim_end_matches('/');
             assert!(
-                start.contains(&format!("({page})")),
-                "the docs start page does not link {page}"
+                docs.join(format!("{path}.md")).is_file()
+                    || docs.join(path).join("_index.md").is_file(),
+                "the start page links {link}, which is no page"
             );
         }
     }
