@@ -2127,6 +2127,29 @@ mod tests {
         assert!(parse_duration("300000000000000d").is_err());
     }
 
+    proptest::proptest! {
+        /// Any text, including numbers past `u64` and counts whose product
+        /// with the unit overflows, is a duration or an error, never a panic.
+        #[test]
+        fn prop_parse_duration_never_panics(s in "\\PC*|[0-9]{0,25}[smhd]?|\\s*[0-9]+\\s*[a-z]{0,3}") {
+            let _ = parse_duration(&s);
+        }
+
+        /// A count and a unit read back as count times the unit's seconds
+        /// when that fits in `u64`, and as an error when it does not.
+        #[test]
+        fn prop_parse_duration_is_count_times_unit(
+            n in proptest::prelude::any::<u64>(),
+            unit in proptest::sample::select(vec![("s", 1u64), ("m", 60), ("h", 3600), ("d", 86400)]),
+        ) {
+            let got = parse_duration(&format!("{n}{}", unit.0));
+            match n.checked_mul(unit.1) {
+                Some(secs) => proptest::prop_assert_eq!(got, Ok(Duration::from_secs(secs))),
+                None => proptest::prop_assert!(got.is_err()),
+            }
+        }
+    }
+
     /// A label comes from the first of the ask, the flock and `[defaults]`
     /// that sets one; none leaves the built-in.
     #[test]
