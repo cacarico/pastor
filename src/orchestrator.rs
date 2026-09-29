@@ -2992,8 +2992,8 @@ prompt = "You are the night orchestrator."
         assert_eq!(head.state().quota_until, Some(reset));
         let st = head.runner.statuses(Utc::now());
         assert_eq!(st[0].state, "waiting for quota");
-        // Another account's limit holds nothing.
-        head.store.clear_limits("head/claude", None).unwrap();
+        // Cleared, it holds nothing.
+        head.runner.fleet.clear_limits("head/claude", None).unwrap();
         let mut state = head.state();
         state.quota_until = None;
         save_state(&head.paths, "merge", &state);

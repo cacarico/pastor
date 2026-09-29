@@ -400,6 +400,12 @@ pub struct Fleet {
     max_orchestrators: std::sync::atomic::AtomicU32,
     /// `[limits]` as last applied: how long a limit holds.
     limits: RwLock<LimitsConfig>,
+    /// The limits table as last read (`live_limits`): a pass settles each
+    /// queued task against each machine, and the later tasks again for
+    /// each one, so reading the store every time adds up. Dropped whenever
+    /// this fleet writes the table; a row another process writes (the CLI
+    /// with no head) shows within `LIMITS_FRESH`.
+    limits_seen: std::sync::Mutex<Option<(std::time::Instant, Vec<AccountLimit>)>>,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
@@ -440,6 +446,7 @@ impl Fleet {
             agents_change_fleet: Default::default(),
             max_orchestrators: std::sync::atomic::AtomicU32::new(1),
             limits: RwLock::default(),
+            limits_seen: Default::default(),
             store,
             spawner: None,
             forward: None,
@@ -485,6 +492,7 @@ impl Fleet {
             agents_change_fleet: Default::default(),
             max_orchestrators: std::sync::atomic::AtomicU32::new(1),
             limits: RwLock::default(),
+            limits_seen: Default::default(),
             store,
             spawner: Some(Spawner { connect, events }),
             forward: None,
@@ -1744,10 +1752,26 @@ impl Fleet {
     /// The live limits, as the store has them at `now`; none when it cannot
     /// be read, so a store error never holds work back.
     fn live_limits(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<AccountLimit> {
-        self.store.live_limits(now).unwrap_or_else(|err| {
-            tracing::warn!(%err, "read the usage limits");
-            Vec::new()
-        })
+        let mut seen = self.limits_seen.lock().recover();
+        let rows = match &*seen {
+            Some((at, rows)) if at.elapsed() < LIMITS_FRESH => rows.clone(),
+            _ => match self.store.limits() {
+                Ok(rows) => {
+                    *seen = Some((std::time::Instant::now(), rows.clone()));
+                    rows
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "read the usage limits");
+                    Vec::new()
+                }
+            },
+        };
+        rows.into_iter().filter(|l| l.retry_at > now).collect()
+    }
+
+    /// Forget the limits as last read: the table changed.
+    fn limits_changed(&self) {
+        *self.limits_seen.lock().recover() = None;
     }
 
     /// Of `live`, the limits that stop `spec`'s agent and model on
@@ -1771,6 +1795,7 @@ impl Fleet {
     /// none: the head owns the table.
     pub fn record_limit(&self, limit: &AccountLimit) -> anyhow::Result<()> {
         self.store.record_limit(limit)?;
+        self.limits_changed();
         tracing::warn!(account = %limit.account, model = ?limit.model, retry_at = %limit.retry_at, "account exhausted");
         self.emit_limit("agent.exhausted", limit, None);
         Ok(())
@@ -1830,6 +1855,9 @@ impl Fleet {
     pub fn expire_limits(&self) {
         match self.store.expire_limits(chrono::Utc::now()) {
             Ok(gone) => {
+                if !gone.is_empty() {
+                    self.limits_changed();
+                }
                 for l in gone {
                     tracing::info!(account = %l.account, model = ?l.model, "usage limit reset");
                     self.emit_limit("agent.reset", &l, Some("time"));
@@ -1847,6 +1875,7 @@ impl Fleet {
         model: Option<&str>,
     ) -> anyhow::Result<Vec<AccountLimit>> {
         let gone = self.store.clear_limits(account, model)?;
+        self.limits_changed();
         for l in &gone {
             tracing::info!(account = %l.account, model = ?l.model, "usage limit cleared by hand");
             self.emit_limit("agent.reset", l, Some("hand"));
@@ -2757,6 +2786,9 @@ fn layer_label(layer: Layer, asked_by: &str, flock: &str, machine: Option<&str>)
 }
 
 use crate::queue::{WAITING_FOR_ACCOUNT, WAITING_FOR_MODEL, asked_by, is_waiting_note};
+
+/// How long `Fleet::live_limits` trusts the table as last read.
+const LIMITS_FRESH: Duration = Duration::from_secs(1);
 
 /// The code of a task every model of which is on an exhausted account
 /// where it would run.
