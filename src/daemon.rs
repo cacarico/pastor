@@ -1544,6 +1544,11 @@ impl Fleet {
         preempt: bool,
     ) -> Result<Task, PriorityError> {
         let _pass = self.dispatch_lock.lock().await;
+        // A pass decides under this lock and sends after it; a task it
+        // placed keeps its queued row until the machine answers.
+        if self.in_flight.lock().unwrap().contains_key(&id) {
+            return Err(PriorityError::InFlight(id));
+        }
         self.store
             .set_priority_preempting(id, priority, from, preempt)
     }
@@ -1553,6 +1558,10 @@ impl Fleet {
     /// the old order after the move has answered.
     pub async fn move_queued(&self, id: i64, to: QueueSpot) -> Result<Moved, MoveError> {
         let _pass = self.dispatch_lock.lock().await;
+        // As in `set_priority_preempting`.
+        if self.in_flight.lock().unwrap().contains_key(&id) {
+            return Err(MoveError::InFlight(id));
+        }
         self.store.move_queued(id, to)
     }
 
@@ -3172,7 +3181,7 @@ impl Daemon {
                     Err(err @ PriorityError::NotFound(_)) => {
                         IpcResponse::error("task_not_found", err)
                     }
-                    Err(err @ PriorityError::NotQueued { .. }) => {
+                    Err(err @ (PriorityError::NotQueued { .. } | PriorityError::InFlight(_))) => {
                         IpcResponse::error("not_queued", err)
                     }
                     Err(PriorityError::Store(err)) => {
@@ -3189,7 +3198,9 @@ impl Daemon {
             IpcRequest::QueueMove { id, to } => match self.fleet.move_queued(id, to).await {
                 Ok(moved) => IpcResponse::Moved(moved),
                 Err(err @ MoveError::NotFound(_)) => IpcResponse::error("task_not_found", err),
-                Err(err @ MoveError::NotQueued { .. }) => IpcResponse::error("not_queued", err),
+                Err(err @ (MoveError::NotQueued { .. } | MoveError::InFlight(_))) => {
+                    IpcResponse::error("not_queued", err)
+                }
                 Err(MoveError::Store(err)) => IpcResponse::error("store_error", format!("{err:#}")),
             },
             IpcRequest::TaskShow { id } => match self.store.get_task(id) {
@@ -7366,6 +7377,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A task a pass placed keeps its queued row until the machine answers
+    /// (`in_flight`). A priority change or a move then would be reported
+    /// applied but have no effect on that dispatch, so both are refused
+    /// until the send is answered.
+    #[tokio::test]
+    async fn priority_and_move_refuse_a_task_in_flight() {
+        let (d, _tmp) = spare_daemon().await;
+        let fleet = d.fleet();
+        let t = fleet
+            .queue_run("x".into(), spec(), Some("spare"), None, None)
+            .await
+            .unwrap();
+        let held = fleet.hold_in_flight(&t, "nowhere");
+        let err = fleet
+            .set_priority_preempting(t.id, Priority::Critical, "test", true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PriorityError::InFlight(id) if id == t.id),
+            "{err:?}"
+        );
+        let err = fleet.move_queued(t.id, QueueSpot::Top).await.unwrap_err();
+        assert!(
+            matches!(err, MoveError::InFlight(id) if id == t.id),
+            "{err:?}"
+        );
+        drop(held);
+        let t = fleet
+            .set_priority(t.id, Priority::High, "test")
+            .await
+            .unwrap();
+        assert_eq!(t.priority, Priority::High);
+        fleet.move_queued(t.id, QueueSpot::Top).await.unwrap();
     }
 
     /// A machine edit changes the file and the wanted flock in one step: a

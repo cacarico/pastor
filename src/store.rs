@@ -138,6 +138,11 @@ pub enum MoveError {
     NotFound(i64),
     #[error("t-{id} is {state}; only queued tasks have a place in the queue")]
     NotQueued { id: i64, state: TaskState },
+    /// A dispatch pass placed it and is sending it to a machine
+    /// (`Fleet::in_flight`): the row still says queued, but the move would
+    /// not change where it goes.
+    #[error("t-{0} is being sent to a machine; only queued tasks have a place in the queue")]
+    InFlight(i64),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
 }
@@ -174,6 +179,10 @@ pub enum PriorityError {
     NotFound(i64),
     #[error("t-{id} is {state}; only a queued task's priority can change")]
     NotQueued { id: i64, state: TaskState },
+    /// As `MoveError::InFlight`: the pass already decided on the old level
+    /// and `preempt`, so the change would be reported but not applied.
+    #[error("t-{0} is being sent to a machine; only a queued task's priority can change")]
+    InFlight(i64),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
 }

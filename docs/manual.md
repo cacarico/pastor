@@ -1134,8 +1134,8 @@ flock.toml or the job file.
 
 `pastor task priority t-4 critical` puts a queued task at another level; it
 keeps its position, so among the tasks of its new level it goes by when it
-was queued. A task a machine has taken has left the queue, and is refused
-with `not_queued`; an agent pastor started is refused, as for any change to
+was queued. A task a machine has taken, or is being sent to, has left the
+queue, and is refused with `not_queued`; an agent pastor started is refused, as for any change to
 the fleet (`agent_refused`). `pastor task retry` keeps the level of the task
 it copies, and the copy queues last in it.
 
@@ -1440,8 +1440,8 @@ t-8 is 1 of 3 in the queue; lifted from low to high
 ```
 
 `task describe` then names `queue move` as what set the level. `--json`
-prints `pos`, `of`, `priority_was` and the `task`. A task that is not queued,
-or a `--before` or `--after` task that is not, is refused with `not_queued`,
+prints `pos`, `of`, `priority_was` and the `task`. A task that is not queued
+or is being sent to a machine, or a `--before` or `--after` task that is not, is refused with `not_queued`,
 an unknown one with `task_not_found`, and an agent pastor started, as for
 `task priority`, with `agent_refused`; reading the queue is fine from
 anywhere. A head from before the queue refuses both as unreadable, so the
