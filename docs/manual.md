@@ -405,7 +405,12 @@ t-4` closes the task's pane (and the agent in it) and marks it `closed`; a
 queued task only has its row closed. `--remove-worktree` removes the task's
 worktree instead, which closes its workspace, pane included. herdr refuses a
 checkout with uncommitted or untracked files; the task is then left as it was,
-so commit or clean up and run it again. `pastor task prune --done --older-than
+so commit or clean up and run it again. `pastor task close t-4 t-5 t-6` closes
+each in turn, `--remove-worktree` applying to all: it prints one line per
+task (`t-4 closed`, or `t-5 no_worktree: ...` for one that failed; with
+`--json` an array of objects), goes on past a failure, and then exits 1 with
+`close_failed` naming the ones not closed. One task prints as it always has.
+`pastor task prune --done --older-than
 3d` deletes done tasks that finished more than three days ago; `--failed` and
 `--closed` add those states. A pruned task's item stays seen, so a job never
 queues it again, and the newest task is always kept so its id is never handed
@@ -688,6 +693,17 @@ pinned to the machine stays queued with a note, and the output names it.
 machine's `max_agents`, for setups with one flock per machine, so it stays
 there whichever flock is the default later. A machine whose only membership
 is already that flock's `machines` table is left as it is.
+
+With no head running, `flock add|join|leave|remove` and `machine remove`
+hold a lock (`fleet.lock` in the state dir) from their read of the queued
+tasks to the save, and `pastor serve` holds the same lock from before it
+reads flock.toml until it listens. So a head starting meanwhile waits for the
+edit and reads the edited file, never queueing a task in a flock the edit
+just removed. An edit that finds a head listening once the lock is free stops
+with `head_started`; run it again and it goes through the head. Either side
+gives up after 30 seconds with `fleet_locked`. A bare `pastor serve` waits
+for the lock before it starts the head and begins its own 30 seconds, so it
+reports `fleet_locked` too rather than `serve_slow`.
 
 pastor never rewrites a machine's old `flock` key on its own. The first of
 `flock join`, `flock leave` or `machine move` on that machine (a move even to
@@ -1340,20 +1356,29 @@ takes the last rule that matches. `Read` is opencode's `read` and `list`,
 `task`; `Bash(git log:*)` is `bash` on `git log` and `git log *`, and any
 other argument goes as written. A tool opencode has no permission for adds
 nothing, and the agent's to-do list (`todoread`, `todowrite`) is always
-allowed. The pane also gets `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and
-`OPENCODE_CONFIG_CONTENT` set empty, over an `[agents]` env that sets them,
-so no other config file adds rules around the profile's.
+allowed. The pane also gets `OPENCODE_CONFIG` and `OPENCODE_CONFIG_DIR` set
+empty, and `OPENCODE_CONFIG_CONTENT` set to the repo's instructions and
+nothing else (below), over an `[agents]` env that sets any of them, so no
+other config adds rules around the profile's.
 
 Before it makes anything on the machine, pastor checks the machine's own
 opencode config (`config.json`, `opencode.json` and `opencode.jsonc` in
-`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`): a `"permission"` key
-anywhere in them, even under an agent, fails the task
+`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`, and in
+`~/.opencode`, and the managed `/etc/opencode`, on macOS
+`/Library/Application Support/opencode` and the MDM preferences
+`ai.opencode.managed.plist` in `/Library/Managed Preferences/<user>` and
+`/Library/Managed Preferences`, read through `plutil`, one it cannot read
+counting as rules): a `"permission"` key anywhere in
+them, even under an agent, or a legacy `"tools"` one, fails the task
 (`opencode_permissions_conflict` in its `error`), since opencode would merge
 those rules with the profile's. Move them out, or run the task without a
-profile. A `command` machine cannot be checked, and goes ahead. The repo's
-own opencode config (an `opencode.json` in the checkout) is still read, and
-its rules would merge with the profile's too; keep permission rules out of
-repos that profiled opencode tasks run in.
+profile. A `command` machine cannot be checked, and goes ahead. pastor turns
+the repo's own opencode config (an `opencode.json` or `.opencode/` in the
+checkout) off for a profiled task (`OPENCODE_DISABLE_PROJECT_CONFIG=1`), so a
+branch cannot add rules to the profile's, and passes the checkout's
+instructions back by path in `OPENCODE_CONFIG_CONTENT`: its `AGENTS.md`, or
+when there is none its `CLAUDE.md`, the one file opencode would have read
+itself. On a `command` machine, which cannot be asked, both go.
 
 An agent of any other kind gets the lists through its `allow_flag` and
 `deny_flag`, as any list, and keeps its own permission mode.
@@ -1924,6 +1949,7 @@ pastor task run --priority critical --preempt "prod is down"  # pauses a low tas
 pastor queue                         # the queue in the order it runs, and why each waits
 pastor queue move t-6 --before t-5   # take t-5's place, and its level
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
+pastor task close t-2 t-3 t-4           # several at once, one line each
 pastor task done t-1                 # mark it done; its pane closes after close_done_after
 pastor task done --summary "done: PR #31"   # from its own pane: how it ended
 pastor task run --summary require "Fix issue 12"   # fails if its agent stops without one
@@ -3039,6 +3065,7 @@ sends nothing. A head from before these requests is refused
 ~/.local/state/pastor/pastor.db   tasks (schema 13, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role, description, preempt, paused_at, paused_for and resumed_at), task summaries, seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/fleet.lock  held by a fleet edit with no head, and by `pastor serve` while it starts
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/watch/<name>.json   a `pastor watch` cursor
 ~/.local/state/pastor/orchestrators/<name>/  an orchestrator's state.json, note, scripts' scratch/ and runs/

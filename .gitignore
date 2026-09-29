@@ -8,3 +8,6 @@ docs/website/.hugo_build.lock
 docs/website/mockups/
 # cargo-mutants output; see make mutants.
 mutants.out*/
+# `pastor watch` output files and local Claude Code settings.
+/watch_*
+.claude/

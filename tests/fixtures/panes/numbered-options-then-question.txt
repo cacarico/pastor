@@ -1,0 +1,22 @@
+#! question: yes
+#! shell: no
+#! trust: no
+● Bash(make check)
+  ⎿  cargo fmt --check
+     cargo clippy --all-targets -- -D warnings
+     test result: ok. 412 passed; 0 failed
+     … +38 lines (ctrl+o to expand)
+
+● The flag is still read in two places, and I can take it out either way:
+
+  1. Remove --legacy now and note it in the changelog.
+  2. Keep it one more release with a deprecation warning.
+
+  Which one do you want?
+
+✻ Baked for 4m 12s
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

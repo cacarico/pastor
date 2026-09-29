@@ -102,6 +102,7 @@ pastor task close t-4                      # closes the pane if there is one, ma
 pastor task done t-4                       # marks a task with a pane done; its pane closes after close_done_after
 pastor task describe t-4 --all-summaries   # how each round of the task ended
 pastor task close t-4 --remove-worktree    # removes the worktree too; refused if it has uncommitted changes
+pastor task close t-4 t-5 t-6              # several: one line each, the rest go on past a failure, exit 1 (close_failed) if any failed
 pastor task prune --done --older-than 3d   # deletes finished rows; --failed and --closed add those states
 ```
 

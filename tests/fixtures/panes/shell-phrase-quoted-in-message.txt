@@ -1,0 +1,19 @@
+#! question: no
+#! shell: no
+#! trust: no
+● Bash(make check)
+  ⎿  cargo fmt --check
+     cargo clippy --all-targets -- -D warnings
+     test result: ok. 412 passed; 0 failed
+     … +38 lines (ctrl+o to expand)
+
+● Fixed. The footer read "1 shell still running" while make check ran,
+  and pastor now waits for it instead of calling the task done. The
+  shell has exited.
+
+✻ Baked for 4m 12s
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
