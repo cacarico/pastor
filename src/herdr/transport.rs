@@ -1251,30 +1251,60 @@ mod tests {
 
     /// The command itself (every real source of "yes") is
     /// `config::opencode`'s own to test; this only proves the wiring here
-    /// runs it and passes its answer through, using the managed-config
-    /// override the script keeps for tests, so it needs no real `$HOME`.
+    /// runs it and passes its answer through. The command reads opencode's
+    /// config under `$HOME` and `$XDG_CONFIG_HOME`, and the environment is
+    /// the whole test binary's, which other tests read, so the local half
+    /// runs in a child of this binary with its own empty `HOME` and managed
+    /// dir: a real config on the host running the suite cannot turn the
+    /// first answer into a yes.
     #[tokio::test]
     async fn opencode_permission_rules_per_endpoint() {
+        const CHILD: &str = "PASTOR_TEST_OPENCODE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let managed = std::path::PathBuf::from(
+                std::env::var_os("OPENCODE_TEST_MANAGED_CONFIG_DIR").unwrap(),
+            );
+            let local = Endpoint::Local {
+                session: "s".into(),
+            };
+            assert_eq!(
+                local.opencode_permission_rules().await.unwrap(),
+                Some(false)
+            );
+            std::fs::write(
+                managed.join("opencode.json"),
+                r#"{"permission": {"bash": "allow"}}"#,
+            )
+            .unwrap();
+            assert_eq!(local.opencode_permission_rules().await.unwrap(), Some(true));
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
         let managed = tempfile::tempdir().unwrap();
-        let local = Endpoint::Local {
-            session: "s".into(),
-        };
-        unsafe {
-            std::env::set_var("OPENCODE_TEST_MANAGED_CONFIG_DIR", managed.path());
-        }
-        assert_eq!(
-            local.opencode_permission_rules().await.unwrap(),
-            Some(false)
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "herdr::transport::tests::opencode_permission_rules_per_endpoint",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env("OPENCODE_TEST_MANAGED_CONFIG_DIR", managed.path())
+            .env(
+                "PASTOR_TEST_MANAGED_PREFERENCES_DIR",
+                managed.path().join("prefs"),
+            )
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
         );
-        std::fs::write(
-            managed.path().join("opencode.json"),
-            r#"{"permission": {"bash": "allow"}}"#,
-        )
-        .unwrap();
-        assert_eq!(local.opencode_permission_rules().await.unwrap(), Some(true));
-        unsafe {
-            std::env::remove_var("OPENCODE_TEST_MANAGED_CONFIG_DIR");
-        }
+        // The filter matched and the child really ran the local half.
+        assert!(stdout.contains("1 passed"), "{stdout}");
         let command = Endpoint::Command {
             argv: vec!["true".into()],
         };
