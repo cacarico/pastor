@@ -1130,6 +1130,12 @@ pub struct AgentDef {
     /// Like `allow_flag`, for `deny` (`--disallowedTools` for claude).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_flag: Option<String>,
+    /// The agent's permissions are in its own settings on the machine (agy's
+    /// allow list), so a task under a profile starts with no permission
+    /// mode and no tool flags, its lists not passed (`lists_unapplied`).
+    /// Without it, an agent with no flags refuses a profiled task.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub own_permissions: bool,
     /// The account the agent is logged in to, as a label: every machine
     /// whose agent names the same account shares its usage limits
     /// (`Agents::limit_key`). Unset, a limit holds only for this agent on
@@ -1378,10 +1384,19 @@ impl Agents {
 
     /// Why `spec`'s allow and deny lists do not reach its agent, when they
     /// do not: a Codex agent under a profile, with no flag of its own for a
-    /// list it has, runs in its sandbox instead (`launch_args`). `task
+    /// list it has, runs in its sandbox instead (`launch_args`); an agent
+    /// with `own_permissions` has its own settings on the machine. `task
     /// describe` shows it next to the lists.
     pub fn lists_unapplied(&self, spec: &crate::task::DispatchSpec) -> Option<String> {
         let profile = spec.profile()?;
+        if self.own_permissions(&spec.agent) {
+            return (!spec.allow.is_empty() || !spec.deny.is_empty()).then(|| {
+                format!(
+                    "not applied: agent {}'s permissions are in its own settings on the machine",
+                    spec.agent
+                )
+            });
+        }
         if self.kind(&spec.agent) != "codex" {
             return None;
         }
@@ -1403,7 +1418,14 @@ impl Agents {
     /// Does `spec` run an opencode agent under a permission profile? Its
     /// lists then go in `OPENCODE_PERMISSION`, not in flags.
     pub fn opencode_profile(&self, spec: &crate::task::DispatchSpec) -> bool {
-        spec.profile().is_some() && self.kind(&spec.agent) == opencode::KIND
+        spec.profile().is_some()
+            && self.kind(&spec.agent) == opencode::KIND
+            && !self.own_permissions(&spec.agent)
+    }
+
+    /// Are `agent`'s permissions in its own settings (`own_permissions`)?
+    fn own_permissions(&self, agent: &str) -> bool {
+        self.0.get(agent).is_some_and(|d| d.own_permissions)
     }
 
     /// The argv after the agent's name for `spec`: its `agent_args`, then,
@@ -1413,7 +1435,8 @@ impl Agents {
     /// and pattern of each `allow`, then of each `deny`; an opencode agent
     /// under a profile gets no tool flags, its lists going in `launch`'s
     /// env, and a Codex one skips a list it has no flag for
-    /// (`lists_unapplied`). Refused when a list is not empty
+    /// (`lists_unapplied`); an agent with `own_permissions` under a profile
+    /// gets its args alone. Refused when a list is not empty
     /// and the agent has no flag for it (`agent_tools_unsupported`):
     /// dropping a deny list without a word would be worse than not
     /// starting. Refused too when a profile applies and the args already
@@ -1426,6 +1449,10 @@ impl Agents {
     ) -> Result<Vec<String>, AgentRefusal> {
         let (allow_flag, deny_flag) = self.tool_flags(&spec.agent);
         let mut args = spec.agent_args.clone();
+        // Its own settings hold (`lists_unapplied`).
+        if spec.profile().is_some() && self.own_permissions(&spec.agent) {
+            return Ok(args);
+        }
         if let Some(profile) = spec.profile()
             && self.kind(&spec.agent) == "claude"
         {
@@ -1486,7 +1513,8 @@ impl Agents {
                 return Err(AgentRefusal {
                     code: "agent_tools_unsupported",
                     message: format!(
-                        "agent {} has no {key} to pass its tool list; set [agents.{}] {key} in pastor.toml",
+                        "agent {} has no {key} to pass its tool list; set [agents.{}] {key} in pastor.toml, \
+                         or own_permissions = true when its permissions are in its own settings on the machine",
                         spec.agent, spec.agent
                     ),
                 });
@@ -2019,6 +2047,12 @@ impl PastorConfig {
             ] {
                 if flag.as_deref().is_some_and(|f| f.trim().is_empty()) {
                     anyhow::bail!("{}: agents.{name}.{key} must not be empty", path.display());
+                }
+                if def.own_permissions && flag.is_some() {
+                    anyhow::bail!(
+                        "{}: agents.{name}.own_permissions: the agent's own settings hold its permissions, so it takes no {key}",
+                        path.display()
+                    );
                 }
             }
             if let Some(account) = &def.account
@@ -3708,6 +3742,69 @@ mod tests {
         spec.deny.clear();
         // Nor is the repo's own config turned off.
         assert!(Agents::default().launch(&spec).unwrap().env.is_empty());
+    }
+
+    /// An agent whose permissions are in its own settings on the machine
+    /// (`own_permissions`, agy's allow list) starts under a profile with
+    /// its args alone: no mode, no tool flags, its lists not passed, and
+    /// `task describe` says why. Without the field it is refused, and the
+    /// message names the field.
+    #[test]
+    fn an_agent_with_its_own_permissions_starts_under_a_profile_without_flags() {
+        let mut spec = spec_with("agy", &["Edit"], &["Bash(sudo:*)"]);
+        spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            agent: "defaults".into(),
+            profile: Some("develop".into()),
+            profile_from: Some("defaults".into()),
+            ..Default::default()
+        }));
+
+        let err = Agents::default().launch(&spec).unwrap_err();
+        assert_eq!(err.code, "agent_tools_unsupported");
+        assert!(err.message.contains("own_permissions"), "{err}");
+        assert_eq!(Agents::default().lists_unapplied(&spec), None);
+
+        let agents: Agents = toml::from_str("[agy]\nown_permissions = true\n").unwrap();
+        let launch = agents.launch(&spec).unwrap();
+        assert_eq!(launch.kind, "agy");
+        assert_eq!(launch.args, vec!["--model", "m"]);
+        assert!(launch.env.is_empty());
+        let why = agents.lists_unapplied(&spec).unwrap();
+        assert!(why.starts_with("not applied:"), "{why}");
+        assert!(why.contains("own settings on the machine"), "{why}");
+
+        // A definition of kind agy under another name, as a machine picks
+        // with `agents = { agy = "agy-builder" }`.
+        let mine: Agents =
+            toml::from_str("[agy-builder]\nkind = \"agy\"\nown_permissions = true\n").unwrap();
+        spec.agent = "agy-builder".into();
+        assert_eq!(mine.launch(&spec).unwrap().args, vec!["--model", "m"]);
+        assert!(mine.lists_unapplied(&spec).is_some());
+
+        // Without a profile the lists still need flags.
+        spec.agent_source = None;
+        assert_eq!(
+            mine.launch(&spec).unwrap_err().code,
+            "agent_tools_unsupported"
+        );
+        assert_eq!(mine.lists_unapplied(&spec), None);
+    }
+
+    /// `own_permissions` and a tool flag contradict each other: pastor
+    /// would pass the lists on one path and not on the other.
+    #[test]
+    fn own_permissions_refuses_a_tool_flag_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.agy]\nown_permissions = true\nallow_flag = \"--allow\"\n",
+        )
+        .unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("agents.agy.own_permissions"), "{err}");
+        std::fs::write(&path, "[agents.agy]\nown_permissions = true\n").unwrap();
+        assert!(PastorConfig::load(&path).unwrap().agents.0["agy"].own_permissions);
     }
 
     /// A task's profile comes from the first layer that names one, like its
