@@ -50,10 +50,12 @@ or later in `~/.config/pastor/flock.toml`. Tasks past the room wait in the
 - Everything the agents need, repos and logins, is on this machine.
 
 Jobs, orchestrators, flocks and profiles all work the same on one machine.
-A work flock and a personal flock can both use `here`, each with its own
-agent and login: see [work and personal](../../examples/work-and-personal/).
+Two flocks can both use `here`, each with its own agent and profile. A
+flock does not make `here` a sandbox, though: work that reads a stranger's
+text belongs on a machine that holds none of your credentials. See
+[untrusted work in a sandbox](../../examples/sandbox/).
 
-## grow into a fleet
+## grow into a flock
 
 Nothing you set up solo has to change. Add a machine the head reaches over
 ssh, and the head spreads tasks over both:
@@ -63,6 +65,6 @@ pastor machine add server-1 user@server-1 --herdr
 ```
 
 Your tasks, jobs and history stay where they are. The head keeps running on
-this machine, which keeps taking tasks too. [fleet](../fleet/) covers ssh,
+this machine, which keeps taking tasks too. [flock](../flock/) covers ssh,
 herdr on the new machine and the load. To move the head itself to an
 always-on box later, see [move the head](../remote/#move-the-head).

@@ -21,9 +21,9 @@ head_address = "user@desk"
 profile = "develop"
 timeout = "3h"
 
-[agents.claude-work]
+[agents.claude-sandbox]
 kind = "claude"
-env = { CLAUDE_CONFIG_DIR = "~/.claude-work" }
+env = { CLAUDE_CONFIG_DIR = "~/.claude-sandbox" }
 
 [models.sonnet]
 kind = "claude"

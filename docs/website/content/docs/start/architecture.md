@@ -12,7 +12,7 @@ and the config files easy to read.
 
 | part | is |
 |---|---|
-| head | the `pastor serve` that holds the queue, the schedule and the history; one per fleet |
+| head | the `pastor serve` that holds the queue, the schedule and the history; one for all your flocks |
 | machine | a computer that runs agents in its herdr; the head's own machine can be one |
 | flock | a named group of machines; a machine can be in several, and one flock is the default |
 | task | one prompt to one agent on one machine, in a repo or a git worktree of its own |
@@ -70,7 +70,7 @@ folders; the XDG variables work too. The full list is in the
 |---|---|
 | what the head does and keeps | [head](../../concepts/head/) |
 | how machines are reached and how much they take | [machines](../../concepts/machines/) |
-| keeping work and personal agents apart | [flocks](../../concepts/flocks/) |
+| keeping some tasks on some machines | [flocks](../../concepts/flocks/) |
 | a task's life, from queued to closed | [tasks](../../concepts/tasks/), [queue](../../concepts/queue/) |
 | work that finds itself | [jobs](../../concepts/jobs/), [connectors](../../concepts/connectors/) |
 | which agent and model a task gets | [agents and models](../../concepts/agents-and-models/) |
@@ -82,6 +82,6 @@ And to lay it out on your machines:
 | setup | when |
 |---|---|
 | [solo](../../deploy/solo/) | one machine is the head and runs every agent |
-| [fleet](../../deploy/fleet/) | a head plus machines it reaches over ssh |
+| [flock](../../deploy/flock/) | a head plus machines it reaches over ssh |
 | [remote](../../deploy/remote/) | the CLI on a laptop, the head somewhere else |
 | [as a service](../../deploy/service/) | keep the head and herdr running across reboots |

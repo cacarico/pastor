@@ -13,14 +13,17 @@ See [machines](../../concepts/machines/) and
 ```toml
 # ~/.config/pastor/flock.toml
 [[flock]]
-name = "work"
+name = "default"
 default = true
 machines = { desk = 2, server-1 = { share = 2, max = 4 } }
 profile = "develop"
 
 [[flock]]
-name = "personal"
-machines = { laptop = 1, server-1 = 1 }
+name = "sandbox"
+machines = { laptop = 1 }
+agent = "claude-sandbox"
+profile = "review"
+deny = ["Bash(git push:*)", "WebFetch"]
 timeout = "1h"
 
 [[machine]]

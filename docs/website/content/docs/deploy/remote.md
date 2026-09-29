@@ -133,7 +133,7 @@ machine:
 5. On `laptop`, run `pastor head set user@server-1`, then
    `pastor setup systemd` again: it now installs the headless serve.
 6. Give each machine whose agents report back its own locked key on
-   `server-1` (see [let agents report back](../fleet/#let-agents-report-back)).
+   `server-1` (see [let agents report back](../flock/#let-agents-report-back)).
 
 From `laptop`, `pastor machine list` then names `user@server-1` as the head
 and `pastor task list --all` shows the old tasks. `laptop`'s own `pastor.db`

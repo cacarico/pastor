@@ -22,7 +22,7 @@ background until you `pastor serve stop` it or the machine restarts.
 | `pastor setup launchd --herdr` | `~/Library/LaunchAgents/pastor.herdr.plist` | `herdr server` |
 
 Run the pastor one on the head. Run the herdr one on every machine that
-runs agents, the head's own included; it is how a fleet machine keeps its
+runs agents, the head's own included; it is how a machine in a flock keeps its
 herdr up.
 
 The file points at the binary setup found: the pastor you ran, or the

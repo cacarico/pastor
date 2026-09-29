@@ -3,7 +3,7 @@ title: head
 summary: the one machine that keeps track
 weight: 1
 ---
-The head is the `pastor serve` process that owns your fleet. It holds the
+The head is the `pastor serve` process that owns your flocks. It holds the
 queue, runs jobs and orchestrators on their schedule, starts agents on the
 machines, and keeps the history. Everything else, the CLI included, asks it.
 
@@ -67,7 +67,7 @@ instead of working around it, so two schedulers never run side by side.
 
 ## one head, or a headless serve
 
-A fleet has one head. On a machine whose CLI points at a head elsewhere,
+All your flocks share one head. On a machine whose CLI points at a head elsewhere,
 `pastor serve` runs headless. It runs that machine's own jobs and hooks
 and hands their items to the head. On a machine the head lists as
 `pull = true`, it also takes tasks from the head and runs them there.

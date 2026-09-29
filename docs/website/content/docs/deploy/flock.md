@@ -1,9 +1,9 @@
 ---
-title: fleet
+title: flock
 summary: a head plus machines over ssh
 weight: 2
 ---
-Pick a fleet when one machine is not enough: the head runs on one box and
+Pick a flock when one machine is not enough: the head runs on one box and
 spreads agents over the others it reaches by ssh.
 
 ## what each machine needs
@@ -88,12 +88,13 @@ it and checks it before saving).
 
 ## flocks, move and remove
 
-Every machine starts in the default flock. To keep work and personal agents
-apart, make more flocks (see [flocks](../../concepts/flocks/)) and put each
-machine where it belongs:
+Every machine starts in the default flock. To keep some tasks on some
+machines, such as outside PRs on a sandbox with no credentials, make more
+flocks (see [flocks](../../concepts/flocks/)) and put each machine where
+it belongs:
 
 ```sh
-pastor machine move server-1 work  # out of every flock, into work
+pastor machine move server-1 sandbox  # out of every flock, into sandbox
 pastor machine remove server-1  # out of flock.toml
 pastor machine remove server-1 --herdr  # and out of herdr's sidebar
 ```

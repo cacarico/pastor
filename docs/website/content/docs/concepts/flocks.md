@@ -7,23 +7,23 @@ aliases:
 ---
 A flock is a named group of machines. Every task and job targets one flock,
 and only that flock's machines take its work. Use flocks to keep work apart:
-work and personal machines, logged in to different accounts, never run each
-other's agents. Or share one machine between projects so that no project
-takes every slot.
+tasks that read outside text run on a sandbox machine with none of your
+credentials, and everyday tasks never land there. Or share one machine
+between projects so that no project takes every slot.
 
 ## flock.toml
 
 ```toml
 # ~/.config/pastor/flock.toml
 [[flock]]
-name = "personal"
-default = true               # tasks and jobs that name no flock go here
-machines = { desk = 2 }      # desk runs at most 2 of personal's tasks
+name = "default"
+default = true                         # tasks and jobs that name no flock go here
+machines = { desk = 2, server-1 = 3 }  # desk runs at most 2 of default's tasks
 
 [[flock]]
-name = "work"
-machines = { desk = 1, server-1 = 3 }
-description = "Paid work, on the work account"
+name = "sandbox"
+machines = { sandbox-1 = 1 }
+description = "Outside PRs and issues, on a machine with no credentials"
 
 [[machine]]
 name = "desk"
@@ -34,6 +34,10 @@ max_agents = 3
 name = "server-1"
 ssh = "user@server-1"
 max_agents = 3
+
+[[machine]]
+name = "sandbox-1"
+ssh = "user@sandbox-1"
 ```
 
 A flock's `machines` names the machines it may use, each with its number
@@ -55,7 +59,7 @@ A task's flock is fixed when it is queued: its `--flock`, or the job's
 A task starts on a machine only when the machine has room for it and the
 task's flock is under its number there. Job slots and burst never take a
 flock past its number. A task whose flock is full waits, with a reason like
-`flock work is at 1 of 1 on desk`, and the next task in the queue goes.
+`flock sandbox is at 1 of 1 on sandbox-1`, and the next task in the queue goes.
 
 A plain number is a hard ceiling. To let a busy project use slots that
 quiet ones leave idle, give its flock a share and a max:
@@ -85,7 +89,7 @@ permissions, priority and timeout.
 ```toml
 # ~/.config/pastor/flock.toml
 [[flock]]
-name = "work"
+name = "app"
 machines = { server-1 = 3 }
 model = "sonnet"     # a name from [models] in pastor.toml
 profile = "develop"  # a permission profile
@@ -105,11 +109,11 @@ what is installed and logged in there. See
 
 ```sh
 pastor flock list --wide                  # machines, live agents, queued tasks, descriptions
-pastor flock describe work
+pastor flock describe sandbox
 pastor flock add lab server-1 --description "Test rigs"  # server-1 joins it
-pastor flock join work desk --max 2       # desk runs at most 2 of work's tasks
-pastor flock leave work desk              # out of work; out of its last flock, back in the default
-pastor flock default set work             # new tasks and jobs go to work
+pastor flock join lab desk --max 2        # desk runs at most 2 of lab's tasks
+pastor flock leave lab desk               # out of lab; out of its last flock, back in the default
+pastor flock default set lab              # new tasks and jobs go to lab
 pastor flock edit                         # saved only once valid
 ```
 
@@ -119,14 +123,14 @@ its other flocks; without `--max` it keeps the number it has there, or takes
 the machine's `max_agents`. Tasks already running keep running when a
 machine leaves a flock.
 
-An older file may put a machine in a flock with `flock = "work"` on its
+An older file may put a machine in a flock with `flock = "sandbox"` on its
 `[[machine]]`. That still works. The first `flock join`, `flock leave` or
 `machine move` on that machine moves it into the flock's `machines`.
 
 A flock is a routing rule, not a sandbox: every agent still runs as the
 machine's user. See [profiles and trust](../profiles-and-trust/).
 
-Read on: [work and personal](../../examples/work-and-personal/) runs two
-accounts on one head with a flock each; every key is in
+Read on: [untrusted work in a sandbox](../../examples/sandbox/) keeps
+outside PRs on a machine of their own; every key is in
 [flock.toml](../../reference/flock-toml/), and the commands in the
 [cli reference](../../reference/cli/#flock).

@@ -10,7 +10,7 @@ pause low work to start at once.
 
 ## what you need
 
-A fleet that is full. Here `desk` and `server-1` run 2 and 3 agents, and
+A flock that is full. Here `desk` and `server-1` run 2 and 3 agents, and
 every agent counts against `max_agents`: no job slots and no burst.
 
 ```toml

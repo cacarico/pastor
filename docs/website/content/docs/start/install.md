@@ -7,7 +7,7 @@ aliases:
 ---
 pastor is a single binary. Install it on the machine that will run the head.
 The other machines need herdr and the agents; pastor on them is optional
-(see [fleet](../../deploy/fleet/)).
+(see [flock](../../deploy/flock/)).
 
 ## one line
 

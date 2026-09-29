@@ -37,9 +37,9 @@ pastor queue
 
 ```text
 POS  TASK  LEVEL   WHERE             FROM         WAITED  WHY NOT YET
-1    t-19  high    flock work        job triage   4m      flock work is full
+1    t-19  high    flock sandbox     job triage   4m      flock sandbox is full
 2    t-17  normal  machine server-1  task run     1h      machine server-1 is full (3/3)
-3    t-18  low     flock personal    task run     2d      next pass: desk has room
+3    t-18  low     flock default     task run     2d      next pass: desk has room
 ```
 
 | column | is |

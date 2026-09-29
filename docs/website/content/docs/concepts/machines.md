@@ -24,14 +24,14 @@ is reached in one of these ways:
 ```sh
 pastor machine add desk --local
 pastor machine add server-1 user@server-1 --max-agents 3 --tag arm
-pastor machine add laptop user@laptop --flock personal --herdr  # also in herdr's sidebar
+pastor machine add laptop user@laptop --flock sandbox --herdr  # also in herdr's sidebar
 ```
 
 Put ssh ports, keys and jump hosts in `~/.ssh/config` under a host alias,
 and give pastor the alias. A machine's tags pick machines inside a flock: a
 task run with `--tag arm` goes only to a machine that has every tag it asks
 for. Setting up ssh and herdr on each machine is in
-[fleet](../../deploy/fleet/); a pull machine is in
+[flock](../../deploy/flock/); a pull machine is in
 [remote](../../deploy/remote/).
 
 ## slots
@@ -68,10 +68,10 @@ pastor machine list
 ```text
 pastor 0.8.0 on desk (herdr 0.9.1), 3 machines, desk is the head of the flock
 
-NAME      HOST           FLOCKS      PROFILE  CHANNEL       HERDR  PASTOR  AGENTS     ORPHANS  TAGS  ERROR
-desk      local          personal:2  -        connected     0.9.1  0.8.0   1/2+1j+1b  -        -
-server-1  user@server-1  work:3      develop  connected     0.9.1  0.8.0   2/3+1j+1b  -        arm
-laptop    user@laptop    personal    -        reconnecting  0.9.1  0.8.0   0/2+1j+1b  -        -     connection lost
+NAME      HOST           FLOCKS     PROFILE  CHANNEL       HERDR  PASTOR  AGENTS     ORPHANS  TAGS  ERROR
+desk      local          default:2  -        connected     0.9.1  0.8.0   1/2+1j+1b  -        -
+server-1  user@server-1  default:3  develop  connected     0.9.1  0.8.0   2/3+1j+1b  -        arm
+laptop    user@laptop    sandbox:1  review   reconnecting  0.9.1  0.8.0   0/2+1j+1b  -        -     connection lost
 ```
 
 AGENTS is the machine's live tasks and orphans over its room: `max_agents`,
@@ -97,17 +97,17 @@ Only `connected` and `polling` machines take tasks. With no head running,
 ## one machine in full
 
 ```sh
-pastor machine describe server-1  # host, flocks, channel, versions, agents, recent errors
-pastor machine list --wide        # adds each machine's description
-pastor machine move laptop work   # out of every flock, into work
-pastor machine remove laptop      # its tasks keep their rows
-pastor machine open server-1      # the full herdr UI there
+pastor machine describe server-1    # host, flocks, channel, versions, agents, recent errors
+pastor machine list --wide          # adds each machine's description
+pastor machine move laptop sandbox  # out of every flock, into sandbox
+pastor machine remove laptop        # its tasks keep their rows
+pastor machine open server-1        # the full herdr UI there
 ```
 
 A machine can also set the agent, model, profile and priority of the tasks
 it runs: see [agents and models](../agents-and-models/).
 
-Read on: the [fleet](../../deploy/fleet/) and
-[work and personal](../../examples/work-and-personal/) pages set machines
-up; the keys are in [flock.toml](../../reference/flock-toml/), and the
-commands in the [cli reference](../../reference/cli/#machine).
+Read on: the [flock](../../deploy/flock/) and
+[sandbox](../../examples/sandbox/) pages set machines up; the keys are in
+[flock.toml](../../reference/flock-toml/), and the commands in the
+[cli reference](../../reference/cli/#machine).

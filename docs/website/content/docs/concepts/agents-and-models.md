@@ -33,24 +33,25 @@ pinned there is refused (`agent_kind_missing`).
 
 `[agents.<name>]` in `pastor.toml` defines an agent by name. `kind` says
 which herdr agent it starts, and `env` sets environment variables in its
-pane. The usual case is a second Claude account on the same machines:
+pane. The usual case is a second Claude account, such as a low-limit one
+for a sandbox machine that holds none of your credentials:
 
 ```toml
 # ~/.config/pastor/pastor.toml
-[agents.claude-work]
+[agents.claude-sandbox]
 kind = "claude"
-env = { CLAUDE_CONFIG_DIR = "~/.claude-work" }  # ~ is the task's machine's home
+env = { CLAUDE_CONFIG_DIR = "~/.claude-sandbox" }  # ~ is the task's machine's home
 ```
 
 ```toml
 # ~/.config/pastor/flock.toml
 [[flock]]
-name = "work"
-machines = { server-1 = 3 }
-agent = "claude-work"  # every task of work runs it
+name = "sandbox"
+machines = { sandbox-1 = 1 }
+agent = "claude-sandbox"  # every task of sandbox runs it
 ```
 
-herdr starts a `claude`, and `task list` shows `claude-work`. A definition
+herdr starts a `claude`, and `task list` shows `claude-sandbox`. A definition
 gets the built-in settings of its kind, such as Claude's folder-trust keys
 and tool flags. For an agent pastor has no built-ins for, the definition
 can set `trust_keys`, `trust_marker`, `allow_flag` and `deny_flag`.
@@ -113,10 +114,10 @@ is of another kind, is refused with `model_kind_mismatch`.
 
 `pastor task describe t-12` prints the agent, its args, the model and the
 profile, each with where it came from, such as
-`model: sonnet (from flock work)`. `task list` has AGENT and MODEL columns.
+`model: sonnet (from flock app)`. `task list` has AGENT and MODEL columns.
 
-Read on: [work and personal](../../examples/work-and-personal/) runs two
-Claude accounts on one head; the keys are in
+Read on: [untrusted work in a sandbox](../../examples/sandbox/) gives a
+sandbox machine its own Claude account; the keys are in
 [pastor.toml](../../reference/pastor-toml/) and
 [flock.toml](../../reference/flock-toml/), and the flags in the
 [cli reference](../../reference/cli/#task).

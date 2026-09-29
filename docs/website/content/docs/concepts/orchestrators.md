@@ -91,7 +91,7 @@ from a file or with `pastor task run --role orchestrator`.
 
 The refusal guards against mistakes, not against a determined script:
 everything runs as the head's user. See
-[profiles and trust](../profiles-and-trust/#agents-and-the-fleet).
+[profiles and trust](../profiles-and-trust/#agents-and-the-flock).
 
 ## commands
 

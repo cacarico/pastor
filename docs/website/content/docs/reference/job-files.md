@@ -24,7 +24,6 @@ tag = "#agent"
 repo = "~/src/app"
 worktree = true
 branch = "kanban/{{ item.key }}"
-flock = "work"
 max_tasks_per_run = 3
 prompt = """
 You are pastor task {{ task.id }}, started from the card "{{ item.title }}".

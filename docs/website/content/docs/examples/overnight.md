@@ -39,7 +39,7 @@ one, and say so in the handover note.
 `cron` is in the head's local time: every five minutes from 22:00 to 07:59.
 `pre` is relative to the file. The script runs on the head with the
 orchestrator's rights: it may run, retry, send to and close tasks, and
-nothing else that changes the fleet. It gets a scratch directory of its own
+nothing else that changes a flock. It gets a scratch directory of its own
 in `PASTOR_ORCHESTRATOR_STATE_DIR`, kept between rounds.
 
 <details>

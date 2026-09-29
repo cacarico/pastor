@@ -5,7 +5,7 @@ weight: 8
 ---
 Running commands by hand is cool, but pastor is even more powerful in the hands of agents.
 
-Ask the coding agent in your own terminal what the fleet is doing, and it
+Ask the coding agent in your own terminal what your flocks are doing, and it
 reads the tasks, sums them up and answers the one that waits on you. The
 agents pastor starts use the same CLI to report how their work went. This
 page shows what to give your agent and where pastor draws the line.
@@ -59,7 +59,7 @@ treats commands from there as that task's.
 A refused command fails with `agent_refused`, and the message lists what is
 off limits. `agents_change_fleet = true` in `pastor.toml` lifts the rule.
 It guards against an agent's mistakes, not against a determined one: the
-agent runs as your user. See [profiles and trust](../../concepts/profiles-and-trust/#agents-and-the-fleet).
+agent runs as your user. See [profiles and trust](../../concepts/profiles-and-trust/#agents-and-the-flock).
 
 ## an orchestrator agent
 
@@ -68,7 +68,7 @@ to and close tasks, enable and disable jobs, and keep its handover note.
 Only a person starts one, never a task:
 
 ```sh
-pastor task run --role orchestrator "Watch the fleet until 8: retry what fails once, answer what blocks, leave a note"
+pastor task run --role orchestrator "Watch the flocks until 8: retry what fails once, answer what blocks, leave a note"
 ```
 
 An [orchestrator file](../../concepts/orchestrators/) starts them on a

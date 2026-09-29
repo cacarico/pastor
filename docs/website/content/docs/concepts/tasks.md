@@ -35,7 +35,7 @@ machine or `[defaults]` unless you pass `--agent`, `--model` or `--profile`
 [profiles and trust](../profiles-and-trust/)). Every flag is in the
 [cli reference](../../reference/cli/#task).
 
-herdr's sidebar shows the task's workspace as `personal/t-12`, its flock and
+herdr's sidebar shows the task's workspace as `default/t-12`, its flock and
 then the task, so tasks of many projects on one machine are easy to tell
 apart. `--label` changes that name.
 

@@ -86,7 +86,7 @@ check, and no list applies. Keep one to machines you could wipe, and never
 use it for jobs fed by outside input. Read a blocked task's pane before you
 answer it.
 
-## agents and the fleet
+## agents and the flock
 
 pastor sets `PASTOR_TASK` in every agent's pane. From there, the agent may
 read everything and end its own task with `pastor task done`. Every command

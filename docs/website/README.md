@@ -14,7 +14,7 @@ tab is also a plain link.
   fails when one of its commands or flags does not exist.
 - `content/docs/` holds five sections, each a folder with an `_index.md`:
   `start`, `concepts` (one page per part of pastor, explaining it),
-  `deploy` (the deployment modes: solo, fleet, remote, as a service),
+  `deploy` (the deployment modes: solo, flock, remote, as a service),
   `examples` (real workflows to copy) and `reference` (tables to look up).
   A page's front matter is `title`, `summary` (shown in the indexes),
   `weight` (its order in the section) and, for a page that moved,
