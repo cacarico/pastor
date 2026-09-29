@@ -3989,6 +3989,135 @@ mod tests {
         assert!(check_commands(SKILL).0 > 20);
     }
 
+    /// Every ```toml fence in the docs parses, and one that is a whole file
+    /// loads with the loader of the file it shows, in a temp config dir, so a
+    /// renamed key cannot leave an example that fails for whoever copies it.
+    /// A fence that is deliberately partial starts with `# fragment` and is
+    /// only parsed.
+    #[test]
+    fn docs_toml_examples_load_as_config() {
+        let repo = skills_dir().parent().unwrap().to_path_buf();
+        let mut files = vec![
+            repo.join("README.md"),
+            repo.join("docs/manual.md"),
+            repo.join("docs/recommended-setup.md"),
+        ];
+        markdown_files(&repo.join("docs/website/content"), &mut files);
+        let mut wrong = Vec::new();
+        let mut loaded = 0;
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (line, fence) in toml_fences(&text) {
+                let at = format!("{}:{line}", file.display());
+                if let Err(e) = toml::from_str::<toml::Table>(&fence) {
+                    wrong.push(format!("{at}: {e}"));
+                    continue;
+                }
+                if fence.trim_start().starts_with("# fragment") {
+                    continue;
+                }
+                match load_example(&fence) {
+                    Ok(()) => loaded += 1,
+                    Err(e) => wrong.push(format!("{at}: {e}")),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        assert!(loaded > 40, "only {loaded} whole-file examples loaded");
+    }
+
+    /// The ```toml fences of a Markdown text with the line each opens on,
+    /// an indented one (in a list item) with its indent taken off.
+    fn toml_fences(text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut open: Option<(usize, usize, String)> = None;
+        for (n, line) in text.lines().enumerate() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            match open.as_mut() {
+                None => {
+                    if trimmed.strip_prefix("```").map(str::trim) == Some("toml") {
+                        open = Some((n + 1, indent, String::new()));
+                    }
+                }
+                Some(_) if trimmed.starts_with("```") => {
+                    let (at, _, block) = open.take().unwrap();
+                    out.push((at, block));
+                }
+                Some((_, pad, block)) => {
+                    block.push_str(line.get(*pad..).unwrap_or(trimmed));
+                    block.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    /// Loads a whole-file example as the file its content shows: a flock
+    /// file (`[[machine]]` or `[[flock]]`), a job (`[connector]` with
+    /// `use`), an orchestrator (`kind`), a connector manifest (`id`), a
+    /// client.toml (`[head]`), or else pastor.toml.
+    fn load_example(text: &str) -> Result<(), String> {
+        use pastor::connector::Catalog;
+        use serde_json::Value;
+        /// Every connector exists: the examples name ones installed apart.
+        struct Any;
+        impl Catalog for Any {
+            fn source(&self, _: &str) -> Option<std::sync::Arc<dyn pastor::connector::ItemSource>> {
+                None
+            }
+            fn check(&self, _: &str, _: &Value) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("config"), tmp.path().join("state"));
+        let write = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let err = |e: anyhow::Error| format!("{e:#}");
+        if table.contains_key("machine") || table.contains_key("flock") {
+            write(&paths.flock_file());
+            Flock::load_existing(&paths.flock_file()).map_err(err)?;
+        } else if table
+            .get("connector")
+            .is_some_and(|c| c.get("use").is_some())
+        {
+            let name = table
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("example");
+            let path = pastor::config::job::job_path(&paths.jobs_dir(), name);
+            write(&path);
+            let defaults = PastorConfig::default().defaults;
+            match pastor::config::job::load_file(&path, name, &defaults, &Any) {
+                pastor::config::job::Loaded::Valid(_) => {}
+                pastor::config::job::Loaded::Invalid { error, .. } => return Err(error),
+            }
+        } else if table.contains_key("kind") {
+            let path = paths.orchestrators_dir().join("example.toml");
+            write(&path);
+            match pastor::orchestrator::load_file(&path, "example") {
+                pastor::orchestrator::Loaded::Valid(_) => {}
+                pastor::orchestrator::Loaded::Invalid { error, .. } => return Err(error),
+            }
+        } else if let Some(id) = table.get("id").and_then(|i| i.as_str()) {
+            let dir = paths.connectors_dir().join(id);
+            write(&dir.join(pastor::connector::manifest::MANIFEST_FILE));
+            pastor::connector::load_manifest(&dir, Some(id))?;
+        } else if table.contains_key("head") {
+            let path = pastor::head::client_file(&paths);
+            write(&path);
+            pastor::head::load(&path).map_err(err)?;
+        } else {
+            write(&paths.config_file());
+            PastorConfig::load_existing(&paths.config_file()).map_err(err)?;
+        }
+        Ok(())
+    }
+
     /// The homepage's live terminal types the commands in
     /// `docs/website/data/demo.toml`; each must be a real command with real
     /// long flags, as the docs' commands are, or the demo would show a CLI

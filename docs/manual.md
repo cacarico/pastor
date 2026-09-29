@@ -607,6 +607,7 @@ A plain number is a hard ceiling. A flock can instead have a share and a max
 on a machine, so a busy project uses slots the quiet ones leave idle:
 
 ```toml
+# fragment of flock.toml
 [[flock]]
 name = "code"
 machines = { desk = { share = 2, max = 4 } }
@@ -778,6 +779,7 @@ timeout = "1h"
 
 [[flock]]
 name = "life"
+default = true
 machines = { desk = 1 }
 model = "haiku"
 place = "pastor"
@@ -887,7 +889,7 @@ deny = ["WebFetch", "Bash(rm:*)"]
 ```
 
 ```toml
-# flock.toml
+# fragment of flock.toml
 [[flock]]
 name = "work"
 allow = ["Bash(make:*)"]
@@ -895,7 +897,7 @@ deny = ["Bash(git push:*)"]
 ```
 
 ```toml
-# a job file
+# fragment of a job file
 [dispatch]
 allow = ["Bash(gh pr view:*)"]
 prompt = "..."
@@ -960,7 +962,7 @@ env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
 ```
 
 ```toml
-# flock.toml: every task of the personal flock runs it
+# fragment of flock.toml: every task of the personal flock runs it
 [[flock]]
 name = "personal"
 agent = "claude-personal"
@@ -1019,7 +1021,7 @@ model = "opus"
 ```
 
 ```toml
-# flock.toml: the personal flock runs sonnet unless a task says otherwise
+# fragment of flock.toml: the personal flock runs sonnet unless a task says otherwise
 [[flock]]
 name = "personal"
 agent = "claude-personal"
@@ -1131,8 +1133,10 @@ unpinned task never takes a machine's, since no machine is picked yet),
 # pastor.toml
 [defaults]
 priority = "low"            # tasks that set none
+```
 
-# flock.toml
+```toml
+# fragment of flock.toml
 [[flock]]
 name = "work"
 machines = { pi-3 = 2 }
@@ -1330,8 +1334,10 @@ not a template.
 # pastor.toml
 [defaults]
 profile = "review"
+```
 
-# flock.toml
+```toml
+# fragment of flock.toml
 [[flock]]
 name = "work"
 profile = "develop"
@@ -2486,6 +2492,7 @@ notifier has no need to see. Its `PASTOR_CONNECTOR_STATE_DIR` is then its own
 `PASTOR_JOB` still names the job.
 
 ```toml
+# fragment of pastor-connector.toml
 [[events]]
 on = ["task.done", "task.blocked"]
 only_own = true
