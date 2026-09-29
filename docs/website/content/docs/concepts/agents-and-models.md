@@ -86,10 +86,28 @@ refused with `unknown_model`.
 
 `fallback = ["sonnet", "gpt"]` names, in order, the models a task may fall
 back to when its own runs out, each finding its agent on the machine as
-above. Nothing switches models yet: pastor settles and keeps the list, and
-shows it. The list comes from `--fallback` or the job's `fallback`, then the
+above. A new task whose model is on an exhausted account starts on the
+first free one (see [usage limits](#usage-limits)); a running task does not
+switch yet. The list comes from `--fallback` or the job's `fallback`, then the
 machine, then the flock, then `[defaults]`; the first list wins whole, and
 `[]` means none. `pastor task run --no-fallback` gives one task none.
+
+## usage limits
+
+A usage limit belongs to an account. `account = "me-personal"` under an
+agent's `[agents]` table says which login it uses; every machine whose agent
+names the same account shares its limits. An agent with no account keeps a
+limit to the machine it was seen on, since the same name can be another
+login elsewhere. pastor never reads the account as a credential.
+
+The head keeps a row per exhausted account (or one model of it) until its
+reset, and a new task does not start on it: it takes the first free model
+of its `fallback` list, or stays queued, and `pastor queue` says why, like
+`waiting: me-personal exhausted until 03:00 (5-hour limit, seen by t-412)`.
+`pastor limit list` shows the rows, and `pastor limit clear <account>`
+forgets one. The events are `agent.exhausted` and `agent.reset`, and
+[`[limits]`](../../reference/pastor-toml/#limits) sets how long a limit
+with no reset holds.
 
 ## a model of another kind
 

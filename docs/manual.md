@@ -1307,6 +1307,94 @@ machine desk)` for a `[]`; `--json` has a `fallback` array.
 from before fallback models refuses `--fallback`, `--no-fallback` and a
 job's `fallback` (`head_too_old`).
 
+A new task goes on under its fallback list when its own model is on an
+exhausted account where it would run; see [Usage limits](#usage-limits).
+A task that is already running does not switch models yet.
+
+### Usage limits
+
+A usage limit belongs to an account: when one Claude login runs out on one
+machine, it has run out on every machine that uses it. The head keeps a
+record of exhausted accounts, and a new task does not start on one before it
+resets.
+
+Which account an agent is logged in to is a label you give it, `account`
+under its `[agents]` table. pastor never reads it as a credential; it only
+compares names.
+
+```toml
+# pastor.toml
+[agents.claude-personal]
+kind = "claude"
+env = { CLAUDE_CONFIG_DIR = "~/.claude-personal" }
+account = "me-personal"    # every machine's claude-personal is this login
+```
+
+An agent that names an account shares its limit with every machine whose
+agent names the same one. An agent that names none keeps its limit to the
+machine it was seen on, under `<machine>/<agent>` (`pi-1/claude`): the same
+agent name can be another login on another machine, so nothing is shared
+unless you say so. An account may not be empty or hold a `/`.
+
+A limit is kept for the whole account, or for one model when the message
+names one (`Opus weekly limit reached` stops `opus` only). It holds until
+`retry_at`: the reset the message named, else `unknown_reset_wait` from when
+it was seen, else `retry_after_no_credit` for a message that says the credit
+ran out (`[limits]` below). A later limit on the same account and model
+replaces the row. Each dispatch pass first deletes the rows whose
+`retry_at` has passed, each with `agent.reset` (`by: time`).
+
+Until then, dispatch skips a machine where every model the task may run is
+on an exhausted account: its own model first, then each of its
+[fallback models](#fallback-models) in order, each settled on that machine as
+any model is. On the first one that is free, the task starts, and `task
+describe` says which and why:
+
+```text
+model:      gpt (fallback 2 of 2; me-personal exhausted until 03:00)
+```
+
+With none free anywhere, the task stays `queued`, and `task describe` and
+`pastor queue` say why:
+
+```text
+waiting: me-personal exhausted until 03:00 (5-hour limit, seen by t-412)
+```
+
+Nothing reads a limit from a task's pane yet: the rows come from an
+orchestrator's agent that stopped on a quota (see
+[Orchestrators](#orchestrators)), and from a pull machine's report. An
+orchestrator whose agent's account is exhausted does not start one before
+the account resets, and shows `waiting for quota`.
+
+`pastor limit list` shows every row: the account, the model (`-` for the
+whole account), when it is tried again, what ran out and the task that saw
+it; `--json` has every field. `pastor limit clear <account>` forgets an
+account's limits, `--model <m>` only that model's, with `agent.reset`
+(`by: hand`), and the tasks they held start on the next pass; clearing an
+account with no limit fails with `not_exhausted`. There is no `limit set`.
+An agent pastor started may list the limits, and may clear one only with
+`agents_change_fleet`.
+
+`[limits]` in pastor.toml:
+
+| key | default | does |
+|---|---|---|
+| `wait_under` | `"1h"` | a limited task waits for a reset closer than this, and falls back past it; `"0s"` never waits |
+| `rate_retries` | `3` | a task stopped on a 429 or 529 is sent on this many times before it counts as limited |
+| `rate_backoff` | `"1m"` | the wait before the first of those; each next one doubles it |
+| `unknown_reset_wait` | `"1h"` | how long a limit whose message names no reset holds |
+| `retry_after_no_credit` | `"6h"` | how long a limit for no credit holds |
+| `handover_lines` | `100` | the pane lines a task moving to another model hands to it |
+
+Only `unknown_reset_wait` and `retry_after_no_credit` are used so far; the
+others are read and checked, for a task that stops on a limit while it runs.
+
+A pull machine's serve reports a limit with its task's state, and the head
+keeps it under the account the task's agent names on that machine. The
+table lives on the head only; a head from before usage limits refuses
+`limit list` and `limit clear` (`head_too_old`).
+
 ### Permission profiles
 
 A permission profile names a pair of tool pattern lists, `allow` and `deny`,
@@ -1849,7 +1937,8 @@ A record, which is also what connector event hooks get on stdin:
 - `type`: `task.queued|running|blocked|done|stale|failed|closed|paused`,
   `task.input` (`pastor task send`), `task.trusted` (the head answered a
   trust prompt), `job.failed`, `connector.finish_failed` (a connector's
-  `[finish]` command failed), `machine.connected`, `machine.lost`, and
+  `[finish]` command failed), `machine.connected`, `machine.lost`,
+  `agent.exhausted` and `agent.reset` (see Usage limits), and
   `orchestrator.started|skipped|held|quota|failed|restarted|stopping|stopped`
   (see Orchestrators).
 - `task`: the full task row at that moment, as stored: `pastor task describe
@@ -1884,7 +1973,11 @@ A record, which is also what connector event hooks get on stdin:
   on `restarted`, `reason` (`hours` or `hand`) on `stopping` and `stopped`
   and `grace` on `stopping`, and `stage` (`pre`, `agent`, `post` or
   `state`) and `error` on `failed`, with `failures` (how many in a row) on a
-  `pre` failure.
+  `pre` failure; on `agent.exhausted` and `agent.reset`, `account`, `model`
+  (null for the whole account), `agent` and `retry_at`, with `until`,
+  `hard`, `no_credit`, `what` (`5-hour limit`, `no credit`) and `line` on
+  `agent.exhausted` and `by` (`time` or `hand`) on `agent.reset`; the
+  record's `task` is the task that saw the limit, when one did.
 - `summary`: on `task.done` and `task.failed`, how the round that just ended
   ended (see Task summaries): `round`, `outcome` (`done`, `partial`,
   `blocked`, `nothing to do`, `unknown`, or `no summary`), `text`, `source`
@@ -2130,7 +2223,10 @@ person names it with `--name`. `-` reads the note from stdin.
 **Quota.** When the agent ends its turn on a usage limit, the head reads the
 reset time from the message, or waits an hour when it names none, emits
 `orchestrator.quota` with `until`, and starts no agent for that orchestrator
-before then. The pre script keeps running, so the mechanical work goes on; a
+before then. The limit also goes in the head's table of exhausted accounts
+(see [Usage limits](#usage-limits)), so no task starts on that account
+either, and an orchestrator whose agent's account is in that table waits for
+it the same way. The pre script keeps running, so the mechanical work goes on; a
 session waits, holding its slot, and restarts at the reset.
 
 The head looks at the end of the turn only: the agent's error and what

@@ -101,6 +101,7 @@ with its own config dir. A task, job, flock or machine names it with
 | `trust_marker` | `"Yes, I trust this folder"` for Claude, else none | text only the trust prompt shows; saved trust presses the keys only while the pane shows it |
 | `allow_flag` | `"--allowedTools"` for Claude | the flag put before each `allow` pattern; an agent with none refuses tasks that carry an allow list |
 | `deny_flag` | `"--disallowedTools"` for Claude | the same, for `deny` |
+| `account` | none | a label for the login the agent uses: every machine whose agent names the same account shares its usage limits; unset, a limit holds only on the machine it was seen on |
 
 ## models
 
@@ -145,6 +146,21 @@ the list for one run.
 | key | default | does |
 |---|---|---|
 | `name` | required | the connector's id, as `pastor connector list` shows it |
+
+## limits
+
+`[limits]` says how the head treats an account that ran out of usage. See
+[usage limits](../../concepts/agents-and-models/#usage-limits); `pastor
+limit list` shows the accounts it holds back.
+
+| key | default | does |
+|---|---|---|
+| `wait_under` | `"1h"` | a limited task waits for a reset closer than this, and falls back past it; `"0s"` never waits |
+| `rate_retries` | `3` | a task stopped on a 429 or 529 is sent on this many times before it counts as limited |
+| `rate_backoff` | `"1m"` | the wait before the first of those; each next one doubles it |
+| `unknown_reset_wait` | `"1h"` | how long a limit whose message names no reset holds |
+| `retry_after_no_credit` | `"6h"` | how long a limit for no credit holds |
+| `handover_lines` | `100` | the pane lines a task moving to another model hands to it |
 
 ## shepherd
 
