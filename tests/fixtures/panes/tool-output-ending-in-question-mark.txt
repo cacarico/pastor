@@ -1,0 +1,24 @@
+#! question: no
+#! shell: no
+#! trust: no
+● Bash(make check)
+  ⎿  cargo fmt --check
+     cargo clippy --all-targets -- -D warnings
+     test result: ok. 412 passed; 0 failed
+     … +38 lines (ctrl+o to expand)
+
+● Checking what the docs still say about the old flag.
+
+● Search(pattern: "legacy", path: "docs")
+  ⎿  Found 2 lines
+
+● Bash(grep -n "legacy" docs/manual.md)
+  ⎿  412:Is `--legacy` still needed?
+     418:Why keep `--legacy` at all?
+
+✻ Baked for 4m 12s
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
