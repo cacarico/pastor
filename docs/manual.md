@@ -1927,6 +1927,22 @@ instructions back by path in `OPENCODE_CONFIG_CONTENT`: its `AGENTS.md`, or
 when there is none its `CLAUDE.md`, the one file opencode would have read
 itself. On a `command` machine, which cannot be asked, both go.
 
+A Codex agent (kind `codex`) starts with `--ask-for-approval never
+--sandbox workspace-write` after its args: it never stops to ask, and its
+commands run in a sandbox that may write only the workspace, with no
+network. Under `unrestricted` the sandbox is `danger-full-access`. Codex has
+no per-command allow or deny flag, so the sandbox stands in for the lists: a
+list it has no `allow_flag` or `deny_flag` for is not passed, and not
+refused either (`agent_tools_unsupported` is only for a task with no
+profile). `pastor task describe` shows such a list with `(not applied: ...)`
+after it. Agent args that pick an approval policy or sandbox
+(`--ask-for-approval`, `-a`, `--sandbox`, `-s`, `--full-auto`,
+`--dangerously-bypass-approvals-and-sandbox`, `--yolo`, or a `-c` of
+`approval_policy` or `sandbox_mode`) are refused while a profile applies
+(`profile_args_conflict`). A task that needs the network, such as a review
+that calls `gh`, adds `-c sandbox_workspace_write.network_access=true` to
+its agent args; the profile does not turn it on.
+
 An agent of any other kind gets the lists through its `allow_flag` and
 `deny_flag`, as any list, and keeps its own permission mode.
 

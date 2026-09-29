@@ -742,6 +742,7 @@ impl Fleet {
             profile_from: pick.profile.as_ref().map(|&(_, layer)| label(layer)),
             timeout_from,
             place_from,
+            lists_unapplied: None,
         }));
         models.apply(&pick, &agents, spec)?;
         // What the machine's owner lets run there (the unrestricted rule).
@@ -749,7 +750,12 @@ impl Fleet {
         self.profiles
             .read()
             .recover()
-            .apply(&pick, own.as_deref(), spec)
+            .apply(&pick, own.as_deref(), spec)?;
+        let unapplied = agents.lists_unapplied(spec);
+        if let Some(source) = spec.agent_source.as_mut() {
+            source.lists_unapplied = unapplied;
+        }
+        Ok(())
     }
 
     /// The level of a task being queued in `flock`, pinned to `pinned` if it
@@ -7777,6 +7783,91 @@ mod tests {
         };
         assert_eq!(t.profile(), None);
         assert!(t.spec.allow.is_empty());
+    }
+
+    /// A profiled Codex task runs with no approval prompts in its
+    /// workspace-write sandbox, not refused for its lists, which it keeps
+    /// and `task describe` marks as not applied.
+    #[tokio::test]
+    async fn a_codex_task_runs_under_a_profile_in_its_sandbox() {
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = profiles_daemon(vec![machine("pi", 2)], &[("pi", 2, fake.clone())]).await;
+        let IpcRequest::Run {
+            agent: Some(choice),
+            ..
+        } = run_profile(Some("ci"), None)
+        else {
+            unreachable!()
+        };
+        let IpcRequest::Run {
+            now,
+            preempt,
+            summary,
+            prompt,
+            spec,
+            flock,
+            priority,
+            role,
+            description,
+            ..
+        } = run_profile(Some("ci"), None)
+        else {
+            unreachable!()
+        };
+        let run = IpcRequest::Run {
+            now,
+            preempt,
+            summary,
+            prompt,
+            spec,
+            flock,
+            priority,
+            role,
+            description,
+            agent: Some(AgentChoice {
+                agent: Some("codex".into()),
+                ..choice
+            }),
+        };
+        let resp = d.handle(run).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.spec.agent, "codex");
+        assert!(t.spec.deny.contains(&"Bash(sudo:*)".to_string()));
+        let why = t
+            .spec
+            .agent_source
+            .as_ref()
+            .unwrap()
+            .lists_unapplied
+            .clone();
+        assert!(
+            why.as_deref().unwrap().contains("workspace-write"),
+            "{why:?}"
+        );
+        let reqs = fake.requests();
+        let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+        let args: Vec<&str> = start.params["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(
+            args.ends_with(&[
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "workspace-write"
+            ]),
+            "{args:?}"
+        );
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("(not applied: codex has no per-command"),
+            "{text}"
+        );
     }
 
     /// A machine's profile reaches its tasks, before its flock's; a name

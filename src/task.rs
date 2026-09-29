@@ -557,6 +557,10 @@ pub struct AgentSource {
     /// Where the spec's `place` came from, like `timeout_from`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place_from: Option<String>,
+    /// Why the spec's `allow` and `deny` do not reach the agent, when they
+    /// do not (`Agents::lists_unapplied`), as settled on the task's agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lists_unapplied: Option<String>,
 }
 
 /// Which of its fallback models a task started on, and why not on those

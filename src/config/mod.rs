@@ -1234,6 +1234,32 @@ fn is_permission_arg(arg: &str) -> bool {
         || arg == "--allow-dangerously-skip-permissions"
 }
 
+/// What a Codex agent under a permission profile starts with: it never
+/// asks for approval, and runs its commands in a sandbox that may write only
+/// the workspace. Codex has no per-command allow or deny flag, so the sandbox
+/// stands in for the profile's lists. `unrestricted` gets no sandbox, as
+/// nothing is denied under it.
+const CODEX_NO_ASK: [&str; 2] = ["--ask-for-approval", "never"];
+const CODEX_SANDBOX: &str = "--sandbox";
+const CODEX_WORKSPACE_WRITE: &str = "workspace-write";
+const CODEX_FULL_ACCESS: &str = "danger-full-access";
+
+/// Does `arg` (after `prev`) pick Codex's approval policy or sandbox, or turn
+/// both off? A `-c` override of either key counts too.
+fn is_codex_permission_arg(prev: Option<&str>, arg: &str) -> bool {
+    let flag = |long: &str, short: &str| {
+        arg == long || arg == short || arg.starts_with(&format!("{long}="))
+    };
+    let key = |v: &str| v.starts_with("approval_policy") || v.starts_with("sandbox_mode");
+    flag("--ask-for-approval", "-a")
+        || flag("--sandbox", "-s")
+        || arg == "--full-auto"
+        || arg == "--dangerously-bypass-approvals-and-sandbox"
+        || arg == "--yolo"
+        || (matches!(prev, Some("-c" | "--config")) && key(arg))
+        || arg.strip_prefix("--config=").is_some_and(key)
+}
+
 /// Claude Code's own names for the allow and deny lists (`claude --help`).
 /// Both take several patterns and may repeat, so one flag per pattern works.
 const CLAUDE_TOOL_FLAGS: (&str, &str) = ("--allowedTools", "--disallowedTools");
@@ -1350,6 +1376,30 @@ impl Agents {
         })
     }
 
+    /// Why `spec`'s allow and deny lists do not reach its agent, when they
+    /// do not: a Codex agent under a profile, with no flag of its own for a
+    /// list it has, runs in its sandbox instead (`launch_args`). `task
+    /// describe` shows it next to the lists.
+    pub fn lists_unapplied(&self, spec: &crate::task::DispatchSpec) -> Option<String> {
+        let profile = spec.profile()?;
+        if self.kind(&spec.agent) != "codex" {
+            return None;
+        }
+        let (allow_flag, deny_flag) = self.tool_flags(&spec.agent);
+        let dropped = (!spec.allow.is_empty() && allow_flag.is_none())
+            || (!spec.deny.is_empty() && deny_flag.is_none());
+        dropped.then(|| {
+            let sandbox = if profile == profile::UNRESTRICTED {
+                CODEX_FULL_ACCESS
+            } else {
+                CODEX_WORKSPACE_WRITE
+            };
+            format!(
+                "not applied: codex has no per-command allow or deny flag; it runs in its {sandbox} sandbox"
+            )
+        })
+    }
+
     /// Does `spec` run an opencode agent under a permission profile? Its
     /// lists then go in `OPENCODE_PERMISSION`, not in flags.
     pub fn opencode_profile(&self, spec: &crate::task::DispatchSpec) -> bool {
@@ -1358,9 +1408,12 @@ impl Agents {
 
     /// The argv after the agent's name for `spec`: its `agent_args`, then,
     /// under a permission profile, the args that stop a Claude agent from
-    /// asking (`--permission-mode dontAsk`), then the flag and pattern of
-    /// each `allow`, then of each `deny`; an opencode agent under a profile
-    /// gets no tool flags, its lists going in `launch`'s env. Refused when a list is not empty
+    /// asking (`--permission-mode dontAsk`) or a Codex one
+    /// (`--ask-for-approval never --sandbox workspace-write`), then the flag
+    /// and pattern of each `allow`, then of each `deny`; an opencode agent
+    /// under a profile gets no tool flags, its lists going in `launch`'s
+    /// env, and a Codex one skips a list it has no flag for
+    /// (`lists_unapplied`). Refused when a list is not empty
     /// and the agent has no flag for it (`agent_tools_unsupported`):
     /// dropping a deny list without a word would be worse than not
     /// starting. Refused too when a profile applies and the args already
@@ -1388,6 +1441,33 @@ impl Agents {
             }
             args.extend(CLAUDE_NO_ASK.map(str::to_string));
         }
+        let codex_profile = spec.profile().filter(|_| self.kind(&spec.agent) == "codex");
+        if let Some(profile) = codex_profile {
+            let prev = std::iter::once(None).chain(args.iter().map(|a| Some(a.as_str())));
+            if let Some((_, arg)) = prev
+                .zip(&args)
+                .find(|(prev, a)| is_codex_permission_arg(*prev, a))
+            {
+                return Err(AgentRefusal {
+                    code: PROFILE_ARGS_CONFLICT,
+                    message: format!(
+                        "task runs under profile {profile}, and agent {}'s args set {arg}; \
+                         drop it from agent_args or the model's args, or run without a profile",
+                        spec.agent
+                    ),
+                });
+            }
+            args.extend(CODEX_NO_ASK.map(str::to_string));
+            args.push(CODEX_SANDBOX.into());
+            args.push(
+                if profile == profile::UNRESTRICTED {
+                    CODEX_FULL_ACCESS
+                } else {
+                    CODEX_WORKSPACE_WRITE
+                }
+                .into(),
+            );
+        }
         if self.opencode_profile(spec) {
             return Ok(args);
         }
@@ -1399,6 +1479,10 @@ impl Agents {
                 continue;
             }
             let Some(flag) = flag else {
+                // Its sandbox stands in (`lists_unapplied`).
+                if codex_profile.is_some() {
+                    continue;
+                }
                 return Err(AgentRefusal {
                     code: "agent_tools_unsupported",
                     message: format!(
@@ -3314,8 +3398,8 @@ mod tests {
 
     /// Under a profile a Claude agent starts with `--permission-mode
     /// dontAsk` after its args and before its tool flags; args that pick a
-    /// permission mode of their own are refused. An agent of another kind
-    /// gets the lists only, through its own flags.
+    /// permission mode of their own are refused. A Codex agent with flags of
+    /// its own gets its lists through them (`a_profile_starts_codex_in_its_sandbox`).
     #[test]
     fn a_profile_starts_claude_without_asking() {
         let with_profile = |agent: &str, args: &[&str]| {
@@ -3334,6 +3418,7 @@ mod tests {
                 profile_from: Some("defaults".into()),
                 timeout_from: None,
                 place_from: None,
+                lists_unapplied: None,
             }));
             spec
         };
@@ -3388,11 +3473,121 @@ mod tests {
             vec![
                 "--permission-mode",
                 "x",
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "workspace-write",
                 "--allow",
                 "Edit",
                 "--deny",
                 "Bash(sudo:*)"
             ]
+        );
+    }
+
+    /// Under a profile a Codex agent starts with `--ask-for-approval never
+    /// --sandbox workspace-write` after its args; `unrestricted` gets
+    /// `danger-full-access`. Codex has no per-command flag, so its lists are
+    /// left out rather than refused, and `lists_unapplied` says so. Args
+    /// that pick an approval policy or sandbox are refused.
+    #[test]
+    fn a_profile_starts_codex_in_its_sandbox() {
+        let with_profile = |agent: &str, profile: &str, args: &[&str]| {
+            let mut spec = spec_with(agent, &["Edit"], &["Bash(sudo:*)"]);
+            spec.agent_args = args.iter().map(|s| s.to_string()).collect();
+            spec.agent_source = Some(Box::new(crate::task::AgentSource {
+                agent: "defaults".into(),
+                profile: Some(profile.into()),
+                ..Default::default()
+            }));
+            spec
+        };
+        let agents = Agents::default();
+        let spec = with_profile("codex", "review", &["--model", "m"]);
+        assert_eq!(
+            agents.launch_args(&spec).unwrap(),
+            vec![
+                "--model",
+                "m",
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "workspace-write"
+            ]
+        );
+        let why = agents.lists_unapplied(&spec).unwrap();
+        assert!(
+            why.contains("not applied") && why.contains("workspace-write"),
+            "{why}"
+        );
+        let spec = with_profile("codex", "unrestricted", &[]);
+        assert_eq!(
+            agents.launch_args(&spec).unwrap(),
+            vec![
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "danger-full-access"
+            ]
+        );
+        assert!(
+            agents
+                .lists_unapplied(&spec)
+                .unwrap()
+                .contains("danger-full-access")
+        );
+        // A network override is not a sandbox pick.
+        let args = ["-c", "sandbox_workspace_write.network_access=true"];
+        assert_eq!(
+            agents
+                .launch_args(&with_profile("codex", "develop", &args))
+                .unwrap()[..2],
+            args
+        );
+        for arg in [
+            &["--ask-for-approval", "on-request"][..],
+            &["-a", "never"],
+            &["--ask-for-approval=never"],
+            &["--sandbox", "read-only"],
+            &["-s", "read-only"],
+            &["--sandbox=read-only"],
+            &["--full-auto"],
+            &["--dangerously-bypass-approvals-and-sandbox"],
+            &["--yolo"],
+            &["-c", "approval_policy=never"],
+            &["--config", "sandbox_mode=\"read-only\""],
+            &["--config=sandbox_mode=read-only"],
+        ] {
+            let err = agents
+                .launch_args(&with_profile("codex", "develop", arg))
+                .unwrap_err();
+            assert_eq!(err.code, PROFILE_ARGS_CONFLICT, "{arg:?}");
+            assert!(err.message.contains("profile develop"), "{err}");
+        }
+        // A definition of kind codex is codex.
+        let mine: Agents = toml::from_str("[cx]\nkind = \"codex\"\n").unwrap();
+        let spec = with_profile("cx", "develop", &[]);
+        assert!(
+            mine.launch_args(&spec)
+                .unwrap()
+                .contains(&"never".to_string())
+        );
+        assert!(mine.lists_unapplied(&spec).is_some());
+        // Without a profile the lists still need flags, and the args pass.
+        let mut plain = with_profile("codex", "develop", &["--full-auto"]);
+        plain.agent_source = None;
+        assert_eq!(
+            agents.launch_args(&plain).unwrap_err().code,
+            "agent_tools_unsupported"
+        );
+        assert_eq!(agents.lists_unapplied(&plain), None);
+        plain.allow.clear();
+        plain.deny.clear();
+        assert_eq!(agents.launch_args(&plain).unwrap(), vec!["--full-auto"]);
+        // Nor does a Claude agent's lists go unapplied.
+        assert_eq!(
+            agents.lists_unapplied(&with_profile("claude", "develop", &[])),
+            None
         );
     }
 
@@ -3416,6 +3611,7 @@ mod tests {
             profile_from: Some("defaults".into()),
             timeout_from: None,
             place_from: None,
+            lists_unapplied: None,
         }));
         let agents: Agents = toml::from_str(
             "[opencode]\nallow_flag = \"--allow\"\n\

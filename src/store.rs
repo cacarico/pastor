@@ -3435,6 +3435,7 @@ mod tests {
                         profile_from: None,
                         timeout_from: None,
                         place_from: Some("flock default".into()),
+                        lists_unapplied: None,
                     })),
                     ..spec()
                 },

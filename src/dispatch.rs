@@ -2031,6 +2031,7 @@ mod tests {
                 profile_from: Some("defaults".into()),
                 timeout_from: None,
                 place_from: None,
+                lists_unapplied: None,
             })),
             ..spec()
         }
