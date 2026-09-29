@@ -260,6 +260,7 @@ const JOB_PROFILE: &str =
     "predates a job naming a permission profile, and would start its agents unenforced";
 const JOB_DESCRIPTION: &str =
     "predates a job naming a description, and would refuse its dispatch table";
+const JOB_PRIORITY: &str = "predates a job naming a priority, and would refuse its dispatch table";
 const JOB_PREEMPT: &str = "predates a job with preempt, and would refuse its dispatch table";
 const JOB_LABEL: &str =
     "predates a job naming a workspace label, and would name its workspaces t-N";
@@ -824,6 +825,9 @@ impl IpcRequest {
                 need.at(JOB_SUBMIT_PROTOCOL, JOB_SUBMIT);
                 if has("model") {
                     need.at(MODEL_PROTOCOL, JOB_MODEL);
+                }
+                if has("priority") {
+                    need.at(PRIORITY_PROTOCOL, JOB_PRIORITY);
                 }
                 if has("profile") {
                     need.at(PROFILE_PROTOCOL, JOB_PROFILE);
@@ -2019,6 +2023,11 @@ mod tests {
                 submit(serde_json::json!({"model": "fast"})),
                 MODEL_PROTOCOL,
                 "model",
+            ),
+            (
+                submit(serde_json::json!({"priority": "high"})),
+                PRIORITY_PROTOCOL,
+                "priority",
             ),
             (
                 req(

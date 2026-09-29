@@ -2640,8 +2640,8 @@ store, and never reads `flock.toml`.
   dispatches the tasks under the job's name. The keys it queued, and those
   it had seen already (a run whose reply was lost), are marked seen here.
 - A head that does not answer fails the run with `head_unreachable`, a head
-  too old for what the job's `[dispatch]` names (a model, a profile, a
-  label, `preempt`, `summary`, a description) with `head_too_old`, and a
+  too old for what the job's `[dispatch]` names (a model, a priority, a
+  profile, a label, `preempt`, `summary`, a description) with `head_too_old`, and a
   head with a job file of that name with `job_name_taken`: each counts as
   a failed run, backing the job off as a failing connector does, and no item
   is kept, so the next run asks the connector for them again. An item the
