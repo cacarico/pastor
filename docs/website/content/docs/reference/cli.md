@@ -116,7 +116,7 @@ List live tasks across the flock; --all adds finished ones
 
 ### pastor task describe
 
-One task in full: state, machine, agent, prompt, error, summary
+One task in full: state, machine, agent, the models it moved through on usage limits, prompt, error, summary
 
 | argument | does | default |
 |---|---|---|
