@@ -992,6 +992,23 @@ fn occupant(agents: &[AgentInfo], pane: &str) -> Occupant {
         .map(|a| a.name.clone())
 }
 
+/// Is `pane`'s agent stopped (idle or done) by `agents`, or is the pane
+/// empty.
+fn stopped_in(agents: &[AgentInfo], pane: &str) -> bool {
+    agents
+        .iter()
+        .find(|a| a.pane_id == pane)
+        .is_none_or(|a| matches!(a.agent_status, AgentStatus::Idle | AgentStatus::Done))
+}
+
+/// Would `next_state` read `pane`'s agent, by `agents`, as `task` finishing.
+fn completion_pending_in(agents: &[AgentInfo], task: &Task, pane: &str) -> bool {
+    agents
+        .iter()
+        .find(|a| a.pane_id == pane)
+        .is_some_and(|agent| next_state(task, &observed_from(agent)) == Some(TaskState::Done))
+}
+
 /// Agents named `t-<id>` that none of `owned` (the pane-owning tasks on the
 /// machine, `Store::tasks_on_machine`) accounts for, as (agent name, pane id).
 /// Shared by the actor's reconcile and the daemon-less `machine status`.
@@ -2678,16 +2695,9 @@ impl Actor {
         let Some(after) = self.settings.close_failed_after else {
             return Ok(());
         };
-        let candidates: Vec<Task> = self
+        let candidates = self
             .store
-            .list_tasks(&TaskFilter {
-                machine: Some(self.name.clone()),
-                states: Some(vec![TaskState::Failed, TaskState::Stale]),
-                ..Default::default()
-            })?
-            .into_iter()
-            .filter(|t| t.pane_id.is_some())
-            .collect();
+            .tasks_holding_panes(&self.name, &[TaskState::Failed, TaskState::Stale])?;
         if candidates.is_empty() && self.orphans.is_empty() {
             return Ok(());
         }
@@ -2695,21 +2705,11 @@ impl Actor {
         let agents = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
             .map_err(|_| TimedOut("agent.list", timeout))??;
-        let stopped = |pane: &str| {
-            agents
-                .iter()
-                .find(|a| a.pane_id == pane)
-                .is_none_or(|a| matches!(a.agent_status, AgentStatus::Idle | AgentStatus::Done))
-        };
+        let stopped = |pane: &str| stopped_in(&agents, pane);
         // A pane whose agent is idle for a reason `next_state` would read as
         // this very task finishing: `confirm_pending_done` gets first say,
         // not this shorter grace.
-        let pending_completion = |t: &Task, pane: &str| {
-            agents
-                .iter()
-                .find(|a| a.pane_id == pane)
-                .is_some_and(|agent| next_state(t, &observed_from(agent)) == Some(TaskState::Done))
-        };
+        let pending_completion = |t: &Task, pane: &str| completion_pending_in(&agents, t, pane);
         // Start, or keep, each stopped pane's clock; a pane seen at work, or
         // whose idle is a pending completion, has its clock reset instead,
         // so a later stop (or a completion that turns out not to be one)
@@ -2791,12 +2791,31 @@ impl Actor {
                 _ => {}
             }
         }
+        // Each `pane.close` can take up to `request_timeout`, and `agents`
+        // was listed before the first: by the time a later pane's turn
+        // comes, its agent may have gone back to work or herdr may have
+        // handed the pane to another. So after every close the agents are
+        // listed again, and a pane whose agent is no longer the stopped one
+        // its clock was started for is kept, its clock dropped: the next
+        // check starts a fresh grace, or repairs a reused task pane.
+        let mut agents = agents;
+        let mut listed = true;
         let mut closed = HashSet::new();
-        for t in due {
+        for mut t in due {
             let pane = t.pane_id.clone().expect("filtered on a pane");
             let name = t.display_id();
-            if !stopped(&pane) {
-                tracing::debug!(machine = %self.name, task = %name, "pane kept: its agent is at work");
+            if !listed {
+                agents = tokio::time::timeout(timeout, self.connector.agent_list())
+                    .await
+                    .map_err(|_| TimedOut("agent.list", timeout))??;
+                listed = true;
+            }
+            if !self.still_stopped(&agents, &pane)
+                || holds_other_agent(&t, &agents, &pane)
+                || completion_pending_in(&agents, &t, &pane)
+            {
+                tracing::debug!(machine = %self.name, task = %name, "pane kept: its agent is at work, or another holds it, since it was found stopped");
+                self.stopped_since.remove(&pane);
                 continue;
             }
             if t.state == TaskState::Stale {
@@ -2813,13 +2832,16 @@ impl Actor {
                     }
                     ours
                 })?;
-                if failed.is_none() {
+                let Some(failed) = failed else {
                     continue;
-                }
+                };
+                t = failed;
                 self.pending_done.remove(&t.id);
                 self.emit("task.failed", Some(t.id));
             }
-            match self.close_pane_of(&pane, &name).await {
+            let close = self.close_pane_of(&pane, &name).await;
+            listed = false;
+            match close {
                 Ok(()) => {}
                 Err(err) if is_outage(&err) => return Err(err),
                 Err(err) => {
@@ -2840,16 +2862,28 @@ impl Actor {
         }
         // Looked for again, not taken from the last reconcile: a task may
         // have claimed the agent since.
-        let still = orphan_agents(&agents, &self.store.tasks_on_machine(&self.name)?);
+        let owned = self.store.tasks_on_machine(&self.name)?;
         for (agent, pane) in orphans_due {
-            if closed.contains(&pane) || !still.contains(&(agent.clone(), pane.clone())) {
+            if closed.contains(&pane) {
                 continue;
             }
-            if !stopped(&pane) {
-                tracing::debug!(machine = %self.name, %agent, "orphan kept: it is at work");
+            if !listed {
+                agents = tokio::time::timeout(timeout, self.connector.agent_list())
+                    .await
+                    .map_err(|_| TimedOut("agent.list", timeout))??;
+                listed = true;
+            }
+            if !orphan_agents(&agents, &owned).contains(&(agent.clone(), pane.clone())) {
                 continue;
             }
-            match self.close_pane_of(&pane, &agent).await {
+            if !self.still_stopped(&agents, &pane) {
+                tracing::debug!(machine = %self.name, %agent, "orphan kept: it is at work, or another holds its pane, since it was found stopped");
+                self.stopped_since.remove(&pane);
+                continue;
+            }
+            let close = self.close_pane_of(&pane, &agent).await;
+            listed = false;
+            match close {
                 Ok(()) => {}
                 Err(err) if is_outage(&err) => return Err(err),
                 Err(err) => {
@@ -3877,6 +3911,16 @@ impl Actor {
             })?;
         }
         Ok(())
+    }
+
+    /// Is `pane` still held, by `agents`, by the stopped occupant its
+    /// auto-close clock (`stopped_since`) was started for.
+    fn still_stopped(&self, agents: &[AgentInfo], pane: &str) -> bool {
+        stopped_in(agents, pane)
+            && self
+                .stopped_since
+                .get(pane)
+                .is_some_and(|(who, _)| *who == occupant(agents, pane))
     }
 
     /// Drop the orphan in `pane_id`, if there is one. Returns whether it did.
@@ -7178,6 +7222,81 @@ mod tests {
         })
         .await;
         assert_eq!(state_of(&store, t.id), TaskState::Failed);
+    }
+
+    /// Two failed tasks' panes come due in one check. While the first
+    /// `pane.close` is in flight, the other agent goes back to work: the
+    /// agents are listed again before the second close, and that pane is
+    /// kept, its grace starting over once it stops.
+    #[tokio::test]
+    async fn a_pane_whose_agent_resumed_during_an_earlier_close_is_kept() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let a = stopped_task(&fake, &store, TaskState::Failed).await;
+        let b = stopped_task(&fake, &store, TaskState::Failed).await;
+        // Whichever closes first sets the other working.
+        for t in [&a, &b] {
+            fake.on_next_close_set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Working);
+        }
+        let grace = Duration::from_millis(300);
+        let (_h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: Some(grace),
+                ..close_failed_settings()
+            },
+        );
+        let open = |t: &Task| pane_open(&fake, t.pane_id.as_deref().unwrap());
+        wait_for("one pane closed", || !open(&a) || !open(&b)).await;
+        let kept = if open(&a) { &a } else { &b };
+        tokio::time::sleep(grace * 3).await;
+        assert!(open(kept), "its agent is at work again");
+        assert_eq!(calls(&fake, "pane.close").len(), 1);
+        assert_eq!(
+            store.get_task(kept.id).unwrap().unwrap().pane_id,
+            kept.pane_id
+        );
+    }
+
+    /// Two orphans' panes come due in one check. While the first
+    /// `pane.close` is in flight, herdr hands the other pane to a new
+    /// agent: the agents are listed again before the second close, and the
+    /// newcomer keeps the pane for a full grace of its own.
+    #[tokio::test]
+    async fn a_pane_reused_during_an_earlier_close_is_kept() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let pa = start_agent(&fake, "t-97").await;
+        let pb = start_agent(&fake, "t-98").await;
+        let grace = Duration::from_millis(600);
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: Some(grace),
+                ..close_failed_settings()
+            },
+        );
+        wait_for("orphans found", || h.snapshot().orphans.len() == 2).await;
+        // Whichever closes first has the other pane handed out again.
+        fake.on_next_close_replace(&pa, "t-96");
+        fake.on_next_close_replace(&pb, "t-96");
+        wait_for("one pane closed", || {
+            !pane_open(&fake, &pa) || !pane_open(&fake, &pb)
+        })
+        .await;
+        let kept = if pane_open(&fake, &pa) { pa } else { pb };
+        assert_eq!(calls(&fake, "pane.close").len(), 1);
+        tokio::time::sleep(grace / 2).await;
+        assert!(
+            pane_open(&fake, &kept),
+            "the newcomer's own grace has not run out"
+        );
+        wait_for("closed after the newcomer's own grace", || {
+            !pane_open(&fake, &kept)
+        })
+        .await;
     }
 
     /// A stale task's real completion still gets its full `settle` window

@@ -235,7 +235,10 @@ stopped, not at the moment the task failed or timed out, and resets each
 time the same pane is found at work again, so an agent that keeps going past
 the grace is not closed the instant it finally stops. The clock is the
 agent's, not the pane's: herdr hands pane ids out again, and another agent
-found in the pane starts it again. A failed task stays `failed` and records
+found in the pane starts it again. Closing one pane can take a while, so
+before each further close in the same check pastor lists the agents again,
+and a pane whose agent went back to work or was replaced meanwhile is kept.
+A failed task stays `failed` and records
 no pane any more, and its worktree stays for the retry; a failed task whose
 pane someone else closes lets go of it too.
 A stale task whose agent stopped turns `failed` first (a `task.failed`
