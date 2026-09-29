@@ -258,6 +258,12 @@ pub struct MachineStatus {
     /// `live`, never closed unless `pastor task close` asks.
     #[serde(default)]
     pub orphans: Vec<String>,
+    /// The live tasks here that `task run --now` started past the
+    /// machine's limits, like `t-9`; `live` counts them. Filled in by
+    /// `Fleet::statuses` from the store; empty from an actor, and from a
+    /// head that predates `--now`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub now: Vec<String>,
     /// The flock the machine is in, as the head last applied flock.toml.
     /// The actor does not know it; `Fleet::statuses` fills it in. `None`
     /// from an actor, and from a head that predates flocks.
@@ -763,6 +769,7 @@ pub const PULL_ENDPOINT: &str = "pull: its own pastor serve asks the head for ta
 pub fn pull_machine(name: String, max_agents: u32, tags: Vec<String>) -> MachineHandle {
     let (tx, _) = mpsc::channel(1);
     let status = Arc::new(RwLock::new(MachineStatus {
+        now: Vec::new(),
         description: None,
         name: name.clone(),
         host: "pull".into(),
@@ -808,6 +815,7 @@ pub fn spawn_machine(
 ) -> MachineHandle {
     let (tx, rx) = mpsc::channel(32);
     let status = Arc::new(RwLock::new(MachineStatus {
+        now: Vec::new(),
         description: None,
         name: name.clone(),
         host: connector.host(),
@@ -4042,6 +4050,7 @@ mod tests {
 
     fn spec() -> DispatchSpec {
         DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],

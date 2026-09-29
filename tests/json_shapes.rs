@@ -182,6 +182,7 @@ const SUMMARY: &[(&str, &str)] = &[
 
 fn spec() -> DispatchSpec {
     DispatchSpec {
+        now: false,
         agent: "claude".into(),
         agent_args: vec![],
         allow: vec![],
@@ -448,6 +449,7 @@ const MACHINE_MAY_BE_ABSENT: &[&str] = &["flocks"];
 
 fn machine_row() -> MachineRow {
     MachineRow {
+        now: Vec::new(),
         name: "pi-1".into(),
         host: "user@pi-1".into(),
         endpoint: "ssh user@pi-1".into(),
@@ -477,6 +479,7 @@ fn machine_row() -> MachineRow {
 /// A machine never reached, in no named flock, with nothing optional set.
 fn bare_machine_row() -> MachineRow {
     MachineRow {
+        now: Vec::new(),
         name: "pi-1".into(),
         host: "user@pi-1".into(),
         endpoint: "ssh user@pi-1".into(),

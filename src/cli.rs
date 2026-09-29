@@ -198,7 +198,10 @@ pub fn task_note(t: &Task) -> String {
                 .take(60)
                 .collect()
         });
-    let note = one_line(&note);
+    let mut note = one_line(&note);
+    if t.spec.now {
+        note = format!("now: {note}");
+    }
     match t.retry_of {
         Some(of) => format!("retry of t-{of}: {note}"),
         None => note,
@@ -302,6 +305,9 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
     };
     if t.pause.preempt {
         priority.push_str(", preempt: pauses a low task on a full machine");
+    }
+    if t.spec.now {
+        priority.push_str(", now: started at once, past its machine's limits");
     }
     let profile = match t.profile() {
         Some(p) => format!("{p}{}", from(source.and_then(|s| s.profile_from.as_ref()))),
@@ -777,6 +783,9 @@ pub struct MachineRow {
     /// `MachineStatus::orphans`; a probe works them out itself from
     /// `agent.list` and the store, and leaves them empty when it cannot.
     pub orphans: Vec<String>,
+    /// `MachineStatus::now`; a probe leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub now: Vec<String>,
     /// `MachineStatus::profile`; a probe settles it from this machine's
     /// pastor.toml and flock.toml.
     #[serde(default)]
@@ -833,6 +842,7 @@ impl From<&MachineStatus> for MachineRow {
             burst: m.burst,
             tags: m.tags.clone(),
             orphans: m.orphans.clone(),
+            now: m.now.clone(),
             profile: m.profile.clone(),
             description: m.description.clone(),
         }
@@ -890,6 +900,20 @@ pub fn capacity(max_agents: u32, job_slots: u32, burst: u32) -> String {
     out
 }
 
+/// The AGENTS column: live over capacity, then the `--now` tasks that may
+/// have taken it past (`4/3 now:t-9`).
+fn agents_cell(m: &MachineRow) -> String {
+    let mut out = format!(
+        "{}/{}",
+        m.live.map_or_else(|| "-".to_string(), |n| n.to_string()),
+        capacity(m.max_agents, m.job_slots, m.burst)
+    );
+    if !m.now.is_empty() {
+        out.push_str(&format!(" now:{}", m.now.join(",")));
+    }
+    out
+}
+
 /// One row per machine, in the order given.
 pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
     let dash = || "-".to_string();
@@ -903,11 +927,7 @@ pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
                 m.channel.clone(),
                 m.herdr_version.clone().unwrap_or_else(dash),
                 m.pastor_version.clone().unwrap_or_else(dash),
-                format!(
-                    "{}/{}",
-                    m.live.map_or_else(dash, |n| n.to_string()),
-                    capacity(m.max_agents, m.job_slots, m.burst)
-                ),
+                agents_cell(m),
                 if m.orphans.is_empty() {
                     dash()
                 } else {
@@ -1119,6 +1139,7 @@ mod tests {
 
     fn status(name: &str, host: &str) -> MachineStatus {
         MachineStatus {
+            now: Vec::new(),
             description: None,
             name: name.into(),
             host: host.into(),
@@ -1303,6 +1324,7 @@ mod tests {
         use crate::config::flock::{Flock, MachineConfig};
         use crate::task::TaskState;
         let spec = crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -1369,6 +1391,7 @@ mod tests {
     #[test]
     fn task_detail_prints_the_agent_args_shell_quoted() {
         let spec = crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![
                 "--model".into(),
@@ -1516,6 +1539,41 @@ mod tests {
         assert!(task_detail(&t).contains("critical, preempt: "));
     }
 
+    /// A `task run --now` task says it ran past its machine's limits, in
+    /// `task describe` and in `task list`'s NOTE.
+    #[test]
+    fn a_now_task_says_it_skipped_the_queue() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("now:"));
+        assert!(!task_note(&t).starts_with("now"));
+        t.spec.now = true;
+        assert!(
+            task_detail(&t).contains("normal, now: started at once, past its machine's limits"),
+            "{}",
+            task_detail(&t)
+        );
+        assert!(task_note(&t).starts_with("now: "), "{}", task_note(&t));
+    }
+
+    /// `machine list` AGENTS names the `--now` tasks that run past the
+    /// machine's limits beside the count, which may pass them.
+    #[test]
+    fn machine_rows_name_now_tasks() {
+        let m = MachineStatus {
+            live: 4,
+            max_agents: 3,
+            now: vec!["t-9".into()],
+            ..status("pi", "local")
+        };
+        let rows = machine_rows(&[MachineRow::from(&m)]);
+        assert_eq!(rows[0][7], "4/3 now:t-9");
+        let plain = MachineStatus {
+            now: vec![],
+            ..m.clone()
+        };
+        assert_eq!(machine_rows(&[MachineRow::from(&plain)])[0][7], "4/3");
+    }
+
     /// `task describe` gives the level and the layer that set it, and
     /// `task list` the level, beside the state.
     #[test]
@@ -1623,6 +1681,7 @@ mod tests {
     #[test]
     fn task_detail_shows_the_description_and_its_source() {
         let mut t = task_with(crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -1660,6 +1719,7 @@ mod tests {
     #[test]
     fn task_detail_keeps_a_multiline_error_on_its_line() {
         let mut t = task_with(crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -1708,6 +1768,7 @@ mod tests {
     #[test]
     fn task_rows_escape_and_cap_an_item_title() {
         let mut t = task_with(crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -1740,6 +1801,7 @@ mod tests {
     #[test]
     fn task_detail_escapes_item_text_in_the_prompt_and_fields() {
         let mut t = task_with(crate::task::DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec!["--x\x1b[2J".into()],
             allow: vec![],

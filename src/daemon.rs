@@ -14,7 +14,7 @@ use crate::config::{
     MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
 };
 use crate::dispatch::{
-    Claim, FlockSeat, MachineView, flock_held, mark_waiting_under_share, pick_machine,
+    Claim, FlockSeat, MachineView, flock_held, mark_waiting_under_share, now_machine, pick_machine,
     pick_machine_where,
 };
 use crate::herdr::{Connector, Endpoint};
@@ -513,7 +513,19 @@ impl Fleet {
                     self.count_pull(&m.handle);
                 }
                 let s = m.handle.snapshot();
+                // On a store error none are named; the count stands.
+                let now = self
+                    .store
+                    .tasks_on_machine(&m.handle.name)
+                    .map(|ts| {
+                        ts.iter()
+                            .filter(|t| t.spec.now)
+                            .map(Task::display_id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 crate::machine::MachineStatus {
+                    now,
                     profile: self.own_profile(&flock, Some(&m.handle.name)),
                     flock: Some(flock),
                     flocks: seats(&wanted, &s),
@@ -1249,6 +1261,27 @@ impl Fleet {
         {
             return Err(QueueError::UnknownMachine(m.clone()));
         }
+        if spec.now {
+            let refuse = |code, message| {
+                Err(QueueError::Agent(crate::config::AgentRefusal {
+                    code,
+                    message,
+                }))
+            };
+            let Some(m) = &spec.machine else {
+                return refuse(
+                    "now_needs_machine",
+                    "--now needs --machine: name the machine the task may run past the limits of"
+                        .into(),
+                );
+            };
+            if !self.views().iter().any(|v| &v.name == m && v.healthy) {
+                return refuse(
+                    "machine_not_connected",
+                    format!("machine {m} is not connected, so --now cannot start the task there"),
+                );
+            }
+        }
         let flock = self
             .flock()
             .task_flock(flock, spec.machine.as_deref())
@@ -1351,6 +1384,8 @@ impl Fleet {
                 spec.place = settled.place;
                 spec.label = settled.label;
                 spec.summary = summary;
+                // Only a person's `task run --now` skips the queue.
+                spec.now = false;
                 Ok((prompt, spec))
             },
         )
@@ -2143,6 +2178,28 @@ impl Fleet {
             let settled_on = |machine: &str| self.settled_on(task, target, machine);
             let claim = Claim::of(task);
             let accepts = |m: &str| settled_on(m).is_none_or(|r| r.is_ok());
+            // A `--now` task takes its pinned machine past its limits, or
+            // nothing: it neither waits for a slot nor pauses another task.
+            if task.spec.now {
+                let Some(name) = now_machine(&views, &task.spec, &accepts) else {
+                    continue;
+                };
+                let Some(handle) = self.get(&name) else {
+                    continue;
+                };
+                if let Some(Ok(spec)) = settled_on(&name) {
+                    let mut on = task.clone();
+                    on.spec = spec;
+                    if on.spec != task.spec
+                        && let Err(err) = self.store.update_task(&mut on)
+                    {
+                        tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
+                        continue;
+                    }
+                }
+                placed.push(self.reserve(task, handle, Outbound::Dispatch));
+                continue;
+            }
             let mut picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
             // A critical task with `preempt` that finds no room pauses the
             // newest low Claude task on a machine it would fit once that one
@@ -2895,6 +2952,21 @@ impl Daemon {
     /// task and an orchestrator is the task: an agent cannot widen its
     /// rights by setting the other.
     pub async fn handle_as(&self, req: IpcRequest, caller: &crate::ipc::Caller) -> IpcResponse {
+        // `task run --now` runs past a machine's limits on a person's say,
+        // `agents_change_fleet` or not.
+        if matches!(req, IpcRequest::Run { now: true, .. }) {
+            let who = match (&caller.task, &caller.orchestrator) {
+                (Some(task), _) => Some(format!("{task} is a task")),
+                (None, Some(o)) => Some(format!("orchestrator {o}'s script is not a person")),
+                (None, None) => None,
+            };
+            if let Some(who) = who {
+                return IpcResponse::error(
+                    "now_refused",
+                    format!("{who}, and only a person may run a task with --now"),
+                );
+            }
+        }
         if let Some(task) = caller.task.as_deref() {
             if let Some(why) = self.makes_orchestrator(&req) {
                 return IpcResponse::error("role_refused", format!("{task} is a task, and {why}"));
@@ -3056,7 +3128,7 @@ impl Daemon {
             },
             IpcRequest::Run {
                 prompt,
-                spec,
+                mut spec,
                 flock,
                 agent,
                 priority,
@@ -3064,7 +3136,11 @@ impl Daemon {
                 description,
                 preempt,
                 summary,
+                now,
             } => {
+                // From the flag alone: a spec that says so does not skip
+                // the queue.
+                spec.now = now;
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
                 if spec.worktree && spec.repo.is_none() {
@@ -3129,6 +3205,27 @@ impl Daemon {
                 });
                 self.fleet.dispatch_queued_for(task.id).await;
                 match self.store.get_task(task.id) {
+                    // A `--now` task never waits in the queue: one its
+                    // machine did not take (it went away since the check,
+                    // or its agent cannot run the model) is closed.
+                    Ok(Some(t)) if t.spec.now && t.state == TaskState::Queued => {
+                        let why = t.error.clone().unwrap_or_else(|| {
+                            format!(
+                                "{} did not take it",
+                                t.spec.machine.as_deref().unwrap_or("its machine")
+                            )
+                        });
+                        if let Err(err) = self.store.close_queued(t.id) {
+                            tracing::warn!(task = %t.display_id(), %err, "close a --now task");
+                        }
+                        IpcResponse::error(
+                            "now_not_started",
+                            format!(
+                                "{} could not start at once ({why}), and is closed",
+                                t.display_id()
+                            ),
+                        )
+                    }
                     Ok(Some(t)) => IpcResponse::Task(t),
                     Ok(None) => IpcResponse::error("task_not_found", task.id),
                     Err(err) => IpcResponse::error("store_error", err),
@@ -4150,6 +4247,7 @@ mod tests {
 
     fn spec() -> DispatchSpec {
         DispatchSpec {
+            now: false,
             agent: "claude".into(),
             agent_args: vec![],
             allow: vec![],
@@ -4627,6 +4725,7 @@ mod tests {
 
     fn run_on(prompt: &str, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             prompt: prompt.into(),
             spec: DispatchSpec {
@@ -5177,6 +5276,7 @@ mod tests {
         let mut events = d.subscribe();
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5230,6 +5330,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
         let IpcResponse::Task(first) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5247,6 +5348,7 @@ mod tests {
         assert_eq!(first.state, TaskState::Running);
         let IpcResponse::Task(second) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5283,6 +5385,7 @@ mod tests {
 
     fn run_at(prompt: &str, priority: Option<Priority>) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt: prompt.into(),
@@ -5394,6 +5497,7 @@ mod tests {
         )
         .await;
         let run = |machine: Option<&str>, priority: Option<Priority>| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt: "x".into(),
@@ -5488,6 +5592,7 @@ mod tests {
         };
         let (d, _tmp) = daemon_with_flock(flock, &[("pi", 4, FakeHerdr::new())]).await;
         let run = |ask: AgentChoice| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt: "x".into(),
@@ -5584,6 +5689,7 @@ mod tests {
         config.defaults.label = Some("{{ machine }}/{{ task.id }}".into());
         d.fleet().set_config(&config);
         let run = |label: Option<&str>, flock: &str| IpcRequest::Run {
+            now: false,
             prompt: "x".into(),
             spec: DispatchSpec {
                 label: crate::task::WorkspaceLabel {
@@ -5738,6 +5844,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5769,6 +5876,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new()), ("b", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -5788,6 +5896,123 @@ mod tests {
         };
         assert_eq!(t.machine.as_deref(), Some("b"));
         assert_eq!(t.state, TaskState::Running);
+    }
+
+    /// `task run --now` (`Run::now`, `DispatchSpec::now`).
+    mod now {
+        use super::*;
+
+        fn run_now(prompt: &str, machine: Option<&str>) -> IpcRequest {
+            let mut req = run_on(prompt, machine);
+            if let IpcRequest::Run { now, .. } = &mut req {
+                *now = true;
+            }
+            req
+        }
+
+        fn no_rows(d: &Daemon) -> bool {
+            d.store
+                .list_tasks(&TaskFilter::default())
+                .unwrap()
+                .is_empty()
+        }
+
+        /// On a full machine a `--now` task starts in the same request,
+        /// past `max_agents`, while a plain task stays queued; it counts
+        /// there, so the queue does not fill the machine further, and
+        /// `machine list` names it.
+        #[tokio::test]
+        async fn a_now_task_starts_past_its_machines_limits() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            let busy = queued(&d, "busy", Some("a")).await;
+            assert_eq!(busy.state, TaskState::Running);
+            let waiting = queued(&d, "waits", Some("a")).await;
+            assert_eq!(waiting.state, TaskState::Queued);
+
+            let IpcResponse::Task(t) = d.handle(run_now("urgent", Some("a"))).await else {
+                panic!()
+            };
+            assert_eq!(t.state, TaskState::Running, "{:?}", t.error);
+            assert_eq!(t.machine.as_deref(), Some("a"));
+            assert!(t.spec.now);
+            let view = d
+                .fleet()
+                .views()
+                .into_iter()
+                .find(|v| v.name == "a")
+                .unwrap();
+            assert_eq!((view.live, view.max_agents), (2, 1));
+
+            d.fleet().dispatch_queued().await;
+            assert_eq!(
+                d.store.get_task(waiting.id).unwrap().unwrap().state,
+                TaskState::Queued,
+                "the queue still waits for a slot"
+            );
+            let status = d.fleet().statuses();
+            let a = status.iter().find(|m| m.name == "a").unwrap();
+            assert_eq!(a.now, vec![t.display_id()]);
+        }
+
+        /// `--now` needs `--machine`, and a machine that is connected (a
+        /// pull machine never is: it takes its own tasks). Nothing is
+        /// queued either way.
+        #[tokio::test]
+        async fn now_needs_a_connected_machine() {
+            let (d, _tmp) = pull_daemon(1).await;
+            assert_eq!(
+                error_code(d.handle(run_now("x", None)).await),
+                "now_needs_machine"
+            );
+            assert_eq!(
+                error_code(d.handle(run_now("x", Some("laptop"))).await),
+                "machine_not_connected"
+            );
+            assert!(no_rows(&d));
+        }
+
+        /// Only a person may skip the queue: an agent, an orchestrator
+        /// task and an orchestrator's script are refused.
+        #[tokio::test]
+        async fn only_a_person_runs_a_task_now() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            let mut req = run_on("orchestrate", None);
+            if let IpcRequest::Run { role, .. } = &mut req {
+                *role = TaskRole::Orchestrator;
+            }
+            let IpcResponse::Task(orch) = d.handle(req).await else {
+                panic!()
+            };
+            for caller in [
+                crate::ipc::Caller::task(Some("t-9")),
+                crate::ipc::Caller::task(Some(&orch.display_id())),
+                crate::ipc::Caller {
+                    task: None,
+                    orchestrator: Some("merge".into()),
+                },
+            ] {
+                let resp = d.handle_as(run_now("x", Some("a")), &caller).await;
+                assert_eq!(error_code(resp), "now_refused", "{caller:?}");
+            }
+            assert_eq!(d.store.list_tasks(&TaskFilter::default()).unwrap().len(), 1);
+        }
+
+        /// The head sets `spec.now` from `Run::now` alone: a spec that
+        /// claims it without the flag queues like any other task.
+        #[tokio::test]
+        async fn a_spec_that_says_now_without_the_flag_queues() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            queued(&d, "busy", Some("a")).await;
+            let mut req = run_on("sneaky", Some("a"));
+            if let IpcRequest::Run { spec, .. } = &mut req {
+                spec.now = true;
+            }
+            let IpcResponse::Task(t) = d.handle(req).await else {
+                panic!()
+            };
+            assert_eq!(t.state, TaskState::Queued);
+            assert!(!t.spec.now);
+        }
     }
 
     /// `home` (the default) holds `h`, `work` holds `w`.
@@ -5826,6 +6051,7 @@ mod tests {
 
     fn run_in(flock: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -5855,6 +6081,7 @@ mod tests {
         )
         .await;
         let run = |flock: &str, agent: Option<AgentChoice>| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -5947,6 +6174,7 @@ mod tests {
         )
         .await;
         let run = |agent: Option<&str>| IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -6018,6 +6246,7 @@ mod tests {
         std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -6096,6 +6325,7 @@ mod tests {
 
     fn run_model(model: Option<&str>, agent: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -6478,6 +6708,7 @@ mod tests {
             flock,
             agent,
             priority,
+            now,
         } = run_model(model, None, machine)
         else {
             unreachable!()
@@ -6495,6 +6726,7 @@ mod tests {
                 ..a
             }),
             priority,
+            now,
         }
     }
 
@@ -6677,6 +6909,7 @@ mod tests {
     fn run_profile(profile: Option<&str>, machine: Option<&str>) -> IpcRequest {
         let IpcRequest::Run {
             preempt: false,
+            now: false,
             summary: _,
             prompt,
             spec,
@@ -6690,6 +6923,7 @@ mod tests {
             unreachable!()
         };
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt,
@@ -6776,6 +7010,7 @@ mod tests {
         );
         let IpcRequest::Run {
             preempt: false,
+            now: false,
             summary: _,
             prompt,
             spec,
@@ -6789,6 +7024,7 @@ mod tests {
             unreachable!()
         };
         let conflict = IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             prompt,
@@ -6923,6 +7159,7 @@ mod tests {
         // Occupy pi's one slot so the new task must wait.
         let IpcResponse::Task(busy) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 prompt: "busy".into(),
@@ -7123,6 +7360,7 @@ mod tests {
         )
         .await;
         let run = || IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role: Default::default(),
@@ -7880,6 +8118,7 @@ mod tests {
         assert!(diff.is_empty(), "{diff:?}");
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -7908,6 +8147,7 @@ mod tests {
         let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(false).await;
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -7984,6 +8224,7 @@ mod tests {
         let resp = crate::ipc::request(
             &socket,
             &IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -8042,6 +8283,7 @@ mod tests {
 
     fn run_hi_as(role: TaskRole) -> IpcRequest {
         IpcRequest::Run {
+            now: false,
             preempt: false,
             summary: None,
             role,
@@ -9483,6 +9725,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -9621,6 +9864,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -9657,6 +9901,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -10026,6 +10271,7 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                now: false,
                 preempt: false,
                 summary: None,
                 role: Default::default(),
@@ -10068,6 +10314,7 @@ mod tests {
 
         fn run(prompt: &str, spec: DispatchSpec, priority: Priority, preempt: bool) -> IpcRequest {
             IpcRequest::Run {
+                now: false,
                 prompt: prompt.into(),
                 spec,
                 flock: None,

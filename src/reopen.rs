@@ -185,6 +185,7 @@ mod tests {
             item: serde_json::Value::Null,
             prompt: "p".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: agent.into(),
                 agent_args: vec![],
                 allow: vec![],

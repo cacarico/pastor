@@ -744,6 +744,7 @@ mod tests {
                 item: serde_json::json!({"key": "k"}),
                 prompt: "p".into(),
                 spec: DispatchSpec {
+                    now: false,
                     agent: "claude".into(),
                     agent_args: vec![],
                     allow: vec![],

@@ -392,6 +392,7 @@ impl Job {
             agent,
             dispatch: Value::Null,
             spec: DispatchSpec {
+                now: false,
                 agent: pick.agent,
                 agent_args: pick.agent_args,
                 allow: pick.allow,
@@ -915,6 +916,25 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert!(job("preempt = true").unwrap().preempt);
         let err = job("preempt = true\npriority = \"high\"").unwrap_err();
         assert!(err.contains("preempt_needs_critical"), "{err}");
+    }
+
+    /// `task run --now` is for a person at the CLI: `[dispatch]` has no
+    /// such key, and a job's spec never skips the queue.
+    #[test]
+    fn a_job_cannot_skip_the_queue() {
+        let job = |extra: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\n{extra}\nprompt = \"p\"\nmachine = \"a\"\n"
+                ),
+                "j",
+                &Defaults::default(),
+                &Builtins,
+            )
+        };
+        assert!(!job("").unwrap().spec.now);
+        let err = job("now = true").unwrap_err();
+        assert!(err.contains("now"), "{err}");
     }
 
     /// A job's `priority` is a template rendered per item: empty falls

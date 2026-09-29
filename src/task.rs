@@ -237,6 +237,13 @@ pub struct DispatchSpec {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// `task run --now`: dispatch starts the task at once on its pinned
+    /// machine, past that machine's `max_agents`, `job_slots`, `burst` and
+    /// its flock's number there (`dispatch::now_machine`). Only the head
+    /// sets it, from `Run::now`; a retry drops it. Left out of the JSON when
+    /// false, so a spec from before it reads as a plain task.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub now: bool,
 }
 
 /// The label template a task's own workspace gets when no layer sets one.
@@ -1376,6 +1383,7 @@ pub(crate) mod tests {
             item: Value::Null,
             prompt: "p".into(),
             spec: DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],

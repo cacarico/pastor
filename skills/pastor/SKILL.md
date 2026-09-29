@@ -83,6 +83,7 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
   - The paused task's agent is interrupted and its pane closed, its worktree kept. It goes `paused`, first among `low` tasks (it ages like a queued task, from when it was paused) and pinned to its machine, and resumes its own session (`claude --resume`) there when a slot frees.
   - A normal task, an opencode task, a done one or one resumed in the last 10 minutes is never paused.
   - `pastor task priority t-N critical --preempt` sets it on a queued task (the same command without it drops it); a job sets `preempt = true` under `[dispatch]`.
+- `--now` (with `--machine`) starts a task at once past that machine's limits. It is for a person at the CLI: from an agent's pane, an orchestrator's included, the head answers `now_refused`. Queue the task, or ask the person.
 - Without `--agent` and `--agent-arg`, the task takes the `agent` and `agent_args` of its machine in `flock.toml`, then its flock's, then `[defaults]` in `pastor.toml`, then `claude`. The agent is the one setting where the machine comes before the flock.
   - Args follow the agent they were written for: a flock's args for codex never reach a task run with `--agent claude`.
   - A flock's `agent` also sets the kind its tasks run: a machine whose own agent is of another kind runs its `agents` entry for that kind, and one with none is skipped (pinned there: `agent_kind_missing`).

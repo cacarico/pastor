@@ -85,6 +85,7 @@ Create a one-off task and dispatch it
 | `--no-fallback` | Fall back to no other model, whatever the machine, flock or `[defaults]` say |  |
 | `--priority <LEVEL>` | Queue at this level: low, normal, high or critical; dispatch takes higher levels first (default: the flock's, else the pinned machine's, else `[defaults] priority`, else normal) |  |
 | `--preempt` | A critical task only: on a full machine, pause the newest low Claude task there (its session resumes when a slot frees) and take its slot |  |
+| `--now` | Start at once on --machine (which it needs), skipping the queue and running past that machine's max_agents, job slots, burst and flock number; for a person at the CLI, never a task or an orchestrator |  |
 | `--profile <NAME>` | Run under this permission profile, built in or from `[profiles]` in pastor.toml: a Claude agent gets its allow and deny lists and never asks (default: the flock's, else the machine's, else `[defaults] profile`, else none) |  |
 | `--worktree` | A git worktree per task, branched from --repo (so it needs --repo) |  |
 | `--branch <BRANCH>` | Branch for the worktree (needs --worktree; a plain workspace has no branch) |  |

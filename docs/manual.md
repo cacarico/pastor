@@ -1509,6 +1509,35 @@ given without; and in a job file whose `priority` is written below
 critical. A job's tasks keep `preempt` only when they settle at critical,
 however they get there. `task retry` keeps it.
 
+### Starting a task now
+
+Sometimes a task cannot wait, and you know the machine it should go to is
+full. `pastor task run --now --machine pi-3 "..."` starts it on `pi-3` in
+the same request, past `max_agents`, job slots, burst and its flock's
+number there, whatever else waits. It never waits in the queue: the head
+refuses it up front without `--machine` (`now_needs_machine`) or when that
+machine is not connected (`machine_not_connected`, and a pull machine never
+is), and if the machine still does not take it (it went away meanwhile, or
+its agent cannot run the task's model), the task is closed and the request
+answers `now_not_started`. It needs the machine's tags like any pinned task,
+and it does not go with `--preempt` (clap refuses the two together): it
+pauses nothing.
+
+The task is marked: `now:` begins its NOTE in `task list`, `task describe`
+adds `now: started at once, past its machine's limits` to its priority, its
+JSON spec has `"now": true`, and `machine list` shows it after the count
+(`4/3 now:t-9`) while it runs. It counts on the machine like any live task,
+so the queue does not start more there until the count is back under the
+limits.
+
+`--now` is for a person at the CLI. A job cannot set it (`now` is not a
+`[dispatch]` key), a `task retry` of such a task goes through the queue, and
+the head refuses it from any agent's pane, an orchestrator's included, and
+from an orchestrator's scripts (`now_refused`), `agents_change_fleet` or
+not: an orchestrator that could skip the limits would make them mean
+nothing. A head from before it would queue the task behind the limits, so
+the CLI refuses to send it there (`head_too_old`).
+
 #### An agent per kind
 
 A machine whose agent is a claude can still run a model of another kind if
@@ -2224,6 +2253,7 @@ pastor task read t-1                 # recent pane output, without attaching
 pastor task retry t-4                # a failed or stale task again, as a new task
 pastor task priority t-5 high        # a queued task goes ahead of normal ones
 pastor task run --priority critical --preempt "prod is down"  # pauses a low task if it must
+pastor task run --now --machine pi-3 "prod is down"  # starts there at once, past its limits
 pastor queue                         # the queue in the order it runs, and why each waits
 pastor queue move t-6 --before t-5   # take t-5's place, and its level
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
@@ -2271,6 +2301,7 @@ that cannot report its home, herdr still decides.
 | `--fallback`, `--no-fallback` | the models it may fall back to, comma separated, or none (see [Fallback models](#fallback-models)) |
 | `--priority` | its level (see [Priority and queue order](#priority-and-queue-order)) |
 | `--preempt` | may pause a low task (see [Pausing a low task](#pausing-a-low-task)) |
+| `--now` | starts at once on `--machine`, past its limits (see [Starting a task now](#starting-a-task-now)) |
 | `--summary` | ask for a summary, require one, or not (see [Asking for one](#asking-for-one)) |
 | `--profile` | a permission profile (see [Permission profiles](#permission-profiles)) |
 | `--worktree`, `--branch` | a worktree of its own, on that branch; `--worktree` needs `--repo`, `--branch` needs `--worktree` |

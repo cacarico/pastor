@@ -864,9 +864,11 @@ mod tests {
 
     async fn run_pinned(head: &Daemon, machine: Option<&str>) -> Task {
         let req = IpcRequest::Run {
+            now: false,
             preempt: false,
             prompt: "fix it".into(),
             spec: crate::task::DispatchSpec {
+                now: false,
                 agent: "claude".into(),
                 agent_args: vec![],
                 allow: vec![],

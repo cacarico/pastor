@@ -692,6 +692,7 @@ mod tests {
                 item: serde_json::json!({"key": "k1", "title": "fix it"}),
                 prompt: "do it".into(),
                 spec: DispatchSpec {
+                    now: false,
                     agent: "claude".into(),
                     agent_args: vec![],
                     allow: vec![],
@@ -793,6 +794,7 @@ mod tests {
             tags: vec![],
             tx,
             status: Arc::new(RwLock::new(MachineStatus {
+                now: Vec::new(),
                 description: None,
                 name: name.into(),
                 host: name.into(),
