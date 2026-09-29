@@ -1218,9 +1218,12 @@ impl Store {
     }
 
     /// Lift each queued task that has waited `age_after` a level
-    /// (`Priority::aged`): since it last aged, else since it was queued.
-    /// `age_after` gives a task's wait, `None` when its flock does not age.
-    /// One level a call, never past `high`; a paused task does not age.
+    /// (`Priority::aged`): since it last aged, it was paused or it was
+    /// queued, whichever is latest. `age_after` gives a task's wait, `None`
+    /// when its flock does not age. One level a call, never past `high`. A
+    /// paused task ages too: it waits in the queue like any other, first
+    /// among its level, and a `low` one queued after it must not age past
+    /// it.
     /// `exclude` (a dispatch pass's in-flight task ids, `Fleet::in_flight`)
     /// is left alone: their row still says `queued`, but they were placed
     /// and have left the queue, so the level they were placed at stays.
@@ -1234,14 +1237,19 @@ impl Store {
         let due: Vec<Task> = self
             .queued_tasks()?
             .into_iter()
-            .filter(|t| t.state == TaskState::Queued && t.priority.aged().is_some())
+            .filter(|t| matches!(t.state, TaskState::Queued | TaskState::Paused))
+            .filter(|t| t.priority.aged().is_some())
             .filter(|t| !exclude.contains(&t.id))
             .filter(|t| {
                 let Some(wait) = age_after(t).and_then(|d| chrono::Duration::from_std(d).ok())
                 else {
                     return false;
                 };
-                now - t.aged_at.unwrap_or(t.created_at) >= wait
+                let since = [t.aged_at, t.pause.paused_at]
+                    .into_iter()
+                    .flatten()
+                    .fold(t.created_at, DateTime::max);
+                now - since >= wait
             })
             .collect();
         let mut aged = Vec::new();
@@ -1249,12 +1257,18 @@ impl Store {
             let to = t.priority.aged().expect("filtered");
             let n = {
                 let conn = self.conn.lock().recover();
-                // Only while it is still queued at the level it was read at:
-                // a claim or a hand change in between wins.
+                // Only while it is still in the state and at the level it was
+                // read at: a claim, a resume or a hand change in between wins.
                 conn.execute(
                     "UPDATE tasks SET priority = ?3, aged_from = COALESCE(aged_from, ?2), aged_at = ?4
-                     WHERE id = ?1 AND state = 'queued' AND priority = ?2",
-                    params![t.id, t.priority.as_str(), to.as_str(), now.to_rfc3339()],
+                     WHERE id = ?1 AND state = ?5 AND priority = ?2",
+                    params![
+                        t.id,
+                        t.priority.as_str(),
+                        to.as_str(),
+                        now.to_rfc3339(),
+                        t.state.as_str()
+                    ],
                 )?
             };
             if n == 1
@@ -3635,8 +3649,8 @@ mod tests {
         }
     }
 
-    /// A task a machine took, one paused, or one in flight (placed, its
-    /// row still `queued`) has left the queue's ageing.
+    /// A task a machine took, or one in flight (placed, its row still
+    /// `queued`), has left the queue's ageing.
     #[test]
     fn age_queued_passes_over_what_is_not_queued() {
         let s = Store::open_in_memory().unwrap();
@@ -3649,11 +3663,37 @@ mod tests {
         assert_eq!(s.get_task(t.id).unwrap().unwrap().priority, Priority::Low);
         s.claim_task(t.id, "m").unwrap().unwrap();
         assert!(s.age_queued(later, wait, &[]).unwrap().is_empty());
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().priority, Priority::Low);
+    }
+
+    /// A task `--preempt` paused is back in the queue, first among `low`,
+    /// and ages like any queued task, its wait counted from when it was
+    /// paused: otherwise a `low` task queued after it would age past it
+    /// and a steady stream of `normal` work would keep it paused for good.
+    /// In flight (a resume on its way) it is left alone.
+    #[test]
+    fn a_paused_task_ages_from_when_it_was_paused() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task_at(new_task("run"), Priority::Low, None, TaskRole::Agent)
+            .unwrap();
+        s.claim_task(t.id, "m").unwrap().unwrap();
+        let paused = t.created_at + chrono::Duration::hours(2);
         let mut t = s.get_task(t.id).unwrap().unwrap();
         t.state = TaskState::Paused;
+        t.pause.paused_at = Some(paused);
         s.update_task(&mut t).unwrap();
-        assert!(s.age_queued(later, wait, &[]).unwrap().is_empty());
-        assert_eq!(s.get_task(t.id).unwrap().unwrap().priority, Priority::Low);
+        let wait = |_: &Task| Some(std::time::Duration::from_secs(1800));
+        let mins = |m: i64| paused + chrono::Duration::minutes(m);
+        assert!(s.age_queued(mins(29), wait, &[]).unwrap().is_empty());
+        assert!(s.age_queued(mins(30), wait, &[t.id]).unwrap().is_empty());
+        let aged = s.age_queued(mins(30), wait, &[]).unwrap();
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].state, TaskState::Paused);
+        assert_eq!(
+            (aged[0].priority, aged[0].aged_from, aged[0].aged_at),
+            (Priority::Normal, Some(Priority::Low), Some(mins(30)))
+        );
     }
 
     /// A level set by hand (`task priority`, a `queue move` that changes

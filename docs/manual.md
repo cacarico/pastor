@@ -1384,7 +1384,9 @@ after each further `age_after`, so a `low` task behind a steady stream of
 never makes a task `critical`, so it never lets one burst or pause another,
 and it promises nothing against `critical` work: a steady stream of
 `critical` tasks still goes first, for as long as it keeps coming. `high` and
-`critical` tasks, and paused ones, do not age. The wait is the flock's
+`critical` tasks do not age. A task `--preempt` paused ages like a queued
+one, its wait counted from when it was paused, so a `low` task queued after
+it never ages past it. The wait is the flock's
 `age_after`, else `[defaults] age_after`, else 30 minutes; `never` turns
 ageing off for that flock, or for every flock that sets none:
 
@@ -1478,8 +1480,9 @@ worktree stays on disk. The task goes
 and for which task (`paused: ... for t-9` in `task describe`, `paused_at`
 and `paused_for` in its JSON).
 
-A paused task waits in the queue first among the `low` tasks and pinned to
-the machine it was paused on, whatever its pin: `pastor queue` shows it
+A paused task waits in the queue first among the `low` tasks (first in its
+level, once it has aged; see [Ageing](#ageing)) and pinned to the machine it
+was paused on, whatever its pin: `pastor queue` shows it
 there with `paused for t-9; machine pi-3 is full (2/2)`. When that machine is
 still in the task's flock and has room for it, and the flock is under its
 number there, a dispatch pass resumes it: the same steps as a
