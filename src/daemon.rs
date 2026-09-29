@@ -642,11 +642,13 @@ impl Fleet {
 
     /// `resolve_agent` written into `spec`, with the ask and where the agent
     /// and its args came from (`DispatchSpec::agent_source`), its model's
-    /// args put in front (`Models::apply`) and its profile's lists added
+    /// args put in front (`Models::apply`), its fallback list
+    /// (`Models::fallback`) and its profile's lists added
     /// (`Profiles::apply`). `asked_by` names the ask: `task run` or `job
-    /// <name>`. Refused when the model is not in `[models]` or not of the
-    /// agent's kind, or the profile is unknown or `unrestricted` where the
-    /// machine's own is not; `spec` is then only partly settled.
+    /// <name>`. Refused when the model or a fallback is not in `[models]`,
+    /// the model is not of the agent's kind, or the profile is unknown or
+    /// `unrestricted` where the machine's own is not; `spec` is then only
+    /// partly settled.
     fn settle(
         &self,
         spec: &mut crate::task::DispatchSpec,
@@ -696,6 +698,8 @@ impl Fleet {
             agent_args: pick.args_from.map(label),
             model: pick.model.as_ref().map(|(name, _)| name.clone()),
             model_from: pick.model.as_ref().map(|&(_, layer)| label(layer)),
+            fallback: models.fallback(&pick)?,
+            fallback_from: pick.fallback.as_ref().map(|&(_, layer)| label(layer)),
             profile: pick.profile.as_ref().map(|(name, _)| name.clone()),
             profile_from: pick.profile.as_ref().map(|&(_, layer)| label(layer)),
             timeout_from,
@@ -1302,6 +1306,7 @@ impl Fleet {
         let mut settled = job.spec.clone();
         let ask = AgentChoice {
             model: job.model_for(item).map_err(anyhow::Error::msg)?,
+            fallback: job.fallback_for(item).map_err(anyhow::Error::msg)?,
             ..job.agent.clone()
         };
         let asked_by = format!("job {}", job.name);
@@ -3595,6 +3600,7 @@ impl Daemon {
             row: crate::cli::MachineRow::from(&status),
             session: m.session.clone(),
             model: m.model.clone(),
+            fallback: m.fallback.clone(),
             agents_by_kind: m.agents.clone(),
             tasks,
             recent_errors: crate::describe::machine_errors(events, name),
@@ -4094,6 +4100,7 @@ mod tests {
             agent: None,
             agent_args: None,
             model: None,
+            fallback: None,
             priority: None,
             agents: Default::default(),
             profile: None,
@@ -6366,6 +6373,215 @@ mod tests {
         assert_eq!(copy.model(), Some("sonnet"));
     }
 
+    /// `models_daemon` whose flock falls back to sonnet then gpt, over pi,
+    /// which falls back to opus, and cx, which sets `[]`; `models_config`
+    /// is the fleet's too, for a job's tasks, which re-read nothing.
+    async fn fallback_daemon() -> (Daemon, tempfile::TempDir) {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pi = MachineConfig {
+            fallback: Some(names(&["opus"])),
+            ..machine("pi", 2)
+        };
+        let cx = MachineConfig {
+            fallback: Some(vec![]),
+            ..machine("cx", 2)
+        };
+        let (d, tmp) = models_daemon(
+            None,
+            vec![pi, cx, machine("bare", 2)],
+            &[
+                ("pi", 2, FakeHerdr::new()),
+                ("cx", 2, FakeHerdr::new()),
+                ("bare", 2, FakeHerdr::new()),
+            ],
+        )
+        .await;
+        let mut flock = Flock::load(&d.paths.flock_file()).unwrap();
+        flock.flocks[0].fallback = Some(names(&["sonnet", "gpt"]));
+        flock.save(&d.paths.flock_file()).unwrap();
+        d.fleet().replace_flock(flock).await;
+        d.fleet().set_config(&models_config());
+        (d, tmp)
+    }
+
+    fn run_fallback(
+        model: Option<&str>,
+        fallback: Option<&[&str]>,
+        machine: Option<&str>,
+    ) -> IpcRequest {
+        let IpcRequest::Run {
+            preempt,
+            summary,
+            role,
+            description,
+            prompt,
+            spec,
+            flock,
+            agent,
+            priority,
+        } = run_model(model, None, machine)
+        else {
+            unreachable!()
+        };
+        IpcRequest::Run {
+            preempt,
+            summary,
+            role,
+            description,
+            prompt,
+            spec,
+            flock,
+            agent: agent.map(|a| AgentChoice {
+                fallback: fallback.map(|f| f.iter().map(|s| s.to_string()).collect()),
+                ..a
+            }),
+            priority,
+        }
+    }
+
+    /// The fallback list a task names is kept with where it came from, less
+    /// the task's own model; `task describe` shows it.
+    #[tokio::test]
+    async fn a_task_keeps_the_fallback_it_names() {
+        let (d, _tmp) = fallback_daemon().await;
+        let run = |model, fallback| d.handle(run_fallback(model, Some(fallback), Some("bare")));
+        let IpcResponse::Task(t) = run(Some("opus"), &["sonnet", "gpt"]).await else {
+            panic!()
+        };
+        assert_eq!(t.fallback(), ["sonnet", "gpt"]);
+        let source = t.spec.agent_source.clone().unwrap();
+        assert_eq!(source.fallback_from.as_deref(), Some("task run"));
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("fallback:   sonnet, gpt (from task run)\n"),
+            "{text}"
+        );
+        let IpcResponse::Task(t) = run(Some("sonnet"), &["sonnet", "gpt"]).await else {
+            panic!()
+        };
+        assert_eq!(t.fallback(), ["gpt"]);
+        let IpcResponse::Task(t) = run(None, &[]).await else {
+            panic!()
+        };
+        assert!(t.fallback().is_empty());
+    }
+
+    /// With no list of its own, a task takes its machine's, else its
+    /// flock's; a machine's `[]` gives it none although the flock has one.
+    #[tokio::test]
+    async fn a_machines_fallback_beats_its_flocks() {
+        let (d, _tmp) = fallback_daemon().await;
+        let placed = |machine| {
+            let d = &d;
+            async move {
+                let IpcResponse::Task(t) = d.handle(run_fallback(None, None, Some(machine))).await
+                else {
+                    panic!()
+                };
+                let from = t.spec.agent_source.as_ref().unwrap().fallback_from.clone();
+                (t.fallback().to_vec(), from)
+            }
+        };
+        assert_eq!(
+            placed("pi").await,
+            (vec!["opus".to_string()], Some("machine pi".into()))
+        );
+        assert_eq!(placed("cx").await, (vec![], Some("machine cx".into())));
+        assert_eq!(
+            placed("bare").await,
+            (
+                vec!["sonnet".to_string(), "gpt".to_string()],
+                Some("flock personal".into())
+            )
+        );
+    }
+
+    /// A fallback name `[models]` lacks is refused by `task run`, and by a
+    /// retry once it is dropped from `[models]`.
+    #[tokio::test]
+    async fn an_unknown_fallback_is_refused_on_run_and_retry() {
+        let (d, _tmp) = fallback_daemon().await;
+        let resp = d
+            .handle(run_fallback(None, Some(&["sonnet", "haiku"]), Some("bare")))
+            .await;
+        match resp {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "unknown_model", "{message}");
+                assert!(message.contains("model haiku"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let IpcResponse::Task(mut t) = d
+            .handle(run_fallback(None, Some(&["opus"]), Some("bare")))
+            .await
+        else {
+            panic!()
+        };
+        t.state = TaskState::Failed;
+        t.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut t).unwrap();
+        let mut config = models_config();
+        config.models.0.remove("opus");
+        d.fleet().set_config(&config);
+        let retry = IpcRequest::TaskRetry {
+            id: t.id,
+            place: None,
+        };
+        assert_eq!(error_code(d.handle(retry.clone()).await), "unknown_model");
+        d.fleet().set_config(&models_config());
+        let IpcResponse::Task(copy) = d.handle(retry).await else {
+            panic!()
+        };
+        assert_eq!(copy.fallback(), ["opus"]);
+    }
+
+    /// A job's fallback renders per item: an item with none leaves the
+    /// task no list although its flock has one, and a name `[models]`
+    /// lacks refuses the item.
+    #[tokio::test]
+    async fn a_jobs_fallback_renders_per_item_and_is_checked() {
+        let (d, _tmp) = fallback_daemon().await;
+        let text = "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nmachine = \"bare\"\nfallback = [\"{{ item.fallback }}\"]\nprompt = \"p\"\n";
+        let job = crate::config::job::Job::parse(
+            text,
+            "j",
+            &models_config().defaults,
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let queue = |item: serde_json::Value| {
+            let job = &job;
+            let d = &d;
+            async move {
+                d.fleet()
+                    .queue_job_task(job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                    .await
+            }
+        };
+        let t = queue(serde_json::json!({"key": "k1"})).await.unwrap();
+        assert!(t.fallback().is_empty());
+        assert_eq!(
+            t.spec
+                .agent_source
+                .as_ref()
+                .unwrap()
+                .fallback_from
+                .as_deref(),
+            Some("job j")
+        );
+        let t = queue(serde_json::json!({"key": "k2", "fallback": "gpt"}))
+            .await
+            .unwrap();
+        assert_eq!(t.fallback(), ["gpt"]);
+        let err = queue(serde_json::json!({"key": "k3", "fallback": "haiku"}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("model haiku is not in [models]"),
+            "{err:#}"
+        );
+    }
+
     /// `models_config` with `[profiles.ci]`, develop plus make.
     fn profiles_config() -> PastorConfig {
         let mut c = models_config();
@@ -8303,6 +8519,7 @@ mod tests {
                     agent: None,
                     agent_args: None,
                     model: None,
+                    fallback: None,
                     priority: None,
                     agents: Default::default(),
                     profile: None,

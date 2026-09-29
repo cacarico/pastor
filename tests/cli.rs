@@ -4678,6 +4678,26 @@ fn complete_offers_connector_ids() {
     }
 }
 
+/// `--model` and `--fallback` both take names from `[models]`.
+#[test]
+fn complete_offers_model_names_after_model_and_fallback() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "[models.sonnet]\nkind = \"claude\"\nargs = []\n[models.gpt]\nkind = \"opencode\"\nargs = []\n",
+    )
+    .unwrap();
+    for words in [
+        &["task", "run", "fix it", "--model", ""][..],
+        &["task", "run", "fix it", "--fallback", ""],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(ok, "{words:?}");
+        assert!(out.contains("sonnet\tclaude\n"), "{words:?}: {out}");
+        assert!(out.contains("gpt\topencode\n"), "{words:?}: {out}");
+    }
+}
+
 #[test]
 fn complete_offers_task_ids_with_their_note() {
     let (_tmp, config, state) = completion_config();

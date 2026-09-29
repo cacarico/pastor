@@ -204,6 +204,7 @@ async fn the_daemon_writes_the_events_log() {
             agent: None,
             agent_args: None,
             model: None,
+            fallback: None,
             priority: None,
             agents: Default::default(),
             profile: None,

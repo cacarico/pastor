@@ -127,6 +127,7 @@ const TASK: &[(&str, &str)] = &[
     ("ended", "bool"),
     ("error", "string|null"),
     ("finished_at", "string|null"),
+    ("fallback", "array"),
     ("flock", "string|null"),
     ("id", "number"),
     ("item", "object|string|number|bool|array|null"),
@@ -246,6 +247,8 @@ fn full_task() -> Task {
             "ask": {},
             "agent": "claude",
             "model": "opus",
+            "fallback": ["sonnet"],
+            "fallback_from": "task run",
             "profile": "safe",
         }))
         .unwrap(),
@@ -607,7 +610,7 @@ fn job_list_json_is_an_array_of_jobs() {
 
 const FLOCK_TOML: &str = "[[flock]]\nname = \"work\"\ndefault = true\ndescription = \"work \
      things\"\nagent = \"claude\"\nagent_args = [\"-v\"]\nallow = [\"Bash\"]\ndeny = \
-     [\"Web\"]\nmodel = \"opus\"\nprofile = \"safe\"\ntimeout = \"1h\"\nplace = \"own\"\n\n\
+     [\"Web\"]\nmodel = \"opus\"\nfallback = [\"sonnet\"]\nprofile = \"safe\"\ntimeout = \"1h\"\nplace = \"own\"\n\n\
      [[machine]]\nname = \"pi-1\"\nssh = \"user@pi-1\"\nflock = \"work\"\n";
 
 #[test]
@@ -621,6 +624,7 @@ fn flock_describe_json_is_the_flock_and_its_tasks() {
         ("default", "bool"),
         ("deny", "array"),
         ("description", "string|null"),
+        ("fallback", "array|null"),
         ("machines", "array"),
         ("model", "string|null"),
         ("name", "string"),
@@ -655,6 +659,7 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
         row: machine_row(),
         session: "default".into(),
         model: Some("opus".into()),
+        fallback: Some(vec!["sonnet".into()]),
         agents_by_kind: Default::default(),
         tasks: vec![full_task()],
         recent_errors: vec![],
@@ -663,6 +668,7 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
     let mut want: Vec<(&str, &str)> = MACHINE.to_vec();
     want.extend([
         ("agents_by_kind", "object"),
+        ("fallback", "array|null"),
         ("model", "string|null"),
         ("recent_errors", "array"),
         ("session", "string"),
@@ -677,6 +683,7 @@ fn machine_describe_json_is_the_row_its_tasks_and_errors() {
         row: bare_machine_row(),
         session: "default".into(),
         model: None,
+        fallback: None,
         agents_by_kind: Default::default(),
         tasks: vec![],
         recent_errors: vec![],

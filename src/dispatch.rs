@@ -1851,6 +1851,8 @@ mod tests {
                 agent_args: None,
                 model: None,
                 model_from: None,
+                fallback: vec![],
+                fallback_from: None,
                 profile: profile.map(str::to_string),
                 profile_from: Some("defaults".into()),
                 timeout_from: None,

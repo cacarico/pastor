@@ -473,6 +473,11 @@ pub struct Defaults {
     /// machine name none. See `resolve_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The `[models]` names a task may fall back to when its run flags,
+    /// job, machine and flock set none; `[]` means none. See
+    /// `resolve_agent_on`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
     /// The level of tasks whose run flags, job, flock and pinned machine
     /// name none; unset, `normal`. See `resolve_priority`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -521,6 +526,11 @@ pub struct AgentChoice {
     /// A `[models]` name, before the flock's, the machine's and `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// `[models]` names the task may fall back to, before the machine's,
+    /// the flock's and `[defaults]` (`--fallback`, a job's `fallback`);
+    /// `Some(vec![])` means none (`--no-fallback`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
     /// A permission profile, before the flock's, the machine's and
     /// `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -564,6 +574,10 @@ pub struct AgentPick {
     /// `None` when no layer names one. Its args are not in `agent_args`:
     /// `Models::apply` puts them in front.
     pub model: Option<(String, Layer)>,
+    /// The `[models]` names the task may fall back to, and the layer that
+    /// set them; `None` when no layer does. A layer's `[]` is kept here, so
+    /// the task shows where its empty list came from.
+    pub fallback: Option<(Vec<String>, Layer)>,
     /// The agent is `agent_from`'s `agents` entry for its kind, not its
     /// `agent` (`Defaults::resolve_agent_for`).
     pub by_kind: bool,
@@ -727,6 +741,16 @@ impl Defaults {
         ]
         .into_iter()
         .find_map(|(layer, name)| Some((name?.clone(), layer)));
+        // Unlike `model`, the machine's list comes before its flock's: what
+        // a task may fall back to is what that machine is logged in to.
+        let fallback = [
+            (Layer::Ask, ask.fallback.as_ref()),
+            (Layer::Machine, machine.and_then(|m| m.fallback.as_ref())),
+            (Layer::Flock, flock.and_then(|f| f.fallback.as_ref())),
+            (Layer::Defaults, self.fallback.as_ref()),
+        ]
+        .into_iter()
+        .find_map(|(layer, names)| Some((names?.clone(), layer)));
         let profile = [
             (Layer::Ask, ask.profile.as_ref()),
             (Layer::Flock, flock.and_then(|f| f.profile.as_ref())),
@@ -743,6 +767,7 @@ impl Defaults {
             agent_from,
             args_from,
             model,
+            fallback,
             by_kind: false,
             profile,
             missing_kind: None,
@@ -1013,6 +1038,7 @@ impl Default for Defaults {
             allow: vec![],
             deny: vec![],
             model: None,
+            fallback: None,
             priority: None,
             agents: KindAgents::new(),
             profile: None,
@@ -1430,6 +1456,22 @@ impl Models {
         spec.agent_args = def.args.iter().chain(&pick.agent_args).cloned().collect();
         Ok(())
     }
+
+    /// `pick`'s fallback list as the task keeps it: each name checked
+    /// (`unknown_model`), the task's own model and repeats dropped. Its
+    /// kind is not checked here: the model finds its agent where the task
+    /// switches to it.
+    pub fn fallback(&self, pick: &AgentPick) -> Result<Vec<String>, AgentRefusal> {
+        let mut out: Vec<String> = Vec::new();
+        for name in pick.fallback.iter().flat_map(|(names, _)| names) {
+            self.get(name)?;
+            let own = pick.model.as_ref().is_some_and(|(m, _)| m == name);
+            if !own && !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1715,6 +1757,11 @@ impl PastorConfig {
             cfg.models
                 .check(m)
                 .map_err(|e| anyhow::anyhow!("{}: defaults.model: {e}", path.display()))?;
+        }
+        for m in cfg.defaults.fallback.iter().flatten() {
+            cfg.models
+                .check(m)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.fallback: {e}", path.display()))?;
         }
         cfg.profiles
             .validate()
@@ -2280,18 +2327,20 @@ mod tests {
     }
 
     /// `[models.<name>]` needs a kind and args, a name in the job names'
-    /// alphabet, and nothing else; `[defaults] model` must name one.
+    /// alphabet, and nothing else; `[defaults] model` must name one, and so
+    /// must each of `[defaults] fallback`.
     #[test]
     fn models_load_and_bad_ones_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pastor.toml");
         std::fs::write(
             &path,
-            "[defaults]\nmodel = \"sonnet\"\n[models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n[models.plain]\nkind = \"codex\"\nargs = []\n",
+            "[defaults]\nmodel = \"sonnet\"\nfallback = [\"plain\"]\n[models.sonnet]\nkind = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5\"]\n[models.plain]\nkind = \"codex\"\nargs = []\n",
         )
         .unwrap();
         let cfg = PastorConfig::load(&path).unwrap();
         assert_eq!(cfg.defaults.model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.defaults.fallback, Some(vec!["plain".to_string()]));
         assert_eq!(
             cfg.models.0["sonnet"].args,
             vec!["--model", "claude-sonnet-5"]
@@ -2317,6 +2366,10 @@ mod tests {
                 "env",
             ),
             ("[defaults]\nmodel = \"haiku\"\n", "defaults.model"),
+            (
+                "[defaults]\nfallback = [\"haiku\"]\n",
+                "defaults.fallback: model haiku is not in [models]",
+            ),
         ] {
             std::fs::write(&path, text).unwrap();
             let err = PastorConfig::load(&path).unwrap_err().to_string();
@@ -2524,6 +2577,73 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code, "unknown_model");
+    }
+
+    /// The fallback list comes whole from the first of the ask, the
+    /// machine, the flock and `[defaults]` that sets one; lists do not
+    /// merge, and `[]` stops the lookup with none.
+    #[test]
+    fn the_fallback_comes_whole_from_the_first_layer_that_sets_one() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let d = Defaults {
+            fallback: Some(names(&["haiku"])),
+            ..Default::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "p".into(),
+            fallback: Some(names(&["sonnet", "gpt"])),
+            ..Default::default()
+        };
+        let machine = |text: &str| -> flock::MachineConfig {
+            toml::from_str(&format!("name = \"m\"\nlocal = true\n{text}")).unwrap()
+        };
+        let ask = |fallback: Option<&[&str]>| AgentChoice {
+            fallback: fallback.map(names),
+            ..Default::default()
+        };
+        let fallback = |p: AgentPick| p.fallback;
+        let own = machine("fallback = [\"opus\"]\n");
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(Some(&["gpt"])), Some(&own), Some(&flock))),
+            Some((names(&["gpt"]), Layer::Ask))
+        );
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(Some(&[])), Some(&own), Some(&flock))),
+            Some((vec![], Layer::Ask))
+        );
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(None), Some(&own), Some(&flock))),
+            Some((names(&["opus"]), Layer::Machine))
+        );
+        let none = machine("fallback = []\n");
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(None), Some(&none), Some(&flock))),
+            Some((vec![], Layer::Machine))
+        );
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(None), Some(&machine("")), Some(&flock))),
+            Some((names(&["sonnet", "gpt"]), Layer::Flock))
+        );
+        assert_eq!(
+            fallback(d.resolve_agent_on(&ask(None), Some(&machine("")), None)),
+            Some((names(&["haiku"]), Layer::Defaults))
+        );
+        assert_eq!(
+            fallback(Defaults::default().resolve_agent(&ask(None), None)),
+            None
+        );
+
+        // Each name must be in `[models]`; the task's own model is dropped.
+        let models: Models = toml::from_str(
+            "[sonnet]\nkind = \"claude\"\nargs = []\n[gpt]\nkind = \"opencode\"\nargs = []\n",
+        )
+        .unwrap();
+        let mut pick = d.resolve_agent(&ask(Some(&["sonnet", "gpt", "sonnet"])), None);
+        assert_eq!(models.fallback(&pick).unwrap(), names(&["sonnet", "gpt"]));
+        pick.model = Some(("sonnet".into(), Layer::Ask));
+        assert_eq!(models.fallback(&pick).unwrap(), names(&["gpt"]));
+        let pick = d.resolve_agent(&ask(Some(&["sonnet", "opus"])), None);
+        assert_eq!(models.fallback(&pick).unwrap_err().code, "unknown_model");
     }
 
     /// A model of another kind than the default agent's runs on the first
@@ -2872,6 +2992,8 @@ mod tests {
                 agent_args: None,
                 model: None,
                 model_from: None,
+                fallback: vec![],
+                fallback_from: None,
                 profile: Some("develop".into()),
                 profile_from: Some("defaults".into()),
                 timeout_from: None,
@@ -2951,6 +3073,8 @@ mod tests {
             agent_args: None,
             model: None,
             model_from: None,
+            fallback: vec![],
+            fallback_from: None,
             profile: Some("develop".into()),
             profile_from: Some("defaults".into()),
             timeout_from: None,

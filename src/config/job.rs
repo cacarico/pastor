@@ -56,6 +56,11 @@ pub struct DispatchTable {
     /// A `[models]` name, or a template of one (`{{ item.model }}`) rendered
     /// per item; rendered empty, the flock's, machine's or `[defaults]` model.
     pub model: Option<String>,
+    /// `[models]` names the job's tasks may fall back to, each a name or a
+    /// template of one rendered per item; entries that render empty are
+    /// dropped. Before the machine's, the flock's and `[defaults]`; `[]`
+    /// means none.
+    pub fallback: Option<Vec<String>>,
     /// A level (`low`, `normal`, `high`, `critical`), or a template of one
     /// (`{{ item.priority }}`) rendered per item; rendered empty, the flock's,
     /// pinned machine's or `[defaults]` level.
@@ -118,8 +123,9 @@ pub struct Job {
     /// flock's is only known when a task is queued, which re-resolves it
     /// from `agent` (`Fleet::queue_job_task`).
     pub spec: DispatchSpec,
-    /// What `[dispatch]` itself says about the agent. Its `model` is still a
-    /// template: `model_for` renders it for one item.
+    /// What `[dispatch]` itself says about the agent. Its `model` and
+    /// `fallback` are still templates: `model_for` and `fallback_for` render
+    /// them for one item.
     pub agent: AgentChoice,
     /// `dispatch.flock`, checked against flock.toml at each run (see
     /// `Flock::task_flock`): the job file does not know the flocks.
@@ -263,6 +269,21 @@ impl Job {
                     .map_err(|e| format!("dispatch.model: {e}"))?;
             }
         }
+        for entry in d.fallback.iter().flatten() {
+            for path in
+                template::placeholders(entry).map_err(|e| format!("dispatch.fallback: {e}"))?
+            {
+                if !(path.starts_with("item.") || path == "job.name") {
+                    return Err(format!(
+                        "dispatch.fallback: unknown placeholder {{{{ {path} }}}}; use item.* or job.name"
+                    ));
+                }
+            }
+            if !entry.contains("{{") {
+                crate::config::check_model_name(entry)
+                    .map_err(|e| format!("dispatch.fallback: {e}"))?;
+            }
+        }
         if let Some(priority) = &d.priority {
             for path in
                 template::placeholders(priority).map_err(|e| format!("dispatch.priority: {e}"))?
@@ -347,6 +368,7 @@ impl Job {
             allow: d.allow,
             deny: d.deny,
             model: d.model,
+            fallback: d.fallback,
             profile: d.profile,
             timeout_secs: d.timeout.is_some().then_some(timeout.as_secs()),
             place: d.place.clone(),
@@ -449,6 +471,32 @@ impl Job {
         }
         crate::config::check_model_name(text).map_err(|e| format!("dispatch.model: {e}"))?;
         Ok(Some(text.to_string()))
+    }
+
+    /// The job's `fallback` rendered for `item`: `None` when the job sets
+    /// none, so the machine's, flock's or `[defaults]` list applies. Entries
+    /// that render empty are dropped, and the list stays the job's even when
+    /// that leaves it empty: the task then has none. A rendered entry that
+    /// is not a model name is refused; whether `[models]` has it is checked
+    /// when the task is queued.
+    pub fn fallback_for(&self, item: &Value) -> Result<Option<Vec<String>>, String> {
+        let Some(entries) = &self.agent.fallback else {
+            return Ok(None);
+        };
+        let ctx = serde_json::json!({"item": item, "job": {"name": self.name}});
+        let mut out = Vec::new();
+        for entry in entries {
+            let text = template::render(entry, &ctx)
+                .map_err(|e| format!("dispatch.fallback: {e}"))?
+                .text;
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            crate::config::check_model_name(text).map_err(|e| format!("dispatch.fallback: {e}"))?;
+            out.push(text.to_string());
+        }
+        Ok(Some(out))
     }
 }
 
@@ -711,6 +759,67 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert_eq!(empty.task_description_for(&item), None);
         let err = job("", "description = \"{{ task.id }}\"\n").unwrap_err();
         assert!(err.contains("dispatch.description"), "{err}");
+    }
+
+    /// A job's `fallback` entries are templates rendered per item: those
+    /// that render empty are dropped, the list stays the job's even when
+    /// empty, and each rendered entry must be a model name.
+    #[test]
+    fn a_jobs_fallback_renders_per_item() {
+        let job = |fallback: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nfallback = {fallback}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &defaults(),
+                &Builtins,
+            )
+        };
+        let j = job(r#"["{{ item.fallback }}", "gpt"]"#).unwrap();
+        let item = |v: serde_json::Value| j.fallback_for(&v).unwrap();
+        assert_eq!(
+            item(serde_json::json!({"fallback": "sonnet"})),
+            Some(vec!["sonnet".to_string(), "gpt".to_string()])
+        );
+        assert_eq!(item(serde_json::json!({})), Some(vec!["gpt".to_string()]));
+        let only = job(r#"["{{ item.fallback }}"]"#).unwrap();
+        assert_eq!(
+            only.fallback_for(&serde_json::json!({})).unwrap(),
+            Some(vec![])
+        );
+        let err = only
+            .fallback_for(&serde_json::json!({"fallback": "--model x"}))
+            .unwrap_err();
+        assert!(err.contains("dispatch.fallback"), "{err}");
+        let none = job("[]").unwrap();
+        assert_eq!(
+            none.fallback_for(&serde_json::json!({})).unwrap(),
+            Some(vec![])
+        );
+        let plain = job(r#"["sonnet"]"#).unwrap();
+        assert_eq!(
+            plain.fallback_for(&serde_json::json!({})).unwrap(),
+            Some(vec!["sonnet".to_string()])
+        );
+        let unset = Job::parse(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n",
+            "j",
+            &defaults(),
+            &Builtins,
+        )
+        .unwrap();
+        assert_eq!(unset.fallback_for(&serde_json::json!({})).unwrap(), None);
+        assert!(
+            job(r#"["{{ task.id }}"]"#)
+                .unwrap_err()
+                .contains("dispatch.fallback")
+        );
+        assert!(
+            job(r#"["Sonnet"]"#)
+                .unwrap_err()
+                .contains("dispatch.fallback")
+        );
     }
 
     /// A job's `model` is a template rendered per item: empty means the job
@@ -1023,6 +1132,7 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             timeout: "30m".into(),
             place: Default::default(),
             model: None,
+            fallback: None,
             priority: None,
             agents: Default::default(),
             profile: None,

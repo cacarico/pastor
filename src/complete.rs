@@ -43,7 +43,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         (_, "machine") | (["flock", "add"], "machines") => Some(Kind::Machine),
         (_, "task") | (["task", "close"], "tasks") => Some(Kind::Task),
         (_, "job") => Some(Kind::Job),
-        (_, "model") => Some(Kind::Model),
+        (_, "model" | "fallback") => Some(Kind::Model),
         (_, "profile") => Some(Kind::Profile),
         (_, "priority") | (["task", "priority"], "level") => Some(Kind::Priority),
         (["connector", ..], "id") => Some(Kind::Connector),

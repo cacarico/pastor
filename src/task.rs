@@ -482,7 +482,7 @@ impl From<Place> for String {
 
 /// See `DispatchSpec::agent_source`. The labels read like `machine own`,
 /// `flock personal`, `defaults`, `task run` or `job <name>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSource {
     pub ask: crate::config::AgentChoice,
     pub agent: String,
@@ -497,6 +497,14 @@ pub struct AgentSource {
     /// Where `model` came from, labelled like `agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_from: Option<String>,
+    /// The `[models]` names the task may fall back to, in order, as
+    /// settled (`Models::fallback`); empty when it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
+    /// Where `fallback` came from, labelled like `agent`; set too when that
+    /// layer's list is `[]`, and `None` when no layer sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_from: Option<String>,
     /// The permission profile the task runs under, whose lists are in the
     /// spec's `allow` and `deny`; `None` when no layer names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -862,6 +870,13 @@ impl Task {
     pub fn model(&self) -> Option<&str> {
         self.spec.agent_source.as_ref()?.model.as_deref()
     }
+    /// The `[models]` names the task may fall back to, in order.
+    pub fn fallback(&self) -> &[String] {
+        self.spec
+            .agent_source
+            .as_ref()
+            .map_or(&[], |s| s.fallback.as_slice())
+    }
     /// The permission profile the task runs under, if it runs one.
     pub fn profile(&self) -> Option<&str> {
         self.spec.profile()
@@ -892,6 +907,7 @@ impl Task {
                 "model".into(),
                 self.model().map_or(Value::Null, Value::from),
             );
+            o.insert("fallback".into(), self.fallback().into());
             o.insert(
                 "profile".into(),
                 self.profile().map_or(Value::Null, Value::from),

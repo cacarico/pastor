@@ -81,6 +81,8 @@ Create a one-off task and dispatch it
 | `--agent <AGENT>` | The agent command to start, like claude or codex (default: the machine's, else its flock's, else `[defaults]`, else claude) |  |
 | `--agent-arg <ARG>` | One argument for the agent; repeat it, in order, for more. Replaces the flock's and `[defaults]` agent_args. The next word is always the value, dashes and all |  |
 | `--model <NAME>` | Run this model, a name from `[models]` in pastor.toml; its args go before the agent's (default: the flock's, else the machine's, else `[defaults] model`, else none) |  |
+| `--fallback <NAMES>` | The models the task may fall back to, in order: names from `[models]` in pastor.toml, comma separated (default: the machine's, else the flock's, else `[defaults] fallback`, else none) |  |
+| `--no-fallback` | Fall back to no other model, whatever the machine, flock or `[defaults]` say |  |
 | `--priority <LEVEL>` | Queue at this level: low, normal, high or critical; dispatch takes higher levels first (default: the flock's, else the pinned machine's, else `[defaults] priority`, else normal) |  |
 | `--preempt` | A critical task only: on a full machine, pause the newest low Claude task there (its session resumes when a slot frees) and take its slot |  |
 | `--profile <NAME>` | Run under this permission profile, built in or from `[profiles]` in pastor.toml: a Claude agent gets its allow and deny lists and never asks (default: the flock's, else the machine's, else `[defaults] profile`, else none) |  |

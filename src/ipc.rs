@@ -34,8 +34,9 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// flock's own `timeout` and `place` (`FlockEntry::timeout`,
 /// `FlockEntry::place`). 25: session orchestrators (`OrchestratorStart`,
 /// `OrchestratorStop`). 26: a flock's share and max on a machine
-/// (`FlockNumber::Split`, `FlockSeat::share`).
-pub const IPC_PROTOCOL: u32 = 26;
+/// (`FlockNumber::Split`, `FlockSeat::share`). 27: fallback models
+/// (`AgentChoice::fallback`, a job's `[dispatch] fallback`).
+pub const IPC_PROTOCOL: u32 = 27;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -169,6 +170,11 @@ pub const JOB_SUBMIT_PROTOCOL: u32 = 7;
 /// on its default model without a word.
 pub const MODEL_PROTOCOL: u32 = 8;
 
+/// The first protocol whose head keeps a task's fallback models
+/// (`--fallback`, `--no-fallback`, a job's `fallback`). An older one would
+/// drop them without a word.
+pub const FALLBACK_PROTOCOL: u32 = 27;
+
 /// The first protocol whose head honours `Run::priority` and knows
 /// `TaskPriority`. An older one would queue the task at its own level
 /// without a word, or refuse the request as unreadable.
@@ -256,6 +262,9 @@ const JOB_SUBMIT: &str = "predates job submits from a headless serve, and would 
 const JOB_TASK: &str = "predates job tasks from a headless serve, and would refuse them";
 const JOB_MODEL: &str =
     "predates a job naming a model, and would start its agents on their default model";
+const FALLBACK: &str = "predates fallback models, and would queue the task without --fallback";
+const JOB_FALLBACK: &str =
+    "predates a job naming fallback models, and would queue its tasks without them";
 const JOB_PROFILE: &str =
     "predates a job naming a permission profile, and would start its agents unenforced";
 const JOB_DESCRIPTION: &str =
@@ -740,6 +749,9 @@ impl IpcRequest {
                 if agent.as_ref().is_some_and(|a| a.model.is_some()) {
                     need.at(MODEL_PROTOCOL, queues);
                 }
+                if agent.as_ref().is_some_and(|a| a.fallback.is_some()) {
+                    need.at(FALLBACK_PROTOCOL, FALLBACK);
+                }
                 if priority.is_some() {
                     need.at(PRIORITY_PROTOCOL, PRIORITY);
                 }
@@ -826,6 +838,9 @@ impl IpcRequest {
                 if has("model") {
                     need.at(MODEL_PROTOCOL, JOB_MODEL);
                 }
+                if has("fallback") {
+                    need.at(FALLBACK_PROTOCOL, JOB_FALLBACK);
+                }
                 if has("priority") {
                     need.at(PRIORITY_PROTOCOL, JOB_PRIORITY);
                 }
@@ -854,6 +869,9 @@ impl IpcRequest {
                 need.at(SHEPHERD_PROTOCOL, JOB_TASK);
                 if agent.profile.is_some() {
                     need.at(PROFILE_PROTOCOL, JOB_PROFILE);
+                }
+                if agent.fallback.is_some() {
+                    need.at(FALLBACK_PROTOCOL, JOB_FALLBACK);
                 }
                 if description.is_some() {
                     need.at(DESCRIPTION_PROTOCOL, JOB_DESCRIPTION);
@@ -1777,6 +1795,7 @@ mod tests {
                     agent: None,
                     agent_args: None,
                     model: None,
+                    fallback: None,
                     priority: None,
                     agents: Default::default(),
                     profile: None,
@@ -2031,6 +2050,16 @@ mod tests {
                 "priority",
             ),
             (
+                submit(serde_json::json!({"fallback": ["fast"]})),
+                FALLBACK_PROTOCOL,
+                "fallback models",
+            ),
+            (
+                run(serde_json::json!({"agent": {"fallback": []}})),
+                FALLBACK_PROTOCOL,
+                "--fallback",
+            ),
+            (
                 req(
                     serde_json::json!({"op": "job_task", "job": "j", "agent": {}, "prompt": "p", "spec": {"agent": "claude"}, "item": {"key": "k"}}),
                 ),
@@ -2196,6 +2225,7 @@ mod tests {
             JOIN_PROTOCOL,
             ORCHESTRATOR_PROTOCOL,
             SESSION_PROTOCOL,
+            FALLBACK_PROTOCOL,
         ] {
             assert!(covered.contains(&p), "no request needs protocol {p}");
         }
