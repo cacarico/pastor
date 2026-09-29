@@ -708,6 +708,7 @@ pub fn works(task: &Task) -> bool {
             | TaskState::Running
             | TaskState::Blocked
             | TaskState::Paused
+            | TaskState::Waiting
     )
 }
 
@@ -721,6 +722,7 @@ pub fn working_orchestrators(store: &Store) -> anyhow::Result<usize> {
             TaskState::Running,
             TaskState::Blocked,
             TaskState::Paused,
+            TaskState::Waiting,
         ]),
         ..Default::default()
     })?;
@@ -2013,18 +2015,20 @@ impl Runner {
         // A claim moves a task out of `queued` once; two reads settle it.
         for _ in 0..3 {
             let result = match t.state {
-                TaskState::Queued | TaskState::Paused => match self.store.close_queued(t.id) {
-                    Ok(Some(_)) => return true,
-                    Ok(None) => match self.store.get_task(t.id) {
-                        Ok(Some(fresh)) => {
-                            t = fresh;
-                            continue;
-                        }
-                        Ok(None) => return true,
+                TaskState::Queued | TaskState::Paused | TaskState::Waiting => {
+                    match self.store.close_queued(t.id) {
+                        Ok(Some(_)) => return true,
+                        Ok(None) => match self.store.get_task(t.id) {
+                            Ok(Some(fresh)) => {
+                                t = fresh;
+                                continue;
+                            }
+                            Ok(None) => return true,
+                            Err(err) => Err(err),
+                        },
                         Err(err) => Err(err),
-                    },
-                    Err(err) => Err(err),
-                },
+                    }
+                }
                 s if s.occupies_pane() => {
                     match t.machine.as_deref().and_then(|m| self.fleet.get(m)) {
                         Some(h) => self

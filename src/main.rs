@@ -2307,7 +2307,11 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
             let _lock = offline_fleet_lock(paths)?;
             let queued = || -> anyhow::Result<Vec<Task>> {
                 open_store(paths)?.list_tasks(&TaskFilter {
-                    states: Some(vec![TaskState::Queued, TaskState::Paused]),
+                    states: Some(vec![
+                        TaskState::Queued,
+                        TaskState::Paused,
+                        TaskState::Waiting,
+                    ]),
                     ..Default::default()
                 })
             };
@@ -2557,6 +2561,21 @@ fn paused_attach_refusal(t: &Task) -> Option<String> {
     })
 }
 
+/// Why `task attach` refuses `t` when it waits for a usage limit to
+/// reset: its session resumes on its own then, and a second `claude
+/// --resume` would put two agents on one conversation. `None` for any
+/// other state.
+fn waiting_attach_refusal(t: &Task) -> Option<String> {
+    (t.state == TaskState::Waiting).then(|| {
+        format!(
+            "{} is waiting for a usage limit to reset; its session resumes in a new pane on {} then. `pastor limit clear` wakes it sooner, `pastor task close {}` gives it up",
+            t.display_id(),
+            t.machine.as_deref().unwrap_or("its machine"),
+            t.display_id()
+        )
+    })
+}
+
 async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     let id = task_id(task);
     // A remote head's task, its flock.toml and its pastor.toml; the pane
@@ -2577,6 +2596,9 @@ async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     };
     if let Some(why) = paused_attach_refusal(&t) {
         fail(TASK_PAUSED, &why);
+    }
+    if let Some(why) = waiting_attach_refusal(&t) {
+        fail(pastor::daemon::TASK_WAITING, &why);
     }
     let f = head_flock(paths).await?;
     let m = reach_from_here(
@@ -3401,6 +3423,10 @@ mod tests {
         let why = paused_attach_refusal(&t).unwrap();
         assert!(why.starts_with("t-4 is paused for t-9;"), "{why}");
         assert!(why.contains("pi-1"), "{why}");
+        assert_eq!(waiting_attach_refusal(&t), None);
+        t.state = TaskState::Waiting;
+        let why = waiting_attach_refusal(&t).unwrap();
+        assert!(why.starts_with("t-4 is waiting for a usage limit"), "{why}");
     }
 
     /// `task run --label` sends its template; a bad one is refused before

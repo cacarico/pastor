@@ -401,6 +401,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `task_not_found` | no task with that id |
 | `task_not_live` | the task has no live agent to send to or act on |
 | `task_paused` | `task attach` to a paused task |
+| `task_waiting` | `task retry` or `task attach` of a task waiting for a usage limit to reset |
 | `timeout` | the daemon did not answer in time; the request may still land |
 | `unknown_flock` | no flock by that name |
 | `unknown_machine` | no machine by that name |

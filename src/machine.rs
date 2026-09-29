@@ -2176,8 +2176,9 @@ impl Actor {
                 }
                 Some(_) => {}
             }
-            // A paused task has no pane or agent; only its checkout.
-            if t.state == TaskState::Paused {
+            // A paused or waiting task has no pane or agent; only its
+            // checkout.
+            if matches!(t.state, TaskState::Paused | TaskState::Waiting) {
                 return self.close_paused(t.clone(), remove_worktree).await;
             }
             // A closed row with no workspace had its worktree removed (or

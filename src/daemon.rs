@@ -2109,7 +2109,10 @@ impl Fleet {
         {
             self.note_limit(&task, machine, limit, chrono::Utc::now())?;
         }
-        if matches!(state, TaskState::Queued | TaskState::Paused) {
+        if matches!(
+            state,
+            TaskState::Queued | TaskState::Paused | TaskState::Waiting
+        ) {
             return Err(crate::cli::CliError::err(
                 "invalid_report",
                 format!("a pull machine cannot report a task {state}"),
@@ -2404,6 +2407,28 @@ impl Fleet {
             self.settled_on(task, theirs, machine)
                 .is_none_or(|r| r.is_ok())
         };
+        // A waiting task goes on once no live limit holds its agent and
+        // model on its machine: at its reset, or when its limit is cleared.
+        // Before the queue: it has started already, and its checkout and
+        // slot are on its machine only.
+        match self.store.waiting_tasks() {
+            Ok(waiting) => {
+                let now = chrono::Utc::now();
+                let live = self.live_limits(now);
+                for task in &waiting {
+                    let Some(machine) = task.pinned_machine() else {
+                        continue;
+                    };
+                    if self.is_in_flight(task.id)
+                        || !self.limits_holding(&live, machine, &task.spec).is_empty()
+                    {
+                        continue;
+                    }
+                    placed.extend(self.resume_paused(task, &queued, &takes));
+                }
+            }
+            Err(err) => tracing::error!(%err, "list waiting"),
+        }
         for (i, task) in queued.iter().enumerate() {
             let later = &queued[i + 1..];
             if self.is_in_flight(task.id) {
@@ -2671,9 +2696,9 @@ impl Fleet {
             .map(|(_, name, id)| (name, id))
     }
 
-    /// Resume paused task `task` on the machine it was paused on, once that
-    /// machine is healthy, still in the flock and has room for it, its own
-    /// flock under its number there. Past its share, it also waits while a
+    /// Resume paused or waiting task `task` on the machine it was paused or
+    /// waiting on, once that machine is healthy, still in the flock and has
+    /// room for it, its own flock under its number there. Past its share, it also waits while a
     /// flock under its share there has a task in `later` for that slot, as
     /// a queued task would (`MachineView::flock_may_take`). It is not
     /// settled again: it goes back to the agent and session it had.
@@ -2768,6 +2793,9 @@ fn layer_label(layer: Layer, asked_by: &str, flock: &str, machine: Option<&str>)
 }
 
 use crate::queue::{WAITING_FOR_ACCOUNT, WAITING_FOR_MODEL, asked_by, is_waiting_note};
+
+/// The code `task retry` refuses a waiting task with.
+pub const TASK_WAITING: &str = "task_waiting";
 
 /// How long `Fleet::live_limits` trusts the table as last read.
 const LIMITS_FRESH: Duration = Duration::from_secs(1);
@@ -4281,6 +4309,20 @@ impl Daemon {
             Err(QueueError::Store(err @ RetryError::NotFound(_))) => {
                 return IpcResponse::error("task_not_found", err);
             }
+            // A waiting task goes on by itself when its limit resets; a
+            // retry would start a second agent on the same work.
+            Err(QueueError::Store(RetryError::NotRetryable {
+                id,
+                state: TaskState::Waiting,
+            })) => {
+                return IpcResponse::error(
+                    TASK_WAITING,
+                    format!(
+                        "t-{id} is waiting for a usage limit to reset and resumes by itself; \
+                         `pastor limit clear` wakes it sooner, `pastor task close` gives it up"
+                    ),
+                );
+            }
             Err(QueueError::Store(err @ RetryError::NotRetryable { .. })) => {
                 return IpcResponse::error("not_retryable", err);
             }
@@ -4363,10 +4405,11 @@ impl Daemon {
             if t.state == TaskState::Closed && !remove_worktree {
                 return IpcResponse::Task(t);
             }
-            // A paused task holds no pane: a plain close is its row alone,
-            // unless a resume claims it first. Its checkout is on its
-            // machine, so `--remove-worktree` goes there.
-            let paused = t.state == TaskState::Paused && !remove_worktree;
+            // A paused or waiting task holds no pane: a plain close is its
+            // row alone, unless a resume claims it first. Its checkout is on
+            // its machine, so `--remove-worktree` goes there.
+            let paused =
+                matches!(t.state, TaskState::Paused | TaskState::Waiting) && !remove_worktree;
             if !paused && let Some(m) = t.machine.clone() {
                 break m;
             }
@@ -7244,6 +7287,60 @@ mod tests {
             panic!()
         };
         assert_eq!(q[0].why, err);
+    }
+
+    /// A waiting task stays so while its limit holds, whatever room its
+    /// machine has; `limit clear` wakes it on the next pass, back on its
+    /// machine with its session. `task retry` refuses it.
+    #[tokio::test]
+    async fn a_waiting_task_goes_on_when_its_limit_is_cleared() {
+        let (d, _tmp) = limits_daemon(true).await;
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("sonnet"), Some(&[]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let mut t = d.store.claim_task(t.id, "pi").unwrap().unwrap();
+        t.state = TaskState::Waiting;
+        t.agent_name = None;
+        t.error = Some("me exhausted until 03:00 (session limit, seen by t-9)".into());
+        t.spec.session_id = crate::task::new_session_id();
+        t.waiting_until = d.store.limits().unwrap().first().map(|l| l.retry_at);
+        d.store.update_task(&mut t).unwrap();
+
+        d.fleet().dispatch_queued().await;
+        let get = |d: &Daemon, id: i64| d.store.get_task(id).unwrap().unwrap();
+        assert_eq!(get(&d, t.id).state, TaskState::Waiting, "its limit holds");
+        let IpcResponse::Error { code, .. } = d
+            .handle(IpcRequest::TaskRetry {
+                id: t.id,
+                place: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(code, TASK_WAITING);
+
+        let IpcResponse::Limits(gone) = d
+            .handle(IpcRequest::LimitClear {
+                account: "me".into(),
+                model: None,
+            })
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(gone.len(), 1);
+        d.fleet().dispatch_queued().await;
+        let back = get(&d, t.id);
+        assert_eq!(back.state, TaskState::Running, "{:?}", back.error);
+        assert_eq!(back.machine.as_deref(), Some("pi"));
+        assert_eq!(back.waiting_until, None);
+        assert_eq!(back.spec.session_id, t.spec.session_id);
     }
 
     /// With no account, a limit holds only for the machine it was seen on:
