@@ -72,12 +72,14 @@ down here because getting them wrong cost a day.
 - CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine` and
   `make test-ssh` (the CLI against a head over a real ssh, through a
   throwaway sshd on localhost; `tests/real_ssh.rs`) on every pull request
-  that touches code (`paths:` skips docs-only diffs), or by hand
-  (`workflow_dispatch`). Push to main does not run `check`. Pull requests
-  land as merge commits, so the merge sha on main is never checked itself:
-  only each PR's head was. Two PRs that pass alone can still break main
-  together, and a direct push that skips a PR goes unchecked, unless someone
-  dispatches CI on main by hand.
+  that touches code (`paths:` skips docs-only diffs), on every push to `main`
+  that touches code or the changelog, and by hand (`workflow_dispatch`).
+- Pull requests merge with a merge commit (`gh pr merge --merge`) and no
+  other way: not `--rebase`, not `--squash`, and not a push of the PR's head
+  straight to `main`. PR CI runs on GitHub's merge of the PR into `main` as
+  `main` was when the run started; `main` can move before the PR merges, so
+  two PRs green on their own run can still break it together. That is why
+  push to `main` runs the checks again, on the tree `main` really has.
 - The repository is public. `.github/workflows/gitleaks.yml` scans the whole
   history of every ref on every pull request, on push to `main`, and weekly,
   and `make leaks` runs the same scan here. It does not run on push to other
