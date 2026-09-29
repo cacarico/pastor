@@ -1374,8 +1374,11 @@ mod tests {
     /// What systemd makes of one unit-file word: specifiers first (`%%` is a
     /// literal `%`; any other specifier is a word `quote` should not have
     /// written), then the word split with its quote and backslash rules. Fails
-    /// unless the line holds exactly one word.
+    /// unless the line holds exactly one word; an empty line holds none.
     fn systemd_unquote(line: &str) -> Result<String, String> {
+        if line.is_empty() {
+            return Err("no word in an empty line".to_string());
+        }
         let mut spec = String::new();
         let mut chars = line.chars();
         while let Some(c) = chars.next() {
@@ -1416,10 +1419,11 @@ mod tests {
 
     proptest::proptest! {
         /// systemd reads back exactly the string `quote` was given, whatever
-        /// `%`, spaces, quotes, backslashes or non-ASCII it holds.
+        /// `%`, spaces, quotes, backslashes or non-ASCII it holds. Not empty:
+        /// `quote("")` writes no word, and no path it is given is empty.
         #[test]
         fn prop_quote_round_trips_through_systemd(
-            s in "([%nC \"'\\\\é中\t]|\\PC){0,24}",
+            s in "([%nC \"'\\\\é中\t]|\\PC){1,24}",
         ) {
             proptest::prop_assert_eq!(systemd_unquote(&quote(&s)), Ok(s));
         }
