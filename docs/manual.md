@@ -1442,11 +1442,15 @@ The limit goes in the table as above, with `agent.exhausted` and
   print as it is.
 
 Each dispatch pass looks at the waiting tasks, the soonest first and before
-the queue. One goes on once no live limit holds its agent and model on its
-machine: when the pass drops the row at its `retry_at`, or on the pass after
-`pastor limit clear`. A later limit on the same account keeps it waiting. It
-resumes as a paused task does, on its machine and once there is room: back
-in its own checkout, with `claude --resume <session>` and a line telling the
+the queue. One goes on once its `waiting_until` has passed and no live limit
+holds its agent and model on its machine: when the pass drops the row at its
+`retry_at`, or on the pass after `pastor limit clear`, which brings
+`waiting_until` forward on the tasks the cleared rows held. A task whose
+limit could not be kept in the table still waits for its time. A later limit
+on the same account keeps it waiting. It resumes as a paused task does, on
+its machine and once there is room, and like one, past its flock's share
+there, it leaves the slot to a flock under its share that has a task queued
+for it: back in its own checkout, with `claude --resume <session>` and a line telling the
 agent it stopped on a usage limit that has reset. A task with no session to
 resume (its agent died at the start of a new one, so its prompt never
 reached it) starts again in the same checkout with its prompt and a

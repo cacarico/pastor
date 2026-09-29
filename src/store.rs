@@ -1250,6 +1250,22 @@ impl Store {
         })
     }
 
+    /// Bring waiting task `id`'s `waiting_until` forward to `now`, so the
+    /// next dispatch pass may resume it: its limit was cleared by hand.
+    /// False when it is not waiting any more.
+    pub fn wake_waiting(&self, id: i64, now: DateTime<Utc>) -> anyhow::Result<bool> {
+        let now = now.to_rfc3339();
+        blocking(|| {
+            let conn = self.conn.lock().recover();
+            let n = conn.execute(
+                "UPDATE tasks SET waiting_until = ?2, updated_at = ?2
+                 WHERE id = ?1 AND state = 'waiting'",
+                params![id, now],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
     /// Waiting tasks (`TaskState::Waiting`), the soonest `waiting_until`
     /// first, then oldest first.
     pub fn waiting_tasks(&self) -> anyhow::Result<Vec<Task>> {
