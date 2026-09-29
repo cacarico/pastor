@@ -3524,6 +3524,7 @@ trust_keys = ["Down", "Enter"]   # accept its folder-trust prompt; [] for none
 trust_marker = "Yes, I trust this folder"  # saved trust presses them only while the pane shows this
 allow_flag = "--allowedTools"    # the flag before each allow pattern
 deny_flag = "--disallowedTools"  # the flag before each deny pattern
+# account = "me-personal"       # a label: machines naming it share its usage limits; unset: none
 [models.sonnet]              # one table per model; none are built in
 kind = "claude"                  # the herdr agent kind that runs it (required)
 args = ["--model", "claude-sonnet-5"]  # put before agent_args (required, may be [])
@@ -3538,6 +3539,13 @@ name = "prs"
 # machine = "laptop"         # its name in the head's flock.toml; unset: the hostname
 takes_flock_work = false     # true: also its flocks' unpinned tasks, not only those pinned here
 # command = ["fake-herdr"]   # developer option: argv speaking herdr on stdio; unset: this herdr
+[limits]                     # usage limits; see Usage limits
+wait_under = "1h"            # a limited task waits for a reset closer than this, else falls back; "0s": never waits
+rate_retries = 3             # a 429 or 529 is sent on this many times before it counts as a limit
+rate_backoff = "1m"          # the wait before the first of those; each next one doubles it
+unknown_reset_wait = "1h"    # how long a limit whose message names no reset holds
+retry_after_no_credit = "6h" # how long a no-credit limit holds
+handover_lines = 100         # pane lines a task moving to another model hands over
 ```
 
 `head_address` is the ssh destination other machines reach the head by. When
