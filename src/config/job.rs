@@ -60,6 +60,13 @@ pub struct DispatchTable {
     /// (`{{ item.priority }}`) rendered per item; rendered empty, the pinned
     /// machine's, flock's or `[defaults]` level.
     pub priority: Option<String>,
+    /// Let the job's critical tasks pause a `low` Claude task on a full
+    /// machine to start (see `Task::pause`); tasks it queues below critical
+    /// ignore it.
+    pub preempt: bool,
+    /// Whether the job's tasks are asked for a summary, or need one
+    /// (`SummaryMode`), before the flock's and `[defaults]`.
+    pub summary: Option<crate::task::SummaryMode>,
     /// A permission profile, built in or in `[profiles]`, before the
     /// machine's, the flock's and `[defaults]`.
     pub profile: Option<String>,
@@ -74,6 +81,9 @@ pub struct DispatchTable {
     pub timeout: Option<String>,
     /// Where the job's tasks' panes go; `None` takes `[defaults] place`.
     pub place: Option<Place>,
+    /// The label template of each task's workspace; `None` takes the
+    /// flock's, else `[defaults] label` (`Defaults::resolve_label`).
+    pub label: Option<String>,
     pub max_tasks_per_run: Option<u32>,
     pub backfill: Option<String>,
     /// The template of each task's description; `None` is
@@ -117,6 +127,11 @@ pub struct Job {
     /// `dispatch.priority`, still a template: `priority_for` renders it for
     /// one item.
     pub priority: Option<String>,
+    /// `dispatch.preempt`: its tasks that settle at critical get `preempt`.
+    pub preempt: bool,
+    /// `dispatch.summary`: before the flock's and `[defaults]`
+    /// (`Defaults::resolve_summary`).
+    pub summary: Option<crate::task::SummaryMode>,
     /// The `[dispatch]` table as written, as JSON and without `prompt`: what
     /// a headless serve sends the head with its items (`IpcRequest::
     /// JobSubmit`), so the head applies its own `[defaults]` to what the
@@ -259,15 +274,23 @@ impl Job {
                 }
             }
             if !priority.contains("{{") && !priority.trim().is_empty() {
-                priority
+                let level = priority
                     .trim()
                     .parse::<Priority>()
                     .map_err(|e| format!("dispatch.priority: {e}"))?;
+                if d.preempt && level != Priority::Critical {
+                    return Err(format!(
+                        "dispatch.preempt: only a critical task may pause another, and priority is {level} (preempt_needs_critical)"
+                    ));
+                }
             }
         }
         if let Some(profile) = &d.profile {
             crate::config::check_profile_name(profile)
                 .map_err(|e| format!("dispatch.profile: {e}"))?;
+        }
+        if let Some(label) = &d.label {
+            crate::task::check_label(label).map_err(|e| format!("dispatch.{e}"))?;
         }
         for (field, text) in [
             ("prompt", Some(d.prompt.as_str())),
@@ -325,6 +348,8 @@ impl Job {
             deny: d.deny,
             model: d.model,
             profile: d.profile,
+            timeout_secs: d.timeout.is_some().then_some(timeout.as_secs()),
+            place: d.place.clone(),
         };
         let pick = defaults.resolve_agent(&agent, None);
         Ok(Job {
@@ -340,6 +365,8 @@ impl Job {
             backfill,
             flock: d.flock,
             priority: d.priority,
+            preempt: d.preempt,
+            summary: d.summary,
             agent,
             dispatch: Value::Null,
             spec: DispatchSpec {
@@ -358,6 +385,11 @@ impl Job {
                 agent_source: None,
                 place: d.place.unwrap_or_else(|| defaults.place.clone()),
                 session_id: None,
+                label: crate::task::WorkspaceLabel {
+                    template: d.label,
+                    ..Default::default()
+                },
+                summary: Default::default(),
             },
         })
     }
@@ -718,6 +750,63 @@ Investigate, fix if it is a bug, and write your answer to REPLY.md.
         assert!(job("Sonnet").unwrap_err().contains("dispatch.model"));
     }
 
+    /// `summary` is read from `[dispatch]`; a job without it leaves it to
+    /// the flock and `[defaults]`, and another word fails the file.
+    #[test]
+    fn a_jobs_summary_is_read_from_dispatch() {
+        use crate::task::SummaryMode;
+        let job = |extra: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\n{extra}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &Defaults::default(),
+                &Builtins,
+            )
+        };
+        assert_eq!(job("").unwrap().summary, None);
+        assert_eq!(
+            job("summary = \"require\"").unwrap().summary,
+            Some(SummaryMode::Require)
+        );
+        assert_eq!(
+            job("summary = \"off\"").unwrap().summary,
+            Some(SummaryMode::Off)
+        );
+        assert!(job("summary = \"never\"").is_err());
+    }
+
+    /// `preempt` is read from `[dispatch]`, and refused beside a priority
+    /// written below critical; a template decides per item.
+    #[test]
+    fn a_jobs_preempt_needs_critical() {
+        let job = |extra: &str| {
+            Job::parse(
+                &format!(
+                    "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\n{extra}\nprompt = \"p\"\n"
+                ),
+                "j",
+                &Defaults::default(),
+                &Builtins,
+            )
+        };
+        assert!(!job("").unwrap().preempt);
+        assert!(
+            job("preempt = true\npriority = \"critical\"")
+                .unwrap()
+                .preempt
+        );
+        assert!(
+            job("preempt = true\npriority = \"{{ item.level }}\"")
+                .unwrap()
+                .preempt
+        );
+        assert!(job("preempt = true").unwrap().preempt);
+        let err = job("preempt = true\npriority = \"high\"").unwrap_err();
+        assert!(err.contains("preempt_needs_critical"), "{err}");
+    }
+
     /// A job's `priority` is a template rendered per item: empty falls
     /// through to the next layer, and what it renders must be a level.
     #[test]
@@ -936,6 +1025,8 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
             priority: None,
             agents: Default::default(),
             profile: None,
+            label: None,
+            summary: None,
         };
         let job = Job::parse(text, "hourly", &d, &Builtins).unwrap();
         assert_eq!(job.spec.agent, "codex");
@@ -968,6 +1059,38 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
         assert_eq!(job.spec.place, Place::Own);
         let err = Job::parse(&text("place = \"elsewhere\"\n"), "j", &d, &Builtins).unwrap_err();
         assert!(err.contains("unknown place elsewhere"), "{err}");
+    }
+
+    /// `[dispatch] label` is the job's label template, kept unrendered for
+    /// dispatch; a job without one leaves it to the flock and `[defaults]`,
+    /// settled when each task is queued.
+    #[test]
+    fn label_is_the_job_s_own_template() {
+        let text = |extra: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        let d = Defaults {
+            label: Some("{{ machine }}".into()),
+            ..defaults()
+        };
+        let job = Job::parse(&text(""), "j", &d, &Builtins).unwrap();
+        assert_eq!(job.spec.label.template, None);
+        let job = Job::parse(
+            &text("label = \"{{ job }}/{{ item.key }}\"\n"),
+            "j",
+            &d,
+            &Builtins,
+        )
+        .unwrap();
+        assert_eq!(
+            job.spec.label.template.as_deref(),
+            Some("{{ job }}/{{ item.key }}")
+        );
+        let err =
+            Job::parse(&text("label = \"{{ job.name }}\"\n"), "j", &d, &Builtins).unwrap_err();
+        assert!(err.contains("dispatch.label: unknown placeholder"), "{err}");
     }
 
     #[test]
@@ -1122,6 +1245,36 @@ prompt = "tick {{ item.key }} for {{ job.name }} as {{ task.id }}"
                 .as_deref(),
             Some("#k1")
         );
+    }
+
+    /// `[connector]` passes every key but `use` to the connector, so the
+    /// only key pastor can call misspelt there is `use` itself: the load
+    /// fails and names the file (the job) and the key.
+    #[test]
+    fn a_typo_of_connector_use_is_a_load_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = job_path(tmp.path(), "nightly");
+        std::fs::write(
+            &path,
+            "every = \"1h\"\n[connector]\nuse_ = \"clock\"\n[dispatch]\nprompt = \"p\"\n",
+        )
+        .unwrap();
+        let Loaded::Invalid { name, error } = load_file(&path, "nightly", &defaults(), &Builtins)
+        else {
+            panic!("a misspelt use must not load")
+        };
+        assert_eq!(name, "nightly");
+        assert!(error.contains("`use`"), "{error}");
+        // A typo beside `use` is the connector's config, not pastor's.
+        std::fs::write(
+            &path,
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\nchanel = \"C1\"\n[dispatch]\nprompt = \"p\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load_file(&path, "nightly", &defaults(), &Builtins),
+            Loaded::Valid(_)
+        ));
     }
 
     #[test]

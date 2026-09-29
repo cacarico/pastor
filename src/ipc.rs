@@ -22,8 +22,19 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 /// (`Run::priority`, `TaskPriority`). 12: `Run::role`. 13: permission
 /// profiles (`AgentChoice::profile`). 14: `Queue` and `QueueMove`. 15:
 /// descriptions (`Run::description`, `FlockAdd::description`,
-/// `JobTask::description`).
-pub const IPC_PROTOCOL: u32 = 15;
+/// `JobTask::description`). 16: pausing (`Run::preempt`,
+/// `TaskPriority::preempt`). 17: task summaries (`TaskDone::summary`,
+/// `TaskSummaries`). 18: a machine in many flocks, each with its own number
+/// (`FlockEntry::machines`). 19: workspace labels (`DispatchSpec::label`).
+/// 20: the `summary` setting (`Run::summary`, a job's `[dispatch]
+/// summary`). 21: pull machines (`TaskClaim`, `TaskReport`). 22:
+/// `FlockJoin`, `FlockLeave` and `FlockAdd::machines`. 23: orchestrators
+/// (`Orchestrator*` requests, and `FROM_ORCHESTRATOR_FIELD`). 24: a
+/// flock's own `timeout` and `place` (`FlockEntry::timeout`,
+/// `FlockEntry::place`). 25: session orchestrators (`OrchestratorStart`,
+/// `OrchestratorStop`). 26: a flock's share and max on a machine
+/// (`FlockNumber::Split`, `FlockSeat::share`).
+pub const IPC_PROTOCOL: u32 = 26;
 
 /// The variable pastor sets in the pane of every agent it starts, to the
 /// task's agent name (`t-7`). The CLI passes it on to the head as
@@ -39,6 +50,28 @@ pub const HEAD_ENV: &str = "PASTOR_HEAD";
 
 /// The field beside a request's own that names the task it comes from.
 pub const FROM_TASK_FIELD: &str = "from_task";
+
+/// The field beside a request's own that names the orchestrator whose pre
+/// or post script sent it (`orchestrator::ORCHESTRATOR_ENV`). Never sent
+/// beside `FROM_TASK_FIELD`, and a head that gets both reads the task.
+pub const FROM_ORCHESTRATOR_FIELD: &str = "from_orchestrator";
+
+/// Who a request says it comes from: an agent's task, an orchestrator's
+/// script, or neither (a person).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Caller {
+    pub task: Option<String>,
+    pub orchestrator: Option<String>,
+}
+
+impl Caller {
+    pub fn task(task: Option<&str>) -> Caller {
+        Caller {
+            task: task.map(str::to_string),
+            orchestrator: None,
+        }
+    }
+}
 
 /// The first protocol whose head honours `flock` in a request.
 pub const FLOCK_PROTOCOL: u32 = 1;
@@ -67,6 +100,36 @@ pub const FILE_PROTOCOL: u32 = 6;
 /// sends for each item its jobs find. An older one refuses it as unknown.
 pub const SHEPHERD_PROTOCOL: u32 = 9;
 
+/// The first protocol whose head's `FlockEntry` knows `machines`, a flock's
+/// per-machine number. An older head's `FlockEntry` (`deny_unknown_fields`)
+/// rejects the field on reload and keeps its previous, single-flock
+/// membership instead, so a CLI new enough to write `machines` refuses to
+/// send it work (see `multi_flock_declared` in `main.rs`).
+pub const MULTI_FLOCK_PROTOCOL: u32 = 18;
+
+/// The first protocol whose head knows pull machines: it answers
+/// `TaskClaim` and `TaskReport`. An older one refuses them as unreadable.
+pub const PULL_PROTOCOL: u32 = 21;
+
+/// The first protocol whose head takes `FlockJoin` and `FlockLeave` and
+/// honours `FlockAdd::machines`. An older one refuses the first two as
+/// unknown requests and adds the flock without its machines.
+pub const JOIN_PROTOCOL: u32 = 22;
+
+/// The first protocol whose head's `FlockEntry` knows `timeout` and
+/// `place`. An older head's `FlockEntry` (`deny_unknown_fields`) rejects
+/// both fields on reload and keeps its previous flock settings instead, so
+/// a CLI new enough to write them refuses to send it work (see
+/// `flock_timeout_or_place_declared` in `main.rs`).
+pub const FLOCK_TIMEOUT_PLACE_PROTOCOL: u32 = 24;
+
+/// The first protocol whose head's `FlockEntry` knows a share and a max
+/// (`machines = { desk = { share = 2, max = 4 } }`). An older head's reads
+/// only a plain number, rejects the file on reload and keeps its previous
+/// flocks instead, so a CLI new enough to write one refuses to send it work
+/// (see `flock_share_declared` in `main.rs`).
+pub const FLOCK_SHARE_PROTOCOL: u32 = 26;
+
 /// `Pong::role` of a headless `pastor serve`: it runs this machine's jobs
 /// and hooks against a head elsewhere, and is not a head itself.
 pub const SHEPHERD_ROLE: &str = "shepherd";
@@ -91,6 +154,11 @@ pub const ROLE_PROTOCOL: u32 = 12;
 /// one would drop it without a word.
 pub const DESCRIPTION_PROTOCOL: u32 = 14;
 
+/// The first protocol whose head settles and renders a task's workspace
+/// label (`task run --label`). An older one would name the workspace `t-N`
+/// without a word.
+pub const LABEL_PROTOCOL: u32 = 19;
+
 /// The first protocol whose head knows `JobSubmit`. An older one refuses the
 /// request as unreadable; `check_protocol` says why before it is sent.
 pub const JOB_SUBMIT_PROTOCOL: u32 = 7;
@@ -114,6 +182,30 @@ pub const PROFILE_PROTOCOL: u32 = 13;
 /// The first protocol whose head knows `Queue` and `QueueMove`; an older
 /// one refuses them as unreadable.
 pub const QUEUE_PROTOCOL: u32 = 14;
+
+/// The first protocol whose head honours `Run::preempt` and
+/// `TaskPriority::preempt`. An older one would queue the task without it,
+/// and it would wait behind low work, without a word.
+pub const PREEMPT_PROTOCOL: u32 = 16;
+
+/// The first protocol whose head keeps what `task done --summary` sends and
+/// knows `TaskSummaries`. An older one would drop the summary without a
+/// word, or refuse the request as unreadable.
+pub const SUMMARY_PROTOCOL: u32 = 17;
+
+/// The first protocol whose head honours `Run::summary` and a job's
+/// `[dispatch] summary`. An older one would ask for a summary on its own
+/// terms, or refuse the job's dispatch table as unreadable.
+pub const SUMMARY_MODE_PROTOCOL: u32 = 20;
+
+/// The first protocol whose head runs orchestrator files and answers the
+/// `Orchestrator*` requests; an older one refuses them as unreadable.
+pub const ORCHESTRATOR_PROTOCOL: u32 = 23;
+
+/// The first protocol whose head runs session orchestrators and answers
+/// `OrchestratorStart` and `OrchestratorStop`; an older one refuses them as
+/// unreadable.
+pub const SESSION_PROTOCOL: u32 = 25;
 
 /// `head_too_old` unless the head (its version and protocol, from `Pong`)
 /// speaks at least `needed`; `what` names what the older head lacks.
@@ -159,11 +251,28 @@ pub enum IpcRequest {
         /// first line.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        /// `task run --preempt`: the task, critical, may pause a low one to
+        /// start. Left out when not given, so an older head still reads the
+        /// request; given, the CLI sends it only to a head of
+        /// `PREEMPT_PROTOCOL` or later.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        preempt: bool,
+        /// `task run --summary`; `None` lets the flock or `[defaults]`
+        /// decide. Left out when not given, so an older head still reads
+        /// the request; given, the CLI sends it only to a head of
+        /// `SUMMARY_MODE_PROTOCOL` or later.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<crate::task::SummaryMode>,
     },
     List {
         filter: TaskFilter,
     },
     TaskShow {
+        id: i64,
+    },
+    /// Every round's summary of a task, the first first. Answers
+    /// `Summaries`.
+    TaskSummaries {
         id: i64,
     },
     TaskRead {
@@ -184,6 +293,24 @@ pub enum IpcRequest {
         /// `flock add --description`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        /// Machines that join it, each with its `max_agents`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        machines: Vec<String>,
+    },
+    /// `flock join`: list a machine in a flock, or change its number there.
+    /// Answers `Text`.
+    FlockJoin {
+        flock: String,
+        machine: String,
+        /// `--max`; `None` keeps its number there, or gives a machine new
+        /// to the flock its `max_agents`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<u32>,
+    },
+    /// `flock leave`. Answers `Text`.
+    FlockLeave {
+        flock: String,
+        machine: String,
     },
     /// `flock default`. Answers `Text`.
     FlockSetDefault {
@@ -233,6 +360,9 @@ pub enum IpcRequest {
     TaskPriority {
         id: i64,
         priority: crate::task::Priority,
+        /// `task priority --preempt`; without it the task's flag goes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        preempt: bool,
     },
     /// The queued tasks in dispatch order, each with why it waits
     /// (`pastor queue`); `flock` and `machine` keep a flock's tasks or the
@@ -269,6 +399,10 @@ pub enum IpcRequest {
     /// (`ends_own_task`). Answers `Task`.
     TaskDone {
         id: i64,
+        /// What the agent did (`task done --summary`); its first line names
+        /// the outcome. `None` ends the round with the pane's last lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     /// The events log records numbered after `after`, oldest first, at most
     /// `limit`, only those about `task` if given, read from the log files.
@@ -362,6 +496,64 @@ pub enum IpcRequest {
     MachineDescribe {
         name: String,
     },
+    /// A pull machine's headless serve asks for work: at most `free_slots`
+    /// queued tasks to start, those pinned to `machine` first, then, with
+    /// `flock_work`, any its flocks would place there now. Each one handed
+    /// out is `starting` on `machine` before the reply. Also what keeps the
+    /// machine from going lost (`pull_lost_after`). Answers `Tasks`.
+    TaskClaim {
+        machine: String,
+        free_slots: u32,
+        #[serde(default)]
+        flock_work: bool,
+    },
+    /// A pull machine's serve says what became of a task it claimed: its
+    /// state, its pane, and `detail`, the note the task carries there (why
+    /// it failed, the question it asked). The head writes it on the row and
+    /// emits the event its own actor would have. Refused `not_on_machine`
+    /// for a task placed elsewhere. Answers `Task`.
+    TaskReport {
+        machine: String,
+        id: i64,
+        state: TaskState,
+        #[serde(default)]
+        pane: Option<String>,
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    /// Every orchestrator file the head reads. Answers `Orchestrators`.
+    OrchestratorList,
+    /// One orchestrator in full. Answers `Orchestrator`.
+    OrchestratorDescribe {
+        name: String,
+    },
+    /// Run a scheduled orchestrator now, whatever its schedule and
+    /// `enabled`, after a run of it already going. Answers `Text`.
+    OrchestratorRun {
+        name: String,
+    },
+    /// Start a session orchestrator now, inside its hours or not. Answers
+    /// `Text`.
+    OrchestratorStart {
+        name: String,
+    },
+    /// Stop a session orchestrator: its last message, then its grace.
+    /// Answers `Text`.
+    OrchestratorStop {
+        name: String,
+    },
+    /// `orchestrator enable|disable` on the head's file. Answers `Text`.
+    OrchestratorSetEnabled {
+        name: String,
+        enabled: bool,
+    },
+    /// Replace an orchestrator's handover note; `name` may be left out by
+    /// its own agent or script, which the head knows. Answers `Text`.
+    OrchestratorNote {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        text: String,
+    },
 }
 
 impl IpcRequest {
@@ -374,6 +566,7 @@ impl IpcRequest {
             IpcRequest::Ping
             | IpcRequest::List { .. }
             | IpcRequest::TaskShow { .. }
+            | IpcRequest::TaskSummaries { .. }
             | IpcRequest::TaskRead { .. }
             | IpcRequest::FlockList
             | IpcRequest::JobList
@@ -381,6 +574,8 @@ impl IpcRequest {
             | IpcRequest::TrustList
             | IpcRequest::FlockDescribe { .. }
             | IpcRequest::MachineDescribe { .. }
+            | IpcRequest::OrchestratorList
+            | IpcRequest::OrchestratorDescribe { .. }
             | IpcRequest::Queue { .. } => false,
             IpcRequest::FileGet { .. } | IpcRequest::JobDescribe { .. } => false,
             IpcRequest::Reload
@@ -388,6 +583,8 @@ impl IpcRequest {
             | IpcRequest::Run { .. }
             | IpcRequest::FlockRemove { .. }
             | IpcRequest::FlockAdd { .. }
+            | IpcRequest::FlockJoin { .. }
+            | IpcRequest::FlockLeave { .. }
             | IpcRequest::FlockSetDefault { .. }
             | IpcRequest::MachineAdd { .. }
             | IpcRequest::MachineRemove { .. }
@@ -405,30 +602,41 @@ impl IpcRequest {
             | IpcRequest::JobSubmit { .. }
             | IpcRequest::JobTask { .. }
             | IpcRequest::TrustAdd { .. }
-            | IpcRequest::TrustRemove { .. } => true,
+            | IpcRequest::TrustRemove { .. }
+            | IpcRequest::TaskClaim { .. }
+            | IpcRequest::TaskReport { .. }
+            | IpcRequest::OrchestratorRun { .. }
+            | IpcRequest::OrchestratorStart { .. }
+            | IpcRequest::OrchestratorStop { .. }
+            | IpcRequest::OrchestratorSetEnabled { .. }
+            | IpcRequest::OrchestratorNote { .. } => true,
         }
     }
 
     /// Whether an orchestrator task (`TaskRole::Orchestrator`) may make this
-    /// change without `agents_change_fleet`: run, retry and type into tasks,
-    /// and disable a job. One arm per request, so adding one is one line.
+    /// change without `agents_change_fleet`: run, retry, type into and close
+    /// tasks, enable or disable a job, and keep its own handover note (the
+    /// head checks whose). An orchestrator's pre and post scripts get the
+    /// same table.
     /// Making another orchestrator is refused apart from this, whoever asks
     /// from inside a task (`Daemon::handle_from`).
     pub fn orchestrator_may(&self) -> bool {
-        match self {
-            IpcRequest::Run { .. } => true,
-            IpcRequest::TaskRetry { .. } => true,
-            IpcRequest::TaskSend { .. } => true,
-            IpcRequest::JobSetEnabled { enabled, .. } => !enabled,
-            _ => false,
-        }
+        matches!(
+            self,
+            IpcRequest::Run { .. }
+                | IpcRequest::TaskRetry { .. }
+                | IpcRequest::TaskSend { .. }
+                | IpcRequest::TaskClose { .. }
+                | IpcRequest::JobSetEnabled { .. }
+                | IpcRequest::OrchestratorNote { .. }
+        )
     }
 
     /// Whether the request only ends `task`, the task the caller runs in
     /// (`TASK_ENV`): an agent may say it is finished, but not for anyone
     /// else.
     pub fn ends_own_task(&self, task: &str) -> bool {
-        matches!(self, IpcRequest::TaskDone { id } if crate::task::parse_task_id(task) == Some(*id))
+        matches!(self, IpcRequest::TaskDone { id, .. } if crate::task::parse_task_id(task) == Some(*id))
     }
 }
 
@@ -436,24 +644,39 @@ impl IpcRequest {
 /// `FROM_TASK_FIELD` when the caller runs in a task's pane. A head that
 /// predates the field skips it, as serde skips any unknown field.
 pub fn request_line(req: &IpcRequest, from_task: Option<&str>) -> anyhow::Result<String> {
+    request_line_as(req, &Caller::task(from_task))
+}
+
+/// `request_line` for any `caller`: `FROM_TASK_FIELD` for a task, else
+/// `FROM_ORCHESTRATOR_FIELD` for an orchestrator's script.
+pub fn request_line_as(req: &IpcRequest, caller: &Caller) -> anyhow::Result<String> {
     let mut v = serde_json::to_value(req)?;
-    if let (Some(task), Some(obj)) = (from_task, v.as_object_mut()) {
-        obj.insert(FROM_TASK_FIELD.into(), task.into());
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(task) = &caller.task {
+            obj.insert(FROM_TASK_FIELD.into(), task.as_str().into());
+        } else if let Some(o) = &caller.orchestrator {
+            obj.insert(FROM_ORCHESTRATOR_FIELD.into(), o.as_str().into());
+        }
     }
     let mut line = serde_json::to_string(&v)?;
     line.push('\n');
     Ok(line)
 }
 
-/// The head's side of `request_line`: the request, and the task it says it
+/// The head's side of `request_line_as`: the request, and who it says it
 /// comes from.
-pub fn parse_request_line(line: &str) -> serde_json::Result<(IpcRequest, Option<String>)> {
+pub fn parse_request_line(line: &str) -> serde_json::Result<(IpcRequest, Caller)> {
     let mut v: serde_json::Value = serde_json::from_str(line)?;
-    let from_task = v
-        .as_object_mut()
-        .and_then(|obj| obj.remove(FROM_TASK_FIELD))
-        .and_then(|t| t.as_str().map(str::to_string));
-    Ok((serde_json::from_value(v)?, from_task))
+    let mut take = |field: &str| {
+        v.as_object_mut()
+            .and_then(|obj| obj.remove(field))
+            .and_then(|t| t.as_str().map(str::to_string))
+    };
+    let caller = Caller {
+        task: take(FROM_TASK_FIELD),
+        orchestrator: take(FROM_ORCHESTRATOR_FIELD),
+    };
+    Ok((serde_json::from_value(v)?, caller))
 }
 
 static CALLER_TASK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -475,6 +698,35 @@ pub fn set_caller_task(task: Option<String>) {
 /// The task this process's requests carry, as `set_caller_task` left it.
 pub fn caller_task() -> Option<String> {
     CALLER_TASK.get().cloned().flatten()
+}
+
+static CALLER_ORCHESTRATOR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The orchestrator `orchestrator::ORCHESTRATOR_ENV` names: `None` outside
+/// its pre and post scripts, or when the variable is empty.
+pub fn orchestrator_from_env() -> Option<String> {
+    std::env::var(crate::orchestrator::ORCHESTRATOR_ENV)
+        .ok()
+        .filter(|o| !o.is_empty())
+}
+
+/// Sets the orchestrator this process's requests carry when they carry no
+/// task (`PASTOR_TASK` wins). Only the `pastor` binary calls it, as for
+/// `set_caller_task`.
+pub fn set_caller_orchestrator(orchestrator: Option<String>) {
+    let _ = CALLER_ORCHESTRATOR.set(orchestrator);
+}
+
+/// Who this process's requests say they come from.
+pub fn caller() -> Caller {
+    let task = caller_task();
+    Caller {
+        orchestrator: task
+            .is_none()
+            .then(|| CALLER_ORCHESTRATOR.get().cloned().flatten())
+            .flatten(),
+        task,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,6 +775,9 @@ pub enum IpcResponse {
     MachineDescription(crate::describe::MachineDescription),
     Queue(Vec<crate::queue::QueueEntry>),
     Moved(crate::store::Moved),
+    Summaries(Vec<crate::task::TaskSummary>),
+    Orchestrators(Vec<crate::orchestrator::OrchestratorStatus>),
+    Orchestrator(crate::orchestrator::OrchestratorDescription),
 }
 
 /// One of the head's config files as `FileGet` found it.
@@ -614,8 +869,7 @@ pub async fn request_head_with_timeout(
 ) -> Result<IpcResponse, RequestError> {
     match remote_head() {
         Some(head) => {
-            let line =
-                request_line(req, caller_task().as_deref()).map_err(RequestError::Exchange)?;
+            let line = request_line_as(req, &caller()).map_err(RequestError::Exchange)?;
             head.request(&line, timeout).await
         }
         None => request_with_timeout(&paths.socket_file(), req, timeout).await,
@@ -692,7 +946,7 @@ async fn round_trip(
     req: &IpcRequest,
 ) -> anyhow::Result<IpcResponse> {
     let (r, mut w) = stream.into_split();
-    let line = request_line(req, caller_task().as_deref())?;
+    let line = request_line_as(req, &caller())?;
     w.write_all(line.as_bytes()).await?;
     w.flush().await?;
     let mut reply = String::new();
@@ -868,6 +1122,8 @@ mod tests {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
+                summary: Default::default(),
             },
             machine: None,
             workspace_id: None,
@@ -883,6 +1139,8 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            pause: Default::default(),
+            summary: None,
             created_at: now,
             started_at: None,
             finished_at: None,
@@ -918,6 +1176,7 @@ mod tests {
             }),
             IpcResponse::Events(crate::events::EventsPage {
                 events: vec![crate::events::EventRecord {
+                    summary: None,
                     seq: 812,
                     at: chrono::Utc::now(),
                     kind: "task.done".into(),
@@ -941,6 +1200,13 @@ mod tests {
                 skipped: vec!["k1".into()],
                 refused: vec![("k2".into(), "max_tasks_per_run".into())],
             },
+            IpcResponse::Summaries(vec![crate::task::TaskSummary {
+                round: 1,
+                outcome: crate::task::Outcome::NothingToDo,
+                text: "nothing to do".into(),
+                source: crate::task::SummarySource::Agent,
+                at: chrono::Utc::now(),
+            }]),
             IpcResponse::error("some_code", "some message"),
         ];
         for resp in responses {
@@ -1024,6 +1290,18 @@ mod tests {
                 limit: 50,
                 task: Some(3),
             },
+            IpcRequest::TaskClaim {
+                machine: "laptop".into(),
+                free_slots: 2,
+                flock_work: true,
+            },
+            IpcRequest::TaskReport {
+                machine: "laptop".into(),
+                id: 4,
+                state: crate::task::TaskState::Blocked,
+                pane: Some("p1".into()),
+                detail: Some("agent asked: go on?".into()),
+            },
         ] {
             let json = serde_json::to_string(&req).unwrap();
             let back: IpcRequest = serde_json::from_str(&json).unwrap();
@@ -1049,6 +1327,7 @@ mod tests {
                 filter: TaskFilter::default(),
             },
             IpcRequest::TaskShow { id: 1 },
+            IpcRequest::TaskSummaries { id: 1 },
             IpcRequest::TaskRead { id: 1, lines: 5 },
             IpcRequest::FlockList,
             IpcRequest::JobList,
@@ -1068,6 +1347,8 @@ mod tests {
                 flock: Some("work".into()),
                 machine: None,
             },
+            IpcRequest::OrchestratorList,
+            IpcRequest::OrchestratorDescribe { name: "o".into() },
         ];
         for req in reads {
             assert!(!req.changes_fleet(), "{req:?}");
@@ -1081,6 +1362,8 @@ mod tests {
     fn fleet_changes() -> Vec<IpcRequest> {
         vec![
             IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 description: None,
                 prompt: "p".into(),
                 spec: minimal_task().spec,
@@ -1090,6 +1373,7 @@ mod tests {
                 role: TaskRole::Agent,
             },
             IpcRequest::TaskPriority {
+                preempt: false,
                 id: 1,
                 priority: crate::task::Priority::High,
             },
@@ -1115,10 +1399,21 @@ mod tests {
                 description: None,
                 name: "f".into(),
                 default: false,
+                machines: vec![],
+            },
+            IpcRequest::FlockJoin {
+                flock: "f".into(),
+                machine: "m".into(),
+                max: Some(2),
+            },
+            IpcRequest::FlockLeave {
+                flock: "f".into(),
+                machine: "m".into(),
             },
             IpcRequest::FlockSetDefault { name: "f".into() },
             IpcRequest::MachineAdd {
                 machine: crate::config::flock::MachineConfig {
+                    pull: false,
                     description: None,
                     name: "m".into(),
                     local: true,
@@ -1180,12 +1475,23 @@ mod tests {
                 machine: "m".into(),
                 repo: "/r".into(),
             },
+            IpcRequest::OrchestratorRun { name: "o".into() },
+            IpcRequest::OrchestratorStart { name: "o".into() },
+            IpcRequest::OrchestratorStop { name: "o".into() },
+            IpcRequest::OrchestratorSetEnabled {
+                name: "o".into(),
+                enabled: true,
+            },
+            IpcRequest::OrchestratorNote {
+                name: None,
+                text: "n".into(),
+            },
         ]
     }
 
-    /// An orchestrator may run, retry and type into tasks and disable a job,
-    /// and nothing else that changes the fleet: not `task close`, not a job
-    /// enabled, not a file or machine edit.
+    /// An orchestrator may run, retry, type into and close tasks and enable
+    /// or disable a job, and nothing else that changes the fleet: not a
+    /// prune, not a file or machine edit.
     #[test]
     fn an_orchestrator_may_make_exactly_the_specs_changes() {
         for req in fleet_changes() {
@@ -1194,21 +1500,32 @@ mod tests {
                 IpcRequest::Run { .. }
                     | IpcRequest::TaskRetry { .. }
                     | IpcRequest::TaskSend { .. }
-                    | IpcRequest::JobSetEnabled { enabled: false, .. }
+                    | IpcRequest::TaskClose { .. }
+                    | IpcRequest::JobSetEnabled { .. }
+                    | IpcRequest::OrchestratorNote { .. }
             );
             assert_eq!(req.orchestrator_may(), allowed, "{req:?}");
         }
+        for enabled in [true, false] {
+            assert!(
+                IpcRequest::JobSetEnabled {
+                    name: "j".into(),
+                    enabled
+                }
+                .orchestrator_may()
+            );
+        }
         assert!(
-            !IpcRequest::JobSetEnabled {
-                name: "j".into(),
-                enabled: true
+            IpcRequest::TaskClose {
+                id: 1,
+                remove_worktree: false
             }
             .orchestrator_may()
         );
         assert!(
-            !IpcRequest::TaskClose {
-                id: 1,
-                remove_worktree: false
+            !IpcRequest::TaskPrune {
+                states: vec![TaskState::Done],
+                older_than_secs: 60,
             }
             .orchestrator_may()
         );
@@ -1219,6 +1536,8 @@ mod tests {
     #[test]
     fn run_names_its_role_only_when_not_a_plain_agent() {
         let run = |role| IpcRequest::Run {
+            preempt: false,
+            summary: None,
             prompt: "p".into(),
             spec: minimal_task().spec,
             flock: None,
@@ -1252,14 +1571,42 @@ mod tests {
         assert_eq!(v[FROM_TASK_FIELD], "t-4");
         let (req, from) = parse_request_line(line.trim()).unwrap();
         assert!(matches!(req, IpcRequest::FlockList));
-        assert_eq!(from.as_deref(), Some("t-4"));
+        assert_eq!(from, Caller::task(Some("t-4")));
 
         let line = request_line(&IpcRequest::FlockList, None).unwrap();
         let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert!(v.get(FROM_TASK_FIELD).is_none(), "{v}");
         let (_, from) = parse_request_line(line.trim()).unwrap();
-        assert_eq!(from, None);
+        assert_eq!(from, Caller::default());
         assert!(parse_request_line("not json").is_err());
+    }
+
+    /// An orchestrator's script names its orchestrator; a caller that is
+    /// both sends only the task, and a head that reads both keeps both for
+    /// `Daemon::handle_as`, which takes the task.
+    #[test]
+    fn a_request_line_carries_the_orchestrator_unless_it_carries_a_task() {
+        let script = Caller {
+            task: None,
+            orchestrator: Some("merge".into()),
+        };
+        let line = request_line_as(&IpcRequest::FlockList, &script).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v[FROM_ORCHESTRATOR_FIELD], "merge");
+        assert_eq!(parse_request_line(line.trim()).unwrap().1, script);
+        let both = Caller {
+            task: Some("t-4".into()),
+            orchestrator: Some("merge".into()),
+        };
+        let line = request_line_as(&IpcRequest::FlockList, &both).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v[FROM_TASK_FIELD], "t-4");
+        assert!(v.get(FROM_ORCHESTRATOR_FIELD).is_none(), "{v}");
+        let (_, from) = parse_request_line(
+            r#"{"op":"flock_list","from_task":"t-4","from_orchestrator":"merge"}"#,
+        )
+        .unwrap();
+        assert_eq!(from, both);
     }
 
     /// A client refuses to send `JobSubmit` to a head older than

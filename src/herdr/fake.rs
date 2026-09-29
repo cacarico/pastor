@@ -80,6 +80,8 @@ struct State {
     home: Option<String>,
     /// Paths `Connector::dir_exists` reports missing; every other path exists.
     missing_dirs: HashSet<String>,
+    /// Paths `Connector::file_exists` reports as files; no other path is.
+    files: HashSet<String>,
     /// Checkouts, by path, holding commits that are on no remote: what
     /// `Connector::unpushed_commits` reports.
     unpushed: HashSet<String>,
@@ -91,6 +93,10 @@ struct State {
     gone_branches: HashSet<String>,
     /// Every `Connector::restore_worktree` call, as (repo, path, branch).
     restored: Vec<(String, String, String)>,
+    /// Every path `Connector::ensure_dir` made.
+    made_dirs: Vec<String>,
+    /// Paths `Connector::ensure_dir` fails to make.
+    unmakeable_dirs: HashSet<String>,
     /// The started agent vanishes immediately, as it does when the agent binary
     /// is missing and the process exits the moment it is launched.
     exit_on_start: bool,
@@ -234,6 +240,10 @@ impl FakeHerdr {
             .missing_dirs
             .insert(path.to_string());
     }
+    /// `Connector::file_exists` finds a file at `path`.
+    pub fn set_file(&self, path: &str) {
+        self.state.lock().unwrap().files.insert(path.to_string());
+    }
     /// `Connector::restore_worktree` finds `branch` gone.
     pub fn set_gone_branch(&self, branch: &str) {
         self.state
@@ -246,6 +256,18 @@ impl FakeHerdr {
     /// as (repo, path, branch).
     pub fn restored(&self) -> Vec<(String, String, String)> {
         self.state.lock().unwrap().restored.clone()
+    }
+    /// Every directory `Connector::ensure_dir` made, in order.
+    pub fn made_dirs(&self) -> Vec<String> {
+        self.state.lock().unwrap().made_dirs.clone()
+    }
+    /// `Connector::ensure_dir` cannot make `path` (a file in the way).
+    pub fn set_unmakeable_dir(&self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .unmakeable_dirs
+            .insert(path.to_string());
     }
     /// The checkout at `path` has commits on no remote.
     pub fn set_unpushed(&self, path: &str) {
@@ -426,6 +448,18 @@ impl FakeHerdr {
     /// `State::trust_redraw`).
     pub fn set_trust_redraw(&self, d: Duration) {
         self.state.lock().unwrap().trust_redraw = d;
+    }
+
+    /// A person answers the trust question of the agent in `pane_id` at the
+    /// pane itself, not through `pane.send_keys`: it goes idle, publishes
+    /// that, and redraws for `trust_redraw` as after any trust answer.
+    pub fn answer_trust_by_hand(&self, pane_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .trust_answered
+            .insert(pane_id.into(), Instant::now());
+        self.set_status(pane_id, AgentStatus::Idle);
     }
 
     /// `agent.prompt` is accepted from now on, but the agent never starts
@@ -817,7 +851,19 @@ impl FakeHerdr {
                         ws
                     }
                 };
-                let label = p.get("label").cloned().unwrap_or(Value::Null);
+                // `already_open` means someone else's workspace: its own
+                // stored label, never the caller's just-rendered one, which
+                // real herdr would ignore too since it did not make this
+                // workspace.
+                let label = if already_open {
+                    s.labels
+                        .get(&ws)
+                        .cloned()
+                        .map(Value::from)
+                        .unwrap_or(Value::Null)
+                } else {
+                    p.get("label").cloned().unwrap_or(Value::Null)
+                };
                 // An open workspace answers with a pane it still has: its
                 // first may have been closed for a split (see `dispatch`).
                 let root = s
@@ -1186,6 +1232,20 @@ impl super::transport::Connector for FakeHerdr {
     fn dir_exists(&self, path: &str) -> super::transport::DirFuture<'_> {
         let exists = !self.state.lock().unwrap().missing_dirs.contains(path);
         Box::pin(async move { Ok(Some(exists)) })
+    }
+    fn file_exists(&self, path: &str) -> super::transport::DirFuture<'_> {
+        let exists = self.state.lock().unwrap().files.contains(path);
+        Box::pin(async move { Ok(Some(exists)) })
+    }
+    /// Makes `path` unless it is unmakeable; it exists from then on.
+    fn ensure_dir(&self, path: &str) -> super::transport::DirFuture<'_> {
+        let mut st = self.state.lock().unwrap();
+        let made = !st.unmakeable_dirs.contains(path);
+        if made {
+            st.missing_dirs.remove(path);
+            st.made_dirs.push(path.to_string());
+        }
+        Box::pin(async move { Ok(Some(made)) })
     }
     fn unpushed_commits(&self, path: &str) -> super::transport::DirFuture<'_> {
         let unpushed = self.state.lock().unwrap().unpushed.contains(path);

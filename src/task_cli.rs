@@ -2,14 +2,12 @@
 //! holds one `TaskCmd` variant per command and calls these.
 use clap::{ArgGroup, Args};
 
-use crate::cli::{CliError, TASK_HEADER, request_failure, table, task_rows};
+use crate::cli::{CliError, ask, print_task, unexpected};
 use crate::config::{Paths, parse_duration};
-use crate::ipc::{
-    Head, IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon, request_head,
-};
+use crate::ipc::{Head, IpcRequest, IpcResponse};
 use crate::machine::SendInput;
 use crate::store::{PruneOutcome, Store};
-use crate::task::{Priority, Task, TaskState, UNKNOWN_PRIORITY, parse_task_id};
+use crate::task::{Priority, TaskState, UNKNOWN_PRIORITY, parse_task_id};
 
 #[derive(Args, Debug)]
 pub struct RetryArgs {
@@ -31,6 +29,10 @@ pub struct PriorityArgs {
     /// Its new level: low, normal, high or critical
     #[arg(value_name = "LEVEL")]
     pub level: String,
+    /// Critical only: let the task pause the newest low Claude task on a
+    /// full machine to start; without it the task's flag goes
+    #[arg(long)]
+    pub preempt: bool,
     /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
@@ -38,12 +40,14 @@ pub struct PriorityArgs {
 
 #[derive(Args, Debug)]
 pub struct CloseArgs {
-    /// A task, like t-12 or 12, or an orphaned agent named like one
-    pub task: String,
-    /// Remove the task's worktree too (refused if it has uncommitted changes)
+    /// Tasks, like t-12 or 12, or orphaned agents named like one; each is
+    /// closed in turn, and one that fails does not stop the rest
+    #[arg(required = true, value_name = "TASK")]
+    pub tasks: Vec<String>,
+    /// Remove each task's worktree too (refused if it has uncommitted changes)
     #[arg(long)]
     pub remove_worktree: bool,
-    /// Print as a JSON object
+    /// Print as a JSON object, or an array of them for several tasks
     #[arg(long)]
     pub json: bool,
 }
@@ -53,12 +57,57 @@ pub struct DoneArgs {
     /// A task, like t-12 or 12: the one to end (default: the task this pane
     /// runs, from PASTOR_TASK)
     pub task: Option<String>,
+    /// What you did, its first line the outcome: done, partial, blocked or
+    /// nothing to do (kept to 2,000 characters)
+    #[arg(long, value_name = "TEXT", conflicts_with = "summary_file")]
+    pub summary: Option<String>,
+    /// Read the summary from a file, or - for stdin
+    #[arg(long, value_name = "PATH")]
+    pub summary_file: Option<String>,
     /// Print as a JSON object
     #[arg(long)]
     pub json: bool,
 }
 
 impl DoneArgs {
+    /// Whether a summary is given, which only a head of `SUMMARY_PROTOCOL`
+    /// keeps.
+    pub fn has_summary(&self) -> bool {
+        self.summary.is_some() || self.summary_file.is_some()
+    }
+
+    /// The summary given: `--summary` as it is, or `--summary-file` read
+    /// (`-` is stdin). A blank one is an error, not a round with none.
+    pub fn summary_text(&self) -> anyhow::Result<Option<String>> {
+        let text = match (&self.summary, self.summary_file.as_deref()) {
+            (Some(s), _) => s.clone(),
+            (None, Some(path)) => {
+                use std::io::Read;
+                let mut text = String::new();
+                if path == "-" {
+                    std::io::stdin().read_to_string(&mut text)
+                } else {
+                    std::fs::File::open(path).and_then(|mut f| f.read_to_string(&mut text))
+                }
+                .map_err(|e| {
+                    CliError::err(
+                        "summary_file_unreadable",
+                        format!("cannot read the summary from {path}: {e}"),
+                    )
+                })?;
+                text
+            }
+            (None, None) => return Ok(None),
+        };
+        if text.trim().is_empty() {
+            return Err(CliError::err(
+                "summary_empty",
+                "the summary is empty; its first line names the outcome: done, partial, blocked or nothing to do",
+            ));
+        }
+        Ok(Some(text))
+    }
+
     /// Whether this ends `own`, the task the caller runs in: no task given,
     /// or that one.
     pub fn ends(&self, own: &str) -> bool {
@@ -121,48 +170,6 @@ fn task_id(s: &str) -> anyhow::Result<i64> {
     parse_task_id(s).ok_or_else(|| CliError::err("usage_error", crate::task::bad_task_id(s)))
 }
 
-/// A request that got no reply, classified as `request_failure` does for
-/// the rest of the CLI. These commands answer `daemon_not_running` where
-/// that says `runtime_error`, and only for a refused or missing socket: a
-/// timed-out retry may still land, and a connect denied for permissions may
-/// hide a live head.
-pub(crate) fn request_error(err: &RequestError) -> anyhow::Error {
-    let (code, message) = request_failure(err);
-    let code = match err {
-        RequestError::Connect(e) if connect_error_means_no_daemon(e) => "daemon_not_running".into(),
-        _ => code,
-    };
-    CliError::err(&code, message)
-}
-
-/// One request to the daemon. Retry and close need it: one dispatches, the
-/// other talks to herdr on the task's machine.
-async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    let resp = request_head(paths, &req)
-        .await
-        .map_err(|e| request_error(&e))?;
-    match resp {
-        IpcResponse::Error { code, message } => Err(CliError::err(&code, message)),
-        other => Ok(other),
-    }
-}
-
-fn print_task(t: &Task, json: bool) -> anyhow::Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&t.to_json())?);
-    } else {
-        println!(
-            "{}",
-            table(&TASK_HEADER, &task_rows(std::slice::from_ref(t)))
-        );
-    }
-    Ok(())
-}
-
-fn unexpected(resp: IpcResponse) -> anyhow::Error {
-    CliError::err("internal", format!("unexpected daemon reply: {resp:?}"))
-}
-
 /// `pastor task retry t-N`: a new task copying t-N, dispatched now.
 pub async fn retry(paths: &Paths, a: RetryArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
@@ -177,32 +184,103 @@ pub async fn retry(paths: &Paths, a: RetryArgs) -> anyhow::Result<()> {
 pub async fn priority(paths: &Paths, a: PriorityArgs) -> anyhow::Result<()> {
     let id = task_id(&a.task)?;
     let priority = parse_priority(&a.level)?;
-    match ask(paths, IpcRequest::TaskPriority { id, priority }).await? {
+    match ask(
+        paths,
+        IpcRequest::TaskPriority {
+            id,
+            priority,
+            preempt: a.preempt,
+        },
+    )
+    .await?
+    {
         IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }
 }
 
-/// `pastor task close t-N [--remove-worktree]`.
+/// `pastor task close t-N... [--remove-worktree]`. One task prints as it
+/// always has; several print one line (or JSON object) each, and any that
+/// failed make it `close_failed`.
 pub async fn close(paths: &Paths, a: CloseArgs) -> anyhow::Result<()> {
-    let id = task_id(&a.task)?;
-    let req = IpcRequest::TaskClose {
-        id,
-        remove_worktree: a.remove_worktree,
-    };
-    match ask(paths, req).await? {
-        IpcResponse::Task(t) => print_task(&t, a.json),
-        // An orphaned agent with no row: there is no task to print.
-        IpcResponse::Text(msg) if a.json => {
-            println!("{}", serde_json::json!({"message": msg}));
-            Ok(())
-        }
-        IpcResponse::Text(msg) => {
-            println!("{msg}");
-            Ok(())
-        }
-        other => Err(unexpected(other)),
+    if let [task] = a.tasks.as_slice() {
+        return match close_one(paths, task, a.remove_worktree).await? {
+            IpcResponse::Task(t) => print_task(&t, a.json),
+            // An orphaned agent with no row: there is no task to print.
+            IpcResponse::Text(msg) if a.json => {
+                println!("{}", serde_json::json!({"message": msg}));
+                Ok(())
+            }
+            IpcResponse::Text(msg) => {
+                println!("{msg}");
+                Ok(())
+            }
+            other => Err(unexpected(other)),
+        };
     }
+    let mut results = Vec::new();
+    let mut failed = Vec::new();
+    for task in &a.tasks {
+        let (line, json) = match close_one(paths, task, a.remove_worktree).await {
+            Ok(IpcResponse::Task(t)) => (
+                format!("{} {}", t.display_id(), t.state),
+                serde_json::json!({"task": t.display_id(), "state": t.state}),
+            ),
+            Ok(IpcResponse::Text(msg)) => (
+                format!("{task} {msg}"),
+                serde_json::json!({"task": task, "message": msg}),
+            ),
+            Ok(other) => return Err(unexpected(other)),
+            Err(e) => {
+                failed.push(task.as_str());
+                let (code, message) = match e.downcast_ref::<CliError>() {
+                    Some(e) => (e.code.clone(), e.message.clone()),
+                    None => ("runtime_error".to_string(), format!("{e:#}")),
+                };
+                (
+                    format!("{task} {code}: {message}"),
+                    serde_json::json!({"task": task, "code": code, "message": message}),
+                )
+            }
+        };
+        if a.json {
+            results.push(json);
+        } else {
+            println!("{line}");
+        }
+    }
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::err(
+            "close_failed",
+            format!(
+                "{} of {} not closed: {}",
+                failed.len(),
+                a.tasks.len(),
+                failed.join(", ")
+            ),
+        ))
+    }
+}
+
+async fn close_one(
+    paths: &Paths,
+    task: &str,
+    remove_worktree: bool,
+) -> anyhow::Result<IpcResponse> {
+    let id = task_id(task)?;
+    Ok(ask(
+        paths,
+        IpcRequest::TaskClose {
+            id,
+            remove_worktree,
+        },
+    )
+    .await?)
 }
 
 /// `pastor task done [t-N]`: the task given, or the one this pane runs.
@@ -220,7 +298,8 @@ pub async fn done(paths: &Paths, a: DoneArgs) -> anyhow::Result<()> {
         }
     };
     let id = task_id(&task)?;
-    match ask(paths, IpcRequest::TaskDone { id }).await? {
+    let summary = a.summary_text()?;
+    match ask(paths, IpcRequest::TaskDone { id, summary }).await? {
         IpcResponse::Task(t) => print_task(&t, a.json),
         other => Err(unexpected(other)),
     }
@@ -317,6 +396,7 @@ fn prune_summary(a: &PruneArgs, out: &PruneOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::RequestError;
     use clap::Parser;
 
     #[derive(Parser, Debug)]
@@ -353,9 +433,8 @@ mod tests {
     #[test]
     fn request_failures_keep_their_own_codes() {
         let code_and_message = |err: RequestError| {
-            let err = request_error(&err);
-            let e = err.downcast_ref::<CliError>().unwrap();
-            (e.code.clone(), e.message.clone())
+            let e = crate::cli::request_error(&err);
+            (e.code, e.message)
         };
         let (code, message) =
             code_and_message(RequestError::Timeout(std::time::Duration::from_secs(120)));

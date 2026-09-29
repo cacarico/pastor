@@ -347,7 +347,7 @@ mod tests {
             let comment = t.split("<!--").nth(1).unwrap().split("-->").next().unwrap();
             assert!(!comment.contains("--"), "{unit:?}");
         }
-        assert!(PASTOR_PLIST.contains("<string>serve</string>"));
+        assert!(PASTOR_PLIST.contains("<string>serve</string>\n\t\t<string>--foreground</string>"));
         assert!(HERDR_PLIST.contains("<string>server</string>"));
     }
 
@@ -368,6 +368,7 @@ mod tests {
 \t<array>
 \t\t<string>/Users/u/.cargo/bin/pastor</string>
 \t\t<string>serve</string>
+\t\t<string>--foreground</string>
 \t</array>
 \t<key>EnvironmentVariables</key>
 \t<dict>

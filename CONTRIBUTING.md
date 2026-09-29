@@ -24,13 +24,16 @@ Useful targets:
 make help
 make test
 make test-machine
+make test-ssh
 make smoke SESSION=s
 ```
 
 The normal test suite must not require a real herdr. Use `make smoke` only when
 you intentionally test against a real herdr instance, and `make
 smoke-profiles` (a live review task per agent through a head running your
-build) before trusting a change to permission profiles.
+build) before trusting a change to permission profiles. `make test-ssh` runs
+the CLI against a head over a real ssh, through an sshd it starts on a
+localhost port as you; it needs OpenSSH's server installed, and CI runs it.
 
 ## Pull requests
 
@@ -39,6 +42,12 @@ A good pull request includes:
 - The problem being solved and why it matters.
 - The design choice made, especially when it differs from existing docs.
 - Tests or a clear reason tests were not added.
+- A changelog entry for anything a user would notice, as its own file
+  `changes/<branch>.md` (slashes in the branch name as dashes), never a
+  line in `CHANGELOG.md`: every pull request adding a line under the same
+  heading made each merge conflict with the next. `changes/README.md` has
+  the format; `make check` fails on an Unreleased section in
+  `CHANGELOG.md` or a malformed change file.
 - Any compatibility, security, data migration, or operational risk.
 - Any AI assistance, generated code, copied snippets, or third-party material
   that needs provenance or license review.
@@ -66,11 +75,18 @@ exit 1. Clap usage errors should stay plain text and exit 2.
   a minor bump, never a patch.
 - Release when there is something worth shipping, not on a calendar. Cut an
   `-rc.N` prerelease for anything that touches the store schema, the IPC or
-  the transport, and run `make smoke` on a fleet machine against it before
-  the final tag. Prereleases never become `install.sh`'s "latest".
-- To release: bump the version in `Cargo.toml`, turn `Unreleased` in
-  `CHANGELOG.md` into `## X.Y.Z - date`, merge, and push the signed tag
-  `vX.Y.Z` on `main`. `.github/workflows/release.yml` builds the tarballs
+  the transport, and smoke it on a fleet machine before the final tag:
+  `make smoke-rc TAG=vX.Y.Z-rc.N LABEL=<machine>` checks the tag out in a
+  scratch worktree, builds it, runs `make smoke` there (and `make
+  smoke-profiles` with `PROFILES=1`, once the head runs the rc) and prints
+  a Markdown block for the release card; it never touches your checkout.
+  Prereleases never become `install.sh`'s "latest".
+- To release: on a release branch, bump the version in `Cargo.toml` and
+  run `make changelog VERSION=X.Y.Z`, which writes `## X.Y.Z - <today>`
+  into `CHANGELOG.md` from `changes/*.md` (entries in the order their files
+  reached `main`) and deletes the files; commit both, merge, and push the
+  signed tag `vX.Y.Z` on `main`. A prerelease tag leaves the change files
+  in place and takes its notes from them (`scripts/changelog.sh notes`). `.github/workflows/release.yml` builds the tarballs
   and drafts the GitHub release with that section as notes. Before
   publishing the draft, check the tag's signature with `git tag -v vX.Y.Z`;
   an unsigned or unverified tag is deleted, not published. Publishing the

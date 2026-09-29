@@ -378,6 +378,7 @@ pub async fn run_job(
                     task_id: Some(t.id),
                     machine: None,
                     job: Some(t.job.clone()),
+                    summary: None,
                 });
                 report.created.push(t.display_id());
             }
@@ -518,6 +519,7 @@ fn back_off(
         task_id: None,
         machine: None,
         job: Some(job.name.clone()),
+        summary: None,
     });
 }
 
@@ -589,6 +591,7 @@ pub async fn submit_items(
                     task_id: Some(t.id),
                     machine: None,
                     job: Some(t.job.clone()),
+                    summary: None,
                 });
                 out.tasks.push(t);
             }
@@ -1344,6 +1347,9 @@ impl Scheduler {
             }
         }
         self.fleet.dispatch_queued().await;
+        self.fleet
+            .check_pull_lost(self.config.pull_lost_after_duration())
+            .await;
         self.warn_long_queued(now);
     }
 
@@ -1587,12 +1593,14 @@ impl Scheduler {
             // The task keeps the flock it was made for, so no pass places it
             // until the machine moves back.
             let wanted = self.fleet.flock();
+            let task_flock = t.flock.as_deref().unwrap_or(wanted.default_flock());
             if let Some((m, now_in)) = t
                 .spec
                 .machine
                 .as_deref()
-                .and_then(|m| Some((m, wanted.machine_flock(m)?)))
-                .filter(|(_, f)| Some(*f) != t.flock.as_deref())
+                .and_then(|m| wanted.get(m))
+                .filter(|m| !wanted.in_flock(m, task_flock))
+                .map(|m| (m.name.as_str(), wanted.primary_flock(m)))
             {
                 if self.warned_queued.insert(t.id) {
                     tracing::warn!(
@@ -1600,7 +1608,7 @@ impl Scheduler {
                         job = %t.job,
                         machine = m,
                         machine_flock = now_in,
-                        task_flock = t.flock.as_deref().unwrap_or(wanted.default_flock()),
+                        task_flock,
                         "queued for a machine that moved to another flock; it stays queued until the machine moves back"
                     );
                 }
@@ -1863,6 +1871,7 @@ mod tests {
             prompt: "{{ job.name }}: {{ item.title }} ({{ task.id }})".into(),
             max_tasks_per_run: 5,
             backfill: Duration::from_secs(600),
+            summary: None,
             spec: DispatchSpec {
                 agent: "claude".into(),
                 agent_args: vec![],
@@ -1879,10 +1888,13 @@ mod tests {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
+                summary: Default::default(),
             },
             agent: Default::default(),
             flock: None,
             priority: None,
+            preempt: false,
             dispatch: json!({
                 "agent": "claude",
                 "repo": "/srv/{{ job.name }}",

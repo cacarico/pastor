@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{CliError, one_line, request_failure};
+use crate::cli::{CliError, one_line};
 use crate::config::{PastorConfig, Paths, parse_duration};
 use crate::connector::exec::{self, Invocation, RunLog};
 use crate::connector::{Discovered, discover};
@@ -28,7 +28,7 @@ use crate::events::{EventRecord, EventsPage};
 use crate::ipc::{IpcRequest, IpcResponse};
 use crate::scheduler::JobStatus;
 use crate::store::TaskFilter;
-use crate::task::{LIVE_STATES, Task, TaskState};
+use crate::task::{LIVE_STATES, Outcome, Task, TaskState};
 
 /// The cursor a watcher with no `--name` keeps.
 pub const DEFAULT_NAME: &str = "default";
@@ -91,12 +91,15 @@ fn parse_interval(s: &str) -> Result<Duration, String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "UPPERCASE")]
 pub enum Line {
-    /// A task reached `state`.
+    /// A task reached `state`. `outcome` is how its round ended, on a
+    /// task done or failed.
     Task {
         task: String,
         state: TaskState,
         machine: Option<String>,
         job: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outcome: Option<Outcome>,
         reason: Option<String>,
     },
     /// A job's last run failed (`failing`), or it ran fine again (`ok`).
@@ -105,8 +108,9 @@ pub enum Line {
         state: String,
         reason: Option<String>,
     },
-    /// The head stopped answering (`down`), answers again (`up`), or events
-    /// were rotated out of its log before this watcher read them (`gap`).
+    /// The head stopped answering (`down`), answers again (`up`), events
+    /// were rotated out of its log before this watcher read them (`gap`), or
+    /// its log ends before this watcher's cursor (`reset`).
     Head {
         state: String,
         reason: Option<String>,
@@ -135,11 +139,13 @@ impl Line {
                 state,
                 machine,
                 job,
+                outcome,
                 reason: r,
             } => format!(
-                "TASK {task} {state} {} {}{}",
+                "TASK {task} {state} {} {}{}{}",
                 dash(machine),
                 dash(job),
+                outcome.map(outcome_field).unwrap_or_default(),
                 reason(r)
             ),
             Line::Job {
@@ -240,6 +246,18 @@ impl Cursor {
     pub fn events(&mut self, page: &EventsPage, all: bool) -> Vec<Line> {
         let after = self.seq.unwrap_or(0);
         let mut out = Vec::new();
+        if let Some(end) = page.ends_before(after) {
+            // Never replayed: what is in the log now was either printed
+            // under the old numbers or happened before this watcher looked.
+            self.seq = Some(end);
+            out.push(Line::head(
+                "reset",
+                Some(format!(
+                    "the head's log ends at event {end}, before this watcher's {after}; going on from its end"
+                )),
+            ));
+            return out;
+        }
         if page.gap
             && let Some(oldest) = page.oldest
         {
@@ -346,6 +364,25 @@ fn connector_state(id: &str, state: &str, reason: Option<String>) -> Line {
     }
 }
 
+/// ` outcome=partial`, quoted when the outcome is more than one word
+/// (` outcome="nothing to do"`), so the line still splits on spaces.
+fn outcome_field(o: Outcome) -> String {
+    let o = o.as_str();
+    if o.contains(' ') {
+        format!(" outcome=\"{o}\"")
+    } else {
+        format!(" outcome={o}")
+    }
+}
+
+/// How a task's round ended, on a line for it in `state`: only a done or
+/// failed task has ended one.
+fn task_outcome(task: &Task, state: TaskState) -> Option<Outcome> {
+    matches!(state, TaskState::Done | TaskState::Failed)
+        .then(|| task.summary.as_ref().map(|s| s.outcome))
+        .flatten()
+}
+
 /// A `TASK` line for a task event that moved it to a state the watcher
 /// prints (`ATTENTION_STATES`, or any with `all`). Events that are not a
 /// state change (`task.started`, `task.input`) print nothing.
@@ -360,6 +397,10 @@ pub fn task_line(rec: &EventRecord, all: bool) -> Option<Line> {
         state,
         machine: task.machine.clone(),
         job: rec.job.clone(),
+        outcome: matches!(state, TaskState::Done | TaskState::Failed)
+            .then(|| rec.summary.as_ref().map(|s| s.outcome))
+            .flatten()
+            .or_else(|| task_outcome(task, state)),
         reason: task_reason(task, state),
     })
 }
@@ -383,6 +424,7 @@ pub fn now_task_lines(tasks: &[Task], all: bool) -> Vec<Line> {
             state: t.state,
             machine: t.machine.clone(),
             job: Some(t.job.clone()),
+            outcome: task_outcome(t, t.state),
             reason: task_reason(t, t.state),
         })
         .collect()
@@ -497,18 +539,18 @@ enum Ask {
     Refused(String, String),
 }
 
+/// `cli::ask` for a watcher, which also needs to tell a head that gave no
+/// answer from one that refused.
 async fn ask(paths: &Paths, req: IpcRequest) -> Result<IpcResponse, Ask> {
-    match crate::ipc::request_head(paths, &req).await {
-        Ok(IpcResponse::Error { code, message }) => Err(Ask::Refused(code, message)),
-        Ok(resp) => Ok(resp),
-        Err(err) => {
-            let (code, message) = request_failure(&err);
-            match err {
-                crate::ipc::RequestError::Refused { .. } => Err(Ask::Refused(code, message)),
-                _ => Err(Ask::Down(message)),
-            }
+    let got = crate::ipc::request_head(paths, &req).await;
+    let down = matches!(&got, Err(e) if !matches!(e, crate::ipc::RequestError::Refused { .. }));
+    crate::cli::reply(got).map_err(|e| {
+        if down {
+            Ask::Down(e.message)
+        } else {
+            Ask::Refused(e.code, e.message)
         }
-    }
+    })
 }
 
 /// A refusal ends the watcher with the head's code: an agent's bridge or an
@@ -717,6 +759,8 @@ mod tests {
                     agent_source: None,
                     place: Default::default(),
                     session_id: None,
+                    label: Default::default(),
+                    summary: Default::default(),
                 },
                 flock: "default".into(),
                 description: None,
@@ -730,6 +774,7 @@ mod tests {
 
     fn rec(seq: u64, kind: &str, t: &Task) -> EventRecord {
         EventRecord {
+            summary: None,
             seq,
             at: chrono::Utc::now(),
             kind: kind.into(),
@@ -802,6 +847,44 @@ mod tests {
         assert_eq!(texts(&lines), ["TASK t-13 running pi-1 nightly"]);
     }
 
+    /// A done or failed task's line says how its round ended.
+    #[test]
+    fn a_task_end_prints_its_outcome() {
+        use crate::task::{Outcome, SummarySource, TaskSummary};
+        let summary = |outcome| TaskSummary {
+            round: 1,
+            outcome,
+            text: String::new(),
+            source: SummarySource::Agent,
+            at: chrono::Utc::now(),
+        };
+        let mut failed = task(12, TaskState::Failed);
+        failed.error = Some("agent exited".into());
+        let mut ended = rec(2, "task.failed", &failed);
+        ended.summary = Some(summary(Outcome::NoSummary));
+        let mut done = rec(3, "task.done", &task(13, TaskState::Done));
+        done.summary = Some(summary(Outcome::Partial));
+        let mut from_row = task(14, TaskState::Done);
+        from_row.summary = Some(summary(Outcome::NothingToDo));
+        let mut c = Cursor::default();
+        let lines = c.events(
+            &page(vec![ended, done, rec(4, "task.done", &from_row)]),
+            false,
+        );
+        assert_eq!(
+            texts(&lines),
+            [
+                "TASK t-12 failed pi-1 nightly outcome=\"no summary\": agent exited",
+                "TASK t-13 done pi-1 nightly outcome=partial",
+                "TASK t-14 done pi-1 nightly outcome=\"nothing to do\"",
+            ]
+        );
+        assert_eq!(
+            texts(&now_task_lines(&[from_row], false)),
+            ["TASK t-14 done pi-1 nightly outcome=\"nothing to do\""]
+        );
+    }
+
     #[test]
     fn a_gap_in_the_log_is_a_head_line() {
         let mut c = Cursor {
@@ -816,6 +899,71 @@ mod tests {
             "HEAD gap: events 4..8 were rotated out of the log before this watcher read them"
         );
         assert_eq!(texts(&lines)[1], "TASK t-1 done pi-1 nightly");
+    }
+
+    /// A page from a head whose log holds `oldest..=newest`, read after a
+    /// cursor past all of it.
+    fn ended(oldest: Option<u64>, newest: Option<u64>) -> EventsPage {
+        EventsPage {
+            events: vec![],
+            gap: false,
+            oldest,
+            newest,
+        }
+    }
+
+    #[test]
+    fn a_cursor_past_the_heads_log_resets_to_its_end_once() {
+        let mut c = Cursor {
+            seq: Some(500),
+            ..Cursor::default()
+        };
+        let lines = c.events(&ended(Some(1), Some(20)), false);
+        assert_eq!(
+            texts(&lines),
+            [
+                "HEAD reset: the head's log ends at event 20, before this watcher's 500; going on from its end"
+            ]
+        );
+        assert_eq!(c.seq, Some(20));
+        let lines = c.events(
+            &page(vec![rec(21, "task.done", &task(1, TaskState::Done))]),
+            false,
+        );
+        assert_eq!(texts(&lines), ["TASK t-1 done pi-1 nightly"]);
+        assert_eq!(c.seq, Some(21));
+    }
+
+    #[test]
+    fn a_cursor_at_the_heads_newest_event_prints_nothing() {
+        let mut c = Cursor {
+            seq: Some(20),
+            ..Cursor::default()
+        };
+        assert!(c.events(&ended(Some(1), Some(20)), false).is_empty());
+        assert_eq!(c.seq, Some(20));
+    }
+
+    #[test]
+    fn an_empty_head_log_under_an_old_cursor_resets_to_zero() {
+        let mut c = Cursor {
+            seq: Some(500),
+            ..Cursor::default()
+        };
+        let lines = c.events(&ended(None, None), false);
+        assert_eq!(
+            texts(&lines),
+            [
+                "HEAD reset: the head's log ends at event 0, before this watcher's 500; going on from its end"
+            ]
+        );
+        assert_eq!(c.seq, Some(0));
+        assert!(c.events(&ended(None, None), false).is_empty(), "once");
+        let lines = c.events(
+            &page(vec![rec(1, "task.done", &task(1, TaskState::Done))]),
+            false,
+        );
+        assert_eq!(texts(&lines), ["TASK t-1 done pi-1 nightly"]);
     }
 
     #[test]

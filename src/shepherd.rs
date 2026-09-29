@@ -1,11 +1,18 @@
 //! A headless `pastor serve`, the shepherd: with a head set on another
-//! machine, this one runs its own jobs and connector hooks and nothing else.
-//! No queue, no machine actors, no task store: the items a job run finds go
-//! to the head in one `IpcRequest::JobSubmit`, and the head's events come back through
-//! `EventsSince` for the hooks here. Its own small database
-//! (`Paths::shepherd_db_file`) keeps the jobs' state and seen keys and how far
-//! it has read the head's events.
+//! machine, this one runs its own jobs and connector hooks, and the tasks
+//! the head gives it as a pull machine. No queue: the items a job run finds
+//! go to the head in one `IpcRequest::JobSubmit`, and the head's events come
+//! back through `EventsSince` for the hooks here. Its own small database
+//! (`Paths::shepherd_db_file`) keeps the jobs' state and seen keys, how far
+//! it has read the head's events, and the rows of the tasks it runs.
+//!
+//! When the head's flock.toml has this machine as `pull = true`, each tick
+//! also asks for tasks (`IpcRequest::TaskClaim`) and runs them with the same
+//! machine actor the head runs for a local machine, on this machine's herdr;
+//! every change the actor sees goes back as `IpcRequest::TaskReport`
+//! (`Puller`).
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,15 +25,22 @@ use crate::config::{PastorConfig, Paths};
 use crate::daemon::{Answer, Daemon, Fleet, answer_on, jobs_answer};
 use crate::events::{EventRecord, EventsPage};
 use crate::head::RemoteHead;
+use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{IPC_PROTOCOL, IpcRequest, IpcResponse, SHEPHERD_ROLE, request_line};
+use crate::machine::{MachineHandle, MachineSettings, PastorEvent};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::Store;
+use crate::task::{Task, TaskState};
 
 /// The meta key that holds the last head event handed to the hooks.
 const CURSOR_KEY: &str = "head_event_seq";
 
 /// How many head events one `EventsSince` asks for.
 const PAGE: u32 = 200;
+
+/// How many tasks one `TaskClaim` asks for. The head's `max_agents` for the
+/// machine is what bounds how many run here at once.
+const CLAIM_AT_ONCE: u32 = 4;
 
 /// How long a request to the head may take. A `JobSubmit` waits for the
 /// head's dispatch pass, agent readiness included.
@@ -65,14 +79,20 @@ pub struct Shepherd {
 }
 
 impl Answer for Shepherd {
-    async fn answer(&self, req: IpcRequest, from_task: Option<String>) -> IpcResponse {
-        // The rule the head applies (`Daemon::handle_from`), from this
-        // machine's pastor.toml.
-        if let Some(task) = &from_task
+    async fn answer(&self, req: IpcRequest, from: crate::ipc::Caller) -> IpcResponse {
+        // The rule the head applies (`Daemon::handle_as`), from this
+        // machine's pastor.toml. Nothing a headless serve answers is on the
+        // orchestrator role's table, and orchestrators run on the head.
+        let refusal = match (&from.task, &from.orchestrator) {
+            (Some(task), _) => Some(crate::daemon::agent_refusal(task)),
+            (None, Some(o)) => Some(crate::daemon::script_refusal(o)),
+            (None, None) => None,
+        };
+        if let Some(refusal) = refusal
             && req.changes_fleet()
             && !PastorConfig::load(&self.paths.config_file()).is_ok_and(|c| c.agents_change_fleet)
         {
-            return IpcResponse::error("agent_refused", crate::daemon::agent_refusal(task));
+            return IpcResponse::error("agent_refused", refusal);
         }
         if let IpcRequest::Ping = req {
             return IpcResponse::Pong {
@@ -124,14 +144,33 @@ pub async fn run(paths: Paths, head: String, ask: Ask) -> anyhow::Result<()> {
     // Once before the first job run, so the cursor starts before any task
     // that run queues and the hooks hear about it.
     follow.pass().await;
+    let mut puller = Puller::new(
+        config.shepherd.machine_name(),
+        config.shepherd.flock_work(),
+        shepherd_connector(&config),
+        crate::daemon::machine_settings(&PastorConfig {
+            head_address: None,
+            ..config.clone()
+        }),
+        store.clone(),
+        ask.clone(),
+    );
     let every = config.tick_duration();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
+        puller.pass().await;
         loop {
-            tick.tick().await;
-            follow.pass().await;
+            tokio::select! {
+                _ = tick.tick() => {
+                    follow.pass().await;
+                    puller.pass().await;
+                }
+                // The actor saw a task change: tell the head now, not at
+                // the next tick.
+                () = puller.changed() => puller.report(false).await,
+            }
         }
     });
     let fleet = Arc::new(Fleet::headless(store.clone(), ask));
@@ -147,6 +186,260 @@ pub async fn run(paths: Paths, head: String, ask: Ask) -> anyhow::Result<()> {
         head,
     };
     answer_on(Arc::new(shepherd), listener, socket).await
+}
+
+/// This machine's own herdr, where the tasks it claims run: the local
+/// session `default`, or `[shepherd] command`.
+fn shepherd_connector(config: &PastorConfig) -> Arc<dyn Connector> {
+    Arc::new(match &config.shepherd.command {
+        Some(argv) => Endpoint::Command { argv: argv.clone() },
+        None => Endpoint::Local {
+            session: "default".into(),
+        },
+    })
+}
+
+/// What was last told to the head about a task: its state, pane and note.
+type Reported = (TaskState, Option<String>, Option<String>);
+
+/// Runs the tasks the head gives this machine as a pull machine: claims
+/// them each tick, starts each with the machine actor, and reports every
+/// change of their rows. The actor starts on the first claim the head
+/// answers, or at once when the store still holds tasks from before a
+/// restart: a machine the head does not have as a pull machine never
+/// talks to its herdr.
+struct Puller {
+    machine: String,
+    flock_work: bool,
+    connector: Arc<dyn Connector>,
+    settings: MachineSettings,
+    store: Arc<Store>,
+    ask: Ask,
+    /// The actor's events; any of them means a row may have changed.
+    events: broadcast::Sender<PastorEvent>,
+    heard: broadcast::Receiver<PastorEvent>,
+    actor: Option<MachineHandle>,
+    /// Per task, what the head last accepted.
+    sent: HashMap<i64, Reported>,
+    /// Tasks whose dispatch is with the actor now, so a tick does not ask
+    /// again while it waits in the actor's queue.
+    dispatching: Arc<std::sync::Mutex<HashSet<i64>>>,
+    /// The code of the last claim the head refused, so it is logged once.
+    refused: Option<String>,
+}
+
+impl Puller {
+    fn new(
+        machine: String,
+        flock_work: bool,
+        connector: Arc<dyn Connector>,
+        settings: MachineSettings,
+        store: Arc<Store>,
+        ask: Ask,
+    ) -> Puller {
+        let (events, heard) = broadcast::channel(256);
+        Puller {
+            machine,
+            flock_work,
+            connector,
+            settings,
+            store,
+            ask,
+            events,
+            heard,
+            actor: None,
+            sent: HashMap::new(),
+            dispatching: Default::default(),
+            refused: None,
+        }
+    }
+
+    /// Resolves when the actor has emitted an event since the last call.
+    async fn changed(&mut self) {
+        loop {
+            match self.heard.recv().await {
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => return,
+                // `self.events` keeps the channel open; never reached.
+                Err(broadcast::error::RecvError::Closed) => std::future::pending::<()>().await,
+            }
+        }
+    }
+
+    /// The tasks this store holds: those claimed and not yet forgotten.
+    fn tasks(&self) -> Vec<Task> {
+        match self.store.list_tasks(&Default::default()) {
+            Ok(tasks) => tasks,
+            Err(err) => {
+                tracing::error!(%err, "list the claimed tasks");
+                Vec::new()
+            }
+        }
+    }
+
+    fn actor(&mut self) -> MachineHandle {
+        self.actor
+            .get_or_insert_with(|| {
+                tracing::info!(machine = %self.machine, "running the head's tasks here, as pull machine {}", self.machine);
+                crate::machine::spawn_machine(
+                    self.machine.clone(),
+                    CLAIM_AT_ONCE,
+                    Vec::new(),
+                    self.connector.clone(),
+                    self.store.clone(),
+                    self.settings.clone(),
+                    self.events.clone(),
+                )
+            })
+            .clone()
+    }
+
+    /// One tick: report every task, claim, and start what is queued here.
+    async fn pass(&mut self) {
+        if self.actor.is_none() && !self.tasks().is_empty() {
+            self.actor();
+        }
+        self.report(true).await;
+        self.claim().await;
+        self.start_queued();
+    }
+
+    /// Ask the head for tasks and keep each as a queued row here.
+    async fn claim(&mut self) {
+        let req = IpcRequest::TaskClaim {
+            machine: self.machine.clone(),
+            free_slots: CLAIM_AT_ONCE,
+            flock_work: self.flock_work,
+        };
+        let tasks = match (self.ask)(req).await {
+            Ok(IpcResponse::Tasks(tasks)) => {
+                if self.refused.take().is_some() {
+                    tracing::info!(machine = %self.machine, "the head gives this machine tasks again");
+                }
+                tasks
+            }
+            Ok(other) => {
+                tracing::warn!(?other, "the head answered TaskClaim with something else");
+                return;
+            }
+            Err(err) => {
+                // An unreachable head is `Follower`'s to report.
+                if let Some(e) = err.downcast_ref::<CliError>()
+                    && !matches!(e.code.as_str(), "head_unreachable" | "no_head")
+                    && self.refused.as_deref() != Some(e.code.as_str())
+                {
+                    tracing::info!(
+                        machine = %self.machine,
+                        code = %e.code,
+                        "the head gives this machine no tasks: {}",
+                        e.message
+                    );
+                    self.refused = Some(e.code.clone());
+                }
+                return;
+            }
+        };
+        self.actor();
+        for t in tasks {
+            match self.store.adopt_claimed(&t) {
+                Ok(_) => tracing::info!(task = %t.display_id(), "claimed from the head"),
+                Err(err) => tracing::error!(task = %t.display_id(), %err, "keep a claimed task"),
+            }
+        }
+    }
+
+    /// Hand every queued row to the actor, each once while it waits there.
+    fn start_queued(&mut self) {
+        let queued: Vec<i64> = self
+            .tasks()
+            .into_iter()
+            .filter(|t| t.state == TaskState::Queued)
+            .map(|t| t.id)
+            .collect();
+        if queued.is_empty() {
+            return;
+        }
+        let actor = self.actor();
+        for id in queued {
+            if !self.dispatching.lock().unwrap().insert(id) {
+                continue;
+            }
+            let (actor, dispatching) = (actor.clone(), self.dispatching.clone());
+            tokio::spawn(async move {
+                if let Err(err) = actor.dispatch(id).await {
+                    tracing::warn!(task = %Task::agent_name_for(id), err = %format!("{err:#}"), "dispatch failed");
+                }
+                dispatching.lock().unwrap().remove(&id);
+            });
+        }
+    }
+
+    /// Tell the head about every row that changed since it last heard, or
+    /// with `all` every row: the head answers an unchanged report with its
+    /// row and nothing else, which is how a `task close` there reaches the
+    /// pane here. A row the head has closed is closed here too; a closed or
+    /// failed one the head has heard of is forgotten here. Stops at the
+    /// first report that does not reach the head, to try again next tick.
+    async fn report(&mut self, all: bool) {
+        for t in self.tasks() {
+            if t.state == TaskState::Queued {
+                continue;
+            }
+            let now: Reported = (t.state, t.pane_id.clone(), t.error.clone());
+            if !all && self.sent.get(&t.id) == Some(&now) {
+                continue;
+            }
+            let req = IpcRequest::TaskReport {
+                machine: self.machine.clone(),
+                id: t.id,
+                state: t.state,
+                pane: t.pane_id.clone(),
+                detail: t.error.clone(),
+            };
+            let head_row = match (self.ask)(req).await {
+                Ok(IpcResponse::Task(row)) => row,
+                Ok(other) => {
+                    tracing::warn!(?other, "the head answered TaskReport with something else");
+                    return;
+                }
+                Err(err) => {
+                    let code = err.downcast_ref::<CliError>().map(|e| e.code.clone());
+                    match code.as_deref() {
+                        // The head has no such task here any more: nothing
+                        // left to tell it.
+                        Some("task_not_found" | "not_on_machine") => {
+                            tracing::warn!(task = %t.display_id(), err = %format!("{err:#}"), "the head disowns a task this machine runs; forgetting it here");
+                            self.forget(t.id);
+                            continue;
+                        }
+                        _ => {
+                            tracing::debug!(task = %t.display_id(), err = %format!("{err:#}"), "report not delivered; again next tick");
+                            return;
+                        }
+                    }
+                }
+            };
+            tracing::info!(task = %t.display_id(), state = %t.state, "reported to the head");
+            self.sent.insert(t.id, now);
+            if head_row.state == TaskState::Closed && t.state.is_open() {
+                // Closed on the head (`task close`): the pane is here.
+                let actor = self.actor();
+                if let Err(err) = actor.close(t.id, false).await {
+                    tracing::warn!(task = %t.display_id(), err = %format!("{err:#}"), "close a task the head closed");
+                }
+                continue;
+            }
+            if matches!(t.state, TaskState::Closed | TaskState::Failed) {
+                self.forget(t.id);
+            }
+        }
+    }
+
+    fn forget(&mut self, id: i64) {
+        self.sent.remove(&id);
+        if let Err(err) = self.store.forget_task(id) {
+            tracing::error!(task = %Task::agent_name_for(id), %err, "forget a claimed task");
+        }
+    }
 }
 
 /// Reads the head's events for this machine's hooks, from where the last
@@ -201,6 +494,18 @@ impl Follower {
             if skip {
                 after = page.events.last().map_or(after, |r| r.seq);
                 self.store.set_meta(CURSOR_KEY, &after.to_string())?;
+            } else if let Some(end) = page.ends_before(after) {
+                // Never replayed: the hooks would fire again for records
+                // they may have heard under the old numbers.
+                tracing::warn!(
+                    code = "head_events_reset",
+                    head = %self.head,
+                    after,
+                    end,
+                    "the head's events log ends before this machine's cursor (the head moved or its state was wiped); the hooks go on from its end"
+                );
+                self.store.set_meta(CURSOR_KEY, &end.to_string())?;
+                return Ok(());
             } else {
                 // The records left still go to the hooks, from the oldest
                 // the head returned: a lost stretch is logged, not retried.
@@ -248,6 +553,7 @@ mod tests {
 
     fn rec(seq: u64) -> EventRecord {
         EventRecord {
+            summary: None,
             seq,
             at: chrono::Utc::now(),
             kind: "task.done".into(),
@@ -396,6 +702,37 @@ mod tests {
         assert_eq!(seqs(&mut rx), vec![321]);
     }
 
+    /// A cursor past the head's newest event (the head moved, or its state
+    /// dir was wiped) moves to the head's end: nothing up to it is heard
+    /// again, what comes after is.
+    #[tokio::test]
+    async fn a_cursor_past_the_heads_log_goes_on_from_its_end() {
+        let log = Arc::new(Mutex::new((1..=20).map(rec).collect::<Vec<_>>()));
+        let (mut f, mut rx) = follower(head(log.clone(), Arc::new(Mutex::new(false))));
+        f.store.set_meta(CURSOR_KEY, "500").unwrap();
+        f.pass().await;
+        assert_eq!(f.reachable, Some(true));
+        assert!(seqs(&mut rx).is_empty(), "no replay");
+        assert_eq!(f.store.meta(CURSOR_KEY).unwrap().as_deref(), Some("20"));
+        f.pass().await;
+        assert!(seqs(&mut rx).is_empty());
+        log.lock().unwrap().extend((21..=22).map(rec));
+        f.pass().await;
+        assert_eq!(seqs(&mut rx), vec![21, 22]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_head_log_under_an_old_cursor_goes_on_from_zero() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, mut rx) = follower(head(log.clone(), Arc::new(Mutex::new(false))));
+        f.store.set_meta(CURSOR_KEY, "500").unwrap();
+        f.pass().await;
+        assert_eq!(f.store.meta(CURSOR_KEY).unwrap().as_deref(), Some("0"));
+        log.lock().unwrap().push(rec(1));
+        f.pass().await;
+        assert_eq!(seqs(&mut rx), vec![1]);
+    }
+
     /// Head events reach this machine's hooks through the hook runner: an
     /// `only_own` hook hears only tasks of a job in this machine's `jobs/`
     /// that uses its connector, and records about no job; a hook without
@@ -428,6 +765,7 @@ mod tests {
         .unwrap();
 
         let about = |seq: u64, kind: &str, job: Option<&str>| EventRecord {
+            summary: None,
             kind: kind.into(),
             job: job.map(str::to_string),
             ..rec(seq)
@@ -463,6 +801,196 @@ mod tests {
         heard(&out.join("all"), &[2, 3]).await;
     }
 
+    /// A head in this process, with `laptop` as a pull machine, and an
+    /// `Ask` that reaches it as the bridge would.
+    async fn pull_head(tmp: &std::path::Path) -> (Arc<Daemon>, Ask) {
+        let paths = Paths::new(tmp.join("head/c"), tmp.join("head/s"));
+        paths.ensure().unwrap();
+        let flock: crate::config::flock::Flock =
+            toml::from_str("[[machine]]\nname = \"laptop\"\npull = true\n").unwrap();
+        flock.save(&paths.flock_file()).unwrap();
+        let config = PastorConfig::default();
+        std::fs::write(paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        let on_disk = ConfigFingerprint::sample(&paths);
+        let head = Arc::new(
+            Daemon::start(paths, config, flock, on_disk, None)
+                .await
+                .unwrap(),
+        );
+        let to = head.clone();
+        let ask: Ask = Arc::new(move |req| {
+            let head = to.clone();
+            Box::pin(async move {
+                match head.handle(req).await {
+                    IpcResponse::Error { code, message } => Err(CliError::err(&code, message)),
+                    resp => Ok(resp),
+                }
+            })
+        });
+        (head, ask)
+    }
+
+    fn fast() -> MachineSettings {
+        MachineSettings {
+            settle: Duration::from_millis(100),
+            reconcile_every: Duration::from_millis(200),
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(200),
+            request_timeout: Duration::from_secs(5),
+            agent_ready_timeout: Duration::from_millis(500),
+            poll_every: Duration::from_millis(200),
+            close_done_after: None,
+            ..Default::default()
+        }
+    }
+
+    async fn run_pinned(head: &Daemon, machine: Option<&str>) -> Task {
+        let req = IpcRequest::Run {
+            preempt: false,
+            prompt: "fix it".into(),
+            spec: crate::task::DispatchSpec {
+                agent: "claude".into(),
+                agent_args: vec![],
+                allow: vec![],
+                deny: vec![],
+                repo: None,
+                worktree: false,
+                branch: None,
+                machine: machine.map(str::to_string),
+                tags: vec![],
+                timeout_secs: 3600,
+                checkout: None,
+                reopen: None,
+                agent_source: None,
+                place: Default::default(),
+                session_id: None,
+                label: Default::default(),
+                summary: Default::default(),
+            },
+            flock: None,
+            agent: None,
+            priority: None,
+            role: Default::default(),
+            description: None,
+            summary: None,
+        };
+        match head.handle(req).await {
+            IpcResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Passes and reports until the head's row of `t` is `want`.
+    async fn head_reaches(p: &mut Puller, head: &Daemon, t: &Task, want: TaskState) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = head.store().get_task(t.id).unwrap().unwrap().state;
+            if state == want {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{state} not {want}");
+            let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
+            p.pass().await;
+        }
+    }
+
+    /// A shepherd that is a pull machine claims the task pinned to it, runs
+    /// it with a machine actor on its own herdr and reports each change: the
+    /// head's row and events follow it, as for a machine the head runs. A
+    /// task nobody pinned is left alone until it asks for flock work, and
+    /// the rows here are forgotten once the head heard the task close.
+    #[tokio::test]
+    async fn a_pull_machine_runs_the_heads_task_and_reports_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, ask) = pull_head(tmp.path()).await;
+        let mut events = head.subscribe();
+        let pinned = run_pinned(&head, Some("laptop")).await;
+        let loose = run_pinned(&head, None).await;
+        assert_eq!(pinned.state, TaskState::Queued);
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "laptop".into(),
+            false,
+            Arc::new(fake.clone()),
+            fast(),
+            store.clone(),
+            ask,
+        );
+        head_reaches(&mut p, &head, &pinned, TaskState::Running).await;
+        let row = head.store().get_task(pinned.id).unwrap().unwrap();
+        assert_eq!(row.machine.as_deref(), Some("laptop"));
+        let pane = row.pane_id.clone().expect("the pane is reported");
+        assert_eq!(
+            head.store().get_task(loose.id).unwrap().unwrap().state,
+            TaskState::Queued,
+            "no flock work unasked"
+        );
+
+        fake.set_status(&pane, crate::herdr::AgentStatus::Idle);
+        head_reaches(&mut p, &head, &pinned, TaskState::Done).await;
+        let kinds: Vec<(String, Option<String>)> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.task_id == Some(pinned.id))
+            .map(|e| (e.kind, e.machine))
+            .collect();
+        let lap = |k: &str| (k.to_string(), Some("laptop".to_string()));
+        assert_eq!(
+            kinds,
+            [
+                ("task.queued".to_string(), None),
+                lap("task.running"),
+                lap("task.done")
+            ],
+            "as the head's own actor would"
+        );
+
+        // Closed on the head: the pane here goes, and so does the row.
+        let IpcResponse::Task(_) = head
+            .handle(IpcRequest::TaskClose {
+                id: pinned.id,
+                remove_worktree: false,
+            })
+            .await
+        else {
+            panic!()
+        };
+        // The head closes the row alone; the pane goes at this machine's
+        // next pass, which reports every task it runs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while store.get_task(pinned.id).unwrap().is_some() {
+            assert!(std::time::Instant::now() < deadline, "never forgotten");
+            let _ = tokio::time::timeout(Duration::from_millis(100), p.changed()).await;
+            p.pass().await;
+        }
+        assert!(fake.agents().is_empty(), "{:?}", fake.agents());
+
+        p.flock_work = true;
+        head_reaches(&mut p, &head, &loose, TaskState::Running).await;
+    }
+
+    /// A machine the head does not have as a pull machine never starts an
+    /// actor, so its herdr is never asked anything.
+    #[tokio::test]
+    async fn a_machine_the_head_refuses_starts_no_actor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_head, ask) = pull_head(tmp.path()).await;
+        let fake = crate::herdr::fake::FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut p = Puller::new(
+            "desk".into(),
+            true,
+            Arc::new(fake.clone()),
+            fast(),
+            store,
+            ask,
+        );
+        p.pass().await;
+        p.pass().await;
+        assert!(p.actor.is_none());
+        assert_eq!(p.refused.as_deref(), Some("unknown_machine"));
+        assert!(fake.requests().is_empty());
+    }
+
     /// Its own jobs' requests, a ping that says what it is, and a refusal
     /// for the rest, which is the head's; an agent pastor started may not
     /// run its jobs.
@@ -484,14 +1012,15 @@ mod tests {
             scheduler,
             head: "user@pi-1".into(),
         };
-        let IpcResponse::Pong { role, protocol, .. } = s.answer(IpcRequest::Ping, None).await
+        let IpcResponse::Pong { role, protocol, .. } =
+            s.answer(IpcRequest::Ping, Default::default()).await
         else {
             panic!()
         };
         assert_eq!(role.as_deref(), Some(SHEPHERD_ROLE));
         assert_eq!(protocol, IPC_PROTOCOL);
         assert!(matches!(
-            s.answer(IpcRequest::JobList, None).await,
+            s.answer(IpcRequest::JobList, Default::default()).await,
             IpcResponse::Jobs(j) if j.is_empty()
         ));
         let code = |r: IpcResponse| match r {
@@ -503,15 +1032,18 @@ mod tests {
                 IpcRequest::List {
                     filter: Default::default(),
                 },
-                None,
+                Default::default(),
             )
             .await,
         );
         assert_eq!(c, "shepherd_unsupported");
         assert!(m.contains("user@pi-1"), "{m}");
         let (c, _) = code(
-            s.answer(IpcRequest::JobRun { name: "x".into() }, Some("t-3".into()))
-                .await,
+            s.answer(
+                IpcRequest::JobRun { name: "x".into() },
+                crate::ipc::Caller::task(Some("t-3")),
+            )
+            .await,
         );
         assert_eq!(c, "agent_refused");
     }
@@ -537,6 +1069,77 @@ mod tests {
         let fleet = Fleet::headless(store, old_head);
         let job = crate::config::job::Job::parse(
             "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprofile = \"ci\"\nprompt = \"p\"\n",
+            "x",
+            &crate::config::Defaults::default(),
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let err = fleet
+            .submit_to_head(&job, vec![serde_json::json!({})])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliError>().map(|e| e.code.as_str()),
+            Some("head_too_old"),
+            "{err}"
+        );
+    }
+
+    /// The same refusal for `[dispatch] preempt = true`: a head before
+    /// `PREEMPT_PROTOCOL` does not know the field and its `DispatchTable`
+    /// would refuse the whole `JobSubmit` as `invalid_dispatch` instead of
+    /// this clear `head_too_old`.
+    #[tokio::test]
+    async fn submit_to_head_refuses_a_head_that_predates_preempt() {
+        let old_head: Ask = Arc::new(|req| {
+            Box::pin(async move {
+                assert!(matches!(req, IpcRequest::Ping), "{req:?}");
+                Ok(IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol: crate::ipc::PREEMPT_PROTOCOL - 1,
+                    role: None,
+                })
+            })
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let fleet = Fleet::headless(store, old_head);
+        let job = crate::config::job::Job::parse(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\npreempt = true\nprompt = \"p\"\n",
+            "x",
+            &crate::config::Defaults::default(),
+            &crate::connector::Builtins,
+        )
+        .unwrap();
+        let err = fleet
+            .submit_to_head(&job, vec![serde_json::json!({})])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CliError>().map(|e| e.code.as_str()),
+            Some("head_too_old"),
+            "{err}"
+        );
+    }
+
+    /// The same guard for a label: a head before `LABEL_PROTOCOL` drops
+    /// `[dispatch] label` (serde skips the unknown field) and names the
+    /// workspace by its own default instead of the job's chosen name.
+    #[tokio::test]
+    async fn submit_to_head_refuses_a_head_that_predates_labels() {
+        let old_head: Ask = Arc::new(|req| {
+            Box::pin(async move {
+                assert!(matches!(req, IpcRequest::Ping), "{req:?}");
+                Ok(IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol: crate::ipc::LABEL_PROTOCOL - 1,
+                    role: None,
+                })
+            })
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let fleet = Fleet::headless(store, old_head);
+        let job = crate::config::job::Job::parse(
+            "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nlabel = \"{{ item.key }}\"\nprompt = \"p\"\n",
             "x",
             &crate::config::Defaults::default(),
             &crate::connector::Builtins,

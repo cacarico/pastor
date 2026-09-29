@@ -7,13 +7,8 @@ use std::time::{Duration, Instant};
 /// bring a daemon up, and a wait that ends early only ever fails a good run.
 const WAIT: Duration = Duration::from_secs(60);
 
-fn pastor() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
-    // The suite may itself run in an agent's pane, which pastor marks; the
-    // tests that want the mark set it.
-    c.env_remove("PASTOR_TASK");
-    c
-}
+mod common;
+use common::pastor;
 
 struct Env {
     _tmp: tempfile::TempDir,
@@ -93,7 +88,7 @@ fn start_with(jobs: &[(&str, &str)], herdr_env: &[(&str, &str)]) -> Env {
     .unwrap();
     let serve_log = std::fs::File::create(tmp.path().join("serve.log")).unwrap();
     let serve = pastor()
-        .args(["serve"])
+        .args(["serve", "--foreground"])
         .env("PASTOR_CONFIG_DIR", &config)
         .env("PASTOR_STATE_DIR", &state)
         .stdout(Stdio::null())
@@ -299,10 +294,14 @@ fn completions_offer_only_the_nested_spellings() {
         !bash.contains("pastor__subcmd__machine,status)"),
         "bash knows machine status"
     );
+    // `serve status` is a command of its own; only machine's is gone.
     assert!(
-        !fish.contains("-f -a \"status\""),
+        !fish
+            .lines()
+            .any(|l| l.contains("using_subcommand machine") && l.contains("-f -a \"status\"")),
         "fish offers machine status"
     );
+    assert!(fish.contains("-f -a \"status\" -d 'Whether pastor serve runs here"));
     assert!(bash.contains("pastor__subcmd__machine,list)"));
 }
 
@@ -1293,7 +1292,7 @@ fn assert_daemon_shuts_down_cleanly_on(signal: &str) {
 
     let stderr_path = tmp.path().join("serve.stderr");
     let serve = pastor()
-        .args(["serve"])
+        .args(["serve", "--foreground"])
         .env("PASTOR_CONFIG_DIR", &config)
         .env("PASTOR_STATE_DIR", &state)
         .stdout(Stdio::null())
@@ -1399,7 +1398,7 @@ fn machine_list_opens_with_a_line_about_the_head() {
     assert_eq!(
         lines[0],
         [
-            "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS",
+            "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS",
             "TAGS", "ERROR"
         ],
         "{stdout}"
@@ -1512,7 +1511,7 @@ fn machine_list_without_daemon_probes_each_machine() {
     // No head, no line about it: the stderr notice says so instead.
     assert_eq!(
         lines[0][..5],
-        ["NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL"],
+        ["NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL"],
         "{stdout}"
     );
     assert_eq!(
@@ -2264,6 +2263,49 @@ fn task_retry_close_and_prune_end_to_end() {
     );
 }
 
+/// `task close` takes several ids: one result line each, every id tried, and
+/// exit 1 naming the ones that failed.
+#[test]
+fn task_close_takes_several_ids() {
+    let env = start();
+    for prompt in ["one", "two", "three", "four"] {
+        env.json(&["task", "run", prompt, "--json"]);
+    }
+    let out = env.cmd(&["task", "close", "t-1", "t-2"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, ["t-1 closed", "t-2 closed"], "{text}");
+
+    // One that fails does not stop the rest, and the exit says which.
+    let out = env.cmd(&["task", "close", "t-99", "t-3", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let results: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(results[0]["task"], "t-99");
+    assert_eq!(results[0]["code"], "task_not_found");
+    assert_eq!(results[1]["task"], "t-3");
+    assert_eq!(results[1]["state"], "closed");
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["code"], "close_failed", "{err}");
+    assert!(err["message"].as_str().unwrap().contains("t-99"), "{err}");
+
+    // --remove-worktree applies to every id: t-4 has none.
+    let out = env.cmd(&["task", "close", "t-4", "t-1", "--remove-worktree"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines().next().unwrap().starts_with("t-4 no_worktree"),
+        "{text}"
+    );
+    assert_ne!(
+        env.json(&["task", "describe", "t-4", "--json"])["state"],
+        "closed"
+    );
+}
 /// Without a head, prune still works on the database; retry and close need
 /// the daemon and say so with a stable code.
 #[test]
@@ -2988,9 +3030,83 @@ fn an_agent_may_end_its_own_task_only() {
     assert_eq!(env.json(&["task", "done", "t-2", "--json"])["ended"], true);
 }
 
+/// `task done --summary` (or `--summary-file`, `-` for stdin) ends the
+/// round with what the agent said: `task describe` shows it, `--all-summaries`
+/// every round's, `task list --wide` its outcome as RESULT, and `--json` the
+/// `summary` object.
+#[test]
+fn a_task_done_with_a_summary_shows_it() {
+    let env = start();
+    for _ in 0..2 {
+        env.json(&["task", "run", "go on", "--repo", "/tmp", "--json"]);
+    }
+    let ended = env.json(&[
+        "task",
+        "done",
+        "t-1",
+        "--summary",
+        "Partial: tests left\npushed pastor/t-1",
+        "--json",
+    ]);
+    assert_eq!(ended["summary"]["outcome"], "partial", "{ended}");
+    assert_eq!(ended["summary"]["source"], "agent", "{ended}");
+    assert_eq!(ended["summary"]["round"], 1, "{ended}");
+    // Said again, it replaces the round's summary.
+    let out = env.cmd_stdin(
+        &["task", "done", "t-1", "--summary-file", "-", "--json"],
+        "nothing to do\nalready merged\n",
+    );
+    let again: serde_json::Value = serde_json::from_str(&ok(out)).unwrap();
+    assert_eq!(again["summary"]["outcome"], "nothing to do", "{again}");
+    let text = ok(env.cmd(&["task", "describe", "t-1"]));
+    assert!(
+        text.contains("summary:    nothing to do (round 1, from the agent,"),
+        "{text}"
+    );
+    assert!(text.contains("\n  already merged\n"), "{text}");
+    let all = env.json(&["task", "describe", "t-1", "--all-summaries", "--json"]);
+    assert_eq!(all["summaries"].as_array().unwrap().len(), 1, "{all}");
+    let listed = ok(env.cmd(&["task", "list", "--all", "--wide"]));
+    let header = listed.lines().next().unwrap();
+    assert!(
+        header.contains(" RESULT ") && header.ends_with("DESCRIPTION"),
+        "{listed}"
+    );
+    let row = listed.lines().find(|l| l.starts_with("t-1 ")).unwrap();
+    assert!(row.contains("nothing to do"), "{listed}");
+    let row = listed.lines().find(|l| l.starts_with("t-2 ")).unwrap();
+    assert!(row.contains(" - "), "{listed}");
+    let tasks = env.json(&["task", "list", "--all", "--json"]);
+    let t1 = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == 1)
+        .unwrap();
+    assert_eq!(
+        t1["summary"]["text"], "nothing to do\nalready merged",
+        "{t1}"
+    );
+    env.fails_with(&["task", "done", "t-2", "--summary", "  "], "summary_empty");
+    env.fails_with(
+        &[
+            "task",
+            "done",
+            "t-2",
+            "--summary-file",
+            "/nonexistent/summary",
+        ],
+        "summary_file_unreadable",
+    );
+    // With no summary the round keeps the pane's last lines instead.
+    let t2 = env.json(&["task", "done", "t-2", "--json"]);
+    assert_eq!(t2["summary"]["outcome"], "no summary", "{t2}");
+    assert_eq!(t2["summary"]["source"], "pane", "{t2}");
+}
+
 /// A person starts an orchestrator with `task run --role orchestrator`; from
-/// its pane it may run tasks, but not close one or make another
-/// orchestrator, and no plain agent may make one either. `task describe` and
+/// its pane it may run and close tasks, but not prune them or make another
+/// orchestrator, and no plain agent may do any of these. `task describe` and
 /// `task list --json` name the role.
 #[test]
 fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
@@ -3038,16 +3154,23 @@ fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
     }
     // t-1's guard runs before the head is ever asked, so it must still know
     // t-1 is an orchestrator: its refusal names the role, not "agent".
-    let closed = from("t-1", &["task", "close", "t-2"]);
-    assert_eq!(error_code(&closed), "agent_refused");
-    let err = String::from_utf8_lossy(&closed.stderr);
+    let pruned = from("t-1", &["task", "prune", "--done", "--older-than", "1d"]);
+    assert_eq!(error_code(&pruned), "agent_refused");
+    let err = String::from_utf8_lossy(&pruned.stderr);
     assert!(err.contains("orchestrator"), "{err}");
     assert!(!err.contains("is an agent pastor started"), "{err}");
     assert_eq!(
         error_code(&from("t-2", &["task", "run", "go", "--repo", "/tmp"])),
         "agent_refused"
     );
-    let listed = env.json(&["task", "list", "--json"]);
+    assert_eq!(
+        error_code(&from("t-2", &["task", "close", "t-2"])),
+        "agent_refused"
+    );
+    let closed: serde_json::Value =
+        serde_json::from_str(&ok(from("t-1", &["task", "close", "t-2", "--json"]))).unwrap();
+    assert_eq!(closed["state"], "closed", "{closed}");
+    let listed = env.json(&["task", "list", "--all", "--json"]);
     let roles: Vec<&str> = listed
         .as_array()
         .unwrap()
@@ -3057,6 +3180,253 @@ fn an_orchestrator_runs_tasks_but_only_a_person_starts_one() {
     assert_eq!(roles, ["agent", "orchestrator"], "{listed}");
     let text = ok(env.cmd(&["task", "describe", "t-1"]));
     assert!(text.contains("role:       orchestrator"), "{text}");
+}
+
+/// An orchestrator file `name` of `text` in the head's config, with a
+/// `pre.sh` of `pre` beside it.
+fn write_orchestrator(env: &Env, name: &str, text: &str, pre: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = env.config.join("orchestrators");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{name}.toml")), text).unwrap();
+    let script = dir.join("pre.sh");
+    std::fs::write(&script, format!("#!/bin/sh\n{pre}\n")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+const MERGE: &str =
+    "kind = \"scheduled\"\ncron = \"0 3 * * *\"\npre = [\"./pre.sh\"]\nprompt = \"Decide.\"\n";
+
+/// The noun end to end: `list` shows each file's kind and state, an
+/// invalid one with its error; `run` fires a run whose pre script printed
+/// nothing, so no agent starts; `disable` turns it off; a person keeps its
+/// note with `--name`; `describe` shows the run and the note.
+#[test]
+fn orchestrator_files_list_run_disable_and_note() {
+    let env = start();
+    write_orchestrator(&env, "merge", MERGE, "echo looked >&2");
+    std::fs::write(
+        env.config.join("orchestrators/night.toml"),
+        "hours = { start = \"22:00\", stop = \"08:00\" }\nprompt = \"p\"\n",
+    )
+    .unwrap();
+    let list = env.json(&["orchestrator", "list", "--json"]);
+    assert_eq!(list[0]["name"], "merge", "{list}");
+    assert_eq!(list[0]["kind"], "scheduled", "{list}");
+    assert_eq!(list[0]["state"], "idle", "{list}");
+    assert_eq!(list[1]["name"], "night", "{list}");
+    assert_eq!(list[1]["state"], "invalid", "{list}");
+    assert!(
+        list[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("kind is required"),
+        "{list}"
+    );
+    let text = ok(env.cmd(&["orchestrator", "list"]));
+    assert!(text.contains("NAME") && text.contains("merge"), "{text}");
+
+    ok(env.cmd(&["orchestrator", "run", "merge"]));
+    let deadline = Instant::now() + WAIT;
+    let d = loop {
+        let d = env.json(&["orchestrator", "describe", "merge", "--json"]);
+        if d["runs"].as_array().is_some_and(|r| !r.is_empty()) {
+            break d;
+        }
+        assert!(Instant::now() < deadline, "the run never finished: {d}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(d["runs"][0]["outcome"], "no_lines", "{d}");
+    assert_eq!(d["last_result"], "no lines", "{d}");
+    let listed = env.json(&["task", "list", "--all", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 0, "{listed}");
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "run", "night"])),
+        "orchestrator_invalid"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "run", "nope"])),
+        "orchestrator_not_found"
+    );
+
+    ok(env.cmd(&["orchestrator", "disable", "merge"]));
+    let list = env.json(&["orchestrator", "list", "--json"]);
+    assert_eq!(list[0]["state"], "off", "{list}");
+    assert!(list[0]["next_run"].is_null(), "{list}");
+    ok(env.cmd(&["orchestrator", "enable", "merge"]));
+
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "note", "x"])),
+        "orchestrator_not_found"
+    );
+    ok(env.cmd(&["orchestrator", "note", "--name", "merge", "merged #31"]));
+    let text = ok(env.cmd(&["orchestrator", "describe", "merge"]));
+    assert!(text.contains("merged #31"), "{text}");
+    assert!(text.contains("no lines"), "{text}");
+}
+
+/// A session orchestrator end to end, outside its hours: nothing starts on
+/// its own, `run` is for the scheduled kind and `start` for the session
+/// one, `start` starts it by hand, and `stop` ends it.
+#[test]
+fn a_session_orchestrator_starts_and_stops_by_hand() {
+    use chrono::Timelike;
+    let env = start();
+    write_orchestrator(&env, "merge", MERGE, "");
+    let hour = |ahead: u32| format!("{:02}:00", (chrono::Local::now().hour() + ahead) % 24);
+    std::fs::write(
+        env.config.join("orchestrators/night.toml"),
+        format!(
+            "kind = \"session\"\nhours = {{ start = \"{}\", stop = \"{}\" }}\nstop_grace = \"1s\"\nprompt = \"Watch the night.\"\n",
+            hour(2),
+            hour(3)
+        ),
+    )
+    .unwrap();
+    let list = env.json(&["orchestrator", "list", "--json"]);
+    assert_eq!(list[1]["kind"], "session", "{list}");
+    assert_eq!(list[1]["state"], "idle", "{list}");
+    assert!(list[1]["next_run"].is_string(), "{list}");
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "run", "night"])),
+        "orchestrator_kind"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "start", "merge"])),
+        "orchestrator_kind"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["orchestrator", "stop", "night"])),
+        "orchestrator_not_running"
+    );
+    // This flock has no machine of the head's own, where an orchestrator's
+    // agent runs: the session starts and holds its slot, and says why its
+    // agent waits.
+    let out = env.cmd(&["orchestrator", "start", "night"]);
+    assert_eq!(error_code(&out), "runtime_error");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("local = true"),
+        "{out:?}"
+    );
+    let d = env.json(&["orchestrator", "describe", "night", "--json"]);
+    assert_eq!(d["state"], "running", "{d}");
+    assert_eq!(d["session"]["started_by"], "hand", "{d}");
+    let text = ok(env.cmd(&["orchestrator", "describe", "night"]));
+    assert!(
+        text.contains("session:") && text.contains("by hand"),
+        "{text}"
+    );
+    let said = ok(env.cmd(&["orchestrator", "start", "night"]));
+    assert!(said.contains("already runs"), "{said}");
+    let said = ok(env.cmd(&["orchestrator", "stop", "night"]));
+    assert!(said.contains("stopped"), "{said}");
+    let d = env.json(&["orchestrator", "describe", "night", "--json"]);
+    assert!(d["session"].is_null(), "{d}");
+    assert_eq!(
+        d["runs"].as_array().unwrap().last().unwrap()["outcome"],
+        "stopped",
+        "{d}"
+    );
+}
+
+/// A pre or post script runs with `PASTOR_ORCHESTRATOR`, and its `pastor`
+/// calls get the orchestrator role: `task run` passes, `machine add` is
+/// refused before it reaches anything, a name the head does not know is
+/// refused, and an agent that also sets the variable keeps its own rights.
+#[test]
+fn a_pre_scripts_pastor_calls_get_the_orchestrator_role() {
+    let env = start();
+    write_orchestrator(&env, "merge", MERGE, "");
+    let as_script = |name: &str, task: Option<&str>, args: &[&str]| {
+        let mut c = pastor();
+        c.args(args)
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("PASTOR_ORCHESTRATOR", name);
+        if let Some(task) = task {
+            c.env("PASTOR_TASK", task);
+        }
+        c.output().unwrap()
+    };
+    let t: serde_json::Value = serde_json::from_str(&ok(as_script(
+        "merge",
+        None,
+        &["task", "run", "fix ci", "--repo", "/tmp", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(t["role"], "agent", "{t}");
+    let before = std::fs::read_to_string(env.config.join("flock.toml")).unwrap();
+    let out = as_script("merge", None, &["machine", "add", "pi-9", "user@pi-9"]);
+    assert_eq!(error_code(&out), "agent_refused");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("orchestrator merge"));
+    assert_eq!(
+        std::fs::read_to_string(env.config.join("flock.toml")).unwrap(),
+        before
+    );
+    let out = as_script(
+        "merge",
+        None,
+        &[
+            "task",
+            "run",
+            "x",
+            "--repo",
+            "/tmp",
+            "--role",
+            "orchestrator",
+        ],
+    );
+    assert_eq!(error_code(&out), "role_refused");
+    let out = as_script("ghost", None, &["task", "run", "x", "--repo", "/tmp"]);
+    assert_eq!(error_code(&out), "agent_refused");
+    // t-1 is a plain agent: PASTOR_TASK wins over PASTOR_ORCHESTRATOR.
+    let out = as_script(
+        "merge",
+        Some("t-1"),
+        &["task", "run", "x", "--repo", "/tmp"],
+    );
+    assert_eq!(error_code(&out), "agent_refused");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is an agent pastor started"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ok(as_script(
+        "merge",
+        None,
+        &["orchestrator", "note", "from the script"],
+    ));
+    let d = env.json(&["orchestrator", "describe", "merge", "--json"]);
+    assert_eq!(d["note"], "from the script", "{d}");
+}
+
+/// `task list` puts orchestrator tasks in a table of their own, above the
+/// others; `--json` keeps one array.
+#[test]
+fn task_list_shows_orchestrators_in_their_own_table_first() {
+    let env = start();
+    ok(env.cmd(&["task", "run", "work", "--repo", "/tmp"]));
+    ok(env.cmd(&[
+        "task",
+        "run",
+        "plan",
+        "--repo",
+        "/tmp",
+        "--role",
+        "orchestrator",
+    ]));
+    let text = ok(env.cmd(&["task", "list", "--all"]));
+    let o = text.find("orchestrators:").expect(&text);
+    let t = text.find("tasks:").expect(&text);
+    assert!(o < t, "{text}");
+    let (orchestrators, tasks) = text.split_at(t);
+    assert!(
+        orchestrators.contains("t-2") && !orchestrators.contains("t-1 "),
+        "{text}"
+    );
+    assert!(tasks.contains("t-1"), "{text}");
+    let listed = env.json(&["task", "list", "--all", "--json"]);
+    assert_eq!(listed.as_array().unwrap().len(), 2, "{listed}");
 }
 
 /// Machine, flock and job edits need no head, so the CLI refuses them
@@ -4091,6 +4461,8 @@ fn complete_offers_flock_names() {
         &["flock", "describe", ""][..],
         &["flock", "default", "set", ""],
         &["machine", "move", "pi-1", ""],
+        &["flock", "join", ""],
+        &["flock", "leave", ""],
         &["task", "run", "fix it", "--flock", ""],
     ] {
         let (ok, out) = complete(&config, &state, words);
@@ -4109,6 +4481,11 @@ fn complete_offers_machine_names() {
         &["machine", "describe", ""][..],
         &["machine", "move", ""],
         &["machine", "open", ""],
+        &["flock", "join", "lab", ""],
+        &["flock", "join", "lab", "--max", "2", ""],
+        &["flock", "leave", "home", ""],
+        &["flock", "add", "new", ""],
+        &["flock", "add", "new", "pi-1", ""],
         &["task", "list", "--machine", ""],
     ] {
         let (ok, out) = complete(&config, &state, words);
@@ -4187,6 +4564,9 @@ fn complete_offers_task_ids_with_their_note() {
         &["task", "read", ""][..],
         &["task", "describe", ""],
         &["task", "done", ""],
+        &["task", "close", ""],
+        // close takes several: past one id it offers more.
+        &["task", "close", "t-2", ""],
         &["events", "--task", ""],
     ] {
         let (ok, out) = complete(&config, &state, words);
@@ -4970,33 +5350,178 @@ fn events_from_a_remote_head_match_the_local_log() {
     assert_eq!(kinds, local[..kinds.len()]);
 }
 
-/// A command not moved behind the head yet would act on this machine's
-/// files; it is refused instead, and `serve` would be a second head. The
-/// commands that are local on purpose still run.
+/// The flock, machine, trust, profile and config commands give the same
+/// stdout, stderr and exit code through a remote head as on the head's own
+/// machine. Two heads start alike; each step runs on one directly and on the
+/// other through the fake `ssh`, and the files they leave are the same. The
+/// client's own config dir holds nothing but client.toml.
+#[test]
+fn a_remote_head_runs_fleet_commands_as_the_local_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let here = start();
+    let there = start();
+    let c = client(Some(&there));
+    ok(c.head_set("head-up", &[]));
+    // An editor that changes nothing, and one that adds a comment.
+    let bin = c.tmp.path().join("editors");
+    std::fs::create_dir_all(&bin).unwrap();
+    let append = bin.join("append");
+    std::fs::write(&append, "#!/bin/sh\necho '# edited' >> \"$1\"\n").unwrap();
+    std::fs::set_permissions(&append, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let append = append.to_str().unwrap().to_string();
+    let steps: &[(&[&str], &str)] = &[
+        (&["flock", "list"], "true"),
+        (&["flock", "list", "--json"], "true"),
+        (&["flock", "default", "show"], "true"),
+        (
+            &["flock", "add", "work", "--description", "work boxes"],
+            "true",
+        ),
+        (&["flock", "add", "work"], "true"),
+        (&["flock", "default", "set", "work"], "true"),
+        (&["flock", "default", "show"], "true"),
+        (&["flock", "describe", "work"], "true"),
+        (&["flock", "describe", "work", "--json"], "true"),
+        (&["flock", "describe", "nope"], "true"),
+        (&["machine", "add", "pi-1", "--command", "false"], "true"),
+        (&["machine", "move", "pi-1", "work"], "true"),
+        (&["machine", "move", "nope", "work"], "true"),
+        (&["machine", "describe", "nope"], "true"),
+        (&["machine", "open", "fake"], "true"),
+        (&["machine", "open", "nope"], "true"),
+        (&["task", "attach", "t-9"], "true"),
+        (&["trust", "add", "fake", "/repo"], "true"),
+        (&["trust", "add", "fake", "/repo"], "true"),
+        (&["trust", "remove", "fake", "/repo"], "true"),
+        (&["trust", "remove", "fake", "/repo"], "true"),
+        (&["trust", "list"], "true"),
+        (&["trust", "list", "--json"], "true"),
+        (&["profile", "list"], "true"),
+        (&["profile", "list", "--json"], "true"),
+        (&["profile", "describe", "develop"], "true"),
+        (&["profile", "describe", "nope"], "true"),
+        (&["machine", "remove", "pi-1"], "true"),
+        (&["machine", "remove", "pi-1"], "true"),
+        (&["flock", "remove", "work"], "true"),
+        (&["flock", "edit"], "true"),
+        (&["config", "edit"], "true"),
+        (&["config", "edit"], &append),
+        (&["profile", "list"], "true"),
+    ];
+    let root = |e: &Env| e._tmp.path().to_str().unwrap().to_string();
+    let norm = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .replace(&root(&here), "<tmp>")
+            .replace(&root(&there), "<tmp>")
+    };
+    for (args, editor) in steps {
+        let local = pastor()
+            .args(*args)
+            .env("PASTOR_CONFIG_DIR", &here.config)
+            .env("PASTOR_STATE_DIR", &here.state)
+            .env_remove("VISUAL")
+            .env("EDITOR", editor)
+            .output()
+            .unwrap();
+        let remote = pastor()
+            .args(*args)
+            .env("PASTOR_CONFIG_DIR", &c.config)
+            .env("PASTOR_STATE_DIR", &c.state)
+            .env("PASTOR_DATA_DIR", &c.data)
+            .env("PATH", &c.path)
+            .env_remove("PASTOR_HEAD")
+            .env_remove("VISUAL")
+            .env("EDITOR", editor)
+            .output()
+            .unwrap();
+        assert_eq!(remote.status.code(), local.status.code(), "{args:?}");
+        assert_eq!(norm(&remote.stdout), norm(&local.stdout), "{args:?}");
+        assert_eq!(norm(&remote.stderr), norm(&local.stderr), "{args:?}");
+    }
+    for file in ["flock.toml", "pastor.toml"] {
+        let read = |e: &Env| {
+            norm(
+                std::fs::read_to_string(e.config.join(file))
+                    .unwrap()
+                    .as_bytes(),
+            )
+        };
+        assert_eq!(read(&there), read(&here), "{file}");
+    }
+    assert!(
+        std::fs::read_to_string(there.config.join("pastor.toml"))
+            .unwrap()
+            .contains("# edited")
+    );
+    let names: Vec<String> = std::fs::read_dir(&c.config)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["client.toml"], "nothing else written here");
+    assert!(!c.state.join("pastor.db").exists());
+}
+
+/// With a head set, every command reaches it or stays here on purpose; none
+/// falls back to this machine's flock.toml, pastor.toml or trust table. A
+/// head that does not answer stops them. `machine authorized-key` prints a
+/// line for the head's own authorized_keys, so it is refused here with the
+/// head named, and `serve` would be a second head. `config edit --local`
+/// edits this machine's pastor.toml.
 #[test]
 fn a_remote_head_refuses_what_would_act_on_local_files() {
     let c = client(None);
     ok(c.head_set("unreachable", &["--force"]));
     for args in [
         &["machine", "add", "pi-1", "--local"][..],
+        &["machine", "open", "pi-1"],
         &["flock", "list"],
+        &["flock", "default", "show"],
         &["trust", "list"],
         &["config", "edit"],
+        &["profile", "list"],
+        &["task", "attach", "t-1"],
     ] {
         let out = c.cmd(args);
-        assert_eq!(error_code(&out), "remote_head_unsupported", "{args:?}");
-        let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-        assert!(
-            v["message"]
-                .as_str()
-                .unwrap()
-                .contains(&args[..args.len().min(2)].join(" ")),
-            "{v}"
-        );
+        assert_eq!(error_code(&out), "head_unreachable", "{args:?}");
     }
+    let out = c.cmd(&["machine", "authorized-key", "pi-1", "--key", "-"]);
+    assert_eq!(error_code(&out), "remote_head_unsupported");
+    let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("machine authorized-key"), "{v}");
+    assert!(message.contains("unreachable"), "{v}");
     assert!(!c.config.join("flock.toml").exists());
+    assert!(!c.config.join("pastor.toml").exists());
     ok(c.cmd(&["completions", "bash"]));
     ok(c.cmd(&["connector", "list"]));
+
+    // `--local` is this machine's pastor.toml, checked as the head checks it.
+    let editor = c.tmp.path().join("tick-editor");
+    std::fs::write(&editor, "#!/bin/sh\necho 'tick = \"5s\"' > \"$1\"\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let out = pastor()
+        .args(["config", "edit", "--local"])
+        .env("PASTOR_CONFIG_DIR", &c.config)
+        .env("PASTOR_STATE_DIR", &c.state)
+        .env("PATH", &c.path)
+        .env_remove("PASTOR_HEAD")
+        .env_remove("VISUAL")
+        .env("EDITOR", &editor)
+        .output()
+        .unwrap();
+    let saved = ok(out);
+    assert!(saved.starts_with("saved "), "{saved}");
+    assert!(
+        saved.contains("applies when this machine's pastor serve starts"),
+        "{saved}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(c.config.join("pastor.toml")).unwrap(),
+        "tick = \"5s\"\n"
+    );
 
     ok(c.cmd(&["head", "unset"]));
     assert_eq!(ok(c.cmd(&["head", "show"])), "head: this machine\n");
@@ -5306,13 +5831,13 @@ fn the_profile_smoke_script_passes_tasks_that_end_done() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/smoke-profiles.sh");
     let run = |vars: &[(&str, &str)]| {
         let mut c = Command::new("sh");
+        common::scrub(&mut c);
         c.arg(script)
             .env("PASTOR", env!("CARGO_BIN_EXE_pastor"))
             .env("PASTOR_CONFIG_DIR", &env.config)
             .env("PASTOR_STATE_DIR", &env.state)
             .env("POLL", "1")
             .env("TIMEOUT", "30")
-            .env_remove("PASTOR_TASK")
             .env_remove("CLAUDE")
             .env_remove("OPENCODE");
         for (k, v) in vars {
@@ -5367,7 +5892,7 @@ impl Client {
     fn serve(&self) -> Served {
         let log = self.tmp.path().join("serve.log");
         let child = pastor()
-            .args(["serve"])
+            .args(["serve", "--foreground"])
             .env("PASTOR_CONFIG_DIR", &self.config)
             .env("PASTOR_STATE_DIR", &self.state)
             .env("PASTOR_DATA_DIR", &self.data)
@@ -5549,6 +6074,198 @@ fn a_headless_serve_runs_its_jobs_through_the_head() {
     .unwrap();
     assert_eq!(error_code(&c.cmd(&["serve"])), "shepherd_running");
     assert!(serve.child.try_wait().unwrap().is_none(), "{}", serve.log());
+}
+
+/// A fake herdr listening on `socket`, killed when dropped, and the
+/// `command` that reaches it (`--connect`).
+struct FakeHerdrServer(std::process::Child);
+
+impl Drop for FakeHerdrServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn fake_herdr_at(socket: &std::path::Path, env: &[(&str, &str)]) -> (FakeHerdrServer, String) {
+    let child = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+        .arg("--listen")
+        .arg(socket)
+        .env("FAKE_HERDR_READY_MS", "200")
+        .envs(env.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let command = format!(
+        "[\"{}\", \"--connect\", \"{}\"]",
+        env!("CARGO_BIN_EXE_fake-herdr"),
+        socket.display()
+    );
+    (FakeHerdrServer(child), command)
+}
+
+/// The head of `start()` with `laptop` as a pull machine too, and
+/// `extra` in its pastor.toml; waits until the head has reloaded.
+fn head_with_pull_machine(extra: &str) -> Env {
+    let env = start();
+    let flock = std::fs::read_to_string(env.config.join("flock.toml")).unwrap();
+    std::fs::write(
+        env.config.join("flock.toml"),
+        format!("{flock}\n[[machine]]\nname = \"laptop\"\npull = true\n"),
+    )
+    .unwrap();
+    let config = std::fs::read_to_string(env.config.join("pastor.toml")).unwrap();
+    std::fs::write(env.config.join("pastor.toml"), format!("{config}{extra}")).unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !ok(env.cmd(&["machine", "list", "--json"])).contains("\"laptop\"") {
+        assert!(Instant::now() < deadline, "the head never took laptop");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    env
+}
+
+/// A shepherd whose head is `env` and which is its pull machine `laptop`,
+/// running tasks on the fake herdr `command` reaches.
+fn pull_shepherd(env: &Env, command: &str) -> (Client, Served) {
+    let c = client(Some(env));
+    ok(c.head_set("head-up", &[]));
+    std::fs::create_dir_all(&c.config).unwrap();
+    std::fs::write(
+        c.config.join("pastor.toml"),
+        format!(
+            "tick = \"1s\"\nsettle = \"1s\"\nreconcile_every = \"1s\"\n[shepherd]\nmachine = \"laptop\"\ncommand = {command}\n"
+        ),
+    )
+    .unwrap();
+    let mut serve = c.serve();
+    serve.wait_log("headless");
+    (c, serve)
+}
+
+fn task_state(env: &Env, id: &str) -> serde_json::Value {
+    serde_json::from_str(&ok(env.cmd(&["task", "describe", id, "--json"]))).unwrap()
+}
+
+fn wait_pulled(env: &Env, id: &str, want: &str, serve: &Served) -> serde_json::Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let t = task_state(env, id);
+        if t["state"] == want {
+            return t;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{id} never {want}: {t}\n{}",
+            serve.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A head and a shepherd, each with its own dirs, the shepherd reaching the
+/// head through the fake ssh: the task pinned to the shepherd's pull
+/// machine waits on the head until the shepherd claims it, runs on the
+/// shepherd's herdr, and the head's row and events follow it to done, with
+/// the machine named, as for a machine the head runs itself.
+#[test]
+fn a_shepherd_runs_the_task_pinned_to_it_and_the_head_sees_it() {
+    let env = head_with_pull_machine("");
+    let tmp = tempfile::tempdir().unwrap();
+    let (_herdr, command) = fake_herdr_at(
+        &tmp.path().join("laptop.sock"),
+        &[("FAKE_HERDR_AUTO_DONE_MS", "300")],
+    );
+    let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
+        "task",
+        "run",
+        "hello",
+        "--machine",
+        "laptop",
+        "--repo",
+        "/tmp",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(t["state"], "queued", "{t}");
+    let id = format!("t-{}", t["id"]);
+
+    let (_c, serve) = pull_shepherd(&env, &command);
+    let running = wait_pulled(&env, &id, "done", &serve);
+    assert_eq!(running["machine"], "laptop", "{running}");
+    assert!(running["pane_id"].is_string(), "{running}");
+
+    let out = ok(env.cmd(&["events", "--task", &id, "--json"]));
+    let events: Vec<(String, String)> = out
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .map(|e| {
+            (
+                e["type"].as_str().unwrap().to_string(),
+                e["task"]["machine"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    let lap = |k: &str| (k.to_string(), "laptop".to_string());
+    assert_eq!(
+        events,
+        [
+            ("task.queued".to_string(), String::new()),
+            lap("task.running"),
+            lap("task.done")
+        ],
+        "{out}"
+    );
+    let machines = ok(env.cmd(&["machine", "list", "--json"]));
+    let laptop = serde_json::from_str::<serde_json::Value>(&machines).unwrap()["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "laptop")
+        .cloned()
+        .unwrap();
+    assert_eq!(laptop["channel"], "connected", "{laptop}");
+}
+
+/// A pull machine that stops asking is lost after `pull_lost_after`: its
+/// running task goes stale on the head, with the reason.
+#[test]
+fn a_silent_pull_machine_s_tasks_go_stale() {
+    let env = head_with_pull_machine("pull_lost_after = \"3s\"\n");
+    let tmp = tempfile::tempdir().unwrap();
+    let (_herdr, command) = fake_herdr_at(&tmp.path().join("laptop.sock"), &[]);
+    let t: serde_json::Value = serde_json::from_str(&ok(env.cmd(&[
+        "task",
+        "run",
+        "hello",
+        "--machine",
+        "laptop",
+        "--repo",
+        "/tmp",
+        "--json",
+    ])))
+    .unwrap();
+    let id = format!("t-{}", t["id"]);
+    let (_c, serve) = pull_shepherd(&env, &command);
+    wait_pulled(&env, &id, "running", &serve);
+    // The shepherd stops: nothing claims or reports for the machine now.
+    drop(serve);
+    let deadline = Instant::now() + WAIT;
+    let t = loop {
+        let t = task_state(&env, &id);
+        if t["state"] == "stale" {
+            break t;
+        }
+        assert!(Instant::now() < deadline, "never stale: {t}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        t["error"]
+            .as_str()
+            .unwrap()
+            .contains("has not claimed or reported"),
+        "{t}"
+    );
 }
 
 /// A head this machine cannot reach is a warning, not a reason to stop:
@@ -5807,4 +6524,439 @@ fn a_shepherd_lists_and_drives_its_jobs_and_the_head_s() {
     let text = ok(c.edit(&editor, &["job", "edit", "sweep"]));
     assert!(text.contains("picked it up"), "{text}");
     assert!(serve.child.try_wait().unwrap().is_none(), "{}", serve.log());
+}
+
+/// `job enable|disable` on a shepherd's own job (`local_job`) never reaches
+/// the head, so a task caller is refused there too: the head is the only
+/// place that knows a task's role, and this machine's shepherd keeps no
+/// task store to check it. `agents_change_fleet` still lets it through.
+#[test]
+fn an_agent_task_may_not_toggle_this_machine_s_own_job() {
+    let env = start_with_jobs(&[("nightly", NIGHTLY)]);
+    let c = client(Some(&env));
+    ok(c.head_set("head-up", &[]));
+    std::fs::create_dir_all(c.config.join("jobs")).unwrap();
+    let here_job = c.config.join("jobs/sweep.toml");
+    std::fs::write(&here_job, SWEEP).unwrap();
+
+    let as_agent = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &c.config)
+            .env("PASTOR_STATE_DIR", &c.state)
+            .env("PASTOR_DATA_DIR", &c.data)
+            .env("PATH", &c.path)
+            .env_remove("PASTOR_HEAD")
+            .env("PASTOR_TASK", "t-3")
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["job", "enable", "sweep"][..],
+        &["job", "disable", "sweep"],
+    ] {
+        let out = as_agent(args);
+        assert_eq!(error_code(&out), "agent_refused", "{args:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&here_job).unwrap(),
+        SWEEP,
+        "an agent's refused enable/disable must not touch the file"
+    );
+
+    std::fs::write(c.config.join("pastor.toml"), "agents_change_fleet = true\n").unwrap();
+    let text = ok(as_agent(&["job", "enable", "sweep"]));
+    assert!(text.contains("enabled sweep"), "{text}");
+}
+
+/// `flock join` and `flock leave` without a head: join, join again with
+/// `--max`, leave, leave the last flock, `machine move`, and the old `flock`
+/// key moved into the flock's `machines` on the first edit, comments kept.
+/// `machine list` and `flock list` show where each machine is.
+#[test]
+fn flock_join_and_leave_edit_membership() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "# the fleet\n\n[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"work\"\n\n\
+         [[machine]]\nname = \"desk\"\ncommand = [\"false\"]\nmax_agents = 4\nflock = \"work\"   # for now\n\n\
+         # the spare one\n[[machine]]\nname = \"lab\"\ncommand = [\"false\"]\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let file = || std::fs::read_to_string(config.join("flock.toml")).unwrap();
+    let list = || -> serde_json::Value {
+        serde_json::from_str(&ok(run(&["flock", "list", "--json"]))).unwrap()
+    };
+
+    let out = ok(run(&["flock", "join", "home", "desk", "--max", "2"]));
+    assert!(
+        out.starts_with("desk is in flock home with 2; its flocks: home:2,work:4; "),
+        "{out}"
+    );
+    let text = file();
+    assert!(!text.contains("flock = \"work\""), "{text}");
+    assert!(text.contains("machines = { desk = 4 }"), "{text}");
+    assert!(text.starts_with("# the fleet\n"), "{text}");
+    assert!(text.contains("# the spare one\n"), "{text}");
+
+    ok(run(&["flock", "join", "home", "desk", "--max", "3"]));
+    let l = list();
+    assert_eq!(
+        l[0]["members"],
+        serde_json::json!([
+            {"name": "desk", "share": 3, "max": 3, "live": null},
+            {"name": "lab", "share": 2, "max": 2, "live": null}
+        ])
+    );
+    let table = ok(run(&["flock", "list"]));
+    assert!(table.contains("desk -/3, lab -/2"), "{table}");
+
+    let out = ok(run(&["flock", "leave", "work", "desk"]));
+    assert!(
+        out.starts_with("desk left flock work; its flocks: home:3; "),
+        "{out}"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "leave", "work", "desk"])),
+        "not_in_flock"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "leave", "home", "lab"])),
+        "not_in_flock"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "join", "nope", "desk"])),
+        "unknown_flock"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "join", "home", "nope"])),
+        "unknown_machine"
+    );
+    assert_eq!(
+        error_code(&run(&["flock", "join", "home", "desk", "--max", "0"])),
+        "config_error"
+    );
+
+    let out = ok(run(&["machine", "move", "lab", "work"]));
+    assert!(out.starts_with("moved lab to flock work (work:2)"), "{out}");
+    let out = ok(run(&["flock", "leave", "work", "lab"]));
+    assert!(
+        out.starts_with("lab left flock work; it is back in the default flock home; "),
+        "{out}"
+    );
+    let out = ok(run(&["flock", "add", "play", "desk", "lab"]));
+    assert!(
+        out.starts_with("added flock play; joined: desk (home:3,play:4), lab (play:2); "),
+        "{out}"
+    );
+
+    let ms: serde_json::Value =
+        serde_json::from_str(&ok(run(&["machine", "list", "--json"]))).unwrap();
+    let desk = &ms["machines"][0];
+    assert_eq!(desk["flock"], "home");
+    assert_eq!(
+        desk["flocks"],
+        serde_json::json!([
+            {"name": "home", "share": 3, "max": 3, "live": 0},
+            {"name": "play", "share": 4, "max": 4, "live": 0}
+        ])
+    );
+    let table = ok(run(&["machine", "list"]));
+    assert!(table.contains("home:3,play:4"), "{table}");
+}
+
+/// `flock join|leave` and `flock add` with machines go to a head of
+/// `JOIN_PROTOCOL` or later; an older one would refuse the first two and add
+/// the flock without its machines, so it is refused before anything is sent.
+#[test]
+fn flock_join_and_leave_go_through_the_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let flock_file = config.join("flock.toml");
+    std::fs::write(&flock_file, NAMED_FLOCKS).unwrap();
+    let socket = state.join("pastor.sock");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let cases: [(&[&str], serde_json::Value); 4] = [
+        (
+            &["flock", "join", "work", "pi-1"],
+            serde_json::json!({"op": "flock_join", "flock": "work", "machine": "pi-1"}),
+        ),
+        (
+            &["flock", "join", "work", "pi-1", "--max", "3"],
+            serde_json::json!({"op": "flock_join", "flock": "work", "machine": "pi-1", "max": 3}),
+        ),
+        (
+            &["flock", "leave", "work", "pi-1"],
+            serde_json::json!({"op": "flock_leave", "flock": "work", "machine": "pi-1"}),
+        ),
+        (
+            &["flock", "add", "spare", "pi-1"],
+            serde_json::json!({"op": "flock_add", "name": "spare", "default": false, "machines": ["pi-1"]}),
+        ),
+    ];
+    let reqs = text_head(&socket, pastor::ipc::JOIN_PROTOCOL);
+    for (args, want) in &cases {
+        assert_eq!(ok(run(args)), "said by the head\n", "{args:?}");
+        let sent = reqs.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(&sent, want, "{args:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&flock_file).unwrap(), NAMED_FLOCKS);
+
+    std::fs::remove_file(&socket).unwrap();
+    let reqs = text_head(&socket, pastor::ipc::JOIN_PROTOCOL - 1);
+    for (args, _) in &cases {
+        assert_eq!(error_code(&run(args)), "head_too_old", "{args:?}");
+    }
+    // `flock add` with no machines is older than join.
+    ok(run(&["flock", "add", "spare"]));
+    let sent: Vec<serde_json::Value> = reqs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r["op"] != "ping")
+        .cloned()
+        .collect();
+    assert_eq!(
+        sent,
+        [serde_json::json!({"op": "flock_add", "name": "spare", "default": false})]
+    );
+}
+
+/// A flock.toml that gives a flock a share and a max on a machine needs a
+/// head that reads them: an older one would fail to reload the file and
+/// keep its old flocks, so the CLI refuses it before sending anything.
+#[test]
+fn a_share_and_a_max_refuse_a_head_from_before_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"work\"\ndefault = true\nmachines = { pi-1 = { share = 1, max = 2 } }\n\n\
+         [[machine]]\nname = \"pi-1\"\nlocal = true\n",
+    )
+    .unwrap();
+    let socket = state.join("pastor.sock");
+    let run = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap()
+    };
+    let reqs = text_head(&socket, pastor::ipc::FLOCK_SHARE_PROTOCOL - 1);
+    let out = run(&["flock", "add", "spare"]);
+    assert_eq!(error_code(&out), "head_too_old");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("share and max"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(reqs.lock().unwrap().iter().all(|r| r["op"] == "ping"));
+
+    std::fs::remove_file(&socket).unwrap();
+    text_head(&socket, pastor::ipc::FLOCK_SHARE_PROTOCOL);
+    assert_eq!(ok(run(&["flock", "add", "spare"])), "said by the head\n");
+}
+
+/// A head of another version may answer a request with a variant this CLI
+/// does not expect. The command stops with the usual JSON error on stderr,
+/// code `internal`, and exit 1, never a Rust panic (exit 101).
+#[test]
+fn an_unexpected_head_reply_is_a_json_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let _reqs = text_head(&state.join("pastor.sock"), pastor::ipc::IPC_PROTOCOL);
+    for args in [
+        &["job", "list"][..],
+        &["task", "list"],
+        &["task", "describe", "t-1"],
+        &["task", "retry", "t-1"],
+        &["queue"],
+    ] {
+        let out = pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        let err: serde_json::Value = serde_json::from_str(stderr.trim())
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {stderr}"));
+        assert_eq!(err["code"], "internal", "{args:?}: {err}");
+    }
+}
+
+/// A flock.toml with a `spare` flock nobody uses, and the dirs around it,
+/// for the fleet lock tests.
+fn spare_flock(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let config = tmp.join("c");
+    let state = tmp.join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"work\"\ndefault = true\n\n[[flock]]\nname = \"spare\"\n\n[[machine]]\nname = \"pi-1\"\nlocal = true\n",
+    )
+    .unwrap();
+    (config, state)
+}
+
+/// Returns once process `pid` has `fleet.lock` in `state` open: an offline
+/// edit opens it only after its ping found no head, just before it waits on
+/// the lock. Linux only, from `/proc`, like CI.
+fn wait_for_fleet_lock_open(pid: u32, state: &std::path::Path) {
+    let lock = state.canonicalize().unwrap().join("fleet.lock");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let open = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock));
+        if open {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the edit never opened {}",
+            lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `flock remove` with no head checks the store and edits flock.toml under
+/// the fleet lock a starting head takes, so a head that starts in between
+/// cannot queue a task in the flock between the check and the save: the
+/// edit waits for the head to let go.
+#[test]
+fn offline_flock_remove_waits_for_a_starting_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, state) = spare_flock(tmp.path());
+    let paths = pastor::config::Paths::new(&config, &state);
+    let held = pastor::fleet_edit::lock_fleet(&paths, Duration::from_secs(5)).unwrap();
+    let child = pastor()
+        .args(["flock", "remove", "spare"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let file = std::fs::read_to_string(config.join("flock.toml")).unwrap();
+    assert!(file.contains("spare"), "edited under the lock: {file}");
+    drop(held);
+    let out = ok(child.wait_with_output().unwrap());
+    assert!(out.contains("removed flock spare"), "{out}");
+    let file = std::fs::read_to_string(config.join("flock.toml")).unwrap();
+    assert!(!file.contains("spare"), "{file}");
+}
+
+/// A head that starts listening while an offline edit waits on the lock
+/// could take a task the edit's store check never saw, so the edit stops
+/// with `head_started` instead of saving.
+#[test]
+fn offline_flock_remove_refuses_a_head_that_started_while_it_waited() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, state) = spare_flock(tmp.path());
+    let paths = pastor::config::Paths::new(&config, &state);
+    let held = pastor::fleet_edit::lock_fleet(&paths, Duration::from_secs(5)).unwrap();
+    let child = pastor()
+        .args(["flock", "remove", "spare"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Past the ping that found no head, the edit waits on the lock.
+    wait_for_fleet_lock_open(child.id(), &state);
+    let _head = std::os::unix::net::UnixListener::bind(state.join("pastor.sock")).unwrap();
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(error_code(&out), "head_started");
+    let file = std::fs::read_to_string(config.join("flock.toml")).unwrap();
+    assert!(file.contains("spare"), "{file}");
+}
+
+/// The reverse: `pastor serve` takes the same lock while it starts, so it
+/// does not load flock.toml or listen while an offline edit holds it.
+#[test]
+fn serve_does_not_listen_while_an_offline_edit_holds_the_fleet_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let socket = tmp.path().join("herdr.sock");
+    let herdr = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+        .arg("--listen")
+        .arg(&socket)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        format!(
+            "[[machine]]\nname = \"fake\"\ncommand = [\"{}\", \"--connect\", \"{}\"]\nmax_agents = 2\n",
+            env!("CARGO_BIN_EXE_fake-herdr"),
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let paths = pastor::config::Paths::new(&config, &state);
+    let held = pastor::fleet_edit::lock_fleet(&paths, Duration::from_secs(5)).unwrap();
+    let serve = pastor()
+        .args(["serve", "--foreground"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut env = ServeEnv { serve, herdr };
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(env.serve.try_wait().unwrap().is_none(), "serve exited");
+    assert!(
+        !state.join("pastor.sock").exists(),
+        "serve listened under the lock"
+    );
+    drop(held);
+    let deadline = Instant::now() + WAIT;
+    while !state.join("pastor.sock").exists() {
+        assert!(Instant::now() < deadline, "serve never listened");
+        assert!(env.serve.try_wait().unwrap().is_none(), "serve exited");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

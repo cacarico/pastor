@@ -1,10 +1,10 @@
 # The pastor website: a homepage and short docs pages, one topic each, drawn
-# like a small TUI. docs/manual.md is mounted as the last docs page, so the
-# full reference stays one file in the repo, not a copy.
+# like a small TUI. The docs are for people learning pastor; docs/manual.md
+# stays in the repo for agents and is not part of the site.
 #
-# For now it is served at https://cacari.co/pastor/: the blog repo copies a
-# build into its static/pastor/ with scripts/sync-pastor-site.sh. Relative
-# URLs keep it working under that subpath.
+# It is served at https://cacari.co/pastor/: the blog repo copies a build
+# into its static/pastor/ with scripts/sync-pastor-site.sh. Relative URLs keep
+# it working under that subpath.
 
 baseURL = "/"
 relativeURLs = true
@@ -15,19 +15,16 @@ disableKinds = ["taxonomy", "term", "rss", "sitemap"]
 repo = "https://github.com/cacarico/pastor"
 blog = "https://cacari.co/posts/pastor/"
 
+# Pages may use a little raw HTML, such as <details> around a long script.
+# The content is ours, in the repo; nothing a visitor sends is rendered.
+[markup.goldmark.renderer]
+unsafe = true
+
+# A page's topics in the nav: its ## headings.
 [markup.tableOfContents]
 startLevel = 2
-endLevel = 3
+endLevel = 2
 
-# The manual has no front matter; give it one here.
-[[cascade]]
-title = "manual"
-weight = 49
-[cascade.params]
-summary = "everything, on one long page"
-group = "reference"
-[cascade.target]
-path = "/docs/manual"
 
 # Mounting a component replaces its default, so content and static are
 # listed again.
@@ -36,12 +33,19 @@ source = "content"
 target = "content"
 
 [[module.mounts]]
-source = "../manual.md"
-target = "content/docs/manual.md"
-
-[[module.mounts]]
 source = "static"
 target = "static"
+
+# The install script is served from the site, so the install command points
+# here; it is the repo's own install.sh, not a copy that could drift.
+[[module.mounts]]
+source = "../../install.sh"
+target = "static/install.sh"
+
+# The homepage's terminal transcript.
+[[module.mounts]]
+source = "data"
+target = "data"
 
 # The version in the header comes from Cargo.toml, so it cannot go stale.
 [[module.mounts]]

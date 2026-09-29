@@ -1,0 +1,4 @@
+{{- /* A file from static/ with a hash of its contents in the query, so a
+       browser fetches it again when it changes instead of using an old copy. */ -}}
+{{- $sum := os.ReadFile (printf "static/%s" .) | md5 | truncate 8 "" -}}
+{{- printf "%s?v=%s" (relURL .) $sum -}}

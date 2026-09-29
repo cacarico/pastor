@@ -7,7 +7,8 @@ use crate::config::Agents;
 use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, Created, HerdrError,
 };
-use crate::task::{Checkout, DispatchSpec, Place, Priority, Reopen, Task, TaskState};
+pub use crate::machine::FlockSeat;
+use crate::task::{Checkout, DispatchSpec, Place, Priority, Reopen, Task, TaskState, render_label};
 
 /// How often dispatch asks `agent.list` whether the agent it started is up yet.
 const READY_POLL: Duration = Duration::from_millis(500);
@@ -36,8 +37,13 @@ pub struct MachineView {
     /// How many of `live` come from a job (`Task::from_job`).
     pub live_jobs: usize,
     pub healthy: bool,
-    /// The flock the machine is in now.
-    pub flock: String,
+    /// The flocks the machine is in now, each with its number and how many
+    /// of its live tasks run here.
+    pub flocks: Vec<FlockSeat>,
+    /// The flocks under their share here with a queued task waiting that
+    /// this machine could take. A flock past its share here takes a slot
+    /// only while this is empty (`MachineView::flock_may_take`).
+    pub waiting_under_share: Vec<String>,
 }
 
 /// What a task may take on a machine: a job slot if it comes from a job,
@@ -58,6 +64,40 @@ impl Claim {
 }
 
 impl MachineView {
+    /// `flock`'s seat here, `None` when the machine is not in it.
+    pub fn seat(&self, flock: &str) -> Option<&FlockSeat> {
+        self.flocks.iter().find(|f| f.name == flock)
+    }
+
+    pub fn in_flock(&self, flock: &str) -> bool {
+        self.seat(flock).is_some()
+    }
+
+    /// Is `flock` under its number here? Job slots and burst never pass it.
+    pub fn flock_has_room(&self, flock: &str) -> bool {
+        self.seat(flock).is_some_and(FlockSeat::has_room)
+    }
+
+    /// May a task of `flock` take a slot here, as far as the flock's number
+    /// goes? Under its share, yes; from its share up to its max, only while
+    /// no flock under its share here has a task waiting; at its max, no.
+    pub fn flock_may_take(&self, flock: &str) -> bool {
+        self.seat(flock).is_some_and(|s| {
+            s.has_room() && (s.under_share() || self.waiting_under_share.is_empty())
+        })
+    }
+
+    /// Count one more live task of `flock` here, as a dispatch would.
+    pub fn take(&mut self, flock: &str, claim: Claim) {
+        self.live += 1;
+        if claim.from_job {
+            self.live_jobs += 1;
+        }
+        if let Some(s) = self.flocks.iter_mut().find(|f| f.name == flock) {
+            s.live += 1;
+        }
+    }
+
     /// Is there a slot for a task that claims `claim`? Up to `job_slots`
     /// live job tasks sit in job slots; every other live task counts
     /// against `max_agents`. A job task takes a free job slot, then a
@@ -74,7 +114,9 @@ impl MachineView {
 
 /// Only machines in `flock`, the task's, qualify. Of those the pinned machine
 /// wins. Otherwise: healthy, has every required tag, has room for `claim`
-/// (`MachineView::has_room`), fewest live tasks. Ties keep flock order.
+/// (`MachineView::has_room`) with `flock` under its number there, and past
+/// its share only while no flock under its share waits there
+/// (`MachineView::flock_may_take`), fewest live tasks. Ties keep flock order.
 pub fn pick_machine(
     machines: &[MachineView],
     flock: &str,
@@ -94,9 +136,9 @@ pub fn pick_machine_where(
     accepts: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
     let fits = |m: &MachineView| {
-        m.flock == flock
-            && m.healthy
+        m.healthy
             && m.has_room(claim)
+            && m.flock_may_take(flock)
             && spec.tags.iter().all(|t| m.tags.contains(t))
             && accepts(&m.name)
     };
@@ -112,6 +154,78 @@ pub fn pick_machine_where(
         .filter(|m| fits(m))
         .min_by_key(|m| m.live)
         .map(|m| m.name.clone())
+}
+
+/// Fill each view's `waiting_under_share` for placing a task of `flock`: on
+/// a machine where `flock` is past its share and under its max, the other
+/// flocks under their share there that have a task in `later` the machine
+/// could take (queued, not pinned elsewhere, with its tags, room for its
+/// claim, one `accepts`). `later` is the queue behind the task being
+/// placed: those tasks still get their turn in this pass, while one ahead
+/// of it already had its turn and did not take the machine. Elsewhere the
+/// list is left empty, since it only matters past a share.
+pub fn mark_waiting_under_share(
+    views: &mut [MachineView],
+    flock: &str,
+    later: &[Task],
+    default_flock: &str,
+    accepts: &dyn Fn(&Task, &str) -> bool,
+) {
+    for v in views.iter_mut() {
+        v.waiting_under_share.clear();
+        if !v
+            .seat(flock)
+            .is_some_and(|s| s.has_room() && !s.under_share())
+        {
+            continue;
+        }
+        let mut waiting: Vec<String> = Vec::new();
+        for t in later {
+            let theirs = t.flock.as_deref().unwrap_or(default_flock);
+            if t.state != TaskState::Queued
+                || theirs == flock
+                || waiting.iter().any(|w| w == theirs)
+                || !v.seat(theirs).is_some_and(FlockSeat::under_share)
+                || t.spec.machine.as_ref().is_some_and(|m| *m != v.name)
+                || !t.spec.tags.iter().all(|tag| v.tags.contains(tag))
+                || !v.has_room(Claim::of(t))
+                || !accepts(t, &v.name)
+            {
+                continue;
+            }
+            waiting.push(theirs.to_string());
+        }
+        v.waiting_under_share = waiting;
+    }
+}
+
+/// Why `flock`'s number holds its task off `v`, as the waiting note says
+/// it: at its max, or past its share while another flock waits under its
+/// share there. `None` when the number lets it take a slot.
+pub fn flock_held(v: &MachineView, flock: &str) -> Option<String> {
+    let seat = v.seat(flock)?;
+    let max = seat.max?;
+    if !seat.has_room() {
+        let of = seat.number_label().unwrap_or_else(|| max.to_string());
+        return Some(format!(
+            "flock {flock} is at {} of {of} on {}",
+            seat.live, v.name
+        ));
+    }
+    if seat.under_share() || v.waiting_under_share.is_empty() {
+        return None;
+    }
+    let others = &v.waiting_under_share;
+    let noun = if others.len() == 1 { "flock" } else { "flocks" };
+    Some(format!(
+        "flock {flock} is past its share on {}, at {} of {}, while {noun} {} wait{} under {} share",
+        v.name,
+        seat.live,
+        seat.number_label().unwrap_or_default(),
+        others.join(", "),
+        if others.len() == 1 { "s" } else { "" },
+        if others.len() == 1 { "its" } else { "their" },
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +286,34 @@ pub async fn dispatch(
     head: Option<&str>,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
+    start(conn, task, agents, head, ready_timeout, false).await
+}
+
+/// `dispatch` for a paused task (`TaskState::Paused`): the same steps, but
+/// the agent starts on the session it was paused in (`claude --resume
+/// <session>`, in place of a new `--session-id`), a worktree task goes back
+/// to its own checkout (`worktree.open`, never a new one: its session is
+/// filed under that directory) and the prompt is `RESUME_PROMPT`, since the
+/// task's own is already in the conversation. A checkout that is gone, or
+/// no session recorded, fails the task.
+pub async fn resume(
+    conn: &dyn Connector,
+    task: &mut Task,
+    agents: &Agents,
+    head: Option<&str>,
+    ready_timeout: Duration,
+) -> Result<DispatchOutcome, DispatchError> {
+    start(conn, task, agents, head, ready_timeout, true).await
+}
+
+async fn start(
+    conn: &dyn Connector,
+    task: &mut Task,
+    agents: &Agents,
+    head: Option<&str>,
+    ready_timeout: Duration,
+    resume: bool,
+) -> Result<DispatchOutcome, DispatchError> {
     let name = Task::agent_name_for(task.id);
     task.agent_name = Some(name.clone());
     task.state = TaskState::Starting;
@@ -179,7 +321,7 @@ pub async fn dispatch(
     task.prompt_pending = false;
     task.activity_seen = false;
 
-    let result = dispatch_steps(conn, task, &name, agents, head, ready_timeout).await;
+    let result = dispatch_steps(conn, task, &name, agents, head, ready_timeout, resume).await;
     match &result {
         Ok(DispatchOutcome::Running) => {
             task.state = TaskState::Running;
@@ -209,6 +351,7 @@ async fn dispatch_steps(
     agents: &Agents,
     head: Option<&str>,
     ready_timeout: Duration,
+    resume: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
     // Before anything is made on the machine: a task whose agent cannot take
@@ -229,7 +372,7 @@ async fn dispatch_steps(
     {
         return Err(DispatchError::Task(format!(
             "{}: the opencode config on {} has permission rules of its own, which opencode would \
-             merge with profile {}'s; move them out of ~/.config/opencode, or run without a profile",
+             merge with profile {}'s; move them out of its opencode config, or run without a profile",
             crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
             task.machine.as_deref().unwrap_or("this machine"),
             spec.profile().unwrap_or_default(),
@@ -239,14 +382,27 @@ async fn dispatch_steps(
     // resume it once the pane is gone; last, after the tool flags. The task
     // records it only once `agent.start` succeeds (`finish_dispatch`): a
     // task that failed before then never had that conversation to resume.
-    task.spec.session_id = None;
+    // A paused task goes back to the session it recorded instead.
     let mut session = None;
-    if launch.kind == "claude"
-        && !crate::task::picks_session(&launch.args)
-        && let Some(id) = crate::task::new_session_id()
-    {
-        launch.args.extend(["--session-id".to_string(), id.clone()]);
+    if resume {
+        let id = spec
+            .session_id
+            .clone()
+            .filter(|id| crate::task::is_session_id(id))
+            .ok_or_else(|| {
+                DispatchError::Task(format!("{name} has no Claude session recorded to resume"))
+            })?;
+        launch.args.extend(["--resume".to_string(), id.clone()]);
         session = Some(id);
+    } else {
+        task.spec.session_id = None;
+        if launch.kind == "claude"
+            && !crate::task::picks_session(&launch.args)
+            && let Some(id) = crate::task::new_session_id()
+        {
+            launch.args.extend(["--session-id".to_string(), id.clone()]);
+            session = Some(id);
+        }
     }
     let repo = match spec.repo.as_deref() {
         Some(repo) => Some(expand_home(conn, "repo", repo, task.machine.as_deref()).await?),
@@ -274,10 +430,32 @@ async fn dispatch_steps(
         return Err(HerdrError::Protocol("worktree = true needs repo".into()).into());
     }
     let host = host_workspace(conn, &spec, repo.as_deref(), task.machine.as_deref()).await?;
+    // A profiled opencode agent reads no project config, so the repo's
+    // instruction files go in by path, from where it works.
+    let opencode = agents.opencode_profile(&spec);
+    let pane_env = async |cwd: Option<&str>| -> Result<_, DispatchError> {
+        let mut env = env.clone();
+        if opencode && let Some(cwd) = cwd {
+            env.insert(
+                crate::config::opencode::CONFIG_CONTENT_ENV.into(),
+                crate::config::opencode::instructions_content(&instruction_files(conn, cwd).await?),
+            );
+        }
+        Ok(env)
+    };
+    let dir = match repo.clone() {
+        Some(repo) => Some(repo),
+        None => no_repo_dir(conn, task.machine.as_deref()).await?,
+    };
+    task.spec.label.name = None;
+    task.spec.label.note = None;
     let pane_id = match (host, repo.as_deref()) {
         // A pane of the task's own in a workspace someone else has: only
-        // that pane is recorded, so closing the task closes only it.
+        // that pane is recorded, so closing the task closes only it. The
+        // workspace keeps its label.
         (Some(host), _) => {
+            task.spec.label.name = host.label.clone();
+            task.spec.label.note = Some(crate::task::JOINED_WORKSPACE.into());
             // A worktree is still made on disk, and the agent works in it;
             // only a workspace herdr just opened on it goes, with its one
             // pane. One that was already showing the checkout
@@ -286,15 +464,24 @@ async fn dispatch_steps(
             if spec.worktree
                 && let Some(repo) = repo.as_deref()
             {
-                let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
+                // Its workspace goes in a moment, so its label is the
+                // agent's name, never the template.
+                let (created, branch) =
+                    open_worktree(conn, &spec, repo, name, name, resume).await?;
                 task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
                 worktree = Some(created);
             }
             let cwd = match worktree {
                 Some(_) => task.spec.checkout.as_ref().map(|c| c.path.clone()),
-                None => repo.clone(),
+                None => dir.clone(),
             };
-            let pane = conn.pane_split(&host.pane_id, cwd.as_deref(), &env).await?;
+            let pane = conn
+                .pane_split(
+                    &host.pane_id,
+                    cwd.as_deref(),
+                    &pane_env(cwd.as_deref()).await?,
+                )
+                .await?;
             task.workspace_id = Some(host.workspace_id);
             task.pane_id = Some(pane.pane_id.clone());
             if let Some(created) = worktree.filter(|c| !c.already_open) {
@@ -303,7 +490,16 @@ async fn dispatch_steps(
             pane.pane_id
         }
         (None, Some(repo)) if spec.worktree => {
-            let (created, branch) = open_worktree(conn, &spec, repo, name).await?;
+            let label = workspace_label(task, name);
+            let (created, branch) = open_worktree(conn, &spec, repo, name, &label, resume).await?;
+            // `worktree.open` answering `already_open` means the checkout
+            // was already in a workspace another task opened: that
+            // workspace's label is unchanged by this task, so its own
+            // label, not the template just rendered, is what gets recorded.
+            if created.already_open {
+                task.spec.label.name = created.workspace.label.clone();
+                task.spec.label.note = Some(crate::task::JOINED_WORKSPACE.into());
+            }
             task.workspace_id = Some(created.workspace.workspace_id.clone());
             task.pane_id = Some(created.root_pane.pane_id.clone());
             task.spec.checkout = find_checkout(conn, repo, branch, &created).await?;
@@ -315,24 +511,46 @@ async fn dispatch_steps(
             // checkout: its root pane is someone else's, and stays.
             let root = created.root_pane.pane_id;
             let cwd = task.spec.checkout.as_ref().map(|c| c.path.clone());
-            let pane = conn.pane_split(&root, cwd.as_deref(), &env).await?;
+            let pane = conn
+                .pane_split(&root, cwd.as_deref(), &pane_env(cwd.as_deref()).await?)
+                .await?;
             task.pane_id = Some(pane.pane_id.clone());
             if !created.already_open {
                 conn.pane_close(&root).await?;
             }
             pane.pane_id
         }
-        (None, repo) => {
-            let created = conn.workspace_create(repo, name, &env).await?;
+        (None, _) => {
+            let label = workspace_label(task, name);
+            let created = conn
+                .workspace_create(dir.as_deref(), &label, &pane_env(dir.as_deref()).await?)
+                .await?;
             task.workspace_id = Some(created.workspace.workspace_id.clone());
             task.pane_id = Some(created.root_pane.pane_id.clone());
             created.root_pane.pane_id
         }
     };
-    finish_dispatch(conn, task, name, &launch, session, &pane_id, ready_timeout).await
+    // A resumed session already has the line asking for a summary.
+    let prompt = if resume {
+        crate::task::RESUME_PROMPT.to_string()
+    } else {
+        crate::task::prompt_to_send(task)
+    };
+    finish_dispatch(
+        conn,
+        task,
+        name,
+        &launch,
+        session,
+        &pane_id,
+        &prompt,
+        ready_timeout,
+    )
+    .await
 }
 
-/// Start the agent in its pane, wait for it to come up and prompt it.
+/// Start the agent in its pane, wait for it to come up and give it `prompt`.
+#[allow(clippy::too_many_arguments)]
 async fn finish_dispatch(
     conn: &dyn Connector,
     task: &mut Task,
@@ -340,6 +558,7 @@ async fn finish_dispatch(
     launch: &crate::config::Launch,
     session: Option<String>,
     pane_id: &str,
+    prompt: &str,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     // herdr's `agent.start` returns as soon as it has launched the agent in the
@@ -349,7 +568,7 @@ async fn finish_dispatch(
     start_agent(conn, name, &launch.kind, &launch.args, pane_id).await?;
     task.spec.session_id = session;
 
-    let (outcome, prompted) = prompt_when_ready(conn, task, name, ready_timeout).await?;
+    let (outcome, prompted) = prompt_when_ready(conn, task, name, prompt, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
     // already at work when the prompt went in; see
     // `task::completed_since_prompt`.
@@ -365,6 +584,30 @@ async fn finish_dispatch(
 struct Host {
     workspace_id: String,
     pane_id: String,
+    /// The workspace's label, which the task leaves as it is.
+    label: Option<String>,
+}
+
+/// The label of the workspace a task makes, recorded on it: its template
+/// rendered (`task::render_label`), or `name` with the reason noted when
+/// that is refused. Only the workspace is named so; the agent keeps `name`,
+/// since pastor finds its agents by it.
+fn workspace_label(task: &mut Task, name: &str) -> String {
+    let label = match render_label(task.spec.label.template.as_deref(), task) {
+        Ok(label) => label,
+        Err(why) => {
+            tracing::warn!(
+                task = name,
+                template = task.spec.label.template.as_deref().unwrap_or(crate::task::DEFAULT_LABEL),
+                %why,
+                "label refused; the workspace is named after the task"
+            );
+            task.spec.label.note = Some(format!("fell back to {name}: {why}"));
+            name.to_string()
+        }
+    };
+    task.spec.label.name = Some(label.clone());
+    label
 }
 
 /// The label of the workspace `place = "pastor"` shares.
@@ -390,14 +633,14 @@ async fn host_workspace(
     let labelled = |label: &str, list: &[crate::herdr::WorkspaceInfo]| {
         list.iter()
             .find(|w| w.label.as_deref() == Some(label))
-            .map(|w| w.workspace_id.clone())
+            .map(|w| (w.workspace_id.clone(), w.label.clone()))
     };
     // A workspace can close between `workspace.list` and `pane.list`. Only
     // `repo` may then fall back to a workspace of the task's own; a named
     // one is looked up once more (`pastor` is made again if it is gone),
     // and still gone fails the task rather than put it somewhere else.
     for _ in 0..2 {
-        let workspace = match &spec.place {
+        let (workspace, label) = match &spec.place {
             Place::Own => return Ok(None),
             Place::Repo => {
                 let Some(repo) = repo.filter(|_| !spec.worktree) else {
@@ -409,7 +652,7 @@ async fn host_workspace(
                         .is_some_and(|c| same_dir(&c.checkout_path, repo))
                 });
                 match showing {
-                    Some(w) => w.workspace_id,
+                    Some(w) => (w.workspace_id, w.label),
                     None => return Ok(None),
                 }
             }
@@ -422,6 +665,7 @@ async fn host_workspace(
                     return Ok(Some(Host {
                         workspace_id: created.workspace.workspace_id,
                         pane_id: created.root_pane.pane_id,
+                        label: Some(PASTOR_WORKSPACE.into()),
                     }));
                 }
             },
@@ -442,6 +686,7 @@ async fn host_workspace(
                     return Ok(Some(Host {
                         workspace_id: workspace,
                         pane_id: p.pane_id,
+                        label,
                     }));
                 }
             }
@@ -469,24 +714,40 @@ pub(crate) fn same_dir(a: &str, b: &str) -> bool {
     trim(a) == trim(b)
 }
 
-/// The workspace of a worktree task, and the branch it is on: the checkout
-/// a retry may reopen (`reopenable`), or else a new worktree on the task's
-/// branch, `pastor/<name>` by default.
+/// The workspace of a worktree task, labelled `label`, and the branch it is
+/// on: the checkout a retry may reopen (`reopenable`), or else a new
+/// worktree on the task's branch, `pastor/<name>` by default.
 async fn open_worktree(
     conn: &dyn Connector,
     spec: &DispatchSpec,
     repo: &str,
     name: &str,
+    label: &str,
+    resume: bool,
 ) -> Result<(Created, String), DispatchError> {
+    // A paused task's own checkout, kept when it was paused: only it will
+    // do, since Claude files the session under that directory.
+    if resume && let Some(checkout) = spec.checkout.as_deref() {
+        return match conn.worktree_open(repo, &checkout.branch, label).await {
+            Ok(created) => Ok((created, checkout.branch.clone())),
+            Err(err) if err.code() == Some("worktree_not_found") => {
+                Err(DispatchError::Task(format!(
+                    "its worktree {} on branch {} is gone, so its session has nowhere to resume",
+                    checkout.path, checkout.branch
+                )))
+            }
+            Err(err) => Err(err.into()),
+        };
+    }
     if let Some(reopen) = reopenable(conn, spec, repo).await? {
-        let created = conn.worktree_open(repo, &reopen.branch, name).await?;
+        let created = conn.worktree_open(repo, &reopen.branch, label).await?;
         return Ok((created, reopen.branch.clone()));
     }
     let branch = spec
         .branch
         .clone()
         .unwrap_or_else(|| format!("pastor/{name}"));
-    Ok((conn.worktree_create(repo, &branch, name).await?, branch))
+    Ok((conn.worktree_create(repo, &branch, label).await?, branch))
 }
 
 /// The one rule for reopening a checkout. A retry goes back to the checkout
@@ -594,6 +855,37 @@ async fn start_agent(
     }
 }
 
+/// Where a task with no repo starts, under the machine's home.
+pub const NO_REPO_DIR: &str = "pastor-tasks";
+
+/// Where a task with no repo starts: herdr opens a pane with no `cwd`
+/// wherever its focused pane is, which can be anyone's checkout (t-284 opened
+/// in a work repo). Not the home itself either: Claude Code never saves
+/// folder trust for the home, so it asked at every start (t-358). So
+/// `~/pastor-tasks`, made when missing, where Claude asks once per machine.
+/// A folder that cannot be made falls back to the home; a machine that
+/// cannot tell its home leaves it to herdr, as before.
+async fn no_repo_dir(
+    conn: &dyn Connector,
+    machine: Option<&str>,
+) -> Result<Option<String>, DispatchError> {
+    let Some(home) = conn.home_dir().await.map_err(CallError::from)? else {
+        return Ok(None);
+    };
+    let dir = format!("{}/{NO_REPO_DIR}", home.trim_end_matches('/'));
+    match conn.ensure_dir(&dir).await.map_err(CallError::from)? {
+        Some(true) => Ok(Some(dir)),
+        _ => {
+            tracing::warn!(
+                machine = machine.unwrap_or("this machine"),
+                %dir,
+                "cannot make the folder for tasks with no repo; starting in the home"
+            );
+            Ok(Some(home))
+        }
+    }
+}
+
 /// Expand a leading `~` in `repo` against the machine's home directory.
 ///
 /// herdr takes `cwd` literally: `~/work` is a directory named `~` to it, and a
@@ -633,6 +925,22 @@ pub(crate) async fn expand_home(
 /// 2026-09-24). Refuse before creating anything. A machine that cannot answer
 /// (`None`: a `command` bridge, a shell that printed nothing) goes ahead, as
 /// before.
+/// The instruction file a profiled opencode task working in `dir` gets back:
+/// the first of `opencode::instruction_candidates` that is there, as opencode
+/// itself would pick, none when none is. Every candidate when the machine
+/// cannot say, since a file that is not there matches nothing.
+async fn instruction_files(conn: &dyn Connector, dir: &str) -> Result<Vec<String>, DispatchError> {
+    let candidates = crate::config::opencode::instruction_candidates(dir);
+    for file in &candidates {
+        match conn.file_exists(file).await.map_err(CallError::from)? {
+            Some(true) => return Ok(vec![file.clone()]),
+            Some(false) => {}
+            None => return Ok(candidates),
+        }
+    }
+    Ok(vec![])
+}
+
 async fn check_repo_exists(
     conn: &dyn Connector,
     repo: &str,
@@ -661,6 +969,7 @@ async fn prompt_when_ready(
     conn: &dyn Connector,
     task: &Task,
     name: &str,
+    prompt: &str,
     ready_timeout: Duration,
 ) -> Result<(DispatchOutcome, Option<AgentInfo>), DispatchError> {
     let machine = task.machine.as_deref().unwrap_or("that machine");
@@ -692,7 +1001,7 @@ async fn prompt_when_ready(
         if agent.launch_pending {
             // still launching: fall through to the wait below
         } else if can_prompt {
-            match conn.agent_prompt(name, &task.prompt).await {
+            match conn.agent_prompt(name, prompt).await {
                 // The reply carries the agent's `state_change_seq` and status
                 // as the prompt went in.
                 Ok(agent) => return Ok((DispatchOutcome::Running, Some(agent))),
@@ -725,8 +1034,10 @@ async fn prompt_when_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::flock::FlockNumber;
     use crate::herdr::AgentStatus;
     use crate::herdr::fake::{FakeHerdr, StartBehaviour};
+    use crate::task::WorkspaceLabel;
     use serde_json::Value;
 
     /// Generous next to every `ready_after` these tests use, so only the test
@@ -743,7 +1054,17 @@ mod tests {
             live,
             live_jobs: 0,
             healthy,
-            flock: "default".into(),
+            flocks: vec![seat("default", None, live)],
+            waiting_under_share: vec![],
+        }
+    }
+
+    fn seat(name: &str, max: Option<u32>, live: usize) -> FlockSeat {
+        FlockSeat {
+            name: name.into(),
+            share: None,
+            max,
+            live,
         }
     }
 
@@ -753,7 +1074,7 @@ mod tests {
         let ms = vec![
             mv("home-1", 2, 1, &[], true),
             MachineView {
-                flock: "work".into(),
+                flocks: vec![seat("work", None, 0)],
                 ..mv("work-1", 2, 0, &[], true)
             },
         ];
@@ -777,6 +1098,102 @@ mod tests {
         );
     }
 
+    /// A machine in two flocks takes a flock's task only while that flock is
+    /// under its number there, whatever room the machine has; the other
+    /// flock is not held back by it.
+    #[test]
+    fn pick_machine_keeps_a_flock_to_its_number() {
+        let desk = MachineView {
+            flocks: vec![seat("home", Some(3), 1), seat("work", Some(1), 1)],
+            ..mv("desk", 4, 2, &[], true)
+        };
+        let ms = vec![desk.clone()];
+        assert_eq!(pick_machine(&ms, "work", &spec(), Claim::default()), None);
+        assert_eq!(
+            pick_machine(&ms, "home", &spec(), Claim::default()).as_deref(),
+            Some("desk")
+        );
+        let pinned = DispatchSpec {
+            machine: Some("desk".into()),
+            ..spec()
+        };
+        assert_eq!(pick_machine(&ms, "work", &pinned, Claim::default()), None);
+        // Job slots and burst never pass the flock's number.
+        let slack = vec![MachineView {
+            job_slots: 2,
+            burst: 2,
+            ..desk.clone()
+        }];
+        for claim in [JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert_eq!(pick_machine(&slack, "work", &spec(), claim), None);
+        }
+        // Under its number, the flock goes to whichever member has room.
+        let other = MachineView {
+            flocks: vec![seat("work", Some(2), 0)],
+            ..mv("lab", 2, 1, &[], true)
+        };
+        assert_eq!(
+            pick_machine(&[desk, other], "work", &spec(), Claim::default()).as_deref(),
+            Some("lab")
+        );
+        // With no number of its own, a flock has the machine's limits.
+        let old = vec![MachineView {
+            job_slots: 1,
+            ..mv("old", 1, 1, &[], true)
+        }];
+        assert_eq!(
+            pick_machine(&old, "default", &spec(), JOB).as_deref(),
+            Some("old")
+        );
+    }
+
+    /// A flock with a share and a max: under its share it takes a slot as
+    /// usual; past it, only while no flock under its share waits there; at
+    /// its max, never. The machine's own room holds all of them.
+    #[test]
+    fn pick_machine_lets_a_flock_past_its_share_only_on_an_idle_machine() {
+        let split = |live| FlockSeat::new("work", Some(FlockNumber::split(1, 3)), live);
+        let desk = |work_live: usize, waiting: &[&str]| MachineView {
+            flocks: vec![seat("home", Some(2), 0), split(work_live)],
+            waiting_under_share: waiting.iter().map(|w| w.to_string()).collect(),
+            ..mv("desk", 4, work_live, &[], true)
+        };
+        let pick = |m: MachineView| pick_machine(&[m], "work", &spec(), Claim::default());
+        // Under its share, a waiting task of another flock does not stop it.
+        assert_eq!(pick(desk(0, &["home"])).as_deref(), Some("desk"));
+        // Past its share on an idle machine it takes the slot.
+        assert_eq!(pick(desk(1, &[])).as_deref(), Some("desk"));
+        assert_eq!(pick(desk(2, &[])).as_deref(), Some("desk"));
+        // Past its share while home waits under its share, it does not.
+        assert_eq!(pick(desk(1, &["home"])), None);
+        // Held at its max, however idle the machine.
+        assert_eq!(pick(desk(3, &[])), None);
+        // The machine's own room caps everything.
+        let full = MachineView {
+            max_agents: 2,
+            ..desk(2, &[])
+        };
+        assert_eq!(pick(full), None);
+        // Job slots and burst never pass the max.
+        let slack = MachineView {
+            job_slots: 2,
+            burst: 2,
+            ..desk(3, &[])
+        };
+        for claim in [JOB, CRITICAL_RUN, CRITICAL_JOB] {
+            assert_eq!(
+                pick_machine(std::slice::from_ref(&slack), "work", &spec(), claim),
+                None
+            );
+        }
+        // The plain number stays a hard ceiling.
+        let plain = MachineView {
+            flocks: vec![seat("work", Some(1), 1)],
+            ..mv("desk", 4, 1, &[], true)
+        };
+        assert_eq!(pick(plain), None);
+    }
+
     fn spec() -> DispatchSpec {
         DispatchSpec {
             agent: "claude".into(),
@@ -794,6 +1211,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         }
     }
 
@@ -880,11 +1299,13 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            pause: Default::default(),
+            summary: None,
             created_at: now,
             started_at: None,
             finished_at: None,
             updated_at: now,
-            flock: None,
+            flock: Some("home".into()),
             role: Default::default(),
         }
     }
@@ -1155,7 +1576,7 @@ mod tests {
             .find(|r| r.method == "workspace.create")
             .unwrap();
         assert_eq!(ws.params["cwd"], "/srv/app");
-        assert_eq!(ws.params["label"], "t-7");
+        assert_eq!(ws.params["label"], "home/t-7");
         let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
         assert_eq!(start.params["kind"], "claude");
         assert_eq!(
@@ -1164,7 +1585,135 @@ mod tests {
         );
         let prompt = reqs.iter().find(|r| r.method == "agent.prompt").unwrap();
         assert_eq!(prompt.params["target"], "t-7");
-        assert_eq!(prompt.params["text"], "line one\n\"two\" {{ three }}");
+        // The prompt as stored, then the line asking for a summary.
+        assert_eq!(
+            prompt.params["text"],
+            format!(
+                "line one\n\"two\" {{{{ three }}}}\n\n{}",
+                crate::task::SUMMARY_ASK
+            )
+        );
+        assert_eq!(t.prompt, "line one\n\"two\" {{ three }}", "not stored");
+    }
+
+    /// `summary = "off"` sends the prompt alone; `require` adds the
+    /// warning after the line that asks.
+    #[tokio::test]
+    async fn dispatch_asks_for_a_summary_as_the_task_is_set() {
+        use crate::task::{SUMMARY_REQUIRE, SummaryMode};
+        let sent = |mode: SummaryMode| async move {
+            let fake = FakeHerdr::new();
+            let mut t = task(DispatchSpec {
+                summary: mode,
+                ..spec()
+            });
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            let reqs = fake.requests();
+            let prompt = reqs.iter().find(|r| r.method == "agent.prompt").unwrap();
+            prompt.params["text"].as_str().unwrap().to_string()
+        };
+        assert_eq!(
+            sent(SummaryMode::Off).await,
+            "line one\n\"two\" {{ three }}"
+        );
+        let required = sent(SummaryMode::Require).await;
+        assert!(required.ends_with(SUMMARY_REQUIRE), "{required}");
+    }
+
+    /// The workspace takes the label template rendered; the agent, which
+    /// pastor finds by name, and the default branch stay `t-N`.
+    #[tokio::test]
+    async fn the_workspace_takes_the_label_and_the_agent_stays_t_n() {
+        for worktree in [false, true] {
+            let fake = FakeHerdr::new();
+            let mut t = task(DispatchSpec {
+                worktree,
+                label: WorkspaceLabel {
+                    template: Some("{{ machine }}:{{ task.id }}".into()),
+                    from: Some("task run".into()),
+                    ..Default::default()
+                },
+                ..spec()
+            });
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            let reqs = fake.requests();
+            let method = if worktree {
+                "worktree.create"
+            } else {
+                "workspace.create"
+            };
+            let create = reqs.iter().find(|r| r.method == method).unwrap();
+            assert_eq!(create.params["label"], "pi-1:t-7");
+            if worktree {
+                assert_eq!(create.params["branch"], "pastor/t-7");
+            }
+            let start = reqs.iter().find(|r| r.method == "agent.start").unwrap();
+            assert_eq!(start.params["name"], "t-7");
+            assert_eq!(t.agent_name.as_deref(), Some("t-7"));
+            assert_eq!(t.spec.label.name.as_deref(), Some("pi-1:t-7"));
+            assert_eq!(t.spec.label.note, None);
+            assert_eq!(t.spec.label.from.as_deref(), Some("task run"));
+        }
+    }
+
+    /// A label that renders empty or with a control character (an item's
+    /// key can hold one) names the workspace `t-N`, and says why.
+    #[tokio::test]
+    async fn a_label_herdr_should_not_show_falls_back_to_t_n() {
+        for key in ["a\u{1b}[2Jb", ""] {
+            let fake = FakeHerdr::new();
+            let mut t = task(DispatchSpec {
+                label: WorkspaceLabel {
+                    template: Some("{{ item.key }}".into()),
+                    from: Some("job j".into()),
+                    ..Default::default()
+                },
+                ..spec()
+            });
+            t.job = "j".into();
+            t.item = serde_json::json!({ "key": key });
+            dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap();
+            let create = fake
+                .requests()
+                .into_iter()
+                .find(|r| r.method == "workspace.create")
+                .unwrap();
+            assert_eq!(create.params["label"], "t-7", "{key:?}");
+            assert_eq!(t.spec.label.name.as_deref(), Some("t-7"));
+            let note = t.spec.label.note.clone().unwrap();
+            assert!(note.starts_with("fell back to t-7"), "{note}");
+        }
+    }
+
+    /// A task that joins a workspace leaves its label alone, and records
+    /// the one it joined.
+    #[tokio::test]
+    async fn a_joined_workspace_keeps_its_label() {
+        let fake = FakeHerdr::new();
+        fake.open_user_workspace("app", Some("/srv/app"));
+        let mut t = task(spec());
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert!(!methods(&fake).iter().any(|m| m.ends_with(".create")));
+        assert_eq!(t.spec.label.name.as_deref(), Some("app"));
+        assert_eq!(t.spec.label.note.as_deref(), Some("joined workspace"));
+
+        let mut shared = task(DispatchSpec {
+            place: Place::Pastor,
+            ..spec()
+        });
+        dispatch(&fake, &mut shared, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(shared.spec.label.name.as_deref(), Some("pastor"));
+        assert_eq!(shared.spec.label.note.as_deref(), Some("joined workspace"));
     }
 
     /// A claude task starts on a session of its own, `--session-id` after
@@ -1292,6 +1841,8 @@ mod tests {
                 model_from: None,
                 profile: profile.map(str::to_string),
                 profile_from: Some("defaults".into()),
+                timeout_from: None,
+                place_from: None,
             })),
             ..spec()
         }
@@ -1351,6 +1902,76 @@ mod tests {
         dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
+    }
+
+    /// A profiled opencode task runs with the repo's own opencode config
+    /// off, so a checkout cannot add rules to the profile's; the repo's
+    /// `AGENTS.md` or `CLAUDE.md`, which that also turns off, comes back
+    /// by its path in the directory the agent works in, a worktree's too:
+    /// the first one there, as opencode would pick. A task with no profile
+    /// keeps the repo's config.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_turns_the_repo_config_off_but_keeps_its_instructions() {
+        let instructions = |env: &serde_json::Value| {
+            let content: serde_json::Value =
+                serde_json::from_str(env["OPENCODE_CONFIG_CONTENT"].as_str().unwrap()).unwrap();
+            content
+        };
+        let fake = FakeHerdr::new();
+        fake.set_file("/srv/app/AGENTS.md");
+        fake.set_file("/srv/app/CLAUDE.md");
+        let mut t = task(opencode_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(env["OPENCODE_DISABLE_PROJECT_CONFIG"], "1");
+        assert_eq!(
+            instructions(&env),
+            serde_json::json!({"instructions": ["/srv/app/AGENTS.md"]}),
+            "opencode reads only the first file there, AGENTS.md before CLAUDE.md"
+        );
+
+        let fake = FakeHerdr::new();
+        let mut t = task(opencode_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(instructions(&env), serde_json::json!({"instructions": []}));
+
+        let fake = FakeHerdr::new();
+        fake.set_file("/fake/worktrees/pastor-k1/CLAUDE.md");
+        let mut t = task(DispatchSpec {
+            worktree: true,
+            branch: Some("pastor/k1".into()),
+            ..opencode_under(Some("review"))
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(env["OPENCODE_DISABLE_PROJECT_CONFIG"], "1");
+        assert_eq!(
+            instructions(&env),
+            serde_json::json!({"instructions": ["/fake/worktrees/pastor-k1/CLAUDE.md"]})
+        );
+
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            allow: vec![],
+            deny: vec![],
+            ..opencode_under(None)
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert!(
+            env.get("OPENCODE_DISABLE_PROJECT_CONFIG").is_none(),
+            "{env}"
+        );
+        assert!(env.get("OPENCODE_CONFIG_CONTENT").is_none(), "{env}");
     }
 
     /// An agent that cannot take a list it was given fails the task before
@@ -1547,7 +2168,44 @@ mod tests {
             .unwrap();
         assert_eq!(wt.params["cwd"], "/srv/app");
         assert_eq!(wt.params["branch"], "pastor/k1");
-        assert_eq!(wt.params["label"], "t-7");
+        assert_eq!(wt.params["label"], "home/t-7");
+    }
+
+    /// A retry's `worktree.open` can answer a workspace someone else already
+    /// has open on the checkout (`already_open`): that workspace's own
+    /// label, not the template this task just rendered, is what gets
+    /// recorded, and the task is marked as having joined it.
+    #[tokio::test]
+    async fn a_reopened_worktree_already_open_elsewhere_keeps_its_own_label() {
+        let fake = FakeHerdr::new();
+        fake.worktree_create("/srv/app", "pastor/k1", "seed")
+            .await
+            .unwrap();
+        let path = fake
+            .worktree_list("/srv/app")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|w| w.branch.as_deref() == Some("pastor/k1"))
+            .unwrap()
+            .path;
+        let mut t = task(DispatchSpec {
+            worktree: true,
+            reopen: Some(Box::new(Reopen {
+                branch: "pastor/k1".into(),
+                path,
+                agent: "someone-else".into(),
+            })),
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.label.name.as_deref(), Some("seed"));
+        assert_eq!(
+            t.spec.label.note.as_deref(),
+            Some(crate::task::JOINED_WORKSPACE)
+        );
     }
 
     /// herdr takes `cwd` literally and opens the pane elsewhere when it does
@@ -1594,6 +2252,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// herdr opens a pane with no `cwd` wherever its focused pane is, which
+    /// put t-284, a task with no repo, in someone's work checkout
+    /// (2026-09-28). A task with no repo starts in `~/pastor-tasks`, made
+    /// when missing, in a workspace of its own or a pane split into a shared
+    /// one: not the home itself, which Claude Code never saves trust for, so
+    /// it asked at every start (t-358). A machine that cannot tell its home
+    /// leaves the choice to herdr, as before.
+    #[tokio::test]
+    async fn a_task_with_no_repo_starts_in_pastor_tasks() {
+        for (home, cwd) in [
+            (
+                Some("/home/fake"),
+                serde_json::json!("/home/fake/pastor-tasks"),
+            ),
+            (None, Value::Null),
+        ] {
+            for place in [Place::Repo, Place::Own, Place::Pastor] {
+                let fake = FakeHerdr::new();
+                fake.set_home(home);
+                fake.set_missing_dir("/home/fake/pastor-tasks");
+                let mut t = task(DispatchSpec {
+                    repo: None,
+                    place: place.clone(),
+                    ..spec()
+                });
+                dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                    .await
+                    .unwrap();
+                let req = fake
+                    .requests()
+                    .into_iter()
+                    .find(|r| {
+                        r.method == "pane.split"
+                            || (r.method == "workspace.create" && r.params["label"] != "pastor")
+                    })
+                    .unwrap();
+                assert_eq!(req.params["cwd"], cwd, "{place:?} with home {home:?}");
+                let made: Vec<String> = home
+                    .map(|_| "/home/fake/pastor-tasks".to_string())
+                    .into_iter()
+                    .collect();
+                assert_eq!(fake.made_dirs(), made, "{place:?} with home {home:?}");
+            }
+        }
+    }
+
+    /// A folder that cannot be made (a file in the way, no permission) is no
+    /// reason to refuse the task: it starts in the home, as before this
+    /// folder, and Claude asks for trust there.
+    #[tokio::test]
+    async fn a_task_with_no_repo_falls_back_to_home_when_the_folder_cannot_be_made() {
+        let fake = FakeHerdr::new();
+        fake.set_unmakeable_dir("/home/fake/pastor-tasks");
+        let mut t = task(DispatchSpec {
+            repo: None,
+            place: Place::Own,
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let req = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "workspace.create" && r.params["label"] != "pastor")
+            .unwrap();
+        assert_eq!(req.params["cwd"], "/home/fake");
     }
 
     /// Where `~` cannot be resolved the task fails up front with a reason,
@@ -1990,7 +2717,7 @@ mod tests {
                 .into_iter()
                 .find(|r| r.method == "workspace.create")
                 .unwrap();
-            assert_eq!(create.params["label"], "t-7");
+            assert_eq!(create.params["label"], "home/t-7");
             assert_eq!(t.workspace_id.as_deref(), Some("w2"), "{repo:?}");
             assert!(!methods(&fake).contains(&"pane.split".to_string()));
         }
@@ -2036,7 +2763,7 @@ mod tests {
             .into_iter()
             .find(|r| r.method == "workspace.create")
             .unwrap();
-        assert_eq!(create.params["label"], "t-7");
+        assert_eq!(create.params["label"], "home/t-7");
     }
 
     /// `pastor`: the first task makes the machine's `pastor` workspace, the

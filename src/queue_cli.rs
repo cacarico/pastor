@@ -4,7 +4,7 @@
 //! so. A move needs the head, like `task priority`.
 use clap::{Args, Subcommand};
 
-use crate::cli::{CliError, table};
+use crate::cli::{CliError, ask, table, unexpected};
 use crate::config::Paths;
 use crate::config::flock::Flock;
 use crate::ipc::{Head, IpcRequest, IpcResponse};
@@ -88,18 +88,6 @@ pub async fn run(paths: &Paths, mut a: QueueArgs, head: Head) -> anyhow::Result<
         Some(QueueCmd::Move(m)) => move_task(paths, m).await,
         None => list(paths, a, head).await,
     }
-}
-
-async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    match crate::ipc::request_head(paths, &req).await {
-        Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
-        Ok(other) => Ok(other),
-        Err(err) => Err(crate::task_cli::request_error(&err)),
-    }
-}
-
-fn unexpected(resp: IpcResponse) -> anyhow::Error {
-    CliError::err("internal", format!("unexpected daemon reply: {resp:?}"))
 }
 
 async fn list(paths: &Paths, a: QueueArgs, head: Head) -> anyhow::Result<()> {

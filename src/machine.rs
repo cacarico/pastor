@@ -16,7 +16,7 @@ use crate::herdr::{
     subscription_agent_status, subscription_lifecycle,
 };
 use crate::store::Store;
-use crate::task::{Observed, Task, TaskState, next_state};
+use crate::task::{Observed, Task, TaskState, TaskSummary, next_state};
 
 /// A herdr request that got no answer within `request_timeout`.
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +127,26 @@ impl ChannelState {
     }
 }
 
+impl MachineStatus {
+    /// The flocks the machine is in: `flocks`, else the one `flock` a head
+    /// from before many flocks sends, else the default.
+    pub fn flock_names(&self) -> Vec<String> {
+        if !self.flocks.is_empty() {
+            self.flocks.iter().map(|f| f.name.clone()).collect()
+        } else {
+            vec![
+                self.flock
+                    .clone()
+                    .unwrap_or_else(|| crate::config::flock::DEFAULT_FLOCK.into()),
+            ]
+        }
+    }
+
+    pub fn in_flock(&self, flock: &str) -> bool {
+        self.flock_names().iter().any(|f| f == flock)
+    }
+}
+
 impl std::fmt::Display for ChannelState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -135,6 +155,65 @@ impl std::fmt::Display for ChannelState {
             ChannelState::Reconnecting => "reconnecting",
             ChannelState::Polling => "polling",
             ChannelState::Incompatible => "incompatible",
+        })
+    }
+}
+
+/// One flock a machine is in: its number there (`None`: the machine's own
+/// limits, from the old `flock` key or the default), as a share and a max
+/// (`FlockNumber`), and how many of the flock's live tasks run on the
+/// machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlockSeat {
+    pub name: String,
+    /// Up to how many live tasks the flock takes a slot as usual; `None`
+    /// with a `max` is a head from before shares, whose number was a plain
+    /// ceiling, so the share is the max.
+    #[serde(default)]
+    pub share: Option<u32>,
+    #[serde(default)]
+    pub max: Option<u32>,
+    #[serde(default)]
+    pub live: usize,
+}
+
+impl FlockSeat {
+    /// `name`'s seat with `number` (`None`: the machine's own limits) and
+    /// `live` of its tasks.
+    pub fn new(
+        name: &str,
+        number: Option<crate::config::flock::FlockNumber>,
+        live: usize,
+    ) -> FlockSeat {
+        FlockSeat {
+            name: name.to_string(),
+            share: number.map(|n| n.share()),
+            max: number.map(|n| n.max()),
+            live,
+        }
+    }
+
+    /// Is the flock under its number here? Its max, which job slots and
+    /// burst never pass.
+    pub fn has_room(&self) -> bool {
+        self.max.is_none_or(|n| self.live < n as usize)
+    }
+
+    /// Is the flock under its share here, so it takes a free slot without
+    /// looking at who else waits? A seat with no number is.
+    pub fn under_share(&self) -> bool {
+        self.share
+            .or(self.max)
+            .is_none_or(|n| self.live < n as usize)
+    }
+
+    /// The number as `flock list` and `machine list` write it: `2`, or
+    /// `2/4` for a share of 2 and a max of 4. `None` with no number.
+    pub fn number_label(&self) -> Option<String> {
+        let max = self.max?;
+        Some(match self.share.filter(|s| *s != max) {
+            Some(share) => format!("{share}/{max}"),
+            None => max.to_string(),
         })
     }
 }
@@ -180,6 +259,17 @@ pub struct MachineStatus {
     /// from an actor, and from a head that predates flocks.
     #[serde(default)]
     pub flock: Option<String>,
+    /// Every flock the machine is in, the one in `flock` among them, with
+    /// its number and live tasks there. `Fleet::statuses` fills it in;
+    /// empty from an actor, and from a head that predates it (read it
+    /// through `flock_names`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flocks: Vec<FlockSeat>,
+    /// The actor's live tasks by the flock stored on each (`None`: a row
+    /// from before flocks, in the default flock), for `Fleet` to count each
+    /// flock's tasks against its number. Not sent: `flocks` carries it.
+    #[serde(skip)]
+    pub live_by_flock: Vec<(Option<String>, usize)>,
     /// The actor was stopped by a reload that took this machine out of the
     /// flock, but it has not ended yet (`Fleet::statuses` fills it in). A
     /// caller that grants access by flock membership must treat this machine
@@ -218,8 +308,10 @@ pub struct MachineSettings {
     /// While `Polling`, how often `agent.list` reconciles. The daemon passes its
     /// `tick`, so a polling machine is reconciled once per tick.
     pub poll_every: Duration,
-    /// How long a `done` task keeps its pane before reconcile closes it
+    /// How long a `done` task keeps its pane before auto-close takes it
     /// (`close_done_after` in `pastor.toml`). `None` turns auto-close off.
+    /// While connected, the check runs after each reconcile and, for a grace
+    /// shorter than `reconcile_every`, every `close_done_after` as well.
     pub close_done_after: Option<Duration>,
     /// While connected or polling, how often the machine is asked for its
     /// pastor version again, so an upgrade shows without a reconnect. Checked
@@ -244,7 +336,7 @@ impl Default for MachineSettings {
             request_timeout: Duration::from_secs(60),
             agent_ready_timeout: Duration::from_secs(30),
             poll_every: Duration::from_secs(10),
-            close_done_after: Some(Duration::from_secs(15 * 60)),
+            close_done_after: Some(Duration::from_secs(5)),
             version_every: Duration::from_secs(10 * 60),
             agents: crate::config::Agents::default(),
             head_address: None,
@@ -265,6 +357,14 @@ pub struct PastorEvent {
     /// names sent and the length of any text, never the text itself.
     #[serde(default)]
     pub detail: Option<serde_json::Value>,
+    /// On `task.done` and `task.failed`: how the round that just ended
+    /// ended, taken at the moment the event was queued. The event log's
+    /// build step trusts this rather than re-reading the store, which by
+    /// then may hold a later round's summary (a reopen, or `task done
+    /// --summary` landing on an already-done task before this event was
+    /// processed).
+    #[serde(default)]
+    pub summary: Option<TaskSummary>,
 }
 
 pub enum MachineCommand {
@@ -296,10 +396,37 @@ pub enum MachineCommand {
     /// `pastor task done`: the agent says it is finished. Marks the task
     /// `done` and `ended`, so it stays done while the agent finishes its
     /// turn and auto-close takes its pane after `close_done_after`.
+    /// `summary` ends the round with what the agent said
+    /// (`Store::end_round`), or replaces the last round's on a task pastor
+    /// already found done.
     End {
+        task_id: i64,
+        summary: Option<String>,
+        by: EndBy,
+        reply: oneshot::Sender<anyhow::Result<Task>>,
+    },
+    /// Pause a running `low` Claude task for critical task `for_task`:
+    /// interrupt its agent, close its pane (its worktree stays) and mark it
+    /// `paused` (see `Task::pause`). Refused with `PauseRefused` for a task
+    /// that cannot be paused (`task::why_not_pausable`).
+    Pause {
+        task_id: i64,
+        for_task: i64,
+        reply: oneshot::Sender<anyhow::Result<Task>>,
+    },
+    /// Start a paused task again on its own session (`dispatch::resume`).
+    Resume {
         task_id: i64,
         reply: oneshot::Sender<anyhow::Result<Task>>,
     },
+}
+
+/// Why `Pause` left a task alone.
+#[derive(Debug, thiserror::Error)]
+#[error("{task} cannot be paused: {why}")]
+pub struct PauseRefused {
+    pub task: String,
+    pub why: String,
 }
 
 /// What `pastor task send` types into a task's pane: `text` first, then
@@ -393,6 +520,10 @@ pub struct MachineHandle {
 /// How long `shutdown` waits for an aborted actor to end. An abort lands at
 /// the actor's next await, so this is only reached if a poll blocks.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+
+/// How often a prompt the agent did not take is sent again before the task
+/// is left `blocked` for a human (see `Actor::unseen_prompt`).
+const MAX_PROMPT_RESENDS: u8 = 2;
 
 /// The running actor, shared by every clone of its handle. The join handle
 /// is kept, not just an abort handle, because aborting only asks the task to
@@ -519,9 +650,46 @@ impl MachineHandle {
         self.request(cmd, rx).await
     }
 
-    pub async fn end(&self, task_id: i64) -> anyhow::Result<Task> {
+    /// `end_by` the task's own agent.
+    pub async fn end(&self, task_id: i64, summary: Option<String>) -> anyhow::Result<Task> {
+        self.end_by(task_id, summary, EndBy::Agent).await
+    }
+
+    /// See `MachineCommand::End`.
+    pub async fn end_by(
+        &self,
+        task_id: i64,
+        summary: Option<String>,
+        by: EndBy,
+    ) -> anyhow::Result<Task> {
         let (reply, rx) = oneshot::channel();
-        self.request(MachineCommand::End { task_id, reply }, rx)
+        self.request(
+            MachineCommand::End {
+                task_id,
+                summary,
+                by,
+                reply,
+            },
+            rx,
+        )
+        .await
+    }
+
+    /// See `MachineCommand::Pause`.
+    pub async fn pause(&self, task_id: i64, for_task: i64) -> anyhow::Result<Task> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = MachineCommand::Pause {
+            task_id,
+            for_task,
+            reply,
+        };
+        self.request(cmd, rx).await
+    }
+
+    /// See `MachineCommand::Resume`.
+    pub async fn resume(&self, task_id: i64) -> anyhow::Result<Task> {
+        let (reply, rx) = oneshot::channel();
+        self.request(MachineCommand::Resume { task_id, reply }, rx)
             .await
     }
 
@@ -559,6 +727,66 @@ impl MachineHandle {
     }
 }
 
+/// `live`, `live_jobs` and `live_by_flock` of `status` from `tasks`, the
+/// pane-owning tasks on its machine (`Store::tasks_on_machine`).
+pub fn count_live(status: &mut MachineStatus, tasks: &[Task]) {
+    status.live = tasks.len();
+    status.live_jobs = tasks.iter().filter(|t| t.from_job()).count();
+    let mut by: Vec<(Option<String>, usize)> = Vec::new();
+    for t in tasks {
+        match by.iter_mut().find(|(f, _)| *f == t.flock) {
+            Some((_, n)) => *n += 1,
+            None => by.push((t.flock.clone(), 1)),
+        }
+    }
+    status.live_by_flock = by;
+}
+
+/// What `machine list` shows as a pull machine's endpoint.
+pub const PULL_ENDPOINT: &str = "pull: its own pastor serve asks the head for tasks";
+
+/// The handle of a pull machine (`pull = true` in flock.toml): no actor and
+/// no connection, since the head never reaches it. A request sent to it
+/// fails at once ("is gone"); the fleet answers for it instead
+/// (`Fleet::claim`, `Fleet::report`). Its status starts `connecting` until
+/// its first claim.
+pub fn pull_machine(name: String, max_agents: u32, tags: Vec<String>) -> MachineHandle {
+    let (tx, _) = mpsc::channel(1);
+    let status = Arc::new(RwLock::new(MachineStatus {
+        description: None,
+        name: name.clone(),
+        host: "pull".into(),
+        endpoint: PULL_ENDPOINT.into(),
+        channel: ChannelState::Connecting,
+        herdr_version: None,
+        pastor_version: None,
+        protocol: None,
+        error: None,
+        live: 0,
+        live_jobs: 0,
+        max_agents,
+        job_slots: 0,
+        burst: 0,
+        tags: tags.clone(),
+        orphans: vec![],
+        flock: None,
+        flocks: vec![],
+        live_by_flock: vec![],
+        shutting_down: false,
+        profile: None,
+    }));
+    MachineHandle {
+        name,
+        max_agents,
+        job_slots: 0,
+        burst: 0,
+        tags,
+        tx,
+        status,
+        task: None,
+    }
+}
+
 pub fn spawn_machine(
     name: String,
     max_agents: u32,
@@ -587,6 +815,8 @@ pub fn spawn_machine(
         tags: tags.clone(),
         orphans: vec![],
         flock: None,
+        flocks: vec![],
+        live_by_flock: vec![],
         shutting_down: false,
         profile: None,
     }));
@@ -600,6 +830,7 @@ pub fn spawn_machine(
         rx,
         pending_done: HashMap::new(),
         trust_answered: HashMap::new(),
+        unseen_prompt: HashMap::new(),
         idle_agents: HashSet::new(),
         was_connected: false,
         failures: 0,
@@ -637,13 +868,22 @@ struct Actor {
     /// agent is still idle at that same sequence; with no sequence, the first
     /// check records one and starts the window over.
     pending_done: HashMap<i64, (Option<u64>, Instant)>,
-    /// task id -> when its trust keys went in. Claude redraws for a moment
-    /// after its trust dialog, already reported idle and ready, and loses a
-    /// prompt typed then although herdr accepts it; the pending prompt waits
-    /// `settle` from here (`deliver_pending_prompt`, `deliver_held_prompts`).
-    /// Kept in memory only: an actor started later comes well after the
-    /// redraw.
+    /// task id -> when its startup prompt was answered: its trust keys went
+    /// in, or, answered by a person at the pane, when the agent was first
+    /// seen out of `blocked`. Claude redraws for a moment after its trust
+    /// dialog, already reported idle and ready, and loses a prompt typed then
+    /// although herdr accepts it; the pending prompt waits `settle` from here
+    /// (`deliver_pending_prompt`, `deliver_held_prompts`). Kept in memory
+    /// only: an actor started later comes well after the redraw.
     trust_answered: HashMap<i64, Instant>,
+    /// task id -> how often its prompt was sent again, for a task whose
+    /// agent this actor gave its prompt (dispatch or a pending delivery) and
+    /// has not seen `working` or `blocked` since. An agent still idle a
+    /// settle window later at the sequence the prompt went in at never took
+    /// it: `confirm_pending_done` sends it again, up to `MAX_PROMPT_RESENDS`
+    /// times, then marks the task `blocked`. Kept in memory only, like the
+    /// activity flag was: after a restart such a task stays `running`.
+    unseen_prompt: HashMap<i64, u8>,
     /// Tasks whose agent this actor last saw `idle` or `done` (`unknown`
     /// changes nothing). Decides what an exit means: an agent that ends
     /// between turns finished its task; see `Observed::PaneExited`.
@@ -713,6 +953,24 @@ fn task_id_of_agent(name: &str) -> Option<i64> {
     }
     let id: i64 = digits.parse().ok()?;
     (id > 0 && Task::agent_name_for(id) == name).then_some(id)
+}
+
+/// Who ran `pastor task done`: the task's own agent, from its pane (or
+/// through the bridge), or anyone else. A task whose `summary` is
+/// `require` refuses its agent's `task done` without a summary, never a
+/// person's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndBy {
+    Agent,
+    Hand,
+}
+
+/// How an idle agent ended its turn, read from its pane before a task is
+/// settled `done` (`Actor::pane_end`).
+enum PaneEnd {
+    Finished,
+    Question(String),
+    ShellRunning,
 }
 
 /// Who asked for a close. `pastor task close` refuses what herdr refuses;
@@ -869,6 +1127,20 @@ impl Actor {
                 tokio::time::interval(Duration::from_millis(50).max(self.settings.settle / 4));
             let mut reconcile_tick = tokio::time::interval(self.settings.reconcile_every);
             reconcile_tick.tick().await; // first tick fires immediately; we just reconciled
+            // Auto-close runs after each reconcile. A grace shorter than
+            // `reconcile_every` gets its own tick as well, or a 5s grace
+            // would wait up to a whole reconcile.
+            let close_every = self
+                .settings
+                .close_done_after
+                .filter(|after| *after < self.settings.reconcile_every)
+                .map(|after| after.max(Duration::from_millis(50)));
+            let mut close_tick =
+                tokio::time::interval(close_every.unwrap_or(self.settings.reconcile_every));
+            close_tick.tick().await; // first tick fires immediately; we just reconciled
+            // Only while the last reconcile went through: a machine whose
+            // events will not open is not one to start closing panes on.
+            let mut reconciled = true;
             loop {
                 tokio::select! {
                     cmd = self.rx.recv() => {
@@ -915,7 +1187,7 @@ impl Actor {
                         }
                     }
                     _ = reconcile_tick.tick() => {
-                        let reconciled = match self.reconcile().await {
+                        reconciled = match self.reconcile().await {
                             Ok(false) => true,
                             Ok(true) => {
                                 match self.open_events().await {
@@ -935,14 +1207,19 @@ impl Actor {
                             }
                         };
                         // Only here, connected: the poll loop reconciles too, but
-                        // a machine whose events will not open is not one to
-                        // start closing panes on.
+                        // it does not close panes.
                         if reconciled && let Err(err) = self.auto_close_done().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "auto-close failed"); break; }
                             tracing::warn!(machine = %self.name, %err, "auto-close failed; staying connected");
                         }
                         if reconciled {
                             self.refresh_pastor_version().await;
+                        }
+                    }
+                    _ = close_tick.tick(), if reconciled && close_every.is_some() => {
+                        if let Err(err) = self.auto_close_done().await {
+                            if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "auto-close failed"); break; }
+                            tracing::warn!(machine = %self.name, %err, "auto-close failed; staying connected");
                         }
                     }
                 }
@@ -1043,6 +1320,8 @@ impl Actor {
                     Some(MachineCommand::Close { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::Send { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                     Some(MachineCommand::End { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::Pause { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
+                    Some(MachineCommand::Resume { reply, .. }) => { let _ = reply.send(Err(anyhow::anyhow!("machine {} is not connected", self.name))); }
                 },
             }
         }
@@ -1060,8 +1339,8 @@ impl Actor {
                 // An orphan holds a pane and an agent just like a task does;
                 // leaving it out would let the picker over-dispatch.
                 let mut s = self.status.write().unwrap();
-                s.live = v.len() + self.orphans.len();
-                s.live_jobs = v.iter().filter(|t| t.from_job()).count();
+                count_live(&mut s, &v);
+                s.live += self.orphans.len();
                 s.orphans = self.orphans.iter().map(|(name, _)| name.clone()).collect();
             }
             Err(err) => {
@@ -1081,8 +1360,34 @@ impl Actor {
         self.emit_with(kind, task_id, None);
     }
 
-    /// `emit` with a `PastorEvent::detail`.
+    /// `emit` with a `PastorEvent::detail`. A task that turns `done` or
+    /// `failed` here ends a round with no summary from its agent, so the
+    /// round keeps the pane's last lines (`Store::end_round`); `end_task`
+    /// ends its own with what the agent said.
     fn emit_with(&self, kind: &str, task_id: Option<i64>, detail: Option<serde_json::Value>) {
+        let summary = task_id.filter(|_| matches!(kind, "task.done" | "task.failed"));
+        let summary = summary.and_then(|id| match self.store.end_round(id, None) {
+            Ok(summary) => Some(summary),
+            Err(err) => {
+                tracing::error!(machine = %self.name, %err, id, "save the task's summary");
+                None
+            }
+        });
+        self.send_event(kind, task_id, detail, summary);
+    }
+
+    /// Send the event as it is, the task's job read from its row. `summary`
+    /// is the round's summary at the moment the event is queued
+    /// (`task.done`/`task.failed` only): it travels with the event rather
+    /// than being read back from the store when the record is built, since
+    /// by then the store may hold a later round's summary.
+    fn send_event(
+        &self,
+        kind: &str,
+        task_id: Option<i64>,
+        detail: Option<serde_json::Value>,
+        summary: Option<TaskSummary>,
+    ) {
         let job = task_id.and_then(|id| match self.store.get_task(id) {
             Ok(t) => t.map(|t| t.job),
             Err(err) => {
@@ -1097,6 +1402,7 @@ impl Actor {
             task_id,
             machine: Some(self.name.clone()),
             job,
+            summary,
         });
     }
 
@@ -1256,7 +1562,7 @@ impl Actor {
     async fn handle_command(&mut self, cmd: MachineCommand) -> CommandOutcome {
         match cmd {
             MachineCommand::Dispatch { task_id, reply } => {
-                let (result, mut dead) = self.run_dispatch(task_id).await;
+                let (result, mut dead) = self.run_dispatch(task_id, false).await;
                 if matches!(&result, Ok(t) if t.state == TaskState::Blocked)
                     && let Err(err) = self.auto_trust().await
                 {
@@ -1300,9 +1606,40 @@ impl Actor {
                     CommandOutcome::Nothing
                 }
             }
-            MachineCommand::End { task_id, reply } => {
-                let _ = reply.send(self.end_task(task_id));
+            MachineCommand::End {
+                task_id,
+                summary,
+                by,
+                reply,
+            } => {
+                let _ = reply.send(self.end_task(task_id, summary, by));
                 CommandOutcome::Nothing
+            }
+            MachineCommand::Pause {
+                task_id,
+                for_task,
+                reply,
+            } => {
+                let result = self.pause_task(task_id, for_task).await;
+                let dead = matches!(&result, Err(err) if is_outage(err));
+                self.refresh_live();
+                let _ = reply.send(result);
+                if dead {
+                    CommandOutcome::Reconnect
+                } else {
+                    CommandOutcome::Nothing
+                }
+            }
+            MachineCommand::Resume { task_id, reply } => {
+                let (result, dead) = self.run_dispatch(task_id, true).await;
+                let changed = result.is_ok();
+                self.refresh_live();
+                let _ = reply.send(result);
+                match (dead, changed) {
+                    (true, _) => CommandOutcome::Reconnect,
+                    (false, true) => CommandOutcome::Resubscribe,
+                    (false, false) => CommandOutcome::Nothing,
+                }
             }
             MachineCommand::Read {
                 task_id,
@@ -1408,7 +1745,20 @@ impl Actor {
             let detail = serde_json::json!({"keys": keys, "trust": true});
             (None, keys, detail)
         } else {
-            (input.text.clone(), input.key_sequence(), input.detail())
+            // Text that reopens a done task is new work, a new round: it
+            // asks for a summary again, on the same line so no newline is
+            // typed. A reply to an open task gets nothing: the prompt's
+            // line is still in the agent's context.
+            let text = input
+                .text
+                .clone()
+                .map(|text| match task.spec.summary.ask_line() {
+                    Some(line) if task.state == TaskState::Done => {
+                        format!("{} {line}", text.trim_end())
+                    }
+                    _ => text,
+                });
+            (text, input.key_sequence(), input.detail())
         };
         let timeout = self.settings.request_timeout;
         let sent = tokio::time::timeout(timeout, async {
@@ -1430,6 +1780,8 @@ impl Actor {
             Err(_) => return (Err(TimedOut("pane input", timeout).into()), true),
         }
         self.emit_with("task.input", Some(task.id), Some(detail));
+        // Whatever the agent does next answers this input, not the prompt.
+        self.unseen_prompt.remove(&task.id);
         if task.state == TaskState::Done {
             return (self.reopen(task), false);
         }
@@ -1452,7 +1804,18 @@ impl Actor {
     /// pane on this machine (starting, running, blocked, stale or done)
     /// becomes `done` and `ended`; its pane stays for `close_done_after`, as
     /// any done task's does, so the agent can finish the turn it said so in.
-    fn end_task(&mut self, task_id: i64) -> anyhow::Result<Task> {
+    ///
+    /// A task whose `summary` is `require` refuses its own agent's `task
+    /// done` without a summary (`SUMMARY_REQUIRED`) and leaves the row as
+    /// it was, so the agent can run it again; a round it already ended with
+    /// one keeps it. A person's is not refused; the round reads
+    /// `ENDED_BY_HAND`.
+    fn end_task(
+        &mut self,
+        task_id: i64,
+        summary: Option<String>,
+        by: EndBy,
+    ) -> anyhow::Result<Task> {
         let Some(task) = self.store.get_task(task_id)? else {
             let err = SendRefused {
                 code: "task_not_found",
@@ -1473,6 +1836,19 @@ impl Actor {
             };
             return Err(err.into());
         }
+        let summary = summary.filter(|s| !s.trim().is_empty());
+        let required = task.spec.summary == crate::task::SummaryMode::Require;
+        if required && summary.is_none() && by == EndBy::Agent && !task.ended {
+            let err = SendRefused {
+                code: crate::task::SUMMARY_REQUIRED,
+                message: format!(
+                    "{} needs a summary: pastor task done --summary-file - <<'EOF', then a first line done, partial, blocked or nothing to do, up to five short lines, and EOF",
+                    task.display_id()
+                ),
+            };
+            return Err(err.into());
+        }
+        let by_hand = required && summary.is_none() && by == EndBy::Hand;
         let was_done = task.state == TaskState::Done;
         let written = write_task(&self.store, task, |t| {
             if !live(t) || t.ended {
@@ -1489,17 +1865,37 @@ impl Actor {
             t.ended = true;
             true
         })?;
-        let Some(t) = written else {
-            return self
-                .store
-                .get_task(task_id)?
-                .ok_or_else(|| anyhow::anyhow!("t-{task_id} not found"));
-        };
-        self.idle_agents.remove(&t.id);
-        if !was_done {
-            self.emit("task.done", Some(t.id));
+        let ended_now = written
+            .as_ref()
+            .is_some_and(|t| !was_done && t.state == TaskState::Done);
+        if ended_now {
+            // The round ends here, with what the agent said or the pane.
+            let round = if by_hand {
+                self.store.end_round_by_hand(task_id)
+            } else {
+                self.store.end_round(task_id, summary.as_deref())
+            };
+            let round = match round {
+                Ok(round) => Some(round),
+                Err(err) => {
+                    tracing::error!(machine = %self.name, %err, task_id, "save the task's summary");
+                    None
+                }
+            };
+            self.idle_agents.remove(&task_id);
+            self.send_event("task.done", Some(task_id), None, round);
+        } else {
+            if written.is_some() {
+                self.idle_agents.remove(&task_id);
+            }
+            // Already done: what the agent says now is how that round ended.
+            if let Some(summary) = &summary {
+                self.store.replace_last_summary(task_id, summary)?;
+            }
         }
-        Ok(t)
+        self.store
+            .get_task(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("t-{task_id} not found"))
     }
 
     /// A done task that was just given more to do runs again. The baseline
@@ -1582,6 +1978,10 @@ impl Actor {
                     anyhow::bail!("task {name} is on machine {m}, not {}", self.name)
                 }
                 Some(_) => {}
+            }
+            // A paused task has no pane or agent; only its checkout.
+            if t.state == TaskState::Paused {
+                return self.close_paused(t.clone(), remove_worktree).await;
             }
             // A closed row with no workspace had its worktree removed (or
             // noted for manual cleanup) already: nothing is left to do.
@@ -2056,6 +2456,43 @@ impl Actor {
         self.finish_close(t)
     }
 
+    /// `close_inner` for a paused task: its pane is gone already, so a plain
+    /// close is the row alone. With `remove_worktree` its checkout, kept
+    /// when it was paused, is opened in a workspace (`open_checkout`) and
+    /// removed through it; a dirty one stays, the workspace goes again, and
+    /// the task stays paused, as `task close --remove-worktree` leaves any
+    /// task whose checkout herdr refuses.
+    async fn close_paused(&mut self, t: Task, remove_worktree: bool) -> anyhow::Result<Task> {
+        if !remove_worktree {
+            return self.finish_close(t);
+        }
+        let name = t.display_id();
+        let Some(created) = self.open_checkout(&t, &name).await? else {
+            // Gone already: nothing left to remove.
+            return self.finish_close(t);
+        };
+        if created.already_open {
+            let why = format!(
+                "workspace {} shows it and pastor did not open it",
+                created.workspace.workspace_id
+            );
+            let note = worktree_kept_note(&t, &name, &why);
+            return self.finish_close_with_note(t, note);
+        }
+        let timeout = self.settings.request_timeout;
+        let ws = created.workspace.workspace_id.clone();
+        let removed = tokio::time::timeout(timeout, self.connector.worktree_remove(&ws, false))
+            .await
+            .map_err(|_| TimedOut("worktree.remove", timeout))?;
+        match removed {
+            Ok(()) => self.finish_close(t),
+            Err(err) => {
+                self.close_reopened(Some(&created.root_pane.pane_id)).await;
+                Err(anyhow::Error::from(err).context(format!("remove the worktree of {name}")))
+            }
+        }
+    }
+
     fn finish_close(&mut self, t: Task) -> anyhow::Result<Task> {
         let was = t.state;
         let closed = self.store.close_task(t.id)?;
@@ -2085,7 +2522,7 @@ impl Actor {
     /// Close the done tasks on this machine that finished `close_done_after`
     /// ago or more, through the same path as `pastor task close`. Failed,
     /// blocked and stale tasks are never closed on their own. A task herdr
-    /// will not close is logged and tried again at the next reconcile; only a
+    /// will not close is logged and tried again at the next check; only a
     /// failure below the API is returned, so the caller can reconnect.
     async fn auto_close_done(&mut self) -> anyhow::Result<()> {
         let Some(after) = self.settings.close_done_after else {
@@ -2123,7 +2560,7 @@ impl Actor {
                     tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed: a new completion has not settled yet");
                 }
                 Err(err) => {
-                    tracing::warn!(machine = %self.name, task = %t.display_id(), err = format!("{err:#}"), "auto-close failed; trying again at the next reconcile");
+                    tracing::warn!(machine = %self.name, task = %t.display_id(), err = format!("{err:#}"), "auto-close failed; trying again at the next check");
                 }
             }
         }
@@ -2162,19 +2599,88 @@ impl Actor {
         }
     }
 
-    async fn run_dispatch(&mut self, task_id: i64) -> (anyhow::Result<Task>, bool) {
+    /// `MachineCommand::Pause`. The agent is interrupted first (`esc`, so
+    /// Claude ends its turn and saves the conversation as it stands), then
+    /// its pane closes, which ends the agent; a worktree stays on disk, since
+    /// only `worktree.remove` deletes one. The row goes `paused` last, with
+    /// no pane or workspace: the pane is gone, and the workspace closed with
+    /// its last pane or is someone else's.
+    async fn pause_task(&mut self, task_id: i64, for_task: i64) -> anyhow::Result<Task> {
+        let task = self
+            .store
+            .get_task(task_id)?
+            .with_context(|| format!("task t-{task_id} not found"))?;
+        let refuse = |why: &str| PauseRefused {
+            task: task.display_id(),
+            why: why.to_string(),
+        };
+        if task.machine.as_deref() != Some(&self.name) {
+            return Err(refuse(&format!("it is not on {}", self.name)).into());
+        }
+        let kind = self.settings.agents.kind(&task.spec.agent).to_string();
+        if let Some(why) = crate::task::why_not_pausable(&task, &kind, Utc::now()) {
+            return Err(refuse(why).into());
+        }
+        let name = task.display_id();
+        if let Some(pane) = task.pane_id.as_deref() {
+            let timeout = self.settings.request_timeout;
+            let keys = ["esc".to_string()];
+            match tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
+                .await
+                .map_err(|_| TimedOut("pane.send_keys", timeout))?
+            {
+                Ok(()) => {}
+                // Gone already: nothing left to interrupt.
+                Err(err) if err.code() == Some("pane_not_found") => {}
+                Err(err) => {
+                    return Err(
+                        anyhow::Error::from(err).context(format!("interrupt the agent of {name}"))
+                    );
+                }
+            }
+            self.close_pane_of(pane, &name).await?;
+        }
+        self.pending_done.remove(&task_id);
+        let now = Utc::now();
+        let paused = write_task(&self.store, task, |t| {
+            if !t.state.occupies_pane() {
+                return false;
+            }
+            t.state = TaskState::Paused;
+            t.pane_id = None;
+            t.workspace_id = None;
+            t.prompt_pending = false;
+            t.activity_seen = false;
+            t.error = None;
+            t.pause.paused_at = Some(now);
+            t.pause.paused_for = Some(for_task);
+            true
+        })?
+        .with_context(|| format!("{name} moved on while it was paused"))?;
+        self.emit("task.paused", Some(task_id));
+        Ok(paused)
+    }
+
+    async fn run_dispatch(&mut self, task_id: i64, resume: bool) -> (anyhow::Result<Task>, bool) {
         // The claim is the `Queued -> Starting` transition done as a conditional
         // UPDATE: a task another pass already took, or that finished meanwhile,
         // is simply not claimable. It also persists `machine` and `agent_name`
         // before the first herdr call, so a daemon crash mid-dispatch leaves a
         // row `reconcile` can adopt by agent name instead of one that still reads
         // `Queued` and gets dispatched twice.
-        let mut task = match self.store.claim_task(task_id, &self.name) {
+        // A paused task is claimed only on the machine it was paused on.
+        let claimed = if resume {
+            self.store.claim_paused(task_id, &self.name)
+        } else {
+            self.store.claim_task(task_id, &self.name)
+        };
+        let mut task = match claimed {
             Ok(Some(t)) => t,
             Ok(None) => {
+                let what = if resume { "paused here" } else { "queued" };
                 return (
                     Err(anyhow::anyhow!(
-                        "task t-{task_id} is not queued (already claimed, finished, or unknown)"
+                        "task t-{task_id} is not {what} (already claimed, finished, or unknown)"
                     )),
                     false,
                 );
@@ -2183,18 +2689,17 @@ impl Actor {
         };
         self.keep_occupied_checkout(&mut task).await;
         let timeout = self.settings.request_timeout;
-        let outcome = match tokio::time::timeout(
-            timeout,
-            dispatch(
-                self.connector.as_ref(),
-                &mut task,
-                &self.settings.agents,
-                self.settings.head_address.as_deref(),
-                self.settings.agent_ready_timeout,
-            ),
-        )
-        .await
-        {
+        let start = async {
+            let (conn, agents) = (self.connector.as_ref(), &self.settings.agents);
+            let head = self.settings.head_address.as_deref();
+            let ready = self.settings.agent_ready_timeout;
+            if resume {
+                crate::dispatch::resume(conn, &mut task, agents, head, ready).await
+            } else {
+                dispatch(conn, &mut task, agents, head, ready).await
+            }
+        };
+        let outcome = match tokio::time::timeout(timeout, start).await {
             Ok(outcome) => outcome,
             // `dispatch()` itself never got to resolve, so its own Failed-recording
             // never ran; do the same bookkeeping it would have done on an error, and
@@ -2220,6 +2725,10 @@ impl Actor {
         }
         match outcome {
             Ok(_) => {
+                // A resume's prompt can be lost as a dispatch's can.
+                if task.state == TaskState::Running && !task.activity_seen {
+                    self.expect_uptake(task.id);
+                }
                 self.emit(&format!("task.{}", task.state), Some(task.id));
                 (Ok(task), dead)
             }
@@ -2308,23 +2817,33 @@ impl Actor {
         if matches!(status, AgentStatus::Blocked | AgentStatus::Unknown) {
             return Ok(false);
         }
-        if let Some(at) = self.trust_answered.get(&task.id) {
-            if at.elapsed() < self.settings.settle {
+        match self.trust_answered.get(&task.id) {
+            Some(at) if at.elapsed() < self.settings.settle => {
                 // Still redrawing after its trust dialog: the settle tick
                 // sends it (`deliver_held_prompts`).
                 return Ok(true);
             }
-            self.trust_answered.remove(&task.id);
+            Some(_) => {
+                self.trust_answered.remove(&task.id);
+            }
+            None if task.state == TaskState::Blocked => {
+                // Out of its startup block with no answer from pastor: a
+                // person answered it at the pane, just now. The agent redraws
+                // as after any trust answer, so the prompt waits out `settle`.
+                self.trust_answered.insert(task.id, Instant::now());
+                return Ok(true);
+            }
+            None => {}
         }
         let name = task
             .agent_name
             .clone()
             .unwrap_or_else(|| Task::agent_name_for(task.id));
         let timeout = self.settings.request_timeout;
-        let result =
-            tokio::time::timeout(timeout, self.connector.agent_prompt(&name, &task.prompt))
-                .await
-                .map_err(|_| TimedOut("agent.prompt", timeout))?;
+        let prompt = crate::task::prompt_to_send(&task);
+        let result = tokio::time::timeout(timeout, self.connector.agent_prompt(&name, &prompt))
+            .await
+            .map_err(|_| TimedOut("agent.prompt", timeout))?;
         let id = task.id;
         // Only a row still waiting for this prompt, on a live pane, takes the
         // outcome. A row closed or failed meanwhile is left as it is.
@@ -2376,6 +2895,12 @@ impl Actor {
             }
         };
         self.pending_done.remove(&id);
+        if written
+            .as_ref()
+            .is_some_and(|t| t.state == TaskState::Running && !t.activity_seen)
+        {
+            self.expect_uptake(id);
+        }
         // A row left alone keeps what it had: nothing seen while the prompt
         // was pending counted as activity (see `apply`).
         if let Some(t) = written {
@@ -2403,21 +2928,25 @@ impl Actor {
             .await
             .map_err(|_| TimedOut("agent.list", timeout))??;
         for id in due {
-            self.trust_answered.remove(&id);
-            let Ok(Some(task)) = self.store.get_task(id) else {
-                continue;
-            };
-            if !task.prompt_pending || !task.state.occupies_pane() {
-                continue;
+            let found = self
+                .store
+                .get_task(id)
+                .ok()
+                .flatten()
+                .filter(|t| t.prompt_pending && t.state.occupies_pane())
+                .and_then(|t| {
+                    let agent = agents
+                        .iter()
+                        .find(|a| Some(&a.pane_id) == t.pane_id.as_ref())?;
+                    Some((t, agent.agent_status))
+                });
+            if let Some((task, status)) = found {
+                // Its entry is still there and due, so the prompt goes in now
+                // rather than being held again as a fresh answer.
+                self.deliver_pending_prompt(task, status).await?;
             }
-            let Some(agent) = agents
-                .iter()
-                .find(|a| Some(&a.pane_id) == task.pane_id.as_ref())
-            else {
-                continue;
-            };
-            self.deliver_pending_prompt(task, agent.agent_status)
-                .await?;
+            // Sent, or blocked again: leaving the block next starts a new hold.
+            self.trust_answered.remove(&id);
         }
         Ok(())
     }
@@ -2465,10 +2994,23 @@ impl Actor {
                     .insert(id, (Some(agent.state_change_seq), Instant::now()));
                 continue;
             }
+            // Idle a whole window at the sequence its prompt went in at, never
+            // seen at work: the agent did not take the prompt.
+            if idle_like
+                && task.state == TaskState::Running
+                && !task.prompt_pending
+                && !task.activity_seen
+                && task.last_completion_seq == Some(agent.state_change_seq)
+                && let Some(&resent) = self.unseen_prompt.get(&id)
+            {
+                self.prompt_not_taken(task, agent.agent_status, resent)
+                    .await?;
+                continue;
+            }
             let observed = observed_from(agent);
-            let question = if next_state(&task, &observed) == Some(TaskState::Done) {
-                match self.question_in_pane(&task).await {
-                    Ok(q) => q,
+            let end = if next_state(&task, &observed) == Some(TaskState::Done) {
+                match self.pane_end(&task).await {
+                    Ok(end) => end,
                     Err(err) => {
                         // Not done yet: the pane could not be read because the
                         // machine is out of reach. Keep the task pending for the
@@ -2478,41 +3020,103 @@ impl Actor {
                     }
                 }
             } else {
-                None
+                PaneEnd::Finished
             };
-            if let Some(question) = question {
-                self.block_on_question(task, &observed, question);
-                continue;
+            match end {
+                PaneEnd::Question(question) => self.block_on_question(task, &observed, question),
+                PaneEnd::ShellRunning => {
+                    // The agent ended its turn waiting on a background shell
+                    // and takes it up again when the shell ends: not done.
+                    // The window starts over at this sequence, so the next
+                    // settle check looks again.
+                    tracing::debug!(machine = %self.name, task = %task.display_id(), "background shell still running");
+                    self.pending_done.insert(id, (seen_seq, Instant::now()));
+                }
+                PaneEnd::Finished => self.apply(task, &observed),
             }
-            self.apply(task, &observed);
         }
         Ok(())
     }
 
-    /// The question the task's agent ended its turn with, read from the tail
-    /// of its pane (`task::trailing_question`). A pane herdr cannot read has
-    /// no question, so the task is done as it would have been without this
-    /// check. A lost connection or a read that never answers is an outage
-    /// (`is_outage`): the task is not settled on it, and the caller reconnects.
-    async fn question_in_pane(&self, task: &Task) -> anyhow::Result<Option<String>> {
+    /// The agent of `task` sits at an empty input with the prompt it was
+    /// given nowhere (see `unseen_prompt`): send it again, or, after
+    /// `MAX_PROMPT_RESENDS`, mark the task `blocked` so it does not read as
+    /// `running` with nothing pending. The baseline stays at the idle it sits
+    /// at, so `next_state` holds it there until the agent moves.
+    async fn prompt_not_taken(
+        &mut self,
+        task: Task,
+        status: AgentStatus,
+        resent: u8,
+    ) -> anyhow::Result<()> {
+        let id = task.id;
+        let unchanged =
+            |t: &Task| t.state == TaskState::Running && !t.prompt_pending && !t.activity_seen;
+        if resent >= MAX_PROMPT_RESENDS {
+            self.unseen_prompt.remove(&id);
+            let message = format!(
+                "agent did not take its prompt ({} sent); send it with `pastor task send`",
+                resent + 1
+            );
+            tracing::warn!(machine = %self.name, task = %task.display_id(), "{message}");
+            let written = write_task(&self.store, task, |t| {
+                if !unchanged(t) {
+                    return false;
+                }
+                t.state = TaskState::Blocked;
+                t.error = Some(message.clone());
+                true
+            })?;
+            if let Some(t) = written {
+                self.emit("task.blocked", Some(t.id));
+                self.refresh_live();
+            }
+            return Ok(());
+        }
+        tracing::warn!(machine = %self.name, task = %task.display_id(), "agent did not take its prompt; sending it again");
+        self.unseen_prompt.insert(id, resent + 1);
+        let pending = write_task(&self.store, task, |t| {
+            let resend = unchanged(t);
+            t.prompt_pending |= resend;
+            resend
+        })?;
+        if let Some(task) = pending {
+            self.deliver_pending_prompt(task, status).await?;
+        }
+        Ok(())
+    }
+
+    /// How the task's agent ended its turn, read from the tail of its pane:
+    /// on a question (`task::trailing_question`), waiting on a background
+    /// shell (`task::background_shell_running`), or finished. A pane herdr
+    /// cannot read is finished, so the task is done as it would have been
+    /// without this check. A lost connection or a read that never answers is
+    /// an outage (`is_outage`): the task is not settled on it, and the caller
+    /// reconnects.
+    async fn pane_end(&self, task: &Task) -> anyhow::Result<PaneEnd> {
         let Some(target) = task.agent_name.as_deref() else {
-            return Ok(None);
+            return Ok(PaneEnd::Finished);
         };
         let timeout = self.settings.request_timeout;
         match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
             Ok(Ok(text)) => {
+                if crate::task::background_shell_running(&text) {
+                    return Ok(PaneEnd::ShellRunning);
+                }
                 // Kept only when the task really is done: a tail left by a
                 // question would reach a later failed task's finish command.
-                let question = crate::task::trailing_question(&text);
-                if question.is_none() {
-                    self.store.note_pane_tail(task.id, &text);
-                }
-                Ok(question)
+                Ok(match crate::task::trailing_question(&text) {
+                    Some(question) => PaneEnd::Question(question),
+                    None => {
+                        self.store.note_pane_tail(task.id, &text);
+                        PaneEnd::Finished
+                    }
+                })
             }
             Ok(Err(err)) if err.is_transport() => Err(err.into()),
             Ok(Err(err)) => {
                 tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a question");
-                Ok(None)
+                Ok(PaneEnd::Finished)
             }
             Err(_) => Err(TimedOut("agent.read", timeout).into()),
         }
@@ -2557,9 +3161,21 @@ impl Actor {
             }
             AgentStatus::Working | AgentStatus::Blocked => {
                 self.idle_agents.remove(&id);
+                // It took its prompt, or stopped on something a person answers.
+                self.unseen_prompt.remove(&id);
             }
             AgentStatus::Unknown => {}
         }
+    }
+
+    /// The agent of task `id` was just given its prompt: watch that it takes
+    /// it (see `unseen_prompt`). The settle window starts now, since an agent
+    /// that lost the prompt sends no event to start one.
+    fn expect_uptake(&mut self, id: i64) {
+        self.unseen_prompt.entry(id).or_insert(0);
+        self.pending_done
+            .entry(id)
+            .or_insert((None, Instant::now()));
     }
 
     fn apply(&mut self, mut task: Task, observed: &Observed) {
@@ -2587,12 +3203,27 @@ impl Actor {
             }
             return;
         };
+        // An agent that stops without a summary on a task that requires one
+        // did not finish: the agent's own `task done --summary` is the only
+        // way such a task ends `done` (`end_task`).
+        let to = if to == TaskState::Done
+            && !task.ended
+            && task.spec.summary == crate::task::SummaryMode::Require
+        {
+            task.error = Some(crate::task::STOPPED_WITHOUT_SUMMARY.into());
+            TaskState::Failed
+        } else {
+            to
+        };
         if to == TaskState::Done || !to.is_open() {
             // The next completion needs activity of its own.
             task.activity_seen = false;
         }
         if !to.is_open() {
             self.idle_agents.remove(&task.id);
+        }
+        if to != TaskState::Running {
+            self.unseen_prompt.remove(&task.id);
         }
         if let Observed::Status {
             state_change_seq,
@@ -3024,6 +3655,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         }
     }
 
@@ -3407,6 +4040,46 @@ mod tests {
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
     }
 
+    /// Claude can end its turn with a command left running in the
+    /// background; its footer says "1 shell still running" and it takes the
+    /// turn up again when the shell ends. herdr reads it idle all the while,
+    /// but the task is not done: it stays running through settle windows
+    /// until the shell has ended and the agent went idle again.
+    #[tokio::test]
+    async fn an_agent_waiting_on_a_background_shell_is_not_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(
+            &pane,
+            "● Running make check in the background.\n\n❯\n  ⏵⏵ auto mode on · 1 shell still running\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 6).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "a background shell keeps the task running"
+        );
+
+        // The shell ended: the agent takes the turn up, pushes, goes idle.
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● make check passed. Pushed the branch.\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
     /// The pane text read to settle a task as done is kept as its tail, for
     /// its connector's finish command (`Store::take_pane_tail`).
     #[tokio::test]
@@ -3593,7 +4266,11 @@ mod tests {
             .into_iter()
             .rfind(|r| r.method == "agent.prompt")
             .expect("at least one agent.prompt request was made");
-        assert_eq!(sent.params["text"], "hi", "our prompt, not a stray one");
+        assert_eq!(
+            sent.params["text"],
+            format!("hi\n\n{}", crate::task::SUMMARY_ASK),
+            "our prompt, not a stray one, asking for a summary"
+        );
     }
 
     /// A store error in reconcile is pastor's problem, not the machine's: the
@@ -3974,6 +4651,9 @@ mod tests {
 
         fake.exit_pane(t.pane_id.as_deref().unwrap());
         wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+        // A failed task ended its round too, with no summary.
+        let failed = store.get_task(t.id).unwrap().unwrap().summary.unwrap();
+        assert_eq!(failed.outcome, crate::task::Outcome::NoSummary);
         let again = store.insert_retry(t.id).unwrap();
         assert_eq!(again.spec.reopen.as_ref().unwrap().branch, branch);
         let t = h.dispatch(again.id).await.unwrap();
@@ -5170,6 +5850,125 @@ mod tests {
         assert_eq!(state_of(&store, t.id), TaskState::Running);
     }
 
+    /// The same when a person answers the dialog at the pane: pastor sees
+    /// only the agent leave `blocked`, and still waits out the redraw.
+    #[tokio::test]
+    async fn a_trust_prompt_answered_at_the_pane_gets_the_prompt_after_the_redraw() {
+        let (fake, settings) = redrawing_after_trust();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h
+            .dispatch(repo_task(&store, "claude", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        fake.answer_trust_by_hand(t.pane_id.as_deref().unwrap());
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// An agent that sits at an empty input after its prompt went in (herdr
+    /// accepted it, the agent lost it) gets the prompt again once it has
+    /// sat idle a settle window at the sequence the prompt went in at.
+    #[tokio::test]
+    async fn a_prompt_the_agent_did_not_take_is_sent_again() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        fake.ignore_prompts(false);
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 2);
+        let t = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert!(!t.prompt_pending);
+    }
+
+    /// A resumed task's prompt is watched the same way: an agent that lost
+    /// `RESUME_PROMPT` gets it again.
+    #[tokio::test]
+    async fn a_resume_prompt_the_agent_did_not_take_is_sent_again() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let mut t = new_task(&store);
+        t.state = TaskState::Paused;
+        t.machine = Some("m".into());
+        t.spec.session_id = crate::task::new_session_id();
+        store.update_task(&mut t).unwrap();
+        let t = h.resume(t.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        fake.ignore_prompts(false);
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 2);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// An agent that never takes its prompt is not left `running` with
+    /// nothing pending: after the resends it is `blocked`, saying so.
+    #[tokio::test]
+    async fn an_agent_that_never_takes_its_prompt_ends_blocked() {
+        let fake = FakeHerdr::new();
+        fake.ignore_prompts(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        assert_eq!(
+            calls(&fake, "agent.prompt").len(),
+            1 + MAX_PROMPT_RESENDS as usize
+        );
+        let t = store.get_task(t.id).unwrap().unwrap();
+        assert!(
+            t.error.as_deref().unwrap_or("").contains("did not take"),
+            "{:?}",
+            t.error
+        );
+        assert!(saw(&mut events, "task.blocked", t.id));
+        // Left for a human: no more prompts.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            calls(&fake, "agent.prompt").len(),
+            1 + MAX_PROMPT_RESENDS as usize
+        );
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+    }
+
+    /// The same for an agent that took its trust answer: a prompt lost
+    /// anyway (a redraw longer than `settle`) is sent again.
+    #[tokio::test]
+    async fn a_prompt_lost_after_a_trust_answer_is_sent_again() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
+        fake.set_trust_redraw(Duration::from_millis(250));
+        let settings = settings_with_settle(Duration::from_millis(100));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h
+            .dispatch(repo_task(&store, "claude", Some("~/src/app")).id)
+            .await
+            .unwrap();
+        fake.answer_trust_by_hand(t.pane_id.as_deref().unwrap());
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
+        assert!(calls(&fake, "agent.prompt").len() >= 2);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
     /// The same for the actor's own answer to a trusted repo's dialog.
     #[tokio::test]
     async fn auto_trust_delivers_the_prompt_once_after_the_agent_redraws() {
@@ -5463,7 +6262,10 @@ mod tests {
         assert_eq!(
             fake.pane_input(&pane),
             [
-                crate::herdr::fake::PaneInput::Text("commit and push".into()),
+                crate::herdr::fake::PaneInput::Text(format!(
+                    "commit and push {}",
+                    crate::task::SUMMARY_ASK
+                )),
                 crate::herdr::fake::PaneInput::Keys(vec!["Enter".into()]),
             ]
         );
@@ -5544,6 +6346,25 @@ mod tests {
         found
     }
 
+    /// A grace shorter than `reconcile_every` is not stretched to it: auto-close
+    /// runs on its own tick, so the task closes long before the next reconcile.
+    #[tokio::test]
+    async fn a_short_grace_closes_before_the_next_reconcile() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(30),
+            ..auto_close_settings()
+        };
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = run_to_done(&h, &fake, &store, new_task(&store)).await;
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+    }
+
     #[tokio::test]
     async fn a_done_task_is_closed_after_close_done_after() {
         let fake = FakeHerdr::new();
@@ -5594,12 +6415,12 @@ mod tests {
             store.get_task(t.id).unwrap().unwrap().activity_seen
         })
         .await;
-        let ended = h.end(t.id).await.unwrap();
+        let ended = h.end(t.id, None).await.unwrap();
         assert_eq!(ended.state, TaskState::Done);
         assert!(ended.ended);
         assert_eq!(count(&mut events, "task.done", t.id).len(), 1);
         // Ending again changes nothing and says nothing.
-        assert!(h.end(t.id).await.unwrap().ended);
+        assert!(h.end(t.id, None).await.unwrap().ended);
         let before = lists(&fake);
         wait_for("a few reconciles", || lists(&fake) >= before + 4).await;
         assert_eq!(state_of(&store, t.id), TaskState::Done, "still at work");
@@ -5613,6 +6434,178 @@ mod tests {
         );
         assert!(count(&mut events, "task.done", t.id).is_empty());
         wait_for("live drops", || h.snapshot().live == 0).await;
+    }
+
+    /// `task done --summary` ends the round with what the agent said; said
+    /// again, it replaces that round's rather than starting another.
+    #[tokio::test]
+    async fn a_task_ended_with_a_summary_keeps_it_for_its_round() {
+        use crate::task::{Outcome, SummarySource};
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let ended = h
+            .end(t.id, Some("partial: tests left\npushed pastor/t-1".into()))
+            .await
+            .unwrap();
+        let summary = ended.summary.expect("the reply carries the summary");
+        assert_eq!(summary.round, 1);
+        assert_eq!(summary.outcome, Outcome::Partial);
+        assert_eq!(summary.source, SummarySource::Agent);
+        assert_eq!(count(&mut events, "task.done", t.id).len(), 1);
+        let again = h.end(t.id, Some("done".into())).await.unwrap();
+        assert_eq!(again.summary.unwrap().outcome, Outcome::Done);
+        let all = store.summaries(t.id).unwrap();
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(count(&mut events, "task.done", t.id).is_empty());
+    }
+
+    /// A task pastor finds done on its own ends a round with no summary,
+    /// holding the pane's last lines; the tail stays for the finish command,
+    /// and a summary the agent sends after replaces that round's.
+    #[tokio::test]
+    async fn a_round_with_no_summary_keeps_the_end_of_the_pane() {
+        use crate::task::{Outcome, SummarySource};
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(100)),
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● Opened https://example.org/pr/7\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        let done = store.get_task(t.id).unwrap().unwrap();
+        let summary = done.summary.expect("a done task shows its round");
+        assert_eq!(summary.outcome, Outcome::NoSummary);
+        assert_eq!(summary.source, SummarySource::Pane);
+        assert!(summary.text.contains("example.org/pr/7"), "{summary:?}");
+        assert!(store.take_pane_tail(t.id).is_some(), "left for the finish");
+        let late = h.end(t.id, Some("done: PR 7".into())).await.unwrap();
+        let late = late.summary.unwrap();
+        assert_eq!((late.round, late.outcome), (1, Outcome::Done));
+        assert_eq!(late.source, SummarySource::Agent);
+    }
+
+    /// A task whose `summary` is `require`.
+    fn new_required_task(store: &Store) -> Task {
+        store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    summary: crate::task::SummaryMode::Require,
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// With `require`, the agent's own `task done` without a summary is
+    /// refused and leaves the task as it was; with one it ends `done`.
+    #[tokio::test]
+    async fn a_required_summary_refuses_the_agents_bare_task_done() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_required_task(&store).id).await.unwrap();
+        let err = h.end(t.id, None).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<SendRefused>().map(|r| r.code),
+            Some(crate::task::SUMMARY_REQUIRED)
+        );
+        assert!(err.to_string().contains("--summary-file -"), "{err}");
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert!(store.summaries(t.id).unwrap().is_empty());
+        let done = h
+            .end(t.id, Some("blocked: no access".into()))
+            .await
+            .unwrap();
+        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(
+            done.summary.unwrap().outcome,
+            crate::task::Outcome::Blocked,
+            "any outcome counts"
+        );
+        // Ended with one: a bare `task done` after it keeps it.
+        let again = h.end(t.id, None).await.unwrap();
+        assert_eq!(
+            again.summary.unwrap().outcome,
+            crate::task::Outcome::Blocked
+        );
+    }
+
+    /// With `require`, a person's `task done t-N` is not refused; the round
+    /// says it was ended by hand.
+    #[tokio::test]
+    async fn a_required_summary_lets_a_person_end_the_task() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_required_task(&store).id).await.unwrap();
+        let done = h.end_by(t.id, None, EndBy::Hand).await.unwrap();
+        assert_eq!(done.state, TaskState::Done);
+        let round = done.summary.unwrap();
+        assert_eq!(round.outcome, crate::task::Outcome::NoSummary);
+        assert_eq!(round.text, crate::task::ENDED_BY_HAND);
+    }
+
+    /// With `require`, an agent pastor finds idle and finished without a
+    /// summary ends the task `failed`, with the pane's last lines kept;
+    /// with `ask` the same finish is `done`.
+    #[tokio::test]
+    async fn a_required_summary_fails_an_idle_finish_without_one() {
+        use crate::task::{Outcome, SummarySource};
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            settings_with_settle(Duration::from_millis(100)),
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_required_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(&pane, "● All finished\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("failed", || state_of(&store, t.id) == TaskState::Failed).await;
+        let failed = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            failed.error.as_deref(),
+            Some(crate::task::STOPPED_WITHOUT_SUMMARY)
+        );
+        let round = failed.summary.expect("a failed task shows its round");
+        assert_eq!(round.outcome, Outcome::NoSummary);
+        assert_eq!(round.source, SummarySource::Pane);
+        assert!(round.text.contains("All finished"), "{round:?}");
     }
 
     /// Typing into an ended task gives it more to do: it runs again, and no
@@ -5630,7 +6623,19 @@ mod tests {
         let t = h.dispatch(new_task(&store).id).await.unwrap();
         let pane = t.pane_id.clone().unwrap();
         fake.set_status(&pane, AgentStatus::Working);
-        h.end(t.id).await.unwrap();
+        let typed = || {
+            let sent = calls(&fake, "pane.send_text");
+            sent.last().unwrap()["text"].as_str().unwrap().to_string()
+        };
+        // A reply to a running task: nothing added.
+        let reply = SendInput {
+            text: Some("carry on".into()),
+            enter: true,
+            ..Default::default()
+        };
+        h.send(t.id, reply).await.unwrap();
+        assert_eq!(typed(), "carry on");
+        h.end(t.id, None).await.unwrap();
         // The rest of the turn after `task done`: work, then idle.
         fake.set_status(&pane, AgentStatus::Working);
         wait_for("activity recorded", || {
@@ -5651,6 +6656,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sent.state, TaskState::Running);
+        // New work asks for a summary again.
+        assert_eq!(
+            typed(),
+            format!("one more thing {}", crate::task::SUMMARY_ASK)
+        );
         assert!(!sent.ended);
         assert!(!store.get_task(t.id).unwrap().unwrap().ended);
         // An idle report before the agent picks the input up must not count
@@ -5675,14 +6685,14 @@ mod tests {
         })
         .await;
         let queued = new_task(&store);
-        let err = h.end(queued.id).await.unwrap_err();
+        let err = h.end(queued.id, None).await.unwrap_err();
         assert_eq!(
             err.downcast_ref::<SendRefused>().map(|r| r.code),
             Some("task_not_live"),
             "{err:#}"
         );
         assert_eq!(state_of(&store, queued.id), TaskState::Queued);
-        let err = h.end(999).await.unwrap_err();
+        let err = h.end(999, None).await.unwrap_err();
         assert_eq!(
             err.downcast_ref::<SendRefused>().map(|r| r.code),
             Some("task_not_found"),
@@ -6556,9 +7566,10 @@ mod tests {
         // An idle event with no state change behind it (herdr sends one when a
         // human looks at a `done` pane) is a candidate, not a completion.
         fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
-        // Several settle windows (100ms) and reconciles (200ms).
+        // Several settle windows (100ms) and reconciles (200ms). The prompt
+        // is sent again meanwhile, and then the task is blocked; never done.
         tokio::time::sleep(Duration::from_millis(700)).await;
-        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert_ne!(state_of(&store, t.id), TaskState::Done);
         assert!(!saw(&mut events, "task.done", t.id));
     }
 

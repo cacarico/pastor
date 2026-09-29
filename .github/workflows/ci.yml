@@ -6,8 +6,10 @@
 # it is dropped; `workflow_dispatch` keeps a manual way to run it (for a
 # direct push to main that skipped a PR, or to re-check main by hand).
 # `check`, `test-machine` and `portability` only exercise what they build
-# or read, so `paths:` skips docs-only changes; gitleaks has no such filter
-# because a secret can land in any file.
+# or read, so `paths:` skips docs-only changes, but not the docs the tests
+# read (README.md, docs/manual.md, docs/recommended-setup.md, the website
+# content, everything under skills/, the plugin manifest);
+# gitleaks has no such filter because a secret can land in any file.
 name: ci
 
 on:
@@ -15,17 +17,26 @@ on:
     paths:
       - "src/**"
       - "tests/**"
-      - "skills/pastor/SKILL.md"
+      - "skills/**"
+      - "README.md"
+      - "docs/manual.md"
+      - "docs/recommended-setup.md"
+      - "docs/website/content/**"
+      - ".claude-plugin/plugin.json"
       - "contrib/systemd/**"
       - "contrib/launchd/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
+      - "scripts/changelog.sh"
       - ".github/workflows/ci.yml"
       - ".github/workflows/release.yml"
       - "install.sh"
       - ".github/actions/**"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -38,16 +49,25 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1, 2026-09-12
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # fmt-check, clippy -D warnings and the whole suite, including
       # tests/cli.rs against fake-herdr.
       - run: make check
       # The machine actor tests five times over, to catch timing flakes.
       - run: make test-machine
+      # The CLI against a head over a real ssh: every other test runs a fake
+      # ssh, which let a ControlPath too long for a unix socket through in
+      # 0.7.0. sshd runs as the runner's user; /run/sshd is the privilege
+      # separation dir it checks for at start.
+      - run: |
+          sudo apt-get install -y --no-install-recommends openssh-server
+          sudo mkdir -p /run/sshd
+      - run: make test-ssh
 
   # The release builds are static musl binaries and a FreeBSD build is the
   # source-only route, so a change that only compiles against glibc on
@@ -59,11 +79,12 @@ jobs:
   portability:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1, 2026-09-12
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl, armv7-unknown-linux-musleabihf, x86_64-unknown-freebsd
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: ./.github/actions/zig
       - run: |
           for target in x86_64-unknown-linux-musl armv7-unknown-linux-musleabihf x86_64-unknown-freebsd; do

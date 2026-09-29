@@ -48,6 +48,11 @@ down here because getting them wrong cost a day.
   `task::trailing_question` looks for a last `●` message ending in `?`; if so
   the task goes `blocked` with its baseline moved to that idle, and
   `next_state` keeps a blocked task at that same sequence where it is.
+- herdr also shows Claude idle while it waits on a background shell it
+  left running at the end of its turn (footer: `1 shell still running`);
+  Claude picks the turn up when the shell ends. The same pane read
+  (`task::background_shell_running`) keeps such a task pending and running,
+  and looks again after the next settle window.
 - A herdr error reply is an API error with a code, never a dead connection.
   Only EOF before a reply, spawn failure or a non-zero exit with no reply are
   transport failures, and only those make a machine `lost`.
@@ -66,8 +71,9 @@ down here because getting them wrong cost a day.
 
 - `make check` is the gate: fmt check, clippy with warnings as errors, the
   full suite. Run it before every commit. `make help` lists the rest.
-- CI (`.github/workflows/ci.yml`) runs `make check` and `make test-machine` on
-  every pull request that touches code (`paths:` skips docs-only diffs), or
+- CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine` and
+  `make test-ssh` (the CLI against a head over a real ssh, through a
+  throwaway sshd on localhost; `tests/real_ssh.rs`) on every pull request that touches code (`paths:` skips docs-only diffs), or
   by hand (`workflow_dispatch`). Since this project merges by fast-forwarding
   a PR's exact head sha to main, that sha was already checked on its PR, so
   push-to-main does not run `check` again; a direct push that skips a PR goes
@@ -110,8 +116,15 @@ down here because getting them wrong cost a day.
   usage errors stay plain text with exit 2.
 - Rust edition 2024, toolchain from mise. No new runtime dependencies without
   a reason in the commit body.
+- A changelog entry is its own file, `changes/<branch>.md` (slashes as
+  dashes, Keep a Changelog `###` subsections inside), never a line in
+  `CHANGELOG.md`, so two pull requests never conflict over it. `make check`
+  (`scripts/changelog.sh check`) fails on an Unreleased section or a
+  malformed change file; `changes/README.md` has the format.
 - Releases are tagged `vX.Y.Z` on `main` with a signed tag. `CHANGELOG.md`
-  gets one section per release; the tag push runs
+  gets one section per release, written by `make changelog VERSION=X.Y.Z`
+  on the release pull request from `changes/*.md` in merge order, which
+  also deletes them; the tag push runs
   `.github/workflows/release.yml`, which builds the tarballs and drafts the
   GitHub release with that section as notes. `CONTRIBUTING.md` has the
   release policy.
@@ -162,6 +175,15 @@ Still open as of the last review; none of them blocks normal use.
   refuses the item (`job_task_refused`).
 - Cron minutes that do not exist on a spring-forward day are skipped;
   Vixie cron runs them instead.
+- A session orchestrator's restart closes the old agent's pane even when
+  it only ended its turn, so whatever it left on screen is gone; the
+  handover note is what carries over. Its quota wait reads Claude's
+  messages only.
+- The orchestrator runner ticks at pastor.toml's `tick` as the head started
+  with; a later edit of `tick` reaches it only on a restart
+  (`max_orchestrators` is read on each run).
+- An orchestrator agent's branch is pastor's usual `pastor/t-<n>`, not the
+  spec's `orchestrator/<name>-<n>`.
 - With a remote head (`pastor head set`), `task run` fills what its flags
   leave out from the built-in defaults, not the head's `[defaults]` timeout
   and place, and most commands that read or edit files (machine and flock
@@ -174,12 +196,16 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
+~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
 ~/.local/state/pastor/pastor.db   tasks (schema 9), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/fleet.lock  offline fleet edits and a starting `pastor serve` take turns on it
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/watch/<name>.json `pastor watch` cursors
+~/.local/state/pastor/serve.log   background `pastor serve` log, rotated at 10 MB, 3 kept
+~/.local/state/pastor/serve.json  running serve's pid, service manager, log
 ~/.local/state/pastor/ssh/        one ssh ControlMaster socket per machine
 ~/.config/systemd/user/*.service  from `pastor setup systemd [--herdr]`
 ~/.config/pastor/connectors/<id>/.env   connector secrets and settings
@@ -189,8 +215,11 @@ Still open as of the last review; none of them blocks normal use.
 ~/.local/state/pastor/connectors/@<id>/ connector scratch for hooks and runs with no job
 ~/.local/state/pastor/runs/<job>/       connector run logs, 256 KiB each, newest 20 kept
 ~/.local/state/pastor/runs/@<id>/       hook logs (and `connector` runs with no job)
+~/.local/state/pastor/orchestrators/<name>/ state.json, note, scripts' scratch/ and runs/
 skills/pastor/SKILL.md            agent skill, in the repo; `pastor --skill` prints it
 skills/spec/                      plan-for-the-flock skill, its plan format and example
+changes/<branch>.md               a pull request's changelog entry, gathered at release
+scripts/changelog.sh              check, notes and gather for those files
 .claude-plugin/plugin.json        makes the repo a Claude Code plugin named pastor
 ```
 
@@ -208,3 +237,9 @@ own task, `IpcRequest::ends_own_task`); auto-close of done tasks after `close_do
 `run_close` (`CloseBy::AutoClose`); orphan detection is
 `machine::orphan_agents`, used by reconcile and by the head-less probe in
 `machine list`.
+
+Orchestrators are `src/orchestrator.rs` (files, state, `Runner`, which the
+head spawns beside the scheduler) and `src/orchestrator_cli.rs`; the guard
+for their scripts is `Daemon::handle_as` (`ipc::Caller`,
+`FROM_ORCHESTRATOR_FIELD`) and the `caller().orchestrator` branch of the
+CLI's own guard in `main`.

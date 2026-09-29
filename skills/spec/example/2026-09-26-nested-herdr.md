@@ -120,7 +120,7 @@ pastor task run --prompt-file docs/superpowers/plans/2026-09-26-nested-herdr/tas
 
 - Modify: `docs/manual.md` (the paragraph on `pastor machine open` under "How it works")
 - Modify: `AGENTS.md` (Known gaps)
-- Modify: `CHANGELOG.md` (Unreleased)
+- Create: `changes/pastor-nested-herdr.md` (the changelog entry)
 
 **Interfaces:**
 
@@ -137,7 +137,7 @@ In `AGENTS.md`, delete the Known gaps item that starts "`pastor machine open` sh
 
 - [ ] **Step 3: Changelog**
 
-Under `## Unreleased` in `CHANGELOG.md`, add a `### Fixed` section if there is none, with the item: "`pastor machine open` inside a herdr pane fails with `nested_herdr` instead of handing the terminal to a herdr that refuses to start."
+Create `changes/pastor-nested-herdr.md` (the plan branch's name, slash as a dash) with a `### Fixed` heading and the item: "`pastor machine open` inside a herdr pane fails with `nested_herdr` instead of handing the terminal to a herdr that refuses to start."
 
 - [ ] **Step 4: Check and commit**
 
@@ -145,7 +145,7 @@ Run: `make check`
 Expected: pass.
 
 ```bash
-git add docs/manual.md AGENTS.md CHANGELOG.md
+git add docs/manual.md AGENTS.md changes/pastor-nested-herdr.md
 git commit -m "docs: say that pastor machine open refuses inside herdr"
 ```
 

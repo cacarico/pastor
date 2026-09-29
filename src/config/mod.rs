@@ -83,6 +83,25 @@ impl Paths {
         self.state_dir.join("pastor.sock")
     }
 
+    /// The lock an offline fleet edit and a starting head take in turns
+    /// (`fleet_edit::lock_fleet`).
+    pub fn fleet_lock_file(&self) -> PathBuf {
+        self.state_dir.join("fleet.lock")
+    }
+
+    /// A background `pastor serve`'s log (`serve_cli`), rotated to
+    /// `serve.log.1` .. `serve.log.3`. A head in the foreground or under a
+    /// service logs to stderr instead.
+    pub fn serve_log_file(&self) -> PathBuf {
+        self.state_dir.join("serve.log")
+    }
+
+    /// What the running `pastor serve` wrote about itself at start: its pid,
+    /// the service manager that runs it, its log (`serve_cli::Record`).
+    pub fn serve_record_file(&self) -> PathBuf {
+        self.state_dir.join("serve.json")
+    }
+
     /// The events log, one JSON `EventRecord` per line. Rotated by size to
     /// `events.jsonl.1`; read by `pastor events` straight from disk.
     pub fn events_file(&self) -> PathBuf {
@@ -146,6 +165,18 @@ impl Paths {
     /// Secrets and settings for one connector, written by the user.
     pub fn connector_env_file(&self, id: &str) -> PathBuf {
         self.config_dir.join("connectors").join(id).join(".env")
+    }
+
+    /// One TOML file per orchestrator, next to `jobs/`. Read by the head on
+    /// each tick; `orchestrator enable|disable` rewrites one line of one.
+    pub fn orchestrators_dir(&self) -> PathBuf {
+        self.config_dir.join("orchestrators")
+    }
+
+    /// What the head keeps for one orchestrator: `state.json`, its handover
+    /// `note`, the scripts' `scratch/` dir and their run logs in `runs/`.
+    pub fn orchestrator_state_dir(&self, name: &str) -> PathBuf {
+        self.state_dir.join("orchestrators").join(name)
     }
 
     /// Per-job scratch a connector may use; pastor owns the directory, the
@@ -427,7 +458,7 @@ fn safe_ancestors(dir: &Path, euid: u32) -> anyhow::Result<()> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Defaults {
     pub agent: String,
     /// Extra argv for the agent (`["--model", "claude-opus-5-5"]`), for tasks
@@ -438,11 +469,11 @@ pub struct Defaults {
     pub allow: Vec<String>,
     /// Tool patterns every task's agent must never use; wins over `allow`.
     pub deny: Vec<String>,
-    /// The `[models]` entry tasks run when their run flags, job, machine and
-    /// flock name none. See `resolve_agent`.
+    /// The `[models]` entry tasks run when their run flags, job, flock and
+    /// machine name none. See `resolve_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The level of tasks whose run flags, job, pinned machine and flock
+    /// The level of tasks whose run flags, job, flock and pinned machine
     /// name none; unset, `normal`. See `resolve_priority`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::task::Priority>,
@@ -451,15 +482,25 @@ pub struct Defaults {
     #[serde(skip_serializing_if = "KindAgents::is_empty")]
     pub agents: KindAgents,
     /// The permission profile tasks run under when their run flags, job,
-    /// machine and flock name none. See `resolve_agent`.
+    /// flock and machine name none. See `resolve_agent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     pub max_tasks_per_run: u32,
     pub timeout: String,
+    /// Whether tasks whose run flags, job and flock say nothing are asked
+    /// for a summary, or need one (`SummaryMode`); unset, `ask`. See
+    /// `resolve_summary`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::task::SummaryMode>,
     /// Where a task's pane goes when its run flags and job say nothing
     /// (`task::Place`).
     #[serde(skip_serializing_if = "crate::task::Place::is_repo")]
     pub place: crate::task::Place,
+    /// The label template of the workspace a task makes when its run
+    /// flags, job and flock set none; unset, `task::DEFAULT_LABEL`. See
+    /// `resolve_label`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// What `pastor task run` flags or a job file's `[dispatch]` say about the
@@ -477,13 +518,22 @@ pub struct AgentChoice {
     /// Tool patterns added to the flock's and `[defaults]` deny lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
-    /// A `[models]` name, before the machine's, the flock's and `[defaults]`.
+    /// A `[models]` name, before the flock's, the machine's and `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// A permission profile, before the machine's, the flock's and
+    /// A permission profile, before the flock's, the machine's and
     /// `[defaults]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// `--timeout` or a job's `[dispatch] timeout`, in seconds, before the
+    /// flock's and `[defaults]` (`Defaults::resolve_timeout`). Unset from a
+    /// client that predates flock timeouts: the spec's own then stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// `--place` or a job's `[dispatch] place`, before the flock's and
+    /// `[defaults]` (`Defaults::resolve_place`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<crate::task::Place>,
 }
 
 /// Where a task's agent, or its args, came from (`Defaults::resolve_agent_on`).
@@ -520,6 +570,10 @@ pub struct AgentPick {
     /// The permission profile the task runs under, and the layer that named
     /// it; `None` when no layer names one. `Profiles::apply` adds its lists.
     pub profile: Option<(String, Layer)>,
+    /// The kind of the agent the flock names, when the machine runs another
+    /// kind and has no agent of this one (`Defaults::resolve_agent_for`):
+    /// the task cannot run there.
+    pub missing_kind: Option<String>,
 }
 
 /// `agents = { <kind> = "<agent>" }` on a machine, a flock or `[defaults]`:
@@ -609,7 +663,10 @@ impl Defaults {
 
     /// `resolve_agent` for a task on `machine`: its `agent` and
     /// `agent_args` come between the ask and the flock's, so machines of
-    /// one flock can run different agents. Tool lists stay per flock.
+    /// one flock can run different agents, each the one installed and
+    /// logged in there. The `model` and `profile` come from the flock
+    /// before the machine: a project's flock sets them on a shared machine.
+    /// Tool lists stay per flock.
     pub fn resolve_agent_on(
         &self,
         ask: &AgentChoice,
@@ -664,16 +721,16 @@ impl Defaults {
             .unwrap_or_default();
         let model = [
             (Layer::Ask, ask.model.as_ref()),
-            (Layer::Machine, machine.and_then(|m| m.model.as_ref())),
             (Layer::Flock, flock.and_then(|f| f.model.as_ref())),
+            (Layer::Machine, machine.and_then(|m| m.model.as_ref())),
             (Layer::Defaults, self.model.as_ref()),
         ]
         .into_iter()
         .find_map(|(layer, name)| Some((name?.clone(), layer)));
         let profile = [
             (Layer::Ask, ask.profile.as_ref()),
-            (Layer::Machine, machine.and_then(|m| m.profile.as_ref())),
             (Layer::Flock, flock.and_then(|f| f.profile.as_ref())),
+            (Layer::Machine, machine.and_then(|m| m.profile.as_ref())),
             (Layer::Defaults, self.profile.as_ref()),
         ]
         .into_iter()
@@ -688,11 +745,14 @@ impl Defaults {
             model,
             by_kind: false,
             profile,
+            missing_kind: None,
         }
     }
 
-    /// `resolve_agent_on`, then, when the task's model runs on another kind
-    /// than that agent's, the agent for the model's kind: at the machine,
+    /// `resolve_agent_on`, then, for a task with no model, the machine's
+    /// agent of the kind its flock's agent is (`flock_kind_on`). When the
+    /// task's model runs on another kind than that agent's, the model's
+    /// kind decides instead, and the agent is the one for it: at the machine,
     /// the flock and these defaults in turn, the layer's `agent` if it is
     /// of that kind, else its `agents` entry for it. An agent the task or
     /// job named itself is kept, as is the first agent when no layer has
@@ -714,7 +774,7 @@ impl Defaults {
             .and_then(|(name, _)| models.0.get(name))
             .map(|def| def.kind.as_str())
         else {
-            return pick;
+            return self.flock_kind_on(pick, ask, machine, flock, agents);
         };
         if pick.agent_from == Layer::Ask || agents.kind(&pick.agent) == kind {
             return pick;
@@ -764,11 +824,76 @@ impl Defaults {
             ..pick
         }
     }
+
+    /// The agent the flock names, on `machine`: the machine keeps choosing
+    /// it, but of the flock agent's kind. Its `agent` when that is of the
+    /// kind, else its `agents` entry for the kind; a machine that names no
+    /// agent runs the flock's. A machine whose `agent` is of another kind
+    /// and has no entry for this one cannot run the task (`missing_kind`).
+    /// An agent the task or job named is kept.
+    fn flock_kind_on(
+        &self,
+        pick: AgentPick,
+        ask: &AgentChoice,
+        machine: Option<&flock::MachineConfig>,
+        flock: Option<&flock::FlockEntry>,
+        agents: &Agents,
+    ) -> AgentPick {
+        let (Some(m), Some(wanted)) = (machine, flock.and_then(|f| f.agent.as_deref())) else {
+            return pick;
+        };
+        if ask.agent.is_some() {
+            return pick;
+        }
+        let kind = agents.kind(wanted);
+        if agents.kind(&pick.agent) == kind {
+            return pick;
+        }
+        let Some(agent) = m.agents.get(kind) else {
+            if m.agent.is_some() {
+                return AgentPick {
+                    missing_kind: Some(kind.to_string()),
+                    ..pick
+                };
+            }
+            return pick;
+        };
+        // Args only from a layer written for this very agent, as for a
+        // model's kind: the machine's and the flock's are for their own.
+        let (args_from, agent_args) = [
+            (Layer::Ask, None, ask.agent_args.as_ref()),
+            (Layer::Machine, m.agent.as_deref(), m.agent_args.as_ref()),
+            (
+                Layer::Flock,
+                Some(wanted),
+                flock.and_then(|f| f.agent_args.as_ref()),
+            ),
+            (
+                Layer::Defaults,
+                Some(self.agent.as_str()),
+                Some(&self.agent_args),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(layer, own, args)| {
+            args.filter(|_| own.is_none_or(|a| a == agent))
+                .map(|a| (Some(layer), a.clone()))
+        })
+        .unwrap_or_default();
+        AgentPick {
+            agent: agent.clone(),
+            agent_args,
+            agent_from: Layer::Machine,
+            args_from,
+            by_kind: true,
+            ..pick
+        }
+    }
 }
 
 impl Defaults {
     /// A task's level: from the first of `ask` (`--priority`, a job's
-    /// `priority`), the machine it is pinned to, its flock and these
+    /// `priority`), its flock, the machine it is pinned to and these
     /// defaults that sets one, and the layer that did; `normal` from none.
     /// Only a pinned task has a machine here: an unpinned one is queued
     /// before any machine is picked, and its level is settled then.
@@ -780,13 +905,103 @@ impl Defaults {
     ) -> (crate::task::Priority, Option<Layer>) {
         [
             (Layer::Ask, ask),
-            (Layer::Machine, pinned.and_then(|m| m.priority)),
             (Layer::Flock, flock.and_then(|f| f.priority)),
+            (Layer::Machine, pinned.and_then(|m| m.priority)),
             (Layer::Defaults, self.priority),
         ]
         .into_iter()
         .find_map(|(layer, p)| Some((p?, Some(layer))))
         .unwrap_or_default()
+    }
+
+    /// A task's timeout in seconds: from the first of `ask` (`--timeout`, a
+    /// job's `[dispatch] timeout`), its flock and these defaults, and the
+    /// layer that set it. No machine layer: a machine has no `timeout`.
+    /// Both files are checked on load; one that no longer parses is passed
+    /// over.
+    pub fn resolve_timeout(
+        &self,
+        ask: Option<u64>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> (u64, Layer) {
+        let secs = |t: &str| parse_duration(t).ok().map(|d| d.as_secs());
+        [
+            (Layer::Ask, ask),
+            (
+                Layer::Flock,
+                flock.and_then(|f| f.timeout.as_deref()).and_then(secs),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(layer, t)| Some((t?, layer)))
+        .unwrap_or_else(|| {
+            let t = duration_or_default(&self.timeout, &Defaults::default().timeout);
+            (t.as_secs(), Layer::Defaults)
+        })
+    }
+
+    /// Where a task's pane goes: from the first of `ask` (`--place`, a
+    /// job's `[dispatch] place`), its flock and these defaults, and the
+    /// layer that set it. No machine layer, as for `resolve_timeout`.
+    pub fn resolve_place(
+        &self,
+        ask: Option<&crate::task::Place>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> (crate::task::Place, Layer) {
+        match (ask, flock.and_then(|f| f.place.as_ref())) {
+            (Some(p), _) => (p.clone(), Layer::Ask),
+            (None, Some(p)) => (p.clone(), Layer::Flock),
+            (None, None) => (self.place.clone(), Layer::Defaults),
+        }
+    }
+
+    /// The machine's own profile, which decides whether a task may ask for
+    /// `unrestricted` on it (`Profiles::apply`): its `profile`, else its
+    /// flock's, else these defaults'. The machine comes first here, unlike
+    /// the profile a task runs under, so a flock's never lifts it.
+    pub fn own_profile(
+        &self,
+        machine: Option<&flock::MachineConfig>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> Option<String> {
+        machine
+            .and_then(|m| m.profile.clone())
+            .or_else(|| flock.and_then(|f| f.profile.clone()))
+            .or_else(|| self.profile.clone())
+    }
+
+    /// A task's `summary` setting: from the first of `ask` (`task run
+    /// --summary`, a job's `[dispatch] summary`), its flock and these
+    /// defaults that sets one; `ask` from none.
+    pub fn resolve_summary(
+        &self,
+        ask: Option<crate::task::SummaryMode>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> crate::task::SummaryMode {
+        ask.or_else(|| flock.and_then(|f| f.summary))
+            .or(self.summary)
+            .unwrap_or_default()
+    }
+}
+
+impl Defaults {
+    /// A task's workspace label template: from the first of `ask`
+    /// (`--label`, a job's `label`), `flock` and these defaults that sets
+    /// one, and the layer that did; `None` leaves `task::DEFAULT_LABEL`.
+    /// No machine layer: the label is settled when the task is queued,
+    /// before a machine is picked, and `{{ machine }}` covers that need.
+    pub fn resolve_label(
+        &self,
+        ask: Option<&str>,
+        flock: Option<&flock::FlockEntry>,
+    ) -> Option<(String, Layer)> {
+        [
+            (Layer::Ask, ask),
+            (Layer::Flock, flock.and_then(|f| f.label.as_deref())),
+            (Layer::Defaults, self.label.as_deref()),
+        ]
+        .into_iter()
+        .find_map(|(layer, label)| Some((label?.to_string(), layer)))
     }
 }
 
@@ -803,7 +1018,9 @@ impl Default for Defaults {
             profile: None,
             max_tasks_per_run: 5,
             timeout: "2h".into(),
+            summary: None,
             place: crate::task::Place::Repo,
+            label: None,
         }
     }
 }
@@ -811,7 +1028,7 @@ impl Default for Defaults {
 /// One agent's definition under `[agents.<name>]` in `pastor.toml`. The
 /// name is what tasks, jobs and flocks call it; `kind` is what herdr starts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AgentDef {
     /// The herdr agent kind to start (`claude`, `codex`); unset, the name
     /// itself. Built-in trust keys and tool flags follow it, so
@@ -981,7 +1198,9 @@ impl Agents {
     /// its definition. Refused as `launch_args` is.
     /// An opencode agent under a profile gets its lists in the env instead
     /// (`opencode::permission_json`), over its definition's, with the
-    /// variables that would load another config emptied.
+    /// variables that would load another config emptied and the repo's
+    /// config turned off; dispatch gives it the repo's instruction file back
+    /// once it knows the checkout (`opencode::instructions_content`).
     pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, AgentRefusal> {
         let mut env = self
             .0
@@ -992,6 +1211,7 @@ impl Agents {
             for key in opencode::CONFIG_ENV {
                 env.insert(key.into(), String::new());
             }
+            env.insert(opencode::DISABLE_PROJECT_CONFIG_ENV.into(), "1".into());
             env.insert(
                 opencode::PERMISSION_ENV.into(),
                 opencode::permission_json(
@@ -1127,6 +1347,11 @@ pub fn check_profile_name(name: &str) -> Result<(), String> {
 /// The code of a model whose kind is not the task's agent's.
 pub const MODEL_KIND_MISMATCH: &str = "model_kind_mismatch";
 
+/// The code of a task whose flock names an agent of a kind the machine has
+/// no agent of (`AgentPick::missing_kind`): an unpinned task skips that
+/// machine, as for `MODEL_KIND_MISMATCH`.
+pub const AGENT_KIND_MISSING: &str = "agent_kind_missing";
+
 /// Why a task's agent cannot run as resolved: a stable code for the CLI's
 /// error and a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1208,7 +1433,7 @@ impl Models {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PastorConfig {
     pub tick: String,
     pub settle: String,
@@ -1223,12 +1448,21 @@ pub struct PastorConfig {
     /// `pastor task attach` can still show the agent's last screen. `never`
     /// turns auto-close off.
     pub close_done_after: String,
+    /// How long a pull machine (`pull = true` in flock.toml) may go without
+    /// a `TaskClaim` or `TaskReport` before the head counts it lost and its
+    /// starting and running tasks go stale.
+    pub pull_lost_after: String,
     /// Whether an agent pastor started (`ipc::TASK_ENV` in its pane) may
     /// change the fleet: run, send to, retry, close or prune tasks, run jobs,
     /// and edit machines, flocks and jobs. Off by default, so the head
     /// refuses it. A guard against an agent acting on its own; the agent runs
     /// as the same user, so it is not a security boundary.
     pub agents_change_fleet: bool,
+    /// How many orchestrator agents (`role = "orchestrator"`) the head runs
+    /// at once, of both kinds, outside `max_agents` and job slots. A
+    /// scheduled orchestrator's run past it starts no agent
+    /// (`orchestrator.held`).
+    pub max_orchestrators: u32,
     /// The ssh destination other machines reach the head by. Agents on
     /// machines other than the head's own get it as `ipc::HEAD_ENV`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1244,6 +1478,69 @@ pub struct PastorConfig {
     /// What `pastor watch` runs besides the head's events.
     #[serde(skip_serializing_if = "WatchConfig::is_empty")]
     pub watch: WatchConfig,
+    /// `[shepherd]`: how this machine takes tasks when its `pastor serve`
+    /// runs headless and the head has it as a pull machine.
+    #[serde(skip_serializing_if = "ShepherdConfig::is_empty")]
+    pub shepherd: ShepherdConfig,
+}
+
+/// The variable that makes a headless serve take flock work, as
+/// `[shepherd] takes_flock_work = true` does: `1` or `true`.
+pub const SHEPHERD_FLOCK_WORK_ENV: &str = "PASTOR_SHEPHERD_FLOCK_WORK";
+
+/// `[shepherd]` in pastor.toml, read by a headless `pastor serve`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShepherdConfig {
+    /// The name this machine has in the head's flock.toml, where it is
+    /// `pull = true`; the hostname when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// Take any task the head would place on this machine, not only those
+    /// pinned to it (`task run --shepherd`, `--machine <this one>`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub takes_flock_work: bool,
+    /// Developer option: argv speaking the herdr protocol on stdio, in
+    /// place of this machine's own herdr (as `command` in flock.toml).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+}
+
+impl ShepherdConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &ShepherdConfig::default()
+    }
+
+    /// The pull machine this machine is: `machine`, else the hostname.
+    pub fn machine_name(&self) -> String {
+        self.machine
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(hostname)
+    }
+
+    /// Whether it takes flock work: `takes_flock_work`, or
+    /// `SHEPHERD_FLOCK_WORK_ENV` set to `1` or `true`.
+    pub fn flock_work(&self) -> bool {
+        self.takes_flock_work
+            || std::env::var(SHEPHERD_FLOCK_WORK_ENV)
+                .is_ok_and(|v| matches!(v.trim(), "1" | "true"))
+    }
+}
+
+/// This machine's hostname, read from the kernel and files rather than a
+/// new dependency for `gethostname`; `-` when none says.
+pub fn hostname() -> String {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .find_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "-".into())
 }
 
 /// `[watch]` in pastor.toml.
@@ -1280,14 +1577,17 @@ impl Default for PastorConfig {
             reconcile_every: "60s".into(),
             request_timeout: "60s".into(),
             agent_ready_timeout: "30s".into(),
-            close_done_after: "15m".into(),
+            close_done_after: "5s".into(),
+            pull_lost_after: "10m".into(),
             agents_change_fleet: false,
+            max_orchestrators: 1,
             head_address: None,
             defaults: Defaults::default(),
             agents: Agents::default(),
             models: Models::default(),
             profiles: profile::Profiles::default(),
             watch: WatchConfig::default(),
+            shepherd: ShepherdConfig::default(),
         }
     }
 }
@@ -1321,8 +1621,10 @@ impl PastorConfig {
     /// `text` as the file at `path` would load, with errors that name
     /// `path`. `pastor config edit` checks an edit with it.
     pub fn parse(path: &Path, text: &str) -> anyhow::Result<PastorConfig> {
+        // The toml error in the message, not a context under it: the reload
+        // logs `%err`, which shows only the top, and the key must be there.
         let cfg: PastorConfig =
-            toml::from_str(text).with_context(|| format!("parse {}", path.display()))?;
+            toml::from_str(text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
         // tick, settle and reconcile_every all drive `tokio::time::interval`,
         // which panics on a zero period. Reject zero here so a bad config
         // fails to load instead of crashing the daemon at startup.
@@ -1334,6 +1636,7 @@ impl PastorConfig {
             ("agent_ready_timeout", &cfg.agent_ready_timeout, false),
             ("defaults.timeout", &cfg.defaults.timeout, true),
             ("close_done_after", &cfg.close_done_after, false),
+            ("pull_lost_after", &cfg.pull_lost_after, false),
         ] {
             if name == "close_done_after" && v == CLOSE_NEVER {
                 continue;
@@ -1404,6 +1707,10 @@ impl PastorConfig {
                 check_kind_agents(Some(&cfg.defaults.agent), &cfg.defaults.agents, &cfg.agents)
             })
             .map_err(|e| anyhow::anyhow!("{}: defaults.{e}", path.display()))?;
+        if let Some(label) = &cfg.defaults.label {
+            crate::task::check_label(label)
+                .map_err(|e| anyhow::anyhow!("{}: defaults.{e}", path.display()))?;
+        }
         if let Some(m) = &cfg.defaults.model {
             cfg.models
                 .check(m)
@@ -1416,6 +1723,14 @@ impl PastorConfig {
             cfg.profiles
                 .resolve(p)
                 .map_err(|e| anyhow::anyhow!("{}: defaults.profile: {e}", path.display()))?;
+        }
+        if cfg.shepherd.command.as_ref().is_some_and(|c| c.is_empty()) {
+            anyhow::bail!("{}: shepherd.command is empty", path.display());
+        }
+        if let Some(m) = &cfg.shepherd.machine
+            && m.trim().is_empty()
+        {
+            anyhow::bail!("{}: shepherd.machine must not be empty", path.display());
         }
         if cfg.agent_ready_timeout_duration() >= cfg.request_timeout_duration() {
             anyhow::bail!(
@@ -1458,6 +1773,12 @@ impl PastorConfig {
             &self.close_done_after,
             &PastorConfig::default().close_done_after,
         ))
+    }
+    pub fn pull_lost_after_duration(&self) -> Duration {
+        duration_or_default(
+            &self.pull_lost_after,
+            &PastorConfig::default().pull_lost_after,
+        )
     }
     pub fn agent_ready_timeout_duration(&self) -> Duration {
         duration_or_default(
@@ -1531,6 +1852,113 @@ mod tests {
 
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A misspelt key in pastor.toml fails the load, naming the file and
+    /// the key, rather than leaving the default it meant to change.
+    fn typo_error(text: &str) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, text).unwrap();
+        // Display, not `{:#}`: the reload logs only the top of the error.
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("pastor.toml"), "{err}");
+        assert_eq!(
+            PastorConfig::load_existing(&path).unwrap_err().to_string(),
+            err
+        );
+        err
+    }
+
+    /// The TOML examples of pastor.toml, flock.toml and client.toml in
+    /// README.md and docs/manual.md load, now that a key they carry and the
+    /// code does not know is a load error. An example says which file it is
+    /// by a leading comment, or by its first table.
+    #[test]
+    fn the_docs_config_examples_load() {
+        #[derive(Deserialize)]
+        struct Client {
+            #[allow(dead_code)]
+            head: crate::head::HeadSetting,
+        }
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0;
+        for doc in ["README.md", "docs/manual.md"] {
+            let text = std::fs::read_to_string(repo.join(doc)).unwrap();
+            for block in text.split("```toml\n").skip(1) {
+                let block = block.split("```").next().unwrap();
+                // One block can hold two files, each under a comment naming
+                // it (`# pastor.toml` then `# flock.toml`): split it there.
+                let names = |line: &str| {
+                    line.starts_with('#').then(|| {
+                        ["pastor.toml", "flock.toml"]
+                            .into_iter()
+                            .find(|f| line.split(&[' ', ':', ',', '/']).any(|w| w == *f))
+                    })?
+                };
+                let mut sections: Vec<(Option<&str>, String)> = vec![(None, String::new())];
+                for line in block.lines() {
+                    if let Some(f) = names(line) {
+                        sections.push((Some(f), String::new()));
+                    }
+                    let (_, text) = sections.last_mut().unwrap();
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                for (named, section) in sections {
+                    let first = section.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                    let which = named.or_else(|| {
+                        if first.starts_with("[[flock]]") || first.starts_with("[[machine]]") {
+                            Some("flock.toml")
+                        } else if first.starts_with("[head]") {
+                            Some("client.toml")
+                        } else if [
+                            "[defaults]",
+                            "[agents.",
+                            "[models.",
+                            "[profiles.",
+                            "[[watch.",
+                        ]
+                        .iter()
+                        .any(|t| first.starts_with(t))
+                        {
+                            Some("pastor.toml")
+                        } else {
+                            None
+                        }
+                    });
+                    let parsed = match which {
+                        Some("pastor.toml") => toml::from_str::<PastorConfig>(&section).map(drop),
+                        Some("flock.toml") => toml::from_str::<flock::Flock>(&section).map(drop),
+                        Some("client.toml") => toml::from_str::<Client>(&section).map(drop),
+                        _ => continue,
+                    };
+                    assert!(parsed.is_ok(), "{doc}: {first}: {}", parsed.unwrap_err());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 20, "only {checked} examples found");
+    }
+
+    #[test]
+    fn a_typo_in_pastor_toml_is_a_load_error() {
+        let err = typo_error("close_done_afer = \"never\"\n");
+        assert!(err.contains("close_done_afer"), "{err}");
+        let err = typo_error("head_adress = \"user@head\"\n");
+        assert!(err.contains("head_adress"), "{err}");
+    }
+
+    #[test]
+    fn a_typo_in_defaults_is_a_load_error() {
+        let err = typo_error("[defaults]\ntimout = \"1h\"\n");
+        assert!(err.contains("timout"), "{err}");
+    }
+
+    #[test]
+    fn a_typo_in_an_agent_is_a_load_error() {
+        let err = typo_error("[agents.claude-personal]\nknd = \"claude\"\n");
+        assert!(err.contains("knd"), "{err}");
+    }
 
     #[test]
     fn from_env_uses_overrides() {
@@ -1699,6 +2127,83 @@ mod tests {
         assert!(parse_duration("300000000000000d").is_err());
     }
 
+    proptest::proptest! {
+        /// Any text, including numbers past `u64` and counts whose product
+        /// with the unit overflows, is a duration or an error, never a panic.
+        #[test]
+        fn prop_parse_duration_never_panics(s in "\\PC*|[0-9]{0,25}[smhd]?|\\s*[0-9]+\\s*[a-z]{0,3}") {
+            let _ = parse_duration(&s);
+        }
+
+        /// A count and a unit read back as count times the unit's seconds
+        /// when that fits in `u64`, and as an error when it does not.
+        #[test]
+        fn prop_parse_duration_is_count_times_unit(
+            n in proptest::prelude::any::<u64>(),
+            unit in proptest::sample::select(vec![("s", 1u64), ("m", 60), ("h", 3600), ("d", 86400)]),
+        ) {
+            let got = parse_duration(&format!("{n}{}", unit.0));
+            match n.checked_mul(unit.1) {
+                Some(secs) => proptest::prop_assert_eq!(got, Ok(Duration::from_secs(secs))),
+                None => proptest::prop_assert!(got.is_err()),
+            }
+        }
+    }
+
+    /// A label comes from the first of the ask, the flock and `[defaults]`
+    /// that sets one; none leaves the built-in.
+    #[test]
+    fn a_label_comes_from_its_layers() {
+        let work = flock::FlockEntry {
+            name: "work".into(),
+            label: Some("w/{{ task.id }}".into()),
+            ..Default::default()
+        };
+        let bare = flock::FlockEntry {
+            name: "bare".into(),
+            ..Default::default()
+        };
+        let d = Defaults {
+            label: Some("d/{{ task.id }}".into()),
+            ..Default::default()
+        };
+        let got =
+            |d: &Defaults, ask: Option<&str>, f: &flock::FlockEntry| d.resolve_label(ask, Some(f));
+        assert_eq!(
+            got(&d, Some("a"), &work),
+            Some(("a".to_string(), Layer::Ask))
+        );
+        assert_eq!(
+            got(&d, None, &work),
+            Some(("w/{{ task.id }}".to_string(), Layer::Flock))
+        );
+        assert_eq!(
+            got(&d, None, &bare),
+            Some(("d/{{ task.id }}".to_string(), Layer::Defaults))
+        );
+        assert_eq!(got(&Defaults::default(), None, &bare), None);
+    }
+
+    /// `[defaults] label` is checked on load like any other template.
+    #[test]
+    fn a_defaults_label_is_checked_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nlabel = \"{{ machine }}/{{ task.id }}\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.defaults.label.as_deref(),
+            Some("{{ machine }}/{{ task.id }}")
+        );
+        std::fs::write(&path, "[defaults]\nlabel = \"{{ nope }}\"\n").unwrap();
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("defaults.label: unknown placeholder"), "{err}");
+    }
+
     #[test]
     fn accessors_fall_back_to_defaults() {
         let cfg = PastorConfig {
@@ -1814,7 +2319,7 @@ mod tests {
             ("[defaults]\nmodel = \"haiku\"\n", "defaults.model"),
         ] {
             std::fs::write(&path, text).unwrap();
-            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            let err = PastorConfig::load(&path).unwrap_err().to_string();
             assert!(err.contains(says), "{text}: {err}");
         }
     }
@@ -1833,8 +2338,55 @@ mod tests {
         let ci = cfg.profiles.resolve("ci").unwrap();
         assert_eq!(ci.chain, vec!["ci", "develop"]);
         std::fs::write(&path, "[profiles.ci]\nextends = \"nope\"\n").unwrap();
-        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("profiles.ci") && err.contains("nope"), "{err}");
+    }
+
+    /// `summary` comes from the first of the ask (`task run`, the job), the
+    /// flock and `[defaults]` that sets one; with none it is `ask`.
+    #[test]
+    fn the_summary_setting_comes_from_the_first_layer_that_sets_one() {
+        use crate::task::SummaryMode;
+        let d = Defaults {
+            summary: Some(SummaryMode::Off),
+            ..Default::default()
+        };
+        let flock = flock::FlockEntry {
+            name: "p".into(),
+            summary: Some(SummaryMode::Require),
+            ..Default::default()
+        };
+        assert_eq!(
+            d.resolve_summary(Some(SummaryMode::Ask), Some(&flock)),
+            SummaryMode::Ask
+        );
+        assert_eq!(d.resolve_summary(None, Some(&flock)), SummaryMode::Require);
+        assert_eq!(
+            d.resolve_summary(None, Some(&flock::FlockEntry::default())),
+            SummaryMode::Off
+        );
+        assert_eq!(
+            Defaults::default().resolve_summary(None, None),
+            SummaryMode::Ask
+        );
+    }
+
+    /// `[defaults] summary` loads as one of its words; a file without it
+    /// loads as before, and asks; another word fails the load.
+    #[test]
+    fn defaults_summary_loads_and_is_ask_when_absent() {
+        use crate::task::SummaryMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, "[defaults]\nagent = \"claude\"\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.summary, None);
+        assert_eq!(cfg.defaults.resolve_summary(None, None), SummaryMode::Ask);
+        std::fs::write(&path, "[defaults]\nsummary = \"require\"\n").unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(cfg.defaults.summary, Some(SummaryMode::Require));
+        std::fs::write(&path, "[defaults]\nsummary = \"always\"\n").unwrap();
+        assert!(PastorConfig::load(&path).is_err());
     }
 
     /// The level comes from the first of the ask, the pinned machine, the
@@ -1857,13 +2409,15 @@ mod tests {
             d.resolve_priority(Some(Priority::Normal), Some(&machine), Some(&flock)),
             (Priority::Normal, Some(Layer::Ask))
         );
+        // The flock before the machine: a project's flock sets the level
+        // on a shared machine.
         assert_eq!(
             d.resolve_priority(None, Some(&machine), Some(&flock)),
-            (Priority::Critical, Some(Layer::Machine))
+            (Priority::High, Some(Layer::Flock))
         );
         assert_eq!(
-            d.resolve_priority(None, None, Some(&flock)),
-            (Priority::High, Some(Layer::Flock))
+            d.resolve_priority(None, Some(&machine), None),
+            (Priority::Critical, Some(Layer::Machine))
         );
         assert_eq!(
             d.resolve_priority(None, None, None),
@@ -1887,7 +2441,7 @@ mod tests {
             Some(crate::task::Priority::High)
         );
         std::fs::write(&path, "[defaults]\npriority = \"urgent\"\n").unwrap();
-        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("urgent"), "{err}");
         for text in [
             "[[flock]]\nname = \"p\"\ndefault = true\npriority = \"asap\"\n",
@@ -1928,11 +2482,11 @@ mod tests {
         );
         assert_eq!(
             model(d.resolve_agent_on(&ask(None), Some(&machine), Some(&flock))),
-            ("haiku".into(), Layer::Machine)
+            ("sonnet".into(), Layer::Flock)
         );
         assert_eq!(
-            model(d.resolve_agent(&ask(None), Some(&flock))),
-            ("sonnet".into(), Layer::Flock)
+            model(d.resolve_agent_on(&ask(None), Some(&machine), None)),
+            ("haiku".into(), Layer::Machine)
         );
         assert_eq!(
             model(d.resolve_agent(&ask(None), None)),
@@ -2057,6 +2611,125 @@ mod tests {
         assert!(!err.message.contains("agents."), "{err}");
     }
 
+    /// A flock's timeout and place come after the task's or job's and
+    /// before `[defaults]`; a flock's timeout is checked on load.
+    #[test]
+    fn a_flocks_timeout_and_place_come_before_the_defaults() {
+        use crate::task::Place;
+        let d = Defaults::default();
+        let flock: flock::FlockEntry =
+            toml::from_str("name = \"p\"\ntimeout = \"30m\"\nplace = \"pastor\"\n").unwrap();
+        assert_eq!(d.resolve_timeout(Some(60), Some(&flock)), (60, Layer::Ask));
+        assert_eq!(d.resolve_timeout(None, Some(&flock)), (1800, Layer::Flock));
+        assert_eq!(d.resolve_timeout(None, None), (7200, Layer::Defaults));
+        let own = Place::Own;
+        assert_eq!(
+            d.resolve_place(Some(&own), Some(&flock)),
+            (Place::Own, Layer::Ask)
+        );
+        assert_eq!(
+            d.resolve_place(None, Some(&flock)),
+            (Place::Pastor, Layer::Flock)
+        );
+        assert_eq!(d.resolve_place(None, None), (Place::Repo, Layer::Defaults));
+
+        let f: flock::Flock = toml::from_str(
+            "[[machine]]\nname = \"m\"\nlocal = true\n[[flock]]\nname = \"p\"\ndefault = true\ntimeout = \"soon\"\n",
+        )
+        .unwrap();
+        let err = f.validate().unwrap_err();
+        assert!(err.contains("flock p: timeout"), "{err}");
+        assert!(
+            toml::from_str::<flock::FlockEntry>("name = \"p\"\nplace = \"nowhere\"\n").is_err()
+        );
+    }
+
+    /// A flock that names an agent sets its kind; the machine picks which
+    /// agent of that kind runs: its `agent` if of the kind, else its
+    /// `agents` entry. A machine whose agent is of another kind and has no
+    /// entry for this one cannot run the task. A machine that names no
+    /// agent runs the flock's, and the task's own agent is kept.
+    #[test]
+    fn a_flocks_agent_kind_takes_the_machines_agent_of_that_kind() {
+        let models = Models::default();
+        let agents: Agents = toml::from_str(
+            "[claude-personal]\nkind = \"claude\"\n[oc-work]\nkind = \"opencode\"\n",
+        )
+        .unwrap();
+        let d = Defaults::default();
+        let flock: flock::FlockEntry =
+            toml::from_str("name = \"p\"\nagent = \"opencode\"\nagent_args = [\"-q\"]\n").unwrap();
+        let machine = |extra: &str| -> flock::MachineConfig {
+            toml::from_str(&format!("name = \"m\"\nlocal = true\n{extra}")).unwrap()
+        };
+        let pick = |ask: &AgentChoice, m: &flock::MachineConfig| {
+            d.resolve_agent_for(ask, Some(m), Some(&flock), &models, &agents)
+        };
+        let none = AgentChoice::default();
+
+        // The machine's own agent, of the flock's kind.
+        let p = pick(
+            &none,
+            &machine("agent = \"oc-work\"\nagent_args = [\"--x\"]\n"),
+        );
+        assert_eq!(
+            (p.agent.as_str(), p.agent_from),
+            ("oc-work", Layer::Machine)
+        );
+        assert_eq!(p.agent_args, vec!["--x"]);
+        assert_eq!(p.missing_kind, None);
+
+        // Its agent is claude: its agents entry for opencode, with no args
+        // written for another agent.
+        let p = pick(
+            &none,
+            &machine(
+                "agent = \"claude-personal\"\nagent_args = [\"-v\"]\nagents = { opencode = \"oc-work\" }\n",
+            ),
+        );
+        assert_eq!(
+            (p.agent.as_str(), p.agent_from, p.by_kind),
+            ("oc-work", Layer::Machine, true)
+        );
+        assert!(p.agent_args.is_empty(), "{:?}", p.agent_args);
+        assert_eq!(p.missing_kind, None);
+
+        // No opencode agent there: the machine cannot run the task.
+        let p = pick(&none, &machine("agent = \"claude-personal\"\n"));
+        assert_eq!(p.missing_kind.as_deref(), Some("opencode"));
+
+        // A machine that names no agent runs the flock's, with its args.
+        let p = pick(&none, &machine(""));
+        assert_eq!((p.agent.as_str(), p.agent_from), ("opencode", Layer::Flock));
+        assert_eq!(p.agent_args, vec!["-q"]);
+        assert_eq!(p.missing_kind, None);
+
+        // The task's own agent is kept.
+        let asked = AgentChoice {
+            agent: Some("claude".into()),
+            ..Default::default()
+        };
+        let p = pick(&asked, &machine("agent = \"claude-personal\"\n"));
+        assert_eq!((p.agent.as_str(), p.missing_kind), ("claude", None));
+
+        // A flock with no agent leaves the machine's alone.
+        let plain = flock::FlockEntry {
+            name: "p".into(),
+            ..Default::default()
+        };
+        let p = d.resolve_agent_for(
+            &none,
+            Some(&machine("agent = \"claude-personal\"\n")),
+            Some(&plain),
+            &models,
+            &agents,
+        );
+        assert_eq!(
+            (p.agent.as_str(), p.missing_kind),
+            ("claude-personal", None)
+        );
+    }
+
     /// An `agents` entry whose agent is of another kind than its key, and
     /// one for the kind of the layer's own agent, fail the load: in
     /// `[defaults]`, and on a flock or machine against `[agents]`.
@@ -2134,6 +2807,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         }
     }
 
@@ -2198,6 +2873,8 @@ mod tests {
                 model_from: None,
                 profile: Some("develop".into()),
                 profile_from: Some("defaults".into()),
+                timeout_from: None,
+                place_from: None,
             }));
             spec
         };
@@ -2275,6 +2952,8 @@ mod tests {
             model_from: None,
             profile: Some("develop".into()),
             profile_from: Some("defaults".into()),
+            timeout_from: None,
+            place_from: None,
         }));
         let agents: Agents = toml::from_str(
             "[opencode]\nallow_flag = \"--allow\"\n\
@@ -2292,6 +2971,7 @@ mod tests {
             assert_eq!(launch.env[key], "", "{key}");
         }
         assert_eq!(launch.env["KEEP"], "1");
+        assert_eq!(launch.env[opencode::DISABLE_PROJECT_CONFIG_ENV], "1");
 
         // A definition of kind opencode is opencode.
         let mine: Agents = toml::from_str("[oc]\nkind = \"opencode\"\n").unwrap();
@@ -2309,6 +2989,7 @@ mod tests {
         assert_eq!(err.code, "agent_tools_unsupported");
         spec.allow.clear();
         spec.deny.clear();
+        // Nor is the repo's own config turned off.
         assert!(Agents::default().launch(&spec).unwrap().env.is_empty());
     }
 
@@ -2338,12 +3019,23 @@ mod tests {
         );
         assert_eq!(
             profile(d.resolve_agent_on(&ask(None), Some(&machine), Some(&flock))),
-            ("ci".into(), Layer::Machine)
-        );
-        assert_eq!(
-            profile(d.resolve_agent(&ask(None), Some(&flock))),
             ("develop".into(), Layer::Flock)
         );
+        assert_eq!(
+            profile(d.resolve_agent_on(&ask(None), Some(&machine), None)),
+            ("ci".into(), Layer::Machine)
+        );
+        // The machine's own profile, which decides `unrestricted`, is
+        // still its own before the flock's.
+        assert_eq!(
+            d.own_profile(Some(&machine), Some(&flock)).as_deref(),
+            Some("ci")
+        );
+        assert_eq!(
+            d.own_profile(None, Some(&flock)).as_deref(),
+            Some("develop")
+        );
+        assert_eq!(d.own_profile(None, None).as_deref(), Some("review"));
         assert_eq!(
             profile(d.resolve_agent(&ask(None), None)),
             ("review".into(), Layer::Defaults)
@@ -2365,7 +3057,7 @@ mod tests {
             Some("ci")
         );
         std::fs::write(&path, "[defaults]\nprofile = \"nope\"\n").unwrap();
-        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("defaults.profile: profile nope"), "{err}");
     }
 
@@ -2398,7 +3090,7 @@ mod tests {
             ),
         ] {
             std::fs::write(&path, text).unwrap();
-            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            let err = PastorConfig::load(&path).unwrap_err().to_string();
             assert!(err.contains(want), "{text}: {err}");
         }
     }
@@ -2444,7 +3136,7 @@ mod tests {
             ),
         ] {
             std::fs::write(&path, text).unwrap();
-            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            let err = PastorConfig::load(&path).unwrap_err().to_string();
             assert!(err.contains(want), "{text}: {err}");
         }
     }
@@ -2476,7 +3168,7 @@ mod tests {
         assert_eq!(cfg.agents.trust_keys("claude").map(|k| k.len()), Some(2));
 
         std::fs::write(&path, "[agents.claude]\ntrust_keys = [\"Down\", \"\"]\n").unwrap();
-        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("agents.claude.trust_keys"), "{err}");
     }
 
@@ -2616,6 +3308,7 @@ mod tests {
             deny: vec![],
             model: None,
             profile: None,
+            ..Default::default()
         };
         assert_eq!(pick(&own, Some(&work)), ("aider".into(), "-v".into()));
         // Args follow the agent they were written for: the flock's are for
@@ -2627,6 +3320,7 @@ mod tests {
             deny: vec![],
             model: None,
             profile: None,
+            ..Default::default()
         };
         assert_eq!(
             pick(&claude, Some(&work)),
@@ -2639,6 +3333,7 @@ mod tests {
             deny: vec![],
             model: None,
             profile: None,
+            ..Default::default()
         };
         assert_eq!(
             pick(&codex, Some(&work)),
@@ -3024,18 +3719,57 @@ mod tests {
     }
 
     #[test]
-    fn close_done_after_defaults_to_fifteen_minutes_and_never_disables() {
+    fn close_done_after_defaults_to_five_seconds_and_never_disables() {
         let d = PastorConfig::default();
-        assert_eq!(d.close_done_after, "15m");
-        assert_eq!(
-            d.close_done_after_duration(),
-            Some(Duration::from_secs(15 * 60))
-        );
+        assert_eq!(d.close_done_after, "5s");
+        assert_eq!(d.close_done_after_duration(), Some(Duration::from_secs(5)));
         let c = PastorConfig {
             close_done_after: "never".into(),
             ..Default::default()
         };
         assert_eq!(c.close_done_after_duration(), None);
+    }
+
+    /// `[shepherd]` names the pull machine this one is, the hostname when
+    /// it does not; an empty name or command and an unknown key are refused.
+    #[test]
+    fn shepherd_names_the_pull_machine_this_one_is() {
+        let path = Path::new("pastor.toml");
+        let d = PastorConfig::default();
+        assert!(d.shepherd.is_empty());
+        assert_eq!(d.shepherd.machine_name(), hostname());
+        let cfg = PastorConfig::parse(
+            path,
+            "[shepherd]\nmachine = \"laptop\"\ntakes_flock_work = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.shepherd.machine_name(), "laptop");
+        assert!(cfg.shepherd.flock_work());
+        for (bad, key) in [
+            ("[shepherd]\nmachine = \" \"\n", "shepherd.machine"),
+            ("[shepherd]\ncommand = []\n", "shepherd.command"),
+            ("[shepherd]\nmachines = \"x\"\n", "machines"),
+        ] {
+            let err = format!("{:#}", PastorConfig::parse(path, bad).unwrap_err());
+            assert!(err.contains(key), "{bad}: {err}");
+        }
+    }
+
+    /// A pull machine is lost after ten silent minutes unless pastor.toml
+    /// says otherwise; zero is refused like any other timing.
+    #[test]
+    fn pull_lost_after_defaults_to_ten_minutes() {
+        assert_eq!(
+            PastorConfig::default().pull_lost_after_duration(),
+            Duration::from_secs(600)
+        );
+        let path = Path::new("pastor.toml");
+        let cfg = PastorConfig::parse(path, "pull_lost_after = \"90s\"").unwrap();
+        assert_eq!(cfg.pull_lost_after_duration(), Duration::from_secs(90));
+        let err = PastorConfig::parse(path, "pull_lost_after = \"0s\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pull_lost_after"), "{err}");
     }
 
     #[test]
@@ -3085,5 +3819,80 @@ mod tests {
         let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("settle"), "{err}");
         assert!(err.contains("must not be zero"), "{err}");
+    }
+
+    /// Tool patterns from a small pool, so the layers' lists often share
+    /// one, mixed with anything at all.
+    fn tool_patterns() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
+        use proptest::prelude::*;
+        let pattern = prop_oneof![
+            3 => proptest::sample::select(vec![
+                "Read", "Edit", "Bash", "Bash(git:*)", "Bash(rm:*)", "WebFetch", "Task",
+            ])
+            .prop_map(String::from),
+            1 => ".{0,12}",
+        ];
+        proptest::collection::vec(pattern, 0..6)
+    }
+
+    proptest::proptest! {
+        /// A pattern any layer denies is never in the resolved allow and
+        /// always in the resolved deny, whatever the layers hold and
+        /// whichever machine the task runs on. A machine has no tool
+        /// lists of its own; it is generated for its agent only.
+        #[test]
+        fn prop_a_denied_pattern_is_never_allowed(
+            d_allow in tool_patterns(), d_deny in tool_patterns(),
+            f_allow in tool_patterns(), f_deny in tool_patterns(),
+            a_allow in tool_patterns(), a_deny in tool_patterns(),
+            machine_agent in proptest::option::of("[a-z]{1,6}"),
+            flock_agent in proptest::option::of("[a-z]{1,6}"),
+            ask_agent in proptest::option::of("[a-z]{1,6}"),
+            with_flock in proptest::prelude::any::<bool>(),
+            with_machine in proptest::prelude::any::<bool>(),
+        ) {
+            let d = Defaults { allow: d_allow, deny: d_deny.clone(), ..Default::default() };
+            let flock = flock::FlockEntry {
+                name: "f".into(),
+                agent: flock_agent,
+                allow: f_allow,
+                deny: f_deny.clone(),
+                ..Default::default()
+            };
+            let mut machine: flock::MachineConfig =
+                toml::from_str("name = \"m\"\nlocal = true\n").unwrap();
+            machine.agent = machine_agent;
+            let ask = AgentChoice {
+                agent: ask_agent,
+                allow: a_allow,
+                deny: a_deny.clone(),
+                ..Default::default()
+            };
+            let pick = d.resolve_agent_on(
+                &ask,
+                with_machine.then_some(&machine),
+                with_flock.then_some(&flock),
+            );
+            let flock_deny = if with_flock { f_deny } else { vec![] };
+            for p in d_deny.iter().chain(&flock_deny).chain(&a_deny) {
+                proptest::prop_assert!(!pick.allow.contains(p), "{p:?} allowed: {pick:?}");
+                proptest::prop_assert!(pick.deny.contains(p), "{p:?} not denied: {pick:?}");
+            }
+        }
+
+        /// `check_tools` refuses a pattern exactly when it is blank or
+        /// starts with `-`.
+        #[test]
+        fn prop_check_tools_refuses_only_blank_and_dash_patterns(
+            p in proptest::prop_oneof![".*", "[ \t\n]*", "-.*", "[ \t]+-?.*"],
+        ) {
+            let refused = p.trim().is_empty() || p.starts_with('-');
+            proptest::prop_assert_eq!(
+                check_tools("allow", std::slice::from_ref(&p)).is_err(),
+                refused,
+                "{:?}",
+                p
+            );
+        }
     }
 }

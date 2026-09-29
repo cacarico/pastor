@@ -1,8 +1,9 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::config::flock::{DEFAULT_FLOCK, Flock};
-use crate::ipc::{RequestError, connect_error_means_no_daemon};
+use crate::config::Paths;
+use crate::config::flock::{DEFAULT_FLOCK, Flock, FlockNumber};
+use crate::ipc::{IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon};
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::task::Task;
@@ -242,11 +243,38 @@ fn escape_controls(s: &str, keep_lines: bool) -> String {
     out
 }
 
+/// The `label` line of `task describe`: the workspace's name once dispatch
+/// gave it one, else the template, then where it came from. A task that
+/// joined a workspace says so instead, since no template named it.
+fn workspace_label(l: &crate::task::WorkspaceLabel) -> String {
+    let from = match &l.from {
+        Some(from) => format!("from {from}"),
+        None => "built-in".to_string(),
+    };
+    let why = match l.note.as_deref() {
+        Some(note @ crate::task::JOINED_WORKSPACE) => note.to_string(),
+        Some(note) => format!("{from}; {note}"),
+        None => from,
+    };
+    let shown = l
+        .name
+        .as_deref()
+        .or(l.template.as_deref())
+        .unwrap_or(crate::task::DEFAULT_LABEL);
+    format!("{shown} ({why})")
+}
+
 /// `pastor task describe`: every field a human asks about one task, one per line,
 /// then the prompt. The agent args are shell-quoted, so the line reads as the
 /// command herdr runs; each is followed by where it came from, when the task
 /// knows (`DispatchSpec::agent_source`).
 pub fn task_detail(t: &Task) -> String {
+    task_detail_with(t, t.summary.as_slice())
+}
+
+/// `task_detail` with `summaries` in place of the last round's: `task
+/// describe --all-summaries` passes every round's.
+pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> String {
     let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
     let when = |v: Option<chrono::DateTime<Utc>>| {
         v.map(|at| format!("{} ({} ago)", at.format("%Y-%m-%d %H:%M:%S UTC"), age(at)))
@@ -259,7 +287,10 @@ pub fn task_detail(t: &Task) -> String {
         Some(m) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
         None => "-".to_string(),
     };
-    let priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
+    let mut priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
+    if t.pause.preempt {
+        priority.push_str(", preempt: pauses a low task on a full machine");
+    }
     let profile = match t.profile() {
         Some(p) => format!("{p}{}", from(source.and_then(|s| s.profile_from.as_ref()))),
         None => "-".to_string(),
@@ -294,6 +325,7 @@ pub fn task_detail(t: &Task) -> String {
         }
         repo.push(')');
     }
+    let label = workspace_label(&t.spec.label);
     let tags = if t.spec.tags.is_empty() {
         "-".to_string()
     } else {
@@ -305,6 +337,7 @@ pub fn task_detail(t: &Task) -> String {
         ("priority", priority),
         ("job", t.job.clone()),
         ("role", t.role.to_string()),
+        ("summary", t.spec.summary.describe()),
         ("flock", opt(&t.flock)),
         ("machine", opt(&t.machine)),
         ("agent", agent),
@@ -314,15 +347,41 @@ pub fn task_detail(t: &Task) -> String {
         ("allow", list(&t.spec.allow)),
         ("deny", list(&t.spec.deny)),
         ("repo", repo),
-        ("place", t.spec.place.to_string()),
+        (
+            "place",
+            format!(
+                "{}{}",
+                t.spec.place,
+                from(source.and_then(|s| s.place_from.as_ref()))
+            ),
+        ),
+        ("label", label),
         ("tags", tags),
-        ("timeout", format!("{}s", t.spec.timeout_secs)),
+        (
+            "timeout",
+            format!(
+                "{}s{}",
+                t.spec.timeout_secs,
+                from(source.and_then(|s| s.timeout_from.as_ref()))
+            ),
+        ),
         ("pane", opt(&t.pane_id)),
         ("session", opt(&t.spec.session_id)),
         ("created", when(Some(t.created_at))),
         ("started", when(t.started_at)),
         ("finished", when(t.finished_at)),
     ];
+    if let Some(at) = t.pause.paused_at {
+        let by = t
+            .pause
+            .paused_for
+            .map(|id| format!(" for {}", Task::agent_name_for(id)))
+            .unwrap_or_default();
+        fields.push(("paused", format!("{}{by}", when(Some(at)))));
+    }
+    if t.pause.resumed_at.is_some() {
+        fields.push(("resumed", when(t.pause.resumed_at)));
+    }
     if let Some(e) = &t.error {
         fields.push(("error", e.clone()));
     }
@@ -342,6 +401,14 @@ pub fn task_detail(t: &Task) -> String {
             t.description_from()
         ),
     );
+    for s in summaries {
+        out.push(summary_heading(s));
+        out.extend(
+            printable(&s.text)
+                .lines()
+                .map(|l| format!("  {l}").trim_end().to_string()),
+        );
+    }
     out.push("prompt:".into());
     out.extend(
         printable(&t.prompt)
@@ -351,18 +418,43 @@ pub fn task_detail(t: &Task) -> String {
     out.join("\n")
 }
 
-/// The stable code and message for a request that got no reply. Only a connect
-/// that was refused or found no socket means nothing is listening; one denied
-/// for permissions may hide a live head, as `probe_daemon` also assumes. A head
-/// that took the connection and then sat on it is running but busy. Telling
-/// the user to start a head in either case would send them the wrong way.
-/// The head handles each request in a detached task, so a timed-out `run`,
+/// A summary's first line in `task describe`: its outcome, round, who wrote
+/// it and when.
+fn summary_heading(s: &crate::task::TaskSummary) -> String {
+    let by = match s.source {
+        crate::task::SummarySource::Agent => "from the agent",
+        crate::task::SummarySource::Pane => "the pane's last lines",
+    };
+    format!(
+        "{:<12}{} (round {}, {by}, {} ago)",
+        "summary:",
+        s.outcome,
+        s.round,
+        age(s.at)
+    )
+}
+
+/// The RESULT column of `task list --wide`: the outcome of the task's last
+/// round, `-` while it has none.
+pub fn task_result(t: &Task) -> String {
+    t.summary
+        .as_ref()
+        .map_or_else(|| "-".into(), |s| s.outcome.to_string())
+}
+
+/// The CLI error for a request that got no reply, the one mapper every
+/// command uses. Only a connect that was refused or found no socket means
+/// nothing is listening (`daemon_not_running`); one denied for permissions
+/// may hide a live head, as `probe_daemon` also assumes. A head that took the
+/// connection and then sat on it is running but busy. Telling the user to
+/// start a head in either case would send them the wrong way. The head
+/// handles each request in a detached task, so a timed-out `run`,
 /// `task retry`, `tick` or `job run` may still land; sending it again blindly
 /// can queue a duplicate.
-pub fn request_failure(err: &RequestError) -> (String, String) {
+pub fn request_error(err: &RequestError) -> CliError {
     let (code, message) = match err {
         RequestError::Connect(e) if connect_error_means_no_daemon(e) => (
-            "runtime_error",
+            "daemon_not_running",
             format!("pastor serve is not running ({e}); start it with `pastor serve`"),
         ),
         RequestError::Connect(e) => (
@@ -381,9 +473,53 @@ pub fn request_failure(err: &RequestError) -> (String, String) {
             format!("pastor serve dropped the request: {e:#}"),
         ),
         RequestError::Unreachable(message) => ("head_unreachable", message.clone()),
-        RequestError::Refused { code, message } => return (code.clone(), message.clone()),
+        RequestError::Refused { code, message } => {
+            return CliError {
+                code: code.clone(),
+                message: message.clone(),
+            };
+        }
     };
-    (code.to_string(), message)
+    CliError {
+        code: code.into(),
+        message,
+    }
+}
+
+/// What `request_head` got, as the CLI takes it: a reply, or a `CliError`
+/// for an error reply or for no reply at all (`request_error`).
+pub fn reply(got: Result<IpcResponse, RequestError>) -> Result<IpcResponse, CliError> {
+    match got {
+        Ok(IpcResponse::Error { code, message }) => Err(CliError { code, message }),
+        Ok(resp) => Ok(resp),
+        Err(err) => Err(request_error(&err)),
+    }
+}
+
+/// One request to the head, the local serve or the remote head, whichever
+/// `request_head` reaches. The error is for the caller to return, print or
+/// act on (an invalid edit reopens the editor); nothing here exits.
+pub async fn ask(paths: &Paths, req: IpcRequest) -> Result<IpcResponse, CliError> {
+    reply(crate::ipc::request_head(paths, &req).await)
+}
+
+/// A reply of a variant the command does not expect, as from a head of
+/// another version: an error with code `internal`, never a panic.
+pub fn unexpected(resp: IpcResponse) -> anyhow::Error {
+    CliError::err("internal", format!("unexpected daemon reply: {resp:?}"))
+}
+
+/// One task, as `task show` prints it: JSON, or a one-row table.
+pub fn print_task(t: &Task, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&t.to_json())?);
+    } else {
+        println!(
+            "{}",
+            table(&TASK_HEADER, &task_rows(std::slice::from_ref(t)))
+        );
+    }
+    Ok(())
 }
 
 /// Tasks still holding a pane on a machine the flock no longer has. Nothing
@@ -413,10 +549,38 @@ pub struct FlockRow {
     pub name: String,
     pub default: bool,
     pub machines: Vec<String>,
+    /// Each of `machines` with the flock's number there and its live tasks
+    /// of the flock, known only from a running head.
+    pub members: Vec<FlockMember>,
     pub agents: Option<usize>,
     pub queued: usize,
     /// Its `[[flock]]` entry's `description`.
     pub description: Option<String>,
+}
+
+/// A machine in `FlockRow::members`. `share` and `max` are the flock's
+/// number there (equal for a plain number), or for a machine with none
+/// written (the old `flock` key, or the default flock of a machine no flock
+/// lists) its `max_agents`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FlockMember {
+    pub name: String,
+    pub share: u32,
+    pub max: u32,
+    pub live: Option<usize>,
+}
+
+impl FlockMember {
+    /// `desk 1/2`, or `desk -/2` with no head to count; with a share and a
+    /// max, `desk 1/2/4`.
+    pub fn label(&self) -> String {
+        let live = self.live.map_or_else(|| "-".into(), |n| n.to_string());
+        if self.share == self.max {
+            format!("{} {live}/{}", self.name, self.max)
+        } else {
+            format!("{} {live}/{}/{}", self.name, self.share, self.max)
+        }
+    }
 }
 
 pub const FLOCK_HEADER: [&str; 5] = ["NAME", "DEFAULT", "MACHINES", "AGENTS", "QUEUED"];
@@ -429,18 +593,41 @@ pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]
         .flock_names()
         .into_iter()
         .map(|name| {
-            let machines: Vec<String> = flock
-                .machines
+            let machines: Vec<String> = flock.members(name).into_iter().map(String::from).collect();
+            // The flock's own tasks on a machine; a head from before many
+            // flocks reports only the machine's.
+            let live_on = |s: &MachineStatus| match s.flocks.iter().find(|f| f.name == name) {
+                Some(seat) => seat.live,
+                // A head that reports only its single `flock` (or none, before
+                // flocks): count its live agents under that one flock, not
+                // under every local flock the machine is configured into.
+                None if s.flocks.is_empty()
+                    && name == s.flock.as_deref().unwrap_or(flock.default_flock()) =>
+                {
+                    s.live
+                }
+                None => 0,
+            };
+            let members: Vec<FlockMember> = machines
                 .iter()
-                .filter(|m| flock.flock_of(m) == name)
-                .map(|m| m.name.clone())
+                .map(|m| {
+                    let number = flock
+                        .machine_flocks(m)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|(f, _)| *f == name)
+                        .and_then(|(_, n)| n)
+                        .or_else(|| flock.get(m).map(|c| FlockNumber::plain(c.max_agents)))
+                        .unwrap_or(FlockNumber::plain(0));
+                    FlockMember {
+                        name: m.clone(),
+                        share: number.share(),
+                        max: number.max(),
+                        live: live.map(|ms| ms.iter().find(|s| &s.name == m).map_or(0, live_on)),
+                    }
+                })
                 .collect();
-            let agents = live.map(|ms| {
-                ms.iter()
-                    .filter(|s| machines.contains(&s.name))
-                    .map(|s| s.live)
-                    .sum()
-            });
+            let agents = live.map(|_| members.iter().filter_map(|m| m.live).sum());
             let queued = queued
                 .iter()
                 .filter(|t| t.flock.as_deref().unwrap_or(flock.default_flock()) == name)
@@ -449,6 +636,7 @@ pub fn flock_list(flock: &Flock, live: Option<&[MachineStatus]>, queued: &[Task]
                 name: name.to_string(),
                 default: name == flock.default_flock(),
                 machines,
+                members,
                 agents,
                 queued,
                 description: flock
@@ -465,10 +653,14 @@ pub fn flock_rows(rows: &[FlockRow]) -> Vec<Vec<String>> {
             vec![
                 f.name.clone(),
                 if f.default { "yes" } else { "no" }.into(),
-                if f.machines.is_empty() {
+                if f.members.is_empty() {
                     "-".into()
                 } else {
-                    f.machines.join(",")
+                    f.members
+                        .iter()
+                        .map(FlockMember::label)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 },
                 f.agents.map_or_else(|| "-".into(), |n| n.to_string()),
                 f.queued.to_string(),
@@ -488,7 +680,7 @@ pub fn orphan_lines(
 ) -> Vec<String> {
     ms.iter()
         .filter(|m| machine.is_none_or(|name| m.name == name))
-        .filter(|m| flock.is_none_or(|f| m.flock.as_deref().unwrap_or(DEFAULT_FLOCK) == f))
+        .filter(|m| flock.is_none_or(|f| m.in_flock(f)))
         .flat_map(|m| {
             m.orphans.iter().map(move |o| {
                 format!(
@@ -548,8 +740,12 @@ pub struct MachineRow {
     pub name: String,
     pub host: String,
     pub endpoint: String,
-    /// The flock the machine is in.
+    /// The flock that stands for the machine (`Flock::primary_flock`).
     pub flock: String,
+    /// Every flock it is in, with its number and live tasks there. Empty
+    /// from a head that predates it: then `flock` is the only one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flocks: Vec<crate::machine::FlockSeat>,
     pub channel: String,
     pub herdr_version: Option<String>,
     pub pastor_version: Option<String>,
@@ -577,6 +773,33 @@ pub struct MachineRow {
     pub description: Option<String>,
 }
 
+impl MachineRow {
+    pub fn in_flock(&self, flock: &str) -> bool {
+        if self.flocks.is_empty() {
+            self.flock == flock
+        } else {
+            self.flocks.iter().any(|f| f.name == flock)
+        }
+    }
+
+    /// The FLOCKS column: every flock, with its number where it has one
+    /// (`home,work:2`, `work:2/4` for a share and a max).
+    pub fn flock_label(&self) -> String {
+        if self.flocks.is_empty() {
+            return self.flock.clone();
+        }
+        let names: Vec<String> = self
+            .flocks
+            .iter()
+            .map(|f| match f.number_label() {
+                Some(n) => format!("{}:{n}", f.name),
+                None => f.name.clone(),
+            })
+            .collect();
+        names.join(",")
+    }
+}
+
 impl From<&MachineStatus> for MachineRow {
     fn from(m: &MachineStatus) -> MachineRow {
         MachineRow {
@@ -585,6 +808,7 @@ impl From<&MachineStatus> for MachineRow {
             endpoint: m.endpoint.clone(),
             // A head from before flocks has only the one.
             flock: m.flock.clone().unwrap_or_else(|| DEFAULT_FLOCK.into()),
+            flocks: m.flocks.clone(),
             channel: m.channel.to_string(),
             herdr_version: m.herdr_version.clone(),
             pastor_version: m.pastor_version.clone(),
@@ -604,7 +828,7 @@ impl From<&MachineStatus> for MachineRow {
 
 /// AGENTS counts orphans too; ORPHANS names them (see `MachineStatus::orphans`).
 pub const MACHINE_HEADER: [&str; 11] = [
-    "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
+    "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS", "ORPHANS", "TAGS",
     "ERROR",
 ];
 
@@ -661,7 +885,7 @@ pub fn machine_rows(ms: &[MachineRow]) -> Vec<Vec<String>> {
             vec![
                 m.name.clone(),
                 m.host.clone(),
-                m.flock.clone(),
+                m.flock_label(),
                 m.profile.clone().unwrap_or_else(dash),
                 m.channel.clone(),
                 m.herdr_version.clone().unwrap_or_else(dash),
@@ -710,6 +934,41 @@ pub fn in_(at: chrono::DateTime<Utc>) -> String {
     } else {
         format!("{} ago", age(at))
     }
+}
+
+pub const ORCHESTRATOR_HEADER: [&str; 8] = [
+    "NAME",
+    "KIND",
+    "STATE",
+    "SCHEDULE",
+    "LAST RUN",
+    "NEXT RUN",
+    "AGENT",
+    "LAST RESULT",
+];
+
+/// `orchestrator list`'s rows, one per file.
+pub fn orchestrator_rows(list: &[crate::orchestrator::OrchestratorStatus]) -> Vec<Vec<String>> {
+    list.iter()
+        .map(|o| {
+            let result = match &o.error {
+                Some(e) => format!("invalid: {e}"),
+                None => o.last_result.clone().unwrap_or_default(),
+            };
+            vec![
+                o.name.clone(),
+                o.kind.map_or("-".into(), |k| k.to_string()),
+                o.state.clone(),
+                o.schedule.clone().unwrap_or_else(|| "-".into()),
+                o.last_run_at
+                    .map(|t| format!("{} ago", age(t)))
+                    .unwrap_or_else(|| "never".into()),
+                o.next_run.map(in_).unwrap_or_else(|| "-".into()),
+                o.task.map_or("-".into(), |t| format!("t-{t}")),
+                one_line(result.trim()),
+            ]
+        })
+        .collect()
 }
 
 pub const JOB_HEADER: [&str; 8] = [
@@ -832,6 +1091,8 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            pause: Default::default(),
+            summary: None,
             created_at: now,
             started_at: Some(now),
             finished_at: None,
@@ -860,6 +1121,8 @@ mod tests {
             tags: vec!["fast".into(), "arm".into()],
             orphans: vec![],
             flock: None,
+            flocks: vec![],
+            live_by_flock: vec![],
             shutting_down: false,
             profile: None,
         }
@@ -874,7 +1137,7 @@ mod tests {
     }
 
     /// The head's own machine (the `local` one) comes first; the others
-    /// keep flock order. FLOCK follows HOST, and PROFILE follows FLOCK.
+    /// keep flock order. FLOCKS follows HOST, and PROFILE follows FLOCKS.
     #[test]
     fn machine_table_puts_the_heads_machine_first_with_its_flock() {
         let mut rows = vec![
@@ -893,7 +1156,7 @@ mod tests {
         assert_eq!(
             cells(0),
             [
-                "NAME", "HOST", "FLOCK", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS",
+                "NAME", "HOST", "FLOCKS", "PROFILE", "CHANNEL", "HERDR", "PASTOR", "AGENTS",
                 "ORPHANS", "TAGS", "ERROR"
             ]
         );
@@ -1040,6 +1303,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -1054,6 +1319,7 @@ mod tests {
         let flock = Flock {
             flocks: vec![],
             machines: vec![MachineConfig {
+                pull: false,
                 description: None,
                 name: "pi-1".into(),
                 local: true,
@@ -1106,6 +1372,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -1148,6 +1416,8 @@ mod tests {
                 model_from: None,
                 profile: None,
                 profile_from: None,
+                timeout_from: None,
+                place_from: None,
             })),
             ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
         };
@@ -1170,6 +1440,8 @@ mod tests {
                 model_from: None,
                 profile: None,
                 profile_from: None,
+                timeout_from: None,
+                place_from: None,
             })),
             ..spec
         }));
@@ -1178,6 +1450,24 @@ mod tests {
             "{bare}"
         );
         assert!(bare.contains("agent args: -\n"), "{bare}");
+    }
+
+    /// `task describe` says when a paused task was paused and for which
+    /// task, and marks a task that may pause one.
+    #[test]
+    fn a_paused_task_says_when_and_for_whom() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        t.priority = crate::task::Priority::Low;
+        t.state = crate::task::TaskState::Paused;
+        t.pause.paused_at = Some(Utc::now());
+        t.pause.paused_for = Some(9);
+        let out = task_detail(&t);
+        assert!(out.contains("state:      paused\n"), "{out}");
+        assert!(out.contains(" for t-9\n"), "{out}");
+        assert!(!out.contains("resumed:"), "{out}");
+        t.pause.preempt = true;
+        t.priority = crate::task::Priority::Critical;
+        assert!(task_detail(&t).contains("critical, preempt: "));
     }
 
     /// `task describe` gives the level and the layer that set it, and
@@ -1203,6 +1493,64 @@ mod tests {
         let json = t.to_json();
         assert_eq!(json["priority"], "high");
         assert_eq!(json["priority_from"], "flock work");
+    }
+
+    /// `task describe` gives the workspace label and where it came from:
+    /// the template until dispatch names the workspace, then that name,
+    /// with a note when it joined a workspace or fell back to `t-N`.
+    #[test]
+    fn a_tasks_label_shows_with_where_it_came_from() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      {{ flock }}/{{ task.id }} (built-in)\n"),
+            "{out}"
+        );
+        t.spec.label.template = Some("{{ machine }}/{{ task.id }}".into());
+        t.spec.label.from = Some("flock work".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      {{ machine }}/{{ task.id }} (from flock work)\n"),
+            "{out}"
+        );
+        t.spec.label.name = Some("pi-1/t-1".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      pi-1/t-1 (from flock work)\n"),
+            "{out}"
+        );
+        t.spec.label.name = Some("t-1".into());
+        t.spec.label.note = Some("fell back to t-1: it renders empty".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      t-1 (from flock work; fell back to t-1: it renders empty)\n"),
+            "{out}"
+        );
+        t.spec.label.name = Some("pastor".into());
+        t.spec.label.note = Some("joined workspace".into());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("label:      pastor (joined workspace)\n"),
+            "{out}"
+        );
+    }
+
+    /// `task describe` says whether pastor asks the task for a summary.
+    #[test]
+    fn a_task_shows_its_summary_setting() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        let out = task_detail(&t);
+        assert!(
+            out.contains("summary:    ask (line added to the prompt)\n"),
+            "{out}"
+        );
+        t.spec.summary = crate::task::SummaryMode::Require;
+        assert!(
+            task_detail(&t)
+                .contains("summary:    require (line added to the prompt; fails without one)\n")
+        );
+        t.spec.summary = crate::task::SummaryMode::Off;
+        assert!(task_detail(&t).contains("summary:    off (nothing added to the prompt)\n"));
     }
 
     /// `task describe` names the task's role, and `task list --json`'s
@@ -1237,6 +1585,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         });
         let out = task_detail(&t);
         assert!(
@@ -1271,6 +1621,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);
@@ -1316,6 +1668,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
         let note = task_rows(std::slice::from_ref(&t))[0]
@@ -1345,6 +1699,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
         let out = task_detail(&t);
@@ -1578,5 +1934,128 @@ mod tests {
         assert_eq!(rows[0][8], "t-4,t-9");
         assert_eq!(rows[1][8], "-");
         assert_eq!(rows[0].len(), MACHINE_HEADER.len());
+    }
+
+    /// `flock list` gives each machine of a flock with the flock's number
+    /// there and its live tasks of the flock: `desk 1/2`; without a head,
+    /// `desk -/2`. A machine with no number written shows its max_agents.
+    #[test]
+    fn a_flock_row_shows_each_machine_with_its_number_and_live_count() {
+        let f: Flock = toml::from_str(
+            "[[flock]]\nname = \"home\"\ndefault = true\n\n[[flock]]\nname = \"work\"\nmachines = { desk = 2 }\n\n\
+             [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 4\n\n\
+             [[machine]]\nname = \"lab\"\nssh = \"user@lab\"\nflock = \"work\"\n",
+        )
+        .unwrap();
+        let seat = |name: &str, max: Option<u32>, live: usize| crate::machine::FlockSeat {
+            name: name.into(),
+            share: None,
+            max,
+            live,
+        };
+        let desk = MachineStatus {
+            flocks: vec![seat("work", Some(2), 1)],
+            ..status("desk", "local")
+        };
+        let rows = flock_list(&f, Some(&[desk]), &[]);
+        assert_eq!(rows[1].machines, ["desk", "lab"]);
+        assert_eq!(flock_rows(&rows)[1][2], "desk 1/2, lab 0/2");
+        assert_eq!(rows[1].agents, Some(1));
+        assert_eq!(flock_rows(&rows)[0][2], "-");
+        let rows = flock_list(&f, None, &[]);
+        assert_eq!(flock_rows(&rows)[1][2], "desk -/2, lab -/2");
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        assert_eq!(
+            json["members"],
+            serde_json::json!([
+                {"name": "desk", "share": 2, "max": 2, "live": null},
+                {"name": "lab", "share": 2, "max": 2, "live": null}
+            ])
+        );
+    }
+
+    /// A share and a max read `2/4`: `desk 1/2/4` in `flock list` (live,
+    /// share, max), `work:2/4` in `machine list`, and both numbers in JSON.
+    #[test]
+    fn a_share_and_a_max_show_as_two_numbers() {
+        let f: Flock = toml::from_str(
+            "[[flock]]\nname = \"work\"\ndefault = true\nmachines = { desk = { share = 2, max = 4 } }\n\n\
+             [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 4\n",
+        )
+        .unwrap();
+        let seat = crate::machine::FlockSeat::new(
+            "work",
+            Some(crate::config::flock::FlockNumber::split(2, 4)),
+            1,
+        );
+        let desk = MachineStatus {
+            flock: Some("work".into()),
+            flocks: vec![seat.clone()],
+            ..status("desk", "local")
+        };
+        let rows = flock_list(&f, Some(std::slice::from_ref(&desk)), &[]);
+        assert_eq!(flock_rows(&rows)[0][2], "desk 1/2/4");
+        assert_eq!(
+            serde_json::to_value(&rows[0]).unwrap()["members"],
+            serde_json::json!([{"name": "desk", "share": 2, "max": 4, "live": 1}])
+        );
+        let row = MachineRow::from(&desk);
+        assert_eq!(row.flock_label(), "work:2/4");
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            json["flocks"],
+            serde_json::json!([{"name": "work", "share": 2, "max": 4, "live": 1}])
+        );
+        // A head from before shares sends only `max`: its number was a
+        // plain ceiling.
+        let old: crate::machine::FlockSeat =
+            serde_json::from_value(serde_json::json!({"name": "work", "max": 2, "live": 2}))
+                .unwrap();
+        assert_eq!(old.number_label().as_deref(), Some("2"));
+        assert!(!old.has_room() && !old.under_share());
+    }
+
+    /// A status carries every flock of the machine; one from a head before
+    /// many flocks has only `flock` and reads as that one flock.
+    #[test]
+    fn a_machine_row_carries_its_flocks_and_an_old_head_reads_as_one() {
+        let seat = |name: &str, max: Option<u32>, live: usize| crate::machine::FlockSeat {
+            name: name.into(),
+            share: None,
+            max,
+            live,
+        };
+        let m = MachineStatus {
+            flock: Some("home".into()),
+            flocks: vec![seat("home", None, 1), seat("work", Some(2), 0)],
+            ..status("desk", "local")
+        };
+        let row = MachineRow::from(&m);
+        assert_eq!(row.flock_label(), "home,work:2");
+        assert!(row.in_flock("work") && row.in_flock("home") && !row.in_flock("play"));
+        assert_eq!(
+            orphan_lines(
+                &[MachineStatus {
+                    orphans: vec!["t-1".into()],
+                    ..m.clone()
+                }],
+                None,
+                Some("work")
+            )
+            .len(),
+            1
+        );
+        let back: MachineStatus =
+            serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert_eq!(back.flocks, m.flocks);
+
+        let mut old = serde_json::to_value(&m).unwrap();
+        old.as_object_mut().unwrap().remove("flocks");
+        old["flock"] = "work".into();
+        let old: MachineStatus = serde_json::from_value(old).unwrap();
+        assert_eq!(old.flock_names(), ["work"]);
+        let row = MachineRow::from(&old);
+        assert_eq!(row.flock_label(), "work");
+        assert!(row.in_flock("work") && !row.in_flock("home"));
     }
 }

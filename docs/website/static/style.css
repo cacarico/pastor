@@ -21,7 +21,7 @@ body {
 }
 a { color: var(--link); text-decoration: none; }
 a:hover, a:focus-visible { text-decoration: underline; outline: none; }
-pre { margin: 0; white-space: pre; overflow-x: auto; font: inherit; }
+pre { margin: 0; white-space: pre; overflow-x: auto; font: inherit; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 b, strong { font-weight: 700; color: var(--hot); }
 
 .screen { max-width: 1180px; margin: 0 auto; padding: 8px 12px 0; min-height: 100vh; display: flex; flex-direction: column; }
@@ -52,24 +52,88 @@ b, strong { font-weight: 700; color: var(--hot); }
 .cursor { background: var(--ink); color: var(--bg); }
 
 /* home */
-.home { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); grid-template-areas: "what install" "how first" "not first"; }
-.steps { margin: 0; padding: 0; list-style: none; counter-reset: step; }
-.steps li { counter-increment: step; display: grid; grid-template-columns: 3ch 1fr; margin-bottom: 4px; }
-.steps li::before { content: counter(step); color: var(--accent); }
+.home { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); grid-template-areas: "pastor live" "install live" "can why" "can not"; grid-template-rows: 1fr auto auto auto; }
+/* the tall terminal's extra height goes to the pitch; install keeps its own height */
+.home > .pane.focus { padding-bottom: 28px; } /* install: a little of that room */
+.pitch { font-size: 1.1em; }
+.pitch b { color: var(--accent); }
+.feats b { display: inline-block; min-width: 8ch; }
 .not { margin: 0; padding: 0; list-style: none; }
 .not li { display: grid; grid-template-columns: 2ch 1fr; margin-bottom: 4px; }
 .not li::before { content: "×"; color: var(--bad); }
 .not b { color: var(--ink); }
+.uses { margin: 0 0 8px; padding: 0; list-style: none; }
+.uses li { display: grid; grid-template-columns: 2ch 1fr; margin-bottom: 4px; }
+.uses li::before { content: "›"; color: var(--accent); }
+.uses b { color: var(--ink); }
+
+/* the live terminal: term.js types the transcript into it */
+/* a fixed window that scrolls up as lines arrive, like a real terminal */
+.term { background: var(--code); padding: 8px 10px; margin: 6px 0 8px; font-size: 12px; line-height: 1.55; height: 30em; overflow: auto; }
+/* on the home it fills its column, as tall as the panes beside it */
+.home .live { display: flex; flex-direction: column; }
+.home .live .term { flex: 1 1 auto; height: 0; min-height: 33em; }
+.term .p { color: var(--dim); user-select: none; }
+.term .lbl { color: var(--accent); }
+.term .in { color: var(--sel-ink); }
+.term .ask { color: var(--hot); }
+.term .out { color: var(--dim); }
+.term .say { color: var(--ink); }
+.term .dot { color: var(--ink); }
+.term .call { color: var(--ink); }
+.term .call .dot { color: var(--ok); }
+.term .call .in { color: var(--sel-ink); }
+.term .res { color: var(--dim); }
+/* its controls sit on the pane's top border, like the title on the left */
+/* only the lower half is painted: enough to hide the border under it, and
+   nothing shows above the border where the page, or a popup's backdrop, is */
+.term-ctl { position: absolute; top: -10px; height: 20px; right: 1ch; display: flex; align-items: center; gap: 1ch; padding: 0 1ch; background: linear-gradient(transparent 45%, var(--bg) 45%); }
+.term-ctl[hidden] { display: none; }
+.term-ctl .act { width: 11px; height: 11px; padding: 0; border: 1.5px solid var(--ink); border-radius: 50%; background: transparent; cursor: pointer; }
+.term-ctl .act.on { background: var(--accent); border-color: var(--accent); }
+.term-ctl .act:hover, .term-ctl .act:focus-visible { border-color: var(--accent); outline: none; }
+.term-ctl .btn { display: grid; place-items: center; width: 22px; height: 20px; padding: 0; color: var(--dim); background: var(--code); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+.term-ctl .btn svg { width: 12px; height: 12px; fill: currentColor; }
+.term-ctl .btn:hover, .term-ctl .btn:focus-visible { color: var(--accent); border-color: var(--accent); outline: none; }
+.term-ctl .act + .btn { margin-left: 1ch; }
+
+/* the terminal's bigger view: a centred dialog, 60% of the window each way */
+.term-big { width: 60vw; height: 60vh; max-width: none; max-height: none; padding: 0; border: 0; background: transparent; color: var(--ink); overflow: visible; }
+.term-big::backdrop { background: rgb(0 0 0 / .65); }
+/* in the popup the title and controls sit inside the frame, as a header */
+.term-big .pane { height: 100%; display: grid; grid-template: "t ctl" auto "term term" 1fr / minmax(0, 1fr) auto; gap: 8px 12px; background: var(--bg); padding: 10px 12px 12px; }
+.term-big .pane > .t { grid-area: t; position: static; padding: 0; background: none; align-self: center; }
+.term-big .term-ctl { grid-area: ctl; position: static; padding: 0; background: none; }
+.term-big .term { grid-area: term; height: auto; min-height: 0; margin: 0; font-size: 13px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 /* docs */
-.docs { grid-template-columns: 22ch minmax(0, 1fr); }
+/* the docs nav: a tree of sections, the open one's pages, the page's topics */
+.docs { grid-template-columns: 35ch minmax(0, 1fr); }
 .list { align-self: start; position: sticky; top: 12px; }
-.list .grp { color: var(--dim); margin: 8px 0 2px; }
-.list .grp:first-of-type { margin-top: 0; }
-.list a { display: block; color: var(--ink); padding: 0 1ch; }
-.list a.sel, .list a:focus { background: var(--sel); color: var(--sel-ink); text-decoration: none; }
-.list a.sel { box-shadow: inset 2px 0 0 var(--accent); }
-.list a.sel::before { content: "▸ "; }
+/* the nav reads as a list of names, easier in a proportional face than in
+   the monospace the rest of the site keeps */
+.list { line-height: 1.75; font-family: system-ui, -apple-system, "Segoe UI", Inter, "Helvetica Neue", Arial, sans-serif; font-size: 15px; }
+.list > .t { font-family: var(--mono); font-size: 14px; }
+.list a { display: block; color: var(--ink); padding: 1px 1ch; }
+.list a:hover, .list a:focus { background: var(--sel); color: var(--sel-ink); text-decoration: none; }
+.list .grp { margin: 2px 0; }
+.list .grp summary { list-style: none; cursor: pointer; color: var(--accent); padding: 0 1ch; }
+.list .grp summary::-webkit-details-marker { display: none; }
+.list .grp summary::before { content: "▸ "; color: var(--dim); }
+.list .grp[open] summary::before { content: "▾ "; }
+.list .grp summary:hover, .list .grp summary:focus-visible { background: var(--sel); outline: none; }
+.list .grp { margin: 4px 0; }
+.list .grp[open] { margin-bottom: 8px; }
+.list a.top { color: var(--accent); margin-bottom: 4px; }
+.list a.top::before { content: "≡ "; color: var(--dim); }
+.list a.top.sel { background: var(--sel); box-shadow: inset 2px 0 0 var(--accent); }
+.list a.pg { padding-left: 2ch; margin-left: 1.5ch; border-left: 1px solid var(--line); }
+.list a.pg.sel { background: var(--sel); color: var(--sel-ink); box-shadow: inset 2px 0 0 var(--accent); }
+.list .topics { margin: 2px 0 6px; }
+.list .topics ul { list-style: none; margin: 0; padding: 0; }
+.list .topics a { padding-left: 4ch; margin-left: 1.5ch; border-left: 1px solid var(--line); color: var(--bar-ink); }
+.list .topics a::before { content: "· "; color: var(--dim); }
 
 .doc { line-height: 1.6; }
 .doc p, .doc ul, .doc ol { margin: 0 0 10px; max-width: 88ch; }
@@ -96,12 +160,20 @@ h2:hover .anchor, h3:hover .anchor, h4:hover .anchor, .anchor:focus { opacity: 1
 .more { margin-top: 18px; padding-top: 8px; border-top: 1px dashed var(--line); color: var(--dim); }
 .pager { display: flex; justify-content: space-between; gap: 12px; margin-top: 18px; }
 
-/* docs index */
-.index { columns: 2 36ch; column-gap: 32px; }
-.index section { break-inside: avoid; margin-bottom: 14px; }
-.index h2 { margin: 0 0 4px; font: inherit; color: var(--dim); }
-.index dl { display: grid; grid-template-columns: 16ch 1fr; gap: 2px 1ch; margin: 0; }
-.index dd { margin: 0; color: var(--dim); }
+/* docs index: a card per section */
+.index { columns: 2 40ch; column-gap: 14px; margin-top: 14px; }
+.index .card { break-inside: avoid; border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; margin-bottom: 14px; }
+.index h2 { margin: 0; font: inherit; }
+.doc .index h2::before { content: none; }
+.index h2 a { color: var(--accent); text-decoration: none; }
+.index .sum { margin: 0 0 8px; color: var(--dim); }
+.index ul { list-style: none; margin: 0; padding: 0; }
+.index li { margin: 0 0 6px; }
+.index li:last-child { margin-bottom: 0; }
+.index li a { color: var(--link); text-decoration: none; }
+.index li a::before { content: "› "; color: var(--accent); }
+.index li a:hover, .index h2 a:hover { text-decoration: underline; }
+.index li span { display: block; padding-left: 2ch; color: var(--dim); font-size: 13px; }
 
 .toc { margin: 0 0 12px; }
 .toc summary { cursor: pointer; color: var(--dim); }
@@ -113,12 +185,12 @@ h2:hover .anchor, h3:hover .anchor, h4:hover .anchor, .anchor:focus { opacity: 1
 .status .right { margin-left: auto; padding-right: 1ch; color: var(--dim); }
 
 @media (max-width: 760px) {
-  .home { grid-template-columns: minmax(0, 1fr); grid-template-areas: "what" "install" "first" "how" "not"; }
+  .home { grid-template-columns: minmax(0, 1fr); grid-template-areas: "pastor" "live" "install" "can" "why" "not"; }
+  .term, .home .live .term { font-size: 11px; height: 26em; min-height: 0; flex: none; }
+  .term-big { width: 94vw; height: 70vh; }
   .docs { grid-template-columns: minmax(0, 1fr); }
-  .list { position: relative; top: 0; display: flex; flex-wrap: wrap; gap: 0 1ch; }
-  .list .grp { width: 100%; margin: 6px 0 0; }
-  .list a { padding: 0 .5ch; }
-  .list a.sel::before { content: ""; }
+  .list { position: relative; top: 0; }
+  .list .topics { display: none; }
   .meta { display: none; }
   .status .right { display: none; }
 }

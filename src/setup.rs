@@ -902,7 +902,8 @@ mod tests {
             }
             assert_eq!(t.lines().filter(|l| l.starts_with("ExecStart=")).count(), 1);
         }
-        assert!(PASTOR_UNIT.contains("ExecStart=%h/.cargo/bin/pastor serve"));
+        // In the foreground: a bare `pastor serve` would go to the background.
+        assert!(PASTOR_UNIT.contains("ExecStart=%h/.cargo/bin/pastor serve --foreground\n"));
         // pastor's own service is hardened where that costs nothing in a
         // user unit; herdr's is left open, since its agents need the user's
         // whole session (sudo included).
@@ -936,7 +937,7 @@ mod tests {
         assert_eq!(
             service,
             [
-                "ExecStart=/home/u/.cargo/bin/pastor serve",
+                "ExecStart=/home/u/.cargo/bin/pastor serve --foreground",
                 "Environment=\"PATH=/usr/bin:/home/u/my bin\"",
                 "Environment=PASTOR_STATE_DIR=/s/100%%",
             ]
@@ -975,7 +976,7 @@ mod tests {
         assert!(render(PASTOR_UNIT, Path::new("/bin/pa\rstor"), &[]).is_err());
         let text = render(PASTOR_UNIT, Path::new("/opt/$HOME/pastor"), &[]).unwrap();
         assert!(
-            text.contains("ExecStart=/opt/$$HOME/pastor serve\n"),
+            text.contains("ExecStart=/opt/$$HOME/pastor serve --foreground\n"),
             "{text}"
         );
     }
@@ -1055,7 +1056,10 @@ mod tests {
         assert_eq!(report.unit_path, unit_path);
         assert_eq!(report.written, Written::Created);
         let text = std::fs::read_to_string(&unit_path).unwrap();
-        assert!(text.contains("ExecStart=/opt/bin/pastor serve\n"), "{text}");
+        assert!(
+            text.contains("ExecStart=/opt/bin/pastor serve --foreground\n"),
+            "{text}"
+        );
         assert!(
             text.contains("Environment=PATH=/usr/bin:/opt/bin\n"),
             "{text}"
@@ -1365,5 +1369,63 @@ mod tests {
         let path = path.to_str().unwrap();
         assert_eq!(which("herdr", path), Some(b.join("herdr")));
         assert_eq!(which("nope", path), None);
+    }
+
+    /// What systemd makes of one unit-file word: specifiers first (`%%` is a
+    /// literal `%`; any other specifier is a word `quote` should not have
+    /// written), then the word split with its quote and backslash rules. Fails
+    /// unless the line holds exactly one word; an empty line holds none.
+    fn systemd_unquote(line: &str) -> Result<String, String> {
+        if line.is_empty() {
+            return Err("no word in an empty line".to_string());
+        }
+        let mut spec = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                spec.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => spec.push('%'),
+                other => return Err(format!("specifier %{other:?} in {line:?}")),
+            }
+        }
+        let mut word = String::new();
+        let mut chars = spec.chars().peekable();
+        let mut quote: Option<char> = None;
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (None, ' ' | '\t' | '\n' | '\r') => return Err(format!("two words in {line:?}")),
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), c) if c == q => {
+                    quote = None;
+                    if chars.peek().is_some() {
+                        return Err(format!("text after the closing quote in {line:?}"));
+                    }
+                }
+                (_, '\\') => match chars.next() {
+                    Some(e @ ('\\' | '"' | '\'')) => word.push(e),
+                    other => return Err(format!("escape \\{other:?} in {line:?}")),
+                },
+                (_, c) => word.push(c),
+            }
+        }
+        if quote.is_some() {
+            return Err(format!("unclosed quote in {line:?}"));
+        }
+        Ok(word)
+    }
+
+    proptest::proptest! {
+        /// systemd reads back exactly the string `quote` was given, whatever
+        /// `%`, spaces, quotes, backslashes or non-ASCII it holds. Not empty:
+        /// `quote("")` writes no word, and no path it is given is empty.
+        #[test]
+        fn prop_quote_round_trips_through_systemd(
+            s in "([%nC \"'\\\\é中\t]|\\PC){1,24}",
+        ) {
+            proptest::prop_assert_eq!(systemd_unquote(&quote(&s)), Ok(s));
+        }
     }
 }

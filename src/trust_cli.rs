@@ -1,12 +1,12 @@
 //! `pastor trust list|add|remove`: the (machine, repo) pairs whose
 //! folder-trust prompt the head answers on its own. With a head running they
-//! go through it (`IpcRequest::TrustList`, `TrustAdd`, `TrustRemove`), so a
-//! CLI elsewhere sees the head's table; with none, straight to the store. The
+//! go through it (`IpcRequest::TrustList`, `TrustAdd`, `TrustRemove`), a
+//! remote one included, so a CLI elsewhere sees the head's table; with none, straight to the store. The
 //! head reads the table afresh each time a task blocks, so a change applies
 //! at once.
 use clap::Subcommand;
 
-use crate::cli::{CliError, age, request_failure, table};
+use crate::cli::{CliError, age, request_error, table};
 use crate::config::Paths;
 use crate::ipc::{Head, IpcRequest, IpcResponse};
 use crate::store::Store;
@@ -75,7 +75,7 @@ async fn run_on_head(paths: &Paths, cmd: TrustCmd) -> anyhow::Result<()> {
         TrustCmd::Add { machine, repo } => (IpcRequest::TrustAdd { machine, repo }, false),
         TrustCmd::Remove { machine, repo } => (IpcRequest::TrustRemove { machine, repo }, false),
     };
-    match crate::ipc::request(&paths.socket_file(), &req).await {
+    match crate::ipc::request_head(paths, &req).await {
         Ok(IpcResponse::Trusted(list)) => print_list(&list, json),
         Ok(IpcResponse::Text(text)) => {
             println!("{text}");
@@ -83,10 +83,7 @@ async fn run_on_head(paths: &Paths, cmd: TrustCmd) -> anyhow::Result<()> {
         }
         Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
         Ok(other) => anyhow::bail!("unexpected reply to a trust request: {other:?}"),
-        Err(err) => {
-            let (code, message) = request_failure(&err);
-            Err(CliError::err(&code, message))
-        }
+        Err(err) => Err(request_error(&err).into()),
     }
 }
 

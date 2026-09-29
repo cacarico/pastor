@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -10,10 +10,13 @@ use crate::config::flock::{
     DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig, TaskFlockError,
 };
 use crate::config::{
-    AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer, MODEL_KIND_MISMATCH, Models,
-    PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
+    AGENT_KIND_MISSING, AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer,
+    MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
 };
-use crate::dispatch::{Claim, MachineView, pick_machine, pick_machine_where};
+use crate::dispatch::{
+    Claim, FlockSeat, MachineView, flock_held, mark_waiting_under_share, pick_machine,
+    pick_machine_where,
+};
 use crate::herdr::{Connector, Endpoint};
 use crate::ipc::{HeadPing, IpcRequest, IpcResponse, MODEL_PROTOCOL, check_protocol};
 use crate::machine::{
@@ -23,6 +26,7 @@ use crate::machine::{
 use crate::queue::{QueueEntry, QueueSpot};
 use crate::scheduler::{ConfigFingerprint, Scheduler, SchedulerHandle};
 use crate::store::{MoveError, Moved, NewTask, PriorityError, RetryError, Store, TaskFilter};
+use crate::sync::Recover;
 use crate::task::{AgentSource, PANE_OWNING_STATES, Priority, Task, TaskRole, TaskState};
 
 /// How a headless serve's fleet reaches the head with the items a job run
@@ -128,14 +132,38 @@ pub fn warn_removed(store: &Store, flock: &Flock, warned: &mut HashSet<i64>) -> 
     }
 }
 
-/// The flock `name` is in according to `flock`; a machine the file does not
-/// have (a fixed fleet's, or one held until its actor ends) is in the default
-/// flock, the only one a fixed fleet has.
+/// The flock that stands for `name` according to `flock`
+/// (`Flock::primary_flock`); a machine the file does not have (a fixed
+/// fleet's, or one held until its actor ends) is in the default flock, the
+/// only one a fixed fleet has.
 fn flock_of(flock: &Flock, name: &str) -> String {
     flock
         .machine_flock(name)
         .unwrap_or(flock.default_flock())
         .to_string()
+}
+
+/// The flocks `status`'s machine is in according to `flock`, each with its
+/// number (`Flock::flocks_of`) and how many of its live tasks run there, by
+/// the flock stored on each task (`None`: the default). A machine the file
+/// does not have is in the default flock, as in `flock_of`.
+fn seats(flock: &Flock, status: &crate::machine::MachineStatus) -> Vec<FlockSeat> {
+    let default = flock.default_flock();
+    let flocks = flock
+        .machine_flocks(&status.name)
+        .unwrap_or_else(|| vec![(default, None)]);
+    flocks
+        .into_iter()
+        .map(|(name, number)| {
+            let live = status
+                .live_by_flock
+                .iter()
+                .filter(|(f, _)| f.as_deref().unwrap_or(default) == name)
+                .map(|(_, n)| n)
+                .sum();
+            FlockSeat::new(name, number, live)
+        })
+        .collect()
 }
 
 /// The part of a machine's entry its actor is built from. The flock, the
@@ -162,6 +190,111 @@ pub fn actor_settings(m: &MachineConfig, settings: &MachineSettings) -> MachineS
         head_address: settings.head_address.clone().filter(|_| !m.local),
         ..settings.clone()
     }
+}
+
+/// How many `request_timeout`s the head waits for a machine's actor to
+/// answer one request. A dispatch is a claim, `agent.start`, the readiness
+/// wait and the prompt under one `request_timeout`, then maybe the trust
+/// keys under another, and the actor may be inside a reconcile (a third)
+/// when the request arrives.
+const REPLY_WAIT_FACTOR: u32 = 3;
+
+fn reply_wait_ms(config: &PastorConfig) -> std::sync::atomic::AtomicU64 {
+    let wait = config.request_timeout_duration() * REPLY_WAIT_FACTOR;
+    std::sync::atomic::AtomicU64::new(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// A machine's actor did not answer within the head's bound
+/// (`Fleet::bounded`). The request may still be carried out: it stays in the
+/// actor's queue, and `Store::claim_task` keeps a dispatch from happening
+/// twice.
+#[derive(Debug, thiserror::Error)]
+#[error("machine {machine} did not answer within {after:?}")]
+pub struct NoReply {
+    pub machine: String,
+    pub after: Duration,
+}
+
+async fn within<T>(
+    machine: &str,
+    after: Duration,
+    request: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(after, request).await {
+        Ok(res) => res,
+        Err(_) => Err(NoReply {
+            machine: machine.to_string(),
+            after,
+        }
+        .into()),
+    }
+}
+
+/// A task a dispatch pass placed on a machine under the dispatch lock and
+/// is sending outside it. Until the send ends it counts on that machine in
+/// `Fleet::views`, as the actor's own count will once it has claimed the
+/// task, and later passes leave the task alone.
+#[derive(Debug, Clone)]
+struct Placed {
+    task_id: i64,
+    machine: String,
+    flock: Option<String>,
+    from_job: bool,
+}
+
+/// The `Placed` tasks of every pass, and a signal each time one's send ends.
+#[derive(Default)]
+struct InFlight {
+    placed: std::sync::Mutex<Vec<Placed>>,
+    sent: tokio::sync::Notify,
+}
+
+impl InFlight {
+    fn placed(&self) -> Vec<Placed> {
+        self.placed.lock().unwrap().clone()
+    }
+
+    fn holds(&self, task_id: i64) -> bool {
+        self.placed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.task_id == task_id)
+    }
+}
+
+/// Holds a `Placed` in `Fleet::in_flight` until dropped: when the send
+/// ends, fails, times out or is abandoned with its pass.
+struct Reservation {
+    in_flight: Arc<InFlight>,
+    task_id: i64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.in_flight
+            .placed
+            .lock()
+            .unwrap()
+            .retain(|p| p.task_id != self.task_id);
+        self.in_flight.sent.notify_waiters();
+    }
+}
+
+/// What a dispatch pass sends for one placed task, once the lock is let go.
+enum Outbound {
+    Dispatch,
+    /// Pause this task on the machine first (`preempt`), then dispatch.
+    PauseFor(i64),
+    Resume,
+}
+
+/// One send a pass decided under the lock.
+struct Placement {
+    task: Task,
+    handle: MachineHandle,
+    send: Outbound,
+    _held: Reservation,
 }
 
 /// What `apply_flock` changed, by machine name, in flock order (`removed` in
@@ -213,6 +346,17 @@ struct Member {
     /// The actor was stopped but has not ended. Nothing is dispatched to it
     /// and no replacement is spawned until a later `apply_flock` sees it end.
     shutting_down: bool,
+    /// A pull machine (`MachineConfig::pull`): no actor, never picked by a
+    /// dispatch pass; it takes its tasks with `Fleet::claim`.
+    pull: bool,
+}
+
+/// When the head last heard from a pull machine (`Fleet::claim`,
+/// `Fleet::report`), and whether it has been counted lost since.
+#[derive(Debug, Clone, Copy)]
+struct PullSeen {
+    at: tokio::time::Instant,
+    lost: bool,
 }
 
 struct Spawner {
@@ -246,13 +390,24 @@ pub struct Fleet {
     /// `agents_change_fleet` as last applied: whether the head takes a
     /// fleet-changing request from an agent it started.
     agents_change_fleet: std::sync::atomic::AtomicBool,
+    /// `max_orchestrators` as last applied.
+    max_orchestrators: std::sync::atomic::AtomicU32,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
     /// Set for a headless serve (`Fleet::headless`): job tasks go to the
     /// head instead of this store, and the head checks their flock.
     forward: Option<HeadForward>,
+    /// Pull machines by name, since each was added or last heard from.
+    pull_seen: std::sync::Mutex<HashMap<String, PullSeen>>,
     dispatch_lock: tokio::sync::Mutex<()>,
+    /// What dispatch passes placed under the lock and are sending outside
+    /// it (`Fleet::dispatch_queued`).
+    in_flight: Arc<InFlight>,
+    /// How long the head waits for a machine's actor to answer a request
+    /// (`Fleet::bounded`), in milliseconds: `REPLY_WAIT_FACTOR` times
+    /// `request_timeout` as last applied.
+    reply_wait_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Fleet {
@@ -264,6 +419,7 @@ impl Fleet {
                 handle,
                 spawned_from: None,
                 shutting_down: false,
+                pull: false,
             })
             .collect();
         Fleet {
@@ -274,10 +430,14 @@ impl Fleet {
             models: RwLock::default(),
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
+            max_orchestrators: std::sync::atomic::AtomicU32::new(1),
             store,
             spawner: None,
             forward: None,
+            pull_seen: Default::default(),
             dispatch_lock: tokio::sync::Mutex::new(()),
+            in_flight: Default::default(),
+            reply_wait_ms: reply_wait_ms(&PastorConfig::default()),
         }
     }
 
@@ -295,7 +455,7 @@ impl Fleet {
     /// scheduler: nothing is dispatched from it, but the tasks it queues must
     /// land in the flocks flock.toml declares.
     pub fn with_flock(self, flock: Flock) -> Fleet {
-        *self.wanted.write().unwrap() = flock;
+        *self.wanted.write().recover() = flock;
         self
     }
 
@@ -314,10 +474,14 @@ impl Fleet {
             models: RwLock::default(),
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
+            max_orchestrators: std::sync::atomic::AtomicU32::new(1),
             store,
             spawner: Some(Spawner { connect, events }),
             forward: None,
+            pull_seen: Default::default(),
             dispatch_lock: tokio::sync::Mutex::new(()),
+            in_flight: Default::default(),
+            reply_wait_ms: reply_wait_ms(&PastorConfig::default()),
         }
     }
 
@@ -325,7 +489,7 @@ impl Fleet {
     pub fn machines(&self) -> Vec<MachineHandle> {
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .map(|m| m.handle.clone())
             .collect()
@@ -334,24 +498,29 @@ impl Fleet {
     /// Every machine's status with the flock it is in (see `flock_of`) and
     /// whether it is `shutting_down`, in flock order: what `machine list`
     /// and `machine.*` events report, and what a caller granting access by
-    /// flock membership (`bridge::machine_flock`) must check before trusting
+    /// flock membership (`bridge::machine_flocks`) must check before trusting
     /// the flock it reports for a machine no longer in `wanted`.
     pub fn statuses(&self) -> Vec<crate::machine::MachineStatus> {
         let wanted = self.flock();
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .map(|m| {
                 let flock = flock_of(&wanted, &m.handle.name);
+                if m.pull {
+                    self.count_pull(&m.handle);
+                }
+                let s = m.handle.snapshot();
                 crate::machine::MachineStatus {
                     profile: self.own_profile(&flock, Some(&m.handle.name)),
                     flock: Some(flock),
+                    flocks: seats(&wanted, &s),
                     shutting_down: m.shutting_down,
                     description: wanted
                         .get(&m.handle.name)
                         .and_then(|c| crate::config::clean_description(c.description.as_deref())),
-                    ..m.handle.snapshot()
+                    ..s
                 }
             })
             .collect()
@@ -360,7 +529,7 @@ impl Fleet {
     pub fn get(&self, name: &str) -> Option<MachineHandle> {
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .find(|m| m.handle.name == name)
             .map(|m| m.handle.clone())
@@ -371,20 +540,68 @@ impl Fleet {
     /// swap a machine that was shutting down held up. Empty for a fixed
     /// fleet.
     pub fn flock(&self) -> Flock {
-        self.wanted.read().unwrap().clone()
+        self.wanted.read().recover().clone()
     }
 
     /// Take `[defaults]` and `[agents]` from `pastor.toml` as now loaded;
     /// the scheduler calls it at start, and a reload through `apply_config`.
     pub fn set_config(&self, config: &PastorConfig) {
-        *self.defaults.write().unwrap() = config.defaults.clone();
-        *self.agents.write().unwrap() = config.agents.clone();
-        *self.models.write().unwrap() = config.models.clone();
-        *self.profiles.write().unwrap() = config.profiles.clone();
+        *self.defaults.write().recover() = config.defaults.clone();
+        *self.agents.write().recover() = config.agents.clone();
+        *self.models.write().recover() = config.models.clone();
+        *self.profiles.write().recover() = config.profiles.clone();
         self.agents_change_fleet.store(
             config.agents_change_fleet,
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.max_orchestrators.store(
+            config.max_orchestrators,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.reply_wait_ms.store(
+            reply_wait_ms(config).into_inner(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// How long a request to a machine's actor may take, as last applied.
+    pub fn reply_wait(&self) -> Duration {
+        Duration::from_millis(
+            self.reply_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Set `reply_wait` below any `request_timeout`, for a test.
+    #[cfg(test)]
+    fn set_reply_wait(&self, wait: Duration) {
+        self.reply_wait_ms.store(
+            u64::try_from(wait.as_millis()).unwrap(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// `request` to `machine`'s actor, failing with `NoReply` once it has
+    /// taken `reply_wait`. The actor bounds each herdr call by
+    /// `request_timeout`; this bounds the wait for an actor stuck elsewhere,
+    /// so a caller never waits on it forever.
+    pub async fn bounded<T>(
+        &self,
+        machine: &str,
+        request: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        within(machine, self.reply_wait(), request).await
+    }
+
+    /// `max_orchestrators` in `pastor.toml` as last applied.
+    pub fn max_orchestrators(&self) -> u32 {
+        self.max_orchestrators
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `[defaults]` as last applied.
+    pub fn defaults(&self) -> Defaults {
+        self.defaults.read().recover().clone()
     }
 
     /// Whether `pastor.toml` as last applied lets an agent pastor started
@@ -404,20 +621,23 @@ impl Fleet {
         flock: &str,
         machine: Option<&str>,
     ) -> AgentPick {
-        let wanted = self.wanted.read().unwrap();
-        self.defaults.read().unwrap().resolve_agent_on(
+        let wanted = self.wanted.read().recover();
+        self.defaults.read().recover().resolve_agent_on(
             ask,
             machine.and_then(|m| wanted.get(m)),
             wanted.entry(flock),
         )
     }
 
-    /// The profile a task in `flock` on `machine` runs under when it names
-    /// none: the machine's, else the flock's, else `[defaults]`.
+    /// The own profile of `machine` for a task in `flock`, which decides
+    /// whether it may ask for `unrestricted` there: the machine's, else the
+    /// flock's, else `[defaults]` (`Defaults::own_profile`).
     pub fn own_profile(&self, flock: &str, machine: Option<&str>) -> Option<String> {
-        self.resolve_agent(&AgentChoice::default(), flock, machine)
-            .profile
-            .map(|(name, _)| name)
+        let wanted = self.wanted.read().recover();
+        self.defaults
+            .read()
+            .recover()
+            .own_profile(machine.and_then(|m| wanted.get(m)), wanted.entry(flock))
     }
 
     /// `resolve_agent` written into `spec`, with the ask and where the agent
@@ -435,11 +655,11 @@ impl Fleet {
         machine: Option<&str>,
         asked_by: &str,
     ) -> Result<(), AgentRefusal> {
-        let models = self.models.read().unwrap();
-        let agents = self.agents.read().unwrap();
+        let models = self.models.read().recover();
+        let agents = self.agents.read().recover();
         let pick = {
-            let wanted = self.wanted.read().unwrap();
-            self.defaults.read().unwrap().resolve_agent_for(
+            let wanted = self.wanted.read().recover();
+            self.defaults.read().recover().resolve_agent_for(
                 ask,
                 machine.and_then(|m| wanted.get(m)),
                 wanted.entry(flock),
@@ -447,8 +667,25 @@ impl Fleet {
                 &agents,
             )
         };
+        if let Some(kind) = &pick.missing_kind {
+            return Err(AgentRefusal {
+                code: AGENT_KIND_MISSING,
+                message: format!(
+                    "flock {flock} runs {kind} agents, and machine {} has none: its agent {} is {}, and it has no agents.{kind}",
+                    machine.unwrap_or("-"),
+                    pick.agent,
+                    agents.kind(&pick.agent)
+                ),
+            });
+        }
         pick.apply_to(spec);
         let label = |layer| layer_label(layer, asked_by, flock, machine);
+        // Settled once, when the task is queued (`settle_run`); kept here.
+        let (timeout_from, place_from) = spec
+            .agent_source
+            .as_ref()
+            .map(|s| (s.timeout_from.clone(), s.place_from.clone()))
+            .unwrap_or_default();
         let mut agent_from = label(pick.agent_from);
         if pick.by_kind {
             agent_from.push_str(&format!(" agents.{}", agents.kind(&pick.agent)));
@@ -461,13 +698,15 @@ impl Fleet {
             model_from: pick.model.as_ref().map(|&(_, layer)| label(layer)),
             profile: pick.profile.as_ref().map(|(name, _)| name.clone()),
             profile_from: pick.profile.as_ref().map(|&(_, layer)| label(layer)),
+            timeout_from,
+            place_from,
         }));
         models.apply(&pick, &agents, spec)?;
         // What the machine's owner lets run there (the unrestricted rule).
         let own = self.own_profile(flock, machine);
         self.profiles
             .read()
-            .unwrap()
+            .recover()
             .apply(&pick, own.as_deref(), spec)
     }
 
@@ -482,8 +721,8 @@ impl Fleet {
         pinned: Option<&str>,
         asked_by: &str,
     ) -> (Priority, Option<String>) {
-        let wanted = self.wanted.read().unwrap();
-        let (priority, layer) = self.defaults.read().unwrap().resolve_priority(
+        let wanted = self.wanted.read().recover();
+        let (priority, layer) = self.defaults.read().recover().resolve_priority(
             ask,
             pinned.and_then(|m| wanted.get(m)),
             wanted.entry(flock),
@@ -492,6 +731,77 @@ impl Fleet {
             priority,
             layer.map(|l| layer_label(l, asked_by, flock, pinned)),
         )
+    }
+
+    /// The label template of a task being queued in `flock`: its own
+    /// (`--label`, a job's `label`), else the flock's, else `[defaults]`,
+    /// as they stand now, with where it came from
+    /// (`Defaults::resolve_label`). `asked_by` names the ask, as for
+    /// `settle`. Dispatch renders it on the machine it picks.
+    fn settle_label(&self, spec: &mut crate::task::DispatchSpec, flock: &str, asked_by: &str) {
+        let wanted = self.wanted.read().recover();
+        let picked = self
+            .defaults
+            .read()
+            .recover()
+            .resolve_label(spec.label.template.as_deref(), wanted.entry(flock));
+        spec.label = crate::task::WorkspaceLabel {
+            from: picked
+                .as_ref()
+                .map(|&(_, layer)| layer_label(layer, asked_by, flock, None)),
+            template: picked.map(|(template, _)| template),
+            ..Default::default()
+        };
+    }
+
+    /// A task's timeout and place as it is queued in `flock`, from what its
+    /// run or job asked for, else the flock's, else `[defaults]`
+    /// (`Defaults::resolve_timeout`, `resolve_place`), with where each came
+    /// from in its `agent_source`. `settle_agent` makes that first. An ask
+    /// from a client that predates flock timeouts carries neither, and
+    /// keeps the spec's own unless the flock sets one.
+    fn settle_run(
+        &self,
+        spec: &mut crate::task::DispatchSpec,
+        ask: &AgentChoice,
+        flock: &str,
+        asked_by: &str,
+    ) {
+        let wanted = self.wanted.read().recover();
+        let entry = wanted.entry(flock);
+        let defaults = self.defaults.read().recover();
+        let label = |layer| layer_label(layer, asked_by, flock, None);
+        let (timeout, timeout_from) = defaults.resolve_timeout(ask.timeout_secs, entry);
+        let (place, place_from) = defaults.resolve_place(ask.place.as_ref(), entry);
+        let mut from = (Some(label(timeout_from)), Some(label(place_from)));
+        if timeout_from == Layer::Defaults {
+            from.0 = None;
+        } else {
+            spec.timeout_secs = timeout;
+        }
+        if place_from == Layer::Defaults {
+            from.1 = None;
+        } else {
+            spec.place = place;
+        }
+        if let Some(source) = spec.agent_source.as_mut() {
+            (source.timeout_from, source.place_from) = from;
+        }
+    }
+
+    /// A task's `summary` setting as it is queued in `flock`
+    /// (`Defaults::resolve_summary`), from the flock and defaults as they
+    /// stand now.
+    fn settle_summary(
+        &self,
+        ask: Option<crate::task::SummaryMode>,
+        flock: &str,
+    ) -> crate::task::SummaryMode {
+        let wanted = self.wanted.read().recover();
+        self.defaults
+            .read()
+            .recover()
+            .resolve_summary(ask, wanted.entry(flock))
     }
 
     /// `settle` for a task being queued: on the machine it is pinned to,
@@ -518,6 +828,7 @@ impl Fleet {
         let per_machine = |e: &AgentRefusal| {
             pinned.is_none()
                 && ((e.code == MODEL_KIND_MISMATCH && ask.agent.is_none())
+                    || e.code == AGENT_KIND_MISSING
                     || e.code == PROFILE_NOT_ALLOWED)
         };
         let mut landings = Vec::new();
@@ -528,11 +839,7 @@ impl Fleet {
         }
         if pinned.is_none() {
             let wanted = self.flock();
-            for m in wanted
-                .machines
-                .iter()
-                .filter(|m| wanted.flock_of(m) == flock)
-            {
+            for m in wanted.machines.iter().filter(|m| wanted.in_flock(m, flock)) {
                 let mut s = spec.clone();
                 match self.settle(&mut s, ask, flock, Some(&m.name), asked_by) {
                     Ok(()) => landings.push(s),
@@ -541,7 +848,7 @@ impl Fleet {
                 }
             }
         }
-        let agents = self.agents.read().unwrap();
+        let agents = self.agents.read().recover();
         landings
             .iter()
             .try_for_each(|s| agents.launch_args(s).map(drop))
@@ -556,7 +863,7 @@ impl Fleet {
     pub fn shutting_down(&self, name: &str) -> bool {
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .any(|m| m.handle.name == name && m.shutting_down)
     }
@@ -567,7 +874,7 @@ impl Fleet {
     /// plus those of the flock file it was given (`with_flock`), which is
     /// all the daemon-less scheduler has.
     pub fn in_flock(&self, name: &str) -> bool {
-        let wanted = self.wanted.read().unwrap().get(name).is_some();
+        let wanted = self.wanted.read().recover().get(name).is_some();
         if self.spawner.is_some() {
             wanted
         } else {
@@ -600,7 +907,7 @@ impl Fleet {
     #[cfg(test)]
     pub async fn replace_flock(&self, flock: Flock) {
         let _pass = self.dispatch_lock.lock().await;
-        *self.wanted.write().unwrap() = flock;
+        *self.wanted.write().recover() = flock;
     }
 
     /// Hold the dispatch lock, as a dispatch pass does, for a test.
@@ -611,7 +918,11 @@ impl Fleet {
 
     /// Is any machine waiting for its old actor to end?
     pub fn any_shutting_down(&self) -> bool {
-        self.members.read().unwrap().iter().any(|m| m.shutting_down)
+        self.members
+            .read()
+            .recover()
+            .iter()
+            .any(|m| m.shutting_down)
     }
 
     /// Make the running set match `flock` and `settings`: spawn actors for
@@ -619,9 +930,11 @@ impl Fleet {
     /// the ones whose entry or timings changed. A machine whose entry is the
     /// same keeps its actor, connection and event stream.
     ///
-    /// Takes the dispatch lock, so no pass is holding a handle that is being
-    /// stopped. Stopping an actor touches nothing on its machine; tasks left
-    /// there keep their last state. A replacement is spawned, or a removed
+    /// Takes the dispatch lock, so no pass is placing tasks on a handle that
+    /// is being stopped; a send a pass placed before the lock was taken fails
+    /// with `ActorStopped`, and its task stays queued. The old actors are
+    /// stopped together. Stopping an actor touches nothing on its machine;
+    /// tasks left there keep their last state. A replacement is spawned, or a removed
     /// machine dropped, only once its old actor has ended, so a removed
     /// machine writes no row afterwards and a retargeted one never has two
     /// actors on the same tasks. An old actor that does not end in time keeps
@@ -659,12 +972,12 @@ impl Fleet {
         flock: &Flock,
         settings: &MachineSettings,
     ) -> FlockDiff {
-        *self.wanted.write().unwrap() = flock.clone();
+        *self.wanted.write().recover() = flock.clone();
         let mut diff = FlockDiff::default();
         // A copy: readers keep seeing the old set until the new one is ready,
         // and the lock is not held across the waits below. The dispatch lock
         // keeps any other `apply_flock` out meanwhile.
-        let mut old: Vec<Member> = self.members.read().unwrap().clone();
+        let mut old: Vec<Member> = self.members.read().recover().clone();
         enum Step {
             Keep(Member),
             Add,
@@ -696,11 +1009,42 @@ impl Fleet {
             })
             .chain(gone.iter().map(|o| o.handle.name.clone()))
             .collect();
-        for m in self.members.write().unwrap().iter_mut() {
+        for m in self.members.write().recover().iter_mut() {
             if stopping.contains(&m.handle.name) {
                 m.shutting_down = true;
             }
         }
+        // Every old actor is stopped at once, so a reload that stops several
+        // waits about one `SHUTDOWN_WAIT` for them, not one each.
+        let mut stops = tokio::task::JoinSet::new();
+        for o in plan
+            .iter()
+            .filter_map(|s| match s {
+                Step::Replace(o) => Some(o),
+                _ => None,
+            })
+            .chain(&gone)
+        {
+            let handle = o.handle.clone();
+            stops.spawn(async move { (handle.name.clone(), handle.shutdown().await) });
+        }
+        let mut stopped: HashMap<String, ShutdownOutcome> = HashMap::new();
+        while let Some(res) = stops.join_next().await {
+            match res {
+                Ok((name, outcome)) => {
+                    stopped.insert(name, outcome);
+                }
+                Err(err) => tracing::warn!(%err, "stop an actor"),
+            }
+        }
+        // A stop that panicked is treated as one that has not finished: the
+        // next reload pass waits for it again.
+        let outcome = |name: &str| {
+            stopped
+                .get(name)
+                .copied()
+                .unwrap_or(ShutdownOutcome::StillRunning)
+        };
         let mut members: Vec<Member> = Vec::new();
         for (step, m) in plan.into_iter().zip(&flock.machines) {
             members.push(match step {
@@ -709,7 +1053,7 @@ impl Fleet {
                     diff.added.push(m.name.clone());
                     self.spawn(spawner, m, settings)
                 }
-                Step::Replace(o) => match o.handle.shutdown().await {
+                Step::Replace(o) => match outcome(&o.handle.name) {
                     ShutdownOutcome::Finished => {
                         diff.retargeted.push(m.name.clone());
                         self.spawn(spawner, m, settings)
@@ -722,7 +1066,7 @@ impl Fleet {
             });
         }
         for o in gone {
-            match o.handle.shutdown().await {
+            match outcome(&o.handle.name) {
                 ShutdownOutcome::Finished => diff.removed.push(o.handle.name.clone()),
                 ShutdownOutcome::StillRunning => {
                     diff.shutting_down.push(o.handle.name.clone());
@@ -737,20 +1081,42 @@ impl Fleet {
                  replaced or removed yet; the next reload pass tries again"
             );
         }
-        *self.members.write().unwrap() = members;
+        self.pull_seen
+            .lock()
+            .recover()
+            .retain(|name, _| members.iter().any(|m| m.pull && &m.handle.name == name));
+        *self.members.write().recover() = members;
         diff
     }
 
     /// Keep `m` in the fleet, out of dispatch, until its actor ends.
     fn hold(mut m: Member) -> Member {
         m.shutting_down = true;
-        m.handle.status.write().unwrap().error =
+        m.handle.status.write().recover().error =
             Some("shutting down: the old actor has not stopped yet".into());
         m
     }
 
     fn spawn(&self, spawner: &Spawner, m: &MachineConfig, settings: &MachineSettings) -> Member {
         let settings = &actor_settings(m, settings);
+        if m.pull {
+            // Heard from as of now: a head that starts gives the machine
+            // `pull_lost_after` to claim before its tasks go stale.
+            self.pull_seen.lock().recover().insert(
+                m.name.clone(),
+                PullSeen {
+                    at: tokio::time::Instant::now(),
+                    lost: false,
+                },
+            );
+            return Member {
+                handle: crate::machine::pull_machine(m.name.clone(), m.max_agents, m.tags.clone())
+                    .with_slots(m.job_slots, m.burst),
+                spawned_from: Some((actor_config(m), settings.clone())),
+                shutting_down: false,
+                pull: true,
+            };
+        }
         let handle = spawn_machine(
             m.name.clone(),
             m.max_agents,
@@ -765,17 +1131,39 @@ impl Fleet {
             handle,
             spawned_from: Some((actor_config(m), settings.clone())),
             shutting_down: false,
+            pull: false,
         }
     }
 
+    /// Every machine as dispatch sees it: the tasks on it in the store, as
+    /// its actor counts them (`refresh_live`), plus the ones passes are
+    /// sending it and it has not claimed yet (`Placed`). Read from the
+    /// store rather than the actor's last count, so a pass sees a task
+    /// another placed and the actor claimed at once, and not twice.
     pub fn views(&self) -> Vec<MachineView> {
         let wanted = self.flock();
+        let in_flight = self.in_flight.placed();
         self.members
             .read()
-            .unwrap()
+            .recover()
             .iter()
             .map(|m| {
-                let s = m.handle.snapshot();
+                let mut s = m.handle.snapshot();
+                // On a store error the actor's last count stands.
+                let on_it = self.store.tasks_on_machine(&m.handle.name).ok();
+                if let Some(tasks) = &on_it {
+                    crate::machine::count_live(&mut s, tasks);
+                    s.live += s.orphans.len();
+                }
+                let claimed = |id: i64| on_it.iter().flatten().any(|t| t.id == id);
+                for p in in_flight
+                    .iter()
+                    .filter(|p| p.machine == m.handle.name && !claimed(p.task_id))
+                {
+                    s.live += 1;
+                    s.live_jobs += usize::from(p.from_job);
+                    s.live_by_flock.push((p.flock.clone(), 1));
+                }
                 MachineView {
                     name: m.handle.name.clone(),
                     max_agents: m.handle.max_agents,
@@ -785,9 +1173,11 @@ impl Fleet {
                     live: s.live,
                     live_jobs: s.live_jobs,
                     // An aborted actor answers nothing, and a dispatch to
-                    // it would wait for as long as it stays wedged.
-                    healthy: !m.shutting_down && s.channel.accepts_dispatch(),
-                    flock: flock_of(&wanted, &m.handle.name),
+                    // it would wait for as long as it stays wedged. A pull
+                    // machine takes its tasks itself (`claim`).
+                    healthy: !m.pull && !m.shutting_down && s.channel.accepts_dispatch(),
+                    flocks: seats(&wanted, &s),
+                    waiting_under_share: Vec::new(),
                 }
             })
             .collect()
@@ -814,11 +1204,22 @@ impl Fleet {
         ask: Option<&AgentChoice>,
         priority: Option<Priority>,
     ) -> Result<Task, QueueError> {
-        self.queue_run_as(prompt, spec, flock, ask, priority, TaskRole::Agent, None)
-            .await
+        self.queue_run_as(
+            prompt,
+            spec,
+            flock,
+            ask,
+            priority,
+            TaskRole::Agent,
+            None,
+            false,
+            None,
+        )
+        .await
     }
 
-    /// `queue_run`, for a task of `role` (`task run --role`).
+    /// `queue_run`, for a task of `role` (`task run --role`). `summary` is
+    /// `task run --summary`; without it the flock or `[defaults]` decide.
     #[allow(clippy::too_many_arguments)]
     pub async fn queue_run_as(
         &self,
@@ -829,6 +1230,8 @@ impl Fleet {
         priority: Option<Priority>,
         role: TaskRole,
         description: Option<String>,
+        preempt: bool,
+        summary: Option<crate::task::SummaryMode>,
     ) -> Result<Task, QueueError> {
         let _pass = self.dispatch_lock.lock().await;
         if let Some(m) = &spec.machine
@@ -843,11 +1246,24 @@ impl Fleet {
         if let Some(ask) = ask {
             self.settle_agent(&mut spec, ask, &flock, "task run")
                 .map_err(QueueError::Agent)?;
+            self.settle_run(&mut spec, ask, &flock, "task run");
         }
+        self.settle_label(&mut spec, &flock, "task run");
         let (priority, from) =
             self.settle_priority(priority, &flock, spec.machine.as_deref(), "task run");
+        spec.summary = self.settle_summary(summary, &flock);
+        // Checked against the level it settles at: a machine or flock may
+        // make it critical without `--priority`.
+        if preempt && priority != Priority::Critical {
+            return Err(QueueError::Agent(crate::config::AgentRefusal {
+                code: crate::task::PREEMPT_NEEDS_CRITICAL,
+                message: format!(
+                    "--preempt needs critical: only a critical task may pause another, and this one is {priority}"
+                ),
+            }));
+        }
         self.store
-            .insert_task_at(
+            .insert_task_preempting(
                 NewTask {
                     description,
                     job: "run".into(),
@@ -859,6 +1275,7 @@ impl Fleet {
                 priority,
                 from.as_deref(),
                 role,
+                preempt,
             )
             .map_err(QueueError::Store)
     }
@@ -890,6 +1307,8 @@ impl Fleet {
         let asked_by = format!("job {}", job.name);
         self.settle_agent(&mut settled, &ask, &flock, &asked_by)
             .map_err(|e| anyhow::Error::msg(e.message))?;
+        self.settle_run(&mut settled, &ask, &flock, &asked_by);
+        self.settle_label(&mut settled, &flock, &asked_by);
         let (priority, from) = self.settle_priority(
             job.priority_for(item).map_err(anyhow::Error::msg)?,
             &flock,
@@ -897,12 +1316,18 @@ impl Fleet {
             &asked_by,
         );
         let level = (priority, from.as_deref());
+        // A job's tasks keep `preempt` only where they settle at critical:
+        // its level may be a template, and an item below critical just
+        // queues as it would without it.
+        let preempt = job.preempt && priority == Priority::Critical;
         let description = job.task_description_for(item);
+        let summary = self.settle_summary(job.summary, &flock);
         self.store.insert_job_task_at(
             &job.name,
             &flock,
             item,
             level,
+            preempt,
             description.as_deref(),
             |id| {
                 let (prompt, mut spec) = render(id)?;
@@ -911,6 +1336,10 @@ impl Fleet {
                 spec.allow = settled.allow;
                 spec.deny = settled.deny;
                 spec.agent_source = settled.agent_source;
+                spec.timeout_secs = settled.timeout_secs;
+                spec.place = settled.place;
+                spec.label = settled.label;
+                spec.summary = summary;
                 Ok((prompt, spec))
             },
         )
@@ -980,6 +1409,55 @@ impl Fleet {
                 other => anyhow::bail!("the head answered a ping with {other:?}"),
             }
         }
+        // `preempt` rides in `dispatch` the same way; the head's
+        // `DispatchTable` refuses an unknown field, so a head before
+        // `PREEMPT_PROTOCOL` would answer an opaque `invalid_dispatch`
+        // instead of this clear refusal.
+        if job.preempt {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::PREEMPT_PROTOCOL,
+                    "a job with preempt",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
+        // A workspace label template rides in `dispatch` the same way; a
+        // head before `LABEL_PROTOCOL` would drop it (serde skips the
+        // unknown field) and name the workspace by its default instead of
+        // refusing.
+        if job.spec.label.template.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::LABEL_PROTOCOL,
+                    "a job naming a workspace label",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
+        // `summary` rides in `dispatch` the same way; a head before
+        // `SUMMARY_MODE_PROTOCOL` would answer an opaque `invalid_dispatch`.
+        if job.summary.is_some() {
+            match forward(IpcRequest::Ping).await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => check_protocol(
+                    &version,
+                    protocol,
+                    crate::ipc::SUMMARY_MODE_PROTOCOL,
+                    "a job with summary",
+                )?,
+                other => anyhow::bail!("the head answered a ping with {other:?}"),
+            }
+        }
         let reply = forward(IpcRequest::JobSubmit {
             job: job.name.clone(),
             dispatch: job.dispatch.clone(),
@@ -1036,7 +1514,7 @@ impl Fleet {
         doc.save(file)?;
         self.wanted
             .write()
-            .unwrap()
+            .recover()
             .flocks
             .retain(|f| f.name != name);
         Ok(())
@@ -1063,13 +1541,13 @@ impl Fleet {
             && let Ok(flock) = Flock::load_existing(file)
             && flock
                 .check_config(
-                    &self.models.read().unwrap(),
-                    &self.agents.read().unwrap(),
-                    &self.profiles.read().unwrap(),
+                    &self.models.read().recover(),
+                    &self.agents.read().recover(),
+                    &self.profiles.read().recover(),
                 )
                 .is_ok()
         {
-            *self.wanted.write().unwrap() = flock;
+            *self.wanted.write().recover() = flock;
         }
         Ok(done)
     }
@@ -1117,7 +1595,7 @@ impl Fleet {
                 None => {
                     self.agents
                         .read()
-                        .unwrap()
+                        .recover()
                         .launch_args(&t.spec)
                         .map_err(QueueError::Agent)?;
                 }
@@ -1139,8 +1617,22 @@ impl Fleet {
         priority: Priority,
         from: &str,
     ) -> Result<Task, PriorityError> {
+        self.set_priority_preempting(id, priority, from, false)
+            .await
+    }
+
+    /// `set_priority`, setting the task's `preempt` (`task priority
+    /// --preempt`); the caller has checked the level is critical.
+    pub async fn set_priority_preempting(
+        &self,
+        id: i64,
+        priority: Priority,
+        from: &str,
+        preempt: bool,
+    ) -> Result<Task, PriorityError> {
         let _pass = self.dispatch_lock.lock().await;
-        self.store.set_priority(id, priority, from)
+        self.store
+            .set_priority_preempting(id, priority, from, preempt)
     }
 
     /// Move a queued task (`Store::move_queued`), under the dispatch lock
@@ -1183,45 +1675,522 @@ impl Fleet {
         Ok(entries)
     }
 
-    /// Try to place every queued task, oldest first. Serialised: a pass sees the
-    /// live counts the previous pass left behind, because a machine actor
-    /// refreshes its count before it answers a dispatch (see
-    /// `Actor::handle_command`) and no two passes run at once. The claim inside
-    /// the actor (`Store::claim_task`) is the second line of defence: it makes a
-    /// double dispatch of one task impossible even if this lock were bypassed.
-    pub async fn dispatch_queued(&self) {
+    /// `task`'s spec with its agent settled for `machine` in `flock`: a
+    /// machine whose agent cannot run the task's model does not take it. A
+    /// task from before `agent_source` keeps the agent it was queued with
+    /// (`None`). A profile it inherited (from a machine or flock, not its
+    /// own ask) is pinned onto the ask here, so a re-settle that can no
+    /// longer resolve it refuses instead of quietly dropping it.
+    fn settled_on(
+        &self,
+        task: &Task,
+        flock: &str,
+        machine: &str,
+    ) -> Option<Result<crate::task::DispatchSpec, AgentRefusal>> {
+        let source = task.spec.agent_source.as_ref()?;
+        let mut ask = source.ask.clone();
+        if ask.profile.is_none() {
+            ask.profile = source.profile.clone();
+        }
+        let mut spec = task.spec.clone();
+        let r = self.settle(&mut spec, &ask, flock, Some(machine), &asked_by(task));
+        Some(r.map(|()| spec))
+    }
+
+    /// Is `name` a pull machine (`MachineConfig::pull`) of the fleet?
+    pub fn is_pull(&self, name: &str) -> bool {
+        self.members
+            .read()
+            .recover()
+            .iter()
+            .any(|m| m.pull && m.handle.name == name)
+    }
+
+    /// The handle of pull machine `name`, or why a claim or report from it
+    /// is refused.
+    fn pull_handle(&self, name: &str) -> anyhow::Result<MachineHandle> {
+        let members = self.members.read().recover();
+        match members.iter().find(|m| m.handle.name == name) {
+            Some(m) if m.pull => Ok(m.handle.clone()),
+            Some(_) => Err(crate::cli::CliError::err(
+                "not_pull_machine",
+                format!("machine {name} is not a pull machine; the head reaches it itself"),
+            )),
+            None => Err(crate::cli::CliError::err(
+                "unknown_machine",
+                format!("machine {name} is not in the flock"),
+            )),
+        }
+    }
+
+    /// A pull machine's live counts, from the store: no actor keeps them.
+    fn count_pull(&self, handle: &MachineHandle) {
+        match self.store.tasks_on_machine(&handle.name) {
+            Ok(tasks) => crate::machine::count_live(&mut handle.status.write().recover(), &tasks),
+            Err(err) => {
+                tracing::error!(machine = %handle.name, %err, "count a pull machine's tasks")
+            }
+        }
+    }
+
+    /// Emit `kind` about `machine` and `task`, as an actor would: a
+    /// `task.done` or `task.failed` ends the task's round. A fixed fleet has
+    /// nowhere to send it.
+    fn emit(
+        &self,
+        kind: &str,
+        machine: &str,
+        task: Option<&Task>,
+        detail: Option<serde_json::Value>,
+    ) {
+        let Some(spawner) = &self.spawner else {
+            return;
+        };
+        let summary = task
+            .filter(|_| matches!(kind, "task.done" | "task.failed"))
+            .and_then(|t| match self.store.end_round(t.id, None) {
+                Ok(summary) => Some(summary),
+                Err(err) => {
+                    tracing::error!(machine, %err, id = t.id, "save the task's summary");
+                    None
+                }
+            });
+        tracing::info!(machine, kind, task = ?task.map(|t| t.id), "event");
+        let _ = spawner.events.send(PastorEvent {
+            kind: kind.into(),
+            task_id: task.map(|t| t.id),
+            machine: Some(machine.into()),
+            job: task.map(|t| t.job.clone()),
+            detail,
+            summary,
+        });
+    }
+
+    /// Pull machine `handle` was heard from now: it is connected, and one
+    /// counted lost is announced back.
+    fn heard(&self, handle: &MachineHandle) {
+        let was_lost = {
+            let mut seen = self.pull_seen.lock().recover();
+            let e = seen.entry(handle.name.clone()).or_insert(PullSeen {
+                at: tokio::time::Instant::now(),
+                lost: false,
+            });
+            e.at = tokio::time::Instant::now();
+            std::mem::replace(&mut e.lost, false)
+        };
+        {
+            let mut s = handle.status.write().recover();
+            s.channel = crate::machine::ChannelState::Connected;
+            s.error = None;
+        }
+        if was_lost {
+            self.emit("machine.connected", &handle.name, None, None);
+        }
+    }
+
+    /// `TaskClaim`: at most `free_slots` queued tasks for pull machine
+    /// `machine` to start, each `starting` there before this returns. Those
+    /// pinned to it first, then, with `flock_work`, any a dispatch pass
+    /// would place there now; both only while the machine and the task's
+    /// flock have room, as for any machine. Under the dispatch lock, so a
+    /// pass and a claim never take the same slot.
+    pub async fn claim(
+        &self,
+        machine: &str,
+        free_slots: u32,
+        flock_work: bool,
+    ) -> anyhow::Result<Vec<Task>> {
         let _pass = self.dispatch_lock.lock().await;
+        let handle = self.pull_handle(machine)?;
+        self.heard(&handle);
+        self.count_pull(&handle);
+        let flock = self.flock();
+        let s = handle.snapshot();
+        let mut view = MachineView {
+            name: machine.to_string(),
+            max_agents: handle.max_agents,
+            job_slots: handle.job_slots,
+            burst: handle.burst,
+            tags: handle.tags.clone(),
+            live: s.live,
+            live_jobs: s.live_jobs,
+            healthy: true,
+            flocks: seats(&flock, &s),
+            waiting_under_share: Vec::new(),
+        };
+        let queued = self.store.queued_tasks()?;
+        let pinned = queued
+            .iter()
+            .filter(|t| t.spec.machine.as_deref() == Some(machine));
+        let loose = queued
+            .iter()
+            .filter(|t| flock_work && t.spec.machine.is_none());
+        let order: Vec<Task> = pinned.chain(loose).cloned().collect();
+        let default = flock.default_flock();
+        let takes = |task: &Task, machine: &str| {
+            let theirs = task.flock.as_deref().unwrap_or(default);
+            self.settled_on(task, theirs, machine)
+                .is_none_or(|r| r.is_ok())
+        };
+        let mut claimed = Vec::new();
+        for (i, task) in order.iter().enumerate() {
+            if claimed.len() >= free_slots as usize {
+                break;
+            }
+            if task.state != TaskState::Queued {
+                continue;
+            }
+            let target = task.flock.as_deref().unwrap_or(default);
+            let settled = self.settled_on(task, target, machine);
+            let claim = Claim::of(task);
+            let accepts = |_: &str| settled.as_ref().is_none_or(|r| r.is_ok());
+            let later = &order[i + 1..];
+            mark_waiting_under_share(
+                std::slice::from_mut(&mut view),
+                target,
+                later,
+                default,
+                &takes,
+            );
+            let views = std::slice::from_ref(&view);
+            if pick_machine_where(views, target, &task.spec, claim, &accepts).is_none() {
+                continue;
+            }
+            let mut on = task.clone();
+            if let Some(Ok(spec)) = settled {
+                on.spec = spec;
+            }
+            if on
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
+            {
+                on.error = None;
+            }
+            if (on.spec != task.spec || on.error != task.error)
+                && let Err(err) = self.store.update_task(&mut on)
+            {
+                tracing::warn!(task = %task.display_id(), machine, %err, "settle agent");
+                continue;
+            }
+            let Some(t) = self.store.claim_task(task.id, machine)? else {
+                continue;
+            };
+            tracing::info!(task = %t.display_id(), machine, "claimed by a pull machine");
+            view.take(target, claim);
+            claimed.push(t);
+        }
+        self.count_pull(&handle);
+        Ok(claimed)
+    }
+
+    /// `TaskReport`: what pull machine `machine` saw become of task `id`,
+    /// written on the row with the event its own actor would have emitted.
+    /// A closed or failed row stays as it is, a stale one stays stale while
+    /// its agent works (as `task::next_state` keeps it), and one `task done`
+    /// ended stays done until its pane closes; each answers the row as it
+    /// is.
+    pub async fn report(
+        &self,
+        machine: &str,
+        id: i64,
+        state: TaskState,
+        pane: Option<String>,
+        detail: Option<String>,
+    ) -> anyhow::Result<Task> {
+        let handle = self.pull_handle(machine)?;
+        self.heard(&handle);
+        if matches!(state, TaskState::Queued | TaskState::Paused) {
+            return Err(crate::cli::CliError::err(
+                "invalid_report",
+                format!("a pull machine cannot report a task {state}"),
+            ));
+        }
+        // Twice at most: once more on the fresh row after a write that lost
+        // a race (a `task close` on the head, say).
+        for _ in 0..2 {
+            let mut task = self.store.get_task(id)?.ok_or_else(|| {
+                crate::cli::CliError::err("task_not_found", format!("t-{id} not found"))
+            })?;
+            if task.machine.as_deref() != Some(machine) {
+                return Err(crate::cli::CliError::err(
+                    "not_on_machine",
+                    format!("{} is not on {machine}", task.display_id()),
+                ));
+            }
+            let from = task.state;
+            let working = matches!(
+                state,
+                TaskState::Starting | TaskState::Running | TaskState::Blocked
+            );
+            // Reports carry no sequence and may arrive out of order, so a
+            // failed row takes no later report, and an ended one only its
+            // pane closing, which `next_state` also lets through.
+            let kept = matches!(from, TaskState::Closed | TaskState::Failed)
+                || from == TaskState::Done && task.ended && state != TaskState::Closed
+                || from == TaskState::Stale && working;
+            if kept
+                || from == state
+                    && task.error == detail
+                    && pane
+                        .as_ref()
+                        .is_none_or(|p| task.pane_id.as_ref() == Some(p))
+            {
+                return Ok(task);
+            }
+            task.state = state;
+            if pane.is_some() {
+                task.pane_id = pane.clone();
+            }
+            task.error = detail.clone();
+            let now = chrono::Utc::now();
+            if matches!(state, TaskState::Running | TaskState::Blocked) && task.started_at.is_none()
+            {
+                task.started_at = Some(now);
+            }
+            task.finished_at = match state {
+                TaskState::Closed => task.finished_at.or(Some(now)),
+                TaskState::Done | TaskState::Failed if from != state => Some(now),
+                TaskState::Done | TaskState::Failed => task.finished_at,
+                _ => None,
+            };
+            match self.store.update_task(&mut task) {
+                Ok(()) => {}
+                Err(err) if err.downcast_ref::<crate::store::Conflict>().is_some() => continue,
+                Err(err) => return Err(err),
+            }
+            if from != state {
+                let question = (state == TaskState::Blocked)
+                    .then(|| detail.as_deref()?.strip_prefix("agent asked: "))
+                    .flatten()
+                    .map(|q| serde_json::json!({ "question": q }));
+                self.emit(&format!("task.{state}"), machine, Some(&task), question);
+            }
+            self.count_pull(&handle);
+            return Ok(task);
+        }
+        Err(crate::cli::CliError::err(
+            "store_error",
+            format!("t-{id} kept changing under the report; try again"),
+        ))
+    }
+
+    /// `task done` for a task on a pull machine, which has no actor here:
+    /// the row is ended as `Actor::end_task` ends it, `done` and `ended`, so
+    /// a report of the agent's last turn does not take it back to running.
+    /// A required summary is held to the same rules as there (`by`).
+    pub fn end_pull(
+        &self,
+        task: Task,
+        summary: Option<String>,
+        by: crate::machine::EndBy,
+    ) -> anyhow::Result<Task> {
+        use crate::machine::EndBy;
+        let machine = task.machine.clone().unwrap_or_default();
+        let summary = summary.filter(|s| !s.trim().is_empty());
+        let required = task.spec.summary == crate::task::SummaryMode::Require;
+        if required && summary.is_none() && by == EndBy::Agent && !task.ended {
+            return Err(crate::cli::CliError::err(
+                crate::task::SUMMARY_REQUIRED,
+                format!(
+                    "{} needs a summary: pastor task done --summary-file - <<'EOF', then a first line done, partial, blocked or nothing to do, up to five short lines, and EOF",
+                    task.display_id()
+                ),
+            ));
+        }
+        let by_hand = required && summary.is_none() && by == EndBy::Hand;
+        if task.ended {
+            if let Some(summary) = &summary {
+                self.store.replace_last_summary(task.id, summary)?;
+            }
+            return Ok(task);
+        }
+        let was_done = task.state == TaskState::Done;
+        let mut t = task;
+        if !was_done {
+            t.state = TaskState::Done;
+            t.finished_at = Some(chrono::Utc::now());
+            t.activity_seen = false;
+            t.prompt_pending = false;
+            t.error = None;
+        }
+        t.ended = true;
+        self.store.update_task(&mut t)?;
+        if was_done {
+            if let Some(summary) = &summary {
+                self.store.replace_last_summary(t.id, summary)?;
+            }
+        } else if let Some(spawner) = &self.spawner {
+            let round = if by_hand {
+                self.store.end_round_by_hand(t.id)
+            } else {
+                self.store.end_round(t.id, summary.as_deref())
+            };
+            let round = match round {
+                Ok(round) => Some(round),
+                Err(err) => {
+                    tracing::error!(%machine, %err, id = t.id, "save the task's summary");
+                    None
+                }
+            };
+            let _ = spawner.events.send(PastorEvent {
+                kind: "task.done".into(),
+                task_id: Some(t.id),
+                machine: Some(machine),
+                job: Some(t.job.clone()),
+                detail: None,
+                summary: round,
+            });
+        }
+        Ok(t)
+    }
+
+    /// Count each pull machine not heard from for `after` lost, once per
+    /// silence: `machine.lost`, and its starting and running tasks go
+    /// stale, as a task does whose agent pastor lost sight of. Tasks pinned
+    /// to it stay queued. Answers the machines it counted lost now.
+    pub async fn check_pull_lost(&self, after: Duration) -> Vec<String> {
+        let _pass = self.dispatch_lock.lock().await;
+        let now = tokio::time::Instant::now();
+        let lost: Vec<String> = self
+            .pull_seen
+            .lock()
+            .recover()
+            .iter_mut()
+            .filter(|(_, seen)| !seen.lost && now.duration_since(seen.at) >= after)
+            .map(|(name, seen)| {
+                seen.lost = true;
+                name.clone()
+            })
+            .collect();
+        for name in &lost {
+            let Ok(handle) = self.pull_handle(name) else {
+                continue;
+            };
+            let why = format!("pull machine {name} has not claimed or reported for {after:?}");
+            {
+                let mut s = handle.status.write().recover();
+                s.channel = crate::machine::ChannelState::Reconnecting;
+                s.error = Some(why.clone());
+            }
+            tracing::warn!(machine = %name, "{why}; counted lost");
+            self.emit("machine.lost", name, None, None);
+            let tasks = match self.store.tasks_on_machine(name) {
+                Ok(tasks) => tasks,
+                Err(err) => {
+                    tracing::error!(machine = %name, %err, "list a lost pull machine's tasks");
+                    continue;
+                }
+            };
+            for mut t in tasks {
+                if !matches!(t.state, TaskState::Starting | TaskState::Running) {
+                    continue;
+                }
+                t.state = TaskState::Stale;
+                t.error = Some(why.clone());
+                match self.store.update_task(&mut t) {
+                    Ok(()) => self.emit("task.stale", name, Some(&t), None),
+                    Err(err) => {
+                        tracing::warn!(task = %t.display_id(), %err, "mark stale")
+                    }
+                }
+            }
+            self.count_pull(&handle);
+        }
+        lost
+    }
+
+    /// Try to place every queued task, oldest first. The placements are
+    /// decided under the dispatch lock (`place_queued`), then sent with the
+    /// lock let go: one machine slow to start an agent, or wedged, holds up
+    /// neither the other machines nor `task run`, pull claims or a reload.
+    /// Each machine gets its sends in order, the machines at once, each
+    /// bounded by `reply_wait`.
+    ///
+    /// Passes still see each other's placements: a task placed and not yet
+    /// claimed counts on its machine (`Placed`, in `views`), one claimed
+    /// counts from its row, and the next pass skips it until its send ends.
+    /// The claim inside the actor (`Store::claim_task`) is the second line
+    /// of defence: it makes a double dispatch of one task impossible even
+    /// if this were bypassed.
+    pub async fn dispatch_queued(&self) {
+        let placed = self.place_queued().await;
+        let wait = self.reply_wait();
+        let mut by_machine: Vec<(String, Vec<Placement>)> = Vec::new();
+        for p in placed {
+            match by_machine.iter_mut().find(|(m, _)| *m == p.handle.name) {
+                Some((_, sends)) => sends.push(p),
+                None => by_machine.push((p.handle.name.clone(), vec![p])),
+            }
+        }
+        let mut sending = tokio::task::JoinSet::new();
+        for (_, sends) in by_machine {
+            sending.spawn(async move {
+                for p in sends {
+                    send_placement(p, wait).await;
+                }
+            });
+        }
+        while sending.join_next().await.is_some() {}
+    }
+
+    /// `dispatch_queued`'s decisions, under the dispatch lock: every task
+    /// placed is reserved on its machine before the next one is looked at.
+    async fn place_queued(&self) -> Vec<Placement> {
+        let _pass = self.dispatch_lock.lock().await;
+        let mut placed = Vec::new();
         let queued = match self.store.queued_tasks() {
             Ok(q) => q,
             Err(err) => {
                 tracing::error!(%err, "list queued");
-                return;
+                return placed;
             }
         };
         let flock = self.flock();
-        for task in queued {
+        // Would `machine` take `task` as far as its agent goes? For the
+        // tasks behind the one being placed (`mark_waiting_under_share`).
+        let takes = |task: &Task, machine: &str| {
+            let theirs = task.flock.as_deref().unwrap_or(flock.default_flock());
+            self.settled_on(task, theirs, machine)
+                .is_none_or(|r| r.is_ok())
+        };
+        for (i, task) in queued.iter().enumerate() {
+            let later = &queued[i + 1..];
+            if self.is_in_flight(task.id) {
+                continue;
+            }
+            if task.state == TaskState::Paused {
+                placed.extend(self.resume_paused(task, later, &takes));
+                continue;
+            }
             let target = task.flock.as_deref().unwrap_or(flock.default_flock());
-            let views = self.views();
+            let default = flock.default_flock();
+            let mut views = self.views();
+            mark_waiting_under_share(&mut views, target, later, default, &takes);
             // The agent can depend on the machine: a machine whose agent
             // cannot run the task's model does not take it. A task from
             // before `agent_source` keeps the agent it was queued with.
             // A profile it inherited (from a machine or flock, not its own
             // ask) is pinned onto the ask here, so a re-settle that can no
             // longer resolve it refuses instead of quietly dropping it.
-            let settled_on = |machine: &str| {
-                let source = task.spec.agent_source.as_ref()?;
-                let mut ask = source.ask.clone();
-                if ask.profile.is_none() {
-                    ask.profile = source.profile.clone();
-                }
-                let mut spec = task.spec.clone();
-                let r = self.settle(&mut spec, &ask, target, Some(machine), &asked_by(&task));
-                Some(r.map(|()| spec))
-            };
-            let claim = Claim::of(&task);
-            let picked = pick_machine_where(&views, target, &task.spec, claim, &|m| {
-                settled_on(m).is_none_or(|r| r.is_ok())
-            });
+            let settled_on = |machine: &str| self.settled_on(task, target, machine);
+            let claim = Claim::of(task);
+            let accepts = |m: &str| settled_on(m).is_none_or(|r| r.is_ok());
+            let mut picked = pick_machine_where(&views, target, &task.spec, claim, &accepts);
+            // A critical task with `preempt` that finds no room pauses the
+            // newest low Claude task on a machine it would fit once that one
+            // is gone, then takes the slot: the pause and the dispatch go
+            // to that machine one after the other.
+            let mut send = Outbound::Dispatch;
+            if picked.is_none()
+                && task.pause.preempt
+                && task.priority == Priority::Critical
+                && let Some((machine, victim)) =
+                    self.pausable_for(&views, target, task, claim, &accepts, later, &takes)
+            {
+                picked = Some(machine);
+                send = Outbound::PauseFor(victim);
+            }
             let Some(name) = picked else {
                 // Say why: no machine of the flock has an agent for its
                 // model, or one would take it but for its model.
@@ -1229,7 +2198,7 @@ impl Fleet {
                     let kind = self
                         .models
                         .read()
-                        .unwrap()
+                        .recover()
                         .get(task.model()?)
                         .ok()?
                         .kind
@@ -1237,7 +2206,7 @@ impl Fleet {
                     let mut members = flock
                         .machines
                         .iter()
-                        .filter(|m| flock.flock_of(m) == target)
+                        .filter(|m| flock.in_flock(m, target))
                         .peekable();
                     let none = task.spec.machine.is_none()
                         && members.peek().is_some()
@@ -1253,18 +2222,36 @@ impl Fleet {
                         format!("no machine in flock {target} has {a} {kind} agent")
                     })
                 };
-                let why = none_has().or_else(|| {
-                    let m = pick_machine(&views, target, &task.spec, claim)?;
-                    Some(settled_on(&m)?.err()?.to_string())
-                });
-                if let Some(why) = why {
-                    let note = format!("{WAITING_FOR_MODEL}: {why}");
-                    if task.error.as_deref() != Some(note.as_str()) {
-                        let mut t = task.clone();
-                        t.error = Some(note);
-                        if let Err(err) = self.store.update_task(&mut t) {
-                            tracing::warn!(task = %task.display_id(), %err, "note why it waits");
-                        }
+                // Or a machine would take it but its flock is at its
+                // number there, or past its share while another waits.
+                let flock_full = || {
+                    views
+                        .iter()
+                        .filter(|v| task.spec.machine.as_ref().is_none_or(|p| *p == v.name))
+                        .filter(|v| {
+                            v.healthy
+                                && v.has_room(claim)
+                                && task.spec.tags.iter().all(|t| v.tags.contains(t))
+                                && settled_on(&v.name).is_none_or(|r| r.is_ok())
+                        })
+                        .find_map(|v| flock_held(v, target))
+                };
+                let why = none_has()
+                    .or_else(|| {
+                        let m = pick_machine(&views, target, &task.spec, claim)?;
+                        Some(settled_on(&m)?.err()?.to_string())
+                    })
+                    .or_else(flock_full);
+                let note = why.map(|why| format!("{WAITING_FOR_MODEL}: {why}"));
+                let stale = task
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL));
+                if note.is_some() && task.error != note || note.is_none() && stale {
+                    let mut t = task.clone();
+                    t.error = note;
+                    if let Err(err) = self.store.update_task(&mut t) {
+                        tracing::warn!(task = %task.display_id(), %err, "note why it waits");
                     }
                 }
                 continue;
@@ -1272,31 +2259,210 @@ impl Fleet {
             let Some(handle) = self.get(&name) else {
                 continue;
             };
+            let mut on = task.clone();
             if let Some(Ok(spec)) = settled_on(&name) {
-                let mut on = task.clone();
                 on.spec = spec;
-                if on
-                    .error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
-                {
-                    on.error = None;
-                }
-                if (on.spec != task.spec || on.error != task.error)
-                    && let Err(err) = self.store.update_task(&mut on)
-                {
-                    tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
-                    continue;
-                }
             }
-            match handle.dispatch(task.id).await {
-                Ok(t) => {
-                    tracing::info!(task = %t.display_id(), machine = %name, state = %t.state, "dispatched")
+            if on
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(WAITING_FOR_MODEL))
+            {
+                on.error = None;
+            }
+            if (on.spec != task.spec || on.error != task.error)
+                && let Err(err) = self.store.update_task(&mut on)
+            {
+                tracing::warn!(task = %task.display_id(), machine = %name, %err, "settle agent");
+                continue;
+            }
+            placed.push(self.reserve(task, handle, send));
+        }
+        placed
+    }
+
+    /// Is a pass sending `task_id` right now?
+    fn is_in_flight(&self, task_id: i64) -> bool {
+        self.in_flight.holds(task_id)
+    }
+
+    /// `dispatch_queued`, then, if another pass placed `task_id` and is
+    /// still sending it, wait for that send to end (at most `reply_wait`),
+    /// so a reply with the row shows where it went. Sends for other tasks
+    /// are not waited for.
+    pub async fn dispatch_queued_for(&self, task_id: i64) {
+        self.dispatch_queued().await;
+        loop {
+            let sent = self.in_flight.sent.notified();
+            tokio::pin!(sent);
+            sent.as_mut().enable();
+            if !self.is_in_flight(task_id) {
+                return;
+            }
+            sent.await;
+        }
+    }
+
+    /// Count `task` on `handle`'s machine until the returned placement's
+    /// send has ended.
+    fn reserve(&self, task: &Task, handle: MachineHandle, send: Outbound) -> Placement {
+        self.in_flight.placed.lock().unwrap().push(Placed {
+            task_id: task.id,
+            machine: handle.name.clone(),
+            flock: task.flock.clone(),
+            from_job: task.from_job(),
+        });
+        Placement {
+            task: task.clone(),
+            handle,
+            send,
+            _held: Reservation {
+                in_flight: self.in_flight.clone(),
+                task_id: task.id,
+            },
+        }
+    }
+
+    /// Where critical task `task` could start by pausing a task: the
+    /// machines it may run on (in its flock, healthy, its tags, its pin, one
+    /// `accepts`) that have no room for `claim` or `flock` is at its number
+    /// there now, but would have both once one pausable task
+    /// (`Task::pausable`) is gone, the newest such, the machine with the
+    /// fewest live tasks first. Pausing another flock's task frees a slot,
+    /// not a seat in `flock`, so it only helps a machine short of slots.
+    /// Past its share, `flock` may take the freed slot only while no flock
+    /// under its share there has a task in `later` waiting for it, the same
+    /// rule dispatch applies, so a pause never frees a slot the task then
+    /// may not take. Answers the machine and that task's id.
+    #[allow(clippy::too_many_arguments)]
+    fn pausable_for(
+        &self,
+        views: &[MachineView],
+        flock: &str,
+        task: &Task,
+        claim: Claim,
+        accepts: &dyn Fn(&str) -> bool,
+        later: &[Task],
+        takes: &dyn Fn(&Task, &str) -> bool,
+    ) -> Option<(String, i64)> {
+        let agents = self.agents.read().recover().clone();
+        let default = self.flock().default_flock().to_string();
+        let now = chrono::Utc::now();
+        views
+            .iter()
+            .filter(|m| {
+                m.in_flock(flock)
+                    && m.healthy
+                    && !(m.has_room(claim) && m.flock_may_take(flock))
+                    && task.spec.machine.as_ref().is_none_or(|p| *p == m.name)
+                    && task.spec.tags.iter().all(|t| m.tags.contains(t))
+                    && accepts(&m.name)
+            })
+            .filter_map(|m| {
+                let victim = self
+                    .store
+                    .tasks_on_machine(&m.name)
+                    .ok()?
+                    .into_iter()
+                    .filter(|t| t.pausable(agents.kind(&t.spec.agent), now))
+                    .filter(|t| {
+                        let mut after = MachineView {
+                            live: m.live.saturating_sub(1),
+                            live_jobs: m.live_jobs.saturating_sub(usize::from(t.from_job())),
+                            ..m.clone()
+                        };
+                        let freed = t.flock.as_deref().unwrap_or(&default);
+                        if let Some(s) = after.flocks.iter_mut().find(|s| s.name == freed) {
+                            s.live = s.live.saturating_sub(1);
+                        }
+                        // The pause can bring `flock` from its max to
+                        // past its share, where waiters matter again.
+                        mark_waiting_under_share(
+                            std::slice::from_mut(&mut after),
+                            flock,
+                            later,
+                            &default,
+                            takes,
+                        );
+                        after.has_room(claim) && after.flock_may_take(flock)
+                    })
+                    .max_by_key(|t| t.id)?;
+                Some((m.live, m.name.clone(), victim.id))
+            })
+            .min_by_key(|(live, _, _)| *live)
+            .map(|(_, name, id)| (name, id))
+    }
+
+    /// Resume paused task `task` on the machine it was paused on, once that
+    /// machine is healthy, still in the flock and has room for it, its own
+    /// flock under its number there. Past its share, it also waits while a
+    /// flock under its share there has a task in `later` for that slot, as
+    /// a queued task would (`MachineView::flock_may_take`). It is not
+    /// settled again: it goes back to the agent and session it had.
+    fn resume_paused(
+        &self,
+        task: &Task,
+        later: &[Task],
+        takes: &(dyn Fn(&Task, &str) -> bool + Sync),
+    ) -> Option<Placement> {
+        let machine = task.pinned_machine()?;
+        let flock = self.flock();
+        let target = task.flock.as_deref().unwrap_or(flock.default_flock());
+        let mut views = self.views();
+        mark_waiting_under_share(&mut views, target, later, flock.default_flock(), takes);
+        let fits = views
+            .iter()
+            .find(|m| m.name == machine)
+            .is_some_and(|m| m.healthy && m.has_room(Claim::of(task)) && m.flock_may_take(target));
+        if !fits || !self.in_flock(machine) {
+            return None;
+        }
+        let handle = self.get(machine)?;
+        Some(self.reserve(task, handle, Outbound::Resume))
+    }
+}
+
+/// Send what a dispatch pass decided for one task, waiting at most `wait`
+/// for each answer. Its reservation ends with it.
+async fn send_placement(p: Placement, wait: Duration) {
+    let Placement {
+        task, handle, send, ..
+    } = &p;
+    let machine = &handle.name;
+    let (res, what) = match *send {
+        Outbound::Resume => (
+            within(machine, wait, handle.resume(task.id)).await,
+            "resume",
+        ),
+        Outbound::PauseFor(victim) => {
+            match within(machine, wait, handle.pause(victim, task.id)).await {
+                Ok(_) => {
+                    tracing::info!(task = %task.display_id(), paused = %Task::agent_name_for(victim), machine = %machine, "paused a low task");
                 }
                 Err(err) => {
-                    tracing::warn!(task = %task.display_id(), machine = %name, %err, "dispatch failed")
+                    tracing::warn!(task = %task.display_id(), victim = %Task::agent_name_for(victim), machine = %machine, %err, "pause failed");
+                    return;
                 }
             }
+            (
+                within(machine, wait, handle.dispatch(task.id)).await,
+                "dispatch",
+            )
+        }
+        Outbound::Dispatch => (
+            within(machine, wait, handle.dispatch(task.id)).await,
+            "dispatch",
+        ),
+    };
+    match res {
+        Ok(t) if what == "resume" => {
+            tracing::info!(task = %t.display_id(), machine = %machine, state = %t.state, "resumed")
+        }
+        Ok(t) => {
+            tracing::info!(task = %t.display_id(), machine = %machine, state = %t.state, "dispatched")
+        }
+        Err(err) => {
+            tracing::warn!(task = %task.display_id(), machine = %machine, err = %format!("{err:#}"), "{what} failed")
         }
     }
 }
@@ -1359,9 +2525,17 @@ pub fn refusal(task: &str, role: TaskRole) -> String {
     match role {
         TaskRole::Agent => agent_refusal(task),
         TaskRole::Orchestrator => format!(
-            "{task} is an orchestrator, and an orchestrator may only run, retry and send to tasks and disable jobs besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
+            "{task} is an orchestrator, and an orchestrator may only run, retry, send to and close tasks, enable and disable jobs and keep its note besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
         ),
     }
+}
+
+/// What the head says when it refuses orchestrator `name`'s pre or post
+/// script a change outside the role's table.
+pub fn script_refusal(name: &str) -> String {
+    format!(
+        "this is orchestrator {name}'s script, and an orchestrator may only run, retry, send to and close tasks, enable and disable jobs and keep its note besides reading; set agents_change_fleet = true in pastor.toml to allow the rest"
+    )
 }
 
 pub fn agent_refusal(task: &str) -> String {
@@ -1376,6 +2550,7 @@ pub struct Daemon {
     fleet: Arc<Fleet>,
     scheduler: SchedulerHandle,
     events: broadcast::Sender<PastorEvent>,
+    orchestrators: Arc<crate::orchestrator::Runner>,
 }
 
 /// The longest IPC request line, newline excluded. The largest real one is a
@@ -1464,19 +2639,56 @@ impl ExtraSignals {
     }
 }
 
+/// Refuse a socket that something answers on, or that something holds but
+/// does not answer: only a refused (or absent) connect leaves it free to
+/// replace. `Daemon::bind_socket` checks this before it binds, and a
+/// background `pastor serve` before it starts the head that would.
+pub async fn refuse_live_socket(socket: &std::path::Path) -> anyhow::Result<()> {
+    // Staleness is a property of the connect, not of the reply: a live
+    // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
+    // herdr) can go a while without answering a ping, and a busy daemon
+    // looks exactly like a wedged one from the outside. Only a refused (or
+    // absent) connect means nothing is actually listening; anything else
+    // must be left alone rather than unlinked and stolen.
+    match crate::ipc::ping_head(socket).await {
+        HeadPing::Pong { role: Some(r), .. } if r == crate::ipc::SHEPHERD_ROLE => {
+            Err(crate::cli::CliError::err(
+                "shepherd_running",
+                format!(
+                    "a headless pastor serve is already running on {}; stop it first (`pastor serve stop`)",
+                    socket.display()
+                ),
+            ))
+        }
+        HeadPing::Pong { .. } => Err(crate::cli::CliError::err(
+            "head_running",
+            format!(
+                "another pastor daemon is already running on {}, as this machine's head; stop it first (`pastor serve stop`)",
+                socket.display()
+            ),
+        )),
+        HeadPing::Unresponsive => anyhow::bail!(
+            "a daemon is listening on {} but did not respond within 2s; \
+             remove the socket file by hand only if that daemon is dead",
+            socket.display()
+        ),
+        HeadPing::NotRunning => Ok(()),
+    }
+}
+
 /// What answers a request line on the socket: the head (`Daemon`) or a
 /// headless serve (`shepherd::Shepherd`).
 pub(crate) trait Answer: Send + Sync + 'static {
     fn answer(
         &self,
         req: IpcRequest,
-        from_task: Option<String>,
+        from: crate::ipc::Caller,
     ) -> impl std::future::Future<Output = IpcResponse> + Send;
 }
 
 impl Answer for Daemon {
-    async fn answer(&self, req: IpcRequest, from_task: Option<String>) -> IpcResponse {
-        self.handle_from(req, from_task.as_deref()).await
+    async fn answer(&self, req: IpcRequest, from: crate::ipc::Caller) -> IpcResponse {
+        self.handle_as(req, &from).await
     }
 }
 
@@ -1508,7 +2720,7 @@ pub(crate) async fn answer_on<A: Answer>(
                     let (r, mut w) = stream.into_split();
                     let resp = match read_request(r, MAX_IPC_REQUEST, IPC_READ_TIMEOUT).await {
                         Ok(line) => match crate::ipc::parse_request_line(line.trim()) {
-                            Ok((req, from_task)) => d.answer(req, from_task).await,
+                            Ok((req, from)) => d.answer(req, from).await,
                             Err(err) => IpcResponse::error("invalid_request", err),
                         },
                         Err(RequestReadError::TooLarge) => IpcResponse::error(
@@ -1588,12 +2800,20 @@ impl Daemon {
         .with_connectors()
         .with_config_baseline(on_disk)
         .spawn();
+        let orchestrators = crate::orchestrator::Runner::new(
+            paths.clone(),
+            store.clone(),
+            fleet.clone(),
+            events.clone(),
+        );
+        orchestrators.spawn(config.tick_duration());
         Ok(Daemon {
             paths,
             store,
             fleet,
             scheduler,
             events,
+            orchestrators,
         })
     }
 
@@ -1624,38 +2844,8 @@ impl Daemon {
         socket: &std::path::Path,
     ) -> anyhow::Result<tokio::net::UnixListener> {
         if socket.exists() {
-            // Staleness is a property of the connect, not of the reply: a live
-            // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
-            // herdr) can go a while without answering a ping, and a busy daemon
-            // looks exactly like a wedged one from the outside. Only a refused (or
-            // absent) connect means nothing is actually listening; anything else
-            // must be left alone rather than unlinked and stolen.
-            match crate::ipc::ping_head(socket).await {
-                HeadPing::Pong { role: Some(r), .. } if r == crate::ipc::SHEPHERD_ROLE => {
-                    return Err(crate::cli::CliError::err(
-                        "shepherd_running",
-                        format!(
-                            "a headless pastor serve is already running on {}; stop it first",
-                            socket.display()
-                        ),
-                    ));
-                }
-                HeadPing::Pong { .. } => {
-                    return Err(crate::cli::CliError::err(
-                        "head_running",
-                        format!(
-                            "another pastor daemon is already running on {}, as this machine's head; stop it first",
-                            socket.display()
-                        ),
-                    ));
-                }
-                HeadPing::Unresponsive => anyhow::bail!(
-                    "a daemon is listening on {} but did not respond within 2s; \
-                     remove the socket file by hand only if that daemon is dead",
-                    socket.display()
-                ),
-                HeadPing::NotRunning => std::fs::remove_file(socket)?,
-            }
+            refuse_live_socket(socket).await?;
+            std::fs::remove_file(socket)?;
         }
         let listener = tokio::net::UnixListener::bind(socket)?;
         std::fs::set_permissions(
@@ -1708,19 +2898,101 @@ impl Daemon {
     /// `IpcRequest::orchestrator_may` lists. No caller in a task may make an
     /// orchestrator, `agents_change_fleet` or not: only a person does.
     pub async fn handle_from(&self, req: IpcRequest, from_task: Option<&str>) -> IpcResponse {
-        let Some(task) = from_task else {
+        self.handle_as(req, &crate::ipc::Caller::task(from_task))
+            .await
+    }
+
+    /// `handle` for `caller`: a task's agent as `handle_from` says, an
+    /// orchestrator's pre or post script (`orchestrator::ORCHESTRATOR_ENV`)
+    /// under the orchestrator role's table, which must name an orchestrator
+    /// the head has a file for, or a person. A caller that names both a
+    /// task and an orchestrator is the task: an agent cannot widen its
+    /// rights by setting the other.
+    pub async fn handle_as(&self, req: IpcRequest, caller: &crate::ipc::Caller) -> IpcResponse {
+        if let Some(task) = caller.task.as_deref() {
+            if let Some(why) = self.makes_orchestrator(&req) {
+                return IpcResponse::error("role_refused", format!("{task} is a task, and {why}"));
+            }
+            if req.changes_fleet() && !req.ends_own_task(task) && !self.fleet.agents_change_fleet()
+            {
+                let role = self.caller_role(task);
+                if !(role == TaskRole::Orchestrator && req.orchestrator_may()) {
+                    return IpcResponse::error("agent_refused", refusal(task, role));
+                }
+            }
+            if let IpcRequest::OrchestratorNote { name, text } = req {
+                return self.note_from_task(task, name, &text);
+            }
+            // The agent ending its own task: one that must say what it did is
+            // held to it (`SummaryMode::Require`).
+            if req.ends_own_task(task)
+                && let IpcRequest::TaskDone { id, summary } = req
+            {
+                return self.end(id, summary, crate::machine::EndBy::Agent).await;
+            }
             return self.handle(req).await;
-        };
-        if let Some(why) = self.makes_orchestrator(&req) {
-            return IpcResponse::error("role_refused", format!("{task} is a task, and {why}"));
         }
-        if req.changes_fleet() && !req.ends_own_task(task) && !self.fleet.agents_change_fleet() {
-            let role = self.caller_role(task);
-            if !(role == TaskRole::Orchestrator && req.orchestrator_may()) {
-                return IpcResponse::error("agent_refused", refusal(task, role));
+        if let Some(o) = caller.orchestrator.as_deref() {
+            if let Some(why) = self.makes_orchestrator(&req) {
+                return IpcResponse::error(
+                    "role_refused",
+                    format!("orchestrator {o}'s script is not a person, and {why}"),
+                );
+            }
+            if req.changes_fleet() {
+                if !self.orchestrators.knows(o) {
+                    return IpcResponse::error(
+                        "agent_refused",
+                        format!(
+                            "{} names {o:?}, but the head has no orchestrator of that name",
+                            crate::orchestrator::ORCHESTRATOR_ENV
+                        ),
+                    );
+                }
+                if !req.orchestrator_may() && !self.fleet.agents_change_fleet() {
+                    return IpcResponse::error("agent_refused", script_refusal(o));
+                }
+            }
+            if let IpcRequest::OrchestratorNote { name, text } = req {
+                if name.as_deref().is_some_and(|n| n != o) {
+                    return IpcResponse::error(
+                        "agent_refused",
+                        format!("orchestrator {o}'s script may keep only its own note"),
+                    );
+                }
+                return self.note(o, &text);
             }
         }
         self.handle(req).await
+    }
+
+    /// `orchestrator note` from task `task`'s agent: the note of the
+    /// orchestrator that started it, and no other.
+    fn note_from_task(&self, task: &str, name: Option<String>, text: &str) -> IpcResponse {
+        let own = crate::task::parse_task_id(task).and_then(|id| self.orchestrators.of_task(id));
+        match (own, name) {
+            (Some(own), Some(name)) if name != own => IpcResponse::error(
+                "agent_refused",
+                format!("{task} is orchestrator {own}'s agent, and may keep only its note"),
+            ),
+            (Some(own), _) => self.note(&own, text),
+            (None, _) => IpcResponse::error(
+                "not_an_orchestrator",
+                format!(
+                    "{task} was not started by an orchestrator file, so it has no note to keep"
+                ),
+            ),
+        }
+    }
+
+    fn note(&self, name: &str, text: &str) -> IpcResponse {
+        if let Err((code, message)) = crate::orchestrator::file_of(&self.paths, name) {
+            return IpcResponse::error(&code, message);
+        }
+        match crate::orchestrator::write_note(&self.paths, name, text) {
+            Ok(said) => IpcResponse::Text(said),
+            Err(err) => IpcResponse::error("runtime_error", format!("{err:#}")),
+        }
     }
 
     /// Why `req` would make an orchestrator, which only a person may do:
@@ -1804,6 +3076,8 @@ impl Daemon {
                 priority,
                 role,
                 description,
+                preempt,
+                summary,
             } => {
                 // clap refuses this too; checked here as well so no other
                 // client can queue a task dispatch can only fail.
@@ -1834,6 +3108,8 @@ impl Daemon {
                         priority,
                         role,
                         crate::config::clean_description(description.as_deref()),
+                        preempt,
+                        summary,
                     )
                     .await
                 {
@@ -1863,8 +3139,9 @@ impl Daemon {
                     task_id: Some(task.id),
                     machine: None,
                     job: Some(task.job.clone()),
+                    summary: None,
                 });
-                self.fleet.dispatch_queued().await;
+                self.fleet.dispatch_queued_for(task.id).await;
                 match self.store.get_task(task.id) {
                     Ok(Some(t)) => IpcResponse::Task(t),
                     Ok(None) => IpcResponse::error("task_not_found", task.id),
@@ -1875,8 +3152,24 @@ impl Daemon {
                 Ok(ts) => IpcResponse::Tasks(ts),
                 Err(err) => IpcResponse::error("store_error", err),
             },
-            IpcRequest::TaskPriority { id, priority } => {
-                match self.fleet.set_priority(id, priority, "task priority").await {
+            IpcRequest::TaskPriority {
+                id,
+                priority,
+                preempt,
+            } => {
+                if preempt && priority != Priority::Critical {
+                    return IpcResponse::error(
+                        crate::task::PREEMPT_NEEDS_CRITICAL,
+                        format!(
+                            "--preempt needs critical: only a critical task may pause another, not a {priority} one"
+                        ),
+                    );
+                }
+                match self
+                    .fleet
+                    .set_priority_preempting(id, priority, "task priority", preempt)
+                    .await
+                {
                     Ok(t) => IpcResponse::Task(t),
                     Err(err @ PriorityError::NotFound(_)) => {
                         IpcResponse::error("task_not_found", err)
@@ -1906,6 +3199,14 @@ impl Daemon {
                 Ok(None) => IpcResponse::error("task_not_found", format!("t-{id}")),
                 Err(err) => IpcResponse::error("store_error", err),
             },
+            IpcRequest::TaskSummaries { id } => match self.store.get_task(id) {
+                Ok(Some(_)) => match self.store.summaries(id) {
+                    Ok(all) => IpcResponse::Summaries(all),
+                    Err(err) => IpcResponse::error("store_error", format!("{err:#}")),
+                },
+                Ok(None) => IpcResponse::error("task_not_found", format!("t-{id}")),
+                Err(err) => IpcResponse::error("store_error", err),
+            },
             IpcRequest::TaskRead { id, lines } => {
                 let task = match self.store.get_task(id) {
                     Ok(Some(t)) => t,
@@ -1918,6 +3219,9 @@ impl Daemon {
                         format!("t-{id} is not on any machine"),
                     );
                 };
+                if self.fleet.is_pull(&handle.name) {
+                    return pull_machine_task(&task, &handle.name);
+                }
                 // Its aborted actor answers nothing; the read would wait for
                 // as long as it stays wedged.
                 if self.fleet.shutting_down(&handle.name) {
@@ -1926,7 +3230,11 @@ impl Daemon {
                         format!("machine {} is shutting down; try again later", handle.name),
                     );
                 }
-                match handle.read(id, lines).await {
+                match self
+                    .fleet
+                    .bounded(&handle.name, handle.read(id, lines))
+                    .await
+                {
                     Ok(text) => IpcResponse::Text(text),
                     Err(err) if err.downcast_ref::<ActorStopped>().is_some() => {
                         IpcResponse::error("machine_shutting_down", err)
@@ -1961,6 +3269,7 @@ impl Daemon {
                 name,
                 default,
                 description,
+                machines,
             } => {
                 let store = &self.store;
                 self.edit_flock_file("; ", |file| {
@@ -1969,6 +3278,7 @@ impl Daemon {
                         &name,
                         default,
                         description.as_deref(),
+                        &machines,
                         || {
                             Ok(store
                                 .queued_tasks()?
@@ -1978,6 +3288,23 @@ impl Daemon {
                                 .collect())
                         },
                     )
+                })
+                .await
+            }
+            IpcRequest::FlockJoin {
+                flock,
+                machine,
+                max,
+            } => {
+                self.edit_flock_file("; ", |file| {
+                    crate::fleet_edit::join_flock(file, &flock, &machine, max)
+                })
+                .await
+            }
+            IpcRequest::FlockLeave { flock, machine } => {
+                let store = &self.store;
+                self.edit_flock_file("; ", |file| {
+                    crate::fleet_edit::leave_flock(file, &flock, &machine, || store.queued_tasks())
                 })
                 .await
             }
@@ -2019,7 +3346,9 @@ impl Daemon {
                 remove_worktree,
             } => self.close(id, remove_worktree).await,
             IpcRequest::TaskSend { id, input } => self.send(id, input).await,
-            IpcRequest::TaskDone { id } => self.end(id).await,
+            IpcRequest::TaskDone { id, summary } => {
+                self.end(id, summary, crate::machine::EndBy::Hand).await
+            }
             IpcRequest::TaskPrune {
                 states,
                 older_than_secs,
@@ -2102,6 +3431,9 @@ impl Daemon {
                     // A headless serve resolves priority itself before
                     // sending the item; the head does not re-render it.
                     priority: None,
+                    preempt: false,
+                    // `JobTask` carries none: the flock's or `[defaults]`.
+                    summary: None,
                     dispatch: serde_json::Value::Null,
                 };
                 self.job_task(job, item).await
@@ -2148,6 +3480,70 @@ impl Daemon {
             }
             IpcRequest::FlockDescribe { name } => self.describe_flock(&name),
             IpcRequest::MachineDescribe { name } => self.describe_machine(&name),
+            IpcRequest::TaskClaim {
+                machine,
+                free_slots,
+                flock_work,
+            } => match self.fleet.claim(&machine, free_slots, flock_work).await {
+                Ok(tasks) => IpcResponse::Tasks(tasks),
+                Err(err) => cli_error(err),
+            },
+            IpcRequest::TaskReport {
+                machine,
+                id,
+                state,
+                pane,
+                detail,
+            } => match self.fleet.report(&machine, id, state, pane, detail).await {
+                Ok(task) => IpcResponse::Task(task),
+                Err(err) => cli_error(err),
+            },
+            IpcRequest::OrchestratorList => {
+                IpcResponse::Orchestrators(self.orchestrators.statuses(chrono::Utc::now()))
+            }
+            IpcRequest::OrchestratorDescribe { name } => {
+                match self.orchestrators.describe(&name, chrono::Utc::now()) {
+                    Ok(d) => IpcResponse::Orchestrator(d),
+                    Err((code, message)) => IpcResponse::error(&code, message),
+                }
+            }
+            IpcRequest::OrchestratorRun { name } => match self.orchestrators.fire(&name) {
+                Ok(said) => IpcResponse::Text(said),
+                Err((code, message)) => IpcResponse::error(&code, message),
+            },
+            IpcRequest::OrchestratorStart { name } => {
+                match self
+                    .orchestrators
+                    .start_by_hand(&name, chrono::Utc::now())
+                    .await
+                {
+                    Ok(said) => IpcResponse::Text(said),
+                    Err((code, message)) => IpcResponse::error(&code, message),
+                }
+            }
+            IpcRequest::OrchestratorStop { name } => {
+                match self
+                    .orchestrators
+                    .stop_by_hand(&name, chrono::Utc::now())
+                    .await
+                {
+                    Ok(said) => IpcResponse::Text(said),
+                    Err((code, message)) => IpcResponse::error(&code, message),
+                }
+            }
+            IpcRequest::OrchestratorSetEnabled { name, enabled } => {
+                match crate::orchestrator::set_enabled(&self.paths, &name, enabled) {
+                    Ok(said) => IpcResponse::Text(said),
+                    Err((code, message)) => IpcResponse::error(&code, message),
+                }
+            }
+            IpcRequest::OrchestratorNote { name, text } => match name {
+                Some(name) => self.note(&name, &text),
+                None => IpcResponse::error(
+                    "orchestrator_not_found",
+                    "name the orchestrator whose note this is (--name)",
+                ),
+            },
         }
     }
 
@@ -2296,6 +3692,9 @@ impl Daemon {
                 ),
             );
         };
+        if self.fleet.is_pull(&handle.name) {
+            return pull_machine_task(&task, &handle.name);
+        }
         if self.fleet.shutting_down(&handle.name) {
             return IpcResponse::error(
                 "machine_shutting_down",
@@ -2304,7 +3703,11 @@ impl Daemon {
         }
         let what = describe_input(&input);
         let trust = input.trust;
-        match handle.send(id, input).await {
+        match self
+            .fleet
+            .bounded(&handle.name, handle.send(id, input))
+            .await
+        {
             Ok(t) if trust => IpcResponse::Text(match &t.spec.repo {
                 Some(repo) => format!(
                     "sent the trust keys to {}; {repo} on {} is trusted from now on",
@@ -2327,7 +3730,14 @@ impl Daemon {
     /// `TaskDone`: through the actor of the task's machine, which checks the
     /// row again and marks it done and ended. A task on no machine, or one
     /// whose machine has left the flock, has no pane to end.
-    async fn end(&self, id: i64) -> IpcResponse {
+    /// `by` is who asks (`EndBy`): the task's own agent (`handle_from`), or
+    /// anyone else.
+    async fn end(
+        &self,
+        id: i64,
+        summary: Option<String>,
+        by: crate::machine::EndBy,
+    ) -> IpcResponse {
         let task = match self.store.get_task(id) {
             Ok(Some(t)) => t,
             Ok(None) => return IpcResponse::error("task_not_found", format!("t-{id}")),
@@ -2348,7 +3758,17 @@ impl Daemon {
                 ),
             );
         };
-        match handle.end(id).await {
+        if self.fleet.is_pull(&handle.name) {
+            return match self.fleet.end_pull(task, summary, by) {
+                Ok(t) => IpcResponse::Task(t),
+                Err(err) => cli_error(err),
+            };
+        }
+        match self
+            .fleet
+            .bounded(&handle.name, handle.end_by(id, summary, by))
+            .await
+        {
             Ok(t) => IpcResponse::Task(t),
             Err(err) => match err.downcast_ref::<SendRefused>() {
                 Some(r) => IpcResponse::error(r.code, r),
@@ -2416,8 +3836,9 @@ impl Daemon {
             task_id: Some(task.id),
             machine: None,
             job: Some(task.job.clone()),
+            summary: None,
         });
-        self.fleet.dispatch_queued().await;
+        self.fleet.dispatch_queued_for(task.id).await;
         match self.store.get_task(task.id) {
             Ok(Some(t)) => IpcResponse::Task(t),
             Ok(None) => IpcResponse::error("task_not_found", task.id),
@@ -2484,8 +3905,9 @@ impl Daemon {
             task_id: Some(task.id),
             machine: None,
             job: Some(task.job.clone()),
+            summary: None,
         });
-        self.fleet.dispatch_queued().await;
+        self.fleet.dispatch_queued_for(task.id).await;
         match self.store.get_task(task.id) {
             Ok(Some(t)) => IpcResponse::Task(t),
             Ok(None) => IpcResponse::error("task_not_found", task.display_id()),
@@ -2515,7 +3937,11 @@ impl Daemon {
                     format!("{name}: no task row, and no machine reports an agent by that name"),
                 );
             };
-            return match handle.close(id, remove_worktree).await {
+            return match self
+                .fleet
+                .bounded(&handle.name, handle.close(id, remove_worktree))
+                .await
+            {
                 Err(err) if err.downcast_ref::<OrphanClosed>().is_some() => {
                     IpcResponse::Text(err.to_string())
                 }
@@ -2548,11 +3974,15 @@ impl Daemon {
             if t.state == TaskState::Closed && !remove_worktree {
                 return IpcResponse::Task(t);
             }
-            if let Some(m) = t.machine.clone() {
+            // A paused task holds no pane: a plain close is its row alone,
+            // unless a resume claims it first. Its checkout is on its
+            // machine, so `--remove-worktree` goes there.
+            let paused = t.state == TaskState::Paused && !remove_worktree;
+            if !paused && let Some(m) = t.machine.clone() {
                 break m;
             }
             let was = t.state;
-            let closed = if was == TaskState::Queued {
+            let closed = if was == TaskState::Queued || paused {
                 match self.store.close_queued(id) {
                     Ok(Some(c)) => c,
                     // Claimed (or closed) since the read: read it again.
@@ -2580,16 +4010,23 @@ impl Daemon {
                     task_id: Some(id),
                     machine: None,
                     job: Some(closed.job.clone()),
+                    summary: None,
                 });
             }
             return IpcResponse::Task(closed);
         };
         // A removed machine held only until its old actor ends counts as
         // gone: that actor answers nothing and no replacement will come.
+        // A pull machine has no actor either: the head closes the row, and
+        // its own pastor serve closes the pane when it next reports on it.
+        let pull = self.fleet.is_pull(&machine);
+        if pull && remove_worktree {
+            return pull_machine_task(&t, &machine);
+        }
         let handle = self
             .fleet
             .get(&machine)
-            .filter(|_| self.fleet.in_flock(&machine));
+            .filter(|_| self.fleet.in_flock(&machine) && !pull);
         let Some(handle) = handle else {
             // Its machine left the flock, so no actor owns the row and no
             // herdr can be asked: a plain close is only the row, but the
@@ -2613,6 +4050,7 @@ impl Daemon {
                 task_id: Some(id),
                 machine: Some(machine),
                 job: Some(closed.job.clone()),
+                summary: None,
             });
             return IpcResponse::Task(closed);
         };
@@ -2625,11 +4063,27 @@ impl Daemon {
                 format!("machine {machine} is shutting down; try again later"),
             );
         }
-        match handle.close(id, remove_worktree).await {
+        match self
+            .fleet
+            .bounded(&handle.name, handle.close(id, remove_worktree))
+            .await
+        {
             Ok(t) => IpcResponse::Task(t),
             Err(err) => stopped_or(err, "close_failed"),
         }
     }
+}
+
+/// The answer to a request about `task` that only its pull machine
+/// `machine` can carry out, being the one that reaches its pane.
+fn pull_machine_task(task: &Task, machine: &str) -> IpcResponse {
+    IpcResponse::error(
+        "pull_machine_task",
+        format!(
+            "{} runs on pull machine {machine}, which the head never reaches; read, send to or attach to it from {machine} itself",
+            task.display_id()
+        ),
+    )
 }
 
 /// A request that lost the race with a reload stopping its machine's actor
@@ -2642,6 +4096,16 @@ fn stopped_or(err: anyhow::Error, code: &str) -> IpcResponse {
 }
 
 pub async fn serve(paths: Paths) -> anyhow::Result<()> {
+    // Held from before flock.toml is read until the socket listens, so an
+    // edit made with no head either lands before the load or sees this head
+    // listening and stops (`fleet_edit::lock_fleet`).
+    let fleet_lock = {
+        let paths = paths.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::fleet_edit::lock_fleet(&paths, crate::fleet_edit::FLEET_LOCK_WAIT)
+        })
+        .await??
+    };
     // Before the loads: an edit that lands after them must still read as a
     // change on the scheduler's first pass.
     let on_disk = ConfigFingerprint::sample(&paths);
@@ -2653,6 +4117,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
         "flock is empty; add a machine with `pastor machine add`"
     );
     let (daemon, listener) = Daemon::bind_and_start(paths, config, flock, on_disk, None).await?;
+    drop(fleet_lock);
     tracing::info!(socket = %daemon.socket_path().display(), machines = daemon.fleet.machines().len(), "pastor serve");
     daemon.run_with_listener(listener).await
 }
@@ -2671,6 +4136,7 @@ mod tests {
 
     fn machine(name: &str, max: u32) -> MachineConfig {
         MachineConfig {
+            pull: false,
             description: None,
             name: name.into(),
             local: false,
@@ -2709,6 +4175,8 @@ mod tests {
             agent_source: None,
             place: Default::default(),
             session_id: None,
+            label: Default::default(),
+            summary: Default::default(),
         }
     }
 
@@ -3121,11 +4589,374 @@ mod tests {
             .await
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while d.fleet().views().iter().any(|v| !v.healthy) {
+        while d
+            .fleet()
+            .views()
+            .iter()
+            .any(|v| !v.healthy && !d.fleet().is_pull(&v.name))
+        {
             assert!(Instant::now() < deadline, "machines never connected");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         (d, tmp)
+    }
+
+    /// `a` (a fake herdr, one slot) and `laptop`, a pull machine with
+    /// `slots`.
+    async fn pull_daemon(slots: u32) -> (Daemon, tempfile::TempDir) {
+        let laptop = MachineConfig {
+            pull: true,
+            command: None,
+            ..machine("laptop", slots)
+        };
+        let flock = Flock {
+            flocks: vec![],
+            machines: vec![machine("a", 1), laptop],
+        };
+        daemon_with_flock(flock, &[("a", 1, FakeHerdr::new())]).await
+    }
+
+    fn run_on(prompt: &str, machine: Option<&str>) -> IpcRequest {
+        IpcRequest::Run {
+            preempt: false,
+            prompt: prompt.into(),
+            spec: DispatchSpec {
+                machine: machine.map(str::to_string),
+                ..spec()
+            },
+            flock: None,
+            agent: None,
+            priority: None,
+            role: TaskRole::Agent,
+            description: None,
+            summary: None,
+        }
+    }
+
+    async fn queued(d: &Daemon, prompt: &str, machine: Option<&str>) -> Task {
+        match d.handle(run_on(prompt, machine)).await {
+            IpcResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    async fn claim(d: &Daemon, free_slots: u32, flock_work: bool) -> Vec<String> {
+        let req = IpcRequest::TaskClaim {
+            machine: "laptop".into(),
+            free_slots,
+            flock_work,
+        };
+        match d.handle(req).await {
+            IpcResponse::Tasks(ts) => ts
+                .into_iter()
+                .map(|t| {
+                    assert_eq!(t.state, TaskState::Starting, "{t:?}");
+                    assert_eq!(t.machine.as_deref(), Some("laptop"));
+                    t.prompt
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn report(machine: &str, t: &Task, state: TaskState, detail: Option<&str>) -> IpcRequest {
+        IpcRequest::TaskReport {
+            machine: machine.into(),
+            id: t.id,
+            state,
+            pane: Some("p-9".into()),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    /// (kind, task id, machine) of each event sent so far.
+    fn events_of(rx: &mut broadcast::Receiver<PastorEvent>) -> Vec<(String, Option<i64>, String)> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| (e.kind, e.task_id, e.machine.unwrap_or_default()))
+            .collect()
+    }
+
+    fn state_of(d: &Daemon, t: &Task) -> TaskState {
+        d.store().get_task(t.id).unwrap().unwrap().state
+    }
+
+    /// The head runs no actor for a pull machine and never dispatches to
+    /// it: tasks pinned there wait until it claims them, pinned ones first
+    /// and flock work only when asked, within its free slots and its own
+    /// number. Its reports land on the rows with the events an actor
+    /// would send; one about another machine's task, or from a machine the
+    /// head reaches itself, is refused.
+    #[tokio::test]
+    async fn a_pull_machine_claims_its_tasks_and_reports_them() {
+        let (d, _tmp) = pull_daemon(3).await;
+        let laptop = || {
+            d.fleet()
+                .statuses()
+                .into_iter()
+                .find(|s| s.name == "laptop")
+                .unwrap()
+        };
+        assert_eq!(laptop().endpoint, crate::machine::PULL_ENDPOINT);
+        assert_eq!(laptop().channel, crate::machine::ChannelState::Connecting);
+        let p1 = queued(&d, "p1", Some("laptop")).await;
+        let p2 = queued(&d, "p2", Some("laptop")).await;
+        let on_a = queued(&d, "u1", None).await;
+        let loose = queued(&d, "u2", None).await;
+        assert_eq!(p1.state, TaskState::Queued);
+        assert_eq!(on_a.machine.as_deref(), Some("a"));
+        assert_eq!(loose.state, TaskState::Queued, "a is full");
+        d.fleet().dispatch_queued().await;
+        assert_eq!(state_of(&d, &p1), TaskState::Queued, "never dispatched");
+
+        let mut rx = d.subscribe();
+        assert_eq!(claim(&d, 1, false).await, ["p1"]);
+        assert_eq!(laptop().channel, crate::machine::ChannelState::Connected);
+        assert_eq!(claim(&d, 5, false).await, ["p2"], "no flock work unasked");
+        assert_eq!(claim(&d, 5, true).await, ["u2"]);
+        assert!(claim(&d, 5, true).await.is_empty());
+        assert_eq!(laptop().live, 3);
+
+        let resp = d
+            .handle(report("laptop", &p1, TaskState::Running, None))
+            .await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(t.pane_id.as_deref(), Some("p-9"));
+        assert!(t.started_at.is_some());
+        // The same report again changes nothing and says nothing.
+        d.handle(report("laptop", &p1, TaskState::Running, None))
+            .await;
+        d.handle(report("laptop", &p1, TaskState::Done, None)).await;
+        d.handle(report(
+            "laptop",
+            &p2,
+            TaskState::Blocked,
+            Some("agent asked: go on?"),
+        ))
+        .await;
+        let blocked = d.store().get_task(p2.id).unwrap().unwrap();
+        assert_eq!(blocked.error.as_deref(), Some("agent asked: go on?"));
+        let events = events_of(&mut rx);
+        let lap = |kind: &str, t: &Task| (kind.to_string(), Some(t.id), "laptop".to_string());
+        assert_eq!(
+            events,
+            [
+                lap("task.running", &p1),
+                lap("task.done", &p1),
+                lap("task.blocked", &p2)
+            ]
+        );
+        assert_eq!(state_of(&d, &p1), TaskState::Done);
+
+        assert_eq!(
+            error_code(d.handle(report("a", &on_a, TaskState::Done, None)).await),
+            "not_pull_machine"
+        );
+        assert_eq!(
+            error_code(
+                d.handle(report("laptop", &on_a, TaskState::Done, None))
+                    .await
+            ),
+            "not_on_machine"
+        );
+        assert_eq!(
+            error_code(
+                d.handle(report("laptop", &p1, TaskState::Queued, None))
+                    .await
+            ),
+            "invalid_report"
+        );
+        assert_eq!(
+            error_code(
+                d.handle(IpcRequest::TaskClaim {
+                    machine: "nope".into(),
+                    free_slots: 1,
+                    flock_work: false,
+                })
+                .await
+            ),
+            "unknown_machine"
+        );
+    }
+
+    /// Reading, typing into or removing the worktree of a pull machine's
+    /// task needs that machine; `task done` and a plain close are the
+    /// head's rows alone, and a report after `task done` leaves it done.
+    #[tokio::test]
+    async fn a_pull_machine_s_task_is_read_and_sent_to_on_that_machine() {
+        let (d, _tmp) = pull_daemon(2).await;
+        let t = queued(&d, "p", Some("laptop")).await;
+        claim(&d, 1, false).await;
+        d.handle(report("laptop", &t, TaskState::Running, None))
+            .await;
+        assert_eq!(
+            error_code(d.handle(IpcRequest::TaskRead { id: t.id, lines: 5 }).await),
+            "pull_machine_task"
+        );
+        let send = IpcRequest::TaskSend {
+            id: t.id,
+            input: SendInput {
+                text: Some("hi".into()),
+                ..Default::default()
+            },
+        };
+        assert_eq!(error_code(d.handle(send).await), "pull_machine_task");
+        let mut rx = d.subscribe();
+        let done = IpcRequest::TaskDone {
+            id: t.id,
+            summary: Some("did it".into()),
+        };
+        let IpcResponse::Task(ended) = d.handle(done).await else {
+            panic!()
+        };
+        assert_eq!(ended.state, TaskState::Done);
+        assert!(ended.ended);
+        d.handle(report("laptop", &t, TaskState::Running, None))
+            .await;
+        assert_eq!(state_of(&d, &t), TaskState::Done, "ended stays done");
+        assert_eq!(
+            events_of(&mut rx),
+            [("task.done".to_string(), Some(t.id), "laptop".to_string())]
+        );
+        let close = |remove_worktree| IpcRequest::TaskClose {
+            id: t.id,
+            remove_worktree,
+        };
+        let mut wt = d.store().get_task(t.id).unwrap().unwrap();
+        wt.spec.worktree = true;
+        wt.spec.repo = Some("~/r".into());
+        d.store().update_task(&mut wt).unwrap();
+        assert_eq!(error_code(d.handle(close(true)).await), "pull_machine_task");
+        let IpcResponse::Task(closed) = d.handle(close(false)).await else {
+            panic!()
+        };
+        assert_eq!(closed.state, TaskState::Closed);
+        d.handle(report("laptop", &t, TaskState::Done, None)).await;
+        assert_eq!(state_of(&d, &t), TaskState::Closed, "closed stays closed");
+    }
+
+    /// A task on a pull machine that requires a summary is held to it as
+    /// one on a herdr machine: its agent's bare `task done` is refused, and
+    /// a person's ends it by hand.
+    #[tokio::test]
+    async fn a_pull_task_holds_its_agent_to_a_required_summary() {
+        use crate::machine::EndBy;
+        let (d, _tmp) = pull_daemon(2).await;
+        let t = queued(&d, "p", Some("laptop")).await;
+        claim(&d, 1, false).await;
+        let mut row = d.store().get_task(t.id).unwrap().unwrap();
+        row.spec.summary = crate::task::SummaryMode::Require;
+        d.store().update_task(&mut row).unwrap();
+        let err = d
+            .fleet()
+            .end_pull(row.clone(), None, EndBy::Agent)
+            .unwrap_err();
+        let err = err.downcast_ref::<crate::cli::CliError>().unwrap();
+        assert_eq!(err.code, crate::task::SUMMARY_REQUIRED);
+        assert!(!d.store().get_task(t.id).unwrap().unwrap().ended);
+        let ended = d.fleet().end_pull(row, None, EndBy::Hand).unwrap();
+        assert!(ended.ended);
+        let round = d.store().get_task(t.id).unwrap().unwrap().summary.unwrap();
+        assert_eq!(round.text, crate::task::ENDED_BY_HAND);
+    }
+
+    /// A pull machine that neither claims nor reports for `after` is lost
+    /// once: its starting and running tasks go stale, the ones pinned to it
+    /// stay queued, and its next claim brings it back. A report of work on
+    /// a stale task leaves it stale; one of its end does not.
+    #[tokio::test]
+    async fn a_silent_pull_machine_is_lost_and_its_tasks_go_stale() {
+        let (d, _tmp) = pull_daemon(2).await;
+        let fleet = d.fleet();
+        let after = Duration::from_millis(300);
+        let running = queued(&d, "r", Some("laptop")).await;
+        let starting = queued(&d, "s", Some("laptop")).await;
+        claim(&d, 2, false).await;
+        d.handle(report("laptop", &running, TaskState::Running, None))
+            .await;
+        let waiting = queued(&d, "w", Some("laptop")).await;
+        let mut rx = d.subscribe();
+        assert!(fleet.check_pull_lost(after).await.is_empty(), "just heard");
+        tokio::time::sleep(after).await;
+        assert_eq!(fleet.check_pull_lost(after).await, ["laptop"]);
+        assert!(fleet.check_pull_lost(after).await.is_empty(), "lost once");
+        assert_eq!(state_of(&d, &running), TaskState::Stale);
+        assert_eq!(state_of(&d, &starting), TaskState::Stale);
+        assert_eq!(state_of(&d, &waiting), TaskState::Queued);
+        let status = fleet
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == "laptop")
+            .unwrap();
+        assert_eq!(status.channel, crate::machine::ChannelState::Reconnecting);
+        assert!(status.error.unwrap().contains("has not claimed"));
+        let mut events = events_of(&mut rx);
+        events[1..].sort();
+        let lap = |kind: &str, id: Option<i64>| (kind.to_string(), id, "laptop".to_string());
+        assert_eq!(
+            events,
+            [
+                lap("machine.lost", None),
+                lap("task.stale", Some(running.id)),
+                lap("task.stale", Some(starting.id)),
+            ]
+        );
+
+        // Two slots, both stale tasks still hold theirs.
+        assert!(claim(&d, 2, false).await.is_empty());
+        assert_eq!(events_of(&mut rx), [lap("machine.connected", None)]);
+        d.handle(report("laptop", &running, TaskState::Running, None))
+            .await;
+        assert_eq!(state_of(&d, &running), TaskState::Stale);
+        d.handle(report("laptop", &running, TaskState::Done, None))
+            .await;
+        assert_eq!(state_of(&d, &running), TaskState::Done);
+    }
+
+    /// Reports carry no sequence, so a late one must not reopen a failed
+    /// task or move one `task done` ended anywhere but closed.
+    #[tokio::test]
+    async fn a_late_report_leaves_failed_and_ended_tasks_as_they_are() {
+        let (d, _tmp) = pull_daemon(2).await;
+        let failed = queued(&d, "f", Some("laptop")).await;
+        let ended = queued(&d, "e", Some("laptop")).await;
+        claim(&d, 2, false).await;
+        d.handle(report("laptop", &failed, TaskState::Failed, Some("boom")))
+            .await;
+        for late in [TaskState::Running, TaskState::Blocked, TaskState::Done] {
+            d.handle(report("laptop", &failed, late, None)).await;
+            assert_eq!(state_of(&d, &failed), TaskState::Failed, "{late}");
+        }
+        d.handle(IpcRequest::TaskDone {
+            id: ended.id,
+            summary: None,
+        })
+        .await;
+        for late in [TaskState::Failed, TaskState::Stale, TaskState::Running] {
+            d.handle(report("laptop", &ended, late, None)).await;
+            assert_eq!(state_of(&d, &ended), TaskState::Done, "{late}");
+        }
+        d.handle(report("laptop", &ended, TaskState::Closed, None))
+            .await;
+        assert_eq!(state_of(&d, &ended), TaskState::Closed);
+    }
+
+    /// `pull = true` is a way to reach a machine, like `ssh`, `local` and
+    /// `command`: exactly one of them.
+    #[test]
+    fn a_pull_machine_has_no_other_way_in() {
+        let f: Flock = toml::from_str("[[machine]]\nname = \"laptop\"\npull = true\n").unwrap();
+        f.validate().unwrap();
+        assert!(f.machines[0].pull);
+        let f: Flock =
+            toml::from_str("[[machine]]\nname = \"laptop\"\npull = true\nssh = \"user@pi-1\"\n")
+                .unwrap();
+        assert_eq!(
+            f.validate().unwrap_err(),
+            "machine laptop: set exactly one of local, ssh, command, pull"
+        );
     }
 
     /// `JobSubmit` queues another machine's items as this head's own job
@@ -3337,6 +5168,8 @@ mod tests {
         let mut events = d.subscribe();
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "hi".into(),
@@ -3388,6 +5221,8 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
         let IpcResponse::Task(first) = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "1".into(),
@@ -3403,6 +5238,8 @@ mod tests {
         assert_eq!(first.state, TaskState::Running);
         let IpcResponse::Task(second) = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "2".into(),
@@ -3437,6 +5274,8 @@ mod tests {
 
     fn run_at(prompt: &str, priority: Option<Priority>) -> IpcRequest {
         IpcRequest::Run {
+            preempt: false,
+            summary: None,
             prompt: prompt.into(),
             spec: spec(),
             flock: None,
@@ -3469,7 +5308,11 @@ mod tests {
         assert_eq!(high.priority, Priority::High);
         assert_eq!(high.priority_from.as_deref(), Some("task run"));
 
-        let set = |id: i64, priority: Priority| IpcRequest::TaskPriority { id, priority };
+        let set = |id: i64, priority: Priority| IpcRequest::TaskPriority {
+            preempt: false,
+            id,
+            priority,
+        };
         let raised = task(d.handle(set(low.id, Priority::Critical)).await);
         assert_eq!(raised.priority, Priority::Critical);
         assert_eq!(raised.priority_from.as_deref(), Some("task priority"));
@@ -3502,8 +5345,8 @@ mod tests {
         assert_eq!(state(normal.id), TaskState::Queued);
     }
 
-    /// A task's level comes from `--priority`, else the machine it is
-    /// pinned to, else its flock, else `[defaults]`; an unpinned task never
+    /// A task's level comes from `--priority`, else its flock, else the
+    /// machine it is pinned to, else `[defaults]`; an unpinned task never
     /// takes a machine's. A job's comes from its template, and an empty
     /// value falls through; a value that is not a level is the item's error.
     #[tokio::test]
@@ -3514,21 +5357,36 @@ mod tests {
         urgent.priority = Some(Priority::Critical);
         let mut plain = machine("b", 4);
         plain.flock = Some("work".into());
+        let mut loud = machine("c", 4);
+        loud.flock = Some("play".into());
+        loud.priority = Some(Priority::Critical);
         let flock = Flock {
-            flocks: vec![FlockEntry {
-                name: "work".into(),
-                default: true,
-                priority: Some(Priority::High),
-                ..Default::default()
-            }],
-            machines: vec![urgent, plain],
+            flocks: vec![
+                FlockEntry {
+                    name: "work".into(),
+                    default: true,
+                    priority: Some(Priority::High),
+                    ..Default::default()
+                },
+                FlockEntry {
+                    name: "play".into(),
+                    ..Default::default()
+                },
+            ],
+            machines: vec![urgent, plain, loud],
         };
         let (d, _tmp) = daemon_with_flock(
             flock,
-            &[("a", 4, FakeHerdr::new()), ("b", 4, FakeHerdr::new())],
+            &[
+                ("a", 4, FakeHerdr::new()),
+                ("b", 4, FakeHerdr::new()),
+                ("c", 4, FakeHerdr::new()),
+            ],
         )
         .await;
         let run = |machine: Option<&str>, priority: Option<Priority>| IpcRequest::Run {
+            preempt: false,
+            summary: None,
             prompt: "x".into(),
             spec: DispatchSpec {
                 machine: machine.map(Into::into),
@@ -3544,9 +5402,15 @@ mod tests {
             IpcResponse::Task(t) => (t.priority, t.priority_from.unwrap_or_default()),
             other => panic!("{other:?}"),
         };
+        // The flock before the machine it is pinned to.
         assert_eq!(
             level(d.handle(run(Some("a"), None)).await),
-            (Priority::Critical, "machine a".into())
+            (Priority::High, "flock work".into())
+        );
+        // A flock that sets none leaves it to the machine.
+        assert_eq!(
+            level(d.handle(run(Some("c"), None)).await),
+            (Priority::Critical, "machine c".into())
         );
         assert_eq!(
             level(d.handle(run(Some("a"), Some(Priority::Low))).await),
@@ -3595,6 +5459,246 @@ mod tests {
         assert!(format!("{err:#}").contains("unknown_priority"), "{err:#}");
     }
 
+    /// A flock's timeout and place reach its tasks that set none, run or
+    /// job, and describe says so; `--timeout` and `--place` win.
+    #[tokio::test]
+    async fn a_flocks_timeout_and_place_reach_its_tasks() {
+        use crate::config::flock::FlockEntry;
+        use crate::task::Place;
+        let mut pi = machine("pi", 4);
+        pi.flock = Some("work".into());
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "work".into(),
+                default: true,
+                timeout: Some("30m".into()),
+                place: Some(Place::Own),
+                ..Default::default()
+            }],
+            machines: vec![pi],
+        };
+        let (d, _tmp) = daemon_with_flock(flock, &[("pi", 4, FakeHerdr::new())]).await;
+        let run = |ask: AgentChoice| IpcRequest::Run {
+            preempt: false,
+            summary: None,
+            prompt: "x".into(),
+            spec: spec(),
+            flock: None,
+            agent: Some(ask),
+            priority: None,
+            role: TaskRole::Agent,
+            description: None,
+        };
+        let IpcResponse::Task(t) = d.handle(run(AgentChoice::default())).await else {
+            panic!()
+        };
+        assert_eq!((t.spec.timeout_secs, &t.spec.place), (1800, &Place::Own));
+        let text = crate::cli::task_detail(&t);
+        assert!(
+            text.contains("timeout:    1800s (from flock work)"),
+            "{text}"
+        );
+        assert!(text.contains("place:      own (from flock work)"), "{text}");
+        let asked = AgentChoice {
+            timeout_secs: Some(60),
+            place: Some(Place::Pastor),
+            ..Default::default()
+        };
+        let IpcResponse::Task(t) = d.handle(run(asked)).await else {
+            panic!()
+        };
+        assert_eq!((t.spec.timeout_secs, &t.spec.place), (60, &Place::Pastor));
+        let text = crate::cli::task_detail(&t);
+        assert!(text.contains("timeout:    60s (from task run)"), "{text}");
+
+        let config = test_config();
+        let job = |dispatch: &str| {
+            crate::config::job::Job::parse(
+                &format!("every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{dispatch}"),
+                "j",
+                &config.defaults,
+                &crate::connector::Builtins,
+            )
+            .unwrap()
+        };
+        let queue = |job: crate::config::job::Job, key: &str| {
+            let fleet = d.fleet().clone();
+            let item = serde_json::json!({ "key": key });
+            async move {
+                fleet
+                    .queue_job_task(&job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                    .await
+                    .unwrap()
+            }
+        };
+        let t = queue(job(""), "a").await;
+        assert_eq!((t.spec.timeout_secs, &t.spec.place), (1800, &Place::Own));
+        let t = queue(job("timeout = \"5m\"\nplace = \"repo\"\n"), "b").await;
+        assert_eq!((t.spec.timeout_secs, &t.spec.place), (300, &Place::Repo));
+        let text = crate::cli::task_detail(&t);
+        assert!(text.contains("timeout:    300s (from job j)"), "{text}");
+    }
+
+    /// A task's workspace label comes from `--label`, else its job's, else
+    /// its flock's, else `[defaults]`, settled when it is queued; dispatch
+    /// renders it on the machine, and the agent stays `t-N`. A retry keeps
+    /// the template and where it came from.
+    #[tokio::test]
+    async fn a_tasks_label_comes_from_its_layers() {
+        use crate::config::flock::FlockEntry;
+        let mut a = machine("a", 4);
+        a.flock = Some("work".into());
+        let mut b = machine("b", 4);
+        b.flock = Some("bare".into());
+        let flock = Flock {
+            flocks: vec![
+                FlockEntry {
+                    name: "work".into(),
+                    default: true,
+                    label: Some("w/{{ task.id }}".into()),
+                    ..Default::default()
+                },
+                FlockEntry {
+                    name: "bare".into(),
+                    ..Default::default()
+                },
+            ],
+            machines: vec![a, b],
+        };
+        let fake_a = FakeHerdr::new();
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("a", 4, fake_a.clone()), ("b", 4, FakeHerdr::new())],
+        )
+        .await;
+        let mut config = test_config();
+        config.defaults.label = Some("{{ machine }}/{{ task.id }}".into());
+        d.fleet().set_config(&config);
+        let run = |label: Option<&str>, flock: &str| IpcRequest::Run {
+            prompt: "x".into(),
+            spec: DispatchSpec {
+                label: crate::task::WorkspaceLabel {
+                    template: label.map(Into::into),
+                    ..Default::default()
+                },
+                ..spec()
+            },
+            flock: Some(flock.into()),
+            agent: None,
+            priority: None,
+            role: TaskRole::Agent,
+            description: None,
+            preempt: false,
+            summary: None,
+        };
+        let task = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let label = |t: &Task| {
+            (
+                t.spec.label.template.clone().unwrap_or_default(),
+                t.spec.label.from.clone().unwrap_or_default(),
+                t.spec.label.name.clone().unwrap_or_default(),
+            )
+        };
+        let asked = task(d.handle(run(Some("mine-{{ task.id }}"), "work")).await);
+        let id = asked.display_id();
+        assert_eq!(
+            label(&asked),
+            (
+                "mine-{{ task.id }}".into(),
+                "task run".into(),
+                format!("mine-{id}")
+            )
+        );
+        assert_eq!(asked.agent_name.as_deref(), Some(id.as_str()));
+        let from_flock = task(d.handle(run(None, "work")).await);
+        assert_eq!(
+            label(&from_flock),
+            (
+                "w/{{ task.id }}".into(),
+                "flock work".into(),
+                format!("w/{}", from_flock.display_id())
+            )
+        );
+        let from_defaults = task(d.handle(run(None, "bare")).await);
+        assert_eq!(
+            label(&from_defaults),
+            (
+                "{{ machine }}/{{ task.id }}".into(),
+                "defaults".into(),
+                format!("b/{}", from_defaults.display_id())
+            )
+        );
+        let created: Vec<String> = fake_a
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "workspace.create")
+            .map(|r| r.params["label"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            created,
+            vec![
+                format!("mine-{id}"),
+                format!("w/{}", from_flock.display_id())
+            ]
+        );
+
+        let text = |extra: &str| {
+            format!(
+                "every = \"1h\"\n[connector]\nuse = \"clock\"\n[dispatch]\nprompt = \"p\"\n{extra}"
+            )
+        };
+        let parse = |extra: &str| {
+            crate::config::job::Job::parse(
+                &text(extra),
+                "j",
+                &config.defaults,
+                &crate::connector::Builtins,
+            )
+            .unwrap()
+        };
+        for (job, want) in [
+            (
+                parse("label = \"{{ job }}/{{ item.key }}\"\n"),
+                ("{{ job }}/{{ item.key }}", "job j"),
+            ),
+            (parse(""), ("w/{{ task.id }}", "flock work")),
+        ] {
+            let item = serde_json::json!({"key": want.1.replace(' ', "-")});
+            let t = d
+                .fleet()
+                .queue_job_task(&job, &item, |_| Ok(("p".into(), job.spec.clone())))
+                .await
+                .unwrap();
+            assert_eq!(t.spec.label.template.as_deref(), Some(want.0));
+            assert_eq!(t.spec.label.from.as_deref(), Some(want.1));
+        }
+
+        let mut failed = asked.clone();
+        failed.state = TaskState::Failed;
+        failed.finished_at = Some(chrono::Utc::now());
+        d.store.update_task(&mut failed).unwrap();
+        let copy = task(
+            d.handle(IpcRequest::TaskRetry {
+                id: failed.id,
+                place: None,
+            })
+            .await,
+        );
+        assert_eq!(
+            copy.spec.label.template.as_deref(),
+            Some("mine-{{ task.id }}")
+        );
+        assert_eq!(copy.spec.label.from.as_deref(), Some("task run"));
+        assert_eq!(
+            copy.spec.label.name,
+            Some(format!("mine-{}", copy.display_id())),
+            "rendered again for the copy"
+        );
+    }
+
     /// A retry keeps the level of the task it copies, and where it came
     /// from.
     #[tokio::test]
@@ -3625,6 +5729,8 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -3654,6 +5760,8 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new()), ("b", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -3709,6 +5817,8 @@ mod tests {
 
     fn run_in(flock: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -3736,6 +5846,8 @@ mod tests {
         )
         .await;
         let run = |flock: &str, agent: Option<AgentChoice>| IpcRequest::Run {
+            preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -3765,6 +5877,7 @@ mod tests {
             deny: vec![],
             model: None,
             profile: None,
+            ..Default::default()
         });
         assert_eq!(
             queued(d.handle(run("work", own)).await),
@@ -3825,6 +5938,8 @@ mod tests {
         )
         .await;
         let run = |agent: Option<&str>| IpcRequest::Run {
+            preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -3894,6 +6009,8 @@ mod tests {
         std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -3970,6 +6087,8 @@ mod tests {
 
     fn run_model(model: Option<&str>, agent: Option<&str>, machine: Option<&str>) -> IpcRequest {
         IpcRequest::Run {
+            preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -4216,6 +6335,67 @@ mod tests {
         }
     }
 
+    /// A flock that names an agent sets its kind, and each machine runs
+    /// its own agent of that kind: an unpinned task skips a machine that
+    /// has none and waits, saying why, when no machine is left; pinned to
+    /// such a machine, it is refused.
+    #[tokio::test]
+    async fn a_flocks_agent_kind_runs_on_the_machines_agent_of_that_kind() {
+        use crate::config::flock::FlockEntry;
+        let own = |name: &str, extra: crate::config::KindAgents| MachineConfig {
+            agent: Some("claude-personal".into()),
+            agents: extra,
+            ..machine(name, 1)
+        };
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "personal".into(),
+                default: true,
+                agent: Some("codex".into()),
+                ..Default::default()
+            }],
+            machines: vec![
+                own("pi", Default::default()),
+                own(
+                    "cx",
+                    [("codex".to_string(), "codex-work".to_string())].into(),
+                ),
+            ],
+        };
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("pi", 1, FakeHerdr::new()), ("cx", 1, FakeHerdr::new())],
+        )
+        .await;
+        let mut config = models_config();
+        config.agents.0.insert(
+            "codex-work".into(),
+            crate::config::AgentDef {
+                kind: Some("codex".into()),
+                ..Default::default()
+            },
+        );
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        d.fleet().set_config(&config);
+        let IpcResponse::Task(t) = d.handle(run_model(None, None, None)).await else {
+            panic!()
+        };
+        assert_eq!(
+            (t.machine.as_deref(), t.spec.agent.as_str()),
+            (Some("cx"), "codex-work")
+        );
+        // cx is full, and pi has no codex agent.
+        let IpcResponse::Task(t) = d.handle(run_model(None, None, None)).await else {
+            panic!()
+        };
+        assert_eq!(t.state, TaskState::Queued);
+        let err = t.error.unwrap_or_default();
+        assert!(err.starts_with("waiting for a machine"), "{err}");
+        assert!(err.contains("machine pi has none"), "{err}");
+        let resp = d.handle(run_model(None, None, Some("pi"))).await;
+        assert_eq!(error_code(resp), "agent_kind_missing");
+    }
+
     /// A retry settles its model again, so one since dropped from
     /// `[models]` is refused.
     #[tokio::test]
@@ -4278,6 +6458,8 @@ mod tests {
 
     fn run_profile(profile: Option<&str>, machine: Option<&str>) -> IpcRequest {
         let IpcRequest::Run {
+            preempt: false,
+            summary: _,
             prompt,
             spec,
             flock,
@@ -4290,6 +6472,8 @@ mod tests {
             unreachable!()
         };
         IpcRequest::Run {
+            preempt: false,
+            summary: None,
             prompt,
             spec,
             flock,
@@ -4373,6 +6557,8 @@ mod tests {
             "unknown_profile"
         );
         let IpcRequest::Run {
+            preempt: false,
+            summary: _,
             prompt,
             spec,
             flock,
@@ -4385,6 +6571,8 @@ mod tests {
             unreachable!()
         };
         let conflict = IpcRequest::Run {
+            preempt: false,
+            summary: None,
             prompt,
             spec,
             flock,
@@ -4517,6 +6705,8 @@ mod tests {
         // Occupy pi's one slot so the new task must wait.
         let IpcResponse::Task(busy) = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 prompt: "busy".into(),
                 spec: spec(),
                 flock: None,
@@ -4715,6 +6905,8 @@ mod tests {
         )
         .await;
         let run = || IpcRequest::Run {
+            preempt: false,
+            summary: None,
             role: Default::default(),
             description: None,
             prompt: "x".into(),
@@ -4907,6 +7099,7 @@ mod tests {
                 description: None,
                 name: "spare".into(),
                 default: false,
+                machines: vec![],
             })
             .await,
         );
@@ -4953,6 +7146,42 @@ mod tests {
         assert_eq!(fleet_flock_of(&d, "h").as_deref(), Some("spare"));
 
         let said = text(
+            d.handle(IpcRequest::FlockJoin {
+                flock: "work".into(),
+                machine: "h".into(),
+                max: Some(1),
+            })
+            .await,
+        );
+        assert!(
+            said.starts_with("h is in flock work with 1; its flocks: work:1,spare:2; "),
+            "{said}"
+        );
+        assert!(said.contains("picked it up"), "{said}");
+        assert_eq!(
+            d.fleet().flock().machine_flocks("h").unwrap(),
+            [
+                ("work", Some(crate::config::flock::FlockNumber::plain(1))),
+                ("spare", Some(crate::config::flock::FlockNumber::plain(2)))
+            ]
+        );
+        let said = text(
+            d.handle(IpcRequest::FlockLeave {
+                flock: "work".into(),
+                machine: "h".into(),
+            })
+            .await,
+        );
+        assert!(
+            said.starts_with("h left flock work; its flocks: spare:2"),
+            "{said}"
+        );
+        assert_eq!(
+            on_disk().machine_flocks("h").unwrap(),
+            [("spare", Some(crate::config::flock::FlockNumber::plain(2)))]
+        );
+
+        let said = text(
             d.handle(IpcRequest::MachineRemove { name: "w".into() })
                 .await,
         );
@@ -4968,8 +7197,24 @@ mod tests {
                     description: None,
                     name: "spare".into(),
                     default: false,
+                    machines: vec![],
                 },
                 "flock_exists",
+            ),
+            (
+                IpcRequest::FlockJoin {
+                    flock: "work".into(),
+                    machine: "nope".into(),
+                    max: None,
+                },
+                "unknown_machine",
+            ),
+            (
+                IpcRequest::FlockLeave {
+                    flock: "work".into(),
+                    machine: "h".into(),
+                },
+                "not_in_flock",
             ),
             (
                 IpcRequest::FlockSetDefault {
@@ -5034,6 +7279,7 @@ mod tests {
                 description: None,
                 name: "work".into(),
                 default: true,
+                machines: vec![],
             })
             .await
         else {
@@ -5282,7 +7528,7 @@ mod tests {
         assert!(diff.is_empty(), "{diff:?}");
         let views = d.fleet().views();
         let h = views.iter().find(|v| v.name == "h").unwrap();
-        assert_eq!(h.flock, "work");
+        assert!(h.in_flock("work") && !h.in_flock("home"), "{h:?}");
         let resp = d.handle(run_in(Some("home"), None)).await;
         let IpcResponse::Task(t) = resp else {
             panic!("{resp:?}")
@@ -5305,6 +7551,8 @@ mod tests {
         assert!(diff.is_empty(), "{diff:?}");
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -5331,6 +7579,8 @@ mod tests {
         let (d, _tmp, _unwedge) = daemon_with_b_shutting_down(false).await;
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -5405,6 +7655,8 @@ mod tests {
         let resp = crate::ipc::request(
             &socket,
             &IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "hi".into(),
@@ -5461,6 +7713,8 @@ mod tests {
 
     fn run_hi_as(role: TaskRole) -> IpcRequest {
         IpcRequest::Run {
+            preempt: false,
+            summary: None,
             role,
             description: None,
             prompt: "hi".into(),
@@ -5517,13 +7771,29 @@ mod tests {
         let store = d.store.clone();
         let socket = serving(d).await;
         let own = mine.display_id();
-        let resp = ask_as(&socket, &IpcRequest::TaskDone { id: theirs.id }, &own).await;
+        let resp = ask_as(
+            &socket,
+            &IpcRequest::TaskDone {
+                id: theirs.id,
+                summary: None,
+            },
+            &own,
+        )
+        .await;
         assert!(
             matches!(&resp, IpcResponse::Error { code, .. } if code == "agent_refused"),
             "{resp:?}"
         );
         assert!(!store.get_task(theirs.id).unwrap().unwrap().ended);
-        let resp = ask_as(&socket, &IpcRequest::TaskDone { id: mine.id }, &own).await;
+        let resp = ask_as(
+            &socket,
+            &IpcRequest::TaskDone {
+                id: mine.id,
+                summary: None,
+            },
+            &own,
+        )
+        .await;
         let IpcResponse::Task(t) = resp else {
             panic!("{resp:?}")
         };
@@ -5539,11 +7809,125 @@ mod tests {
         );
     }
 
+    /// `req`, a `Run`, with `task run --summary mode`.
+    fn with_summary(mut req: IpcRequest, mode: crate::task::SummaryMode) -> IpcRequest {
+        if let IpcRequest::Run { summary, .. } = &mut req {
+            *summary = Some(mode);
+        }
+        req
+    }
+
+    /// A task that requires a summary refuses its own agent's bare `task
+    /// done`, and takes a person's, whose round says it was ended by hand.
+    #[tokio::test]
+    async fn a_required_summary_holds_the_agent_not_a_person() {
+        let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let run = || with_summary(run_hi(), crate::task::SummaryMode::Require);
+        let IpcResponse::Task(mine) = d.handle(run()).await else {
+            panic!("run failed")
+        };
+        let IpcResponse::Task(other) = d.handle(run()).await else {
+            panic!("run failed")
+        };
+        assert_eq!(mine.spec.summary, crate::task::SummaryMode::Require);
+        let store = d.store.clone();
+        let socket = serving(d).await;
+        let bare = |id| IpcRequest::TaskDone { id, summary: None };
+        let resp = ask_as(&socket, &bare(mine.id), &mine.display_id()).await;
+        assert_eq!(
+            code_of(&resp),
+            Some(crate::task::SUMMARY_REQUIRED),
+            "{resp:?}"
+        );
+        assert!(!store.get_task(mine.id).unwrap().unwrap().ended);
+        let with_one = IpcRequest::TaskDone {
+            id: mine.id,
+            summary: Some("done\npushed".into()),
+        };
+        let resp = ask_as(&socket, &with_one, &mine.display_id()).await;
+        assert!(
+            matches!(resp, IpcResponse::Task(ref t) if t.ended),
+            "{resp:?}"
+        );
+        // A person, with no task of their own.
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let line = crate::ipc::request_line(&bare(other.id), None).unwrap();
+        w.write_all(line.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        BufReader::new(r).read_line(&mut reply).await.unwrap();
+        let resp: IpcResponse = serde_json::from_str(reply.trim()).unwrap();
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(t.ended);
+        assert_eq!(t.summary.unwrap().text, crate::task::ENDED_BY_HAND);
+    }
+
+    /// A task's `summary` comes from `task run --summary`, else its job's,
+    /// else its flock's, else `[defaults]` (unset here: `ask`), and is
+    /// stored on the task.
+    #[tokio::test]
+    async fn the_summary_setting_is_settled_when_a_task_is_queued() {
+        use crate::task::SummaryMode;
+        let mut flock = home_and_work();
+        flock.flocks.push(crate::config::flock::FlockEntry {
+            name: "quiet".into(),
+            summary: Some(SummaryMode::Off),
+            ..Default::default()
+        });
+        let (d, _tmp) = daemon_with_flock(
+            flock,
+            &[("h", 2, FakeHerdr::new()), ("w", 2, FakeHerdr::new())],
+        )
+        .await;
+        let settled = |resp: IpcResponse| match resp {
+            IpcResponse::Task(t) => t.spec.summary,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            settled(d.handle(run_in(None, None)).await),
+            SummaryMode::Ask
+        );
+        assert_eq!(
+            settled(d.handle(run_in(Some("quiet"), None)).await),
+            SummaryMode::Off
+        );
+        let asked = with_summary(run_in(Some("quiet"), None), SummaryMode::Require);
+        assert_eq!(settled(d.handle(asked).await), SummaryMode::Require);
+        let submit = |job: &str, dispatch: serde_json::Value| IpcRequest::JobSubmit {
+            job: job.into(),
+            dispatch,
+            prompt: "p".into(),
+            items: vec![serde_json::json!({"key": "k"})],
+        };
+        let job_task = |resp: IpcResponse| match resp {
+            IpcResponse::JobSubmitted { tasks, .. } => tasks[0].spec.summary,
+            other => panic!("{other:?}"),
+        };
+        let from_flock = d
+            .handle(submit("j1", serde_json::json!({"flock": "quiet"})))
+            .await;
+        assert_eq!(job_task(from_flock), SummaryMode::Off);
+        let from_job = d
+            .handle(submit(
+                "j2",
+                serde_json::json!({"flock": "quiet", "summary": "require"}),
+            ))
+            .await;
+        assert_eq!(job_task(from_job), SummaryMode::Require);
+    }
+
     /// A task with no pane has nothing to end.
     #[tokio::test]
     async fn ending_a_task_with_no_pane_is_refused() {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
-        let resp = d.handle(IpcRequest::TaskDone { id: 42 }).await;
+        let resp = d
+            .handle(IpcRequest::TaskDone {
+                id: 42,
+                summary: None,
+            })
+            .await;
         assert!(
             matches!(&resp, IpcResponse::Error { code, .. } if code == "task_not_found"),
             "{resp:?}"
@@ -5556,7 +7940,12 @@ mod tests {
             remove_worktree: false,
         })
         .await;
-        let resp = d.handle(IpcRequest::TaskDone { id: t.id }).await;
+        let resp = d
+            .handle(IpcRequest::TaskDone {
+                id: t.id,
+                summary: None,
+            })
+            .await;
         assert!(
             matches!(&resp, IpcResponse::Error { code, .. } if code == "task_not_live"),
             "{resp:?}"
@@ -5592,10 +7981,11 @@ mod tests {
         file
     }
 
-    /// An orchestrator may run, retry and send to tasks and disable a job,
-    /// all from its own pane with `agents_change_fleet` off.
+    /// An orchestrator may run, retry, send to and close tasks and enable
+    /// and disable a job, all from its own pane with `agents_change_fleet`
+    /// off.
     #[tokio::test]
-    async fn an_orchestrator_may_run_retry_send_and_disable() {
+    async fn an_orchestrator_may_run_retry_send_close_enable_and_disable() {
         let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         assert!(!d.fleet().agents_change_fleet());
         let me = orchestrator(&d).await;
@@ -5651,6 +8041,179 @@ mod tests {
                 .unwrap()
                 .contains("enabled = false")
         );
+        let resp = d
+            .handle_from(
+                IpcRequest::JobSetEnabled {
+                    name: "clock".into(),
+                    enabled: true,
+                },
+                Some(own),
+            )
+            .await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("enabled = true")
+        );
+
+        let resp = d
+            .handle_from(
+                IpcRequest::TaskClose {
+                    id: retry.id,
+                    remove_worktree: false,
+                },
+                Some(own),
+            )
+            .await;
+        let IpcResponse::Task(closed) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(closed.state, TaskState::Closed);
+    }
+
+    /// An orchestrator file `name` in the head's orchestrators directory.
+    fn write_orchestrator(tmp: &tempfile::TempDir, name: &str) -> Paths {
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.orchestrators_dir()).unwrap();
+        std::fs::write(
+            paths.orchestrators_dir().join(format!("{name}.toml")),
+            "kind = \"scheduled\"\nevery = \"1h\"\npre = [\"./pre.sh\"]\nprompt = \"p\"\n",
+        )
+        .unwrap();
+        paths
+    }
+
+    fn script(name: &str) -> crate::ipc::Caller {
+        crate::ipc::Caller {
+            task: None,
+            orchestrator: Some(name.into()),
+        }
+    }
+
+    /// A pre or post script (`PASTOR_ORCHESTRATOR`) gets the orchestrator
+    /// role's table: `task run` passes, `machine add` and making an
+    /// orchestrator do not, and a name the head has no file for is refused
+    /// every change.
+    #[tokio::test]
+    async fn an_orchestrators_script_gets_the_roles_table() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        write_orchestrator(&tmp, "merge");
+        let resp = d.handle_as(run_hi(), &script("merge")).await;
+        let IpcResponse::Task(t) = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(t.role, TaskRole::Agent);
+        let add = IpcRequest::MachineAdd {
+            machine: machine("x", 1),
+        };
+        let resp = d.handle_as(add, &script("merge")).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "agent_refused");
+        assert!(message.contains("orchestrator merge"), "{message}");
+        assert!(d.fleet().flock().get("x").is_none());
+        let resp = d
+            .handle_as(run_hi_as(TaskRole::Orchestrator), &script("merge"))
+            .await;
+        assert_eq!(code_of(&resp), Some("role_refused"), "{resp:?}");
+        let resp = d.handle_as(run_hi(), &script("ghost")).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "agent_refused");
+        assert!(message.contains("ghost"), "{message}");
+        let list = IpcRequest::List {
+            filter: TaskFilter::default(),
+        };
+        assert!(matches!(
+            d.handle_as(list, &script("ghost")).await,
+            IpcResponse::Tasks(_)
+        ));
+    }
+
+    /// A request that names both a task and an orchestrator is the task's:
+    /// a plain agent that sets `PASTOR_ORCHESTRATOR` gains nothing.
+    #[tokio::test]
+    async fn a_caller_with_both_variables_gets_the_tasks_rights() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        write_orchestrator(&tmp, "merge");
+        let IpcResponse::Task(agent) = d.handle(run_hi()).await else {
+            panic!("run failed")
+        };
+        let both = crate::ipc::Caller {
+            task: Some(agent.display_id()),
+            orchestrator: Some("merge".into()),
+        };
+        let resp = d.handle_as(run_hi(), &both).await;
+        let IpcResponse::Error { code, message } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(code, "agent_refused");
+        assert!(message.contains("is an agent pastor started"), "{message}");
+        let note = IpcRequest::OrchestratorNote {
+            name: Some("merge".into()),
+            text: "x".into(),
+        };
+        assert_eq!(
+            code_of(&d.handle_as(note, &both).await),
+            Some("agent_refused")
+        );
+    }
+
+    /// The handover note: a script keeps its own orchestrator's only, the
+    /// agent an orchestrator file started keeps that one's, a hand-started
+    /// orchestrator has none, and a person names it.
+    #[tokio::test]
+    async fn each_orchestrator_keeps_only_its_own_note() {
+        let (d, tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
+        let paths = write_orchestrator(&tmp, "merge");
+        write_orchestrator(&tmp, "night");
+        let note = |name: Option<&str>, text: &str| IpcRequest::OrchestratorNote {
+            name: name.map(str::to_string),
+            text: text.into(),
+        };
+        let resp = d.handle_as(note(None, "from pre"), &script("merge")).await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            crate::orchestrator::read_note(&paths, "merge").as_deref(),
+            Some("from pre")
+        );
+        let resp = d
+            .handle_as(note(Some("night"), "x"), &script("merge"))
+            .await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+
+        let me = orchestrator(&d).await;
+        let resp = d.handle_from(note(None, "x"), Some(&me)).await;
+        assert_eq!(code_of(&resp), Some("not_an_orchestrator"), "{resp:?}");
+        // As if merge's last run had started it.
+        let id = crate::task::parse_task_id(&me).unwrap();
+        std::fs::create_dir_all(paths.orchestrator_state_dir("merge")).unwrap();
+        std::fs::write(
+            paths.orchestrator_state_dir("merge").join("state.json"),
+            serde_json::json!({ "task": id }).to_string(),
+        )
+        .unwrap();
+        d.handle(IpcRequest::OrchestratorList).await;
+        let resp = d.handle_from(note(None, "from the agent"), Some(&me)).await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            crate::orchestrator::read_note(&paths, "merge").as_deref(),
+            Some("from the agent")
+        );
+        let resp = d.handle_from(note(Some("night"), "x"), Some(&me)).await;
+        assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+
+        let resp = d.handle(note(None, "x")).await;
+        assert!(code_of(&resp).is_some(), "{resp:?}");
+        let resp = d.handle(note(Some("night"), "by hand")).await;
+        assert!(matches!(resp, IpcResponse::Text(_)), "{resp:?}");
+        assert_eq!(
+            crate::orchestrator::read_note(&paths, "night").as_deref(),
+            Some("by hand")
+        );
     }
 
     /// Everything else that changes the fleet is refused an orchestrator,
@@ -5672,6 +8235,7 @@ mod tests {
             },
             IpcRequest::MachineAdd {
                 machine: crate::config::flock::MachineConfig {
+                    pull: false,
                     name: "m".into(),
                     local: true,
                     ssh: None,
@@ -5691,13 +8255,9 @@ mod tests {
                     description: None,
                 },
             },
-            IpcRequest::TaskClose {
-                id: worker.id,
-                remove_worktree: false,
-            },
-            IpcRequest::JobSetEnabled {
-                name: "clock".into(),
-                enabled: true,
+            IpcRequest::TaskPrune {
+                states: vec![TaskState::Done],
+                older_than_secs: 0,
             },
             IpcRequest::JobRun {
                 name: "clock".into(),
@@ -5722,16 +8282,32 @@ mod tests {
         let agent = worker.display_id();
         let resp = d.handle_from(run_hi(), Some(&agent)).await;
         assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        for enabled in [false, true] {
+            let resp = d
+                .handle_from(
+                    IpcRequest::JobSetEnabled {
+                        name: "clock".into(),
+                        enabled,
+                    },
+                    Some(&agent),
+                )
+                .await;
+            assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        }
         let resp = d
             .handle_from(
-                IpcRequest::JobSetEnabled {
-                    name: "clock".into(),
-                    enabled: false,
+                IpcRequest::TaskClose {
+                    id: worker.id,
+                    remove_worktree: false,
                 },
                 Some(&agent),
             )
             .await;
         assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
+        assert_eq!(
+            d.store.get_task(worker.id).unwrap().unwrap().state,
+            worker.state
+        );
         // A task the head does not know is a plain agent.
         let resp = d.handle_from(run_hi(), Some("t-999")).await;
         assert_eq!(code_of(&resp), Some("agent_refused"), "{resp:?}");
@@ -6129,6 +8705,162 @@ mod tests {
         assert_eq!(fake.agents().len(), 3);
     }
 
+    /// One machine in two flocks: a flock at its number there waits with a
+    /// note saying so, the task behind it from the other flock goes, and
+    /// the machine's status carries both flocks with their live tasks.
+    #[tokio::test]
+    async fn dispatch_keeps_a_flock_to_its_number_on_a_machine() {
+        let fake = FakeHerdr::new();
+        let flock: Flock = toml::from_str(
+            "[[flock]]\nname = \"home\"\ndefault = true\nmachines = { desk = 3 }\n\n\
+             [[flock]]\nname = \"work\"\nmachines = { desk = 1 }\n\n\
+             [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 3\njob_slots = 1\nburst = 1\n",
+        )
+        .unwrap();
+        flock.validate().unwrap();
+        let (d, _tmp) = daemon_with_flock(flock, &[("desk", 3, fake.clone())]).await;
+        let insert = |job: &str, flock: &str| {
+            d.store()
+                .insert_task(NewTask {
+                    job: job.into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                    flock: flock.into(),
+                    description: None,
+                })
+                .unwrap()
+        };
+        let first = insert("run", "work");
+        let second = insert("nightly", "work");
+        let home = insert("run", "home");
+        let fleet = d.fleet();
+        fleet.dispatch_queued().await;
+        let task = |id: i64| d.store().get_task(id).unwrap().unwrap();
+        assert_eq!(task(first.id).state, TaskState::Running);
+        assert_eq!(
+            task(second.id).state,
+            TaskState::Queued,
+            "no job slot past the number"
+        );
+        assert_eq!(
+            task(second.id).error.as_deref(),
+            Some("waiting for a machine: flock work is at 1 of 1 on desk")
+        );
+        assert_eq!(
+            task(home.id).state,
+            TaskState::Running,
+            "the next task goes"
+        );
+        let status = fleet
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == "desk")
+            .unwrap();
+        assert_eq!(status.flock.as_deref(), Some("home"));
+        let seats: Vec<(String, Option<u32>, usize)> = status
+            .flocks
+            .iter()
+            .map(|f| (f.name.clone(), f.max, f.live))
+            .collect();
+        assert_eq!(
+            seats,
+            [("home".into(), Some(3), 1), ("work".into(), Some(1), 1)]
+        );
+
+        // The flock's task ends; the waiting one goes and its note clears.
+        fleet
+            .get("desk")
+            .unwrap()
+            .close(first.id, false)
+            .await
+            .unwrap();
+        fleet.dispatch_queued().await;
+        assert_eq!(task(second.id).state, TaskState::Running);
+        assert_eq!(task(second.id).error, None);
+    }
+
+    /// A flock with a share and a max: past its share it waits while a
+    /// flock under its share has a task for the machine, even one behind it
+    /// in the queue, and takes the idle slot once nobody else wants it; at
+    /// its max it waits however idle the machine is.
+    #[tokio::test]
+    async fn dispatch_lets_a_flock_past_its_share_only_into_idle_slots() {
+        let fake = FakeHerdr::new();
+        let flock: Flock = toml::from_str(
+            "[[flock]]\nname = \"pastor\"\ndefault = true\nmachines = { desk = { share = 1, max = 2 } }\n\n\
+             [[flock]]\nname = \"life\"\nmachines = { desk = 2 }\n\n\
+             [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 4\n",
+        )
+        .unwrap();
+        flock.validate().unwrap();
+        let (d, _tmp) = daemon_with_flock(flock, &[("desk", 4, fake.clone())]).await;
+        let insert = |flock: &str| {
+            d.store()
+                .insert_task(NewTask {
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                    flock: flock.into(),
+                    description: None,
+                })
+                .unwrap()
+        };
+        let task = |id: i64| d.store().get_task(id).unwrap().unwrap();
+        let fleet = d.fleet();
+
+        // Two flocks want the same slot: the one under its share goes first.
+        let first = insert("pastor");
+        let second = insert("pastor");
+        let life = insert("life");
+        fleet.dispatch_queued().await;
+        assert_eq!(task(first.id).state, TaskState::Running, "under its share");
+        assert_eq!(task(life.id).state, TaskState::Running, "under its share");
+        assert_eq!(task(second.id).state, TaskState::Queued);
+        assert_eq!(
+            task(second.id).error.as_deref(),
+            Some(
+                "waiting for a machine: flock pastor is past its share on desk, at 1 of 1/2, \
+                 while flock life waits under its share"
+            )
+        );
+
+        // Nobody under its share waits: the idle slot is pastor's.
+        fleet.dispatch_queued().await;
+        assert_eq!(task(second.id).state, TaskState::Running, "past its share");
+        assert_eq!(task(second.id).error, None);
+
+        // At its max it waits though the machine has room; life still goes.
+        let third = insert("pastor");
+        let more_life = insert("life");
+        fleet.dispatch_queued().await;
+        assert_eq!(task(third.id).state, TaskState::Queued, "held at its max");
+        assert_eq!(
+            task(third.id).error.as_deref(),
+            Some("waiting for a machine: flock pastor is at 2 of 1/2 on desk")
+        );
+        assert_eq!(task(more_life.id).state, TaskState::Running);
+        let status = fleet
+            .statuses()
+            .into_iter()
+            .find(|s| s.name == "desk")
+            .unwrap();
+        let seats: Vec<(String, Option<u32>, Option<u32>, usize)> = status
+            .flocks
+            .iter()
+            .map(|f| (f.name.clone(), f.share, f.max, f.live))
+            .collect();
+        assert_eq!(
+            seats,
+            [
+                ("pastor".into(), Some(1), Some(2), 2),
+                ("life".into(), Some(2), Some(2), 2)
+            ]
+        );
+        assert_eq!(fake.agents().len(), 4);
+    }
+
     /// `FileGet` and `FilePut` act on the head's own files, named only as
     /// `flock`, `config` or `job:<name>`, and write only a valid edit made
     /// from the file as it is now.
@@ -6421,6 +9153,8 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "hi".into(),
@@ -6557,6 +9291,8 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -6591,6 +9327,8 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
         let IpcResponse::Task(t) = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -6958,6 +9696,8 @@ mod tests {
         let (d, _tmp) = daemon(&[("a", 2, FakeHerdr::new())]).await;
         let resp = d
             .handle(IpcRequest::Run {
+                preempt: false,
+                summary: None,
                 role: Default::default(),
                 description: None,
                 prompt: "x".into(),
@@ -6977,6 +9717,639 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "no row for a refused run"
+        );
+    }
+
+    /// Pausing a low task for a critical one (`Task::pause`), against the
+    /// fake herdr on a one-slot machine with no burst.
+    mod pausing {
+        use super::*;
+        use crate::herdr::ConnectorExt;
+        use serde_json::Value;
+
+        /// A worktree task, so the checkout kept at pause can be followed.
+        fn wt() -> DispatchSpec {
+            DispatchSpec {
+                repo: Some("/srv/app".into()),
+                worktree: true,
+                ..spec()
+            }
+        }
+
+        fn run(prompt: &str, spec: DispatchSpec, priority: Priority, preempt: bool) -> IpcRequest {
+            IpcRequest::Run {
+                prompt: prompt.into(),
+                spec,
+                flock: None,
+                agent: None,
+                priority: Some(priority),
+                role: Default::default(),
+                description: None,
+                preempt,
+                summary: None,
+            }
+        }
+
+        async fn start(d: &Daemon, req: IpcRequest) -> Task {
+            match d.handle(req).await {
+                IpcResponse::Task(t) => t,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        fn get(d: &Daemon, id: i64) -> Task {
+            d.store.get_task(id).unwrap().unwrap()
+        }
+
+        fn started_args(fake: &FakeHerdr, agent: &str) -> Vec<Value> {
+            fake.requests()
+                .iter()
+                .rev()
+                .find(|r| r.method == "agent.start" && r.params["name"] == agent)
+                .map(|r| r.params["args"].as_array().cloned().unwrap_or_default())
+                .unwrap_or_default()
+        }
+
+        /// A critical task with `--preempt` on a full machine pauses the
+        /// low task there and starts in the same pass. The paused task's
+        /// agent is interrupted and its pane closed; its worktree stays.
+        #[tokio::test]
+        async fn a_preempting_critical_task_pauses_the_newest_low_task() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
+            let older = start(&d, run("older", wt(), Priority::Low, false)).await;
+            let low = start(&d, run("low", wt(), Priority::Low, false)).await;
+            assert_eq!(get(&d, low.id).state, TaskState::Running);
+            let checkout = get(&d, low.id).spec.checkout.clone().expect("a checkout");
+            let pane = get(&d, low.id).pane_id.clone().unwrap();
+
+            let crit = start(&d, run("fix prod", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit.state, TaskState::Running, "started in the same pass");
+            assert!(crit.pause.preempt);
+            let paused = get(&d, low.id);
+            assert_eq!(paused.state, TaskState::Paused, "the newest low task");
+            assert_eq!(paused.pause.paused_for, Some(crit.id));
+            assert!(paused.pause.paused_at.is_some());
+            assert_eq!(
+                paused.machine.as_deref(),
+                Some("a"),
+                "pinned to its machine"
+            );
+            assert_eq!((paused.pane_id, paused.workspace_id), (None, None));
+            assert_eq!(get(&d, older.id).state, TaskState::Running);
+            assert!(
+                fake.pane_input(&pane)
+                    .contains(&crate::herdr::fake::PaneInput::Keys(vec!["esc".into()])),
+                "interrupted before its pane closed"
+            );
+            assert!(
+                !fake
+                    .agents()
+                    .iter()
+                    .any(|a| a.name.as_deref() == Some("t-2"))
+            );
+            let reqs = fake.requests();
+            assert!(!reqs.iter().any(|r| r.method == "worktree.remove"));
+            let kept = fake.worktree_list("/srv/app").await.unwrap();
+            assert!(
+                kept.iter().any(|w| w.path == checkout.path),
+                "the worktree is kept: {kept:?}"
+            );
+        }
+
+        /// A critical task whose flock is at its number pauses a task of
+        /// its own flock, even when another flock's task there is newer:
+        /// pausing that one frees a slot, not a seat in the flock.
+        #[tokio::test]
+        async fn a_preempting_task_pauses_in_its_own_flock_at_its_number() {
+            let fake = FakeHerdr::new();
+            let flock: Flock = toml::from_str(
+                "[[flock]]\nname = \"home\"\ndefault = true\nmachines = { desk = 3 }\n\n\
+                 [[flock]]\nname = \"work\"\nmachines = { desk = 1 }\n\n\
+                 [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 3\n",
+            )
+            .unwrap();
+            flock.validate().unwrap();
+            let (d, _tmp) = daemon_with_flock(flock, &[("desk", 3, fake.clone())]).await;
+            let in_flock = |prompt: &str, name: &str, priority: Priority, preempt: bool| {
+                let mut req = run(prompt, spec(), priority, preempt);
+                if let IpcRequest::Run { flock, .. } = &mut req {
+                    *flock = Some(name.into());
+                }
+                req
+            };
+            let work = start(&d, in_flock("work", "work", Priority::Low, false)).await;
+            let home = start(&d, in_flock("home", "home", Priority::Low, false)).await;
+            assert_eq!(get(&d, work.id).state, TaskState::Running);
+            assert_eq!(get(&d, home.id).state, TaskState::Running);
+
+            let crit = start(&d, in_flock("fix", "work", Priority::Critical, true)).await;
+            assert_eq!(crit.state, TaskState::Running, "started in the same pass");
+            assert_eq!(get(&d, work.id).state, TaskState::Paused);
+            assert_eq!(
+                get(&d, home.id).state,
+                TaskState::Running,
+                "not the newer one"
+            );
+        }
+
+        /// Without `--preempt` a critical task still waits on a full
+        /// machine (burst 0), and nothing is paused.
+        #[tokio::test]
+        async fn a_critical_task_without_preempt_waits() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", spec(), Priority::Low, false)).await;
+            let crit = start(&d, run("crit", spec(), Priority::Critical, false)).await;
+            assert_eq!(crit.state, TaskState::Queued);
+            assert_eq!(get(&d, low.id).state, TaskState::Running);
+        }
+
+        /// `--preempt` is for critical tasks only, from `task run` and
+        /// `task priority` alike, and nothing is queued or changed.
+        #[tokio::test]
+        async fn preempt_is_refused_below_critical() {
+            let (d, _tmp) = daemon(&[("a", 1, FakeHerdr::new())]).await;
+            let resp = d.handle(run("x", spec(), Priority::High, true)).await;
+            assert_eq!(error_code(resp), crate::task::PREEMPT_NEEDS_CRITICAL);
+            assert!(
+                d.store
+                    .list_tasks(&TaskFilter::default())
+                    .unwrap()
+                    .is_empty()
+            );
+
+            start(&d, run("busy", spec(), Priority::Normal, false)).await;
+            let queued = start(&d, run("q", spec(), Priority::Normal, false)).await;
+            let resp = d
+                .handle(IpcRequest::TaskPriority {
+                    id: queued.id,
+                    priority: Priority::High,
+                    preempt: true,
+                })
+                .await;
+            assert_eq!(error_code(resp), crate::task::PREEMPT_NEEDS_CRITICAL);
+            let IpcResponse::Task(t) = d
+                .handle(IpcRequest::TaskPriority {
+                    id: queued.id,
+                    priority: Priority::Critical,
+                    preempt: true,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert!(t.pause.preempt);
+            let IpcResponse::Task(t) = d
+                .handle(IpcRequest::TaskPriority {
+                    id: queued.id,
+                    priority: Priority::Critical,
+                    preempt: false,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert!(!t.pause.preempt, "task priority without --preempt drops it");
+        }
+
+        /// No task to pause: a normal one, an opencode one, one that
+        /// resumed a moment ago, a done one. The critical task waits.
+        #[tokio::test]
+        async fn only_a_running_low_claude_task_can_be_paused() {
+            for case in ["normal", "opencode", "resumed", "done"] {
+                let fake = FakeHerdr::new();
+                let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+                let (level, agent) = match case {
+                    "normal" => (Priority::Normal, "claude"),
+                    "opencode" => (Priority::Low, "opencode"),
+                    _ => (Priority::Low, "claude"),
+                };
+                let busy = start(
+                    &d,
+                    run(
+                        "busy",
+                        DispatchSpec {
+                            agent: agent.into(),
+                            ..spec()
+                        },
+                        level,
+                        false,
+                    ),
+                )
+                .await;
+                let mut t = get(&d, busy.id);
+                match case {
+                    "resumed" => t.pause.resumed_at = Some(chrono::Utc::now()),
+                    "done" => t.state = TaskState::Done,
+                    _ => {}
+                }
+                d.store.update_task(&mut t).unwrap();
+                let crit = start(&d, run("crit", spec(), Priority::Critical, true)).await;
+                assert_eq!(crit.state, TaskState::Queued, "{case}");
+                assert_ne!(get(&d, busy.id).state, TaskState::Paused, "{case}");
+            }
+        }
+
+        /// A paused task goes first among the low tasks, and resumes its
+        /// own session in its own worktree once a slot frees: `claude
+        /// --resume <session>`, told to carry on.
+        #[tokio::test]
+        async fn a_paused_task_resumes_first_among_low_tasks_when_a_slot_frees() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", wt(), Priority::Low, false)).await;
+            let session = get(&d, low.id).spec.session_id.clone().expect("a session");
+            let branch = get(&d, low.id).spec.checkout.clone().unwrap().branch;
+            let crit = start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit.state, TaskState::Running);
+            let later = start(&d, run("later low", spec(), Priority::Low, false)).await;
+            assert_eq!(later.state, TaskState::Queued);
+            let queue: Vec<i64> = d
+                .store
+                .queued_tasks()
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect();
+            assert_eq!(queue, vec![low.id, later.id], "the paused task goes first");
+            let entries = d.fleet().queue(None, None).unwrap();
+            assert_eq!(entries[0].task.id, low.id);
+
+            // Still full: it stays paused.
+            d.fleet().dispatch_queued().await;
+            assert_eq!(get(&d, low.id).state, TaskState::Paused);
+
+            let IpcResponse::Task(_) = d
+                .handle(IpcRequest::TaskClose {
+                    id: crit.id,
+                    remove_worktree: false,
+                })
+                .await
+            else {
+                panic!()
+            };
+            d.fleet().dispatch_queued().await;
+            let resumed = get(&d, low.id);
+            assert_eq!(resumed.state, TaskState::Running);
+            assert!(resumed.pause.resumed_at.is_some());
+            assert_eq!(resumed.spec.session_id.as_deref(), Some(session.as_str()));
+            assert_eq!(get(&d, later.id).state, TaskState::Queued);
+            let args = started_args(&fake, "t-1");
+            assert_eq!(
+                args[args.len() - 2..],
+                [Value::from("--resume"), Value::from(session.as_str())]
+            );
+            let reqs = fake.requests();
+            let open = reqs
+                .iter()
+                .rev()
+                .find(|r| r.method == "worktree.open")
+                .expect("its own checkout opened again");
+            assert_eq!(open.params["branch"], branch.as_str());
+            let prompt = reqs
+                .iter()
+                .rev()
+                .find(|r| r.method == "agent.prompt" && r.params["target"] == "t-1")
+                .unwrap();
+            assert_eq!(prompt.params["text"], crate::task::RESUME_PROMPT);
+            assert_eq!(get(&d, low.id).prompt, "low", "its own prompt is kept");
+
+            // Resumed a moment ago: another critical task does not pause it.
+            let again = start(&d, run("crit 2", spec(), Priority::Critical, true)).await;
+            assert_eq!(again.state, TaskState::Queued);
+            assert_eq!(get(&d, low.id).state, TaskState::Running);
+        }
+
+        /// Two low tasks paused for two critical ones, both pinned to the
+        /// same machine: closing only one critical frees a single slot, and
+        /// `dispatch_queued` resumes exactly one paused task, not both. Each
+        /// `resume_paused` call reads a fresh `views()` after the previous
+        /// one's actor has replied (`refresh_live` runs before the reply),
+        /// so the second sees the slot the first just took.
+        #[tokio::test]
+        async fn only_one_of_two_paused_tasks_resumes_into_one_freed_slot() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 2, fake.clone())]).await;
+            let low1 = start(&d, run("low1", spec(), Priority::Low, false)).await;
+            let low2 = start(&d, run("low2", spec(), Priority::Low, false)).await;
+            assert_eq!(low1.state, TaskState::Running);
+            assert_eq!(low2.state, TaskState::Running);
+            let crit1 = start(&d, run("crit1", spec(), Priority::Critical, true)).await;
+            let crit2 = start(&d, run("crit2", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit1.state, TaskState::Running);
+            assert_eq!(crit2.state, TaskState::Running);
+            assert_eq!(get(&d, low1.id).state, TaskState::Paused);
+            assert_eq!(get(&d, low2.id).state, TaskState::Paused);
+
+            // Free exactly one slot.
+            d.handle(IpcRequest::TaskClose {
+                id: crit1.id,
+                remove_worktree: false,
+            })
+            .await;
+            d.fleet().dispatch_queued().await;
+
+            let states = [get(&d, low1.id).state, get(&d, low2.id).state];
+            let running = states.iter().filter(|s| **s == TaskState::Running).count();
+            let paused = states.iter().filter(|s| **s == TaskState::Paused).count();
+            assert_eq!(running, 1, "only one freed slot, only one may resume");
+            assert_eq!(paused, 1, "the other stays paused");
+        }
+
+        /// A paused task past its flock's share waits, as a queued one
+        /// would, while a flock under its share there has a task for the
+        /// freed slot; it resumes once nobody under a share wants it.
+        #[tokio::test]
+        async fn a_paused_task_past_its_share_leaves_the_slot_to_a_flock_under_its_share() {
+            let fake = FakeHerdr::new();
+            let flock: Flock = toml::from_str(
+                "[[flock]]\nname = \"pastor\"\ndefault = true\nmachines = { desk = { share = 1, max = 2 } }\n\n\
+                 [[flock]]\nname = \"life\"\nmachines = { desk = 2 }\n\n\
+                 [[machine]]\nname = \"desk\"\nlocal = true\nmax_agents = 2\n",
+            )
+            .unwrap();
+            flock.validate().unwrap();
+            let (d, _tmp) = daemon_with_flock(flock, &[("desk", 2, fake.clone())]).await;
+            let first = start(&d, run("first", spec(), Priority::Low, false)).await;
+            let second = start(&d, run("second", spec(), Priority::Low, false)).await;
+            assert_eq!(first.state, TaskState::Running);
+            assert_eq!(
+                second.state,
+                TaskState::Running,
+                "past its share, nobody waits"
+            );
+            let crit = start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(crit.state, TaskState::Running);
+            assert_eq!(get(&d, second.id).state, TaskState::Paused);
+
+            let mut req = run("life", spec(), Priority::Low, false);
+            if let IpcRequest::Run { flock, .. } = &mut req {
+                *flock = Some("life".into());
+            }
+            let life = start(&d, req).await;
+            assert_eq!(life.state, TaskState::Queued);
+
+            // One slot frees: pastor is at its share again, life is under
+            // its own and waits, so life takes it.
+            d.handle(IpcRequest::TaskClose {
+                id: crit.id,
+                remove_worktree: false,
+            })
+            .await;
+            d.fleet().dispatch_queued().await;
+            assert_eq!(get(&d, life.id).state, TaskState::Running);
+            assert_eq!(get(&d, second.id).state, TaskState::Paused);
+
+            // Nobody under a share waits now: the paused task resumes.
+            d.handle(IpcRequest::TaskClose {
+                id: life.id,
+                remove_worktree: false,
+            })
+            .await;
+            d.fleet().dispatch_queued().await;
+            assert_eq!(get(&d, second.id).state, TaskState::Running);
+        }
+
+        /// A resume whose agent does not come up fails the task, as any
+        /// dispatch that fails does.
+        #[tokio::test]
+        async fn a_failed_resume_fails_the_task() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", spec(), Priority::Low, false)).await;
+            let crit = start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(get(&d, low.id).state, TaskState::Paused);
+            d.handle(IpcRequest::TaskClose {
+                id: crit.id,
+                remove_worktree: false,
+            })
+            .await;
+            fake.exit_agents_on_start(true);
+            d.fleet().dispatch_queued().await;
+            let failed = get(&d, low.id);
+            assert_eq!(failed.state, TaskState::Failed);
+            assert!(failed.error.is_some());
+        }
+
+        /// A paused task has no agent: `send` has nothing to type into,
+        /// and `close` closes its row, with nothing asked of the machine.
+        #[tokio::test]
+        async fn send_and_close_on_a_paused_task() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", spec(), Priority::Low, false)).await;
+            start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(get(&d, low.id).state, TaskState::Paused);
+            let resp = d
+                .handle(IpcRequest::TaskSend {
+                    id: low.id,
+                    input: SendInput {
+                        text: Some("hi".into()),
+                        enter: true,
+                        ..Default::default()
+                    },
+                })
+                .await;
+            assert_eq!(error_code(resp), "task_not_live");
+            let before = fake.requests().len();
+            let IpcResponse::Task(t) = d
+                .handle(IpcRequest::TaskClose {
+                    id: low.id,
+                    remove_worktree: false,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert_eq!(t.state, TaskState::Closed);
+            assert_eq!(fake.requests().len(), before, "the row alone");
+            assert!(d.store.queued_tasks().unwrap().is_empty());
+        }
+
+        /// `close --remove-worktree` on a paused task opens its kept
+        /// checkout and removes it through that workspace.
+        #[tokio::test]
+        async fn close_remove_worktree_on_a_paused_task_removes_its_checkout() {
+            let fake = FakeHerdr::new();
+            let (d, _tmp) = daemon(&[("a", 1, fake.clone())]).await;
+            let low = start(&d, run("low", wt(), Priority::Low, false)).await;
+            let checkout = get(&d, low.id).spec.checkout.clone().unwrap();
+            start(&d, run("crit", spec(), Priority::Critical, true)).await;
+            assert_eq!(get(&d, low.id).state, TaskState::Paused);
+            let IpcResponse::Task(t) = d
+                .handle(IpcRequest::TaskClose {
+                    id: low.id,
+                    remove_worktree: true,
+                })
+                .await
+            else {
+                panic!()
+            };
+            assert_eq!(t.state, TaskState::Closed);
+            let left = fake.worktree_list("/srv/app").await.unwrap();
+            assert!(!left.iter().any(|w| w.path == checkout.path), "{left:?}");
+        }
+    }
+
+    /// A queued task pinned to `machine`, straight into the store.
+    fn queue_on(store: &Store, prompt: &str, machine: Option<&str>) -> Task {
+        store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: prompt.into(),
+                spec: DispatchSpec {
+                    machine: machine.map(Into::into),
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// A pass sends outside the dispatch lock: while `a` is still starting
+    /// its agent, a `task run` for `b` is queued and dispatched without
+    /// waiting for it.
+    #[tokio::test]
+    async fn a_stalled_dispatch_holds_up_no_other_machine() {
+        let slow = FakeHerdr::new();
+        slow.set_ready_after(Duration::from_secs(3));
+        let (d, _tmp) = daemon(&[("a", 1, slow.clone()), ("b", 1, FakeHerdr::new())]).await;
+        let first = queue_on(&d.store(), "slow", Some("a"));
+        let fleet = d.fleet();
+        let pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state_of(&d, &first) != TaskState::Starting {
+            assert!(Instant::now() < deadline, "a never claimed its task");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let run = tokio::time::timeout(Duration::from_secs(1), async {
+            let t = fleet
+                .queue_run(
+                    "quick".into(),
+                    DispatchSpec {
+                        machine: Some("b".into()),
+                        ..spec()
+                    },
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            fleet.dispatch_queued().await;
+            t
+        })
+        .await
+        .expect("a run on b does not wait for a's dispatch");
+        assert_eq!(state_of(&d, &run), TaskState::Running);
+        assert!(!pass.is_finished(), "a is still starting its agent");
+        pass.await.unwrap();
+        assert_eq!(state_of(&d, &first), TaskState::Running);
+    }
+
+    /// Two passes racing for one task that two machines could take send it
+    /// once: the second skips what the first placed and has not sent yet.
+    #[tokio::test]
+    async fn two_passes_racing_for_one_task_dispatch_it_once() {
+        let (a, b) = (FakeHerdr::new(), FakeHerdr::new());
+        a.set_ready_after(Duration::from_millis(300));
+        b.set_ready_after(Duration::from_millis(300));
+        let (d, _tmp) = daemon(&[("a", 1, a.clone()), ("b", 1, b.clone())]).await;
+        let t = queue_on(&d.store(), "once", None);
+        let fleet = d.fleet();
+        tokio::join!(fleet.dispatch_queued(), fleet.dispatch_queued());
+        assert_eq!(state_of(&d, &t), TaskState::Running);
+        assert_eq!(a.agents().len() + b.agents().len(), 1, "one agent in all");
+        assert!(fleet.in_flight.placed().is_empty());
+    }
+
+    /// A reload that stops three actors stuck in a poll stops them together:
+    /// it takes about one `SHUTDOWN_WAIT` (2s), not three.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn a_reload_stops_its_actors_at_once() {
+        let wedged: Vec<FakeHerdr> = (0..3).map(|_| FakeHerdr::new()).collect();
+        let _unwedge: Vec<Unwedge> = wedged
+            .iter()
+            .map(|f| {
+                f.wedge_connects(true);
+                Unwedge(f.clone())
+            })
+            .collect();
+        let (fleet, _store) = managed(&[
+            ("b", wedged[0].clone()),
+            ("c", wedged[1].clone()),
+            ("e", wedged[2].clone()),
+        ]);
+        fleet
+            .apply_flock(
+                &flock_of(&[("a", 1), ("b", 1), ("c", 1), ("e", 1)]),
+                &fast(),
+            )
+            .await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while wedged.iter().any(|f| f.wedged() == 0) {
+            assert!(Instant::now() < deadline, "an actor never reached connect");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let started = Instant::now();
+        let diff = fleet.apply_flock(&flock_of(&[("a", 1)]), &fast()).await;
+        let took = started.elapsed();
+        assert_eq!(diff.shutting_down, vec!["b", "c", "e"], "{diff:?}");
+        assert!(took < Duration::from_secs(4), "took {took:?}");
+    }
+
+    /// An actor that never reads its queue: a request to it fails with
+    /// `NoReply` after the bound, and a pass that placed a task on it ends
+    /// then too, leaving the task queued and the slot free.
+    #[tokio::test]
+    async fn a_request_to_a_stuck_actor_fails_after_the_bound() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut stuck = crate::machine::pull_machine("a".into(), 1, vec![]);
+        let (tx, _unread) = tokio::sync::mpsc::channel(8);
+        stuck.tx = tx;
+        stuck.status.write().unwrap().channel = crate::machine::ChannelState::Connected;
+        let fleet = Fleet::new(vec![stuck.clone()], store.clone());
+        assert_eq!(fleet.reply_wait(), Duration::from_secs(180), "3 x 60s");
+        fleet.set_config(&PastorConfig {
+            request_timeout: "1s".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            fleet.reply_wait(),
+            Duration::from_secs(3),
+            "3 x request_timeout"
+        );
+        let wait = Duration::from_millis(200);
+        fleet.set_reply_wait(wait);
+
+        let started = Instant::now();
+        let err = fleet.bounded("a", stuck.read(1, 10)).await.unwrap_err();
+        assert!(err.downcast_ref::<NoReply>().is_some(), "{err:#}");
+        assert!(
+            err.to_string().ends_with("within 200ms"),
+            "a subsecond bound keeps its unit: {err:#}"
+        );
+        assert!(started.elapsed() >= wait);
+
+        let t = queue_on(&store, "stuck", None);
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), fleet.dispatch_queued())
+            .await
+            .expect("the pass ends after the bound");
+        assert!(started.elapsed() >= wait, "it did send to a");
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        assert!(
+            fleet.in_flight.placed().is_empty(),
+            "the slot is free again"
         );
     }
 }

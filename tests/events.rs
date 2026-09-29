@@ -13,9 +13,10 @@ use pastor::task::{DispatchSpec, Task};
 /// bring a daemon up, and a wait that ends early only ever fails a good run.
 const WAIT: Duration = Duration::from_secs(60);
 
+mod common;
+
 fn pastor(state: &std::path::Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
-    c.env_remove("PASTOR_TASK");
+    let mut c = common::pastor();
     c.env("PASTOR_CONFIG_DIR", state.join("c"))
         .env("PASTOR_STATE_DIR", state.join("s"));
     c
@@ -45,6 +46,8 @@ fn task(id: i64) -> Task {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
+                summary: Default::default(),
             },
             flock: "default".into(),
         })
@@ -55,6 +58,7 @@ fn task(id: i64) -> Task {
 
 fn record(kind: &str, t: Option<&Task>, job: Option<&str>) -> EventRecord {
     EventRecord {
+        summary: None,
         seq: 0,
         detail: None,
         at: Utc::now(),
@@ -184,6 +188,7 @@ async fn the_daemon_writes_the_events_log() {
     let flock = Flock {
         flocks: vec![],
         machines: vec![MachineConfig {
+            pull: false,
             description: None,
             name: "m".into(),
             local: false,
@@ -250,6 +255,8 @@ async fn the_daemon_writes_the_events_log() {
         &socket,
         &IpcRequest::Run {
             role: Default::default(),
+            preempt: false,
+            summary: None,
             description: None,
             prompt: "hi".into(),
             spec: DispatchSpec {
@@ -268,6 +275,8 @@ async fn the_daemon_writes_the_events_log() {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
+                summary: Default::default(),
             },
             flock: None,
             agent: None,

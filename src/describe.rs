@@ -123,7 +123,8 @@ pub struct MachineDescription {
     #[serde(flatten)]
     pub row: MachineRow,
     pub session: String,
-    /// The machine's own `model`; `None` falls through to its flock's.
+    /// The machine's own `model`, after its task's flock's; `None` falls
+    /// through to `[defaults]`.
     pub model: Option<String>,
     /// The machine's own `agents`, the agent per kind for a model of
     /// another kind than its agent's. Missing from an older head.
@@ -148,15 +149,23 @@ pub struct FlockDescription {
     pub agent_args: Option<Vec<String>>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
-    /// The flock's own `model`; `None` falls through to `[defaults]`.
+    /// The flock's own `model`, before the machine's; `None` falls through
+    /// to the machine's, then `[defaults]`.
     pub model: Option<String>,
     /// The flock's own `agents`, as the machine's. Missing from an older
     /// head.
     #[serde(default)]
     pub agents_by_kind: crate::config::KindAgents,
-    /// The flock's own `profile`; `None` falls through to `[defaults]`.
+    /// The flock's own `profile`, before the machine's, as `model`.
     #[serde(default)]
     pub profile: Option<String>,
+    /// The flock's own `timeout`; `None` falls through to `[defaults]`.
+    /// Missing from an older head.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// The flock's own `place`, as `timeout`.
+    #[serde(default)]
+    pub place: Option<crate::task::Place>,
     pub machines: Vec<String>,
     /// Live agents on its machines; known only from a running head.
     pub agents: Option<usize>,
@@ -318,6 +327,8 @@ pub fn flock_description(
         model: entry.model,
         agents_by_kind: entry.agents,
         profile: entry.profile,
+        timeout: entry.timeout,
+        place: entry.place,
         machines: row.machines,
         agents: row.agents,
         tasks,
@@ -463,6 +474,99 @@ pub fn job_text(j: &JobDescription) -> String {
     out.join("\n")
 }
 
+/// `orchestrator describe`: the file's settings, its state, the note, the
+/// last runs with the lines each pre script printed, and recent events.
+pub fn orchestrator_text(d: &crate::orchestrator::OrchestratorDescription) -> String {
+    let s = &d.status;
+    let next = dash(
+        s.next_run
+            .map(|at| format!("{} ({})", at.format("%Y-%m-%d %H:%M:%S UTC"), in_(at))),
+    );
+    let mut rows = vec![
+        ("name", s.name.clone()),
+        ("description", description(&s.description)),
+        ("file", d.file.display().to_string()),
+        ("kind", dash(s.kind.map(|k| k.to_string()))),
+        ("state", s.state.clone()),
+        ("enabled", yes(s.enabled)),
+        ("schedule", dash(s.schedule.clone())),
+    ];
+    if s.kind == Some(crate::orchestrator::Kind::Scheduled) {
+        rows.push(("pre", words(&d.pre)));
+        rows.push(("post", dash(d.post.as_deref().map(words))));
+        rows.push(("timeout", dash(d.timeout.clone())));
+    }
+    if s.kind == Some(crate::orchestrator::Kind::Session) {
+        rows.push(("stop grace", dash(d.stop_grace.clone())));
+        if let Some(run) = &d.session {
+            rows.push((
+                "session",
+                format!(
+                    "started {} by {}, until {} ({}), {} restart{} in the last hour",
+                    ago(Some(run.started_at)),
+                    run.started_by,
+                    run.until.format("%Y-%m-%d %H:%M:%S UTC"),
+                    in_(run.until),
+                    run.restarts.len(),
+                    if run.restarts.len() == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+    }
+    rows.extend([
+        ("model", dash(d.model.clone())),
+        ("skill", dash(d.skill.clone())),
+        ("repo", dash(d.repo.clone())),
+        ("next run", next),
+        ("last run", ago(s.last_run_at)),
+        (
+            "last result",
+            dash(s.last_result.clone().map(|r| one_line(&r))),
+        ),
+        ("agent", dash(s.task.map(|t| format!("t-{t}")))),
+        ("quota until", ago(s.quota_until)),
+    ]);
+    let mut out = fields(&rows);
+    if let Some(e) = &s.error {
+        out.push(format!("file error: {}", one_line(e)));
+    }
+    section(
+        &mut out,
+        "prompt",
+        d.prompt
+            .as_deref()
+            .map(|p| p.lines().map(crate::cli::printable).collect())
+            .unwrap_or_default(),
+    );
+    section(
+        &mut out,
+        "note",
+        d.note
+            .as_deref()
+            .map(|n| n.lines().map(crate::cli::printable).collect())
+            .unwrap_or_default(),
+    );
+    let mut runs = Vec::new();
+    for r in d.runs.iter().rev() {
+        let mut head = format!("{} {}", r.at.format("%Y-%m-%d %H:%M:%S UTC"), r.outcome);
+        if let Some(t) = r.task {
+            head.push_str(&format!(" t-{t}"));
+        }
+        if let Some(detail) = &r.detail {
+            head.push_str(&format!(": {}", one_line(detail)));
+        }
+        runs.push(head);
+        runs.extend(r.lines.iter().map(|l| format!("  {}", one_line(l))));
+    }
+    section(&mut out, "last runs, newest first", runs);
+    section(
+        &mut out,
+        "recent events",
+        d.events.iter().map(EventRecord::line).collect(),
+    );
+    out.join("\n")
+}
+
 /// An `agents` table as `kind=agent` words, or where the layer's lookup
 /// goes on to when it has none.
 fn by_kind(agents: &crate::config::KindAgents, next: &str) -> String {
@@ -488,13 +592,13 @@ pub fn machine_text(m: &MachineDescription) -> String {
         ("description", description(&r.description)),
         ("host", r.host.clone()),
         ("endpoint", r.endpoint.clone()),
-        ("flock", r.flock.clone()),
+        ("flock", r.flock_label()),
         ("session", m.session.clone()),
         (
             "model",
             m.model
                 .clone()
-                .unwrap_or_else(|| "- (from its flock)".into()),
+                .unwrap_or_else(|| "- (from [defaults])".into()),
         ),
         ("by kind", by_kind(&m.agents_by_kind, "its flock")),
         ("profile", dash(r.profile.clone())),
@@ -539,14 +643,26 @@ pub fn flock_text(f: &FlockDescription) -> String {
             "model",
             f.model
                 .clone()
-                .unwrap_or_else(|| "- (from [defaults])".into()),
+                .unwrap_or_else(|| "- (from the machine or [defaults])".into()),
         ),
         ("by kind", by_kind(&f.agents_by_kind, "[defaults]")),
         (
             "profile",
             f.profile
                 .clone()
+                .unwrap_or_else(|| "- (from the machine or [defaults])".into()),
+        ),
+        (
+            "timeout",
+            f.timeout
+                .clone()
                 .unwrap_or_else(|| "- (from [defaults])".into()),
+        ),
+        (
+            "place",
+            f.place
+                .as_ref()
+                .map_or_else(|| "- (from [defaults])".into(), |p| p.to_string()),
         ),
         ("machines", dash(Some(f.machines.join(",")))),
         ("agents", dash(f.agents.map(|n| n.to_string()))),
@@ -723,12 +839,16 @@ mod tests {
             model: Some("sonnet".into()),
             agents_by_kind: Default::default(),
             profile: Some("develop".into()),
+            timeout: None,
+            place: Some(crate::task::Place::Pastor),
             machines: vec!["pi-1".into(), "pi-2".into()],
             agents: None,
             tasks: vec![],
         };
         let text = flock_text(&f);
         assert!(text.contains("agent:       - (from [defaults])"), "{text}");
+        assert!(text.contains("timeout:     - (from [defaults])"), "{text}");
+        assert!(text.contains("place:       pastor\n"), "{text}");
         assert!(text.contains("by kind:     - (from [defaults])"), "{text}");
         let with = FlockDescription {
             agents_by_kind: [("opencode".to_string(), "opencode".to_string())].into(),
@@ -755,6 +875,7 @@ mod tests {
     #[test]
     fn recent_events_keeps_the_last_ones_in_order() {
         let ev = |kind: &str| EventRecord {
+            summary: None,
             seq: 0,
             at: Utc::now(),
             kind: kind.into(),

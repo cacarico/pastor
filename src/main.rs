@@ -3,7 +3,7 @@ use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use pastor::cli::{CliError, request_failure};
+use pastor::cli::{CliError, ask, print_task, unexpected};
 use pastor::config::flock::{DEFAULT_FLOCK, EditError, Flock, FlockDoc, MachineConfig};
 use pastor::config::job::set_enabled;
 use pastor::config::{AgentChoice, PastorConfig, Paths, parse_duration};
@@ -47,8 +47,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the daemon: scheduler, machine channels, dispatch. With a head set on another machine, run headless: only this machine's jobs and hooks
-    Serve,
+    /// Run the daemon in the background: scheduler, machine channels, dispatch. With a head set on another machine, run headless: only this machine's jobs and hooks
+    ///
+    /// A bare `pastor serve` starts the head in the background, logging to
+    /// serve.log in the state dir, and returns once it answers; --foreground
+    /// keeps it in this terminal. One started by systemd or launchd stays in
+    /// the foreground either way.
+    Serve(ServeArgs),
     /// Manage tasks
     Task {
         #[command(subcommand)]
@@ -72,6 +77,11 @@ enum Command {
     Job {
         #[command(subcommand)]
         cmd: JobCmd,
+    },
+    /// Manage orchestrators (files in ~/.config/pastor/orchestrators/): the head runs a pre script on a schedule and starts an agent with the orchestrator role for what it prints, or keeps one agent running through set hours
+    Orchestrator {
+        #[command(subcommand)]
+        cmd: pastor::orchestrator_cli::OrchestratorCmd,
     },
     /// pastor.toml: the head's settings and the task defaults
     Config {
@@ -114,6 +124,15 @@ enum Command {
         #[command(subcommand)]
         cmd: pastor::head::HeadCmd,
     },
+}
+
+#[derive(Args, Debug)]
+struct ServeArgs {
+    /// Run in this terminal until a signal, logging to stderr; what a service runs
+    #[arg(short, long)]
+    foreground: bool,
+    #[command(subcommand)]
+    cmd: Option<pastor::serve_cli::ServeCmd>,
 }
 
 #[derive(Args, Debug)]
@@ -185,7 +204,11 @@ enum JobCmd {
 #[derive(Subcommand, Debug)]
 enum ConfigCmd {
     /// Open pastor.toml in $VISUAL or $EDITOR; save it only once it is valid
-    Edit,
+    Edit {
+        /// This machine's pastor.toml, even with a head on another machine
+        #[arg(long)]
+        local: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -227,6 +250,10 @@ struct RunArgs {
     /// flock's, else `[defaults] priority`, else normal)
     #[arg(long, value_name = "LEVEL")]
     priority: Option<String>,
+    /// A critical task only: on a full machine, pause the newest low Claude
+    /// task there (its session resumes when a slot frees) and take its slot
+    #[arg(long)]
+    preempt: bool,
     /// Run under this permission profile, built in or from `[profiles]` in
     /// pastor.toml: a Claude agent gets its allow and deny lists and never
     /// asks (default: the machine's, else its flock's, else `[defaults]
@@ -245,16 +272,28 @@ struct RunArgs {
     /// Mark the task stale once it has run this long (30m, 2h; default: `[defaults]` timeout)
     #[arg(long)]
     timeout: Option<String>,
+    /// Label template of the workspace pastor makes for the task, with
+    /// {{ task.id }}, {{ flock }}, {{ machine }}, {{ job }} and
+    /// {{ item.key }} (default: the flock's `label`, else `[defaults]
+    /// label`, else {{ flock }}/{{ task.id }}). The agent stays t-N
+    #[arg(long, value_name = "TEMPLATE", value_parser = parse_label)]
+    label: Option<String>,
     /// Where the agent's pane goes: repo (under the repo it works on), own
     /// (its own workspace), pastor (the `pastor` workspace) or
     /// pane:<workspace> (default: `[defaults] place`, else repo)
     #[arg(long, value_name = "PLACE")]
     place: Option<Place>,
     /// What the agent may change through the head: agent (read, and end
-    /// its own task) or orchestrator (also run, retry and send to tasks and
-    /// disable jobs). Only a person may start an orchestrator, never a task
+    /// its own task) or orchestrator (also run, retry, send to and close
+    /// tasks and enable and disable jobs). Only a person may start an
+    /// orchestrator, never a task
     #[arg(long, value_enum, value_name = "ROLE", default_value_t = TaskRole::Agent)]
     role: TaskRole,
+    /// Ask the agent for a summary when it finishes (ask), also fail the
+    /// task if it stops without one (require), or neither (off) (default:
+    /// the flock's `summary`, else `[defaults] summary`, else ask)
+    #[arg(long, value_enum, value_name = "MODE")]
+    summary: Option<pastor::task::SummaryMode>,
     /// One line on what the task is about, for `task list --wide` and
     /// `describe` (default: the prompt's first line)
     #[arg(long, value_name = "TEXT")]
@@ -298,10 +337,13 @@ enum TaskCmd {
     Run(Box<RunArgs>),
     /// List live tasks across the flock; --all adds finished ones
     List(ListArgs),
-    /// One task in full: state, machine, agent, prompt, error
+    /// One task in full: state, machine, agent, prompt, error, summary
     Describe {
         /// A task, like t-12 or 12
         task: String,
+        /// Show every round's summary, not only the last
+        #[arg(long)]
+        all_summaries: bool,
         /// Print as a JSON object
         #[arg(long)]
         json: bool,
@@ -324,7 +366,7 @@ enum TaskCmd {
     Retry(pastor::task_cli::RetryArgs),
     /// Put a queued task at another level: low, normal, high or critical
     Priority(pastor::task_cli::PriorityArgs),
-    /// Close a task's pane (and with --remove-worktree its worktree), or an orphaned agent
+    /// Close tasks' panes (and with --remove-worktree their worktrees), or orphaned agents
     Close(pastor::task_cli::CloseArgs),
     /// Delete old finished tasks; their items stay seen
     Prune(pastor::task_cli::PruneArgs),
@@ -384,7 +426,7 @@ enum MachineCmd {
         #[arg(long)]
         herdr: bool,
     },
-    /// Put a machine in another flock; tasks already on it stay there
+    /// Take a machine out of every flock and put it in this one; tasks already on it stay there
     Move {
         /// The machine, as flock.toml names it
         name: String,
@@ -452,12 +494,31 @@ enum FlockCmd {
     Add {
         /// The new flock's name
         name: String,
+        /// Machines that join it, each with its max_agents
+        machines: Vec<String>,
         /// Make it the default flock too
         #[arg(long)]
         default: bool,
         /// One line on what the flock is for, for `flock list --wide`
         #[arg(long, value_name = "TEXT")]
         description: Option<String>,
+    },
+    /// Put a machine in a flock, or change its number there; it stays in its other flocks
+    Join {
+        /// The flock
+        flock: String,
+        /// The machine, as flock.toml names it
+        machine: String,
+        /// At most this many of the flock's tasks on the machine (default: its max_agents, or its number there already)
+        #[arg(long, value_name = "N")]
+        max: Option<u32>,
+    },
+    /// Take a machine out of a flock; out of its last one it is in the default flock
+    Leave {
+        /// The flock
+        flock: String,
+        /// The machine, as flock.toml names it
+        machine: String,
     },
     /// Remove a flock; refused while it has machines or queued tasks, or is the default
     Remove {
@@ -482,13 +543,6 @@ enum FlockCmd {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pastor=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
     // `pastor __complete <shell> -- <words>` is what the completion scripts
     // ask at TAB time. It is not in the clap tree, which would put it in the
     // very scripts it serves, and it runs before the legacy migration, the
@@ -498,6 +552,8 @@ fn main() {
         complete(&args[2..]);
     }
     let cli = Cli::parse();
+    let serve_log = serve_log(&cli);
+    init_tracing(serve_log.as_deref());
     // `exclusive` does not cover subcommands, and `--head` being global rules
     // out `args_conflicts_with_subcommands`, so `--skill task` is refused here.
     if cli.skill && cli.command.is_some() {
@@ -512,6 +568,18 @@ fn main() {
         print!("{SKILL}");
         return;
     }
+    if let Some(Command::Serve(args)) = &cli.command
+        && args.foreground
+        && args.cmd.is_some()
+    {
+        <Cli as clap::CommandFactory>::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--foreground starts a head; it cannot be used with `serve stop` or `serve status`",
+            )
+            .exit();
+    }
+    let head_flag = cli.head.clone();
     // `arg_required_else_help` means clap has already printed help for a bare
     // `pastor`; the only other way here without a command is `--skill`.
     let Some(command) = cli.command else {
@@ -549,10 +617,10 @@ fn main() {
         match remote_route(&command) {
             // With a head elsewhere, serve runs headless (`shepherd`).
             RemoteRoute::Head | RemoteRoute::Here | RemoteRoute::Serve => {}
-            RemoteRoute::Unsupported => fail(
+            RemoteRoute::Unsupported(why) => fail(
                 "remote_head_unsupported",
                 &format!(
-                    "`pastor {}` does not work with a remote head yet: it would act on this machine's files; run it on {}, or `pastor head unset`",
+                    "`pastor {}` runs on the head only: {why}; run it on {}",
                     command_path(),
                     r.ssh
                 ),
@@ -561,6 +629,7 @@ fn main() {
     }
     pastor::ipc::set_remote_head(remote.clone());
     pastor::ipc::set_caller_task(pastor::ipc::task_from_env());
+    pastor::ipc::set_caller_orchestrator(pastor::ipc::orchestrator_from_env());
     if let Some(task) = pastor::ipc::caller_task() {
         if makes_orchestrator(&command) {
             fail(
@@ -570,7 +639,8 @@ fn main() {
                 ),
             );
         }
-        if changes_fleet(&command)
+        if !head_decides(&paths, &command, remote.is_some())
+            && changes_fleet(&command)
             && !ends_own_task(&command, &task)
             && !orchestrator_may(&command)
             && !agents_change_fleet(&paths)
@@ -580,13 +650,35 @@ fn main() {
                 &pastor::daemon::refusal(&task, local_caller_role(&paths, &task)),
             );
         }
+    } else if let Some(o) = pastor::ipc::caller().orchestrator {
+        // An orchestrator's pre or post script: the role's table, as the
+        // head applies it (`Daemon::handle_as`), for what the CLI does
+        // without it.
+        if makes_orchestrator(&command) {
+            fail(
+                "role_refused",
+                &format!(
+                    "orchestrator {o}'s script is not a person, and only a person may run a task with --role orchestrator"
+                ),
+            );
+        }
+        if changes_fleet(&command) && !orchestrator_may(&command) && !agents_change_fleet(&paths) {
+            fail("agent_refused", &pastor::daemon::script_refusal(&o));
+        }
     }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async {
         // Commands that never talk to the head do not read `head`, and with a
         // remote head, commands that stay here on purpose do not ask it.
         let head_use = match remote_route(&command) {
-            RemoteRoute::Here if remote.is_some() => None,
+            RemoteRoute::Here if remote.is_some() && !reads_head_files(&command) => None,
+            // Attach and open go to the machine directly, but ask a remote
+            // head for the task and its files, so it must answer.
+            RemoteRoute::Here if remote.is_some() => Some(false),
+            // What a local head leaves to the files here (`flock default
+            // show`, `profile`) is fetched from a remote head, so it must
+            // answer.
+            RemoteRoute::Head if remote.is_some() => Some(head_use(&command).unwrap_or(false)),
             // Here `events` reads the log file, head or no head; a remote
             // head is asked for it, so it must be up and new enough.
             _ if remote.is_some() && matches!(command, Command::Events(_)) => Some(false),
@@ -598,9 +690,7 @@ fn main() {
                 // by this machine's serve: the head only supplies its recent
                 // tasks, so a protocol need that is only about the file
                 // request (`needs_file_protocol`) does not apply to it.
-                let local_job_route = remote.is_some()
-                    && matches!(&command, Command::Job { cmd }
-                        if job_name(cmd).is_some_and(|name| is_local_job(&paths, name)));
+                let local_job_route = remote.is_some() && names_local_job(&paths, &command);
                 probe_head(
                     &paths,
                     // A remote head's flock.toml is not here to read.
@@ -608,6 +698,26 @@ fn main() {
                     needs_fleet_edit_protocol(&command),
                     if local_job_route {
                         None
+                    } else if remote.is_none()
+                        && let Some(file_need) = flock_file_need(&paths)
+                    {
+                        // flock.toml uses a field an older head's
+                        // `FlockEntry` (`deny_unknown_fields`) does not
+                        // know; its reload fails and it silently keeps the
+                        // old flocks, so refuse rather than let the CLI
+                        // dispatch, list or reload on that stale view.
+                        Some(protocol_need(&command).map_or(file_need, |(p, why)| {
+                            if p >= file_need.0 {
+                                (p, why)
+                            } else {
+                                file_need
+                            }
+                        }))
+                    } else if remote.is_some() && reads_head_files(&command) {
+                        protocol_need(&command).or(Some((
+                            pastor::ipc::FILE_PROTOCOL,
+                            "predates reading its files through the head",
+                        )))
                     } else {
                         protocol_need(&command)
                     },
@@ -617,18 +727,16 @@ fn main() {
             None => Head::Absent,
         };
         match command {
-            Command::Serve => match remote.clone() {
-                Some(r) => pastor::shepherd::serve(paths, r).await,
-                None => pastor::daemon::serve(paths).await,
-            },
+            Command::Serve(args) => serve(paths, args, remote.clone(), head_flag, serve_log).await,
             Command::Task { cmd } => task(&paths, cmd, head).await,
             Command::Machine { cmd } => machine(&paths, cmd, head).await,
             Command::Flock { cmd } => flock(&paths, cmd, head).await,
             Command::Tick(args) => tick(&paths, args, head).await,
             Command::Job { cmd } => job(&paths, cmd, head).await,
+            Command::Orchestrator { cmd } => pastor::orchestrator_cli::run(&paths, cmd, head).await,
             Command::Config {
-                cmd: ConfigCmd::Edit,
-            } => config_edit(&paths, head).await,
+                cmd: ConfigCmd::Edit { local },
+            } => config_edit(&paths, local, head).await,
             Command::Completions { shell } => {
                 let mut cmd = completion_tree();
                 clap_complete::generate(shell, &mut cmd, "pastor", &mut std::io::stdout());
@@ -643,7 +751,7 @@ fn main() {
             Command::Watch(args) => pastor::watch::cli(&paths, args).await,
             Command::Setup { cmd } => pastor::setup::cli(&paths, cmd),
             Command::Connector { cmd } => pastor::connector::cli::run(&paths, cmd, head).await,
-            Command::Profile { cmd } => pastor::profile_cli::run(&paths, cmd),
+            Command::Profile { cmd } => pastor::profile_cli::run(&head_config(&paths).await?, cmd),
             Command::Trust { cmd } => pastor::trust_cli::run(&paths, cmd, head).await,
             Command::Queue(args) => pastor::queue_cli::run(&paths, args, head).await,
             Command::Bridge(_) => unreachable!("handled before the runtime"),
@@ -655,6 +763,75 @@ fn main() {
             fail(&e.code, &e.message);
         }
         fail("runtime_error", &format!("{err:#}"));
+    }
+}
+
+/// The log a background `pastor serve --foreground` was started with
+/// (`serve_cli::LOG_ENV`), taken out of the environment before any thread
+/// starts, so the connectors and hooks it runs do not inherit it.
+fn serve_log(cli: &Cli) -> Option<std::path::PathBuf> {
+    let log = std::env::var_os(pastor::serve_cli::LOG_ENV)?;
+    // SAFETY: no other thread runs yet: the tokio runtime starts later.
+    unsafe { std::env::remove_var(pastor::serve_cli::LOG_ENV) };
+    match &cli.command {
+        Some(Command::Serve(ServeArgs {
+            foreground: true,
+            cmd: None,
+        })) => Some(log.into()),
+        _ => None,
+    }
+}
+
+/// Tracing to stderr, or for a background `pastor serve` to its rotated log,
+/// without colour.
+fn init_tracing(serve_log: Option<&std::path::Path>) {
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "pastor=info".into())
+    };
+    if let Some(path) = serve_log {
+        use pastor::serve_cli::{LOG_KEEP, LOG_MAX_BYTES, RotatingLog};
+        match RotatingLog::open(path.to_path_buf(), LOG_MAX_BYTES, LOG_KEEP, true) {
+            Ok(log) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter())
+                    .with_ansi(false)
+                    .with_writer(log)
+                    .init();
+                return;
+            }
+            Err(err) => fail("config_error", &format!("open {}: {err}", path.display())),
+        }
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(filter())
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// `pastor serve`, `serve stop` and `serve status`. A bare `serve` goes to
+/// the background unless a service manager started it.
+async fn serve(
+    paths: Paths,
+    args: ServeArgs,
+    remote: Option<pastor::head::RemoteHead>,
+    head_flag: Option<String>,
+    log: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    use pastor::serve_cli::{self, ServeCmd};
+    match args.cmd {
+        Some(ServeCmd::Stop) => return serve_cli::stop(&paths).await,
+        Some(ServeCmd::Status { json }) => return serve_cli::status(&paths, json).await,
+        None => {}
+    }
+    let service = serve_cli::service_manager();
+    if !args.foreground && service.is_none() {
+        return serve_cli::start_background(&paths, head_flag.as_deref()).await;
+    }
+    serve_cli::record_start(&paths, service, log.as_deref()).await?;
+    match remote {
+        Some(r) => pastor::shepherd::serve(paths, r).await,
+        None => pastor::daemon::serve(paths).await,
     }
 }
 
@@ -711,33 +888,6 @@ fn bridge(paths: &Paths, args: &BridgeArgs) -> ! {
 fn fail(code: &str, message: &str) -> ! {
     eprintln!("{}", serde_json::json!({"code": code, "message": message}));
     std::process::exit(1)
-}
-
-async fn ask(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    match ask_or_refused(paths, req).await {
-        Err(err) => match err.downcast::<CliError>() {
-            Ok(e) => fail(&e.code, &e.message),
-            Err(err) => Err(err),
-        },
-        ok => ok,
-    }
-}
-
-/// `ask`, with the head's refusal handed back as a `CliError` rather than
-/// ending the command, for a caller that acts on it (an invalid edit
-/// reopens the editor). A request that never got an answer still ends it.
-async fn ask_or_refused(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    let resp = match pastor::ipc::request_head(paths, &req).await {
-        Ok(resp) => resp,
-        Err(err) => {
-            let (code, message) = request_failure(&err);
-            fail(&code, &message);
-        }
-    };
-    if let IpcResponse::Error { code, message } = resp {
-        return Err(CliError::err(&code, message));
-    }
-    Ok(resp)
 }
 
 /// The one ping a command sends the head, before it does anything, and what
@@ -883,6 +1033,7 @@ fn head_use(command: &Command) -> Option<bool> {
             _ => Some(true),
         },
         Command::Tick(_) | Command::Job { .. } | Command::Config { .. } => Some(false),
+        Command::Orchestrator { .. } => Some(false),
         Command::Trust { .. } => Some(false),
         Command::Queue(a) => Some(a.flock.is_some()),
         Command::Connector { cmd } => {
@@ -903,9 +1054,9 @@ enum RemoteRoute {
     /// `pastor serve`: headless, running this machine's jobs and hooks for
     /// the head.
     Serve,
-    /// Not moved behind the head yet: it would read or edit this machine's
-    /// files, so it is refused rather than act on the wrong ones.
-    Unsupported,
+    /// Only on the head's own machine, for the reason given: run here it
+    /// would act on this machine's files instead of the head's.
+    Unsupported(&'static str),
 }
 
 fn remote_route(command: &Command) -> RemoteRoute {
@@ -913,26 +1064,87 @@ fn remote_route(command: &Command) -> RemoteRoute {
         Command::Task {
             cmd: TaskCmd::Attach { .. },
         } => RemoteRoute::Here,
+        // The line names the pastor binary on the machine it is printed
+        // on, and goes in that machine's authorized_keys.
+        Command::Machine {
+            cmd: MachineCmd::AuthorizedKey { .. },
+        } => RemoteRoute::Unsupported(
+            "the line it prints names the head's pastor and goes in the head's authorized_keys",
+        ),
+        // Open, like attach, goes to the machine directly; the head only
+        // says how to reach it.
+        Command::Machine {
+            cmd: MachineCmd::Open { .. },
+        } => RemoteRoute::Here,
+        Command::Config {
+            cmd: ConfigCmd::Edit { local: true },
+        } => RemoteRoute::Here,
         // Watch asks the head for its events, tasks and jobs; its connectors
         // are this machine's.
         Command::Task { .. }
         | Command::Watch(_)
         | Command::Queue(_)
-        | Command::Machine {
-            cmd: MachineCmd::List { .. },
-        }
+        | Command::Machine { .. }
+        | Command::Flock { .. }
+        | Command::Trust { .. }
+        | Command::Profile { .. }
+        | Command::Config { .. }
         | Command::Events(_)
         | Command::Tick(_)
         // The head's jobs through it, this machine's own here (`job`).
-        | Command::Job { .. } => RemoteRoute::Head,
+        | Command::Job { .. }
+        // Orchestrators run only on the head.
+        | Command::Orchestrator { .. } => RemoteRoute::Head,
         Command::Completions { .. }
         | Command::Setup { .. }
         | Command::Head { .. }
         | Command::Bridge(_)
         | Command::Connector { .. } => RemoteRoute::Here,
-        Command::Serve => RemoteRoute::Serve,
-        _ => RemoteRoute::Unsupported,
+        // Stop and status act on this machine's serve, head or headless.
+        Command::Serve(ServeArgs { cmd: Some(_), .. }) => RemoteRoute::Here,
+        Command::Serve(_) => RemoteRoute::Serve,
     }
+}
+
+/// Whether a remote head, not this machine, judges whether the task
+/// calling may run `command`: the head refuses what its own
+/// `agents_change_fleet` and the task's role forbid, and this machine's
+/// pastor.toml and store have no say in it. A job whose file is here is
+/// not the head's: `job()` runs and edits it here, so the guard here
+/// applies.
+fn head_decides(paths: &Paths, command: &Command, remote: bool) -> bool {
+    remote && remote_route(command) == RemoteRoute::Head && !names_local_job(paths, command)
+}
+
+/// Whether `command` is a `job` command naming a job whose file is on this
+/// machine (`is_local_job`), which `job()` hands to `local_job` when the
+/// head is elsewhere.
+fn names_local_job(paths: &Paths, command: &Command) -> bool {
+    matches!(command, Command::Job { cmd }
+        if job_name(cmd).is_some_and(|name| is_local_job(paths, name)))
+}
+
+/// Whether `command`, sent to a remote head, fetches one of its files
+/// (`head_file`) or its task where a local head's CLI would read them
+/// here: it needs `FILE_PROTOCOL`. Attach and open stay here, but still
+/// ask the head.
+fn reads_head_files(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Profile { .. }
+            | Command::Task {
+                cmd: TaskCmd::Attach { .. }
+            }
+            | Command::Machine {
+                cmd: MachineCmd::Open { .. }
+            }
+            | Command::Flock {
+                cmd: FlockCmd::List { .. }
+                    | FlockCmd::Default {
+                        cmd: FlockDefaultCmd::Show
+                    }
+            }
+    )
 }
 
 /// The subcommand words the command line named (`machine add`), for a
@@ -986,6 +1198,7 @@ fn changes_fleet(command: &Command) -> bool {
         ),
         Command::Tick(_) => true,
         Command::Job { cmd } => !matches!(cmd, JobCmd::List { .. } | JobCmd::Describe { .. }),
+        Command::Orchestrator { cmd } => pastor::orchestrator_cli::changes_fleet(cmd),
         // pastor.toml holds agents_change_fleet itself.
         Command::Config { .. } => true,
         // Install, link, uninstall and unlink edit the catalog and reload the
@@ -996,7 +1209,12 @@ fn changes_fleet(command: &Command) -> bool {
         ),
         // A head started from an agent's pane schedules and dispatches with
         // no request to refuse; setup installs one that starts on login.
-        Command::Serve | Command::Setup { .. } => true,
+        // Status only reads.
+        Command::Serve(ServeArgs {
+            cmd: Some(pastor::serve_cli::ServeCmd::Status { .. }),
+            ..
+        }) => false,
+        Command::Serve(_) | Command::Setup { .. } => true,
         Command::Trust { cmd } => pastor::trust_cli::changes_fleet(cmd),
         Command::Queue(a) => pastor::queue_cli::changes_fleet(a),
         _ => false,
@@ -1012,14 +1230,20 @@ fn makes_orchestrator(command: &Command) -> bool {
 /// Whether `command` is one an orchestrator task may make
 /// (`IpcRequest::orchestrator_may`). The CLI does not know the caller's
 /// role, so from a task's pane it leaves these to the head, which does:
-/// `task run|retry|send` only ever go through it, and `job disable` with no
-/// head is refused in `toggle`.
+/// `task run|retry|send|close` only ever go through it, and `job
+/// enable|disable` is refused for a task caller in `toggle` (no head) and
+/// in `local_toggle` (a head elsewhere, but the job is this machine's own,
+/// which never reaches it either).
 fn orchestrator_may(command: &Command) -> bool {
     match command {
         Command::Task { cmd } => {
-            matches!(cmd, TaskCmd::Run(_) | TaskCmd::Retry(_) | TaskCmd::Send(_))
+            matches!(
+                cmd,
+                TaskCmd::Run(_) | TaskCmd::Retry(_) | TaskCmd::Send(_) | TaskCmd::Close(_)
+            )
         }
-        Command::Job { cmd } => matches!(cmd, JobCmd::Disable { .. }),
+        Command::Job { cmd } => matches!(cmd, JobCmd::Enable { .. } | JobCmd::Disable { .. }),
+        Command::Orchestrator { cmd } => pastor::orchestrator_cli::orchestrator_may(cmd),
         _ => false,
     }
 }
@@ -1069,7 +1293,13 @@ fn needs_agent_protocol(command: &Command) -> bool {
 /// edit` are not: the first is older, the second edits here and reloads.
 fn needs_fleet_edit_protocol(command: &Command) -> bool {
     match command {
-        Command::Flock { cmd } => matches!(cmd, FlockCmd::Add { .. } | FlockCmd::Default { .. }),
+        Command::Flock { cmd } => matches!(
+            cmd,
+            FlockCmd::Add { .. }
+                | FlockCmd::Join { .. }
+                | FlockCmd::Leave { .. }
+                | FlockCmd::Default { .. }
+        ),
         Command::Machine { cmd } => matches!(
             cmd,
             MachineCmd::Add { .. } | MachineCmd::Remove { .. } | MachineCmd::Move { .. }
@@ -1091,6 +1321,40 @@ fn needs_priority_protocol(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` sends `--preempt`, which only a head of
+/// `PREEMPT_PROTOCOL` or later honours.
+fn needs_preempt_protocol(command: &Command) -> bool {
+    match command {
+        Command::Task { cmd } => match cmd {
+            TaskCmd::Run(a) => a.preempt,
+            TaskCmd::Priority(a) => a.preempt,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether `command` sends `task run --summary`, which only a head of
+/// `SUMMARY_MODE_PROTOCOL` or later honours.
+fn needs_summary_mode_protocol(command: &Command) -> bool {
+    matches!(command, Command::Task { cmd: TaskCmd::Run(a) } if a.summary.is_some())
+}
+
+/// Whether `command` sends a summary, or asks for every round's, which only
+/// a head of `SUMMARY_PROTOCOL` or later keeps or knows: `task done
+/// --summary|--summary-file` and `task describe --all-summaries`.
+fn needs_summary_protocol(command: &Command) -> bool {
+    match command {
+        Command::Task {
+            cmd: TaskCmd::Done(a),
+        } => a.has_summary(),
+        Command::Task {
+            cmd: TaskCmd::Describe { all_summaries, .. },
+        } => *all_summaries,
+        _ => false,
+    }
+}
+
 /// Whether `command` sends a description only a head of
 /// `DESCRIPTION_PROTOCOL` or later keeps: `task run`, `flock add` or
 /// `machine add` with `--description`.
@@ -1107,6 +1371,22 @@ fn needs_description_protocol(command: &Command) -> bool {
         } => description.is_some(),
         _ => false,
     }
+}
+
+/// `--label`, checked before anything is sent (`task::check_label`).
+fn parse_label(s: &str) -> Result<String, String> {
+    pastor::task::check_label(s).map(|()| s.to_string())
+}
+
+/// Whether `command` sends a label only a head of `LABEL_PROTOCOL` or later
+/// renders: `task run --label`.
+fn needs_label_protocol(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Task {
+            cmd: TaskCmd::Run(a)
+        } if a.label.is_some()
+    )
 }
 
 /// Whether `command` sends a request only a head of `PLACE_PROTOCOL` or later
@@ -1137,6 +1417,19 @@ fn needs_file_protocol(command: &Command) -> bool {
     }
 }
 
+/// Whether `command` sends a request only a head of `JOIN_PROTOCOL` or later
+/// knows or honours: `flock join|leave`, and `flock add` with machines.
+fn needs_join_protocol(command: &Command) -> bool {
+    match command {
+        Command::Flock { cmd } => match cmd {
+            FlockCmd::Join { .. } | FlockCmd::Leave { .. } => true,
+            FlockCmd::Add { machines, .. } => !machines.is_empty(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether `command` asks the head a request only a head of
 /// `HEAD_READS_PROTOCOL` or later knows: the trust commands and `flock|machine
 /// describe`.
@@ -1155,7 +1448,48 @@ fn needs_head_reads_protocol(command: &Command) -> bool {
 /// needs `PLACE_PROTOCOL` for the flag and `PROFILE_PROTOCOL` as a queueing
 /// command, and a head between the two would drop its named model.
 fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
-    if needs_description_protocol(command) {
+    if matches!(
+        command,
+        Command::Orchestrator {
+            cmd: pastor::orchestrator_cli::OrchestratorCmd::Start { .. }
+                | pastor::orchestrator_cli::OrchestratorCmd::Stop { .. }
+        }
+    ) {
+        Some((
+            pastor::ipc::SESSION_PROTOCOL,
+            "predates session orchestrators, and would refuse the request",
+        ))
+    } else if matches!(command, Command::Orchestrator { .. }) {
+        Some((
+            pastor::ipc::ORCHESTRATOR_PROTOCOL,
+            "predates orchestrator files, and would refuse the request",
+        ))
+    } else if needs_join_protocol(command) {
+        Some((
+            pastor::ipc::JOIN_PROTOCOL,
+            "predates `flock join` and `flock leave`, and would refuse them or add the flock without its machines",
+        ))
+    } else if needs_summary_mode_protocol(command) {
+        Some((
+            pastor::ipc::SUMMARY_MODE_PROTOCOL,
+            "predates the summary setting, and would queue the task without --summary",
+        ))
+    } else if needs_label_protocol(command) {
+        Some((
+            pastor::ipc::LABEL_PROTOCOL,
+            "predates workspace labels and would name the workspace t-N",
+        ))
+    } else if needs_summary_protocol(command) {
+        Some((
+            pastor::ipc::SUMMARY_PROTOCOL,
+            "predates task summaries, and would drop the summary or refuse the request",
+        ))
+    } else if needs_preempt_protocol(command) {
+        Some((
+            pastor::ipc::PREEMPT_PROTOCOL,
+            "predates pausing a low task, and would queue the task without --preempt",
+        ))
+    } else if needs_description_protocol(command) {
         Some((
             pastor::ipc::DESCRIPTION_PROTOCOL,
             "predates descriptions and would drop --description",
@@ -1214,6 +1548,69 @@ fn protocol_need(command: &Command) -> Option<(u32, &'static str)> {
 /// not load counts as declaring them.
 fn flocks_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).map_or(true, |f| !f.flocks.is_empty())
+}
+
+/// The protocol a head needs to read this machine's flock.toml without
+/// dropping part of it on reload, and why, when the file uses a field older
+/// heads' `FlockEntry` does not know: per-flock `machines`
+/// (`MULTI_FLOCK_PROTOCOL`), a flock's `timeout` or `place`
+/// (`FLOCK_TIMEOUT_PLACE_PROTOCOL`), a share and a max
+/// (`FLOCK_SHARE_PROTOCOL`). The newest one the file uses wins.
+fn flock_file_need(paths: &Paths) -> Option<(u32, &'static str)> {
+    if flock_share_declared(paths) {
+        Some((
+            pastor::ipc::FLOCK_SHARE_PROTOCOL,
+            "predates a flock's share and max on a machine, and would silently drop flock.toml's `machines` on reload, keeping its old membership",
+        ))
+    } else if flock_timeout_or_place_declared(paths) {
+        Some((
+            pastor::ipc::FLOCK_TIMEOUT_PLACE_PROTOCOL,
+            "predates per-flock timeout and place, and would silently drop flock.toml's `timeout`/`place` on reload, keeping its old settings",
+        ))
+    } else if multi_flock_declared(paths) {
+        Some((
+            pastor::ipc::MULTI_FLOCK_PROTOCOL,
+            "predates per-flock machine limits, and would silently drop flock.toml's `machines` on reload, keeping its old membership",
+        ))
+    } else {
+        None
+    }
+}
+
+/// Whether flock.toml gives any flock a share and a max on a machine
+/// (`machines = { desk = { share = 2, max = 4 } }`), the schema an older
+/// head's `FlockEntry` does not know (see `FLOCK_SHARE_PROTOCOL`). A
+/// flock.toml that does not load counts as not declaring it.
+fn flock_share_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| {
+        f.flocks.iter().any(|e| {
+            e.machines
+                .values()
+                .any(|n| matches!(n, pastor::config::flock::FlockNumber::Split(_)))
+        })
+    })
+}
+
+/// Whether flock.toml puts any machine in a flock with a number
+/// (`[[flock]] machines = { desk = 2 }`), the schema an older head's
+/// `FlockEntry` does not know (see `probe_head`'s `need` above). A
+/// flock.toml that does not load counts as not declaring it: a head that
+/// cannot read the file either is refused for other reasons first.
+fn multi_flock_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| !e.machines.is_empty()))
+}
+
+/// Whether flock.toml gives any flock its own `timeout` or `place`, the
+/// schema an older head's `FlockEntry` does not know (see
+/// `FLOCK_TIMEOUT_PLACE_PROTOCOL`). A flock.toml that does not load counts
+/// as not declaring it: a head that cannot read the file either is refused
+/// for other reasons first.
+fn flock_timeout_or_place_declared(paths: &Paths) -> bool {
+    Flock::load(&paths.flock_file()).is_ok_and(|f| {
+        f.flocks
+            .iter()
+            .any(|e| e.timeout.is_some() || e.place.is_some())
+    })
 }
 
 /// The prompt of `pastor task run`: the positional one as given, or the
@@ -1277,7 +1674,7 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
         PastorConfig::load(&paths.config_file())?
     };
     let spec = run_spec(&a, &config)?;
-    let IpcResponse::Task(t) = ask(
+    let resp = ask(
         paths,
         IpcRequest::Run {
             agent: Some(agent_choice(&a)),
@@ -1287,24 +1684,32 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
             priority,
             role: a.role,
             description: pastor::config::clean_description(a.description.as_deref()),
+            preempt: a.preempt,
+            summary: a.summary,
         },
     )
-    .await?
-    else {
-        unreachable!()
+    .await?;
+    let IpcResponse::Task(t) = resp else {
+        return Err(unexpected(resp));
     };
-    print_task(&t, a.json);
-    Ok(())
+    print_task(&t, a.json)
 }
 
-/// What `pastor task run`'s flags say about the agent; the head fills in the
-/// rest from the task's flock and `[defaults]`.
+/// What `pastor task run`'s flags say about the agent, its timeout and its
+/// place; the head fills in the rest from the task's flock and `[defaults]`.
 fn agent_choice(a: &RunArgs) -> AgentChoice {
     AgentChoice {
         agent: a.agent.clone(),
         agent_args: (!a.agent_args.is_empty()).then(|| a.agent_args.clone()),
         model: a.model.clone(),
         profile: a.profile.clone(),
+        // Checked by `run_spec`, which refuses a bad one.
+        timeout_secs: a
+            .timeout
+            .as_deref()
+            .and_then(|t| parse_duration(t).ok())
+            .map(|d| d.as_secs()),
+        place: a.place.clone(),
         ..Default::default()
     }
 }
@@ -1340,21 +1745,13 @@ fn run_spec(a: &RunArgs, config: &PastorConfig) -> anyhow::Result<DispatchSpec> 
             .clone()
             .unwrap_or_else(|| config.defaults.place.clone()),
         session_id: None,
+        // Only the ask: the head fills in the flock's or `[defaults]`.
+        label: pastor::task::WorkspaceLabel {
+            template: a.label.clone(),
+            ..Default::default()
+        },
+        summary: Default::default(),
     })
-}
-
-fn print_task(t: &Task, json: bool) {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&t.to_json()).unwrap());
-    } else {
-        println!(
-            "{}",
-            pastor::cli::table(
-                &pastor::cli::TASK_HEADER,
-                &pastor::cli::task_rows(std::slice::from_ref(t))
-            )
-        );
-    }
 }
 
 /// Turn a direct probe (what `machine list` does with no head running) into a
@@ -1420,14 +1817,13 @@ fn probe_fields(
 /// calls, each on its own connection, exactly as the head makes them: herdr
 /// answers one request per connection. Orphans are agents no open task owns;
 /// the rows live in the store here even with no head running.
-/// The profile a task on `m` runs under when it names none, from this
-/// machine's pastor.toml and flock.toml, as the head would settle it.
+/// The own profile of `m`, which decides whether a task may ask for
+/// `unrestricted` there, from this machine's pastor.toml and flock.toml, as
+/// the head would settle it (`Defaults::own_profile`).
 fn own_profile(config: &PastorConfig, f: &Flock, m: &MachineConfig) -> Option<String> {
     config
         .defaults
-        .resolve_agent_on(&AgentChoice::default(), Some(m), f.entry(f.flock_of(m)))
-        .profile
-        .map(|(name, _)| name)
+        .own_profile(Some(m), f.entry(f.primary_flock(m)))
 }
 
 async fn probe_machine(
@@ -1437,7 +1833,44 @@ async fn probe_machine(
     paths: &Paths,
     store: &Store,
 ) -> anyhow::Result<pastor::cli::MachineRow> {
-    let flock = f.flock_of(m);
+    let flock = f.primary_flock(m);
+    let on_machine = store.tasks_on_machine(&m.name)?;
+    let flocks = f
+        .flocks_of(m)
+        .into_iter()
+        .map(|(name, number)| {
+            let live = on_machine
+                .iter()
+                .filter(|t| t.flock.as_deref().unwrap_or(f.default_flock()) == name)
+                .count();
+            pastor::machine::FlockSeat::new(name, number, live)
+        })
+        .collect();
+    // Nothing connects to a pull machine, and with no head running nobody
+    // has heard its claims: its row says so, with the tasks the store puts
+    // there, rather than probing whatever herdr runs here.
+    if m.pull {
+        return Ok(pastor::cli::MachineRow {
+            name: m.name.clone(),
+            host: "pull".into(),
+            endpoint: pastor::machine::PULL_ENDPOINT.into(),
+            flock: flock.to_string(),
+            flocks,
+            channel: "not probed".into(),
+            herdr_version: None,
+            pastor_version: None,
+            protocol: None,
+            error: None,
+            live: Some(on_machine.len()),
+            max_agents: m.max_agents,
+            job_slots: m.job_slots,
+            burst: m.burst,
+            tags: m.tags.clone(),
+            orphans: vec![],
+            profile: own_profile(config, f, m),
+            description: pastor::config::clean_description(m.description.as_deref()),
+        });
+    }
     let ep = Endpoint::from_machine(m, paths);
     let ping = ep.ping().await;
     let agents = match &ping {
@@ -1445,7 +1878,7 @@ async fn probe_machine(
         Err(_) => None,
     };
     let orphans: Vec<String> = match &agents {
-        Some(Ok(list)) => pastor::machine::orphan_agents(list, &store.tasks_on_machine(&m.name)?)
+        Some(Ok(list)) => pastor::machine::orphan_agents(list, &on_machine)
             .into_iter()
             .map(|(name, _)| name)
             .collect(),
@@ -1465,6 +1898,7 @@ async fn probe_machine(
         host: ep.host(),
         endpoint: ep.describe(),
         flock: flock.to_string(),
+        flocks,
         channel: channel.into(),
         herdr_version,
         pastor_version,
@@ -1481,19 +1915,9 @@ async fn probe_machine(
     })
 }
 
-/// This machine's hostname, read from the kernel and files rather than a
-/// new dependency for `gethostname`; `-` when none says.
+/// This machine's hostname (`config::hostname`).
 fn hostname() -> String {
-    ["/proc/sys/kernel/hostname", "/etc/hostname"]
-        .iter()
-        .find_map(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "-".into())
+    pastor::config::hostname()
 }
 
 /// The head's row: this machine's hostname and the herdr it has, if any.
@@ -1513,8 +1937,9 @@ fn head_row() -> pastor::cli::HeadRow {
 /// A remote head's row: its ssh destination for the host and the version
 /// it answers ping with. Its herdr is not asked, so it reads `-`.
 async fn remote_head_row(paths: &Paths, ssh: &str) -> anyhow::Result<pastor::cli::HeadRow> {
-    let IpcResponse::Pong { version, .. } = ask(paths, IpcRequest::Ping).await? else {
-        unreachable!()
+    let resp = ask(paths, IpcRequest::Ping).await?;
+    let IpcResponse::Pong { version, .. } = resp else {
+        return Err(unexpected(resp));
     };
     let mut row = pastor::cli::HeadRow::new(ssh.to_string(), None);
     row.pastor_version = version;
@@ -1536,8 +1961,9 @@ async fn machine_list(
     // machines are probed directly only when nothing is listening.
     let (rows, note) = match head {
         Head::Live => {
-            let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
-                unreachable!()
+            let resp = ask(paths, IpcRequest::FlockList).await?;
+            let IpcResponse::Machines(ms) = resp else {
+                return Err(unexpected(resp));
             };
             let rows: Vec<pastor::cli::MachineRow> =
                 ms.iter().map(pastor::cli::MachineRow::from).collect();
@@ -1555,7 +1981,7 @@ async fn machine_list(
             for m in f
                 .machines
                 .iter()
-                .filter(|m| flock.is_none_or(|n| f.flock_of(m) == n))
+                .filter(|m| flock.is_none_or(|n| f.in_flock(m, n)))
             {
                 rows.push(probe_machine(m, &f, &config, paths, &store).await?);
             }
@@ -1567,7 +1993,7 @@ async fn machine_list(
     };
     let mut rows: Vec<pastor::cli::MachineRow> = rows
         .into_iter()
-        .filter(|m| flock.is_none_or(|n| m.flock == n))
+        .filter(|m| flock.is_none_or(|n| m.in_flock(n)))
         .collect();
     pastor::cli::head_machine_first(&mut rows);
     let head = match pastor::ipc::remote_head() {
@@ -1642,8 +2068,9 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
         flock: a.flock.clone(),
     };
     let tasks = if head.is_live() {
-        let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
-            unreachable!()
+        let resp = ask(paths, IpcRequest::List { filter }).await?;
+        let IpcResponse::Tasks(ts) = resp else {
+            return Err(unexpected(resp));
         };
         ts
     } else {
@@ -1665,42 +2092,75 @@ async fn list(paths: &Paths, a: ListArgs, head: Head) -> anyhow::Result<()> {
             println!("no tasks");
         }
     } else {
-        let mut rows = pastor::cli::task_rows(&tasks);
-        // The flock file is the truth for "removed" whether or not a head
-        // runs (a running head re-reads it every tick). `load_existing`
-        // rather than `load`: a flock.toml that is momentarily missing (an
-        // editor's delete-and-rename, or a race with `machine add|remove`
-        // rewriting it) must mark nothing, not everything (Copilot
-        // 4103271200, 4103271289, 4103271156).
-        // A remote head's flock.toml is not here: its machines are what it
-        // reports.
-        if pastor::ipc::remote_head().is_some() {
-            let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
-                unreachable!()
-            };
-            pastor::cli::mark_removed(&mut rows, &tasks, |m| ms.iter().any(|s| s.name == m));
-        } else if let Ok(flock) = Flock::load_existing(&paths.flock_file()) {
-            pastor::cli::mark_removed(&mut rows, &tasks, |m| flock.get(m).is_some());
+        // Orchestrators first, in a table of their own; `--json` keeps one
+        // array, with `role`.
+        let (orchestrators, agents): (Vec<Task>, Vec<Task>) = tasks
+            .iter()
+            .cloned()
+            .partition(|t| t.role == TaskRole::Orchestrator);
+        // Titled only when there are orchestrators, so a plain list reads
+        // as it always has.
+        let titled = !orchestrators.is_empty();
+        let mut tables = Vec::new();
+        for (title, group) in [("orchestrators", &orchestrators), ("tasks", &agents)] {
+            if group.is_empty() {
+                continue;
+            }
+            let table = task_table(paths, group, a.wide).await?;
+            tables.push(if titled {
+                format!("{title}:\n{table}")
+            } else {
+                table
+            });
         }
-        let descriptions: Vec<Option<String>> =
-            tasks.iter().map(|t| Some(t.description_text())).collect();
-        println!(
-            "{}",
-            pastor::cli::list_table(&pastor::cli::TASK_HEADER, &rows, a.wide, &descriptions)
-        );
+        println!("{}", tables.join("\n\n"));
     }
     // Orphans have no row to list, so they get a line each under the table.
     // Only a running head knows them (its last reconcile); `--json` stays a
     // plain task array, and `machine list --json` carries them instead.
     if head.is_live() && !a.json && show_orphans {
-        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
-            unreachable!()
+        let resp = ask(paths, IpcRequest::FlockList).await?;
+        let IpcResponse::Machines(ms) = resp else {
+            return Err(unexpected(resp));
         };
         for line in pastor::cli::orphan_lines(&ms, a.machine.as_deref(), a.flock.as_deref()) {
             println!("{line}");
         }
     }
     Ok(())
+}
+
+/// `task list`'s table of `tasks`, with `--wide`'s RESULT and DESCRIPTION.
+async fn task_table(paths: &Paths, tasks: &[Task], wide: bool) -> anyhow::Result<String> {
+    let mut rows = pastor::cli::task_rows(tasks);
+    // The flock file is the truth for "removed" whether or not a head
+    // runs (a running head re-reads it every tick). `load_existing`
+    // rather than `load`: a flock.toml that is momentarily missing (an
+    // editor's delete-and-rename, or a race with `machine add|remove`
+    // rewriting it) must mark nothing, not everything (Copilot
+    // 4103271200, 4103271289, 4103271156).
+    // A remote head's flock.toml is not here: its machines are what it
+    // reports.
+    if pastor::ipc::remote_head().is_some() {
+        let resp = ask(paths, IpcRequest::FlockList).await?;
+        let IpcResponse::Machines(ms) = resp else {
+            return Err(unexpected(resp));
+        };
+        pastor::cli::mark_removed(&mut rows, tasks, |m| ms.iter().any(|s| s.name == m));
+    } else if let Ok(flock) = Flock::load_existing(&paths.flock_file()) {
+        pastor::cli::mark_removed(&mut rows, tasks, |m| flock.get(m).is_some());
+    }
+    let descriptions: Vec<Option<String>> =
+        tasks.iter().map(|t| Some(t.description_text())).collect();
+    // `--wide` adds how each task's last round ended, before DESCRIPTION.
+    let mut header = pastor::cli::TASK_HEADER.to_vec();
+    if wide {
+        header.push("RESULT");
+        for (row, t) in rows.iter_mut().zip(tasks) {
+            row.push(pastor::cli::task_result(t));
+        }
+    }
+    Ok(pastor::cli::list_table(&header, &rows, wide, &descriptions))
 }
 
 /// The store, for a CLI path that reads it without the head. Rows from
@@ -1724,35 +2184,61 @@ async fn task(paths: &Paths, cmd: TaskCmd, head: Head) -> anyhow::Result<()> {
     match cmd {
         TaskCmd::Run(args) => run(paths, *args).await?,
         TaskCmd::List(args) => list(paths, args, head).await?,
-        TaskCmd::Describe { task, json } => {
+        TaskCmd::Describe {
+            task,
+            all_summaries,
+            json,
+        } => {
             let id = task_id(&task);
-            let t = if head.is_live() {
-                let IpcResponse::Task(t) = ask(paths, IpcRequest::TaskShow { id }).await? else {
-                    unreachable!()
+            let (t, all) = if head.is_live() {
+                let resp = ask(paths, IpcRequest::TaskShow { id }).await?;
+                let IpcResponse::Task(t) = resp else {
+                    return Err(unexpected(resp));
                 };
-                t
+                let all = if all_summaries {
+                    let resp = ask(paths, IpcRequest::TaskSummaries { id }).await?;
+                    let IpcResponse::Summaries(all) = resp else {
+                        return Err(unexpected(resp));
+                    };
+                    Some(all)
+                } else {
+                    None
+                };
+                (t, all)
             } else {
-                open_store(paths)?
+                let store = open_store(paths)?;
+                let t = store
                     .get_task(id)?
-                    .unwrap_or_else(|| fail("task_not_found", &task))
+                    .unwrap_or_else(|| fail("task_not_found", &task));
+                let all = if all_summaries {
+                    Some(store.summaries(id)?)
+                } else {
+                    None
+                };
+                (t, all)
             };
-            if json {
-                print_task(&t, true);
-            } else {
-                println!("{}", pastor::cli::task_detail(&t));
+            match (json, all) {
+                (true, Some(all)) => {
+                    let mut v = t.to_json();
+                    v["summaries"] = serde_json::to_value(&all)?;
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                }
+                (true, None) => print_task(&t, true)?,
+                (false, Some(all)) => println!("{}", pastor::cli::task_detail_with(&t, &all)),
+                (false, None) => println!("{}", pastor::cli::task_detail(&t)),
             }
         }
         TaskCmd::Read { task, lines } => {
-            let IpcResponse::Text(text) = ask(
+            let resp = ask(
                 paths,
                 IpcRequest::TaskRead {
                     id: task_id(&task),
                     lines,
                 },
             )
-            .await?
-            else {
-                unreachable!()
+            .await?;
+            let IpcResponse::Text(text) = resp else {
+                return Err(unexpected(resp));
             };
             print!("{}", pastor::cli::printable(&text));
         }
@@ -1785,6 +2271,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             herdr,
         } => {
             let m = MachineConfig {
+                pull: false,
                 description: pastor::config::clean_description(description.as_deref()),
                 name: name.clone(),
                 local,
@@ -1844,18 +2331,23 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
             }
         }
         MachineCmd::Remove { name, herdr } => {
-            // Only for the herdr hint below, read before the machine goes. A
-            // head's file is this machine's file for now; a file that does
-            // not load gives no hint.
-            let target = Flock::load(&path)
-                .ok()
-                .and_then(|f| f.get(&name).and_then(|m| m.ssh.clone()));
+            // Only for the herdr hint below, read before the machine goes,
+            // from the head's file; a file that does not load gives no hint.
+            let target = if herdr {
+                head_flock(paths)
+                    .await
+                    .ok()
+                    .and_then(|f| f.get(&name).and_then(|m| m.ssh.clone()))
+            } else {
+                None
+            };
             if head.is_live() {
                 println!(
                     "{}",
                     ask_text(paths, IpcRequest::MachineRemove { name: name.clone() }).await?
                 );
             } else {
+                let _lock = offline_fleet_lock(paths)?;
                 let done = fleet_edit::remove_machine(&path, &name).map_err(edit_error)?;
                 println!("{done}; {}", reload_running_head(paths, head).await);
             }
@@ -1920,10 +2412,27 @@ fn edit_error(err: impl Into<anyhow::Error>) -> anyhow::Error {
     }
 }
 
+/// The fleet lock for an edit made with no head, held until dropped: from
+/// the edit's store check to its save of flock.toml, so a head starting
+/// meanwhile waits and then reads the edited file. A head that started
+/// listening before the lock came free could already have taken a task the
+/// check would not see, so the edit stops with `head_started` instead.
+fn offline_fleet_lock(paths: &Paths) -> anyhow::Result<std::fs::File> {
+    let lock = fleet_edit::lock_fleet(paths, fleet_edit::FLEET_LOCK_WAIT)?;
+    if std::os::unix::net::UnixStream::connect(paths.socket_file()).is_ok() {
+        return Err(pastor::cli::CliError::err(
+            "head_started",
+            "pastor serve started while this edit waited for it; run the command again to make the edit through the head",
+        ));
+    }
+    Ok(lock)
+}
+
 /// `ask`, for a request the head answers with `Text`.
 async fn ask_text(paths: &Paths, req: IpcRequest) -> anyhow::Result<String> {
-    let IpcResponse::Text(text) = ask(paths, req).await? else {
-        unreachable!()
+    let resp = ask(paths, req).await?;
+    let IpcResponse::Text(text) = resp else {
+        return Err(unexpected(resp));
     };
     Ok(text)
 }
@@ -1943,6 +2452,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
         FlockCmd::Edit => return edit_file(paths, ConfigFile::Flock, head).await,
         FlockCmd::Add {
             name,
+            machines,
             default,
             description,
         } => {
@@ -1955,15 +2465,14 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                             name,
                             default,
                             description,
+                            machines,
                         }
                     )
                     .await?
                 );
                 return Ok(());
             }
-            // As with `flock remove` without a head, a task queued between
-            // this read and the save is not seen; `pastor task close`
-            // recovers it.
+            let _lock = offline_fleet_lock(paths)?;
             let queued = || -> anyhow::Result<Vec<String>> {
                 Ok(open_store(paths)?
                     .list_tasks(&TaskFilter {
@@ -1975,28 +2484,72 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
                     .map(|t| t.display_id())
                     .collect())
             };
-            fleet_edit::add_flock(&path, &name, default, description.as_deref(), queued)
-                .map_err(edit_error)?
+            fleet_edit::add_flock(
+                &path,
+                &name,
+                default,
+                description.as_deref(),
+                &machines,
+                queued,
+            )
+            .map_err(edit_error)?
+        }
+        FlockCmd::Join {
+            flock,
+            machine,
+            max,
+        } => {
+            if head.is_live() {
+                println!(
+                    "{}",
+                    ask_text(
+                        paths,
+                        IpcRequest::FlockJoin {
+                            flock,
+                            machine,
+                            max
+                        }
+                    )
+                    .await?
+                );
+                return Ok(());
+            }
+            let _lock = offline_fleet_lock(paths)?;
+            fleet_edit::join_flock(&path, &flock, &machine, max).map_err(edit_error)?
+        }
+        FlockCmd::Leave { flock, machine } => {
+            if head.is_live() {
+                println!(
+                    "{}",
+                    ask_text(paths, IpcRequest::FlockLeave { flock, machine }).await?
+                );
+                return Ok(());
+            }
+            let _lock = offline_fleet_lock(paths)?;
+            let queued = || -> anyhow::Result<Vec<Task>> {
+                open_store(paths)?.list_tasks(&TaskFilter {
+                    states: Some(vec![TaskState::Queued, TaskState::Paused]),
+                    ..Default::default()
+                })
+            };
+            fleet_edit::leave_flock(&path, &flock, &machine, queued).map_err(edit_error)?
         }
         FlockCmd::Remove { name } => {
             // With a head, the head checks and edits under the lock `task
             // run` takes, so no task can be queued in the flock in between.
             if head.is_live() {
-                let IpcResponse::Text(done) = ask(paths, IpcRequest::FlockRemove { name }).await?
-                else {
-                    unreachable!()
+                let resp = ask(paths, IpcRequest::FlockRemove { name }).await?;
+                let IpcResponse::Text(done) = resp else {
+                    return Err(unexpected(resp));
                 };
                 println!("{done}");
                 return Ok(());
             }
-            // With no head, the store check and the file edit are not atomic
-            // against a head that starts in between. That head could accept
-            // `task run --flock <name>` after the check and before the save;
-            // the reload then drops the flock and the task stays queued with
-            // no machine to take it (`pastor task close` recovers it). It
-            // needs one user to start a head and submit to this flock while
-            // removing it, so it is left open; closing it would take a file
-            // lock shared by this edit and daemon startup.
+            // With no head, the fleet lock covers the store check and the
+            // file edit: a head starting meanwhile waits for the save and
+            // reads the file without the flock, so it never queues a task in
+            // it, and one that already listens stops the edit.
+            let _lock = offline_fleet_lock(paths)?;
             let queued: Vec<String> = open_store(paths)?
                 .list_tasks(&TaskFilter {
                     states: Some(vec![TaskState::Queued]),
@@ -2012,7 +2565,7 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
         FlockCmd::Default {
             cmd: FlockDefaultCmd::Show,
         } => {
-            println!("{}", Flock::load(&path)?.default_flock());
+            println!("{}", head_flock(paths).await?.default_flock());
             return Ok(());
         }
         FlockCmd::Default {
@@ -2035,10 +2588,11 @@ async fn flock(paths: &Paths, cmd: FlockCmd, head: Head) -> anyhow::Result<()> {
 /// `flock list`: the flock file, the queued tasks, and with a head running
 /// the live agents on each flock's machines.
 async fn flock_list(paths: &Paths, wide: bool, json: bool, head: Head) -> anyhow::Result<()> {
-    let f = Flock::load(&paths.flock_file())?;
+    let f = head_flock(paths).await?;
     let live = if head.is_live() {
-        let IpcResponse::Machines(ms) = ask(paths, IpcRequest::FlockList).await? else {
-            unreachable!()
+        let resp = ask(paths, IpcRequest::FlockList).await?;
+        let IpcResponse::Machines(ms) = resp else {
+            return Err(unexpected(resp));
         };
         Some(ms)
     } else {
@@ -2063,6 +2617,59 @@ async fn flock_list(paths: &Paths, wide: bool, json: bool, head: Head) -> anyhow
         );
     }
     Ok(())
+}
+
+/// The head's copy of `file` when the head is on another machine, fetched
+/// with `FileGet`, with the path it has there; `None` with the head here,
+/// whose files are this machine's.
+async fn head_file(
+    paths: &Paths,
+    file: ConfigFile,
+) -> anyhow::Result<Option<(std::path::PathBuf, String)>> {
+    if pastor::ipc::remote_head().is_none() {
+        return Ok(None);
+    }
+    let resp = ask(
+        paths,
+        IpcRequest::FileGet {
+            file: file.to_string(),
+        },
+    )
+    .await?;
+    let IpcResponse::File(got) = resp else {
+        return Err(unexpected(resp));
+    };
+    Ok(Some((got.path.into(), got.text)))
+}
+
+/// flock.toml as the head reads it: the remote head's, else this machine's.
+async fn head_flock(paths: &Paths) -> anyhow::Result<Flock> {
+    match head_file(paths, ConfigFile::Flock).await? {
+        Some((path, text)) => Flock::parse(&path, &text),
+        None => Flock::load(&paths.flock_file()),
+    }
+}
+
+/// pastor.toml as the head reads it: the remote head's, else this
+/// machine's.
+async fn head_config(paths: &Paths) -> anyhow::Result<PastorConfig> {
+    match head_file(paths, ConfigFile::Config).await? {
+        Some((path, text)) => PastorConfig::parse(&path, &text),
+        None => PastorConfig::load(&paths.config_file()),
+    }
+}
+
+/// `m` as this machine reaches it. The head's own machine (`local`) is,
+/// seen from a CLI with a remote head, the head's ssh destination.
+fn reach_from_here(m: &MachineConfig) -> MachineConfig {
+    let mut m = m.clone();
+    if m.local
+        && let Some(r) = pastor::ipc::remote_head()
+    {
+        m.local = false;
+        m.ssh = Some(r.ssh.clone());
+    }
+    m
 }
 
 /// The queued tasks, from the head when one runs, else from the store.
@@ -2148,22 +2755,60 @@ fn attach_remote_command(session: &str, agent: &str) -> String {
     )
 }
 
+/// The code `task attach` refuses a paused task with.
+const TASK_PAUSED: &str = "task_paused";
+
+/// Why `task attach` refuses `t`: a paused task's session resumes on its
+/// own when a slot frees, and a second `claude --resume` of it in a pane of
+/// attach's would put two agents on one conversation. `None` for any
+/// other state.
+fn paused_attach_refusal(t: &Task) -> Option<String> {
+    (t.state == TaskState::Paused).then(|| {
+        let by = t
+            .pause
+            .paused_for
+            .map(|id| format!(" for {}", Task::agent_name_for(id)))
+            .unwrap_or_default();
+        format!(
+            "{} is paused{by}; its session resumes in a new pane on {} when a slot there frees. Close it (`pastor task close {}`) to give it up",
+            t.display_id(),
+            t.machine.as_deref().unwrap_or("its machine"),
+            t.display_id()
+        )
+    })
+}
+
 async fn attach(paths: &Paths, task: &str) -> anyhow::Result<()> {
     let id = task_id(task);
-    let t = open_store(paths)?
-        .get_task(id)?
-        .unwrap_or_else(|| fail("task_not_found", task));
+    // A remote head's task, its flock.toml and its pastor.toml; the pane
+    // itself is reached from here.
+    let t = if pastor::ipc::remote_head().is_some() {
+        let resp = ask(paths, IpcRequest::TaskShow { id }).await?;
+        let IpcResponse::Task(t) = resp else {
+            return Err(unexpected(resp));
+        };
+        t
+    } else {
+        open_store(paths)?
+            .get_task(id)?
+            .unwrap_or_else(|| fail("task_not_found", task))
+    };
     let (Some(machine), Some(mut agent)) = (t.machine.clone(), t.agent_name.clone()) else {
         fail("no_agent", &format!("{} has no agent yet", t.display_id()))
     };
-    let f = Flock::load(&paths.flock_file())?;
-    let m = f
-        .get(&machine)
-        .unwrap_or_else(|| fail("unknown_machine", &machine));
+    if let Some(why) = paused_attach_refusal(&t) {
+        fail(TASK_PAUSED, &why);
+    }
+    let f = head_flock(paths).await?;
+    let m = reach_from_here(
+        f.get(&machine)
+            .unwrap_or_else(|| fail("unknown_machine", &machine)),
+    );
+    let m = &m;
     // Its pane is gone: a Claude task's own session opens again in a new
     // pane, and the task stays as it is.
     if !t.state.occupies_pane() {
-        let agents = PastorConfig::load(&paths.config_file())?.agents;
+        let agents = head_config(paths).await?.agents;
         if let Some(why) = pastor::reopen::why_not(&t, &agents) {
             fail(
                 "no_agent",
@@ -2234,10 +2879,11 @@ fn authorized_key(flock: &std::path::Path, machine: &str, key: &str) -> anyhow::
 }
 
 async fn open(paths: &Paths, machine: &str) -> anyhow::Result<()> {
-    let f = Flock::load(&paths.flock_file())?;
-    let m = f
-        .get(machine)
-        .unwrap_or_else(|| fail("unknown_machine", machine));
+    let f = head_flock(paths).await?;
+    let m = reach_from_here(
+        f.get(machine)
+            .unwrap_or_else(|| fail("unknown_machine", machine)),
+    );
     let err = if let Some(target) = &m.ssh {
         std::process::Command::new("herdr")
             .args(["--remote", target, "--session", &m.session])
@@ -2297,16 +2943,16 @@ fn standalone(paths: &Paths) -> anyhow::Result<Scheduler> {
 
 async fn tick(paths: &Paths, a: TickArgs, head: Head) -> anyhow::Result<()> {
     let runs = if head.is_live() {
-        let IpcResponse::Runs(runs) = ask(
+        let resp = ask(
             paths,
             IpcRequest::Tick {
                 job: a.job,
                 dry_run: a.dry_run,
             },
         )
-        .await?
-        else {
-            unreachable!()
+        .await?;
+        let IpcResponse::Runs(runs) = resp else {
+            return Err(unexpected(resp));
         };
         runs
     } else {
@@ -2321,8 +2967,9 @@ async fn tick(paths: &Paths, a: TickArgs, head: Head) -> anyhow::Result<()> {
 }
 
 async fn reload(paths: &Paths) -> anyhow::Result<()> {
-    let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::Reload).await? else {
-        unreachable!()
+    let resp = ask(paths, IpcRequest::Reload).await?;
+    let IpcResponse::Jobs(jobs) = resp else {
+        return Err(unexpected(resp));
     };
     print_jobs(&jobs, false, false)
 }
@@ -2341,8 +2988,9 @@ async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
     match cmd {
         JobCmd::List { wide, json } => {
             let jobs = if head.is_live() {
-                let IpcResponse::Jobs(jobs) = ask(paths, IpcRequest::JobList).await? else {
-                    unreachable!()
+                let resp = ask(paths, IpcRequest::JobList).await?;
+                let IpcResponse::Jobs(jobs) = resp else {
+                    return Err(unexpected(resp));
                 };
                 jobs
             } else {
@@ -2358,8 +3006,9 @@ async fn job(paths: &Paths, cmd: JobCmd, head: Head) -> anyhow::Result<()> {
         JobCmd::Enable { name } => toggle(paths, &name, true, head).await?,
         JobCmd::Disable { name } => toggle(paths, &name, false, head).await?,
         JobCmd::Run { name } => {
-            let IpcResponse::Text(msg) = ask(paths, IpcRequest::JobRun { name }).await? else {
-                unreachable!()
+            let resp = ask(paths, IpcRequest::JobRun { name }).await?;
+            let IpcResponse::Text(msg) = resp else {
+                return Err(unexpected(resp));
             };
             println!("{msg}");
         }
@@ -2392,8 +3041,9 @@ fn is_local_job(paths: &Paths, name: &str) -> bool {
 
 /// `job list` with a head elsewhere: the head's jobs, then this machine's.
 async fn shepherd_job_list(paths: &Paths, head: &str, json: bool) -> anyhow::Result<()> {
-    let IpcResponse::Jobs(head_jobs) = ask(paths, IpcRequest::JobList).await? else {
-        unreachable!()
+    let resp = ask(paths, IpcRequest::JobList).await?;
+    let IpcResponse::Jobs(head_jobs) = resp else {
+        return Err(unexpected(resp));
     };
     let here = local_jobs(paths).await?;
     if json {
@@ -2410,8 +3060,9 @@ async fn shepherd_job_list(paths: &Paths, head: &str, json: bool) -> anyhow::Res
 /// running, the job files and the last state it saved.
 async fn local_jobs(paths: &Paths) -> anyhow::Result<Vec<JobStatus>> {
     if local_serve(paths).await? {
-        let IpcResponse::Jobs(jobs) = ask_here(paths, IpcRequest::JobList).await? else {
-            unreachable!()
+        let resp = ask_here(paths, IpcRequest::JobList).await?;
+        let IpcResponse::Jobs(jobs) = resp else {
+            return Err(unexpected(resp));
         };
         return Ok(jobs);
     }
@@ -2455,14 +3106,9 @@ async fn local_serve(paths: &Paths) -> anyhow::Result<bool> {
 /// `ask` of this machine's own serve, never the head: for its own jobs
 /// while a head is set elsewhere.
 async fn ask_here(paths: &Paths, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    match request(&paths.socket_file(), &req).await {
-        Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
-        Ok(resp) => Ok(resp),
-        Err(err) => {
-            let (code, message) = request_failure(&err);
-            fail(&code, &message)
-        }
-    }
+    Ok(pastor::cli::reply(
+        request(&paths.socket_file(), &req).await,
+    )?)
 }
 
 /// A job whose file is here, with a head elsewhere: this machine's serve
@@ -2477,8 +3123,9 @@ async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
                     "this machine's pastor serve is not running; start it to run a job here",
                 ));
             }
-            let IpcResponse::Text(msg) = ask_here(paths, IpcRequest::JobRun { name }).await? else {
-                unreachable!()
+            let resp = ask_here(paths, IpcRequest::JobRun { name }).await?;
+            let IpcResponse::Text(msg) = resp else {
+                return Err(unexpected(resp));
             };
             println!("{msg}");
         }
@@ -2504,8 +3151,9 @@ async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
                 job: Some(name),
                 ..Default::default()
             };
-            let IpcResponse::Tasks(tasks) = ask(paths, IpcRequest::List { filter }).await? else {
-                unreachable!()
+            let resp = ask(paths, IpcRequest::List { filter }).await?;
+            let IpcResponse::Tasks(tasks) = resp else {
+                return Err(unexpected(resp));
             };
             d.tasks = tasks.into_iter().take(pastor::describe::RECENT).collect();
             print_description(&d, json, pastor::describe::job_text)?;
@@ -2515,7 +3163,22 @@ async fn local_job(paths: &Paths, cmd: JobCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `toggle`'s own guard: `job enable|disable` reaches this machine's serve
+/// with no head to ask about the caller's role (the shepherd keeps no task
+/// store, `shepherd.rs`), so a task caller is refused unless
+/// `agents_change_fleet` is on, orchestrator or not.
 async fn local_toggle(paths: &Paths, name: &str, enabled: bool) -> anyhow::Result<()> {
+    if let Some(task) = pastor::ipc::caller_task()
+        && !agents_change_fleet(paths)
+    {
+        return Err(CliError::err(
+            "agent_refused",
+            format!(
+                "{task} is an agent pastor started; this machine's own jobs have no head to check its role, so it may not {} a job",
+                if enabled { "enable" } else { "disable" }
+            ),
+        ));
+    }
     set_enabled(&ConfigFile::Job(name.to_string()).path(paths)?, enabled)?;
     let verb = if enabled { "enabled" } else { "disabled" };
     println!("{verb} {name}; {}", reload_here(paths).await?);
@@ -2550,15 +3213,15 @@ async fn edit_file(paths: &Paths, file: ConfigFile, head: Head) -> anyhow::Resul
         }
         return Ok(());
     }
-    let IpcResponse::File(got) = ask(
+    let resp = ask(
         paths,
         IpcRequest::FileGet {
             file: file.to_string(),
         },
     )
-    .await?
-    else {
-        unreachable!()
+    .await?;
+    let IpcResponse::File(got) = resp else {
+        return Err(unexpected(resp));
     };
     let label = std::path::PathBuf::from(&got.path);
     let mut saved = String::new();
@@ -2568,8 +3231,9 @@ async fn edit_file(paths: &Paths, file: ConfigFile, head: Head) -> anyhow::Resul
             text: text.to_string(),
             base_hash: got.hash.clone(),
         };
-        let IpcResponse::Text(msg) = ask_or_refused(paths, req).await? else {
-            unreachable!()
+        let resp = ask(paths, req).await?;
+        let IpcResponse::Text(msg) = resp else {
+            return Err(unexpected(resp));
         };
         saved = msg;
         Ok(())
@@ -2600,8 +3264,21 @@ fn ask_reopen() -> bool {
     }
 }
 
-async fn config_edit(paths: &Paths, head: Head) -> anyhow::Result<()> {
-    edit_file(paths, ConfigFile::Config, head).await
+/// `config edit`: the head's pastor.toml. With `--local` and a head on
+/// another machine, this machine's, which its headless serve reads; with the
+/// head here the two are the same file.
+async fn config_edit(paths: &Paths, local: bool, head: Head) -> anyhow::Result<()> {
+    if !(local && pastor::ipc::remote_head().is_some()) {
+        return edit_file(paths, ConfigFile::Config, head).await;
+    }
+    let path = paths.config_file();
+    let check = ConfigFile::Config.checker(paths)?;
+    let editor = pastor::edit::editor();
+    match pastor::edit::edit_here(&path, &editor, &check, &mut |_| ask_reopen()).await? {
+        Outcome::Unchanged => println!("no changes to {}", path.display()),
+        Outcome::Saved => println!("saved {}; {}", path.display(), reload_here(paths).await?),
+    }
+    Ok(())
 }
 
 /// Tasks matching `filter`, from the head when one runs, else the store.
@@ -2611,8 +3288,9 @@ async fn tasks_matching(
     filter: TaskFilter,
 ) -> anyhow::Result<Vec<Task>> {
     if head.is_live() {
-        let IpcResponse::Tasks(ts) = ask(paths, IpcRequest::List { filter }).await? else {
-            unreachable!()
+        let resp = ask(paths, IpcRequest::List { filter }).await?;
+        let IpcResponse::Tasks(ts) = resp else {
+            return Err(unexpected(resp));
         };
         Ok(ts)
     } else {
@@ -2641,15 +3319,15 @@ fn print_description<T: serde::Serialize>(
 
 async fn job_describe(paths: &Paths, name: &str, json: bool, head: Head) -> anyhow::Result<()> {
     let d = if head.is_live() {
-        let IpcResponse::Job(d) = ask(
+        let resp = ask(
             paths,
             IpcRequest::JobDescribe {
                 name: name.to_string(),
             },
         )
-        .await?
-        else {
-            unreachable!()
+        .await?;
+        let IpcResponse::Job(d) = resp else {
+            return Err(unexpected(resp));
         };
         d
     } else {
@@ -2671,8 +3349,9 @@ async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> 
         let req = IpcRequest::MachineDescribe {
             name: name.to_string(),
         };
-        let IpcResponse::MachineDescription(d) = ask(paths, req).await? else {
-            unreachable!()
+        let resp = ask(paths, req).await?;
+        let IpcResponse::MachineDescription(d) = resp else {
+            return Err(unexpected(resp));
         };
         return print_description(&d, json, pastor::describe::machine_text);
     }
@@ -2706,8 +3385,9 @@ async fn flock_describe(paths: &Paths, name: &str, json: bool, head: Head) -> an
         let req = IpcRequest::FlockDescribe {
             name: name.to_string(),
         };
-        let IpcResponse::FlockDescription(d) = ask(paths, req).await? else {
-            unreachable!()
+        let resp = ask(paths, req).await?;
+        let IpcResponse::FlockDescription(d) = resp else {
+            return Err(unexpected(resp));
         };
         return print_description(&d, json, pastor::describe::flock_text);
     }
@@ -2730,7 +3410,8 @@ async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow:
         return Err(CliError::err(
             "agent_refused",
             format!(
-                "{task} is an agent pastor started; with no pastor serve running to check its role, it may not disable a job"
+                "{task} is an agent pastor started; with no pastor serve running to check its role, it may not {} a job",
+                if enabled { "enable" } else { "disable" }
             ),
         ));
     }
@@ -2739,8 +3420,9 @@ async fn toggle(paths: &Paths, name: &str, enabled: bool, head: Head) -> anyhow:
             name: name.to_string(),
             enabled,
         };
-        let IpcResponse::Text(done) = ask(paths, req).await? else {
-            unreachable!()
+        let resp = ask(paths, req).await?;
+        let IpcResponse::Text(done) = resp else {
+            return Err(unexpected(resp));
         };
         println!("{done}");
         return Ok(());
@@ -2791,12 +3473,13 @@ mod tests {
             &["pastor", "task", "retry", "t-1"],
             &["pastor", "task", "send", "t-1", "go"],
             &["pastor", "job", "disable", "j"],
+            &["pastor", "task", "close", "t-1"],
+            &["pastor", "job", "enable", "j"],
         ] {
             assert!(orchestrator_may(&parse(argv)), "{argv:?}");
         }
         for argv in [
-            &["pastor", "task", "close", "t-1"][..],
-            &["pastor", "job", "enable", "j"],
+            &["pastor", "task", "prune", "--done", "--older-than", "1d"][..],
             &["pastor", "job", "run", "j"],
             &["pastor", "machine", "add", "m", "--local"],
         ] {
@@ -2937,6 +3620,119 @@ mod tests {
         assert!(changes_fleet(&parse(&[
             "pastor", "queue", "move", "t-1", "--to", "2"
         ])));
+    }
+
+    /// `flock join|leave` are fleet edits: an agent pastor started may not
+    /// run them, and they need a head that knows them.
+    #[test]
+    fn flock_join_and_leave_change_the_fleet() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        for argv in [
+            &["pastor", "flock", "join", "work", "desk"][..],
+            &["pastor", "flock", "join", "work", "desk", "--max", "2"],
+            &["pastor", "flock", "leave", "work", "desk"],
+            &["pastor", "flock", "add", "work", "desk"],
+        ] {
+            assert!(changes_fleet(&parse(argv)), "{argv:?}");
+            assert_eq!(
+                protocol_need(&parse(argv)).map(|n| n.0),
+                Some(pastor::ipc::JOIN_PROTOCOL),
+                "{argv:?}"
+            );
+        }
+        assert_ne!(
+            protocol_need(&parse(&["pastor", "flock", "add", "work"])).map(|n| n.0),
+            Some(pastor::ipc::JOIN_PROTOCOL)
+        );
+    }
+
+    /// `--preempt` needs a head that knows pausing; without it the task
+    /// would wait behind low work.
+    #[test]
+    fn preempt_needs_a_head_that_knows_it() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
+        assert_eq!(
+            need(&[
+                "pastor",
+                "task",
+                "run",
+                "hi",
+                "--priority",
+                "critical",
+                "--preempt"
+            ]),
+            Some(pastor::ipc::PREEMPT_PROTOCOL)
+        );
+        assert_eq!(
+            need(&["pastor", "task", "priority", "t-1", "critical", "--preempt"]),
+            Some(pastor::ipc::PREEMPT_PROTOCOL)
+        );
+    }
+
+    /// `task run --summary` needs a head that knows the setting; a run
+    /// without it does not.
+    #[test]
+    fn summary_setting_needs_a_head_that_knows_it() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
+        assert_eq!(
+            need(&["pastor", "task", "run", "hi", "--summary", "require"]),
+            Some(pastor::ipc::SUMMARY_MODE_PROTOCOL)
+        );
+        assert_ne!(
+            need(&["pastor", "task", "run", "hi"]),
+            Some(pastor::ipc::SUMMARY_MODE_PROTOCOL)
+        );
+        assert!(
+            Cli::try_parse_from(["pastor", "task", "run", "hi", "--summary", "always"]).is_err()
+        );
+    }
+
+    /// `task attach` refuses a paused task: its session resumes on its own,
+    /// and a second resume would put two agents on one conversation.
+    #[test]
+    fn attach_refuses_a_paused_task() {
+        let mut t: Task = serde_json::from_value(serde_json::json!({
+            "id": 4, "job": "run", "item": null, "prompt": "p",
+            "spec": {"agent": "claude"}, "machine": "pi-1", "workspace_id": null,
+            "pane_id": null, "agent_name": "t-4", "state": "running", "error": null,
+            "last_completion_seq": null,
+            "created_at": "2026-09-28T10:00:00Z", "started_at": null,
+            "finished_at": null, "updated_at": "2026-09-28T10:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(paused_attach_refusal(&t), None);
+        t.state = TaskState::Paused;
+        t.pause.paused_for = Some(9);
+        let why = paused_attach_refusal(&t).unwrap();
+        assert!(why.starts_with("t-4 is paused for t-9;"), "{why}");
+        assert!(why.contains("pi-1"), "{why}");
+    }
+
+    /// `task run --label` needs a head that settles and renders labels: an
+    /// older one would name the workspace `t-N` without a word. A bad
+    /// template is refused before anything is sent.
+    #[test]
+    fn a_label_needs_a_head_that_knows_it() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        let need = |argv: &[&str]| protocol_need(&parse(argv)).map(|n| n.0);
+        assert_eq!(
+            need(&["pastor", "task", "run", "hi", "--label", "{{ machine }}"]),
+            Some(pastor::ipc::LABEL_PROTOCOL)
+        );
+        let Command::Task {
+            cmd: TaskCmd::Run(a),
+        } = parse(&["pastor", "task", "run", "hi", "--label", "x/{{ task.id }}"])
+        else {
+            panic!()
+        };
+        let spec = run_spec(&a, &PastorConfig::default()).unwrap();
+        assert_eq!(spec.label.template.as_deref(), Some("x/{{ task.id }}"));
+        let err = Cli::try_parse_from(["pastor", "task", "run", "hi", "--label", "{{ nope }}"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown placeholder"), "{err}");
     }
 
     /// `task run --priority` and `task priority` need a head that knows
@@ -3216,6 +4012,16 @@ mod tests {
                 ..Default::default()
             }
         );
+        // Sent as asked, so the head knows they win over the flock's.
+        let a = run_args(&["hi", "--timeout", "5m", "--place", "own"]);
+        assert_eq!(
+            agent_choice(&a),
+            AgentChoice {
+                timeout_secs: Some(300),
+                place: Some(pastor::task::Place::Own),
+                ..Default::default()
+            }
+        );
     }
 
     fn list_args(argv: &[&str]) -> ListArgs {
@@ -3231,8 +4037,8 @@ mod tests {
 
     #[test]
     fn a_busy_head_is_a_timeout_not_a_missing_daemon() {
-        let (code, message) =
-            request_failure(&RequestError::Timeout(std::time::Duration::from_secs(120)));
+        let CliError { code, message } =
+            pastor::cli::request_error(&RequestError::Timeout(std::time::Duration::from_secs(120)));
         assert_eq!(code, "timeout");
         assert!(message.contains("did not answer within 120s"), "{message}");
         assert!(message.contains("may still complete"), "{message}");
@@ -3247,8 +4053,9 @@ mod tests {
             std::io::ErrorKind::NotFound,
         ] {
             let err = std::io::Error::from(kind);
-            let (code, message) = request_failure(&RequestError::Connect(err));
-            assert_eq!(code, "runtime_error");
+            let CliError { code, message } =
+                pastor::cli::request_error(&RequestError::Connect(err));
+            assert_eq!(code, "daemon_not_running");
             assert!(message.contains("not running"), "{kind:?}: {message}");
             assert!(message.contains("start it with"), "{kind:?}: {message}");
         }
@@ -3263,7 +4070,8 @@ mod tests {
             std::io::ErrorKind::Other,
         ] {
             let err = std::io::Error::from(kind);
-            let (code, message) = request_failure(&RequestError::Connect(err));
+            let CliError { code, message } =
+                pastor::cli::request_error(&RequestError::Connect(err));
             assert_eq!(code, "runtime_error");
             assert!(!message.contains("not running"), "{kind:?}: {message}");
             assert!(!message.contains("start it"), "{kind:?}: {message}");
@@ -3301,6 +4109,7 @@ mod tests {
                 TaskState::Starting,
                 TaskState::Running,
                 TaskState::Blocked,
+                TaskState::Paused,
             ]
         );
         for s in [
@@ -3429,6 +4238,37 @@ mod tests {
         let (channel, _, _, _, error) = probe_fields(Err(err), None);
         assert_eq!(channel, "error");
         assert!(error.unwrap().contains("boom"));
+    }
+
+    /// With no head, `machine list` probes each machine, but a pull machine
+    /// is never connected to: its row comes from flock.toml and the store,
+    /// not from the herdr that happens to run here.
+    #[tokio::test]
+    async fn a_pull_machine_is_not_probed_without_a_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        let f = Flock::parse(
+            std::path::Path::new("flock.toml"),
+            "[[machine]]\nname = \"laptop\"\npull = true\nmax_agents = 2\n",
+        )
+        .unwrap();
+        let store = Store::open(&paths.db_file()).unwrap();
+        let row = probe_machine(
+            f.get("laptop").unwrap(),
+            &f,
+            &PastorConfig::default(),
+            &paths,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.host, "pull");
+        assert_eq!(row.endpoint, pastor::machine::PULL_ENDPOINT);
+        assert_eq!(row.channel, "not probed");
+        assert_eq!(row.error, None);
+        assert_eq!(row.live, Some(0));
+        assert_eq!(row.max_agents, 2);
     }
 
     #[test]
@@ -3814,6 +4654,72 @@ mod tests {
         assert!(check_commands(SKILL).0 > 20);
     }
 
+    /// The homepage's live terminal types the commands in
+    /// `docs/website/data/demo.toml`; each must be a real command with real
+    /// long flags, as the docs' commands are, or the demo would show a CLI
+    /// that does not exist.
+    #[test]
+    fn website_demo_commands_are_real() {
+        let path = skills_dir()
+            .parent()
+            .unwrap()
+            .join("docs/website/data/demo.toml");
+        let demo: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let cmds: Vec<&str> = demo["act"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|act| act["step"].as_array().unwrap())
+            .filter_map(|step| step.get("cmd").and_then(|c| c.as_str()))
+            .collect();
+        assert!(cmds.len() > 10, "only {} commands in {path:?}", cmds.len());
+        for cmd in &cmds {
+            assert!(
+                cmd.starts_with("pastor "),
+                "{cmd:?} is not a pastor command"
+            );
+        }
+        let (checked, wrong) = check_commands(&format!("```sh\n{}\n```\n", cmds.join("\n")));
+        assert_eq!(checked, cmds.len(), "{cmds:?}");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The docs are five sections, each an index with its pages, and every
+    /// docs link on the homepage lands on one of them, so a moved or renamed
+    /// page shows here rather than as a dead link.
+    #[test]
+    fn website_sections_and_home_links_resolve() {
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let docs = site.join("content/docs");
+        for section in ["start", "concepts", "deploy", "examples", "reference"] {
+            let dir = docs.join(section);
+            assert!(dir.join("_index.md").is_file(), "no {section}/_index.md");
+            let pages = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name() != "_index.md")
+                .count();
+            assert!(pages > 0, "{section} has no pages");
+        }
+        let home = std::fs::read_to_string(site.join("layouts/home.html")).unwrap();
+        assert!(
+            home.contains("what you can do"),
+            "no \"what you can do\" pane"
+        );
+        let mut links = 0;
+        for link in home.split("\"docs/").skip(1) {
+            let path = link.split('"').next().unwrap().trim_end_matches('/');
+            let path = path.split('#').next().unwrap();
+            let page = docs.join(format!("{path}.md"));
+            let index = docs.join(path).join("_index.md");
+            assert!(
+                path.is_empty() || page.is_file() || index.is_file(),
+                "home links docs/{path}/, which is no page"
+            );
+            links += 1;
+        }
+        assert!(links > 5, "only {links} docs links on the home");
+    }
+
     /// The manual's remote head section lists which commands go to the head,
     /// which stay here, and names the ones refused; each list must be what
     /// `remote_route` does.
@@ -3844,13 +4750,49 @@ mod tests {
         )) {
             assert_eq!(route(&words), RemoteRoute::Head, "{words}");
         }
-        let local = between("Local on purpose, as with no head set:", "\n\n");
-        for words in spans(&local).into_iter().filter(|w| w != "flock.toml") {
+        for words in spans(&between("Local on purpose, as with no head set:", "\n\n")) {
             assert_eq!(route(&words), RemoteRoute::Here, "{words}");
         }
-        let refused = between("Every other command", "\n\n");
-        assert!(refused.contains("`machine open`"), "{refused}");
-        assert_eq!(route("machine open"), RemoteRoute::Unsupported);
+        let refused = between("Every other command runs on the head only.", "\n\n");
+        let refused = spans(&refused);
+        assert_eq!(refused[0], "machine authorized-key");
+        assert!(matches!(route(&refused[0]), RemoteRoute::Unsupported(_)));
+    }
+
+    /// A job whose file is here runs and is edited here, not by the remote
+    /// head, so the caller's guard here applies to it; the head's own jobs
+    /// are the head's to judge.
+    #[test]
+    fn a_local_job_is_not_the_remote_heads_to_judge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        std::fs::create_dir_all(paths.jobs_dir()).unwrap();
+        std::fs::write(paths.jobs_dir().join("here.toml"), "").unwrap();
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).unwrap().command.unwrap();
+        for verb in ["run", "edit", "enable", "disable"] {
+            let here = parse(&["pastor", "job", verb, "here"]);
+            assert!(!head_decides(&paths, &here, true), "{verb}");
+            let theirs = parse(&["pastor", "job", verb, "theirs"]);
+            assert!(head_decides(&paths, &theirs, true), "{verb}");
+            assert!(!head_decides(&paths, &theirs, false), "{verb}");
+        }
+        assert!(head_decides(
+            &paths,
+            &parse(&["pastor", "job", "list"]),
+            true
+        ));
+    }
+
+    /// Attach and open stay here with a remote head, but ask it for the
+    /// task and its files, so they are probed for `FILE_PROTOCOL`.
+    #[test]
+    fn attach_and_open_read_the_remote_heads_files() {
+        for words in ["task attach", "machine open"] {
+            let command = sample_command(words);
+            assert_eq!(remote_route(&command), RemoteRoute::Here, "{words}");
+            assert!(reads_head_files(&command), "{words}");
+        }
+        assert!(!reads_head_files(&sample_command("completions")));
     }
 
     /// A parsed command for `words`, with what its required arguments need.
@@ -3858,7 +4800,14 @@ mod tests {
         let extra: &[&str] = match words {
             "task run" | "task describe" | "task read" | "task attach" | "task retry"
             | "task close" | "task done" | "job run" | "machine open" => &["x"],
-            "task send" | "task priority" => &["x", "y"],
+            "flock add" | "flock remove" | "flock describe" | "machine remove"
+            | "machine describe" | "profile describe" => &["x"],
+            "machine add" => &["x", "--local"],
+            "machine authorized-key" => &["x", "--key", "-"],
+            "flock default" => &["show"],
+            "task send" | "task priority" | "machine move" | "trust add" | "trust remove" => {
+                &["x", "y"]
+            }
             "queue move" => &["x", "--top"],
             "task prune" => &["--older-than", "1d", "--done"],
             "completions" => &["bash"],

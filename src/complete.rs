@@ -19,6 +19,7 @@ use crate::task::LIVE_STATES;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Job,
+    Orchestrator,
     Flock,
     Machine,
     Task,
@@ -39,8 +40,8 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         ([_, "add"], "name") => None,
         (["queue", "move"], "task" | "before" | "after") => Some(Kind::QueuedTask),
         (_, "flock") => Some(Kind::Flock),
-        (_, "machine") => Some(Kind::Machine),
-        (_, "task") => Some(Kind::Task),
+        (_, "machine") | (["flock", "add"], "machines") => Some(Kind::Machine),
+        (_, "task") | (["task", "close"], "tasks") => Some(Kind::Task),
         (_, "job") => Some(Kind::Job),
         (_, "model") => Some(Kind::Model),
         (_, "profile") => Some(Kind::Profile),
@@ -48,6 +49,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         (["connector", ..], "id") => Some(Kind::Connector),
         (["watch"], "connectors") => Some(Kind::Connector),
         (["job", _], "name") => Some(Kind::Job),
+        (["orchestrator", _], "name") => Some(Kind::Orchestrator),
         (["flock", _], "name") => Some(Kind::Flock),
         (["flock", "default", "set"], "name") => Some(Kind::Flock),
         (["machine", _], "name") => Some(Kind::Machine),
@@ -103,7 +105,12 @@ pub fn slot(root: &Command, words: &[String]) -> Option<Kind> {
             let (flag, _) = current.split_once('=')?;
             option(node, flag).filter(|a| a.get_action().takes_values())?
         }
-        None => node.get_positionals().nth(positionals)?,
+        // Past the last positional, one that takes many values takes more.
+        None => node.get_positionals().nth(positionals).or_else(|| {
+            node.get_positionals()
+                .last()
+                .filter(|a| matches!(a.get_action(), clap::ArgAction::Append))
+        })?,
     };
     kind_of(&path, arg.get_id().as_str())
 }
@@ -156,6 +163,7 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
                 (name, desc)
             })
             .collect(),
+        Kind::Orchestrator => dir_names(&paths.orchestrators_dir(), Some("toml")),
         Kind::Connector => dir_names(&paths.connectors_dir(), None),
         Kind::Flock => {
             let Ok(flock) = Flock::load(&paths.flock_file()) else {
@@ -183,7 +191,11 @@ pub fn names(paths: &Paths, kind: Kind) -> Vec<(String, Option<String>)> {
                 .iter()
                 .map(|m| {
                     let desc = crate::config::clean_description(m.description.as_deref())
-                        .unwrap_or_else(|| flock.flock_of(m).to_string());
+                        .unwrap_or_else(|| {
+                            let names: Vec<&str> =
+                                flock.flocks_of(m).into_iter().map(|(f, _)| f).collect();
+                            names.join(", ")
+                        });
                     (m.name.clone(), Some(desc))
                 })
                 .collect()

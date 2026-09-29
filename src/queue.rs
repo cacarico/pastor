@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::age;
-use crate::dispatch::{Claim, MachineView, pick_machine_where};
+use crate::dispatch::{
+    Claim, MachineView, flock_held, mark_waiting_under_share, pick_machine_where,
+};
 use crate::task::Task;
 
 /// Where `pastor queue move` puts a task. Positions count from 1 over the
@@ -52,9 +54,9 @@ pub const QUEUE_HEADER: [&str; 7] = [
 pub const WAITING_FOR_MODEL: &str = "waiting for a machine";
 
 impl QueueEntry {
-    /// The machine it is pinned to, else its flock.
+    /// The machine it is pinned to (or paused on), else its flock.
     pub fn place(&self) -> String {
-        match &self.task.spec.machine {
+        match self.task.pinned_machine() {
             Some(m) => format!("machine {m}"),
             None => format!("flock {}", self.flock),
         }
@@ -69,7 +71,7 @@ impl QueueEntry {
     /// machine it is pinned to.
     pub fn matches(&self, flock: Option<&str>, machine: Option<&str>) -> bool {
         flock.is_none_or(|f| f == self.flock)
-            && machine.is_none_or(|m| self.task.spec.machine.as_deref() == Some(m))
+            && machine.is_none_or(|m| self.task.pinned_machine() == Some(m))
     }
 
     pub fn to_json(&self) -> Value {
@@ -82,7 +84,7 @@ impl QueueEntry {
             "priority": self.task.priority,
             "where": self.place(),
             "flock": self.flock,
-            "machine": self.task.spec.machine,
+            "machine": self.task.pinned_machine(),
             "from": self.from(),
             "waited_secs": waited,
             "why": self.why,
@@ -112,20 +114,21 @@ pub fn entries(
     accepts: &dyn Fn(&Task, &str) -> bool,
 ) -> Vec<QueueEntry> {
     let mut views = machines.to_vec();
-    queue
-        .into_iter()
-        .enumerate()
-        .map(|(i, task)| {
+    (0..queue.len())
+        .map(|i| {
+            let task = &queue[i];
             let flock = task
                 .flock
                 .clone()
                 .unwrap_or_else(|| default_flock.to_string());
-            let why = why_waiting(&task, &flock, &mut views, accepts);
+            let later = &queue[i + 1..];
+            mark_waiting_under_share(&mut views, &flock, later, default_flock, accepts);
+            let why = why_waiting(task, &flock, &mut views, accepts);
             QueueEntry {
                 pos: i + 1,
                 flock,
                 why,
-                task,
+                task: task.clone(),
             }
         })
         .collect()
@@ -145,31 +148,67 @@ fn why_waiting(
         return note.clone();
     }
     let claim = Claim::of(task);
+    // A paused task resumes only on its machine, whatever its flock.
+    if task.state == crate::task::TaskState::Paused {
+        let m = task.machine.as_deref().unwrap_or("-");
+        let by = task
+            .pause
+            .paused_for
+            .map(|id| format!("paused for {}; ", Task::agent_name_for(id)))
+            .unwrap_or_default();
+        return match views.iter_mut().find(|v| v.name == m) {
+            None => format!("{by}machine {m} is not in the flock"),
+            Some(v) if !v.healthy => format!("{by}machine {m} is not connected"),
+            Some(v) if v.has_room(claim) => {
+                v.live += 1;
+                v.live_jobs += usize::from(task.from_job());
+                format!("next pass: resumes on {m}")
+            }
+            Some(v) => format!("{by}machine {m} is full ({}/{})", v.live, v.max_agents),
+        };
+    }
     if let Some(m) = pick_machine_where(views, flock, &task.spec, claim, &|m| accepts(task, m)) {
         let v = views.iter_mut().find(|v| v.name == m).expect("picked");
-        v.live += 1;
+        v.take(flock, claim);
         return format!("next pass: {m} has room");
     }
     let tags = &task.spec.tags;
     let has_tags = |v: &MachineView| tags.iter().all(|t| v.tags.contains(t));
+    // The flock at its number on `v`, or past its share while another
+    // waits, as `dispatch_queued` notes it.
+    let at_number = |v: &MachineView| flock_held(v, flock);
     if let Some(pinned) = &task.spec.machine {
         return match views.iter().find(|v| &v.name == pinned) {
             None => format!("machine {pinned} is not in the flock"),
-            Some(v) if v.flock != flock => {
-                format!("machine {pinned} is in flock {}, not {flock}", v.flock)
+            Some(v) if !v.in_flock(flock) => {
+                let names: Vec<&str> = v.flocks.iter().map(|f| f.name.as_str()).collect();
+                let noun = if names.len() == 1 { "flock" } else { "flocks" };
+                format!(
+                    "machine {pinned} is in {noun} {}, not {flock}",
+                    names.join(", ")
+                )
             }
             Some(v) if !v.healthy => format!("machine {pinned} is not connected"),
             Some(v) if !has_tags(v) => format!("machine {pinned} lacks tags {}", tags.join(", ")),
+            Some(v) if v.has_room(claim) && at_number(v).is_some() => {
+                at_number(v).expect("checked")
+            }
             Some(v) => format!("machine {pinned} is full ({}/{})", v.live, v.max_agents),
         };
     }
-    let mine: Vec<&MachineView> = views.iter().filter(|v| v.flock == flock).collect();
+    let mine: Vec<&MachineView> = views.iter().filter(|v| v.in_flock(flock)).collect();
     if mine.is_empty() {
         format!("flock {flock} has no machines")
     } else if !mine.iter().any(|v| v.healthy) {
         format!("no machine in flock {flock} is connected")
     } else if !mine.iter().any(|v| v.healthy && has_tags(v)) {
         format!("no machine in flock {flock} has tags {}", tags.join(", "))
+    } else if let Some(why) = mine
+        .iter()
+        .filter(|v| v.healthy && has_tags(v) && v.has_room(claim))
+        .find_map(|v| at_number(v))
+    {
+        why
     } else {
         format!("flock {flock} is full")
     }
@@ -227,6 +266,8 @@ mod tests {
             priority: Priority::Normal,
             priority_from: None,
             queue_pos: id,
+            pause: Default::default(),
+            summary: None,
             created_at: now,
             started_at: None,
             finished_at: None,
@@ -244,7 +285,13 @@ mod tests {
             live,
             live_jobs: 0,
             healthy,
-            flock: flock.into(),
+            flocks: vec![crate::dispatch::FlockSeat {
+                name: flock.into(),
+                share: None,
+                max: None,
+                live,
+            }],
+            waiting_under_share: vec![],
         }
     }
 
@@ -264,6 +311,46 @@ mod tests {
             whys(vec![task(1, None, None), task(2, None, None)], &views),
             ["next pass: a has room", "flock default is full"]
         );
+    }
+
+    /// A paused job task that the simulation resumes takes the machine's
+    /// one job slot, so a job task queued behind it reads that slot as
+    /// taken instead of still free.
+    #[test]
+    fn a_resumed_paused_job_task_takes_the_job_slot_in_the_simulation() {
+        let mut paused = task(3, Some("default"), None);
+        paused.job = "board".into();
+        paused.state = TaskState::Paused;
+        paused.machine = Some("b".into());
+        let mut behind = task(4, Some("default"), None);
+        behind.job = "board".into();
+        let mut b = view("b", "default", 0, 0, true);
+        b.job_slots = 1;
+        assert_eq!(
+            whys(vec![paused, behind], &[b]),
+            ["next pass: resumes on b", "flock default is full",],
+            "the job slot the paused task takes is not free twice"
+        );
+    }
+
+    /// A paused task waits on the machine it was paused on, whatever its
+    /// flock or pin, and says for whom it was paused.
+    #[test]
+    fn a_paused_task_waits_on_its_own_machine() {
+        let mut paused = task(3, Some("default"), None);
+        paused.state = TaskState::Paused;
+        paused.machine = Some("b".into());
+        paused.pause.paused_for = Some(9);
+        let full = [
+            view("a", "default", 0, 2, true),
+            view("b", "work", 1, 1, true),
+        ];
+        let e = &entries(vec![paused.clone()], &full, "default", &|_, _| true)[0];
+        assert_eq!(e.why, "paused for t-9; machine b is full (1/1)");
+        assert_eq!(e.place(), "machine b");
+        assert!(e.matches(None, Some("b")));
+        let free = [view("b", "work", 0, 1, true)];
+        assert_eq!(whys(vec![paused], &free), ["next pass: resumes on b"]);
     }
 
     /// Each reason a flock or a pinned machine takes nothing is named.
@@ -301,6 +388,71 @@ mod tests {
                 "no machine in flock lab has tags gpu",
                 "waiting for a machine: no agent runs gpt",
                 "machine b is not connected",
+            ]
+        );
+    }
+
+    /// A flock at its number on a machine with room waits with that as the
+    /// reason, and the task behind it in another flock goes.
+    #[test]
+    fn a_flock_at_its_number_says_so_and_the_next_task_goes() {
+        let seat = |name: &str, max: u32, live: usize| crate::dispatch::FlockSeat {
+            name: name.into(),
+            share: None,
+            max: Some(max),
+            live,
+        };
+        let views = [MachineView {
+            flocks: vec![seat("default", 3, 0), seat("work", 2, 1)],
+            ..view("desk", "default", 1, 4, true)
+        }];
+        assert_eq!(
+            whys(
+                vec![
+                    task(1, Some("work"), None),
+                    task(2, Some("work"), Some("desk")),
+                    task(3, Some("work"), None),
+                    task(4, None, None),
+                ],
+                &views
+            ),
+            [
+                "next pass: desk has room",
+                "flock work is at 2 of 2 on desk",
+                "flock work is at 2 of 2 on desk",
+                "next pass: desk has room",
+            ]
+        );
+    }
+
+    /// A flock past its share waits while a flock under its share has a
+    /// task behind it; once that one has its slot, the next reads the
+    /// machine as idle enough. At its max it reads so.
+    #[test]
+    fn a_flock_past_its_share_waits_for_one_under_it() {
+        use crate::config::flock::FlockNumber;
+        let views = [MachineView {
+            flocks: vec![
+                crate::dispatch::FlockSeat::new("work", Some(FlockNumber::split(1, 3)), 1),
+                crate::dispatch::FlockSeat::new("home", Some(FlockNumber::plain(2)), 1),
+            ],
+            ..view("desk", "default", 2, 4, true)
+        }];
+        assert_eq!(
+            whys(
+                vec![
+                    task(1, Some("work"), None),
+                    task(2, Some("home"), None),
+                    task(3, Some("work"), None),
+                    task(4, Some("work"), None),
+                ],
+                &views
+            ),
+            [
+                "flock work is past its share on desk, at 1 of 1/3, while flock home waits under its share",
+                "next pass: desk has room",
+                "next pass: desk has room",
+                "flock work is full",
             ]
         );
     }

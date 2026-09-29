@@ -1,6 +1,7 @@
 # pastor
 
-**A personal control plane for running coding agents on machines I own.**
+**An agent orchestrator for a flock of machines.** Queue tasks, schedule
+jobs, and let pastor spread coding agents across your flock over ssh.
 
 [![CI](https://github.com/cacarico/pastor/actions/workflows/ci.yml/badge.svg)](https://github.com/cacarico/pastor/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/cacarico/pastor)](https://github.com/cacarico/pastor/releases)
@@ -68,7 +69,7 @@ someone else's cloud. The longer story is in [the blog post](https://cacari.co/p
 One line, no Rust toolchain and no sudo:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/cacarico/pastor/main/install.sh | sh
+curl -fsSL https://cacari.co/pastor/install.sh | sh
 ```
 
 It downloads the release for your OS and CPU, checks it against the
@@ -90,7 +91,7 @@ You also need:
 Each connector says what else it needs: `github-issues`, for example, uses an
 authenticated `gh`, `jq` and `sh` on the head.
 
-For a fleet you'll run for a while, [docs/recommended-setup.md](docs/recommended-setup.md)
+For a flock you'll run for a while, [docs/recommended-setup.md](docs/recommended-setup.md)
 says how to put it together: flocks per account, least-privilege credentials
 for agent machines, permissions, and the settings that keep agents moving.
 
@@ -101,8 +102,12 @@ Add the machines. The head can take tasks too:
 ```sh
 pastor machine add here --local        # this machine
 pastor machine add pi-1 user@pi-1      # a machine you can ssh to
-pastor setup systemd                   # run the head as a user service (setup launchd on macOS)
+pastor serve                           # start the head in the background
 ```
+
+`pastor serve status` shows it and `pastor serve stop` stops it; its log is
+`~/.local/state/pastor/serve.log`. To keep it up after a reboot, run it as a
+user service instead: `pastor setup systemd` (`setup launchd` on macOS).
 
 Give it something to do, then check on it:
 
@@ -202,12 +207,13 @@ notification. Writing one takes a manifest and a script in any language. See
 
 | To... | Run |
 |---|---|
-| see the fleet | `pastor machine list`, `pastor machine describe pi-1` |
+| see your machines | `pastor machine list`, `pastor machine describe pi-1` |
 | start one task | `pastor task run "..." --repo DIR [--worktree] [--machine M]` |
 | follow tasks | `pastor task list`, `pastor task describe t-3`, `pastor events --follow` |
 | talk to an agent | `pastor task read t-3`, `pastor task send t-3 "..."`, `pastor task attach t-3` |
 | end a task | `pastor task close t-3` (an agent can run `pastor task done` itself) |
 | manage jobs | `pastor job list`, `pastor job describe NAME`, `pastor job run NAME`, `pastor job edit NAME` |
+| run orchestrators | `pastor orchestrator list`, `pastor orchestrator describe NAME`, `pastor orchestrator run NAME`, `pastor orchestrator start NAME`, `pastor orchestrator stop NAME` (files in `~/.config/pastor/orchestrators/`, see [the manual](docs/manual.md#orchestrators)) |
 | manage flocks | `pastor flock list`, `pastor flock describe NAME`, `pastor flock edit` |
 | change settings | `pastor config edit` |
 | use connectors | `pastor connector list`, `pastor connector describe ID`, `pastor connector install OWNER/REPO/DIR` |
@@ -253,13 +259,15 @@ machine names.
 
 ## Safety
 
-- **Agents can't take over the fleet.** Every agent pastor starts is marked.
+- **Agents can't take over your flocks.** Every agent pastor starts is marked.
   From its terminal it can read (`task list`, `describe`) and end its own
   task with `pastor task done`, but it can't start tasks, stop other tasks,
   edit machines, jobs or settings, or start its own head, unless you allow it
   with `agents_change_fleet = true`. A task you start with `pastor task run
-  --role orchestrator` may also run, retry and send to tasks and disable a
-  job, and nothing more; no task can start one.
+  --role orchestrator`, or that an orchestrator file starts, may also run,
+  retry, send to and close tasks, enable or disable a job and keep its
+  handover note, and nothing more; no task can start one. An orchestrator's
+  scripts get the same rights.
 - **Agents keep their permission prompts.** pastor passes the allow and deny
   lists you set for each flock. Turning the prompts off is your decision, and
   [the manual](docs/manual.md#trust-model) says when not to.
@@ -299,7 +307,7 @@ above. pastor is still my personal workflow tool first, so I may decline good
 ideas that would pull it away from that shape.
 
 `make check` runs formatting, clippy and the whole test suite against a fake
-herdr, so you don't need a fleet to work on pastor; `make help` lists the rest.
+herdr, so you don't need a flock of machines to work on pastor; `make help` lists the rest.
 Start with [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Rules
 for AI contributors are in [docs/AI_GOVERNANCE.md](docs/AI_GOVERNANCE.md).
 

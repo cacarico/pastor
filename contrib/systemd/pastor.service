@@ -25,7 +25,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/pastor serve
+ExecStart=%h/.cargo/bin/pastor serve --foreground
 Restart=always
 RestartSec=5s
 StandardOutput=journal

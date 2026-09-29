@@ -15,6 +15,11 @@ pub enum TaskState {
     Stale,
     Failed,
     Closed,
+    /// A `low` Claude task a `critical` one with `preempt` took the slot of:
+    /// its pane is closed, its worktree kept, and it waits first among the
+    /// `low` tasks, pinned to its machine, to resume its session there
+    /// (`claude --resume`) when a slot frees.
+    Paused,
 }
 
 /// States whose task holds a pane on its machine. Kept next to
@@ -31,11 +36,12 @@ pub const PANE_OWNING_STATES: [TaskState; 5] = [
 /// The states a task can be in while it still needs pastor or a human:
 /// what `pastor task list` shows by default. Done, failed, stale and closed tasks
 /// are finished; they appear only with `--all` (or `--done` for done ones).
-pub const LIVE_STATES: [TaskState; 4] = [
+pub const LIVE_STATES: [TaskState; 5] = [
     TaskState::Queued,
     TaskState::Starting,
     TaskState::Running,
     TaskState::Blocked,
+    TaskState::Paused,
 ];
 
 impl TaskState {
@@ -75,6 +81,7 @@ impl TaskState {
             TaskState::Stale => "stale",
             TaskState::Failed => "failed",
             TaskState::Closed => "closed",
+            TaskState::Paused => "paused",
         }
     }
 }
@@ -200,6 +207,191 @@ pub struct DispatchSpec {
     /// own args pick the session (`picks_session`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The label of the workspace dispatch makes for the task: the
+    /// template, where it came from, and what the workspace was called.
+    #[serde(default, skip_serializing_if = "WorkspaceLabel::is_unset")]
+    pub label: WorkspaceLabel,
+    /// Whether pastor asks the agent for a summary when it sends the
+    /// prompt, and whether the task needs one to succeed (`SummaryMode`),
+    /// as resolved when the task was queued. Left out of the JSON when it
+    /// is `ask`, so a spec from before it reads as `ask`.
+    #[serde(default, skip_serializing_if = "SummaryMode::is_ask")]
+    pub summary: SummaryMode,
+}
+
+/// The label template a task's own workspace gets when no layer sets one.
+/// With many flocks on one machine, the flock is what tells them apart in
+/// herdr's sidebar.
+pub const DEFAULT_LABEL: &str = "{{ flock }}/{{ task.id }}";
+
+/// `WorkspaceLabel::note` for a task whose pane went into a workspace it
+/// did not make, which keeps its own label.
+pub const JOINED_WORKSPACE: &str = "joined workspace";
+
+/// A task's workspace label. Only the workspace is named this way: the
+/// herdr agent stays `t-N`, since pastor finds its agents by that name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceLabel {
+    /// `--label`, a job's `[dispatch] label`, the flock's or `[defaults]`,
+    /// settled when the task is queued; `None` is `DEFAULT_LABEL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// Where `template` came from, labelled like `AgentSource::agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The label of the workspace the task's pane is in, set by dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Why `name` is not the template rendered: the task joined a
+    /// workspace, or the template rendered to something herdr should not
+    /// show and dispatch fell back to `t-N`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl WorkspaceLabel {
+    pub fn is_unset(&self) -> bool {
+        *self == WorkspaceLabel::default()
+    }
+}
+
+/// Refuse a label template that could never name a workspace: bad
+/// `{{ }}` syntax, a placeholder other than the five a label knows, an
+/// empty one or a control character. Run where a template is written
+/// (`--label`, a job file, `flock.toml`, `pastor.toml`).
+pub fn check_label(template: &str) -> Result<(), String> {
+    if template.trim().is_empty() {
+        return Err("label must not be empty".into());
+    }
+    if template.chars().any(char::is_control) {
+        return Err("label must not hold a control character".into());
+    }
+    for path in crate::template::placeholders(template).map_err(|e| format!("label: {e}"))? {
+        if !LABEL_PLACEHOLDERS.contains(&path.as_str()) {
+            return Err(format!(
+                "label: unknown placeholder {{{{ {path} }}}}; use task.id, flock, machine, job or item.key"
+            ));
+        }
+    }
+    Ok(())
+}
+
+const LABEL_PLACEHOLDERS: [&str; 5] = ["task.id", "flock", "machine", "job", "item.key"];
+
+/// `template` (or `DEFAULT_LABEL`) rendered for `task`. A placeholder with
+/// nothing to fill it (no job, no item, no flock) renders empty, and
+/// leading and trailing spaces and slashes are dropped, so
+/// `{{ job }}/{{ task.id }}` reads `t-N` for a task with no job. Refused
+/// when the result is empty or holds a control character (an item's key
+/// can): the caller then names the workspace `t-N`.
+pub fn render_label(template: Option<&str>, task: &Task) -> Result<String, String> {
+    let ctx = serde_json::json!({
+        "task": {"id": task.display_id()},
+        "flock": task.flock,
+        "machine": task.machine,
+        "job": if task.from_job() { task.job.as_str() } else { "" },
+        "item": {"key": task.item.get("key")},
+    });
+    let text = crate::template::render(template.unwrap_or(DEFAULT_LABEL), &ctx)?.text;
+    if text.chars().any(char::is_control) {
+        return Err("it holds a control character".into());
+    }
+    let text = text.trim_matches(|c: char| c.is_whitespace() || c == '/');
+    if text.is_empty() {
+        return Err("it renders empty".into());
+    }
+    Ok(text.to_string())
+}
+
+/// The `summary` setting: `task run --summary`, a job's `[dispatch]
+/// summary`, a flock's or `[defaults]`, the most specific first
+/// (`Defaults::resolve_summary`). `ask` adds `SUMMARY_ASK` to every prompt
+/// pastor sends; `require` adds it and `SUMMARY_REQUIRE`, refuses the
+/// agent's own `task done` without a summary and fails a task that goes
+/// idle without one; `off` adds nothing and requires nothing.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryMode {
+    /// Add the line that asks for a summary to the prompt
+    #[default]
+    Ask,
+    /// Ask, and fail the task if its agent stops without one
+    Require,
+    /// Add nothing and require nothing
+    Off,
+}
+
+/// The code of a `summary` that is not one of `SummaryMode`'s.
+pub const UNKNOWN_SUMMARY_MODE: &str = "unknown_summary_mode";
+
+/// The paragraph pastor adds to a task's prompt when it sends it, unless
+/// the task's `summary` is `off`. Not stored in the task's prompt.
+pub const SUMMARY_ASK: &str = "When you finish, run `pastor task done --summary-file -` with a short summary on stdin: first line `done`, `partial`, `blocked` or `nothing to do`; then up to five short lines: what changed, where (branch, PR, files or notes), what is left.";
+
+/// Added after `SUMMARY_ASK` for a task whose `summary` is `require`.
+pub const SUMMARY_REQUIRE: &str = "pastor fails this task if you stop without one.";
+
+/// The error of a `require` task whose agent went idle without a summary.
+pub const STOPPED_WITHOUT_SUMMARY: &str = "stopped without a summary";
+
+/// The code of an agent's own `task done` without a summary on a
+/// `require` task.
+pub const SUMMARY_REQUIRED: &str = "summary_required";
+
+/// The text of the round a person ends by hand (`task done t-N` from
+/// outside the task's pane) on a `require` task, with no summary.
+pub const ENDED_BY_HAND: &str = "no summary (ended by hand)";
+
+impl SummaryMode {
+    pub const ALL: [SummaryMode; 3] = [SummaryMode::Ask, SummaryMode::Require, SummaryMode::Off];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SummaryMode::Ask => "ask",
+            SummaryMode::Require => "require",
+            SummaryMode::Off => "off",
+        }
+    }
+
+    pub fn is_ask(&self) -> bool {
+        *self == SummaryMode::Ask
+    }
+
+    /// The paragraph that asks for a summary, `None` for `off`.
+    pub fn ask_line(&self) -> Option<String> {
+        match self {
+            SummaryMode::Ask => Some(SUMMARY_ASK.to_string()),
+            SummaryMode::Require => Some(format!("{SUMMARY_ASK} {SUMMARY_REQUIRE}")),
+            SummaryMode::Off => None,
+        }
+    }
+
+    /// What `task describe` says about it.
+    pub fn describe(&self) -> String {
+        match self {
+            SummaryMode::Ask => "ask (line added to the prompt)".into(),
+            SummaryMode::Require => "require (line added to the prompt; fails without one)".into(),
+            SummaryMode::Off => "off (nothing added to the prompt)".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SummaryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SummaryMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        SummaryMode::ALL
+            .into_iter()
+            .find(|m| m.as_str() == s)
+            .ok_or_else(|| format!("unknown summary {s:?}; use ask, require or off"))
+    }
 }
 
 /// Where dispatch puts a task's pane: `--place`, a job's `[dispatch] place`
@@ -303,6 +495,13 @@ pub struct AgentSource {
     /// Where `profile` came from, labelled like `agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_from: Option<String>,
+    /// Where the spec's `timeout_secs` came from, labelled like `agent`;
+    /// `None` for `[defaults]`, or a task queued before flocks had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_from: Option<String>,
+    /// Where the spec's `place` came from, like `timeout_from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_from: Option<String>,
 }
 
 /// A worktree herdr made for a task: its branch and where it is on disk.
@@ -335,6 +534,131 @@ impl DispatchSpec {
 
 fn default_timeout() -> u64 {
     2 * 60 * 60
+}
+
+/// The most characters a task summary keeps (`cap_summary`).
+pub const SUMMARY_MAX: usize = 2000;
+
+/// How a round of a task ended, from the first line of its summary
+/// (`Outcome::parse`). `NoSummary` is a round that ended with none, whose
+/// row holds the pane's last lines instead; `Unknown` is a summary whose
+/// first line names none of the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    #[serde(rename = "done")]
+    Done,
+    #[serde(rename = "partial")]
+    Partial,
+    #[serde(rename = "blocked")]
+    Blocked,
+    #[serde(rename = "nothing to do")]
+    NothingToDo,
+    #[serde(rename = "no summary")]
+    NoSummary,
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl Outcome {
+    /// The outcomes an agent may name, longest first so `nothing to do`
+    /// is not read as anything shorter.
+    const NAMED: [Outcome; 4] = [
+        Outcome::NothingToDo,
+        Outcome::Partial,
+        Outcome::Blocked,
+        Outcome::Done,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Outcome::Done => "done",
+            Outcome::Partial => "partial",
+            Outcome::Blocked => "blocked",
+            Outcome::NothingToDo => "nothing to do",
+            Outcome::NoSummary => "no summary",
+            Outcome::Unknown => "unknown",
+        }
+    }
+
+    /// The outcome a summary's first line names, ignoring case: the line
+    /// is the outcome, or starts with it and then something that is not a
+    /// letter (`done: pushed`, `Partial - tests left`). `Unknown` otherwise.
+    pub fn parse(summary: &str) -> Outcome {
+        let first = summary.trim_start().lines().next().unwrap_or("").trim();
+        let first = first.to_lowercase();
+        Outcome::NAMED
+            .into_iter()
+            .find(|o| {
+                first.strip_prefix(o.as_str()).is_some_and(|rest| {
+                    !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                })
+            })
+            .unwrap_or(Outcome::Unknown)
+    }
+}
+
+impl std::str::FromStr for Outcome {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "done" => Outcome::Done,
+            "partial" => Outcome::Partial,
+            "blocked" => Outcome::Blocked,
+            "nothing to do" => Outcome::NothingToDo,
+            "no summary" => Outcome::NoSummary,
+            "unknown" => Outcome::Unknown,
+            other => return Err(format!("unknown outcome {other:?}")),
+        })
+    }
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Who wrote a summary: the agent (`task done --summary`), or pastor from
+/// the pane's last lines when the round ended with none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SummarySource {
+    Agent,
+    Pane,
+}
+
+impl SummarySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SummarySource::Agent => "agent",
+            SummarySource::Pane => "pane",
+        }
+    }
+}
+
+/// How one round of a task ended: from the prompt (or the input that
+/// reopened it) to `done` or `failed`. One row per round in
+/// `task_summaries`, numbered from 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub round: u32,
+    pub outcome: Outcome,
+    pub text: String,
+    pub source: SummarySource,
+    pub at: DateTime<Utc>,
+}
+
+/// `text` trimmed and cut to `SUMMARY_MAX` characters, its start kept.
+pub fn cap_summary(text: &str) -> String {
+    text.trim().chars().take(SUMMARY_MAX).collect()
+}
+
+/// The last `SUMMARY_MAX` characters of a pane's text, trimmed: what a
+/// round that ended with no summary keeps.
+pub fn cap_pane_tail(text: &str) -> String {
+    let text = text.trim();
+    let n = text.chars().count();
+    text.chars().skip(n.saturating_sub(SUMMARY_MAX)).collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,13 +735,108 @@ pub struct Task {
     /// (`description_text`).
     #[serde(default)]
     pub description: Option<String>,
+    /// Whether the task may pause a `low` one to start, and whether it was
+    /// paused itself (`Preemption`).
+    #[serde(flatten, default)]
+    pub pause: Preemption,
+    /// How the task's last round ended (`TaskSummary`), on a task that is
+    /// done, failed or closed and has one. Not a column: the store reads it
+    /// from `task_summaries` with the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<TaskSummary>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }
 
+/// The code of `--preempt` (or a job's `preempt`) on a task below critical.
+pub const PREEMPT_NEEDS_CRITICAL: &str = "preempt_needs_critical";
+
+/// How long a task that resumed after a pause is safe from another: long
+/// enough for it to get back into its work before a second critical task
+/// takes its slot again.
+pub const RESUME_GRACE: chrono::Duration = chrono::Duration::minutes(10);
+
+/// What a paused task's agent is told once its session is open again: it
+/// was stopped mid-turn, and the prompt is already in its conversation.
+/// The text dispatch sends a task's agent: its prompt, then, after a
+/// blank line, the paragraph its `summary` setting adds (`ask_line`).
+pub fn prompt_to_send(task: &Task) -> String {
+    match task.spec.summary.ask_line() {
+        Some(line) => format!("{}\n\n{line}", task.prompt.trim_end()),
+        None => task.prompt.clone(),
+    }
+}
+
+pub const RESUME_PROMPT: &str = "pastor paused this session for a critical task and has now resumed it; carry on where you left off.";
+
+/// A task's part in pausing: whether it may pause a `low` task to start
+/// (`task run --preempt`, a job's `[dispatch] preempt`), and, on a task that
+/// was paused, when, for which task, and when it last resumed. Flattened
+/// into the task's JSON; each field is left out while unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preemption {
+    /// Only ever set on a `critical` task: `task run` and `task priority`
+    /// refuse it below, and a job's tasks keep it only when they settle at
+    /// critical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preempt: bool,
+    /// When the task was last paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<DateTime<Utc>>,
+    /// The task that paused it last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_for: Option<i64>,
+    /// When it last resumed after a pause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<DateTime<Utc>>,
+}
+
+/// Why `Task::pausable` says no.
+pub fn why_not_pausable(task: &Task, kind: &str, now: DateTime<Utc>) -> Option<&'static str> {
+    if task.state != TaskState::Running {
+        return Some("only a running task can be paused");
+    }
+    if task.priority != Priority::Low {
+        return Some("only a low task can be paused");
+    }
+    if kind != "claude" {
+        return Some("only a Claude task can be paused");
+    }
+    if task.spec.session_id.is_none() {
+        return Some("it recorded no Claude session to resume");
+    }
+    if task.ended {
+        return Some("its agent said it is finished");
+    }
+    if task
+        .pause
+        .resumed_at
+        .is_some_and(|at| now - at < RESUME_GRACE)
+    {
+        return Some("it resumed from a pause a moment ago");
+    }
+    None
+}
+
 impl Task {
+    /// May a critical task with `preempt` pause this one? A running `low`
+    /// task of an agent of kind `kind` that is `claude`, with a recorded
+    /// session to resume, not ended, and not resumed within `RESUME_GRACE`.
+    pub fn pausable(&self, kind: &str, now: DateTime<Utc>) -> bool {
+        why_not_pausable(self, kind, now).is_none()
+    }
+
+    /// The machine the task must run on: the one it is paused on, else the
+    /// one its spec pins.
+    pub fn pinned_machine(&self) -> Option<&str> {
+        match self.state {
+            TaskState::Paused => self.machine.as_deref(),
+            _ => self.spec.machine.as_deref(),
+        }
+    }
+
     /// Whether a job made this task; `pastor task run` tasks carry the job
     /// name `run`. Only these take a machine's job slots.
     pub fn from_job(&self) -> bool {
@@ -485,9 +904,9 @@ pub enum TaskRole {
     /// unless `agents_change_fleet` is on.
     #[default]
     Agent,
-    /// Also runs, retries and types into tasks and disables jobs
-    /// (`IpcRequest::orchestrator_may`). Only a person makes one: `task run
-    /// --role orchestrator` from outside any task.
+    /// Also runs, retries, types into and closes tasks and enables and
+    /// disables jobs (`IpcRequest::orchestrator_may`). Only a person makes
+    /// one: `task run --role orchestrator` from outside any task.
     Orchestrator,
 }
 
@@ -682,6 +1101,33 @@ pub fn trailing_question(pane: &str) -> Option<String> {
         .then_some(last)
 }
 
+/// Whether the agent's footer says a background shell it started is still
+/// running. Claude Code can end its turn with a command (`make check`) left
+/// running in the background, draws "1 shell still running" in its footer,
+/// and takes the turn up again when the shell ends; herdr reads it as idle
+/// all the while. Only the lines after the last input prompt (`❯`) are the
+/// footer, so a message that quotes the phrase does not count; a pane with
+/// no prompt is read whole.
+pub fn background_shell_running(pane: &str) -> bool {
+    let lines: Vec<&str> = pane.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|l| l.trim_start_matches(['\u{a0}', ' ']).starts_with('❯'))
+        .map_or(0, |i| i + 1);
+    lines[start..].iter().any(|line| {
+        let line = line.replace('\u{a0}', " ");
+        ["shell still running", "shells still running"]
+            .iter()
+            .any(|phrase| {
+                line.match_indices(phrase).any(|(at, _)| {
+                    line[..at]
+                        .trim_end()
+                        .ends_with(|c: char| c.is_ascii_digit())
+                })
+            })
+    })
+}
+
 /// Pure transition. `None` means no change. The settle window for `Done` is the
 /// caller's job: it should confirm the agent is still idle after the window.
 pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
@@ -758,7 +1204,7 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A checkout recorded before `already_open` existed is pastor's own,
@@ -799,6 +1245,86 @@ mod tests {
         assert!(!text.contains("place"), "the default is left out: {text}");
     }
 
+    /// The built-in label is `<flock>/t-N`; each placeholder renders from
+    /// the task, and one with nothing to fill it leaves no stray slash.
+    #[test]
+    fn a_label_renders_every_placeholder() {
+        let mut t = task(TaskState::Queued, None);
+        t.id = 285;
+        t.flock = Some("personal".into());
+        t.machine = Some("pi-1".into());
+        t.job = "board".into();
+        t.item = serde_json::json!({"key": "card-9"});
+        assert_eq!(render_label(None, &t).unwrap(), "personal/t-285");
+        let one = |template: &str, t: &Task| render_label(Some(template), t).unwrap();
+        assert_eq!(one("{{ task.id }}", &t), "t-285");
+        assert_eq!(one("{{ flock }}", &t), "personal");
+        assert_eq!(one("{{ machine }}", &t), "pi-1");
+        assert_eq!(one("{{ job }}", &t), "board");
+        assert_eq!(one("{{ item.key }}", &t), "card-9");
+        assert_eq!(
+            one("{{job}}:{{ item.key }} ({{ task.id }})", &t),
+            "board:card-9 (t-285)"
+        );
+
+        // `task run` has no job and no item.
+        t.job = "run".into();
+        t.item = Value::Null;
+        assert_eq!(one("{{ job }}/{{ task.id }}", &t), "t-285");
+        assert_eq!(one("{{ item.key }}-x", &t), "-x");
+        // A task from before flocks has none.
+        t.flock = None;
+        assert_eq!(render_label(None, &t).unwrap(), "t-285");
+    }
+
+    /// A label herdr would show badly, or not at all, is refused with the
+    /// reason, and dispatch then names the workspace `t-N`.
+    #[test]
+    fn a_label_that_renders_empty_or_with_a_control_character_is_refused() {
+        let mut t = task(TaskState::Queued, None);
+        t.item = serde_json::json!({"key": "a\u{1b}[2Jb"});
+        t.job = "board".into();
+        let err = render_label(Some("{{ item.key }}"), &t).unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+        t.item = serde_json::json!({"key": " / "});
+        let err = render_label(Some("{{ item.key }}"), &t).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let err = render_label(Some("{{ item.key }}\n"), &t).unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    /// Only the five placeholders are known, and a bad one is refused
+    /// where the template is written, not when a task runs.
+    #[test]
+    fn check_label_knows_the_placeholders() {
+        for ok in [
+            "{{ flock }}/{{ task.id }}",
+            "{{ machine }}-{{ job }}-{{ item.key }}",
+            "plain",
+        ] {
+            check_label(ok).unwrap();
+        }
+        let err = check_label("{{ item.title }}").unwrap_err();
+        assert!(err.contains("unknown placeholder"), "{err}");
+        let err = check_label("{{ task.id ").unwrap_err();
+        assert!(err.contains("unterminated"), "{err}");
+        let err = check_label("  ").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let err = check_label("a\tb").unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    /// A spec that says nothing about its label writes nothing, and reads
+    /// back as the built-in.
+    #[test]
+    fn an_unset_label_is_left_out_of_the_spec() {
+        let old: DispatchSpec =
+            serde_json::from_value(serde_json::json!({"agent": "claude"})).unwrap();
+        assert_eq!(old.label, WorkspaceLabel::default());
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("label"), "{text}");
+    }
+
     pub fn task(state: TaskState, last_completion_seq: Option<u64>) -> Task {
         let now = Utc::now();
         Task {
@@ -823,6 +1349,8 @@ mod tests {
                 agent_source: None,
                 place: Default::default(),
                 session_id: None,
+                label: Default::default(),
+                summary: Default::default(),
             },
             machine: Some("pi-1".into()),
             workspace_id: Some("w1".into()),
@@ -838,6 +1366,8 @@ mod tests {
             priority: Default::default(),
             priority_from: None,
             queue_pos: 0,
+            pause: Default::default(),
+            summary: None,
             created_at: now,
             started_at: Some(now),
             finished_at: None,
@@ -1252,6 +1782,110 @@ mod tests {
         );
     }
 
+    /// Every state crossed with every observation and every flag: the rules
+    /// that hold whatever branch `next_state` grows next. Sequences sit
+    /// before, at and past the baseline of 5, with no baseline too (a row
+    /// from a build that recorded none).
+    #[test]
+    fn next_state_keeps_its_invariants_over_the_whole_table() {
+        use TaskState::*;
+        let states = [
+            Queued, Starting, Running, Blocked, Done, Stale, Failed, Closed, Paused,
+        ];
+        let statuses = [
+            AgentStatus::Idle,
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+            AgentStatus::Done,
+            AgentStatus::Unknown,
+        ];
+        let seqs = [None, Some(4), Some(5), Some(6)];
+        let mut observations = vec![
+            Observed::PaneClosed,
+            Observed::PaneExited { agent_idle: false },
+            Observed::PaneExited { agent_idle: true },
+            Observed::DispatchStarting,
+        ];
+        for status in statuses {
+            for state_change_seq in seqs {
+                for completion_seq in seqs {
+                    observations.push(Observed::Status {
+                        status,
+                        state_change_seq,
+                        completion_seq,
+                    });
+                }
+            }
+        }
+        let mut checked = 0;
+        for state in states {
+            for baseline in [None, Some(5)] {
+                for flags in 0..8 {
+                    let t = Task {
+                        ended: flags & 1 != 0,
+                        activity_seen: flags & 2 != 0,
+                        prompt_pending: flags & 4 != 0,
+                        ..task(state, baseline)
+                    };
+                    for seen in &observations {
+                        let got = next_state(&t, seen);
+                        let case = format!(
+                            "{state:?} baseline {baseline:?} ended {} activity_seen {} \
+                             prompt_pending {} on {seen:?} gave {got:?}",
+                            t.ended, t.activity_seen, t.prompt_pending
+                        );
+                        assert_ne!(got, Some(state), "no-op must be None: {case}");
+                        if !state.is_open() {
+                            assert_eq!(got, None, "closed states never move: {case}");
+                        }
+                        if let Observed::Status { status, .. } = seen {
+                            if state == Done && t.ended {
+                                assert_eq!(got, None, "an ended done task stays: {case}");
+                            }
+                            if state == Stale {
+                                assert!(
+                                    !matches!(got, Some(Running | Blocked)),
+                                    "stale never goes back: {case}"
+                                );
+                            }
+                            if *status == AgentStatus::Unknown {
+                                assert_eq!(got, None, "unknown changes nothing: {case}");
+                            }
+                        }
+                        let completion_seq = match seen {
+                            Observed::Status { completion_seq, .. } => *completion_seq,
+                            _ => None,
+                        };
+                        if got == Some(Done) {
+                            assert!(
+                                t.activity_seen || completion_seq.is_some() || baseline.is_none(),
+                                "done needs activity or completion_seq: {case}"
+                            );
+                            assert!(!t.prompt_pending, "prompt_pending is never done: {case}");
+                            // A status only completes on a sequence strictly
+                            // past the baseline: the completion one when the
+                            // agent gave it, the state-change one otherwise.
+                            if let Observed::Status {
+                                state_change_seq,
+                                completion_seq,
+                                ..
+                            } = seen
+                            {
+                                let seq = completion_seq.or(*state_change_seq);
+                                assert!(
+                                    seq.is_some_and(|s| s > baseline.unwrap_or(0)),
+                                    "done needs a sequence past the baseline: {case}"
+                                );
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 9 * 2 * 8 * (4 + 5 * 4 * 4));
+    }
+
     #[test]
     fn ids() {
         assert_eq!(parse_task_id("t-12"), Some(12));
@@ -1309,6 +1943,28 @@ mod tests {
         assert_eq!(trailing_question("fake output\nready?\n"), None);
     }
 
+    #[test]
+    fn a_footer_with_a_background_shell_is_still_running() {
+        let pane = claude_pane("● Running make check in the background.")
+            .replace("← for agents", "← for agents · 1 shell still running");
+        assert!(background_shell_running(&pane));
+        let pane = claude_pane("● Waiting.")
+            .replace("auto mode on", "auto mode on · 2 shells still running");
+        assert!(background_shell_running(&pane));
+        assert!(background_shell_running("1 shell still running\n"));
+    }
+
+    #[test]
+    fn a_footer_without_a_background_shell_is_not_running() {
+        assert!(!background_shell_running(&claude_pane(
+            "● Pushed the branch."
+        )));
+        // The phrase in a message above the input box is not the footer.
+        let pane = claude_pane("● It said 1 shell still running, now ended.");
+        assert!(!background_shell_running(&pane));
+        assert!(!background_shell_running("fake output\n"));
+    }
+
     /// A task marked blocked on a question moves its baseline to the idle
     /// it was found at; that same idle, seen again, changes nothing, while a
     /// newer one (the agent answered and went back to work) runs again.
@@ -1324,5 +1980,98 @@ mod tests {
             next_state(&t, &status(AgentStatus::Working, Some(10))),
             Some(TaskState::Running)
         );
+    }
+
+    #[test]
+    fn a_summary_names_its_outcome_on_its_first_line() {
+        for (text, want) in [
+            ("done", Outcome::Done),
+            ("Done: pushed pastor/t-4\nPR #12", Outcome::Done),
+            ("  partial - tests left\n", Outcome::Partial),
+            ("BLOCKED. needs a token", Outcome::Blocked),
+            (
+                "nothing to do\nthe card was already built",
+                Outcome::NothingToDo,
+            ),
+            ("Nothing to do: already merged", Outcome::NothingToDo),
+            ("doneish", Outcome::Unknown),
+            ("pushed the branch\ndone", Outcome::Unknown),
+            ("", Outcome::Unknown),
+        ] {
+            assert_eq!(Outcome::parse(text), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn outcomes_round_trip_as_their_words() {
+        for o in [
+            Outcome::Done,
+            Outcome::Partial,
+            Outcome::Blocked,
+            Outcome::NothingToDo,
+            Outcome::NoSummary,
+            Outcome::Unknown,
+        ] {
+            assert_eq!(o.as_str().parse::<Outcome>().unwrap(), o);
+            assert_eq!(serde_json::to_value(o).unwrap(), o.as_str());
+        }
+    }
+
+    #[test]
+    fn summaries_are_capped_at_their_start_and_pane_tails_at_their_end() {
+        let long: String = "ab".repeat(SUMMARY_MAX);
+        let s = cap_summary(&format!("  {long}  "));
+        assert_eq!(s.chars().count(), SUMMARY_MAX);
+        assert!(s.starts_with("abab"));
+        let tail = cap_pane_tail(&format!("x{long}y\n"));
+        assert_eq!(tail.chars().count(), SUMMARY_MAX);
+        assert!(tail.ends_with("aby"));
+        assert_eq!(
+            cap_summary("é".repeat(SUMMARY_MAX + 3).as_str())
+                .chars()
+                .count(),
+            SUMMARY_MAX
+        );
+    }
+
+    /// `summary` reads and writes as its word; a spec that says nothing is
+    /// `ask`, and `ask` is left out of the JSON.
+    #[test]
+    fn summary_mode_round_trips_and_defaults_to_ask() {
+        for m in SummaryMode::ALL {
+            assert_eq!(m.as_str().parse::<SummaryMode>().unwrap(), m);
+            assert_eq!(serde_json::to_value(m).unwrap(), m.as_str());
+        }
+        assert!("Ask".parse::<SummaryMode>().is_err());
+        let old: DispatchSpec =
+            serde_json::from_value(serde_json::json!({"agent": "claude"})).unwrap();
+        assert_eq!(old.summary, SummaryMode::Ask);
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("summary"), "the default is left out: {text}");
+        let mut req = old.clone();
+        req.summary = SummaryMode::Require;
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["summary"], "require");
+    }
+
+    /// The prompt pastor sends ends with the paragraph asking for a
+    /// summary, after a blank line, for `ask` and `require`; `off` sends
+    /// the prompt alone. The stored prompt never changes.
+    #[test]
+    fn the_prompt_sent_asks_for_a_summary_unless_off() {
+        let mut t = task(TaskState::Queued, None);
+        t.prompt = "fix it\n".into();
+        assert_eq!(prompt_to_send(&t), format!("fix it\n\n{SUMMARY_ASK}"));
+        assert!(SUMMARY_ASK.contains("pastor task done --summary-file -"));
+        t.spec.summary = SummaryMode::Require;
+        let sent = prompt_to_send(&t);
+        assert!(
+            sent.starts_with(&format!("fix it\n\n{SUMMARY_ASK}")),
+            "{sent}"
+        );
+        assert!(sent.ends_with(SUMMARY_REQUIRE), "{sent}");
+        t.spec.summary = SummaryMode::Off;
+        assert_eq!(prompt_to_send(&t), "fix it\n");
+        assert_eq!(t.prompt, "fix it\n");
     }
 }

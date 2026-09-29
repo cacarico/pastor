@@ -382,14 +382,7 @@ pub(crate) fn lock_file(real: &Path) -> anyhow::Result<std::fs::File> {
 /// waiter lock a file nobody else sees any more.
 fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let f = open_lock(path)?;
     loop {
         // SAFETY: flock on a descriptor this function owns.
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
@@ -400,6 +393,19 @@ fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
             return Err(e).with_context(|| format!("lock {}", path.display()));
         }
     }
+}
+
+/// A lock file at `path`, created private if missing, never through a
+/// symlink.
+pub(crate) fn open_lock(path: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
 }
 
 /// `text` in a new file beside `real`, with `mode`, ready to be renamed

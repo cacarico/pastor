@@ -12,6 +12,8 @@ use pastor::connector::{Connector, Discovered, discover};
 use pastor::connector::{ItemSource, RunInput};
 use serde_json::json;
 
+mod common;
+
 /// How long a test waits for the daemon or the fake herdr to do something.
 /// Generous on purpose: a CI runner under load has taken more than 10s to
 /// bring a daemon up, and a wait that ends early only ever fails a good run.
@@ -340,9 +342,8 @@ impl Cli {
     }
 
     fn pastor(&self, args: &[&str]) -> std::process::Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_pastor"))
+        common::pastor()
             .args(args)
-            .env_remove("PASTOR_TASK")
             .env("PASTOR_CONFIG_DIR", self.dir("c"))
             .env("PASTOR_STATE_DIR", self.dir("s"))
             .env("PASTOR_DATA_DIR", self.dir("d"))
@@ -1008,9 +1009,8 @@ fn serve() -> Serve {
         ),
     )
     .unwrap();
-    let daemon = Command::new(env!("CARGO_BIN_EXE_pastor"))
-        .arg("serve")
-        .env_remove("PASTOR_TASK")
+    let daemon = common::pastor()
+        .args(["serve", "--foreground"])
         .env("PASTOR_CONFIG_DIR", cli.dir("c"))
         .env("PASTOR_STATE_DIR", cli.dir("s"))
         .env("PASTOR_DATA_DIR", cli.dir("d"))
