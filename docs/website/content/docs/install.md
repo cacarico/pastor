@@ -11,7 +11,7 @@ the other machines need herdr and the agents.
 ## one line
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/cacarico/pastor/main/install.sh | sh
+curl -fsSL https://cacari.co/pastor/install.sh | sh
 ```
 
 It downloads the release for your OS and CPU, checks it against the

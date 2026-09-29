@@ -4654,9 +4654,39 @@ mod tests {
         assert!(check_commands(SKILL).0 > 20);
     }
 
+    /// The homepage's live terminal types the commands in
+    /// `docs/website/data/demo.toml`; each must be a real command with real
+    /// long flags, as the docs' commands are, or the demo would show a CLI
+    /// that does not exist.
+    #[test]
+    fn website_demo_commands_are_real() {
+        let path = skills_dir()
+            .parent()
+            .unwrap()
+            .join("docs/website/data/demo.toml");
+        let demo: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let cmds: Vec<&str> = demo["act"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|act| act["step"].as_array().unwrap())
+            .filter_map(|step| step.get("cmd").and_then(|c| c.as_str()))
+            .collect();
+        assert!(cmds.len() > 10, "only {} commands in {path:?}", cmds.len());
+        for cmd in &cmds {
+            assert!(
+                cmd.starts_with("pastor "),
+                "{cmd:?} is not a pastor command"
+            );
+        }
+        let (checked, wrong) = check_commands(&format!("```sh\n{}\n```\n", cmds.join("\n")));
+        assert_eq!(checked, cmds.len(), "{cmds:?}");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// The website's examples page is reached from the docs index, from the
-    /// pages its examples belong to, and from the home's "how I use it" pane,
-    /// so a rename or a lost link shows here rather than as a dead page.
+    /// pages its examples belong to, and from the home's "what you can do"
+    /// pane, so a rename or a lost link shows here rather than as a dead page.
     #[test]
     fn website_examples_page_is_linked() {
         let site = skills_dir().parent().unwrap().join("docs/website");
@@ -4674,7 +4704,10 @@ mod tests {
             assert!(text.contains("examples/"), "{page} does not link examples");
         }
         let home = std::fs::read_to_string(site.join("layouts/home.html")).unwrap();
-        assert!(home.contains("how I use it"), "no \"how I use it\" pane");
+        assert!(
+            home.contains("what you can do"),
+            "no \"what you can do\" pane"
+        );
         assert!(
             home.contains("docs/examples/"),
             "home does not link examples"

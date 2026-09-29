@@ -2,46 +2,77 @@
 
 {{ define "main" }}
 <main class="grid home">
-  <section class="pane" style="grid-area: what">
-    <h2 class="t">what</h2>
-    <p>pastor runs coding agents (Claude Code, opencode, Codex) on machines I own: a home server, a Raspberry Pi, a spare laptop.</p>
-    <p>I hand it a task or a schedule and close my laptop. Later I check what got done, and which agent stopped to ask me something.</p>
+  <section class="pane" style="grid-area: pastor">
+    <h2 class="t">pastor</h2>
+    <p class="pitch"><b>An agent orchestrator for a flock of machines.</b></p>
+    <p>Queue tasks, schedule jobs, and let pastor spread coding agents (Claude Code, Codex, opencode) across your flock over ssh.</p>
+    <ul class="uses feats">
+      <li><span><b>queue</b> tasks wait their turn, by priority</span></li>
+      <li><span><b>jobs</b> cron or a board turns into tasks</span></li>
+      <li><span><b>flocks</b> any box you can ssh to runs agents</span></li>
+    </ul>
+    <p>Every agent is a real terminal you can attach to. You check back later: done, stuck, or waiting on you.</p>
   </section>
 
   <section class="pane focus" style="grid-area: install">
     <h2 class="t">install</h2>
-<pre class="cmd"><span class="p">$ </span>curl -fsSL https://raw.githubusercontent.com/cacarico/pastor/main/install.sh | sh</pre>
+<pre class="cmd"><span class="p">$ </span>curl -fsSL https://cacari.co/pastor/install.sh | sh</pre>
     <p>One binary in <b>~/.local/bin</b>. Each machine needs herdr 0.9+, and the head needs ssh to the others. <a href="{{ "docs/install/" | relURL }}">more</a></p>
   </section>
 
-  <section class="pane" style="grid-area: how">
-    <h2 class="t">how</h2>
-    <ol class="steps">
-      <li>You give it work: one task, or a job that finds work on a schedule.</li>
-      <li>It picks a free machine and starts the agent in a herdr terminal there.</li>
-      <li>It watches the agent: running, blocked on a question, or done.</li>
-      <li>You read the output, answer the question, or attach and take over.</li>
-    </ol>
+  {{/* The transcript comes from data/demo.toml. All of it is here as text,
+       so it reads without scripts; term.js replays it as a live session. */}}
+  <section class="pane live" style="grid-area: live">
+    <h2 class="t">live <span data-term-title>· a scripted session</span></h2>
+    <div class="term-ctl" hidden>
+      {{- range $i, $act := hugo.Data.demo.act }}
+      <button type="button" class="act" data-term-act="{{ $i }}" aria-label="play act {{ add $i 1 }}: {{ $act.name }}" title="{{ $act.name }}"></button>
+      {{- end }}
+      <button type="button" class="btn" data-term-pause aria-label="pause" title="pause"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="3" width="3" height="10" rx="1"/><rect x="9" y="3" width="3" height="10" rx="1"/></svg></button>
+      <button type="button" class="btn" data-term-replay aria-label="replay from the start" title="replay from the start"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5a5.5 5.5 0 1 1-5.2 3.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M1.6 2.2 2.4 6.6 6.6 5.4Z"/></svg></button>
+      <button type="button" class="btn" data-term-big aria-label="bigger" title="bigger"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    </div>
+<pre class="term" data-term aria-label="A pastor session: by hand, then with an agent driving it">
+{{- range $i, $act := hugo.Data.demo.act }}
+{{- $agent := eq $act.kind "agent" }}
+{{- if $i }}{{ "\n" }}{{ end -}}
+<span class="l lbl" data-kind="lbl"># {{ $act.label }}</span>{{ "\n" }}
+{{- range $act.step }}
+{{- if $agent }}
+{{- /* Drawn as a Claude Code session: your prompt after >, the assistant's
+       blocks after ● with a blank line between them, each pastor call as
+       Bash(...) and its result under ⎿. */}}
+{{- with .ask }}<span class="l in ask" data-kind="in"><span class="p">&gt; </span>{{ . }}</span>{{ "\n" }}{{ end }}
+{{- with .say }}{{ "\n" }}<span class="l say" data-kind="out" data-gap data-pause="900"><span class="dot">●</span> {{ . }}</span>{{ "\n" }}{{ end }}
+{{- with .cmd }}{{ "\n" }}<span class="l call" data-kind="out" data-gap data-pause="700"><span class="dot">●</span> Bash(<span class="in">{{ . }}</span>)</span>{{ "\n" }}{{ end }}
+{{- with .out }}<span class="l res" data-kind="out" data-pause="400"><span class="p">  ⎿  </span>{{ replace . "\n" "\n     " }}</span>{{ "\n" }}{{ end }}
+{{- with .report }}{{ "\n" }}<span class="l say rep" data-kind="out" data-gap data-pause="1200"><span class="dot">●</span> {{ replace . "\n" "\n  " }}</span>{{ "\n" }}{{ end }}
+{{- else }}
+{{- with .cmd }}<span class="l in" data-kind="in"><span class="p">$ </span>{{ . }}</span>{{ "\n" }}{{ end }}
+{{- with .out }}<span class="l out" data-kind="out">{{ . }}</span>{{ "\n" }}{{ end }}
+{{- end }}
+{{- end }}
+{{- end }}</pre>
+    <p class="term-bar"><a href="{{ "docs/first-run/" | relURL }}">the first run, step by step →</a></p>
   </section>
 
-  {{/* The commands mirror the README's Quick start; keep them in step. */}}
-  <section class="pane" style="grid-area: first">
-    <h2 class="t">first run</h2>
-<pre class="cmd"><span class="c"># add a machine, keep the head running</span>
-<span class="p">$ </span>pastor machine add pi-1 user@pi-1
-<span class="p">$ </span>pastor setup systemd
+  <section class="pane" style="grid-area: can">
+    <h2 class="t">what you can do</h2>
+    <ul class="uses">
+      <li><span><a href="{{ "docs/examples/#agents-on-another-machine-over-ssh" | relURL }}">run agents on another machine</a>: add a box over ssh, and it shares the load.</span></li>
+      <li><span><a href="{{ "docs/examples/#a-pr-fix-round-from-one-command" | relURL }}">fix a PR with one command</a>: an agent in its own worktree, on the model you name.</span></li>
+      <li><span><a href="{{ "docs/tasks/#wait-your-turn" | relURL }}">put urgent work first</a>: priorities, a queue you can reorder, low work paused for urgent.</span></li>
+      <li><span><a href="{{ "docs/jobs/" | relURL }}">run a job every morning</a>: a schedule that turns into tasks on its own.</span></li>
+      <li><span><a href="{{ "docs/examples/#a-kanban-board-that-hands-cards-to-agents" | relURL }}">hand board cards to agents</a>: tag a card, and it becomes a branch.</span></li>
+      <li><span><a href="{{ "docs/examples/#two-accounts-on-one-head" | relURL }}">keep untrusted work in a sandbox</a>: outside PRs and issues run on a machine with nothing to steal.</span></li>
+    </ul>
+    <p><a href="{{ "docs/examples/" | relURL }}">the examples, with the config to copy</a></p>
+  </section>
 
-<span class="c"># give it a task, in its own git worktree</span>
-<span class="p">$ </span>pastor task run "Fix the flaky test in ci.yml" --repo '~/work/api' --worktree
-
-<span class="c"># later: see where things are</span>
-<span class="p">$ </span>pastor task list
-
-<span class="c"># t-1 is blocked: the agent asked something</span>
-<span class="p">$ </span>pastor task read t-1
-<span class="p">$ </span>pastor task send t-1 "yes, go ahead"
-<span class="p">$ </span><span class="cursor"> </span></pre>
-    <p><a href="{{ "docs/first-run/" | relURL }}">the first run, step by step</a></p>
+  <section class="pane" style="grid-area: why">
+    <h2 class="t">why it exists</h2>
+    <p>I built pastor to learn how AI agents, their harnesses and AI governance work in practice, and to hand my own daily tasks and processes to agents.</p>
+    <p>It is shaped by that use first. <a href="{{ site.Params.blog }}">why I built it</a></p>
   </section>
 
   <section class="pane" style="grid-area: not">
@@ -53,17 +84,14 @@
       <li><span><b>stable.</b> It is young. Compatibility is best effort.</span></li>
     </ul>
   </section>
-
-  <section class="pane" style="grid-area: use">
-    <h2 class="t">how I use it</h2>
-    <ul class="uses">
-      <li><span><b>a Kanban board.</b> A job reads my notes' board every minute; a card tagged <code>#agent</code> becomes a task on its own branch, and the card moves to In Review when the agent is done.</span></li>
-      <li><span><b>a PR fix round.</b> <code>pastor task run "Address the review on #42" --repo '~/src/app' --worktree --model sonnet</code>, then <code>pastor task read t-1</code> when it stops.</span></li>
-      <li><span><b>another machine.</b> <code>pastor machine add server-1 user@server-1 --max-agents 3</code>: its tasks share the load with the head, over ssh.</span></li>
-    </ul>
-    <p><a href="{{ "docs/examples/" | relURL }}">the examples, with the config to copy</a></p>
-  </section>
 </main>
+{{- /* The terminal's bigger view: term.js moves the live pane's title,
+       controls and terminal in here while it is open, so the session keeps
+       playing where it was. */}}
+<dialog class="term-big" aria-label="the scripted session, bigger">
+  <div class="pane live focus"></div>
+</dialog>
+<script type="module" src="{{ partial "asset.html" "term.js" }}"></script>
 {{ end }}
 
 {{ define "status" }}
