@@ -1,0 +1,100 @@
+# Mirrors .github/workflows/ci.yml's three jobs as three steps. No cargo
+# cache yet: the spec's shared cargo-cache PVC is a homelab chart change,
+# out of this repo's scope, so every run compiles from scratch. Steps run
+# one at a time (depends_on) so only one Rust build competes for the Pi's
+# 4 cores and 8GB at once, per the spec's caution for this phase.
+#
+# test-ssh: the GitHub job needs sudo to install and run its own sshd,
+# because the runner isn't root. A Woodpecker step already runs as root,
+# so openssh-server installs and /run/sshd is created with no sudo.
+#
+# portability: needs zig and cargo-zigbuild, as .github/actions/zig
+# installs for GitHub Actions; the same pinned version and checksum,
+# aarch64 build (this cluster's only architecture). CARGO_ZIGBUILD_ZIG_PATH
+# is set as a step-level environment variable, not a shell export, because
+# a plain shell variable set in one command of this list does not survive
+# to the next command (confirmed the hard way on the governance pipeline).
+when:
+  - event: pull_request
+    path:
+      include:
+        - "src/**"
+        - "tests/**"
+        - "skills/**"
+        - "README.md"
+        - "docs/manual.md"
+        - "docs/recommended-setup.md"
+        - "docs/website/content/**"
+        - ".claude-plugin/plugin.json"
+        - "contrib/systemd/**"
+        - "contrib/launchd/**"
+        - "Cargo.toml"
+        - "Cargo.lock"
+        - "Makefile"
+        - "scripts/changelog.sh"
+        - ".woodpecker/ci.yaml"
+        - "install.sh"
+  - event: push
+    branch: main
+    path:
+      include:
+        - "src/**"
+        - "tests/**"
+        - "skills/**"
+        - "README.md"
+        - "docs/manual.md"
+        - "docs/recommended-setup.md"
+        - "docs/website/content/**"
+        - ".claude-plugin/plugin.json"
+        - "contrib/systemd/**"
+        - "contrib/launchd/**"
+        - "Cargo.toml"
+        - "Cargo.lock"
+        - "Makefile"
+        - "scripts/changelog.sh"
+        - ".woodpecker/ci.yaml"
+        - "install.sh"
+        - "CHANGELOG.md"
+        - "changes/**"
+  - event: manual
+
+steps:
+  - name: check
+    image: rust:1-slim
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - apt-get update -qq
+      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev openssh-server make
+      - rustup component add rustfmt clippy
+      - make check
+      - make test-machine
+      - mkdir -p /run/sshd
+      - make test-ssh
+
+  - name: msrv
+    image: rust:1.88-slim
+    depends_on: [check]
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - apt-get update -qq
+      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev make
+      - cargo check --locked --all-targets
+
+  - name: portability
+    image: rust:1-slim
+    depends_on: [msrv]
+    environment:
+      CARGO_TERM_COLOR: always
+      CARGO_ZIGBUILD_ZIG_PATH: /opt/zig/zig
+    commands:
+      - apt-get update -qq
+      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev curl xz-utils make
+      - curl -sSfL -o /tmp/zig.tar.xz "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz"
+      - echo "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17  /tmp/zig.tar.xz" | sha256sum -c -
+      - mkdir -p /opt/zig
+      - tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+      - cargo install --locked cargo-zigbuild@0.23.4
+      - rustup target add x86_64-unknown-linux-musl armv7-unknown-linux-musleabihf x86_64-unknown-freebsd
+      - make portability
