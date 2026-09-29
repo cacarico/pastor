@@ -219,10 +219,11 @@ pub struct DispatchSpec {
     pub summary: SummaryMode,
     /// The directory dispatch started a repo-less task in
     /// (`dispatch::no_repo_dir`): `~/pastor-tasks`, or the machine's home if
-    /// that folder could not be made. Recorded so `pastor task attach`
-    /// reopens the session in the same place rather than asking again,
-    /// which can answer differently once the folder is fixed. `None` for a
-    /// task with a `repo`, and on a task from before this field existed.
+    /// that folder could not be made. Recorded so `pastor task attach` and a
+    /// paused task's resume both go back to the same place rather than
+    /// asking again, which can answer differently once the folder is fixed.
+    /// `None` for a task with a `repo`, and on a task from before this field
+    /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }

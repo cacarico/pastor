@@ -2068,7 +2068,9 @@ always. Once the task is `closed` or `failed`, pastor looks on the task's
 machine first: while herdr still lists the task's agent, attach goes to it.
 Otherwise, for a task that recorded a Claude session, it opens a new
 workspace on that machine, labelled `t-N-resume`, in the task's directory
-(its worktree, else its repo, else `~/pastor-tasks`), with the env of the task's agent definition
+(its worktree, else its repo, else the directory dispatch recorded for it —
+`~/pastor-tasks`, or the machine's home if that folder could not be made),
+with the env of the task's agent definition
 (so `CLAUDE_CONFIG_DIR` points at the same account's sessions), runs `claude
 --resume <session>` there as the agent `t-N-resume`, and attaches. Attaching
 again while that pane is open goes back to it.

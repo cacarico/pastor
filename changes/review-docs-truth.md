@@ -39,3 +39,9 @@
   the home if that folder could not be made), recorded on the task instead
   of asked for again, which could answer differently once the folder is
   fixed and leave `claude --resume` looking in the wrong place.
+- A second GPT (Codex) pass: resuming a paused repo-less task now goes back
+  to the directory recorded at its first dispatch instead of asking
+  `no_repo_dir` again, which could answer differently once `~/pastor-tasks`
+  became makeable and leave the resumed agent unable to find its session.
+  The manual's `task attach` section describes that recorded directory and
+  its home fallback too.

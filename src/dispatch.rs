@@ -445,7 +445,15 @@ async fn dispatch_steps(
     };
     let dir = match repo.clone() {
         Some(repo) => Some(repo),
-        None => no_repo_dir(conn, task.machine.as_deref()).await?,
+        // A resume goes back to the directory recorded at the first dispatch
+        // (as `reopen` does), rather than asking `no_repo_dir` again and
+        // getting a different answer once the folder has since become
+        // makeable: the session is filed under the old directory, and the
+        // agent needs to be started there to find it.
+        None => match task.spec.cwd.clone() {
+            Some(cwd) if resume => Some(cwd),
+            _ => no_repo_dir(conn, task.machine.as_deref()).await?,
+        },
     };
     if repo.is_none() {
         task.spec.cwd = dir.clone();
@@ -2335,6 +2343,44 @@ mod tests {
             .unwrap();
         assert_eq!(req.params["cwd"], "/home/fake");
         assert_eq!(t.spec.cwd.as_deref(), Some("/home/fake"));
+    }
+
+    /// A paused task resumes in the directory recorded at its first
+    /// dispatch, not a fresh answer from `no_repo_dir`: once
+    /// `~/pastor-tasks` becomes makeable, asking again would move the agent
+    /// away from the home its session was filed under.
+    #[tokio::test]
+    async fn a_paused_task_resumes_where_it_first_dispatched_even_once_the_folder_can_be_made() {
+        let fake = FakeHerdr::new();
+        fake.set_unmakeable_dir("/home/fake/pastor-tasks");
+        let mut t = task(DispatchSpec {
+            repo: None,
+            place: Place::Own,
+            ..spec()
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(t.spec.cwd.as_deref(), Some("/home/fake"));
+
+        fake.clear_unmakeable_dir("/home/fake/pastor-tasks");
+        let made_before = fake.made_dirs().len();
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.made_dirs().len(),
+            made_before,
+            "resume must not ask no_repo_dir again"
+        );
+        assert_eq!(t.spec.cwd.as_deref(), Some("/home/fake"));
+        let req = fake
+            .requests()
+            .into_iter()
+            .rev()
+            .find(|r| r.method == "workspace.create" && r.params["label"] != "pastor")
+            .unwrap();
+        assert_eq!(req.params["cwd"], "/home/fake");
     }
 
     /// Where `~` cannot be resolved the task fails up front with a reason,
