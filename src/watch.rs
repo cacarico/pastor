@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{CliError, one_line, request_failure};
+use crate::cli::{CliError, one_line};
 use crate::config::{PastorConfig, Paths, parse_duration};
 use crate::connector::exec::{self, Invocation, RunLog};
 use crate::connector::{Discovered, discover};
@@ -526,18 +526,18 @@ enum Ask {
     Refused(String, String),
 }
 
+/// `cli::ask` for a watcher, which also needs to tell a head that gave no
+/// answer from one that refused.
 async fn ask(paths: &Paths, req: IpcRequest) -> Result<IpcResponse, Ask> {
-    match crate::ipc::request_head(paths, &req).await {
-        Ok(IpcResponse::Error { code, message }) => Err(Ask::Refused(code, message)),
-        Ok(resp) => Ok(resp),
-        Err(err) => {
-            let (code, message) = request_failure(&err);
-            match err {
-                crate::ipc::RequestError::Refused { .. } => Err(Ask::Refused(code, message)),
-                _ => Err(Ask::Down(message)),
-            }
+    let got = crate::ipc::request_head(paths, &req).await;
+    let down = matches!(&got, Err(e) if !matches!(e, crate::ipc::RequestError::Refused { .. }));
+    crate::cli::reply(got).map_err(|e| {
+        if down {
+            Ask::Down(e.message)
+        } else {
+            Ask::Refused(e.code, e.message)
         }
-    }
+    })
 }
 
 /// A refusal ends the watcher with the head's code: an agent's bridge or an
