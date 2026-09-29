@@ -1264,7 +1264,9 @@ impl Store {
     /// Put queued task `id` at `priority`, set by `from`. Refused unless the
     /// task is queued: one a machine took has left the queue. It keeps its
     /// position, so among its new level's tasks it goes by when it was
-    /// queued.
+    /// queued. It forgets what it aged from and resets the ageing clock, so
+    /// a dispatch pass right after does not immediately age it again off a
+    /// wait counted from before the hand change.
     pub fn set_priority(
         &self,
         id: i64,
@@ -1289,7 +1291,7 @@ impl Store {
             let conn = self.conn.lock().recover();
             let n = conn.execute(
                 "UPDATE tasks SET priority = ?2, priority_from = ?3, preempt = ?5, updated_at = ?4,
-                    aged_from = NULL
+                    aged_from = NULL, aged_at = ?4
              WHERE id = ?1 AND state = 'queued'",
                 params![id, priority.as_str(), from, now, preempt],
             )?;
@@ -1319,10 +1321,12 @@ impl Store {
     /// positions they held between them in their new order, so the moved
     /// one sits between its neighbours and a new task, placed by its id,
     /// still queues last. Refused unless both it and the task it is moved
-    /// before or after are queued. `exclude` (a dispatch pass's in-flight
-    /// task ids, `Fleet::in_flight`) drops those rows from the queue this
-    /// works out positions and levels from, and from being a valid `before`
-    /// or `after`: their row still says `queued`, but they are on their way
+    /// before or after are queued. A move that changes its level forgets
+    /// what it aged from and resets the ageing clock, the same as a hand
+    /// priority change. `exclude` (a dispatch pass's in-flight task ids,
+    /// `Fleet::in_flight`) drops those rows from the queue this works out
+    /// positions and levels from, and from being a valid `before` or
+    /// `after`: their row still says `queued`, but they are on their way
     /// out of it, and `--to`'s position must not count them either.
     pub fn move_queued(
         &self,
@@ -1413,9 +1417,10 @@ impl Store {
             }
             if level != was {
                 tx.execute(
-                    "UPDATE tasks SET priority = ?2, priority_from = 'queue move', aged_from = NULL
+                    "UPDATE tasks SET priority = ?2, priority_from = 'queue move',
+                        aged_from = NULL, aged_at = ?3
                      WHERE id = ?1",
-                    params![id, level.as_str()],
+                    params![id, level.as_str(), now],
                 )?;
             }
             tx.execute(
@@ -3644,8 +3649,8 @@ mod tests {
     }
 
     /// A level set by hand (`task priority`, a `queue move` that changes
-    /// it) is the task's own: it forgets what it aged from, and ages on
-    /// from there like any other.
+    /// it) is the task's own: it forgets what it aged from and resets the
+    /// ageing clock, so it ages on from the hand change, not from before it.
     #[test]
     fn a_level_set_by_hand_forgets_ageing() {
         use crate::queue::QueueSpot::*;
@@ -3660,13 +3665,16 @@ mod tests {
         let wait = |_: &Task| Some(std::time::Duration::from_secs(60));
         let later = a.created_at + chrono::Duration::minutes(5);
         assert_eq!(s.age_queued(later, wait).unwrap().len(), 2);
+        let before_set = Utc::now();
         let t = s
             .set_priority(a.id, Priority::Low, "task priority")
             .unwrap();
         assert_eq!((t.priority, t.aged_from), (Priority::Low, None));
+        assert!(t.aged_at.is_some_and(|at| at >= before_set));
         let m = s.move_queued(b.id, Top, &[]).unwrap();
         assert_eq!(m.task.priority, Priority::High);
         assert_eq!(m.task.aged_from, None);
+        assert!(m.task.aged_at.is_some_and(|at| at >= before_set));
         let aged = s
             .age_queued(later + chrono::Duration::minutes(1), wait)
             .unwrap();
@@ -3674,6 +3682,34 @@ mod tests {
         assert_eq!(aged[0].id, a.id);
         assert_eq!(aged[0].aged_from, Some(Priority::Low));
         let _ = high;
+    }
+
+    /// A dispatch pass run right after a hand priority change does not
+    /// immediately undo it: an overdue task's stale `aged_at` used to
+    /// survive the hand change, so the very next `age_queued` call could
+    /// lift it straight back up.
+    #[test]
+    fn a_dispatch_pass_right_after_lowering_does_not_immediately_re_age() {
+        let s = Store::open_in_memory().unwrap();
+        let t = s
+            .insert_task_at(new_task("run"), Priority::Low, None, TaskRole::Agent)
+            .unwrap();
+        let wait = std::time::Duration::from_millis(20);
+        let after = |_: &Task| Some(wait);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let aged = s.age_queued(Utc::now(), after).unwrap();
+        assert_eq!(aged.len(), 1);
+        assert_eq!(aged[0].priority, Priority::Normal);
+        let lowered = s
+            .set_priority(t.id, Priority::Low, "task priority")
+            .unwrap();
+        assert_eq!(lowered.priority, Priority::Low);
+        assert!(
+            s.age_queued(Utc::now(), after)
+                .unwrap()
+                .into_iter()
+                .all(|a| a.id != t.id)
+        );
     }
 
     /// A retry of an aged task queues at the level it had before it aged:
