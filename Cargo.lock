@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "pastor-cli"
-version = "0.8.0"
+version = "0.8.0-rc.2"
 dependencies = [
  "anyhow",
  "chrono",
