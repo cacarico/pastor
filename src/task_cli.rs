@@ -273,14 +273,14 @@ async fn close_one(
     remove_worktree: bool,
 ) -> anyhow::Result<IpcResponse> {
     let id = task_id(task)?;
-    ask(
+    Ok(ask(
         paths,
         IpcRequest::TaskClose {
             id,
             remove_worktree,
         },
     )
-    .await
+    .await?)
 }
 
 /// `pastor task done [t-N]`: the task given, or the one this pane runs.
