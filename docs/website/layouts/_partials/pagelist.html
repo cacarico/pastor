@@ -1,15 +1,23 @@
-{{- /* The docs pages in reading order, grouped by the `group` front matter
-       key. Weights keep groups together: start 1x, use 2x, run 3x,
-       reference 4x. The current page is marked. */ -}}
+{{- /* The docs as a tree: an overview of every section, then the five
+       sections as topics you open and close,
+       their pages, and under the current page its own topics (its ##
+       headings). The section being read is always open; keys.js keeps the
+       ones you opened open from page to page. */ -}}
 {{- $current := . -}}
+{{- $open := cond .IsSection . .CurrentSection -}}
 <nav class="pane list" aria-label="docs pages">
   <h2 class="t">pages</h2>
-  {{- $group := "" }}
-  {{- range (site.GetPage "/docs").Pages.ByWeight }}
-    {{- if ne .Params.group $group }}
-      {{- $group = .Params.group }}
-  <p class="grp">{{ $group }}</p>
-    {{- end }}
-  <a href="{{ .RelPermalink }}"{{ if eq . $current }} class="sel" aria-current="page"{{ end }}>{{ .Title }}</a>
+  {{- $docs := site.GetPage "/docs" }}
+  <a class="top{{ if eq $docs $current }} sel{{ end }}" href="{{ $docs.RelPermalink }}"{{ if eq $docs $current }} aria-current="page"{{ end }}>overview</a>
+  {{- range $docs.Sections.ByWeight }}
+  <details class="grp" data-section="{{ path.Base .RelPermalink }}"{{ if eq . $open }} open data-here{{ end }}>
+    <summary>{{ .Title }}</summary>
+      {{- range .Pages.ByWeight }}
+    <a class="pg{{ if eq . $current }} sel{{ end }}" href="{{ .RelPermalink }}"{{ if eq . $current }} aria-current="page"{{ end }}>{{ .Title }}</a>
+        {{- if and (eq . $current) (gt (len .Fragments.Headings) 0) }}
+    <div class="topics">{{ .TableOfContents }}</div>
+        {{- end }}
+      {{- end }}
+  </details>
   {{- end }}
 </nav>

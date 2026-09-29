@@ -17,7 +17,7 @@
   <section class="pane focus" style="grid-area: install">
     <h2 class="t">install</h2>
 <pre class="cmd"><span class="p">$ </span>curl -fsSL https://cacari.co/pastor/install.sh | sh</pre>
-    <p>One binary in <b>~/.local/bin</b>. Each machine needs herdr 0.9+, and the head needs ssh to the others. <a href="{{ "docs/install/" | relURL }}">more</a></p>
+    <p>One binary in <b>~/.local/bin</b>. Each machine needs herdr 0.9+, and the head needs ssh to the others. <a href="{{ "docs/start/install/" | relURL }}">more</a></p>
   </section>
 
   {{/* The transcript comes from data/demo.toml. All of it is here as text,
@@ -53,18 +53,18 @@
 {{- end }}
 {{- end }}
 {{- end }}</pre>
-    <p class="term-bar"><a href="{{ "docs/first-run/" | relURL }}">the first run, step by step →</a></p>
+    <p class="term-bar"><a href="{{ "docs/start/first-run/" | relURL }}">the first run, step by step →</a></p>
   </section>
 
   <section class="pane" style="grid-area: can">
     <h2 class="t">what you can do</h2>
     <ul class="uses">
-      <li><span><a href="{{ "docs/examples/#agents-on-another-machine-over-ssh" | relURL }}">run agents on another machine</a>: add a box over ssh, and it shares the load.</span></li>
-      <li><span><a href="{{ "docs/examples/#a-pr-fix-round-from-one-command" | relURL }}">fix a PR with one command</a>: an agent in its own worktree, on the model you name.</span></li>
-      <li><span><a href="{{ "docs/tasks/#wait-your-turn" | relURL }}">put urgent work first</a>: priorities, a queue you can reorder, low work paused for urgent.</span></li>
-      <li><span><a href="{{ "docs/jobs/" | relURL }}">run a job every morning</a>: a schedule that turns into tasks on its own.</span></li>
-      <li><span><a href="{{ "docs/examples/#a-kanban-board-that-hands-cards-to-agents" | relURL }}">hand board cards to agents</a>: tag a card, and it becomes a branch.</span></li>
-      <li><span><a href="{{ "docs/examples/#two-accounts-on-one-head" | relURL }}">keep untrusted work in a sandbox</a>: outside PRs and issues run on a machine with nothing to steal.</span></li>
+      <li><span><a href="{{ "docs/deploy/flock/" | relURL }}">run agents on another machine</a>: add a box over ssh, and it shares the load.</span></li>
+      <li><span><a href="{{ "docs/examples/pr-fix-round/" | relURL }}">fix a PR with one command</a>: an agent in its own worktree, on the model you name.</span></li>
+      <li><span><a href="{{ "docs/examples/urgent-first/" | relURL }}">put urgent work first</a>: priorities, a queue you can reorder, low work paused for urgent.</span></li>
+      <li><span><a href="{{ "docs/examples/morning-job/" | relURL }}">run a job every morning</a>: a schedule that turns into tasks on its own.</span></li>
+      <li><span><a href="{{ "docs/examples/board-cards/" | relURL }}">hand board cards to agents</a>: tag a card, and it becomes a branch.</span></li>
+      <li><span><a href="{{ "docs/examples/sandbox/" | relURL }}">keep untrusted work in a sandbox</a>: outside PRs and issues run on a machine with nothing to steal.</span></li>
     </ul>
     <p><a href="{{ "docs/examples/" | relURL }}">the examples, with the config to copy</a></p>
   </section>

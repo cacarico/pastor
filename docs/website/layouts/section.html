@@ -1,23 +1,30 @@
 {{ define "meta" }}docs · one topic per page<br>v{{ hugo.Data.cargo.package.version }}{{ end }}
 
 {{ define "main" }}
+{{- $root := eq .RelPermalink (site.GetPage "/docs").RelPermalink }}
 <main class="grid docs">
   {{ partial "pagelist.html" . }}
 
   <article class="pane focus doc">
-    <h2 class="t">docs <span>how pastor works today</span></h2>
+    <h2 class="t">{{ if $root }}docs <span>how pastor works today</span>{{ else }}{{ .Title }} <span>{{ .Params.summary }}</span>{{ end }}</h2>
     {{ .Content }}
+    {{- /* One card per section: its title and summary, then its pages. The
+           docs root shows every section; a section shows its own. */}}
     <div class="index">
-      {{- $group := "" }}
-      {{- range .Pages.ByWeight }}
-        {{- if ne .Params.group $group }}
-          {{- if $group }}</dl></section>{{ end }}
-          {{- $group = .Params.group }}
-      <section><h2>{{ $group }}</h2><dl>
+      {{- $sections := cond $root .Sections.ByWeight (slice .) }}
+      {{- range $sections }}
+      <section class="card">
+        {{- if $root }}
+        <h2><a href="{{ .RelPermalink }}">{{ .Title }}</a></h2>
+        <p class="sum">{{ .Params.summary }}</p>
         {{- end }}
-        <dt><a href="{{ .RelPermalink }}">{{ .Title }}</a></dt><dd>{{ .Params.summary }}</dd>
+        <ul>
+          {{- range .Pages.ByWeight }}
+          <li><a href="{{ .RelPermalink }}">{{ .Title }}</a><span>{{ .Params.summary }}</span></li>
+          {{- end }}
+        </ul>
+      </section>
       {{- end }}
-      {{- if $group }}</dl></section>{{ end }}
     </div>
   </article>
 </main>
@@ -29,5 +36,5 @@
     <span><k>h</k>/<k>l</k> sideways</span>
     <span><k>gg</k>/<k>G</k> top/end</span>
     <span><k>1-4</k> switch</span>
-    <span class="right">index · {{ len .Pages }} pages</span>
+    <span class="right">{{ .Title }} · {{ len (partial "docpages.html" .) }} pages</span>
 {{ end }}
