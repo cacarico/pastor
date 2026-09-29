@@ -123,6 +123,11 @@ struct State {
     /// Set silently just before the next `agent.list` that comes straight
     /// after another one, within 50ms (see `set_status_between_lists`).
     status_between_lists: Option<(String, AgentStatus)>,
+    /// What happens to one pane while the next `pane.close` of another pane
+    /// is in flight (see `on_next_close_set_status`, `on_next_close_replace`):
+    /// the first entry for a pane other than the one closing runs, and the
+    /// rest are dropped with it.
+    on_close: Vec<(String, OnClose)>,
     /// When the last `agent.list` arrived.
     last_list: Option<Instant>,
     /// Everything typed into each pane, by pane id.
@@ -174,6 +179,12 @@ fn change_status(s: &mut State, pane_id: &str, status: AgentStatus) -> Option<Ag
         a.state_change_seq = seq;
     }
     Some(a.clone())
+}
+
+/// See `State::on_close`.
+enum OnClose {
+    Status(AgentStatus),
+    Replace(String),
 }
 
 #[derive(Clone)]
@@ -522,6 +533,32 @@ impl FakeHerdr {
     /// `reconcile_every` apart. One-shot.
     pub fn set_status_between_lists(&self, pane_id: &str, status: AgentStatus) {
         self.state.lock().unwrap().status_between_lists = Some((pane_id.into(), status));
+    }
+
+    /// The agent on `pane_id` changes to `status`, silently, while the next
+    /// `pane.close` of another pane is in flight: an agent that went back to
+    /// work after the `agent.list` that found it stopped. Given for two
+    /// panes, only one of them changes, whichever does not close first.
+    /// One-shot.
+    pub fn on_next_close_set_status(&self, pane_id: &str, status: AgentStatus) {
+        self.state
+            .lock()
+            .unwrap()
+            .on_close
+            .push((pane_id.into(), OnClose::Status(status)));
+    }
+
+    /// The agent on `pane_id` is replaced by an idle agent named `name`,
+    /// silently, while the next `pane.close` of another pane is in flight:
+    /// herdr handed the pane out again after the `agent.list` that found
+    /// its agent stopped. Given for two panes, as `on_next_close_set_status`.
+    /// One-shot.
+    pub fn on_next_close_replace(&self, pane_id: &str, name: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .on_close
+            .push((pane_id.into(), OnClose::Replace(name.into())));
     }
 
     /// Does the fake have this pane: a workspace's root pane, or one with an
@@ -1156,6 +1193,20 @@ impl FakeHerdr {
                     return Err(("pane_not_found".into(), format!("pane {pane_id} not found")));
                 }
                 s.agents.remove(&pane_id);
+                if let Some(i) = s.on_close.iter().position(|(other, _)| *other != pane_id) {
+                    let (other, what) = std::mem::take(&mut s.on_close).swap_remove(i);
+                    match what {
+                        OnClose::Status(status) => {
+                            change_status(&mut s, &other, status);
+                        }
+                        OnClose::Replace(name) => {
+                            change_status(&mut s, &other, AgentStatus::Idle);
+                            if let Some(a) = s.agents.get_mut(&other) {
+                                a.name = Some(name);
+                            }
+                        }
+                    }
+                }
                 let left = s.panes.get_mut(&ws).map(|panes| {
                     panes.retain(|x| *x != pane_id);
                     panes.len()

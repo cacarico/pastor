@@ -48,6 +48,7 @@ load, and the error names the key.
 | `request_timeout` | `"60s"` | the bound on one herdr request, connect included; a machine that does not answer in time counts as lost |
 | `agent_ready_timeout` | `"30s"` | from starting an agent to a prompt herdr accepts; must be shorter than `request_timeout` |
 | `close_done_after` | `"5s"` | a done task's pane closes after this, so its machine slot frees; `"15m"` leaves time for `pastor task attach` to show its last screen; `"never"` keeps it |
+| `close_failed_after` | `"5s"` | a failed or stale task's pane, or an orphan's, closes after this once its agent has stopped; the task stays failed and retryable, its worktree kept; `"never"` keeps them |
 | `pull_lost_after` | `"10m"` | a pull machine that has not claimed or reported for this long counts as lost, and its starting and running tasks go stale |
 | `agents_change_fleet` | `false` | `true` lets agents pastor started run, retry, send to and close tasks, run jobs, and edit machines, flocks and jobs |
 | `max_orchestrators` | `1` | how many orchestrator agents run at once; each still takes a slot on the head's machine under its `max_agents` |

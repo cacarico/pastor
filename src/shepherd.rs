@@ -857,6 +857,7 @@ mod tests {
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
             close_done_after: None,
+            close_failed_after: None,
             ..Default::default()
         }
     }

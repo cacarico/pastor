@@ -1490,6 +1490,11 @@ pub struct PastorConfig {
     /// `pastor task attach` can still show the agent's last screen. `never`
     /// turns auto-close off.
     pub close_done_after: String,
+    /// How long a `failed` or `stale` task, or an orphaned agent (named
+    /// `t-<id>` with no open task owning it), keeps its pane once its agent
+    /// has stopped before pastor closes it. The row stays failed and
+    /// retryable. `never` keeps those panes.
+    pub close_failed_after: String,
     /// How long a pull machine (`pull = true` in flock.toml) may go without
     /// a `TaskClaim` or `TaskReport` before the head counts it lost and its
     /// starting and running tasks go stale.
@@ -1620,6 +1625,7 @@ impl Default for PastorConfig {
             request_timeout: "60s".into(),
             agent_ready_timeout: "30s".into(),
             close_done_after: "5s".into(),
+            close_failed_after: "5s".into(),
             pull_lost_after: "10m".into(),
             agents_change_fleet: false,
             max_orchestrators: 1,
@@ -1678,9 +1684,10 @@ impl PastorConfig {
             ("agent_ready_timeout", &cfg.agent_ready_timeout, false),
             ("defaults.timeout", &cfg.defaults.timeout, true),
             ("close_done_after", &cfg.close_done_after, false),
+            ("close_failed_after", &cfg.close_failed_after, false),
             ("pull_lost_after", &cfg.pull_lost_after, false),
         ] {
-            if name == "close_done_after" && v == CLOSE_NEVER {
+            if name.starts_with("close_") && v == CLOSE_NEVER {
                 continue;
             }
             let d = parse_duration(v)
@@ -1821,6 +1828,16 @@ impl PastorConfig {
             &PastorConfig::default().close_done_after,
         ))
     }
+    /// `None` when failed and stale tasks keep their panes (`never`).
+    pub fn close_failed_after_duration(&self) -> Option<Duration> {
+        if self.close_failed_after == CLOSE_NEVER {
+            return None;
+        }
+        Some(duration_or_default(
+            &self.close_failed_after,
+            &PastorConfig::default().close_failed_after,
+        ))
+    }
     pub fn pull_lost_after_duration(&self) -> Duration {
         duration_or_default(
             &self.pull_lost_after,
@@ -1835,7 +1852,8 @@ impl PastorConfig {
     }
 }
 
-/// The `close_done_after` value that turns auto-close off.
+/// The `close_done_after` or `close_failed_after` value that turns that
+/// auto-close off.
 const CLOSE_NEVER: &str = "never";
 
 /// Parse `value`, falling back to `default` (assumed valid) if `value` is bad.
@@ -3853,6 +3871,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(c.close_done_after_duration(), None);
+    }
+
+    #[test]
+    fn close_failed_after_defaults_to_five_seconds_and_never_keeps_panes() {
+        let path = Path::new("pastor.toml");
+        let d = PastorConfig::default();
+        assert_eq!(
+            d.close_failed_after_duration(),
+            Some(Duration::from_secs(5))
+        );
+        let cfg = PastorConfig::parse(path, "close_failed_after = \"never\"").unwrap();
+        assert_eq!(cfg.close_failed_after_duration(), None);
+        let cfg = PastorConfig::parse(path, "close_failed_after = \"1h\"").unwrap();
+        assert_eq!(
+            cfg.close_failed_after_duration(),
+            Some(Duration::from_secs(3600))
+        );
+        let err = PastorConfig::parse(path, "close_failed_after = \"0s\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("close_failed_after"), "{err}");
     }
 
     /// `[shepherd]` names the pull machine this one is, the hostname when

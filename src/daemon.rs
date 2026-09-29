@@ -55,6 +55,7 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         agent_ready_timeout: config.agent_ready_timeout_duration(),
         poll_every: config.tick_duration(),
         close_done_after: config.close_done_after_duration(),
+        close_failed_after: config.close_failed_after_duration(),
         agents: config.agents.clone(),
         head_address: config.head_address.clone(),
         ..Default::default()
@@ -4171,6 +4172,7 @@ mod tests {
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
             close_done_after: None,
+            close_failed_after: None,
             agents: Default::default(),
             ..Default::default()
         }

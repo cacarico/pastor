@@ -503,6 +503,12 @@ impl Store {
                 "database schema {v} is newer than this pastor ({SCHEMA_VERSION}); refusing to touch it"
             ),
         }
+        // Rows that still record a pane (`tasks_holding_panes`): a few, out
+        // of every task a machine ever ran. An index needs no schema bump,
+        // and an older pastor opening the file ignores it.
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS tasks_machine_pane ON tasks(machine) WHERE pane_id IS NOT NULL",
+        )?;
         tx.commit()?;
         Ok(Store {
             conn: Mutex::new(conn),
@@ -1094,7 +1100,34 @@ impl Store {
     }
 
     pub fn list_tasks(&self, f: &TaskFilter) -> anyhow::Result<Vec<Task>> {
+        self.list_tasks_where(f, false)
+    }
+
+    /// Tasks in `states` on `machine` that still record a pane, for
+    /// auto-close (`auto_close_stopped`): filtered in SQL, over the
+    /// `tasks_machine_pane` index, so a check every few seconds reads the
+    /// outstanding panes only, never the failed history that has none.
+    pub fn tasks_holding_panes(
+        &self,
+        machine: &str,
+        states: &[TaskState],
+    ) -> anyhow::Result<Vec<Task>> {
+        self.list_tasks_where(
+            &TaskFilter {
+                machine: Some(machine.into()),
+                states: Some(states.to_vec()),
+                ..Default::default()
+            },
+            true,
+        )
+    }
+
+    /// `list_tasks`, and with `pane_only` only rows with a pane id.
+    fn list_tasks_where(&self, f: &TaskFilter, pane_only: bool) -> anyhow::Result<Vec<Task>> {
         let mut sql = format!("{TASK_WITH_SUMMARY} WHERE 1=1");
+        if pane_only {
+            sql.push_str(" AND pane_id IS NOT NULL");
+        }
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(job) = &f.job {
             args.push(Box::new(job.clone()));
@@ -2039,6 +2072,53 @@ mod tests {
             still_open.iter().map(|t| t.id).collect::<Vec<_>>(),
             vec![open.id],
             "the SQL filter must exclude the closed row before it is decoded"
+        );
+    }
+
+    /// Auto-close asks every few seconds for the failed and stale tasks that
+    /// still record a pane: a machine's long failed history, which has none,
+    /// is filtered out in SQL, over its own index, never decoded.
+    #[test]
+    fn tasks_holding_panes_skips_the_paneless_history_in_sql() {
+        let s = Store::open_in_memory().unwrap();
+        for _ in 0..2_000 {
+            s.insert_task(new_task("run")).unwrap();
+        }
+        s.execute_raw("UPDATE tasks SET state = 'failed', machine = 'pi-3'");
+        // A read that decoded the history would trip on this.
+        s.execute_raw("UPDATE tasks SET spec = 'not json'");
+        let mut held = s.insert_task(new_task("run")).unwrap();
+        held.state = TaskState::Stale;
+        held.machine = Some("pi-3".into());
+        held.pane_id = Some("w2:p1".into());
+        s.update_task(&mut held).unwrap();
+        let mut elsewhere = s.insert_task(new_task("run")).unwrap();
+        elsewhere.state = TaskState::Failed;
+        elsewhere.machine = Some("pi-4".into());
+        elsewhere.pane_id = Some("w3:p1".into());
+        s.update_task(&mut elsewhere).unwrap();
+
+        let got = s
+            .tasks_holding_panes("pi-3", &[TaskState::Failed, TaskState::Stale])
+            .unwrap();
+        assert_eq!(got.iter().map(|t| t.id).collect::<Vec<_>>(), vec![held.id]);
+
+        let plan: Vec<String> = {
+            let conn = s.conn.lock().recover();
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT * FROM tasks WHERE 1=1 AND pane_id IS NOT NULL \
+                     AND machine = 'pi-3' AND state IN ('failed','stale')",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>("detail"))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(
+            plan.iter().any(|d| d.contains("tasks_machine_pane")),
+            "{plan:?}"
         );
     }
 

@@ -116,7 +116,10 @@ says how hard pastor asks:
 
 pastor closes a done task's pane after 5 seconds (`close_done_after` in
 `pastor.toml`), and removes its worktree if it is clean: no uncommitted
-changes and no unpushed commits. Nothing else closes on its own.
+changes and no unpushed commits. A failed or stale task, or an orphan, loses
+its pane 5 seconds after its agent stops (`close_failed_after`), but stays
+failed for `pastor task retry`, its worktree kept. Nothing else closes on its
+own.
 
 ```sh
 pastor task close t-12 --remove-worktree  # close it now, worktree too

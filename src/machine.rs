@@ -18,7 +18,7 @@ use crate::herdr::{
     AgentInfo, AgentStatus, CallError, Connector, ConnectorExt, EventStream,
     subscription_agent_status, subscription_lifecycle,
 };
-use crate::store::Store;
+use crate::store::{Store, TaskFilter};
 use crate::sync::Recover;
 use crate::task::{Observed, Task, TaskState, TaskSummary, next_state};
 
@@ -317,6 +317,11 @@ pub struct MachineSettings {
     /// While connected, the check runs after each reconcile and, for a grace
     /// shorter than `reconcile_every`, every `close_done_after` as well.
     pub close_done_after: Option<Duration>,
+    /// How long a `failed` or `stale` task's stopped agent, or an orphaned
+    /// one, keeps its pane before auto-close takes it (`close_failed_after`
+    /// in `pastor.toml`). `None` keeps those panes. Checked with
+    /// `close_done_after`.
+    pub close_failed_after: Option<Duration>,
     /// While connected or polling, how often the machine is asked for its
     /// pastor version again, so an upgrade shows without a reconnect. Checked
     /// after each reconcile (`reconcile_every` connected, `poll_every`
@@ -341,6 +346,7 @@ impl Default for MachineSettings {
             agent_ready_timeout: Duration::from_secs(30),
             poll_every: Duration::from_secs(10),
             close_done_after: Some(Duration::from_secs(5)),
+            close_failed_after: Some(Duration::from_secs(5)),
             version_every: Duration::from_secs(10 * 60),
             agents: crate::config::Agents::default(),
             head_address: None,
@@ -840,6 +846,7 @@ pub fn spawn_machine(
         failures: 0,
         lost_announced: false,
         orphans: vec![],
+        stopped_since: HashMap::new(),
         version_asked_at: Instant::now(),
     };
     let task = tokio::spawn(actor.run());
@@ -904,6 +911,15 @@ struct Actor {
     /// Orphaned agents from the last reconcile, as (agent name, pane id).
     /// See `MachineStatus::orphans`.
     orphans: Vec<(String, String)>,
+    /// By pane id, when `auto_close_stopped` first found that pane's agent
+    /// stopped (idle or done), and who was in the pane then (`Occupant`):
+    /// the grace for `close_failed_after` counts from there, not from when
+    /// the task failed, went stale or was first found orphaned. Reset
+    /// (removed) the moment the same pane is found at work again, so an
+    /// agent that keeps going past the grace is not closed the instant it
+    /// finally stops, and started again when another agent holds the pane:
+    /// herdr hands pane ids out again, and the grace is the agent's.
+    stopped_since: HashMap<String, (Occupant, Instant)>,
     /// When the machine was last asked for its pastor version; see
     /// `refresh_pastor_version`.
     version_asked_at: Instant,
@@ -929,6 +945,68 @@ fn live_pane(task: &Task, machine: &str) -> Result<String, SendRefused> {
             ),
         }),
     }
+}
+
+/// Who holds a pane at one look: the agent's name (`Some(None)` for an
+/// agent herdr lists with no name), or `None` for a pane with no agent.
+type Occupant = Option<Option<String>>;
+
+/// How long `occupant` has been stopped in `pane`, by `clocks`, starting
+/// the clock if it is not running. A pane's clock runs for the agent it was
+/// started for: another agent in the pane (a reused pane, or `find_orphans`
+/// swapping one orphan for another) starts it again, so no agent inherits
+/// time an earlier one spent stopped there.
+fn stopped_for(
+    clocks: &mut HashMap<String, (Occupant, Instant)>,
+    pane: &str,
+    occupant: Occupant,
+) -> Duration {
+    let (who, since) = clocks
+        .entry(pane.to_string())
+        .or_insert_with(|| (occupant.clone(), Instant::now()));
+    if *who != occupant {
+        *who = occupant;
+        *since = Instant::now();
+    }
+    since.elapsed()
+}
+
+/// Does `pane` hold an agent that is not `task`'s: herdr handed the pane
+/// out again, and that agent's status and sequence say nothing about the
+/// task. An empty pane is still the task's.
+fn holds_other_agent(task: &Task, agents: &[AgentInfo], pane: &str) -> bool {
+    let expected = task
+        .agent_name
+        .clone()
+        .unwrap_or_else(|| Task::agent_name_for(task.id));
+    agents
+        .iter()
+        .find(|a| a.pane_id == pane)
+        .is_some_and(|a| a.name.as_deref() != Some(expected.as_str()))
+}
+
+fn occupant(agents: &[AgentInfo], pane: &str) -> Occupant {
+    agents
+        .iter()
+        .find(|a| a.pane_id == pane)
+        .map(|a| a.name.clone())
+}
+
+/// Is `pane`'s agent stopped (idle or done) by `agents`, or is the pane
+/// empty.
+fn stopped_in(agents: &[AgentInfo], pane: &str) -> bool {
+    agents
+        .iter()
+        .find(|a| a.pane_id == pane)
+        .is_none_or(|a| matches!(a.agent_status, AgentStatus::Idle | AgentStatus::Done))
+}
+
+/// Would `next_state` read `pane`'s agent, by `agents`, as `task` finishing.
+fn completion_pending_in(agents: &[AgentInfo], task: &Task, pane: &str) -> bool {
+    agents
+        .iter()
+        .find(|a| a.pane_id == pane)
+        .is_some_and(|agent| next_state(task, &observed_from(agent)) == Some(TaskState::Done))
 }
 
 /// Agents named `t-<id>` that none of `owned` (the pane-owning tasks on the
@@ -1134,11 +1212,15 @@ impl Actor {
             // Auto-close runs after each reconcile. A grace shorter than
             // `reconcile_every` gets its own tick as well, or a 5s grace
             // would wait up to a whole reconcile.
-            let close_every = self
-                .settings
-                .close_done_after
-                .filter(|after| *after < self.settings.reconcile_every)
-                .map(|after| after.max(Duration::from_millis(50)));
+            let close_every = [
+                self.settings.close_done_after,
+                self.settings.close_failed_after,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .filter(|after| *after < self.settings.reconcile_every)
+            .map(|after| after.max(Duration::from_millis(50)));
             let mut close_tick =
                 tokio::time::interval(close_every.unwrap_or(self.settings.reconcile_every));
             close_tick.tick().await; // first tick fires immediately; we just reconciled
@@ -1212,7 +1294,7 @@ impl Actor {
                         };
                         // Only here, connected: the poll loop reconciles too, but
                         // it does not close panes.
-                        if reconciled && let Err(err) = self.auto_close_done().await {
+                        if reconciled && let Err(err) = self.auto_close().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "auto-close failed"); break; }
                             tracing::warn!(machine = %self.name, %err, "auto-close failed; staying connected");
                         }
@@ -1221,7 +1303,7 @@ impl Actor {
                         }
                     }
                     _ = close_tick.tick(), if reconciled && close_every.is_some() => {
-                        if let Err(err) = self.auto_close_done().await {
+                        if let Err(err) = self.auto_close().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "auto-close failed"); break; }
                             tracing::warn!(machine = %self.name, %err, "auto-close failed; staying connected");
                         }
@@ -2525,9 +2607,17 @@ impl Actor {
         Ok(t)
     }
 
+    /// Both auto-closes: done tasks (`auto_close_done`), then the panes of
+    /// stopped agents no task is waiting on (`auto_close_stopped`).
+    async fn auto_close(&mut self) -> anyhow::Result<()> {
+        self.auto_close_done().await?;
+        self.auto_close_stopped().await
+    }
+
     /// Close the done tasks on this machine that finished `close_done_after`
-    /// ago or more, through the same path as `pastor task close`. Failed,
-    /// blocked and stale tasks are never closed on their own. A task herdr
+    /// ago or more, through the same path as `pastor task close`. Failed and
+    /// stale tasks lose only their panes (`auto_close_stopped`); blocked
+    /// tasks are never closed on their own. A task herdr
     /// will not close is logged and tried again at the next check; only a
     /// failure below the API is returned, so the caller can reconnect.
     async fn auto_close_done(&mut self) -> anyhow::Result<()> {
@@ -2570,6 +2660,241 @@ impl Actor {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Close the panes that stopped agents hold for no task pastor still
+    /// waits on, once `close_failed_after` has passed since that pane's
+    /// agent was first found stopped (idle or done; `stopped_since`): a
+    /// `failed` or `stale` task's, and an orphan's (`find_orphans`). The
+    /// grace resets the moment the same pane is next found at work, so an
+    /// agent that keeps going past the check is not closed the instant it
+    /// finally stops. A `stale` task's pane whose current idle observation
+    /// `next_state` would still read as this task's completion is left
+    /// alone instead: `confirm_pending_done`'s settle window owns deciding
+    /// that, so a real completion is never raced into a failure; an idle
+    /// observation that is not heading toward `Done` (an agent stuck idle
+    /// with no completion coming) never sets that aside, so such a task is
+    /// not kept forever. An agent herdr shows working or blocked is left
+    /// alone. A pane that holds another agent now is told apart first,
+    /// before its status or sequence is read: herdr handed the pane out
+    /// again, so the task's own agent is gone and the replacement's status,
+    /// working or idle, is not this task's work or completion. Such a task
+    /// is repaired at once, with no grace: a stale one is failed and a
+    /// failed one kept, both with their pane id cleared, and the
+    /// replacement's pane is never touched.
+    /// Unlike `auto_close_done`, the row is not closed and the worktree
+    /// stays: a failed task stays failed and records no pane, so `pastor
+    /// task retry` still takes it and can reopen its checkout. A stale task
+    /// is failed first, before its pane goes, so the pane's `pane.closed`
+    /// does not close the row, and so reconcile never reads it as a
+    /// `Starting` task with no pane. A pane herdr will not close is logged
+    /// and tried again at the next check; only a failure below the API is
+    /// returned.
+    async fn auto_close_stopped(&mut self) -> anyhow::Result<()> {
+        let Some(after) = self.settings.close_failed_after else {
+            return Ok(());
+        };
+        let candidates = self
+            .store
+            .tasks_holding_panes(&self.name, &[TaskState::Failed, TaskState::Stale])?;
+        if candidates.is_empty() && self.orphans.is_empty() {
+            return Ok(());
+        }
+        let timeout = self.settings.request_timeout;
+        let agents = tokio::time::timeout(timeout, self.connector.agent_list())
+            .await
+            .map_err(|_| TimedOut("agent.list", timeout))??;
+        let stopped = |pane: &str| stopped_in(&agents, pane);
+        // A pane whose agent is idle for a reason `next_state` would read as
+        // this very task finishing: `confirm_pending_done` gets first say,
+        // not this shorter grace.
+        let pending_completion = |t: &Task, pane: &str| completion_pending_in(&agents, t, pane);
+        // Start, or keep, each stopped pane's clock; a pane seen at work, or
+        // whose idle is a pending completion, has its clock reset instead,
+        // so a later stop (or a completion that turns out not to be one)
+        // starts a fresh grace.
+        // A pane that holds another agent now: herdr handed it out again,
+        // so the task's own agent is gone, and the replacement's status,
+        // working or idle at any sequence, says nothing about this task.
+        // Checked before anything reads that status, and repaired at once:
+        // there is no agent of this task left to give a grace to.
+        let reused = |t: &Task, pane: &str| holds_other_agent(t, &agents, pane);
+        let mut seen_panes: HashSet<String> = HashSet::new();
+        // The clock of a reused pane is not marked seen here: it is the
+        // earlier agent's, dropped below unless an orphan now holds the
+        // pane, whose own clock starts then.
+        let (reused_panes, candidates): (Vec<Task>, Vec<Task>) = candidates
+            .into_iter()
+            .partition(|t| reused(t, t.pane_id.as_deref().expect("filtered on a pane")));
+        let mut due: Vec<Task> = vec![];
+        for t in candidates {
+            let pane = t.pane_id.clone().expect("filtered on a pane");
+            seen_panes.insert(pane.clone());
+            if !stopped(&pane) || pending_completion(&t, &pane) {
+                self.stopped_since.remove(&pane);
+            } else if stopped_for(&mut self.stopped_since, &pane, occupant(&agents, &pane)) >= after
+            {
+                due.push(t);
+            }
+        }
+        let mut orphans_due: Vec<(String, String)> = vec![];
+        for (agent, pane) in self.orphans.clone() {
+            seen_panes.insert(pane.clone());
+            if !stopped(&pane) {
+                self.stopped_since.remove(&pane);
+            } else if stopped_for(&mut self.stopped_since, &pane, occupant(&agents, &pane)) >= after
+            {
+                orphans_due.push((agent, pane));
+            }
+        }
+        self.stopped_since
+            .retain(|pane, _| seen_panes.contains(pane));
+        if due.is_empty() && orphans_due.is_empty() && reused_panes.is_empty() {
+            return Ok(());
+        }
+        for t in reused_panes {
+            let pane = t.pane_id.clone().expect("filtered on a pane");
+            let name = t.display_id();
+            tracing::debug!(machine = %self.name, task = %name, %pane, "not closing a reused pane");
+            match t.state {
+                TaskState::Failed => {
+                    write_task(&self.store, t, |t| {
+                        let ours = t.state == TaskState::Failed
+                            && t.pane_id.as_deref() == Some(pane.as_str());
+                        if ours {
+                            t.pane_id = None;
+                        }
+                        ours
+                    })?;
+                }
+                TaskState::Stale => {
+                    let failed = write_task(&self.store, t.clone(), |t| {
+                        let ours = t.state == TaskState::Stale
+                            && t.pane_id.as_deref() == Some(pane.as_str());
+                        if ours {
+                            t.state = TaskState::Failed;
+                            t.pane_id = None;
+                            t.finished_at = t.finished_at.or_else(|| Some(Utc::now()));
+                            t.error = Some(
+                                "timed out and its agent's pane was reused; treated as stopped"
+                                    .into(),
+                            );
+                        }
+                        ours
+                    })?;
+                    if failed.is_some() {
+                        self.pending_done.remove(&t.id);
+                        self.emit("task.failed", Some(t.id));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Each `pane.close` can take up to `request_timeout`, and `agents`
+        // was listed before the first: by the time a later pane's turn
+        // comes, its agent may have gone back to work or herdr may have
+        // handed the pane to another. So after every close the agents are
+        // listed again, and a pane whose agent is no longer the stopped one
+        // its clock was started for is kept, its clock dropped: the next
+        // check starts a fresh grace, or repairs a reused task pane.
+        let mut agents = agents;
+        let mut listed = true;
+        let mut closed = HashSet::new();
+        for mut t in due {
+            let pane = t.pane_id.clone().expect("filtered on a pane");
+            let name = t.display_id();
+            if !listed {
+                agents = tokio::time::timeout(timeout, self.connector.agent_list())
+                    .await
+                    .map_err(|_| TimedOut("agent.list", timeout))??;
+                listed = true;
+            }
+            if !self.still_stopped(&agents, &pane)
+                || holds_other_agent(&t, &agents, &pane)
+                || completion_pending_in(&agents, &t, &pane)
+            {
+                tracing::debug!(machine = %self.name, task = %name, "pane kept: its agent is at work, or another holds it, since it was found stopped");
+                self.stopped_since.remove(&pane);
+                continue;
+            }
+            if t.state == TaskState::Stale {
+                let failed = write_task(&self.store, t.clone(), |t| {
+                    let ours =
+                        t.state == TaskState::Stale && t.pane_id.as_deref() == Some(pane.as_str());
+                    if ours {
+                        t.state = TaskState::Failed;
+                        t.finished_at = t.finished_at.or_else(|| Some(Utc::now()));
+                        t.error = Some(
+                            "timed out and its agent stopped; its pane closed after close_failed_after"
+                                .into(),
+                        );
+                    }
+                    ours
+                })?;
+                let Some(failed) = failed else {
+                    continue;
+                };
+                t = failed;
+                self.pending_done.remove(&t.id);
+                self.emit("task.failed", Some(t.id));
+            }
+            let close = self.close_pane_of(&pane, &name).await;
+            listed = false;
+            match close {
+                Ok(()) => {}
+                Err(err) if is_outage(&err) => return Err(err),
+                Err(err) => {
+                    tracing::warn!(machine = %self.name, task = %name, err = format!("{err:#}"), "closing a failed task's pane failed; trying again at the next check");
+                    continue;
+                }
+            }
+            write_task(&self.store, t, |t| {
+                let ours = t.pane_id.as_deref() == Some(pane.as_str());
+                if ours {
+                    t.pane_id = None;
+                }
+                ours
+            })?;
+            tracing::info!(machine = %self.name, task = %name, ?after, "closed a stopped agent's pane after close_failed_after");
+            self.forget_orphan(&pane);
+            closed.insert(pane);
+        }
+        // Looked for again, not taken from the last reconcile: a task may
+        // have claimed the agent since.
+        let owned = self.store.tasks_on_machine(&self.name)?;
+        for (agent, pane) in orphans_due {
+            if closed.contains(&pane) {
+                continue;
+            }
+            if !listed {
+                agents = tokio::time::timeout(timeout, self.connector.agent_list())
+                    .await
+                    .map_err(|_| TimedOut("agent.list", timeout))??;
+                listed = true;
+            }
+            if !orphan_agents(&agents, &owned).contains(&(agent.clone(), pane.clone())) {
+                continue;
+            }
+            if !self.still_stopped(&agents, &pane) {
+                tracing::debug!(machine = %self.name, %agent, "orphan kept: it is at work, or another holds its pane, since it was found stopped");
+                self.stopped_since.remove(&pane);
+                continue;
+            }
+            let close = self.close_pane_of(&pane, &agent).await;
+            listed = false;
+            match close {
+                Ok(()) => {}
+                Err(err) if is_outage(&err) => return Err(err),
+                Err(err) => {
+                    tracing::warn!(machine = %self.name, %agent, err = format!("{err:#}"), "closing an orphan's pane failed; trying again at the next check");
+                    continue;
+                }
+            }
+            tracing::info!(machine = %self.name, %agent, %pane, ?after, "closed an orphaned agent's pane after close_failed_after");
+            self.forget_orphan(&pane);
+        }
+        self.refresh_live();
         Ok(())
     }
 
@@ -2753,6 +3078,9 @@ impl Actor {
             return Ok(());
         };
         let Ok(Some(task)) = self.store.find_by_pane(&self.name, pane_id) else {
+            if ev.is_pane_closed() {
+                self.release_failed_pane(pane_id)?;
+            }
             if (ev.is_pane_closed() || ev.is_pane_exited()) && self.forget_orphan(pane_id) {
                 self.refresh_live();
             }
@@ -2997,6 +3325,11 @@ impl Actor {
             else {
                 continue;
             };
+            // A stale task's pane handed to another agent: that agent's idle
+            // is not this task's completion; `auto_close_stopped` fails it.
+            if task.state == TaskState::Stale && holds_other_agent(&task, &agents, &agent.pane_id) {
+                continue;
+            }
             self.note_status(id, agent.agent_status);
             let idle_like = matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done);
             // No sequence yet (the candidate came from an event) is as good as a
@@ -3406,6 +3739,14 @@ impl Actor {
                     }
                     self.apply(t, &exited);
                 }
+                // As in `confirm_pending_done`: another agent's status is
+                // not a stale task's; `auto_close_stopped` repairs the row.
+                Some(_)
+                    if task.state == TaskState::Stale
+                        && holds_other_agent(&task, &agents, &pane_id) =>
+                {
+                    self.pending_done.remove(&task.id);
+                }
                 Some(agent) => {
                     self.note_status(task.id, agent.agent_status);
                     // Before the timeout check: a task that sat blocked past its
@@ -3539,17 +3880,54 @@ impl Actor {
         let found = orphan_agents(agents, &self.store.tasks_on_machine(&self.name)?);
         for (name, pane) in &found {
             if !self.orphans.iter().any(|(n, _)| n == name) {
-                tracing::warn!(machine = %self.name, agent = %name, %pane, "orphaned agent: no open task owns it; `pastor task close` closes it");
+                tracing::warn!(machine = %self.name, agent = %name, %pane, "orphaned agent: no open task owns it; `pastor task close` closes it, and auto-close once it stops for close_failed_after");
             }
         }
         self.orphans = found;
         Ok(())
     }
 
+    /// A closed pane is no failed task's any more: herdr hands its id out
+    /// again, and `auto_close_stopped` closes a failed task's recorded pane
+    /// once it looks stopped, as an empty new pane would. The row keeps its
+    /// state and worktree for `task retry`. An exited agent's pane is kept:
+    /// it is still open, and still the task's to close.
+    fn release_failed_pane(&mut self, pane_id: &str) -> anyhow::Result<()> {
+        let failed = self.store.list_tasks(&TaskFilter {
+            machine: Some(self.name.clone()),
+            states: Some(vec![TaskState::Failed]),
+            ..Default::default()
+        })?;
+        for t in failed
+            .into_iter()
+            .filter(|t| t.pane_id.as_deref() == Some(pane_id))
+        {
+            write_task(&self.store, t, |t| {
+                let ours = t.state == TaskState::Failed && t.pane_id.as_deref() == Some(pane_id);
+                if ours {
+                    t.pane_id = None;
+                }
+                ours
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Is `pane` still held, by `agents`, by the stopped occupant its
+    /// auto-close clock (`stopped_since`) was started for.
+    fn still_stopped(&self, agents: &[AgentInfo], pane: &str) -> bool {
+        stopped_in(agents, pane)
+            && self
+                .stopped_since
+                .get(pane)
+                .is_some_and(|(who, _)| *who == occupant(agents, pane))
+    }
+
     /// Drop the orphan in `pane_id`, if there is one. Returns whether it did.
     fn forget_orphan(&mut self, pane_id: &str) -> bool {
         let before = self.orphans.len();
         self.orphans.retain(|(_, p)| p != pane_id);
+        self.stopped_since.remove(pane_id);
         self.orphans.len() != before
     }
 }
@@ -3630,6 +4008,7 @@ mod tests {
             agent_ready_timeout: Duration::from_millis(500),
             poll_every: Duration::from_millis(200),
             close_done_after: None,
+            close_failed_after: None,
             version_every: Duration::from_millis(200),
             agents: Default::default(),
             head_address: None,
@@ -4653,7 +5032,8 @@ mod tests {
 
     /// An agent named like a task that no open task owns is an orphan: its
     /// row failed, closed or is gone. It holds a pane, so it counts in `live`,
-    /// and it is named in the status; nothing closes it.
+    /// and it is named in the status; with `close_failed_after`
+    /// off, nothing closes it.
     #[tokio::test(start_paused = true)]
     async fn reconcile_reports_orphaned_agents() {
         let fake = FakeHerdr::new();
@@ -6574,6 +6954,580 @@ mod tests {
         assert!(calls(&fake, "worktree.remove").is_empty());
         assert!(fake.agents().is_empty());
         wait_for("live drops", || h.snapshot().live == 0).await;
+    }
+
+    fn close_failed_settings() -> MachineSettings {
+        MachineSettings {
+            reconcile_every: Duration::from_millis(100),
+            close_failed_after: Some(Duration::from_millis(150)),
+            ..settings()
+        }
+    }
+
+    /// A task in `state` on machine `m` holding the pane of an idle agent
+    /// named after it, finished now, with no completion since its prompt.
+    async fn stopped_task(fake: &FakeHerdr, store: &Store, state: TaskState) -> Task {
+        let mut t = new_task(store);
+        let pane = start_agent(fake, &Task::agent_name_for(t.id)).await;
+        t.state = state;
+        t.machine = Some("m".into());
+        t.pane_id = Some(pane);
+        t.agent_name = Some(Task::agent_name_for(t.id));
+        t.started_at = Some(Utc::now());
+        t.finished_at = Some(Utc::now());
+        // A baseline no idle reaches: a stale task's agent has not finished.
+        t.last_completion_seq = Some(1_000);
+        store.update_task(&mut t).unwrap();
+        t
+    }
+
+    fn pane_open(fake: &FakeHerdr, pane: &str) -> bool {
+        fake.agents().iter().any(|a| a.pane_id == pane)
+    }
+
+    /// A failed task's stopped agent holds a pane and a slot: auto-close
+    /// takes the pane after `close_failed_after`. The row stays failed, so
+    /// `task retry` still takes it, and records no pane any more.
+    #[tokio::test]
+    async fn a_failed_tasks_pane_closes_after_close_failed_after() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let t = stopped_task(&fake, &store, TaskState::Failed).await;
+        let pane = t.pane_id.clone().unwrap();
+        let (h, _events) = spawn_with_settings(&fake, &store, close_failed_settings());
+        wait_for("pane closed", || !pane_open(&fake, &pane)).await;
+        assert_eq!(
+            calls(&fake, "pane.close"),
+            vec![serde_json::json!({"pane_id": pane})]
+        );
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Failed);
+        assert_eq!(row.pane_id, None);
+        assert_eq!(row.error, t.error);
+        assert!(calls(&fake, "worktree.remove").is_empty());
+        wait_for("live drops", || h.snapshot().live == 0).await;
+        assert!(h.snapshot().orphans.is_empty());
+        store.insert_retry(t.id).expect("still retryable");
+    }
+
+    /// `close_failed_after = "never"` keeps a failed task's pane, as before.
+    #[tokio::test]
+    async fn never_keeps_a_failed_tasks_pane() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let t = stopped_task(&fake, &store, TaskState::Failed).await;
+        let pane = t.pane_id.clone().unwrap();
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: None,
+                ..close_failed_settings()
+            },
+        );
+        wait_for("orphan", || !h.snapshot().orphans.is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(pane_open(&fake, &pane));
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert_eq!(store.get_task(t.id).unwrap().unwrap().pane_id, Some(pane));
+    }
+
+    /// Not before the grace period, and not while the agent works: a
+    /// dispatch can fail after `agent.start` with its agent still at it. The
+    /// grace counts from when it actually stops, not from the failure: an
+    /// agent that kept working well past the grace still gets a full grace
+    /// of its own once it stops, so the pane must stay a moment longer, not
+    /// close the instant it goes idle.
+    #[tokio::test]
+    async fn a_failed_tasks_working_agent_keeps_its_pane() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let t = stopped_task(&fake, &store, TaskState::Failed).await;
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        let grace = Duration::from_millis(300);
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: Some(grace),
+                ..close_failed_settings()
+            },
+        );
+        wait_for("orphan", || !h.snapshot().orphans.is_empty()).await;
+        // Well past the grace while still at work: the clock must not have
+        // been counting since the failure.
+        tokio::time::sleep(grace * 2).await;
+        assert!(pane_open(&fake, &pane), "at work");
+        fake.set_status(&pane, AgentStatus::Idle);
+        // Its own grace has barely started: not yet.
+        tokio::time::sleep(grace / 3).await;
+        assert!(pane_open(&fake, &pane), "its own grace just started");
+        wait_for("pane closed after its own grace", || {
+            !pane_open(&fake, &pane)
+        })
+        .await;
+        assert_eq!(state_of(&store, t.id), TaskState::Failed);
+    }
+
+    /// An orphan's grace also counts from when its agent actually stops, not
+    /// from when it was first found orphaned (`find_orphans`): one still at
+    /// work past the grace keeps its pane, and gets a full grace of its own
+    /// once it stops.
+    #[tokio::test]
+    async fn an_orphans_grace_starts_when_it_actually_stops() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let pane = start_agent(&fake, "t-97").await;
+        fake.set_status(&pane, AgentStatus::Working);
+        let grace = Duration::from_millis(300);
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: Some(grace),
+                ..close_failed_settings()
+            },
+        );
+        wait_for("orphan found", || !h.snapshot().orphans.is_empty()).await;
+        tokio::time::sleep(grace * 2).await;
+        assert!(pane_open(&fake, &pane), "at work");
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(grace / 3).await;
+        assert!(pane_open(&fake, &pane), "its own grace just started");
+        wait_for("orphan closed after its own grace", || {
+            !pane_open(&fake, &pane)
+        })
+        .await;
+    }
+
+    /// herdr can start a different agent in a pane whose agent pastor is
+    /// already timing: the grace is the agent's, not the pane's. An idle
+    /// replacement gets its own full `close_failed_after`, from when it is
+    /// first seen, however far the earlier agent's clock had run.
+    async fn a_replacement_gets_its_own_grace(earlier: &str) {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let pane = start_agent(&fake, earlier).await;
+        let grace = Duration::from_millis(600);
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: Some(grace),
+                ..close_failed_settings()
+            },
+        );
+        wait_for("orphan found", || !h.snapshot().orphans.is_empty()).await;
+        // Most of the earlier agent's grace has run.
+        tokio::time::sleep(grace * 2 / 3).await;
+        assert!(pane_open(&fake, &pane));
+        fake.agent_start("t-96", "claude", &pane, &[])
+            .await
+            .unwrap();
+        wait_for("the replacement is the orphan", || {
+            h.snapshot().orphans == vec!["t-96".to_string()]
+        })
+        .await;
+        tokio::time::sleep(grace / 2).await;
+        assert!(
+            pane_open(&fake, &pane),
+            "the replacement's own grace has not run out"
+        );
+        assert!(calls(&fake, "pane.close").is_empty());
+        wait_for("closed after the replacement's own grace", || {
+            !pane_open(&fake, &pane)
+        })
+        .await;
+    }
+
+    /// A failed task's pane closed by someone else is no longer its pane:
+    /// herdr hands the id out again, and auto-close would close whatever
+    /// pane gets it next, an empty shell included. The row lets it go on
+    /// `pane_closed`, as a pane-owning task's row does.
+    #[tokio::test]
+    async fn a_failed_task_lets_go_of_a_pane_closed_under_it() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let t = stopped_task(&fake, &store, TaskState::Failed).await;
+        let pane = t.pane_id.clone().unwrap();
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: Some(Duration::from_secs(60)),
+                ..close_failed_settings()
+            },
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        wait_for("orphan found", || !h.snapshot().orphans.is_empty()).await;
+        fake.close_pane(&pane);
+        wait_for("the row lets the pane go", || {
+            store.get_task(t.id).unwrap().unwrap().pane_id.is_none()
+        })
+        .await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Failed);
+        assert_eq!(row.error, t.error);
+        assert!(calls(&fake, "pane.close").is_empty());
+        store.insert_retry(t.id).expect("still retryable");
+    }
+
+    /// `find_orphans` swaps one orphan in a pane for another: the clock
+    /// starts again.
+    #[tokio::test]
+    async fn an_orphan_replaced_in_its_pane_gets_its_own_grace() {
+        a_replacement_gets_its_own_grace("t-97").await;
+    }
+
+    /// A failed task's stopped agent had its grace running when herdr put
+    /// an orphan in the pane: the task lets the pane go, and the orphan
+    /// does not inherit the task agent's clock.
+    #[tokio::test]
+    async fn an_orphan_in_a_failed_tasks_reused_pane_gets_its_own_grace() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let t = stopped_task(&fake, &store, TaskState::Failed).await;
+        let pane = t.pane_id.clone().unwrap();
+        let grace = Duration::from_millis(600);
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: Some(grace),
+                ..close_failed_settings()
+            },
+        );
+        wait_for("orphan found", || !h.snapshot().orphans.is_empty()).await;
+        tokio::time::sleep(grace * 2 / 3).await;
+        assert!(pane_open(&fake, &pane));
+        fake.agent_start("t-96", "claude", &pane, &[])
+            .await
+            .unwrap();
+        wait_for("the task lets the pane go", || {
+            store.get_task(t.id).unwrap().unwrap().pane_id.is_none()
+        })
+        .await;
+        tokio::time::sleep(grace / 2).await;
+        assert!(
+            pane_open(&fake, &pane),
+            "the replacement's own grace has not run out"
+        );
+        assert!(calls(&fake, "pane.close").is_empty());
+        wait_for("closed after the replacement's own grace", || {
+            !pane_open(&fake, &pane)
+        })
+        .await;
+        assert_eq!(state_of(&store, t.id), TaskState::Failed);
+    }
+
+    /// Two failed tasks' panes come due in one check. While the first
+    /// `pane.close` is in flight, the other agent goes back to work: the
+    /// agents are listed again before the second close, and that pane is
+    /// kept, its grace starting over once it stops.
+    #[tokio::test]
+    async fn a_pane_whose_agent_resumed_during_an_earlier_close_is_kept() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let a = stopped_task(&fake, &store, TaskState::Failed).await;
+        let b = stopped_task(&fake, &store, TaskState::Failed).await;
+        // Whichever closes first sets the other working.
+        for t in [&a, &b] {
+            fake.on_next_close_set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Working);
+        }
+        let grace = Duration::from_millis(300);
+        let (_h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: Some(grace),
+                ..close_failed_settings()
+            },
+        );
+        let open = |t: &Task| pane_open(&fake, t.pane_id.as_deref().unwrap());
+        wait_for("one pane closed", || !open(&a) || !open(&b)).await;
+        let kept = if open(&a) { &a } else { &b };
+        tokio::time::sleep(grace * 3).await;
+        assert!(open(kept), "its agent is at work again");
+        assert_eq!(calls(&fake, "pane.close").len(), 1);
+        assert_eq!(
+            store.get_task(kept.id).unwrap().unwrap().pane_id,
+            kept.pane_id
+        );
+    }
+
+    /// Two orphans' panes come due in one check. While the first
+    /// `pane.close` is in flight, herdr hands the other pane to a new
+    /// agent: the agents are listed again before the second close, and the
+    /// newcomer keeps the pane for a full grace of its own.
+    #[tokio::test]
+    async fn a_pane_reused_during_an_earlier_close_is_kept() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let pa = start_agent(&fake, "t-97").await;
+        let pb = start_agent(&fake, "t-98").await;
+        let grace = Duration::from_millis(600);
+        let (h, _events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: Some(grace),
+                ..close_failed_settings()
+            },
+        );
+        wait_for("orphans found", || h.snapshot().orphans.len() == 2).await;
+        // Whichever closes first has the other pane handed out again.
+        fake.on_next_close_replace(&pa, "t-96");
+        fake.on_next_close_replace(&pb, "t-96");
+        wait_for("one pane closed", || {
+            !pane_open(&fake, &pa) || !pane_open(&fake, &pb)
+        })
+        .await;
+        let kept = if pane_open(&fake, &pa) { pa } else { pb };
+        assert_eq!(calls(&fake, "pane.close").len(), 1);
+        tokio::time::sleep(grace / 2).await;
+        assert!(
+            pane_open(&fake, &kept),
+            "the newcomer's own grace has not run out"
+        );
+        wait_for("closed after the newcomer's own grace", || {
+            !pane_open(&fake, &kept)
+        })
+        .await;
+    }
+
+    /// A stale task's real completion still gets its full `settle` window
+    /// even when `close_failed_after` is shorter, as it is by default (5s
+    /// vs 10s): `auto_close_stopped` must not fail the task and close its
+    /// pane out from under `confirm_pending_done` while a completion it saw
+    /// idle is still pending confirmation.
+    #[tokio::test]
+    async fn a_stale_tasks_pending_completion_is_not_raced_by_close_failed_after() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(400);
+        let close_failed_after = Duration::from_millis(100);
+        let (h, mut events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                settle,
+                reconcile_every: Duration::from_millis(50),
+                close_failed_after: Some(close_failed_after),
+                ..close_failed_settings()
+            },
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("activity seen", || {
+            store.get_task(t.id).unwrap().unwrap().activity_seen
+        })
+        .await;
+        // A timeout while it is still at work, as `reconcile` would mark it;
+        // set directly here to control the exact timing against the idle
+        // that follows.
+        let mut stale = store.get_task(t.id).unwrap().unwrap();
+        stale.state = TaskState::Stale;
+        store.update_task(&mut stale).unwrap();
+        // It finishes right after timing out.
+        fake.set_status(&pane, AgentStatus::Idle);
+        // Comfortably past `close_failed_after`, but still inside `settle`:
+        // its completion must not be raced into a failure.
+        tokio::time::sleep(close_failed_after * 3).await;
+        assert!(
+            pane_open(&fake, &pane),
+            "kept while its completion is pending"
+        );
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Stale,
+            "not failed out from under its pending completion"
+        );
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        assert_eq!(count(&mut events, "task.done", t.id).len(), 1);
+    }
+
+    /// A stale task whose agent stopped is failed and its pane closed, which
+    /// frees its slot; `task retry` still takes it. One whose agent is still
+    /// at work past its timeout is left stale.
+    #[tokio::test]
+    async fn a_stale_tasks_stopped_agent_is_closed_and_the_task_failed() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let idle = stopped_task(&fake, &store, TaskState::Stale).await;
+        let working = stopped_task(&fake, &store, TaskState::Stale).await;
+        let working_pane = working.pane_id.clone().unwrap();
+        fake.set_status(&working_pane, AgentStatus::Working);
+        let (h, mut events) = spawn_with_settings(&fake, &store, close_failed_settings());
+        let pane = idle.pane_id.clone().unwrap();
+        wait_for("pane closed", || !pane_open(&fake, &pane)).await;
+        wait_for("failed", || state_of(&store, idle.id) == TaskState::Failed).await;
+        let row = store.get_task(idle.id).unwrap().unwrap();
+        assert_eq!(row.pane_id, None);
+        assert!(
+            row.error.as_deref().unwrap().contains("close_failed_after"),
+            "{:?}",
+            row.error
+        );
+        assert_eq!(count(&mut events, "task.failed", idle.id).len(), 1);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(state_of(&store, idle.id), TaskState::Failed, "not reopened");
+        assert_eq!(state_of(&store, working.id), TaskState::Stale);
+        assert!(pane_open(&fake, &working_pane));
+        assert_eq!(h.snapshot().live, 1);
+        store.insert_retry(idle.id).expect("still retryable");
+    }
+
+    /// `auto_close_stopped` has the same reused-pane guard as `task close`
+    /// (`close_leaves_a_pane_reused_by_another_agent`): a stale task's
+    /// recorded pane now holds another, still-owned task's agent, idle. It
+    /// must not keep claiming that pane and its slot forever, and must not
+    /// close the other task's pane; instead the stale row is failed and its
+    /// pane id cleared, same as a stopped agent with no replacement.
+    #[tokio::test]
+    async fn a_stale_tasks_reused_pane_is_failed_without_closing_it() {
+        reused_pane_is_repaired(AgentStatus::Idle, 1_000).await;
+    }
+
+    /// The replacement's status is not the stale task's: one at work must
+    /// not keep the stale row holding the pane and its slot.
+    #[tokio::test]
+    async fn a_stale_tasks_pane_reused_by_a_working_agent_is_failed() {
+        reused_pane_is_repaired(AgentStatus::Working, 1_000).await;
+    }
+
+    /// Nor is the replacement's sequence: an idle one past the stale task's
+    /// baseline, after activity was seen, must not read as that task's
+    /// pending completion and hold off the repair.
+    #[tokio::test]
+    async fn a_stale_tasks_pane_reused_by_an_idle_agent_past_its_baseline_is_failed() {
+        reused_pane_is_repaired(AgentStatus::Idle, 0).await;
+    }
+
+    /// The replacement's idle is not the stale task's completion either on
+    /// reconcile's side: past the task's baseline, after activity was seen,
+    /// it would look like one, and `confirm_pending_done` could mark the
+    /// stale task done before `auto_close_stopped` repairs it (what made
+    /// the test above flaky under load). With auto-close off, nothing
+    /// repairs it, so it must simply stay stale.
+    #[tokio::test]
+    async fn a_stale_task_never_takes_its_reused_panes_idle_as_its_completion() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (stale, other_pane) = stale_in_reused_pane(&fake, &store, AgentStatus::Idle, 0).await;
+        let (h, mut events) = spawn_with_settings(
+            &fake,
+            &store,
+            MachineSettings {
+                close_failed_after: None,
+                ..close_failed_settings()
+            },
+        );
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let before = lists(&fake);
+        wait_for("a few settle windows", || lists(&fake) >= before + 6).await;
+        assert_eq!(state_of(&store, stale.id), TaskState::Stale);
+        assert!(count(&mut events, "task.done", stale.id).is_empty());
+        assert!(pane_open(&fake, &other_pane));
+    }
+
+    /// A stale task whose recorded pane now holds another, still-open
+    /// task's agent in `status`, the stale task's baseline at `baseline`.
+    async fn stale_in_reused_pane(
+        fake: &FakeHerdr,
+        store: &Store,
+        status: AgentStatus,
+        baseline: u64,
+    ) -> (Task, String) {
+        let mut stale = new_task(store);
+        // A second, still-open task now legitimately holds the pane the
+        // stale task remembers: not an orphan, so nothing but this task's
+        // own logic could ever close its pane.
+        let mut other = new_task(store);
+        let other_pane = start_agent(fake, &Task::agent_name_for(other.id)).await;
+        fake.set_status_silently(&other_pane, status);
+        other.state = TaskState::Running;
+        other.machine = Some("m".into());
+        other.pane_id = Some(other_pane.clone());
+        other.agent_name = Some(Task::agent_name_for(other.id));
+        other.started_at = Some(Utc::now());
+        store.update_task(&mut other).unwrap();
+        stale.state = TaskState::Stale;
+        stale.machine = Some("m".into());
+        stale.pane_id = Some(other_pane.clone());
+        stale.agent_name = Some(Task::agent_name_for(stale.id));
+        stale.started_at = Some(Utc::now());
+        stale.finished_at = Some(Utc::now());
+        stale.last_completion_seq = Some(baseline);
+        stale.activity_seen = true;
+        store.update_task(&mut stale).unwrap();
+        (stale, other_pane)
+    }
+
+    async fn reused_pane_is_repaired(status: AgentStatus, baseline: u64) {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (stale, other_pane) = stale_in_reused_pane(&fake, &store, status, baseline).await;
+        let (h, mut events) = spawn_with_settings(&fake, &store, close_failed_settings());
+        wait_for("failed", || state_of(&store, stale.id) == TaskState::Failed).await;
+        let row = store.get_task(stale.id).unwrap().unwrap();
+        assert_eq!(row.pane_id, None);
+        assert_eq!(count(&mut events, "task.failed", stale.id).len(), 1);
+        // A few more checks past the grace: the other task's pane stays
+        // open and untouched, and the stale row does not flip back or
+        // reopen.
+        let before = lists(&fake);
+        wait_for("a few more reconciles", || lists(&fake) >= before + 3).await;
+        assert!(calls(&fake, "pane.close").is_empty());
+        assert!(pane_open(&fake, &other_pane));
+        assert_eq!(fake.agents().len(), 1);
+        assert_eq!(fake.agents()[0].pane_id, other_pane);
+        assert_eq!(state_of(&store, stale.id), TaskState::Failed);
+        assert!(h.snapshot().orphans.is_empty());
+        store.insert_retry(stale.id).expect("still retryable");
+    }
+
+    /// Agents named `t-<id>` that no open task owns (a closed row whose pane
+    /// stayed, a row that is gone) are closed once stopped and orphaned for
+    /// the grace period. Anything not named like a task is never touched,
+    /// and neither is an orphan at work.
+    #[tokio::test]
+    async fn an_orphaned_pane_is_found_and_closed() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut closed = new_task(&store);
+        closed.state = TaskState::Closed;
+        closed.machine = Some("m".into());
+        store.update_task(&mut closed).unwrap();
+        let closed_pane = start_agent(&fake, &Task::agent_name_for(closed.id)).await;
+        let ghost_pane = start_agent(&fake, "t-99").await;
+        let busy_pane = start_agent(&fake, "t-98").await;
+        fake.set_status(&busy_pane, AgentStatus::Working);
+        let mine = start_agent(&fake, "mine").await;
+        let (h, _events) = spawn_with_settings(&fake, &store, close_failed_settings());
+        wait_for("orphans closed", || {
+            !pane_open(&fake, &closed_pane) && !pane_open(&fake, &ghost_pane)
+        })
+        .await;
+        wait_for("one orphan left", || {
+            h.snapshot().orphans == vec!["t-98".to_string()]
+        })
+        .await;
+        assert!(pane_open(&fake, &busy_pane));
+        assert!(pane_open(&fake, &mine));
+        assert_eq!(state_of(&store, closed.id), TaskState::Closed);
+        assert_eq!(h.snapshot().live, 1);
     }
 
     /// An agent that ends its task mid-turn (`pastor task done`): the task
