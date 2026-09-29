@@ -1192,7 +1192,7 @@ pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
                     // `agent.start`; treat it as running, the same target a
                     // successful dispatch would have recorded, rather than leaving
                     // it stuck as `Starting` forever (stale only covers
-                    // Running/Blocked).
+                    // Running).
                     Running
                 } else {
                     return None;
