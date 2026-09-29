@@ -1155,6 +1155,9 @@ mod tests {
             Some("0.2.0")
         );
         assert_eq!(v(0, "welcome\nnone"), None);
+        // "none" wins even when it happens to follow "pastor": read as the
+        // no-pastor answer, never as a version literal spelled "none".
+        assert_eq!(v(0, "pastor none"), None);
         assert_eq!(v(0, "pastor 0.2.0\nmotd after"), None);
         assert_eq!(v(0, "pastor 0.2\u{1b}[0m"), None);
         assert!(remote_pastor_version("t", &out(255, "")).is_err());
