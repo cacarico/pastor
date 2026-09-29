@@ -144,7 +144,8 @@ server-1  user@server-1   default  -        connected  0.9.1  0.8.0   4/3 now:t-
 
 `t-23` counts on `server-1`, so the queue starts nothing more there until
 its count is under 3 again. `--now` needs `--machine`, and a connected one;
-a job cannot set it, and an agent or orchestrator is refused.
+a job cannot set it, and an agent or orchestrator is refused, a guard
+against mistakes rather than a boundary.
 
 ## next
 

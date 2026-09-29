@@ -335,7 +335,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `nothing_to_send` | `task send` with no text, `--key` or `--trust` |
 | `now_needs_machine` | `task run --now` with no `--machine` |
 | `now_not_started` | `task run --now` could not start the task at once; it is closed, not left queued |
-| `now_refused` | `task run --now` from an agent or an orchestrator's script; only a person may use it |
+| `now_refused` | `task run --now` from an agent or an orchestrator's script; a guard against mistakes, not a boundary (see [Starting a task now](#starting-a-task-now)) |
 | `opencode_permissions_conflict` | a profiled opencode task on a machine whose opencode config has permission rules |
 | `orchestrator_held` | a session orchestrator's state could not be read or kept |
 | `orchestrator_invalid` | the orchestrator's file has never been valid |
@@ -1535,13 +1535,18 @@ JSON spec has `"now": true`, and `machine list` shows it after the count
 so the queue does not start more there until the count is back under the
 limits.
 
-`--now` is for a person at the CLI. A job cannot set it (`now` is not a
-`[dispatch]` key), a `task retry` of such a task goes through the queue, and
-the head refuses it from any agent's pane, an orchestrator's included, and
-from an orchestrator's scripts (`now_refused`), `agents_change_fleet` or
-not: an orchestrator that could skip the limits would make them mean
-nothing. A head from before it would queue the task behind the limits, so
-the CLI refuses to send it there (`head_too_old`).
+`--now` is meant for a person at the CLI. A job cannot set it (`now` is not
+a `[dispatch]` key), a `task retry` of such a task goes through the queue,
+and the head refuses it from any agent's pane, an orchestrator's included,
+and from an orchestrator's scripts (`now_refused`), `agents_change_fleet` or
+not: an orchestrator that skipped the limits by habit would make them mean
+nothing. That check stops an agent from using `--now` by mistake, and no
+more. It reads a marker the caller sets itself (`PASTOR_TASK`, or the field
+a request to `pastor.sock` carries), so an agent that wants around it can
+unset the variable or leave the field out; like the rest of the
+[guard](#trust-model), it is not a boundary. A head from before `--now` would
+queue the task behind the limits, so the CLI refuses to send it there
+(`head_too_old`).
 
 #### An agent per kind
 

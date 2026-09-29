@@ -125,8 +125,11 @@ the machine, so the queue waits until the count is back under the limits;
 `machine list` shows it as `4/3 now:t-22`, and `task list` starts its NOTE
 with `now:`.
 
-Only a person may: a job has no such key, a retry of the task queues as
-usual, and an agent or orchestrator gets `now_refused`.
+It is meant for a person: a job has no such key, a retry of the task queues
+as usual, and an agent or orchestrator gets `now_refused`. That check stops
+an agent from using `--now` by mistake; it reads a marker the caller sets
+itself, so it does not stop an agent that wants around it. See
+[profiles and trust](../profiles-and-trust/).
 
 Read on: [urgent work first](../../examples/urgent-first/) puts levels and
 preempting to work; the commands are in the
