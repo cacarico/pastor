@@ -3122,9 +3122,15 @@ impl Actor {
                 this.refresh_live();
                 let _ = reply.send(result);
             };
-            let out = loop {
+            // Urgent dispatches keep coming in until `task_id` and every one
+            // already taken have started, not just `task_id`.
+            let mut out = None;
+            loop {
+                if out.is_some() && starting.is_empty() {
+                    break;
+                }
                 tokio::select! {
-                    out = &mut main => break out,
+                    done = &mut main, if out.is_none() => out = Some(done),
                     Some(now) = recv_now(&mut now_rx) => {
                         starting.push(Box::pin(async move {
                             (this.start_task(now.task_id, false).await, now.reply)
@@ -3132,11 +3138,8 @@ impl Actor {
                     }
                     started = next_started(&mut starting), if !starting.is_empty() => answer(started),
                 }
-            };
-            while !starting.is_empty() {
-                answer(next_started(&mut starting).await);
             }
-            out
+            out.expect("the loop ends only once `main` is done")
         };
         self.now_rx = now_rx;
         for id in std::mem::take(&mut nows.uptake) {

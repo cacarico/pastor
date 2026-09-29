@@ -11056,6 +11056,68 @@ mod tests {
         assert_eq!(slow.agents().len(), 2);
     }
 
+    /// A `--now` task sent after the earlier task has started, while an
+    /// earlier `--now` task is still starting beside it, starts at once too:
+    /// `run_dispatch` keeps taking urgent dispatches while it waits on the
+    /// ones in flight (Gemini review on #103).
+    #[tokio::test]
+    async fn now_starts_while_an_earlier_now_task_is_still_starting() {
+        let slow = FakeHerdr::new();
+        slow.set_ready_after(Duration::from_secs(1));
+        let (d, _tmp) = daemon(&[("a", 1, slow.clone())]).await;
+        let first = queue_on(&d.store(), "slow", Some("a"));
+        let fleet = d.fleet();
+        let pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state_of(&d, &first) != TaskState::Starting {
+            assert!(Instant::now() < deadline, "a never claimed its task");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Half the window later, so `first` is up well before `urgent`.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let urgent = queue_now_on(&d.store(), "urgent", "a");
+        let now_pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state_of(&d, &first) != TaskState::Running {
+            assert!(Instant::now() < deadline, "the earlier task never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Hold `urgent` in its startup from here on.
+        slow.set_ready_after(Duration::from_secs(60));
+        assert_eq!(state_of(&d, &urgent), TaskState::Starting);
+        let later = queue_now_on(&d.store(), "later", "a");
+        let later_pass = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.dispatch_queued().await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state_of(&d, &later) != TaskState::Starting {
+            assert!(
+                Instant::now() < deadline,
+                "the later --now task waited behind the earlier --now task's startup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state_of(&d, &urgent), TaskState::Starting);
+        slow.set_ready_after(Duration::ZERO);
+        for p in [pass, now_pass, later_pass] {
+            tokio::time::timeout(Duration::from_secs(3), p)
+                .await
+                .expect("each pass ends once its agent is up")
+                .unwrap();
+        }
+        assert_eq!(state_of(&d, &first), TaskState::Running);
+        assert_eq!(state_of(&d, &urgent), TaskState::Running);
+        assert_eq!(state_of(&d, &later), TaskState::Running);
+        assert_eq!(slow.agents().len(), 3);
+    }
+
     /// A pass sends outside the dispatch lock: while `a` is still starting
     /// its agent, a `task run` for `b` is queued and dispatched without
     /// waiting for it.
