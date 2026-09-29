@@ -25,6 +25,7 @@ make help
 make test
 make test-machine
 make test-ssh
+make portability
 make smoke SESSION=s
 ```
 
@@ -34,6 +35,11 @@ smoke-profiles` (a live review task per agent through a head running your
 build) before trusting a change to permission profiles. `make test-ssh` runs
 the CLI against a head over a real ssh, through an sshd it starts on a
 localhost port as you; it needs OpenSSH's server installed, and CI runs it.
+
+`make portability` runs `cargo check` for the musl and FreeBSD targets, which
+CI runs too. It is not part of `make check`, so run it when a change touches
+platform code or a dependency. It needs `cargo-zigbuild`, `zig` and the Rust
+targets, and says in one line which of them to install.
 
 ## Pull requests
 

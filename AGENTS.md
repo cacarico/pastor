@@ -69,11 +69,18 @@ down here because getting them wrong cost a day.
 
 - `make check` is the gate: fmt check, clippy with warnings as errors, the
   full suite. Run it before every commit. `make help` lists the rest.
-- CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine` and
-  `make test-ssh` (the CLI against a head over a real ssh, through a
-  throwaway sshd on localhost; `tests/real_ssh.rs`) on every pull request
-  that touches code (`paths:` skips docs-only diffs), on every push to `main`
-  that touches code or the changelog, and by hand (`workflow_dispatch`).
+- `make portability` is a `cargo check` for the musl and FreeBSD targets
+  (the list is `PORTABILITY_TARGETS` in the Makefile), which finds code that
+  only compiles against glibc on x86_64. It is not part of `make check`: run
+  it on a change to platform code (cfg gates, libc, sockets) or a
+  dependency. It needs `cargo-zigbuild`, `zig` and the Rust targets, names
+  what is missing in one line and installs nothing.
+- CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine`,
+  `make portability` and `make test-ssh` (the CLI against a head over a real
+  ssh, through a throwaway sshd on localhost; `tests/real_ssh.rs`) on every
+  pull request that touches code (`paths:` skips docs-only diffs), on every
+  push to `main` that touches code or the changelog, and by hand
+  (`workflow_dispatch`).
 - Pull requests merge with a merge commit (`gh pr merge --merge`) and no
   other way: not `--rebase`, not `--squash`, and not a push of the PR's head
   straight to `main`. PR CI runs on GitHub's merge of the PR into `main` as
