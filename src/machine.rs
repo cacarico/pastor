@@ -1553,6 +1553,9 @@ impl Actor {
     /// ends its own with what the agent said.
     fn emit_with(&self, kind: &str, task_id: Option<i64>, detail: Option<serde_json::Value>) {
         let summary = task_id.filter(|_| matches!(kind, "task.done" | "task.failed"));
+        if let Some(id) = summary {
+            self.read_usage(id);
+        }
         let summary = summary.and_then(|id| match self.store.end_round(id, None) {
             Ok(summary) => Some(summary),
             Err(err) => {
@@ -1561,6 +1564,52 @@ impl Actor {
             }
         });
         self.send_event(kind, task_id, detail, summary);
+    }
+
+    /// Read what task `id`'s Claude session has used so far from its files
+    /// on this machine (`Connector::claude_usage`) and keep it
+    /// (`Store::set_usage`), when a round ends. In the background: the
+    /// files can be large, and the actor must not wait on them. A task with
+    /// no session (another kind of agent, or args that pick their own) has
+    /// nothing to read; a read that fails keeps what was read before.
+    fn read_usage(&self, id: i64) {
+        let task = match self.store.get_task(id) {
+            Ok(Some(t)) => t,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(machine = %self.name, %err, id, "usage: cannot read task row");
+                return;
+            }
+        };
+        let Some(session) = task
+            .spec
+            .session_id
+            .clone()
+            .filter(|s| crate::task::is_session_id(s))
+        else {
+            return;
+        };
+        let config_dir =
+            crate::usage::config_dir(&self.settings.agents, &task.spec.agent).map(String::from);
+        let (connector, store, machine) = (
+            self.connector.clone(),
+            self.store.clone(),
+            self.name.clone(),
+        );
+        tokio::spawn(async move {
+            match connector
+                .claude_usage(config_dir.as_deref(), &session)
+                .await
+            {
+                Ok(Some(usage)) => {
+                    if let Err(err) = store.set_usage(id, &usage) {
+                        tracing::error!(%machine, %err, id, "save the task's usage");
+                    }
+                }
+                Ok(None) => tracing::info!(%machine, id, "no usage found for the task's session"),
+                Err(err) => tracing::warn!(%machine, %err, id, "read the task's usage"),
+            }
+        });
     }
 
     /// Send the event as it is, the task's job read from its row. `summary`
@@ -2078,6 +2127,7 @@ impl Actor {
                 }
             };
             self.idle_agents.remove(&task_id);
+            self.read_usage(task_id);
             self.send_event("task.done", Some(task_id), None, round);
         } else {
             if written.is_some() {
@@ -4946,6 +4996,55 @@ mod tests {
             limits: Some(Default::default()),
             ..settings_with_settle(settle)
         }
+    }
+
+    /// A Claude task that ends has its session's usage read from the
+    /// machine, under the agent's `CLAUDE_CONFIG_DIR`, and kept with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_claude_task_that_ends_keeps_its_sessions_usage() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let mut agents = crate::config::Agents::default();
+        agents.0.insert(
+            "claude".into(),
+            crate::config::AgentDef {
+                env: [("CLAUDE_CONFIG_DIR".into(), "~/.claude-personal".into())].into(),
+                ..Default::default()
+            },
+        );
+        let settings = MachineSettings {
+            agents,
+            ..settings_with_settle(settle)
+        };
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        let session = t.spec.session_id.clone().expect("a Claude session");
+        let usage = crate::usage::TaskUsage {
+            model: Some("claude-opus-4-5".into()),
+            api_calls: 4,
+            input: 10,
+            cache_write: 2_000,
+            cache_read: 90_000,
+            output: 700,
+            read_at: Utc::now(),
+        };
+        fake.set_usage(Some("~/.claude-personal"), &session, usage.clone());
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        assert_eq!(store.get_task(t.id).unwrap().unwrap().usage, None);
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        wait_for("usage", || {
+            store.get_task(t.id).unwrap().unwrap().usage.is_some()
+        })
+        .await;
+        assert_eq!(store.get_task(t.id).unwrap().unwrap().usage, Some(usage));
     }
 
     /// The bug: an agent that stops on "You've hit your limit" is idle

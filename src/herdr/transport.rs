@@ -354,6 +354,10 @@ pub type DirFuture<'a> =
 pub type VersionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<String>, ConnectError>> + Send + 'a>>;
 
+pub type UsageFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Option<crate::usage::TaskUsage>, ConnectError>> + Send + 'a>,
+>;
+
 /// Anything that can open a fresh herdr connection. Endpoints for real use, FakeHerdr in tests.
 ///
 /// A connection carries one request (see `Connection`), so this is called once
@@ -419,6 +423,13 @@ pub trait Connector: Send + Sync {
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// The tokens Claude session `session` used, read from its files on the
+    /// machine under `config_dir` (the agent's `CLAUDE_CONFIG_DIR` as
+    /// written, `~/.claude` when `None`) by `usage::usage_command`. `None`
+    /// when there is no such session there or it cannot be known.
+    fn claude_usage(&self, _config_dir: Option<&str>, _session: &str) -> UsageFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 impl Connector for Endpoint {
@@ -459,6 +470,10 @@ impl Connector for Endpoint {
     }
     fn pastor_version(&self) -> VersionFuture<'_> {
         Box::pin(pastor_version(self))
+    }
+    fn claude_usage(&self, config_dir: Option<&str>, session: &str) -> UsageFuture<'_> {
+        let command = crate::usage::usage_command(config_dir, session);
+        Box::pin(async move { claude_usage(self, command).await })
     }
 }
 
@@ -613,6 +628,23 @@ async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
         Some(p) => remote_pastor_version(&p.target, &p.out),
         None => Ok(None),
     }
+}
+
+async fn claude_usage(
+    ep: &Endpoint,
+    command: String,
+) -> Result<Option<crate::usage::TaskUsage>, ConnectError> {
+    // A local machine runs the same command here, under `sh -c`.
+    let Some(p) = probe(ep, command).await? else {
+        return Ok(None);
+    };
+    reached(&p.target, &p.out)?;
+    let raw = String::from_utf8_lossy(&p.out.stdout);
+    let usage = crate::usage::parse_usage(&raw, chrono::Utc::now());
+    if usage.is_none() && !(p.out.status.success() && raw.trim_end().ends_with("none")) {
+        tracing::warn!(target = %p.target, status = %p.out.status, stdout = ?raw, stderr = %String::from_utf8_lossy(&p.out.stderr).trim(), "no usage from the session files");
+    }
+    Ok(usage)
 }
 
 /// Asks the remote machine for `pastor --version`. ssh runs its command in a

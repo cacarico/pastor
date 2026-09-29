@@ -455,6 +455,28 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
     if let Some(e) = &t.error {
         fields.push((if waiting { "limit" } else { "error" }, e.clone()));
     }
+    // What the task's Claude session used, as read when its last round
+    // ended: its model is the one the machine gave it when `model` is `-`.
+    if let Some(u) = &t.usage {
+        let calls = format!("{} API calls", grouped(u.api_calls));
+        fields.push((
+            "used",
+            match &u.model {
+                Some(m) => format!("{m}, {calls}"),
+                None => calls,
+            },
+        ));
+        fields.push((
+            "tokens",
+            format!(
+                "input {}, cache write {}, cache read {}, output {}",
+                grouped(u.input),
+                grouped(u.cache_write),
+                grouped(u.cache_read),
+                grouped(u.output)
+            ),
+        ));
+    }
     // Branch, repo and the prompt can come from an item; every field is
     // escaped the same way so none of them reaches the terminal raw.
     let mut out: Vec<String> = fields
@@ -486,6 +508,19 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
             .map(|l| format!("  {l}").trim_end().to_string()),
     );
     out.join("\n")
+}
+
+/// `n` with a comma between each group of three digits: `3,400,500`.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A summary's first line in `task describe`: its outcome, round, who wrote
@@ -1179,6 +1214,7 @@ mod tests {
             aged_at: None,
             pause: Default::default(),
             waiting_until: None,
+            usage: None,
             summary: None,
             created_at: now,
             started_at: Some(now),
@@ -1577,6 +1613,41 @@ mod tests {
         assert!(out.contains("fallback:   - (from machine m)\n"), "{out}");
         let out = task_detail(&task_with(spec(&[], None)));
         assert!(out.contains("fallback:   -\n"), "{out}");
+    }
+
+    /// `task describe` shows what a finished Claude task's session used,
+    /// and nothing for a task pastor has read no usage for.
+    #[test]
+    fn a_task_with_usage_shows_its_model_and_tokens() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("tokens:"));
+        t.usage = Some(crate::usage::TaskUsage {
+            model: Some("claude-opus-4-5".into()),
+            api_calls: 42,
+            input: 1_234,
+            cache_write: 56_000,
+            cache_read: 3_400_500,
+            output: 12,
+            read_at: Utc::now(),
+        });
+        let out = task_detail(&t);
+        assert!(
+            out.contains("\nused:       claude-opus-4-5, 42 API calls\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "\ntokens:     input 1,234, cache write 56,000, cache read 3,400,500, output 12\n"
+            ),
+            "{out}"
+        );
+        assert_eq!(
+            t.to_json()["usage"]["cache_read"],
+            3_400_500,
+            "task list --json"
+        );
+        t.usage.as_mut().unwrap().model = None;
+        assert!(task_detail(&t).contains("\nused:       42 API calls\n"));
     }
 
     /// `task describe` says when a paused task was paused and for which

@@ -93,6 +93,10 @@ struct State {
     unpushed: HashSet<String>,
     /// What `Connector::pastor_version` reports.
     pastor_version: Option<String>,
+    /// Claude sessions' usage, by (config dir, session id): what
+    /// `Connector::claude_usage` reports. `None` for the config dir is
+    /// `~/.claude`.
+    usage: HashMap<(Option<String>, String), crate::usage::TaskUsage>,
     /// What `Connector::opencode_permission_rules` reports.
     opencode_permissions: Option<bool>,
     /// Branches `Connector::restore_worktree` finds gone.
@@ -246,6 +250,20 @@ impl FakeHerdr {
     /// What the machine's own opencode config says about permission rules.
     pub fn set_opencode_permissions(&self, rules: Option<bool>) {
         self.state.lock().unwrap().opencode_permissions = rules;
+    }
+    /// Claude session `session` under `config_dir` (`None` for `~/.claude`)
+    /// used `usage`.
+    pub fn set_usage(
+        &self,
+        config_dir: Option<&str>,
+        session: &str,
+        usage: crate::usage::TaskUsage,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .usage
+            .insert((config_dir.map(str::to_string), session.to_string()), usage);
     }
     pub fn set_pastor_version(&self, version: Option<&str>) {
         self.state.lock().unwrap().pastor_version = version.map(str::to_string);
@@ -1350,6 +1368,15 @@ impl super::transport::Connector for FakeHerdr {
     fn pastor_version(&self) -> super::transport::VersionFuture<'_> {
         let version = self.state.lock().unwrap().pastor_version.clone();
         Box::pin(async move { Ok(version) })
+    }
+    fn claude_usage(
+        &self,
+        config_dir: Option<&str>,
+        session: &str,
+    ) -> super::transport::UsageFuture<'_> {
+        let key = (config_dir.map(str::to_string), session.to_string());
+        let usage = self.state.lock().unwrap().usage.get(&key).cloned();
+        Box::pin(async move { Ok(usage) })
     }
 }
 
