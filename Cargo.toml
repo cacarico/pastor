@@ -60,6 +60,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # .cargo/mutants.toml): the attribute exists in test builds alone, so the
 # shipped binary never links it.
 mutants = "0.0.4"
+proptest = "1.11.0"
 tempfile = "3.27.0"
 
 # The daemon mostly waits on sockets, so build time is cheap to spend on a

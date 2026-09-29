@@ -16,18 +16,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use common::pastor;
+
+mod common;
+
 const WAIT: Duration = Duration::from_secs(60);
 
 /// `sun_path`, as `src/ssh.rs` has it.
 const UNIX_PATH_MAX: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
-
-fn pastor() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
-    c.env_remove("PASTOR_TASK");
-    c.env_remove("PASTOR_ORCHESTRATOR");
-    c.env_remove("PASTOR_HEAD");
-    c
-}
 
 fn run(cmd: &mut Command) -> Output {
     cmd.output().unwrap()

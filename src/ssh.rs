@@ -261,4 +261,33 @@ mod tests {
         assert!(control_path_fits(Path::new(&fits)));
         assert!(!control_path_fits(Path::new(&format!("{fits}x"))));
     }
+
+    proptest::proptest! {
+        /// Whatever the target and ControlPath, the target is the word right
+        /// after the first `--`, and everything before `--` is the same as for
+        /// any other target: none of the options came from it.
+        #[test]
+        fn prop_target_sits_right_after_the_double_dash(
+            target in "[^-\\s\\p{C}][^\\s\\p{C}]*",
+            control_path in proptest::option::of("\\PC+"),
+            keepalive in proptest::prelude::any::<bool>(),
+            no_tty in proptest::prelude::any::<bool>(),
+            remote in ".*",
+        ) {
+            proptest::prop_assume!(crate::config::flock::ssh_target_problem(&target).is_none());
+            let control_path = control_path.map(PathBuf::from);
+            let make = |target| Ssh {
+                keepalive,
+                no_tty,
+                ..ssh(target, control_path.as_deref())
+            }
+            .args(&remote);
+            let args = make(&target);
+            let dash = args.iter().position(|a| a == "--").expect("a `--`");
+            proptest::prop_assert_eq!(&args[dash + 1], &target);
+            proptest::prop_assert_eq!(&args[dash + 2], &posix_command(&remote));
+            proptest::prop_assert_eq!(args.len(), dash + 3);
+            proptest::prop_assert_eq!(&args[..dash], &make("other")[..dash]);
+        }
+    }
 }
