@@ -5738,6 +5738,30 @@ fn head_set_treats_an_unfamiliar_role_as_an_ordinary_head() {
     );
 }
 
+/// A pong answering with a protocol older than this CLI's is `head_too_old`,
+/// even though the reply itself came through fine: this is not the
+/// `unrecognized subcommand` case, where the remote has no `bridge` at all.
+#[test]
+fn head_set_refuses_a_pong_with_an_old_protocol() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = client(None);
+    let fake = c.tmp.path().join("fake-pastor");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nread line\necho '{\"kind\":\"pong\",\"data\":{\"version\":\"0.1.0\",\"protocol\":1}}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = c.cmd(&["head", "set", "no-head", "--pastor", fake.to_str().unwrap()]);
+    assert_eq!(error_code(&out), "head_too_old");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("0.1.0"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!c.config.join("client.toml").exists());
+}
+
 /// `--model` offers the `[models]` names, with their kind.
 #[test]
 fn complete_offers_model_names_after_model() {
