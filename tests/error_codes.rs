@@ -72,6 +72,7 @@ fn a() {
     Err(("pair_code".into(), format!("m")));
     x => ("arm_code", message.clone()),
     x => ("machine", "stays"),
+    r.map_err(|e| ("closure_code".into(), e))?;
 }
 impl E {
     fn code(&self) -> &str {
@@ -79,6 +80,13 @@ impl E {
             E::A => "enum_code",
         }
     }
+}
+fn b() {
+    let code = match c.as_deref() {
+        Some("known_code") => "known_code",
+        _ => "match_var_code",
+    };
+    CliError::err(code, m);
 }
 "#;
     let mut found = BTreeMap::new();
@@ -89,12 +97,21 @@ impl E {
         [
             "arm_code",
             "cli_code",
+            "closure_code",
             "enum_code",
             "fail_code",
+            "known_code",
+            "match_var_code",
             "pair_code",
             "thing_code"
         ]
     );
+}
+
+#[test]
+fn non_test_strips_a_test_module_at_any_visibility() {
+    let text = "fn a() {}\n#[cfg(test)]\npub(crate) mod tests {\n    const X: &str = \"made_up_code\";\n}\n";
+    assert_eq!(non_test(text), "fn a() {}");
 }
 
 /// The codes in the manual's table: the first cell of each row, in
@@ -161,18 +178,11 @@ fn scan(
     }
     for site in PAIR_SITES {
         for (at, _) in text.match_indices(site) {
-            let rest = text[at + site.len()..].trim_start();
-            let rest = rest.strip_prefix('(').map(str::trim_start).unwrap_or(rest);
-            let Some(code) = literal(rest) else { continue };
-            let after = rest[code.len() + 2..]
-                .trim_start_matches(".into()")
-                .trim_start_matches(".to_string()");
-            if let Some(message) = after.strip_prefix(',')
-                && !message.trim_start().starts_with('"')
-            {
-                add(code);
-            }
+            add_pair_at(text, at + site.len(), &mut add);
         }
+    }
+    for at in closure_arg_pair_sites(text) {
+        add_pair_at(text, at, &mut add);
     }
     for (at, _) in text.match_indices("fn code(") {
         let body = &text[at..];
@@ -183,11 +193,93 @@ fn scan(
             }
         }
     }
+    for (at, _) in text.match_indices("let code = match ") {
+        if let Some(body) = match_block(&text[at..]) {
+            for arm in body.split("=> ").skip(1) {
+                if let Some(code) = literal(arm) {
+                    add(code);
+                }
+            }
+        }
+    }
     for (code, is_code) in consts(text).into_values() {
         if is_code {
             add(&code);
         }
     }
+}
+
+/// A `(code, message)` pair starting at `at`, the index right after its
+/// opening paren (or the `{` of a block-bodied closure, which may itself
+/// open the tuple with another paren). Adds the code unless the message is
+/// a plain literal too (a pair of words, not an error).
+fn add_pair_at(text: &str, at: usize, add: &mut impl FnMut(&str)) {
+    let rest = text[at..].trim_start();
+    let rest = rest.strip_prefix('(').map(str::trim_start).unwrap_or(rest);
+    let Some(code) = literal(rest) else { return };
+    let after = rest[code.len() + 2..]
+        .trim_start_matches(".into()")
+        .trim_start_matches(".to_string()");
+    if let Some(message) = after.strip_prefix(',')
+        && !message.trim_start().starts_with('"')
+    {
+        add(code);
+    }
+}
+
+/// Every `.map_err(|arg| (` in `text`, such as
+/// `.map_err(|e| ("invalid_dispatch".into(), e))`. Each entry is the index
+/// right after the opening paren, as `PAIR_SITES` sites already are. Only
+/// `map_err`'s closure counts: it always maps to the error side, unlike a
+/// `.map` or `.and_then` closure that may return any shape of tuple, so
+/// generalizing to every `|arg| (` would also catch tuples that only look
+/// like a `(code, message)` pair (`.map(|f| ("flock", &f.name, ...))`).
+fn closure_arg_pair_sites(text: &str) -> Vec<usize> {
+    let mut out = vec![];
+    for (at, _) in text.match_indices(".map_err(|") {
+        let after_bar1 = at + ".map_err(|".len();
+        let Some(rel2) = text[after_bar1..].find('|') else {
+            continue;
+        };
+        let bar2 = after_bar1 + rel2;
+        let ident = &text[after_bar1..bar2];
+        let is_arg = !ident.is_empty()
+            && ident
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !is_arg {
+            continue;
+        }
+        let after_bar2 = bar2 + 1;
+        let rest = &text[after_bar2..];
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with('(') {
+            out.push(after_bar2 + (rest.len() - trimmed.len()) + 1);
+        }
+    }
+    out
+}
+
+/// The body of the `match { ... }` starting right after `text`'s leading
+/// `let <ident> = match `, balancing braces so a nested block in an arm
+/// does not end the scan early.
+fn match_block(text: &str) -> Option<&str> {
+    let open = text.find('{')?;
+    let body = &text[open + 1..];
+    let mut depth = 1;
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&body[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The `&str` constants of a file: name to value, and whether its doc
@@ -240,9 +332,13 @@ fn constant(s: &str) -> Option<&str> {
     shaped.then_some(name)
 }
 
-/// A file without its `mod tests`, whose codes are made up.
+/// A file without its `mod tests`, whose codes are made up. A top-level
+/// `#[cfg(test)]` always precedes a test module, whether it is `mod tests`,
+/// `pub(crate) mod tests` or another name (`mod watch_tests`); one indented
+/// inside an `impl` marks a single test-only item instead, so only a
+/// line-starting match counts.
 fn non_test(text: &str) -> &str {
-    match text.find("\n#[cfg(test)]\nmod tests") {
+    match text.find("\n#[cfg(test)]") {
         Some(at) => &text[..at],
         None => text,
     }

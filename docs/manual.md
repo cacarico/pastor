@@ -276,6 +276,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `head_unresponsive` | something holds the socket but does not answer a ping |
 | `herdr_error` | herdr could not be run, or answered a request with an error |
 | `internal` | the daemon sent a reply of a kind the CLI did not expect |
+| `invalid_dispatch` | a headless job submission has an invalid dispatch configuration |
 | `invalid_edit` | the edited file does not check; `edit` asks to reopen it, and the edit is kept either way |
 | `invalid_file` | a request for a file pastor does not edit (only flock, config or `job:<name>`) |
 | `invalid_key` | `bridge` was given something other than one public key line |
@@ -330,6 +331,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `role_refused` | a task or a script asks for what only a person may, such as `--role orchestrator` |
 | `runtime_error` | any other failure; the message says what |
 | `scheduler_error` | the scheduler could not run, list or reload jobs |
+| `serve_failed` | `pastor serve` in the background exited before answering |
 | `serve_slow` | `pastor serve` started one that has not answered yet |
 | `service_managed` | `serve stop` of a serve that systemd or launchd would restart |
 | `shepherd_not_running` | a job command for this machine's headless serve, which is not running |
@@ -352,7 +354,6 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `unknown_model` | no model by that name in `[models]` |
 | `unknown_priority` | a priority level that is not low, normal, high or critical |
 | `unknown_profile` | no permission profile by that name |
-| `unknown_summary_mode` | a `summary` other than ask, require or off |
 | `usage_error` | arguments clap accepts but pastor does not, such as a bad task id |
 | `worktree_needs_repo` | a worktree task with no repo to branch from |
 
