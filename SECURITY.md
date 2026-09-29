@@ -1,8 +1,8 @@
 # Security Policy
 
-pastor runs coding agents on machines you own and talks to herdr over local or
-SSH transports. Treat configuration, prompts, logs, task output, sockets, SSH
-control paths, and SQLite state as sensitive.
+pastor runs coding agents on your machines, over ssh or a local socket to
+herdr. Everything it keeps can hold secrets: config, prompts, logs, task
+output, its sockets, the ssh control paths and the SQLite store.
 
 ## Trust model
 
@@ -56,13 +56,9 @@ vulnerability" button under the repository's Security tab
 maintainers see the report, and the fix can be discussed and prepared in a
 private advisory before it is published.
 
-A useful report includes:
-
-- Affected version or commit.
-- Reproduction steps in a test or disposable environment.
-- Impact and attacker capabilities required.
-- Whether credentials, prompts, logs, workspaces, agents, or remote machines are
-  exposed.
+A useful report says which version or commit is affected, how to reproduce
+it somewhere disposable, what an attacker needs and gains, and whether
+credentials, prompts, logs, workspaces, agents or other machines are exposed.
 
 ## Handling secrets
 

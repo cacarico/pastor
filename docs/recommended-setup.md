@@ -197,10 +197,10 @@ it with `pastor task close t-7`, which keeps its worktree on disk.
 
 ## Reviews
 
-- A second review by a different model catches what one reviewer misses. An
-  agent definition for another agent kind or model makes that a job like any
-  other.
-- A review agent should never run on the model that wrote the work.
-- Give a reviewer the text it reviews in its prompt, and have it write its
-  findings to a file in its own directory. It then needs no shell, and can't
-  stall on a permission prompt.
+Never let the model that wrote the work review it. A second review by a
+different model catches what one reviewer misses, and an agent definition
+for another agent kind or model makes that a job like any other.
+
+Put the text under review in the reviewer's prompt, and have it write its
+findings to a file in its own directory. It then needs no shell, and can't
+stall on a permission prompt.

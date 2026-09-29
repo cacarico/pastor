@@ -261,19 +261,18 @@ machine names.
 
 ## Safety
 
-- **Agents can't take over your flocks.** Every agent pastor starts is marked.
-  From its terminal it can read (`task list`, `describe`) and end its own
-  task with `pastor task done`, but it can't start tasks, stop other tasks,
-  edit machines, jobs or settings, or start its own head, unless you allow it
-  with `agents_change_fleet = true`. A task you start with `pastor task run
-  --role orchestrator`, or that an orchestrator file starts, may also run,
-  retry, send to and close tasks, enable or disable a job and keep its
-  handover note, and nothing more; no task can start one. An orchestrator's
-  scripts get the same rights.
-- **Permission prompts stay on unless you pick a profile.** pastor passes the
-  allow and deny lists you set. A profile (`review`, `develop`,
-  `unrestricted`) turns Claude's prompts off and refuses whatever its lists
-  don't allow. [The manual](docs/manual.md#trust-model) says when not to.
+- **Agents can't take over your flocks.** Every agent pastor starts is
+  marked. It can read tasks and end its own with `pastor task done`, but
+  can't start tasks, stop other tasks, edit machines, jobs or settings, or
+  start its own head, unless you set `agents_change_fleet = true`.
+- **Orchestrators get a little more.** An orchestrator task (`task run
+  --role orchestrator`, or one an orchestrator file starts) and its scripts
+  may also run, retry, send to and close tasks, enable or disable a job and
+  keep a handover note. No task can start one.
+- **Permission prompts stay on unless you pick a profile.** pastor passes
+  the allow and deny lists you set. A profile (`review`, `develop`,
+  `unrestricted`) turns Claude's prompts off and refuses what its lists
+  don't allow; [the manual](docs/manual.md#trust-model) says when not to.
 - **Nothing is closed that pastor didn't open.** pastor closes only the panes
   and workspaces it created, and keeps a worktree with unpushed commits or
   another agent in it.
@@ -313,8 +312,8 @@ ideas that would pull it away from that shape.
 `make check` runs the changelog check, formatting, clippy and the whole test
 suite against a fake herdr, so you don't need a flock of machines to work on
 pastor; `make help` lists the rest.
-Start with [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Rules
-for AI contributors are in [docs/AI_GOVERNANCE.md](docs/AI_GOVERNANCE.md).
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). How
+AI is used here is in [docs/AI_GOVERNANCE.md](docs/AI_GOVERNANCE.md).
 
 ## License
 
