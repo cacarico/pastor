@@ -1195,7 +1195,11 @@ mod tests {
         assert_eq!(m.live, 1);
         assert_eq!(m.live_jobs, 0, "not from a job");
         assert_eq!(m.seat("work").unwrap().live, 1);
-        assert_eq!(m.seat("home").unwrap().live, 0, "the other flock is untouched");
+        assert_eq!(
+            m.seat("home").unwrap().live,
+            0,
+            "the other flock is untouched"
+        );
 
         m.take("work", JOB);
         assert_eq!(m.live, 2);
@@ -1204,7 +1208,11 @@ mod tests {
 
         m.take("play", RUN);
         assert_eq!(m.live, 3, "live counts every task, seated or not");
-        assert_eq!(m.seat("play"), None, "no seat for a flock not on the machine");
+        assert_eq!(
+            m.seat("play"),
+            None,
+            "no seat for a flock not on the machine"
+        );
     }
 
     /// `later`'s tasks join `waiting_under_share` only for a machine where
@@ -1229,9 +1237,10 @@ mod tests {
             t
         };
         let accepts_all = |_: &Task, _: &str| true;
-        let run = |views: &mut [MachineView], later: &[Task], accepts: &dyn Fn(&Task, &str) -> bool| {
-            mark_waiting_under_share(views, "work", later, "default", accepts);
-        };
+        let run =
+            |views: &mut [MachineView], later: &[Task], accepts: &dyn Fn(&Task, &str) -> bool| {
+                mark_waiting_under_share(views, "work", later, "default", accepts);
+            };
 
         // Under its share, no waiting is computed even for a task that
         // would otherwise qualify.
@@ -1274,7 +1283,10 @@ mod tests {
         // Its own seat is not under share.
         let mut views = vec![desk(1, 2)];
         run(&mut views, &[home_task(|_| {})], &accepts_all);
-        assert!(views[0].waiting_under_share.is_empty(), "home is at its share");
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "home is at its share"
+        );
 
         // Pinned to another machine.
         let mut views = vec![desk(1, 1)];
@@ -1295,12 +1307,18 @@ mod tests {
         };
         let mut views = vec![full];
         run(&mut views, &[home_task(|_| {})], &accepts_all);
-        assert!(views[0].waiting_under_share.is_empty(), "the machine has no room");
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "the machine has no room"
+        );
 
         // `accepts` refuses it.
         let mut views = vec![desk(1, 1)];
         run(&mut views, &[home_task(|_| {})], &|_, _| false);
-        assert!(views[0].waiting_under_share.is_empty(), "accepts refused it");
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "accepts refused it"
+        );
     }
 
     /// Only the task's flock takes it, whatever the others have free.
