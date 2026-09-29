@@ -7,58 +7,47 @@ version.
 
 `pastor serve` runs on one machine, the head: the one whose serve holds the
 queue. Other machines may run a headless serve (see [A headless
-serve](#a-headless-serve)). herdr answers one request per
-connection and then closes it, so pastor opens a connection per request: an
-`ssh` running `herdr --session <s> remote-api-bridge`, which pipes herdr's
-socket protocol over stdio. Every command pastor runs over ssh (this one, the
-probes below, `task attach`) goes as `sh -c '<command>'`, so a remote login
-shell that is not POSIX, such as fish, only parses one quoted word; sh parses
-the rest. For the same reason a machine's `session` may not contain a
-backslash, and a repo path with one needs a POSIX login shell. Those connections are cheap because all of a
-machine's share one multiplexed ssh master
-(`ControlMaster=auto`, `ControlPath=~/.local/state/pastor/ssh/<machine>-%C`,
-`ControlPersist=600`), so only the first one authenticates. A long machine name
-is shortened inside that socket name so it stays under the unix socket path
-limit; `%C` is what tells machines apart. A master lingers for
-up to 10 minutes after `pastor serve` exits; end one by hand with `ssh -O exit -o
-ControlPath=~/.local/state/pastor/ssh/<machine>-%C <target>`. Alongside them each
-machine keeps one long-lived connection for `events.subscribe`, the one thing
-herdr holds open. Over these pastor creates a workspace, starts an agent named
-after the task, waits for the agent to come up (herdr's `agent.start` returns
-before it has), sends the prompt, and watches agent status events. herdr answers
-`agent.start` with `agent_pane_busy` while a new pane's shell is still
-starting, so pastor retries the start up to 5 times, 500ms apart, before it
-fails the task. An agent that
-never becomes ready within 30s fails the task; one that exits on start fails it
-straight away, usually because the agent is not installed on that machine. An
-agent that is blocked on its own startup question marks the task `blocked`;
-herdr drops the prompt then, so pastor sends it once someone answers and the
-agent leaves `blocked`. A task is `done` when its agent has gone idle (herdr's
-`idle` or `done`) after working on the prompt and stays idle for `settle`.
-pastor must have seen the agent `working` or `blocked` since the prompt went in,
-from an event or from `agent.list`; `unknown` does not count. herdr also counts
-each agent state change, and the count must have moved past its value when the
-prompt went in and not moved again during the window. What pastor has seen is
-stored with the task, so a daemon restart or a flock or settings reload does
-not forget work it saw before. An agent that went idle without pastor ever
-seeing it `working` or `blocked` (its whole working spell fell between two
-reconciles while the event was lost) stays `running` until its task goes
-`stale`: herdr's counter moves on `idle -> unknown -> idle` as well, so
-without the activity pastor cannot tell finished work from a flicker. herdr
-shows an agent that stopped to ask something as idle too, so before it calls a
-task `done` pastor reads the last 100 lines of the pane: when the agent's last
-message (Claude's `●` block) ends in `?`, the task goes `blocked` instead, with
-`agent asked: <question>` as its error, and stays there until the agent moves
-again; answer it with `pastor task send`. Agents that draw their messages
-without that marker are never read as asking. Claude can also end its turn
-with a command still running in the background (`make check`), and takes the
-turn up again when it ends; while the pane's footer, below the input prompt,
-says `1 shell still running` (or `N shells`), the task stays `running` and
-pastor looks again after each settle window. An agent whose process exits while it sits idle
-between turns (someone typed `/exit` after the work) leaves its task `done`;
-one that exits while starting, blocked or working fails it with "agent process
-exited". Task state lives in SQLite under
-`~/.local/state/pastor/`.
+serve](#a-headless-serve)). The head keeps the queue and runs the jobs. For
+each task it picks a machine and, for an `ssh`, `local` or `command` one (see
+[Flocks](#flocks)), reaches that machine's herdr itself, opens a workspace,
+starts an agent named after the task, waits for the agent to come up, types
+the prompt and watches the agent's status; for a `pull` machine it hands the
+task to that machine's own headless serve instead, which does the same
+against its own herdr and reports back (see [Pull
+machines](#pull-machines)). Task state lives in SQLite under
+`~/.local/state/pastor/`. How the connections work is under
+[Internals](#internals).
+
+An agent that never becomes ready within 30s fails the task; one that exits
+on start fails it straight away, usually because the agent is not installed
+on that machine. An agent that is blocked on its own startup question marks
+the task `blocked`; herdr drops the prompt then, so pastor sends it once
+someone answers and the agent leaves `blocked`.
+
+A task is `done` when its agent goes idle after working on the prompt and
+stays idle for `settle` (10s). What pastor has seen is stored with the task,
+so a daemon restart or a flock or settings reload does not forget work it saw
+before. How pastor tells finished work from a flicker is under
+[Internals](#internals).
+
+If the agent's last message ends in a question, the task goes `blocked`
+instead, and you answer it with `pastor task send`. herdr shows an agent that
+stopped to ask something as idle too, so before it calls a task `done` pastor
+reads the last 100 lines of the pane: when the agent's last message (Claude's
+`●` block) ends in `?`, the task goes `blocked` with `agent asked:
+<question>` as its error, and stays there until the agent moves again.
+Agents that draw their messages without that marker are never read as
+asking.
+
+Claude can also end its turn with a command still running in the background
+(`make check`), and takes the turn up again when it ends. While the pane's
+footer, below the input prompt, says `1 shell still running` (or `N
+shells`), the task stays `running` and pastor looks again after each settle
+window.
+
+An agent whose process exits while it sits idle between turns (someone typed
+`/exit` after the work) leaves its task `done`; one that exits while
+starting, blocked or working fails it with "agent process exited".
 
 Before creating a workspace, pastor checks that the repo directory is
 actually there: `test -d` over the same ssh master for an `ssh` machine,
@@ -68,22 +57,23 @@ workspace in the shell's home with no error when the requested `cwd` is
 missing, so a missing repo fails the task instead of silently working in
 the wrong place.
 
-The CLI talks to `pastor serve` over a unix socket (`pastor.sock`) with
-newline-delimited JSON; each response is `{"kind": ..., "data": ...}`.
+The CLI talks to `pastor serve` over a unix socket, `pastor.sock`.
 `pastor serve` refuses to start if a daemon already holds that socket, or if
-something answers it but not a ping within 2 seconds — it only removes and
-replaces a socket file whose connection is refused. Every command that talks
-to or reloads the head pings it once, first, and acts on that answer
-throughout. A head that holds the socket but does not answer the ping within
-2 seconds stops the command (`head_unresponsive`) before it does anything:
-it may be busy mid-request, and working as if no head ran would let `tick`
-start a second scheduler next to it, or an edit or a prune go offline behind
-it. `task list` and `task describe`
-read from `pastor serve` when it's running and fall back to the SQLite store
-when it's not (`task list` says so on stderr); `task attach` reads the local store
-directly, since it only needs the task's machine and agent name to hand off
-to `ssh`/`herdr`; with a remote head set it asks the head for the task
-instead.
+something answers it but not a ping within 2 seconds. It only replaces a
+socket file that refuses connections.
+
+Every command that talks to or reloads the head pings it once, first, and
+acts on that answer throughout. A head that holds the socket but does not
+answer the ping within 2 seconds stops the command (`head_unresponsive`)
+before it does anything: it may be busy mid-request, and working as if no
+head ran would let `tick` start a second scheduler next to it, or an edit or
+a prune go offline behind it.
+
+`task list` and `task describe` read from `pastor serve` when it's running
+and fall back to the SQLite store when it's not (`task list` says so on
+stderr). `task attach` reads the local store directly, since it only needs
+the task's machine and agent name to hand off to `ssh`/`herdr`; with a
+remote head set it asks the head for the task instead.
 
 `pastor machine list` opens with a line about the head, then lists the
 machines:
@@ -103,47 +93,52 @@ and its row comes first; a head that runs no agents gets the line without
 that ending. With no head running, the line is replaced by the notice on
 stderr that the machines were probed directly. `--flock F` lists only that
 flock's machines, and the line counts those.
+
 HOST is the ssh target, `local`, or the program a `command` machine runs.
-FLOCKS are the flocks the machine is in, with its number in each (see Flocks). PROFILE is the
-machine's own permission profile, the one that decides whether a task may
-ask for `unrestricted` there: the machine's `profile`, else its primary
-flock's, else `[defaults]` (see [Permission profiles](#permission-profiles));
-`profile` in `--json`. On a machine in several flocks with no `profile` of
-its own, the gate reads the task's flock instead, so a task from another
-flock can meet a different profile than the one shown. A task there runs
-under its own flock's profile before the machine's, so it can run under
-another one. PASTOR is the pastor
-installed on the machine:
-over the ssh master, pastor runs `pastor --version` in a shell that has
-`~/.cargo/bin` and `~/.local/bin` on its PATH, since ssh's non-login shell
-often lacks them. A `local` machine is the head's own pastor; a `command`
-machine, one with no pastor, or one that gives an odd answer shows `-`. The
-head asks each time it connects to a machine, and again after a reconcile
-once ten minutes have passed since it last asked: on the reconcile tick
-(`reconcile_every`, 60s by default) while connected, on the `tick` while
-polling. With the defaults an upgrade shows within about eleven minutes
-without restarting the head; a longer `reconcile_every` delays it to the first
-reconcile past the ten minutes. A probe that gets no answer keeps the version
-last read. `machine list` itself never probes
-while the head is running.
+FLOCKS are the flocks the machine is in, with its number in each (see
+Flocks).
+
+PROFILE is the machine's own permission profile, the one that decides
+whether a task may ask for `unrestricted` there: the machine's `profile`,
+else its primary flock's, else `[defaults]` (see [Permission
+profiles](#permission-profiles)); `profile` in `--json`. On a machine in
+several flocks with no `profile` of its own, the gate reads the task's flock
+instead, so a task from another flock can meet a different profile than the
+one shown. A task there runs under its own flock's profile before the
+machine's, so it can run under another one.
+
+PASTOR is the pastor installed on the machine: over the ssh master, pastor
+runs `pastor --version` in a shell that has `~/.cargo/bin` and
+`~/.local/bin` on its PATH, since ssh's non-login shell often lacks them. A
+`local` machine is the head's own pastor; a `command` machine, one with no
+pastor, or one that gives an odd answer shows `-`. The head asks when it
+connects, then again after each successful reconcile once ten minutes have
+passed since it last asked — a connected machine's own `reconcile_every`
+(60s by default), a polling one's `poll_every` (10s by default, normally
+every tick) — so an upgrade shows within about eleven minutes without a
+restart either way. A probe that gets no answer keeps the version last read.
+`machine list` itself never probes while the head is running.
+
 With `pastor serve` running, CHANNEL is the head's live channel state and
 AGENTS counts pastor's tasks and orphans (see below) against the machine's
 room, `max_agents` followed by `+<n>j` for job slots and `+<n>b` for burst
-when they are set (see Room on a machine). Without it, the command
-probes each machine itself (a ping and an `agent.list`, one at a time, with no
-time limit, plus the pastor version for a machine that answered). A pull
-machine is not probed: nothing connects to it, so its row reads HOST `pull`
-and CHANNEL `not probed`, and AGENTS counts the tasks the store puts there.
-For any other machine CHANNEL reads one of four values: `probed` (the ping answered — an old protocol or a
-failed `agent.list` still counts as `probed`, with the reason in ERROR),
-`server down` (a local endpoint's own socket has nothing listening),
-`unreachable` (any other transport failure), or `error` (the ping itself came
-back with a non-transport API error). AGENTS counts every agent herdr reports,
-and stderr says so. `--json` prints
-`{"head": {...}, "machines": [...]}`, with `pastor_version` on the head and
-on each machine (`null` when unknown), `flock` on each machine, and `channel`
-one of the same four probe values or `not probed` (or the head's live channel state when
-`pastor serve` is running).
+when they are set (see Room on a machine).
+
+Without it, the command probes each machine itself (a ping and an
+`agent.list`, one at a time, with no time limit, plus the pastor version for
+a machine that answered). A pull machine is not probed: nothing connects to
+it, so its row reads HOST `pull` and CHANNEL `not probed`, and AGENTS counts
+the tasks the store puts there. For any other machine CHANNEL reads one of
+four values: `probed` (the ping answered; an old protocol or a failed
+`agent.list` shows in ERROR), `server down` (a local endpoint's own socket
+has nothing listening), `unreachable` (any other transport failure), or
+`error` (the ping itself came back with a non-transport API error). AGENTS
+counts every agent herdr reports, and stderr says so.
+
+`--json` prints `{"head": {...}, "machines": [...]}`, with `pastor_version`
+on the head and on each machine (`null` when unknown), `flock` on each
+machine, and `channel` one of the same four probe values or `not probed` (or
+the head's live channel state when `pastor serve` is running).
 
 Jobs are one TOML file each in `~/.config/pastor/jobs/`. On every `tick` the
 daemon re-reads files that changed (a file that stops parsing keeps its last
@@ -151,36 +146,33 @@ good version and shows the error in `pastor job list`), asks each due job's
 connector for items, drops keys it has seen before, renders `prompt`, `repo`
 and `branch` with `{{ item.* }}`, `{{ job.name }}` and `{{ task.id }}`, and
 queues one task per new item up to `max_tasks_per_run`. The rest stay unseen
-for the next run. `summary` under `[dispatch]` (`ask`, `require` or `off`)
-says whether the job's tasks are asked for a summary, or need one (see
-Asking for one). Item text comes from outside, so an item's control
-characters, other than newline and tab, are dropped before its values go
-into the prompt, which is typed into the agent's terminal. An item value put
-into `repo` or `branch` must be one plain path component: not empty (a missing
-field renders empty), not `.` or `..`, no `/` or `\`, no leading `-` and no
-control characters. An item that breaks this is skipped and shown in the job's
-last result; the job's cursor still moves. An item value may not appear in the first
-component of `branch`: the job fixes a prefix such as `pastor/{{ item.key }}`,
-so an item cannot name an existing branch like `main` and have the agent
-commit to it. A job file that breaks this is `invalid`. A job never overlaps itself; `pastor job run <name>` fires
-one regardless, and it starts once a run already going has finished. `every = "5m"` or `cron = "*/5 9-18 * * 1-5"` (local time)
-says when. The built-in connector is `clock`, one item per run keyed by the
-run time; any other is an installed connector (see Connectors), and a job
-that names one that is not installed is `invalid`.
-A failed connector backs the job off, one minute doubling to an hour, and
-keeps its cursor.
+for the next run.
+
+`every = "5m"` or `cron = "*/5 9-18 * * 1-5"` (local time) says when. A job
+never overlaps itself; `pastor job run <name>` fires one regardless, and it
+starts once a run already going has finished. The built-in connector is
+`clock`, one item per run keyed by the run time; any other is an installed
+connector (see Connectors), and a job that names one that is not installed is
+`invalid`. A failed connector backs the job off, one minute doubling to an
+hour, and keeps its cursor. `summary` under `[dispatch]` (`ask`, `require` or
+`off`) says whether the job's tasks are asked for a summary, or need one (see
+Asking for one).
+
+Item text comes from outside, so an item's control characters, other than
+newline and tab, are dropped before its values go into the prompt, which is
+typed into the agent's terminal. An item value put into `repo` or `branch`
+must be one plain path component: not empty (a missing field renders empty),
+not `.` or `..`, no `/` or `\`, no leading `-` and no control characters. An
+item that breaks this is skipped and shown in the job's last result; the
+job's cursor still moves. An item value may not appear in the first
+component of `branch`: the job fixes a prefix such as `pastor/{{ item.key
+}}`, so an item cannot name an existing branch like `main` and have the
+agent commit to it. A job file that breaks this is `invalid`.
 
 A job can also run on another machine and hand its items to the head, which
-keeps the `seen` keys so no item is queued twice. The IPC request
-`job_submit` carries the job's name, its `[dispatch]` table, its prompt and
-the items (each with its `key`); the head checks the table as it would a job
-file's (`invalid_dispatch` with the same error), and queues each item with the
-same rendering, path checks and `max_tasks_per_run` cap as its own jobs. It
-answers the tasks queued, the keys skipped as seen, and each refused item with
-its reason (`max_tasks_per_run` for those past the cap; they stay unseen). A
-name the head has a job file for is `job_name_taken`; submitters of one name
-share its seen keys. It needs a head of IPC protocol 7 (`head_too_old`
-otherwise). A headless serve (below) sends it for each run of its jobs.
+keeps the `seen` keys so no item is queued twice. A headless serve (below)
+does this for each run of its jobs; the request it sends is under
+[Internals](#internals).
 
 A machine whose requests answer but whose event subscription will not open is
 `polling`: it still takes tasks and is reconciled every `tick`. Two dispatch
@@ -189,29 +181,32 @@ conditional update, so a machine is never given more than its room (see Room
 on a machine).
 
 `pastor task list` shows live tasks only: queued, starting, running, blocked
-and paused (see [Pausing a low task](#pausing-a-low-task)).
-Finished ones (done, failed, stale, closed) appear with `--all`, and an empty
-default list says so on stderr. `--blocked` and `--done` narrow to just that
-state, `--job`, `--flock` and `--machine` narrow whichever set is shown, and
+and paused (see [Pausing a low task](#pausing-a-low-task)). Finished ones
+(done, failed, stale, closed) appear with `--all`, and an empty default list
+says so on stderr. `--blocked` and `--done` narrow to just that state,
+`--job`, `--flock` and `--machine` narrow whichever set is shown, and
 `--json` prints the same selection. `--wide` adds RESULT, how each task's
 last round ended (see Task summaries), and each task's description (see
 Descriptions). FLOCK is the flock the task targets. When an orchestrator is
-in the list, it prints two titled tables, `orchestrators:` and then `tasks:`;
-a script should read `--json`, which stays one array. `pastor task read t-1` fetches recent output from the
-task's pane over the machine channel. Text that came from an item or a pane is
-printed with its control characters escaped (`\x1b`, `\r`, ...), so none of
-it can move the cursor, retitle the terminal or set the clipboard: the NOTE
-column of `task list` (an item's title, cut to 60 characters), every field and
-the prompt of `task describe`, and `task read`. `--json` prints it raw. `pastor machine open pi-3` execs the full herdr
-UI against a flock machine (`herdr --remote` for an SSH one, `herdr` directly
-for a local one) instead of showing pastor's own view; herdr refuses to start
-inside one of its own panes, so run it from a plain terminal. pastor's flock and
-herdr's saved machines are separate lists on purpose: `machine add --herdr` and
-`machine remove --herdr` keep them in step by running `herdr machine add|remove`
-for you, and without the flag `machine add` prints the command instead. `remove`
-matches herdr's entry by label only; when none matches but the same host is
-saved under another label, it prints that entry's remove command rather than
-guessing.
+in the list, it prints two titled tables, `orchestrators:` and then
+`tasks:`; a script should read `--json`, which stays one array.
+
+`pastor task read t-1` fetches recent output from the task's pane over the
+machine channel. Text that came from an item or a pane is printed with its
+control characters escaped (`\x1b`, `\r`, ...), so none of it can move the
+cursor, retitle the terminal or set the clipboard: the NOTE column of `task
+list` (an item's title, cut to 60 characters), every field and the prompt of
+`task describe`, and `task read`. `--json` prints it raw.
+
+`pastor machine open pi-3` execs the full herdr UI against a flock machine
+(`herdr --remote` for an SSH one, `herdr` directly for a local one) instead
+of showing pastor's own view; herdr refuses to start inside one of its own
+panes, so run it from a plain terminal. `machine add --herdr` and `machine
+remove --herdr` keep herdr's machine list in step, by running `herdr machine
+add|remove` for you; without the flag `machine add` prints the command
+instead. `remove` matches herdr's entry by label only; when none matches but
+the same host is saved under another label, it prints that entry's remove
+command rather than guessing.
 
 A task that reaches `done` is closed by pastor after `close_done_after`
 (`pastor.toml`, default `5s`; `never` disables it): the pane closes, a
@@ -220,16 +215,18 @@ worktree pastor created is removed if it is clean, and the task shows as
 remote (`git rev-list HEAD --not --remotes` is empty; a repo with no remote
 at all always has some). A worktree that is not clean is kept, with a note
 on the task naming the branch, for you to save and remove with `git worktree
-remove`. herdr never deletes the branch, even for a worktree it removes. Failed and stale tasks are left for
-`pastor task retry`; blocked tasks need their prompt answered
-(`pastor task send` or `pastor task attach`) or `pastor task close`. None of them is closed on its
-own. The grace period keeps the pane there for `pastor task attach` (a
-Claude task can be reopened after it anyway; see [Reopening a finished
-task](#reopening-a-finished-task)); the
-check runs every `close_done_after` (at most every reconcile) while the
-machine is connected. An agent
-that herdr shows working or blocked again
-at that moment is left alone, and its task goes back to running or blocked.
+remove`. herdr never deletes the branch, even for a worktree it removes.
+
+The grace period keeps the pane there for `pastor task attach` (a Claude
+task can be reopened after it anyway; see [Reopening a finished
+task](#reopening-a-finished-task)). The check runs every `close_done_after`
+(at most every reconcile) while the machine is connected. An agent that
+herdr shows working or blocked again at that moment is left alone, and its
+task goes back to running or blocked.
+
+Failed and stale tasks are left for `pastor task retry`; blocked tasks need
+their prompt answered (`pastor task send` or `pastor task attach`) or
+`pastor task close`. None of them is closed on its own.
 
 An agent says it is finished with `pastor task done` from its own pane (the
 task defaults to `PASTOR_TASK`; a human may name any task, `pastor task done
@@ -240,6 +237,33 @@ completion sequence check does not hold its close. Auto-close then closes its
 pane once the agent is idle and `close_done_after` has passed, which frees the
 machine's slot. `pastor task send` to such a task gives it more to do, and it
 runs again as any done task does. `task describe --json` prints `"ended": true`.
+
+### Errors
+
+Runtime errors print JSON on stderr with a stable `code` and exit 1; a
+malformed command line gets clap's plain usage text and exit 2.
+
+### After an upgrade
+
+After an upgrade, restart `pastor serve`. A CLI newer than its head refuses
+what that head can't do, with `head_too_old`.
+
+Every request to a head, from the CLI or from a headless serve, is checked
+against the head's protocol before it goes out. A request that carries
+something the head predates (a field it would drop without a word, or a
+request it does not know) is refused `head_too_old`, naming what the head
+lacks, and is not sent. So a head from before a feature never queues a task
+without its flock, model, profile, allow and deny lists, level, `preempt`,
+label, description or summary setting, and never gets a request it cannot
+read, such as `queue`, `events` from another machine or an `orchestrator`
+command. The check uses one ping per head, kept for a minute, so a command
+pings once and a headless serve sees a restarted head within a minute. A
+request every head takes sends no ping for it.
+
+A headless serve's job run that needs what its head lacks fails the same way,
+and backs off as a failing connector does. `pastor head set` refuses such a
+head unless given `--force`. Which protocol each feature needs is under
+[Internals](#internals).
 
 ### Task summaries
 
@@ -282,11 +306,8 @@ Where it shows:
   connector's `[finish]` command gets `summary` on stdin.
 
 A task shows its last round's summary only while it is done, failed or
-closed; a running one has none yet. `task done --summary` and
-`--all-summaries` need a head speaking protocol 17 or newer (`head_too_old`
-otherwise). Summaries are in the store's `task_summaries` table (schema 13),
-created when the new pastor first opens an older store; its tasks show
-none.
+closed; a running one has none yet. Tasks from before 0.8.0 show no
+summary.
 
 #### Asking for one
 
@@ -339,9 +360,7 @@ With `require`, a summary is a condition of success; any outcome counts,
 - A person's `pastor task done t-N`, from outside the task's pane, is not
   refused: the round reads `no summary (ended by hand)`.
 
-No reminder is sent first. `task run --summary`, and a headless serve
-forwarding a job with `summary`, need a head speaking protocol 20
-(`head_too_old` otherwise).
+No reminder is sent first.
 
 `pastor task send t-3 "yes, go on"` types into the pane of a live task
 (starting, running, blocked, or done with its pane still open) and presses
@@ -358,83 +377,90 @@ done at does not.
 
 An agent started in a folder it has not seen stops at its folder-trust
 prompt, and a worktree is always a new folder. `pastor task send t-3
---trust` presses the agent's trust keys (`trust_keys` under `[agents.<name>]`
-in `pastor.toml`; Claude's are built in as `Down`, `Enter`) and saves the
-task's machine and repo, the `--repo` as given, so every worktree of that
-repo counts. It answers only a task blocked on its startup prompt; any other
-task answers `not_at_trust_prompt`, and nothing is sent or saved. An agent
-without trust keys answers `no_trust_keys`, and a task
-without `--repo` gets the keys but nothing is saved. From then on, when a task
-of a saved repo is blocked during startup on that machine, the head reads its
-pane and, if it shows the agent's trust prompt, presses the trust keys itself,
-once per task, and emits `task.trusted`; a task still blocked after that is
-left for a human. The prompt is known by its `trust_marker` (Claude's is built
-in as its "Yes, I trust this folder" option), so a task blocked on another
-dialog the same keys would accept, such as Claude's bypass-permissions
-warning, is left for a human too. The marker must be in the prompt at the
-bottom of the pane (after the last output, and after any menu above the last
-one), since the read includes scrollback where an earlier trust prompt can
-linger above a later dialog. An agent with no marker (`trust_marker =
-""`, or one that is not Claude and sets none) gets the keys without the check. Either way the task's prompt goes in
-once, `settle` after the trust keys: Claude redraws for a moment after the
-dialog and loses what is typed then, though herdr takes it. A prompt
-answered by a person at the pane waits the same: the head sees the agent
-leave `blocked` and sends the prompt `settle` later.
+--trust` presses the agent's trust keys (`trust_keys` under
+`[agents.<name>]` in `pastor.toml`; Claude's are built in as `Down`,
+`Enter`) and saves the task's machine and repo, the `--repo` as given, so
+every worktree of that repo counts. It answers only a task blocked on its
+startup prompt; any other task answers `not_at_trust_prompt`, and nothing is
+sent or saved. An agent without trust keys answers `no_trust_keys`, and a
+task without `--repo` gets the keys but nothing is saved.
+
+From then on, when a task of a saved repo is blocked during startup on that
+machine, the head reads its pane and, if it shows the agent's trust prompt,
+presses the trust keys itself, once per task, and emits `task.trusted`; a
+task still blocked after that is left for a human. The prompt is known by
+its `trust_marker` (Claude's is built in as its "Yes, I trust this folder"
+option), so a task blocked on another dialog the same keys would accept,
+such as Claude's bypass-permissions warning, is left for a human too. The
+marker must be in the prompt at the bottom of the pane (after the last
+output, and after any menu above the last one), since the read includes
+scrollback where an earlier trust prompt can linger above a later dialog. An
+agent with no marker (`trust_marker = ""`, or one that is not Claude and
+sets none) gets the keys without the check.
+
+Either way the task's prompt goes in once, `settle` after the trust keys:
+Claude redraws for a moment after the dialog and loses what is typed then,
+though herdr takes it. A prompt answered by a person at the pane waits the
+same: the head sees the agent leave `blocked` and sends the prompt `settle`
+later.
+
+`pastor trust list [--json]` shows the saved pairs, `pastor trust add
+<machine> <repo>` saves one without a blocked task, and `pastor trust remove
+<machine> <repo>` forgets one. With `pastor serve` running they go through
+it, so the table is the head's; with it down they read and write the store
+directly. `add` and `remove` change the fleet: an agent pastor started is
+refused them unless `agents_change_fleet` is on.
 
 A prompt the agent does not take anyway is sent again. An agent the head
-gave its prompt (at start or resume, or after its startup prompt) that sits idle a
-whole settle window at the sequence the prompt went in at, never seen
+gave its prompt (at start or resume, or after its startup prompt) that sits
+idle a whole settle window at the sequence the prompt went in at, never seen
 working or blocked, did not take it; the head sends it again, up to twice,
 then marks the task `blocked` with the error "agent did not take its
 prompt", for a person to look at the pane and `task send` it. This is kept
 in the head's memory: after a restart such a task stays `running` until it
 goes stale.
-`pastor trust list [--json]` shows
-the saved pairs, `pastor trust add <machine> <repo>` saves one without a
-blocked task, and `pastor trust remove <machine> <repo>` forgets one. With
-`pastor serve` running they go through it, so the table is the head's; with
-it down they read and write the store directly. `add` and `remove` change the
-fleet: an agent pastor started is refused them unless `agents_change_fleet`
-is on.
 
-Everything else pastor closes only when asked; three commands do it, all
-with `--json`. `pastor task retry t-4` queues a new task
-copying a failed or stale one (job, item, prompt and dispatch settings, with
-`retry_of` pointing back and a "retry of t-4" note in `task list`) and dispatches it
-at once. It gets a new id because the old agent `t-4`, named after the task, may
-still be running. The retry of a failed worktree task goes back to that
-task's checkout, on its branch, with herdr's `worktree.open` instead of
-`worktree.create` (which git would refuse with "already exists"), but only
-when pastor knows the checkout is that task's own (its dispatch made it and
-recorded where), it is still on disk at the same path, the old agent is
-gone, no agent is in the checkout's workspace (an earlier retry of the
-same task may have reopened it) and no other task's agent works in the
-checkout from elsewhere (found by its path, as for removing a worktree,
-below). Any other retry, a stale task's included (its agent may still be
-working), gets a branch of its own (`pastor/t-<new id>`, even when the task
-named one) and a new worktree. `pastor task close
-t-4` closes the task's pane (and the agent in it) and marks it `closed`; a
-queued task only has its row closed. `--remove-worktree` removes the task's
-worktree instead, which closes its workspace, pane included. herdr refuses a
-checkout with uncommitted or untracked files; the task is then left as it was,
-so commit or clean up and run it again. `pastor task close t-4 t-5 t-6` closes
-each in turn, `--remove-worktree` applying to all: it prints one line per
-task (`t-4 closed`, or `t-5 no_worktree: ...` for one that failed; with
-`--json` an array of objects), goes on past a failure, and then exits 1 with
+Everything else pastor closes only when asked. Three commands do it, retry,
+close and prune, all with `--json`.
+
+`pastor task retry t-4` queues a copy of a failed or stale task (job, item,
+prompt and dispatch settings, with `retry_of` pointing back and a "retry of
+t-4" note in `task list`) and dispatches it at once. It gets a new id because
+the old agent `t-4`, named after the task, may still be running. A failed
+worktree task goes back to its own checkout, on its branch, when that
+checkout is still there and free: pastor knows the checkout is that task's
+own (its dispatch made it and recorded where), it is still on disk at the
+same path, the old agent is gone, no agent is in the checkout's workspace
+(an earlier retry of the same task may have reopened it) and no other task's
+agent works in the checkout from elsewhere (found by its path, as for
+removing a worktree, below). Any other retry, a stale task's included (its
+agent may still be working), gets a branch of its own (`pastor/t-<new id>`,
+even when the task named one) and a new worktree.
+
+`pastor task close t-4` closes the task's pane (and the agent in it) and
+marks it `closed`; a queued task only has its row closed.
+`--remove-worktree` removes the task's worktree instead, which closes its
+workspace, pane included. herdr refuses a checkout with uncommitted or
+untracked files; the task is then left as it was, so commit or clean up and
+run it again. `pastor task close t-4 t-5 t-6` closes each in turn,
+`--remove-worktree` applying to all: it prints one line per task (`t-4
+closed`, or `t-5 no_worktree: ...` for one that failed; with `--json` an
+array of objects), goes on past a failure, and then exits 1 with
 `close_failed` naming the ones not closed. One task prints as it always has.
-`pastor task prune --done --older-than
-3d` deletes done tasks that finished more than three days ago; `--failed` and
-`--closed` add those states. A pruned task's item stays seen, so a job never
-queues it again, and the newest task is always kept so its id is never handed
-out twice. Prune also keeps a worktree task whose checkout may still be on
-disk: a plain close only closes the pane, and the row is then the only record
-of that checkout. It names each one it keeps; `task close --remove-worktree`
-on it removes the worktree (or, when herdr has already lost the workspace,
-says to run `git worktree remove`) and clears the recorded workspace, and the
-next prune takes the row. Prune works without `pastor serve`, but not behind one that holds
-the socket and does not answer (`head_unresponsive`): that head may still be
-writing tasks. Retry and close need it.
-`task run --worktree` needs `--repo`.
+
+`pastor task prune --done --older-than 3d` deletes done tasks that finished
+more than three days ago; `--failed` and `--closed` add those states. A
+pruned task's item stays seen, so a job never queues it again, and the
+newest task is always kept so its id is never handed out twice. Prune keeps
+a row whose worktree may still be on disk, and says which: a plain close only
+closes the pane, and the row is then the only record of that checkout. `task
+close --remove-worktree` on it removes the worktree (or, when herdr has
+already lost the workspace, says to run `git worktree remove`) and clears the
+recorded workspace, and the next prune takes the row.
+
+Prune works without `pastor serve`, but not behind one that holds the socket
+and does not answer (`head_unresponsive`): that head may still be writing
+tasks. Retry and close need it.
 
 ### Where a task's pane goes
 
@@ -443,10 +469,7 @@ It is set like every dispatch setting: `--place` on `task run` (and on `task
 retry`, to move a retry), `place = "..."` in a job's `[dispatch]`, `place` under
 `[defaults]` in `pastor.toml`, or under the task's `[[flock]]` entry, which
 comes before `[defaults]`; `task describe` prints it and where it came from,
-such as `place: own (from flock work)`. A head from before
-`task retry --place` would retry the task where it was, so `task retry
---place` refuses one (`head_too_old`): restart `pastor serve` after an
-upgrade.
+such as `place: own (from flock work)`.
 
 - `repo` (the default) keeps an agent under the repo it works on. A
   `--worktree` task gets a new worktree, which herdr shows under the repo's
@@ -471,29 +494,29 @@ A `pastor` or `pane:<workspace>` workspace that closes while pastor places the
 task is looked up once more; still gone, the task fails (`pastor` is made
 again instead), and it never lands in a workspace of its own.
 
-A pane in a workspace the task did not make is still the task's own: the
-task records that pane and that workspace, and `task close` and auto-close
-close only the pane, never the workspace or its other panes (herdr still
-closes a workspace whose last pane closes, so one left with only the task's
-pane goes with it). A worktree task placed in `pastor` or `pane:<workspace>`
-still gets its worktree on disk and works in it; the workspace herdr opened on
-the checkout is closed once the agent's pane is split off the shared one. A
-retry whose `worktree.open` finds a workspace already showing the checkout
-(the failed task's own, or one someone opened) never closes anything in it:
-the retry's pane is split off it and the workspace keeps every pane it had.
-Removing that worktree (`--remove-worktree`, or auto-close of a clean one)
-closes the task's pane, has herdr open a workspace on the checkout
-(`worktree.open`) and removes that; when herdr refuses (uncommitted changes),
-the workspace it opened is closed again and the checkout stays. When a
-workspace already shows the checkout, herdr answers that one, and removing
-the checkout would close it: pastor did not open it, so the checkout stays
-and the task closes with a note to remove it with `git worktree remove`
-(its workspace is kept on the row, so `--remove-worktree` can try again
-once that workspace is gone). Whatever the place, a task whose own dispatch found a
-workspace already showing its checkout (a retry placed `repo` or `own` that
-joined the failed task's workspace, or one someone opened) records that, and
-its checkout is kept the same way on `--remove-worktree` and auto-close:
-only the task's pane goes.
+A task closes only its own pane, never a workspace it joined. A pane in a
+workspace the task did not make is still the task's own: the task records
+that pane and that workspace, and `task close` and auto-close close only the
+pane, never the workspace or its other panes (herdr still closes a workspace
+whose last pane closes, so one left with only the task's pane goes with it).
+
+A worktree task placed in `pastor` or `pane:<workspace>` still gets its
+worktree on disk and works in it; the workspace herdr opened on the checkout
+is closed once the agent's pane is split off the shared one. A retry that
+finds a workspace already showing its checkout (the failed task's own, or
+one someone opened) never closes anything in it: the retry's pane is split
+off it and the workspace keeps every pane it had.
+
+pastor never removes a checkout that a workspace it didn't open still shows.
+When one does, removing the checkout would close that workspace, so on
+`--remove-worktree` or auto-close the checkout stays and the task closes with
+a note to remove it with `git worktree remove`. Its workspace is kept on the
+row, so `--remove-worktree` can try again once that workspace is gone.
+Whatever the place, a task whose own dispatch found a workspace already
+showing its checkout (a retry placed `repo` or `own` that joined the failed
+task's workspace, or one someone opened) records that, and its checkout is
+kept the same way: only the task's pane goes. When herdr refuses to remove a
+checkout (uncommitted changes), the checkout stays too.
 
 Since a fix round joins the workspace of the worktree it works in, removing
 that worktree would end the fix round too. While another agent works in a
@@ -543,8 +566,7 @@ untouched, and a task that joins a workspace (`place = "repo"` finding one,
 `pastor`, `pane:<workspace>`) leaves its label as it is. `task describe`
 prints the label with where it came from: the template until dispatch, then
 the workspace's name, `(joined workspace)` for one the task joined, and the
-reason when it fell back to `t-N`. A head from before labels would name the
-workspace `t-N`, so `task run --label` refuses one (`head_too_old`).
+reason when it fell back to `t-N`.
 
 An agent named like a task (`t-N`) that no open task owns is an orphan: a
 dispatch that failed after the agent started, a daemon killed mid-dispatch, a
@@ -636,8 +658,7 @@ one at its max says `waiting for a machine: flock code is at 4 of 2/4 on
 desk`. Nothing passes the machine's own room,
 and job slots and burst never take a flock past its max. `max` below `share`,
 `max` alone (the plain number is that), a share alone and a share of 0 fail
-the load. A head needs IPC protocol 26 to read this form; the CLI refuses an
-older one while flock.toml uses it.
+the load.
 
 The `flock` key on a machine still works: it puts the machine in that flock
 with no number but the machine's own limits (`max_agents`, job slots and
@@ -714,6 +735,12 @@ machine's `max_agents`, for setups with one flock per machine, so it stays
 there whichever flock is the default later. A machine whose only membership
 is already that flock's `machines` table is left as it is.
 
+`pastor machine move`, `pastor flock join` and `pastor flock leave` change
+the flocks of tasks dispatched after them; tasks already on the machine keep
+running there, and its connection stays up. A queued task pinned to a machine
+that has moved to another flock stays queued for its own flock, and the head
+logs a warning once.
+
 With no head running, `flock add|join|leave|remove` and `machine remove`
 hold a lock (`fleet.lock` in the state dir) from their read of the queued
 tasks to the save, and `pastor serve` holds the same lock from before it
@@ -739,9 +766,8 @@ key, or the default flock of a machine no flock lists) shows its
 `max_agents`. The live count needs a running head and is `-` without one
 (`desk -/2`), and so is AGENTS, the flock's live tasks over all its
 machines. `--json` keeps `machines` as the names and adds `members`
-(`name`, `share`, `max`, `live`). The flock commands go through a running head like
-the other edits, need a head of IPC protocol 22 or later for `join`,
-`leave` and `add` with machines, and an agent pastor started may not run them
+(`name`, `share`, `max`, `live`). The flock commands go through a running
+head like the other edits, and an agent pastor started may not run them
 unless `agents_change_fleet` is on.
 
 A task's flock is fixed when it is created: `--flock` on `pastor task run`, or
@@ -752,17 +778,9 @@ that does not exist (`unknown_flock`). A job whose flock does not fit, or
 whose pinned machine is not in the flock, fails its run before the connector
 is asked for anything, with the reason in `pastor job list`. A flock or a
 pinned machine removed while the connector runs gets none of that run's tasks:
-each item fails, and the cursor holds for the next run. `pastor task retry` keeps the flock of the task it copies, and is refused
-(`unknown_flock`) once that flock has been removed. A head
-started from a pastor before flocks would ignore `--flock` and read
-`flock.toml` as one flock, so while flocks are in play every command that
-talks to or reloads the head asks its protocol first and refuses an old one
-(`head_too_old`): restart `pastor serve` after an upgrade. Flocks are in play
-when the command takes `--flock`, edits `flock.toml` (`flock
-add|join|leave|default|remove`, `machine add|remove|move`), or `flock.toml` declares named flocks, since then
-no `--flock` means the default flock rather than every machine. A head that
-is listening but does not answer is refused whether flocks are in play or not
-(`head_unresponsive`); only a head that is not running at all is passed by.
+each item fails, and the cursor holds for the next run. `pastor task retry`
+keeps the flock of the task it copies, and is refused (`unknown_flock`) once
+that flock has been removed.
 
 ### What a flock sets
 
@@ -940,11 +958,7 @@ deny_flag = "--deny-tool"
 A task whose agent has no flag for a list it carries is refused rather than
 started without it (`agent_tools_unsupported` from `pastor task run` and
 `pastor task retry`; a job records the error for that item). `pastor task describe`
-prints a task's `allow` and `deny`. Since a head from before these lists would
-start the agent without them, every command that can make it queue a task
-(`pastor task run`, `pastor task retry`, `pastor tick` without `--dry-run`,
-`pastor job run`) refuses one (`head_too_old`): restart `pastor serve` after
-an upgrade.
+prints a task's `allow` and `deny`.
 
 #### Arguments that turn permissions off
 
@@ -992,22 +1006,13 @@ definition gets Claude's trust keys and its `--allowedTools` and
 starts with `~/` is expanded against the home of the machine the task runs
 on, as `--repo` is; a `command` machine cannot report a home, so give those
 absolute paths. Keys must be variable names (letters, digits and `_`, not
-starting with a digit). pastor sets the env when it creates the task's pane:
-`workspace.create` takes it directly. herdr's `worktree.create` and
-`worktree.open` take none, so for a `--worktree` task pastor splits a pane off
-the worktree's, with the env and the checkout as its directory, closes the
-pane without it, and starts the agent in the new one. A task without env keeps
-herdr's own pane either way.
+starting with a digit). pastor sets the env on the task's pane, worktree
+tasks included (see [Internals](#internals)).
 
 The head checks a task's agent against pastor.toml when it queues it (for a
 task that is not pinned, the agent each machine of its flock would run), and
 `pastor task run` makes the head apply an edit of pastor.toml or flock.toml
 first, so a definition you have just added is the one its machine starts.
-
-`pastor machine move`, `pastor flock join` and `pastor flock leave` change the flocks of tasks
-dispatched after them; tasks already on the machine keep running there, and its connection stays up. A
-queued task pinned to a machine that has moved to another flock stays queued
-for its own flock, and the head logs a warning once.
 
 ### Models
 
@@ -1075,9 +1080,7 @@ item. In flock.toml, a flock's or a machine's unknown `model` fails the load
 `model: sonnet (from flock personal)`; `task list` has a MODEL column and
 `--json` a `model` field; `flock describe` and `machine describe` show their
 own `model`; task events carry `model`. The store keeps the name, and a retry
-settles the model's args again from pastor.toml as it stands. Since a head
-from before models would start the agent without its model, every command
-that can make it queue a task refuses one (`head_too_old`).
+settles the model's args again from pastor.toml as it stands.
 
 ### Permission profiles
 
@@ -1181,9 +1184,7 @@ it copies, and the copy queues last in it.
 `pastor task describe` prints the level and the layer that set it, such as
 `priority: high (from flock work)` (`task priority` when set by hand);
 `task list` has a PRIORITY column, and `--json` has `priority`,
-`priority_from` and `queue_pos`, the task's position. A head from before
-levels would queue the task at its own level without a word, so `task run
---priority` and `task priority` refuse one (`head_too_old`).
+`priority_from` and `queue_pos`, the task's position.
 
 ### Room on a machine
 
@@ -1239,7 +1240,7 @@ opencode or codex one, a blocked or done one is never paused.
 
 Pausing goes in this order: pastor presses `esc` in the task's pane, which
 interrupts Claude's turn, then closes the pane, which ends the agent. A
-worktree stays on disk: only `worktree.remove` deletes one. The task goes
+worktree stays on disk. The task goes
 `paused` (event `task.paused`), with no pane or workspace, and records when
 and for which task (`paused: ... for t-9` in `task describe`, `paused_at`
 and `paused_for` in its JSON).
@@ -1249,8 +1250,8 @@ the machine it was paused on, whatever its pin: `pastor queue` shows it
 there with `paused for t-9; machine pi-3 is full (2/2)`. When that machine is
 still in the task's flock and has room for it, and the flock is under its
 number there, a dispatch pass resumes it: the same steps as a
-dispatch, but a worktree task goes back to its own checkout (`worktree.open`
-on its branch), the agent starts with `--resume <session>` in place of a new
+dispatch, but a worktree task goes back to its own checkout on its branch,
+the agent starts with `--resume <session>` in place of a new
 `--session-id`, and its prompt is a line telling it that it was paused and
 to carry on; its own prompt is already in the conversation. The task goes
 `running` again, with `resumed:` in `task describe` (`resumed_at`). A resume
@@ -1270,9 +1271,7 @@ flock may make it critical); from `task priority`, which sets the flag with
 the level (`pastor task priority t-4 critical --preempt`) and drops it when
 given without; and in a job file whose `priority` is written below
 critical. A job's tasks keep `preempt` only when they settle at critical,
-however they get there. `task retry` keeps it. A head from before
-pausing would queue the task without it, so the CLI refuses to send it there
-(`head_too_old`).
+however they get there. `task retry` keeps it.
 
 #### An agent per kind
 
@@ -1440,11 +1439,8 @@ A retry settles the profile again from pastor.toml as it stands.
 develop (from flock work)`, and the task's `--json` has a `profile` field;
 `machine list` has a PROFILE column, `machine describe` a `profile` line with
 the machine's own profile (its `profile`, else its flock's, else
-`[defaults]`, as the unrestricted rule reads it), and `flock describe` the flock's own.
-Since a head from before profiles would start the agent without them, every
-command that can make it queue a task (`pastor task run`, `pastor task
-retry`, `pastor tick` without `--dry-run`, `pastor job run`) refuses one
-(`head_too_old`): restart `pastor serve` after an upgrade.
+`[defaults]`, as the unrestricted rule reads it), and `flock describe` the
+flock's own.
 
 ### The queue
 
@@ -1501,8 +1497,7 @@ prints `pos`, `of`, `priority_was` and the `task`. A task that is not queued
 or is being sent to a machine, or a `--before` or `--after` task that is not, is refused with `not_queued`,
 an unknown one with `task_not_found`, and an agent pastor started, as for
 `task priority`, with `agent_refused`; reading the queue is fine from
-anywhere. A head from before the queue refuses both as unreadable, so the
-CLI refuses one first (`head_too_old`).
+anywhere.
 
 ## Events
 
@@ -1516,15 +1511,14 @@ keeps printing as new ones are written. It reads the file, not the daemon, so
 it works with `pastor serve` down.
 
 With a remote head set (see [A head on another machine](#a-head-on-another-machine)
-below), `pastor events` asks the head instead, through `events_since`: it pages
+below), `pastor events` asks the head instead: it pages
 from the start of the head's log, 500 records at a time, and with `--follow`
 asks again every second. `--task` and `--json` work as they do here, and the
 output is the same, except that lines written before pastor numbered records
 are not shown. When records the command had not read yet were rotated out of
 the head's log (`gap: true`), it prints one line to stderr naming the missing
 numbers and carries on from the oldest record left; a first read of a log
-that has rotated says so too. It needs a head speaking protocol 4 or newer
-(`head_too_old` otherwise).
+that has rotated says so too.
 
 A record, which is also what connector event hooks get on stdin:
 
@@ -1594,14 +1588,8 @@ A record, which is also what connector event hooks get on stdin:
 Fields may be added; none will be renamed or removed. Unreadable lines (a
 torn write, a hand edit) are skipped.
 
-A client can read the log through the head by number: the IPC request
-`events_since` (`{"op":"events_since","after":N,"limit":L,"task":ID}`, head
-protocol 4 or newer) answers the records whose `seq` is past `N`, oldest
-first, at most `L`, only those about task `ID` if given, with `oldest`, the
-oldest number the two log files still hold, `newest`, the newest number they
-hold (whatever `N`, `L` and `ID`, so a limit of 0 asks only where the log
-ends), and `gap: true` when records after `N` were already rotated out of both.
-It is a read, so an agent may send it.
+A client can also read the log through the head by number; the request is
+under [Internals](#internals).
 
 ## Watch
 
@@ -1681,15 +1669,8 @@ events, tasks and jobs are that head's, and the connectors run here. The
 watcher only reads, so an agent pastor started may run it; through a bridge
 that limits an agent to its own tasks (`bridge --agent`) the head refuses the
 events, and the watcher stops with the head's error. So does one whose head
-predates `events_since`. A head that answers with any other error stops it
+is too old to hand out events by number. A head that answers with any other error stops it
 too; one that does not answer at all is `HEAD down`.
-
-Runtime errors print JSON on stderr with a stable `code` and exit 1; a
-malformed command line gets clap's plain usage text and exit 2.
-
-Each machine needs herdr 0.9 or newer (protocol 22 or newer) with its server
-running, and SSH access from the head without a passphrase prompt (a key in
-ssh-agent won't be there for a service; use a dedicated key or Tailscale SSH).
 
 ## Orchestrators
 
@@ -1922,9 +1903,7 @@ tasks appear in `pastor task list` in a table of their own above the others;
 `--json` keeps one array with `role`. With no head running, `list` and
 `describe` read the files and the state the head left, `enable`, `disable`
 and `note --name` edit them, and `run`, `start` and `stop` are refused
-(`no_head`). With a head on
-another machine, every command goes to it. The commands need a head of IPC
-protocol 23, and `start` and `stop` one of protocol 25 (`head_too_old`).
+(`no_head`). With a head on another machine, every command goes to it.
 
 What the head keeps per orchestrator lives in
 `~/.local/state/pastor/orchestrators/<name>/`: `state.json` (last run,
@@ -1947,7 +1926,14 @@ orchestrator runs again on the next tick.
 For a fleet you'll keep, see [the recommended setup](recommended-setup.md)
 first: which credentials each machine gets, and the settings that keep
 unattended agents moving. The README's Install section has the other ways to
-install pastor (`install.sh`, `cargo binstall`); from a checkout:
+install pastor (`install.sh`, `cargo binstall`).
+
+Each machine needs herdr 0.9 or newer with its server running. An `ssh`
+machine also needs SSH access from the head without a passphrase prompt (a
+key in ssh-agent won't be there for a service; use a dedicated key or
+Tailscale SSH); a `local` machine needs none, since the head is that
+machine, and a `command` machine needs whatever its own bridge program
+requires. From a checkout:
 
 ```bash
 make install                         # pastor into ~/.cargo/bin
@@ -2017,27 +2003,36 @@ with no repo, so the head does not answer it for later ones). A folder that
 cannot be made (a file in the way) leaves the task in the home. On a machine
 that cannot report its home, herdr still decides.
 
-`pastor task run` takes the prompt as its argument or, instead, `--prompt-file
-PATH`, and `--repo`, `--flock`, `--machine`, `--agent`, `--agent-arg`,
-`--model` (a name from `[models]`, see [Models](#models)), `--priority` (see
-[Priority and queue order](#priority-and-queue-order)), `--preempt` (see
-[Pausing a low task](#pausing-a-low-task)), `--summary` (see [Asking for
-one](#asking-for-one)), `--profile` (see
-[Permission profiles](#permission-profiles)), `--worktree`, `--branch` (with `--worktree`), `--tag` (repeatable),
-`--timeout`, `--place` (see [Where a task's pane goes](#where-a-tasks-pane-goes))
-and `--json`. `--agent-arg` hands one argument to the agent,
-through herdr's `agent.start`; repeat it for more, in order. It always takes the
-next word as its value, even one that starts with a dash, so
-`--agent-arg --model --agent-arg claude-opus-5-5` and
-`--agent-arg=--model --agent-arg=claude-opus-5-5` mean the same thing; the
-`=` form just reads more clearly. There is no single-string form: pastor would
-have to split it on spaces, and that breaks any argument that contains one. A
-job file's `agent_args` does the same for its tasks. When neither says
-anything, the machine's `agent_args` apply, then the flock's, then
-`[defaults] agent_args` in pastor.toml (see [A flock's or a machine's
-agent](#a-flocks-or-a-machines-agent)); a job file that sets `agent_args = []`
-opts out of all three. `pastor task describe t-1` prints the agent and
-args a task was started with.
+`pastor task run` takes the prompt as its argument or, instead,
+`--prompt-file PATH`, and these flags:
+
+| flag | what it does |
+|---|---|
+| `--repo` | where the agent works, a path on its machine (above) |
+| `--flock`, `--machine` | the flock the task goes to, or the machine it is pinned to (see [Flocks](#flocks)) |
+| `--agent`, `--agent-arg` | the agent and one argument for it (below) |
+| `--model` | a name from `[models]` (see [Models](#models)) |
+| `--priority` | its level (see [Priority and queue order](#priority-and-queue-order)) |
+| `--preempt` | may pause a low task (see [Pausing a low task](#pausing-a-low-task)) |
+| `--summary` | ask for a summary, require one, or not (see [Asking for one](#asking-for-one)) |
+| `--profile` | a permission profile (see [Permission profiles](#permission-profiles)) |
+| `--worktree`, `--branch` | a worktree of its own, on that branch; `--worktree` needs `--repo`, `--branch` needs `--worktree` |
+| `--tag` | only a machine with this tag takes it; repeat for more, and it needs them all |
+| `--timeout` | marks the task stale once it has run this long |
+| `--place` | where its pane goes (see [Where a task's pane goes](#where-a-tasks-pane-goes)) |
+| `--json` | JSON output |
+
+`--agent-arg` hands one argument to the agent; repeat it for more, in order.
+It always takes the next word as its value, even one that starts with a
+dash, so `--agent-arg --model --agent-arg claude-opus-5-5` and
+`--agent-arg=--model --agent-arg=claude-opus-5-5` mean the same thing. The
+`=` form reads better. There is no single-string form, since splitting on
+spaces breaks arguments that hold one. A job file's `agent_args` does the
+same for its tasks. When neither says anything, the machine's `agent_args`
+apply, then the flock's, then `[defaults] agent_args` in pastor.toml (see [A
+flock's or a machine's agent](#a-flocks-or-a-machines-agent)); a job file
+that sets `agent_args = []` opts out of all three. `pastor task describe
+t-1` prints the agent and args a task was started with.
 
 An agent of kind `claude` also gets `--session-id <uuid>`, after every other
 argument, with a new id per task. The task records it (`session:` in `task
@@ -2057,16 +2052,6 @@ is sent unchanged. A file that cannot be read (missing, a directory, not UTF-8)
 fails with `prompt_file_unreadable`, and one with nothing but whitespace with
 `prompt_file_empty`; in both cases nothing is dispatched.
 
-Without a real herdr, a fake one speaks the same protocol. It comes in the same
-two pieces the real thing does, because state has to outlive a single request:
-a server, and a bridge per request.
-
-```bash
-FAKE_HERDR_AUTO_DONE_MS=500 fake-herdr --listen /tmp/fake-herdr.sock &
-pastor machine add fake --command "fake-herdr --connect /tmp/fake-herdr.sock"
-pastor serve --foreground            # its log in this terminal; ctrl-c stops it
-```
-
 ### Reopening a finished task
 
 `pastor task attach t-N` on a task whose pane is still there lands in it, as
@@ -2074,7 +2059,7 @@ always. Once the task is `closed` or `failed`, pastor looks on the task's
 machine first: while herdr still lists the task's agent, attach goes to it.
 Otherwise, for a task that recorded a Claude session, it opens a new
 workspace on that machine, labelled `t-N-resume`, in the task's directory
-(its worktree, else its repo, else the directory dispatch recorded for it —
+(its worktree, else its repo, else the directory dispatch recorded for it:
 `~/pastor-tasks`, or the machine's home if that folder could not be made),
 with the env of the task's agent definition
 (so `CLAUDE_CONFIG_DIR` points at the same account's sessions), runs `claude
@@ -2112,9 +2097,7 @@ when you want to watch it. A `pastor serve` that a service manager started
 stays in the foreground without the flag, so a unit written before
 `--foreground` existed keeps working: pastor looks at the process that
 started it, and a `systemd` manager (the user one or pid 1), launchd on
-macOS, or any other pid 1 counts as a service. It does not go by
-`INVOCATION_ID`, which every process under a systemd unit inherits, a shell
-in a herdr pane started by `herdr.service` included.
+macOS, or any other pid 1 counts as a service.
 
 `pastor serve status` pings the socket and says whether a head (or a
 headless serve) runs here: its pid, its version, and whether it runs under a
@@ -2137,38 +2120,45 @@ launchd --stop`.
 ## Run under systemd
 
 `pastor setup systemd` installs `contrib/systemd/pastor.service` to
-`~/.config/systemd/user/`, shows what it will do, and only continues after you
-type `yes`. `--yes` (`-y`) skips the prompt; it is required when stdin is not a
-terminal (a script, a task, `ssh host pastor setup systemd --yes`), where setup
-fails at once rather than wait for an answer. With no action flag it runs `systemctl --user enable --now` on the
-unit. `--enable`, `--start`, `--enable --now`, `--enable --start` and `--stop`
-map to the same `systemctl --user` actions after the unit is written.
-`pastor setup systemd --herdr` does the same with `herdr.service` (the herdr
-server) and belongs on every machine in the flock. `pastor.service` runs
-`pastor serve --foreground`; a unit from before that flag, with a bare
-`pastor serve`, keeps its head in the foreground too (see [Run the
-head](#run-the-head)), but re-run setup to bring it up to date. Both units always restart
-(`Restart=always`, so a head killed by a stray signal comes back) and log to
-the journal (`journalctl --user -u pastor`); `systemctl --user stop` still
-stops one for good, since systemd does not restart after an explicit stop.
-Setup points `ExecStart`
-at the binary it finds (the running pastor, or `herdr` on PATH) and copies your
-shell's `PATH` into the unit, so `ssh`, `herdr` and the agents resolve under
-systemd the way they do in a terminal; re-run it after moving a binary.
-Entries anyone could plant a binary in are left out and named on stderr: an
-empty or relative entry (`.`, `node_modules/.bin`), a world-writable
-directory and one that does not exist, since someone else could create it
-later. `herdr` is looked up in the `PATH` the unit keeps, and setup fails
-if it is only in an entry left out. A value with a line break is refused, since it would start a new
-directive, and a `$` in the binary's path is written `$$`, since systemd
-expands it in `ExecStart`.
-`pastor.service` also gets the config, state and data dirs this run resolved,
-as absolute `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR`, so
-the head uses the same dirs as the shell that set it up, whether they came from
-an override, an XDG variable or the default. A unit
-that differs from what setup would write is kept as `<unit>.service.bak`, and a
-running service is not restarted, since restarting herdr stops its agents: run
-`systemctl --user restart pastor` (or `herdr`) yourself.
+`~/.config/systemd/user/`, shows what it will do, and only continues after
+you type `yes`. `--yes` (`-y`) skips the prompt; it is required when stdin is
+not a terminal (a script, a task, `ssh host pastor setup systemd --yes`),
+where setup fails at once rather than wait for an answer. With no action
+flag it runs `systemctl --user enable --now` on the unit. `--enable`,
+`--start`, `--enable --now`, `--enable --start` and `--stop` map to the same
+`systemctl --user` actions after the unit is written. `pastor setup systemd
+--herdr` does the same with `herdr.service` (the herdr server) and belongs on
+every machine in the flock.
+
+`pastor.service` runs `pastor serve --foreground`; a unit from before that
+flag, with a bare `pastor serve`, keeps its head in the foreground too (see
+[Run the head](#run-the-head)), but re-run setup to bring it up to date.
+Both units always restart (`Restart=always`, so a head killed by a stray
+signal comes back) and log to the journal (`journalctl --user -u pastor`);
+`systemctl --user stop` still stops one for good, since systemd does not
+restart after an explicit stop.
+
+Setup points `ExecStart` at the binary it finds (the running pastor, or
+`herdr` on PATH) and copies your shell's `PATH` into the unit, so `ssh`,
+`herdr` and the agents resolve under systemd the way they do in a terminal;
+re-run it after moving a binary. Entries anyone could plant a binary in are
+left out and named on stderr: an empty or relative entry (`.`,
+`node_modules/.bin`), a world-writable directory and one that does not exist,
+since someone else could create it later. `herdr` is looked up in the `PATH`
+the unit keeps, and setup fails if it is only in an entry left out. A value
+with a line break is refused, since it would start a new directive, and a `$`
+in the binary's path is written `$$`, since systemd expands it in
+`ExecStart`.
+
+`pastor.service` also gets the config, state and data dirs this run
+resolved, as absolute `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and
+`PASTOR_DATA_DIR`, so the head uses the same dirs as the shell that set it
+up, whether they came from an override, an XDG variable or the default.
+
+A unit that differs from what setup would write is kept as
+`<unit>.service.bak`, and a running service is not restarted, since
+restarting herdr stops its agents: run `systemctl --user restart pastor` (or
+`herdr`) yourself.
 
 `pastor.service` runs with `NoNewPrivileges=yes`, `UMask=0077`,
 `LockPersonality=yes` and `RestrictRealtime=yes`: what works in a user unit
@@ -2296,12 +2286,11 @@ names must look like environment variables (`[A-Z_][A-Z0-9_]*`).
 
 `authors`, `homepage`, `repository` and `license` are for people reading
 `connector describe`; pastor shows them and checks nothing about them. They
-are new in 0.6.0. pastor 0.5.0 reads a manifest strictly and
-rejects these fields as unknown keys, naming the key; that can't be changed in
-a release already out. From 0.6.0 on, pastor checks
-`min_pastor_version` before the strict read, so a connector that adds fields a
-future pastor introduces, and raises its `min_pastor_version` to match, gets
-"needs pastor X or later" on an older one instead of an unknown key.
+need pastor 0.6.0 or later; 0.5.0 rejects them as unknown keys. From 0.6.0
+on, pastor checks `min_pastor_version` before the strict read, so a connector
+that adds fields a future pastor introduces, and raises its
+`min_pastor_version` to match, gets "needs pastor X or later" on an older one
+instead of an unknown key.
 
 ### Connector protocol
 
@@ -2581,8 +2570,7 @@ not retried.
 
 `[watch]` feeds [`pastor watch`](#watch) what the head cannot know, like the
 state of the pull requests the agents opened, without pastor itself calling
-`gh`. The table is `[watch]` rather than `[events]` because `[[events]]` is
-the hooks' array, and TOML cannot hold both under one name.
+`gh`.
 
 Each interval, every watcher that lists the connector runs `command` in the
 connector's directory with its environment and no job: the `.env` and its
@@ -2650,16 +2638,9 @@ It needs:
 `head set` sends one ping first and saves nothing if it fails:
 `head_unreachable` when ssh fails (the message carries ssh's stderr),
 `no_head` when nothing runs there, `head_too_old` when that pastor has no
-`bridge` or speaks an older protocol. Any command fails the same way later;
-it never falls back to this machine's files.
-
-Every request to a head, from the CLI or from a headless serve, is checked
-against the head's IPC protocol before it goes out: a request that carries
-something the head predates (a field it would drop without a word, or a
-request it does not know) is refused `head_too_old`, naming what the head
-lacks, and is not sent. The check uses one ping per head, kept for a minute,
-so a command pings once and a headless serve sees a restarted head within a
-minute. A request every head takes sends no ping for it.
+`bridge` or is older than this one (see [After an upgrade](#after-an-upgrade)).
+Any command fails the same way later; it never falls back to this machine's
+files.
 
 These commands go to a remote head: `task run|list|describe|read|retry|priority|close|prune|send|done`,
 `queue` and `queue move`, `machine list|add|remove|move|describe`, `flock list|add|join|leave|remove|describe|default|edit`,
@@ -2674,8 +2655,7 @@ They print and exit as they would on the head's own machine. The edits
 are the head's own requests, so the head checks and reloads them;
 `flock edit` and `config edit` fetch the head's file, open it here and send
 it back. `flock list`, `flock default show` and `profile` read the head's
-`flock.toml` and `pastor.toml` with the same request (IPC protocol 6 or
-later). `machine add|remove --herdr` still changes this machine's herdr
+`flock.toml` and `pastor.toml` with the same request. `machine add|remove --herdr` still changes this machine's herdr
 sidebar, which is where you look at the machines from.
 
 Local on purpose, as with no head set: `completions`, `setup`, `head`,
@@ -2683,8 +2663,7 @@ Local on purpose, as with no head set: `completions`, `setup`, `head`,
 (this machine's pastor.toml, which its headless serve reads), and
 `task attach` and `machine open`: they go to the machine directly, but ask
 the head for the task, its flock.toml and its pastor.toml instead of
-reading this machine's, so they need the head up and at IPC protocol 6 or
-later. The head's own machine, the local one in its
+reading this machine's, so they need the head up. The head's own machine, the local one in its
 flock.toml, is reached at the head's ssh destination.
 
 Only one command is refused with a remote head: `machine authorized-key` prints a
@@ -2701,22 +2680,23 @@ the head hands it, on this machine's herdr. It has no queue and never reads
 `flock.toml`.
 
 - The new items a job run finds (not seen here, within `max_tasks_per_run`)
-  go to the head together, in one `job_submit` request with the job's
-  `[dispatch]` table as written and its unrendered prompt. The head applies
+  go to the head together, in one request with the job's `[dispatch]` table
+  as written and its unrendered prompt. The head applies
   its own `[defaults]` to what the table leaves out, renders each item with
   the id it gives the task, checks its paths and the flock, and queues and
   dispatches the tasks under the job's name. The keys it queued, and those
   it had seen already (a run whose reply was lost), are marked seen here.
 - A head that does not answer fails the run with `head_unreachable`, a head
   too old for what the job's `[dispatch]` names (a model, a priority, a
-  profile, a label, `preempt`, `summary`, a description) with `head_too_old`, and a
-  head with a job file of that name with `job_name_taken`: each counts as
+  profile, a label, `preempt`, `summary`, a description) as in [After an
+  upgrade](#after-an-upgrade), and a head with a job file of that name with
+  `job_name_taken`: each counts as
   a failed run, backing the job off as a failing connector does, and no item
   is kept, so the next run asks the connector for them again. An item the
   head refuses for its paths is reported and skipped; one past its cap waits
   for the next run; any other refusal fails the run and holds the job's
   cursor, as a failed insert does.
-- Every tick it reads the head's events past its cursor (`EventsSince`) and
+- Every tick it reads the head's events past its cursor and
   hands them to this machine's hooks in order, saving the cursor after each.
   The first time it reaches the head it skips the head's history and starts
   from there. A hook with `only_own` hears only tasks of a job in this
@@ -2759,8 +2739,7 @@ counts it lost and its starting and running tasks go stale.
 `pastor setup systemd` (or `launchd`) installs it the same way: the unit
 runs `pastor serve --foreground`, which reads the head from `client.toml`.
 Without a service, `pastor serve` starts it in the background, and `pastor
-serve status` and `stop` work on it as on a head. The head
-needs IPC protocol 7 or later for `job_submit`.
+serve status` and `stop` work on it as on a head.
 
 ### Pull machines
 
@@ -2769,14 +2748,14 @@ run tasks: the head's flock.toml has it as `pull = true`, and its own
 headless serve asks the head for work. The head never connects to it and
 runs no actor for it; `machine list` shows its HOST as `pull`.
 
-- Each tick the headless serve sends `task_claim` to ask for more work, a
-  few tasks at most. The head decides how many from its own view of the
+- Each tick the headless serve asks the head for more work, a few tasks at
+  most. The head decides how many from its own view of the
   machine (`max_agents`, job slots, burst, flock room) and hands out the
   queued tasks pinned to it first, then, when it takes flock work, any task
   its flocks would place there now; each is `starting` on the machine before
   the reply. The serve runs them on this machine's
-  herdr with the same machine actor the head runs, and sends every change
-  back as `task_report`. The head needs IPC protocol 21 or later.
+  herdr with the same machine actor the head runs, and reports every change
+  back.
 - `task run --machine <name>` (or a job's `machine`) sends a task to a pull
   machine as to any other. There is no `task run` flag of its own for this.
 - A pull machine takes only the tasks pinned to it unless `[shepherd]
@@ -2974,8 +2953,7 @@ So:
   task), so these go through `pastor serve`: with no head, `job enable` and
   `job disable` from a task's pane are refused. Like the rest of the guard, a role is a guard
   against an agent's mistakes, not a boundary: an orchestrator runs as the
-  same user as pastor and can do anything that user can. `--role
-  orchestrator` needs a head of IPC protocol 12 (`head_too_old`).
+  same user as pastor and can do anything that user can.
 
 The head's user is the fleet's trust boundary. Anything that runs as that
 user on the head controls every machine in the flock file, because it can:
@@ -3086,12 +3064,6 @@ is none, whole and with its newlines. A task's also says where it came from:
 task's is always a string, the one it resolved to, with `description_from`
 beside it. `--wide` with `--json` changes nothing.
 
-`task run --description`, `flock add --description` and `machine add
---description` need a head of 0.7.0 or later; an older one would
-drop the line, so the CLI refuses it (`head_too_old`). The tasks table gains
-a `description` column (schema 11), added in place when the new pastor first
-opens the store.
-
 ## Describe and edit
 
 In the terminal pastor reads like kubectl: `list` shows many things, `describe`
@@ -3118,8 +3090,7 @@ runs and from the files and the store when not; a machine is then probed
 directly, as `machine list` does. `machine describe` and `flock describe` are
 built by the head itself, from the flock it last applied rather than
 `flock.toml` as it reads now, so a machine the head has not picked up yet is
-`unknown_machine`. These and the `trust` commands need a head from this
-release or later (`head_too_old` otherwise). The job's `connector` and `dispatch` are the
+`unknown_machine`. The job's `connector` and `dispatch` are the
 tables as written in its file. Recent events come from `events.jsonl`: a
 job's `job.*` events, and for a machine its `machine.*` events that carried
 an error and its `task.failed` ones, ten at most.
@@ -3147,13 +3118,12 @@ two pastor edits of one file never interleave.
 
 With a head running, `edit`, `job describe` and `job enable|disable` act on
 the head's files, not the caller's copies. The editor still runs here: the CLI
-fetches the head's file and a hash of it (`FileGet`), edits a temp copy, and
-sends the result back with that hash (`FilePut`). The head checks it with the
+fetches the head's file and a hash of it, edits a temp copy, and sends the
+result back with that hash. The head checks it with the
 same code as an edit with no head, against its own `[defaults]` and
 connectors, and refuses a stale hash (`edit_conflict`); an invalid edit comes
 back with the head's error and reopens the editor as above. An unchanged file
-sends nothing. A head from before these requests is refused
-(`head_too_old`): restart `pastor serve` after an upgrade.
+sends nothing.
 
 ## Files
 
@@ -3163,7 +3133,7 @@ sends nothing. A head from before these requests is refused
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (and an optional .env for its scripts)
 ~/.config/pastor/client.toml      this CLI's `[head]`, from `pastor head set`
-~/.local/state/pastor/pastor.db   tasks (schema 13, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role, description, preempt, paused_at, paused_for and resumed_at), task summaries, seen keys, job state, trusted repos, the last event seq
+~/.local/state/pastor/pastor.db   tasks, summaries, seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
 ~/.local/state/pastor/fleet.lock  held by a fleet edit with no head, and by `pastor serve` while it starts
@@ -3334,6 +3304,17 @@ make build            # debug build of both binaries; cargo run --bin pastor -- 
 `make check` is what a pull request has to pass. Nothing in the suite talks to
 a real herdr, so run `make smoke` on a fleet machine before trusting it there.
 
+To try pastor without herdr, run the fake one. It comes in the same two
+pieces the real thing does, a server and a bridge per request, because state
+has to outlive a single request. `make build` leaves it at
+`target/debug/fake-herdr`; `make install` does not install it, only `pastor`:
+
+```bash
+FAKE_HERDR_AUTO_DONE_MS=500 target/debug/fake-herdr --listen /tmp/fake-herdr.sock &
+pastor machine add fake --command "target/debug/fake-herdr --connect /tmp/fake-herdr.sock"
+pastor serve --foreground            # its log in this terminal; ctrl-c stops it
+```
+
 `make smoke-profiles` starts real agents: through the running head, a task
 under the `review` profile for each agent named (`CLAUDE` and `OPENCODE` take
 a machine from flock.toml, `CLAUDE_AGENT` and `OPENCODE_AGENT` another agent
@@ -3355,3 +3336,157 @@ answers with the tag's version (`serve status --json`, over ssh when `head
 show` names a remote head), since the head must run the candidate; `PASTOR`
 picks the CLI for both. The exit status is the result; the worktree is
 removed either way.
+
+## Internals
+
+What follows is how pastor does things, for someone working on it or
+debugging it. Nothing here is needed to use it.
+
+### Connections to herdr
+
+herdr answers one request per connection and then closes it, so pastor opens
+a connection per request, and how it opens one follows the machine's kind: a
+`local` machine dials herdr's unix socket directly; a `command` machine
+spawns its configured bridge program; an `ssh` machine runs `herdr --session
+<s> remote-api-bridge` over ssh, which pipes herdr's socket protocol over
+stdio. A pull machine's own headless serve reaches its herdr the same way,
+as whichever of those three kinds it is in its own flock.toml; the head
+never opens a connection to it at all (see [Pull
+machines](#pull-machines)). Every command pastor runs over ssh (this one,
+the probes, `task attach`) goes as `sh -c '<command>'`, so a remote login
+shell that is not POSIX, such as fish, only parses one quoted word; sh
+parses the rest. For the same reason a machine's `session` may not contain a
+backslash, and a repo path with one needs a POSIX login shell.
+
+For an `ssh` machine those connections are cheap because all of them share
+one multiplexed ssh master (`ControlMaster=auto`,
+`ControlPath=~/.local/state/pastor/ssh/<machine>-%C`, `ControlPersist=600`),
+so only the first one authenticates. A long machine name is shortened inside
+that socket name so it stays under the unix socket path limit; `%C` is what
+tells machines apart. A master lingers for up to 10 minutes after `pastor
+serve` exits; end one by hand with `ssh -O exit -o
+ControlPath=~/.local/state/pastor/ssh/<machine>-%C <target>`. A `local` or
+`command` machine pays no such per-connection cost: the socket dial or the
+spawned bridge is already as direct as it gets. Alongside the per-request
+connections, whatever their kind, each machine keeps one long-lived
+connection open for `events.subscribe`, the one thing herdr holds open.
+
+Each machine needs herdr protocol 22 or newer (herdr 0.9).
+
+### Starting an agent
+
+herdr's `agent.start` returns before the agent is up, so pastor waits for it
+to come up before it sends the prompt. herdr answers `agent.start` with
+`agent_pane_busy` while a new pane's shell is still starting, so pastor
+retries the start up to 5 times, 500ms apart, before it fails the task.
+`--agent-arg` reaches the agent through `agent.start`.
+
+pastor sets an agent definition's env when it creates the task's pane:
+`workspace.create` takes it directly. herdr's `worktree.create` and
+`worktree.open` take none, so for a `--worktree` task pastor splits a pane
+off the worktree's, with the env and the checkout as its directory, closes
+the pane without it, and starts the agent in the new one. A task without env
+keeps herdr's own pane either way.
+
+### When a task is done
+
+A task is done when its agent has gone idle (herdr's `idle` or `done`) after
+working on the prompt and stays idle for `settle`. pastor must have seen the
+agent `working` or `blocked` since the prompt went in, from an event or from
+`agent.list`; `unknown` does not count. herdr also counts each agent state
+change, and the count must have moved past its value when the prompt went in
+and not moved again during the window.
+
+An agent that went idle without pastor ever seeing it `working` or `blocked`
+(its whole working spell fell between two reconciles while the event was
+lost) stays `running` until its task goes `stale`: herdr's counter moves on
+`idle -> unknown -> idle` as well, so without the activity pastor cannot
+tell finished work from a flicker.
+
+### Worktrees
+
+The retry of a failed worktree task reopens its checkout with herdr's
+`worktree.open` instead of `worktree.create`, which git would refuse with
+"already exists". When `worktree.open` finds a workspace already showing the
+checkout, herdr answers that one, and the retry's pane is split off it. A
+paused worktree task resumes the same way, with `worktree.open` on its
+branch; pausing never deletes a worktree, since only `worktree.remove` does.
+
+Removing a worktree (`--remove-worktree`, or auto-close of a clean one)
+closes the task's pane, has herdr open a workspace on the checkout
+(`worktree.open`) and removes that with `worktree.remove`; when herdr refuses
+(uncommitted changes), the workspace it opened is closed again and the
+checkout stays. When a workspace already shows the checkout, herdr answers
+that one, and removing the checkout would close it, which is why pastor
+keeps such a checkout.
+
+### The socket and its requests
+
+The CLI and the head speak newline-delimited JSON over `pastor.sock`; each
+response is `{"kind": ..., "data": ...}`.
+
+`job_submit` is how a job on another machine hands its items to the head. It
+carries the job's name, its `[dispatch]` table, its prompt and the items
+(each with its `key`). The head checks the table as it would a job file's
+(`invalid_dispatch` with the same error), and queues each item with the same
+rendering, path checks and `max_tasks_per_run` cap as its own jobs. It
+answers the tasks queued, the keys skipped as seen, and each refused item
+with its reason (`max_tasks_per_run` for those past the cap; they stay
+unseen). A name the head has a job file for is `job_name_taken`; submitters
+of one name share its seen keys.
+
+`events_since` reads the log through the head by number:
+`{"op":"events_since","after":N,"limit":L,"task":ID}` answers the records
+whose `seq` is past `N`, oldest first, at most `L`, only those about task
+`ID` if given, with `oldest`, the oldest number the two log files still
+hold, `newest`, the newest number they hold (whatever `N`, `L` and `ID`, so a
+limit of 0 asks only where the log ends), and `gap: true` when records after
+`N` were already rotated out of both. It is a read, so an agent may send it.
+`pastor events` and `pastor watch` with a remote head, and a headless serve's
+hooks, read the head's events with it.
+
+A pull machine's headless serve asks for work with `task_claim` and sends
+every change back as `task_report`. `edit` and `job enable|disable` with a
+head running fetch the head's file with `FileGet` and send it back with
+`FilePut`.
+
+### Protocol numbers
+
+A CLI refuses a head below the IPC protocol a request needs
+(`head_too_old`). The numbers:
+
+| request | head protocol |
+|---|---|
+| `events` from another machine, `events_since` | 4 |
+| reading the head's `flock.toml` and `pastor.toml` (`flock list`, `flock default show`, `profile`, and `task attach` and `machine open` with a remote head) | 6 |
+| `job_submit` | 7 |
+| `task run --role orchestrator` | 12 |
+| `task done --summary`, `task describe --all-summaries` | 17 |
+| `task run --summary`, and a headless serve forwarding a job with `summary` | 20 |
+| `task_claim` and `task_report` | 21 |
+| `flock join`, `flock leave` and `flock add` with machines | 22 |
+| `orchestrator` commands | 23 |
+| `orchestrator start` and `stop` | 25 |
+| a flock's share and max in flock.toml | 26 |
+
+`task run --description`, `flock add --description` and `machine add
+--description` need a head of 0.7.0 or later.
+
+A head started from a pastor before flocks would ignore `--flock` and read
+`flock.toml` as one flock, so while flocks are in play every command that
+talks to or reloads the head asks its protocol first and refuses an old one.
+Flocks are in play when the command takes `--flock`, edits `flock.toml`
+(`flock add|join|leave|default|remove`, `machine add|remove|move`), or
+`flock.toml` declares named flocks, since then no `--flock` means the
+default flock rather than every machine. A head that is listening but does
+not answer is refused whether flocks are in play or not
+(`head_unresponsive`); only a head that is not running at all is passed by.
+
+### The store
+
+`pastor.db` is at schema 13. Its tasks table has, among others, `retry_of`,
+`flock`, `trust_sent`, `activity_seen`, `ended`, `priority`,
+`priority_from`, `queue_pos`, `role`, `description` (since schema 11),
+`preempt`, `paused_at`, `paused_for` and `resumed_at`. Summaries are in the
+`task_summaries` table (schema 13). A new pastor adds what it needs in place
+when it first opens an older store.
