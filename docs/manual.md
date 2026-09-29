@@ -1558,11 +1558,13 @@ A task that moved stays on its new model when the old one resets; only new
 tasks start on the first choice again. A limit on the new model is handled
 the same way, with the rest of the list; past its end the task goes back to
 the first model before it that is free. When no other model of its list is
-free, or none of them runs on its machine, it waits: `task.waiting` with
-`why: all_exhausted` (or `no_fallback`), until the earliest reset among all
-the models of its list. At that time it starts on the first model of its
-list that is free: its own session when that is the model it stopped on,
-the handover above otherwise.
+free, it waits: `task.waiting` with `why: all_exhausted`, until the earliest
+reset among all the models of its list. At that time it starts on the first
+model of its list that is free: its own session when that is the model it
+stopped on, the handover above otherwise. When no other model of its list
+runs on its machine, it waits on its own model as a task with no list does:
+`why: no_fallback` with the account and model, until that model's reset,
+and it resumes on it.
 
 `waiting` is not `paused`: they share the closing and the resuming, not the
 meaning. A paused task goes first among the `low` tasks when a slot frees;

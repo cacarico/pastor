@@ -1832,7 +1832,6 @@ impl Fleet {
         let mut runnable = false;
         for model in after.iter().chain(before) {
             if *model == current {
-                runnable = true;
                 // Its own model just stopped on the limit: a move does not
                 // go back to it before `waiting_until`.
                 if then != NextRound::Switch && own.is_empty() {
@@ -1854,13 +1853,18 @@ impl Fleet {
         if then != NextRound::Switch {
             return Wake::Hold;
         }
+        // Its own model does not make it `runnable`: that is always in the
+        // list. With no other model this machine can run, it waits on its
+        // own, as a task with no list does.
+        if !runnable {
+            return Wake::Wait {
+                why: "no_fallback",
+                held: own,
+            };
+        }
         hold(own);
         Wake::Wait {
-            why: if runnable {
-                "all_exhausted"
-            } else {
-                "no_fallback"
-            },
+            why: "all_exhausted",
             held,
         }
     }
@@ -1944,7 +1948,10 @@ impl Fleet {
     /// Keep waiting `task` until the earliest of `held`, the limits on
     /// every model it may run: no other one was free
     /// (`Wake::Wait`). At that time it starts on the first of its models
-    /// that is free. Emits `task.waiting`.
+    /// that is free. With `no_fallback` it has no other model here: it
+    /// waits on its own and resumes on it, and `task.waiting` names that
+    /// account and model as a wait with no list does. Emits
+    /// `task.waiting`.
     fn wait_longer(
         &self,
         task: &Task,
@@ -1965,27 +1972,39 @@ impl Fleet {
             .min()
             .or(fresh.spec.rounds.stop.as_ref().map(|s| s.until))
             .unwrap_or(now);
+        let own = why == "no_fallback";
         fresh.waiting_until = Some(until);
         if let Some(stop) = fresh.spec.rounds.stop.as_mut() {
-            stop.then = crate::task::NextRound::First;
+            stop.then = if own {
+                crate::task::NextRound::Own
+            } else {
+                crate::task::NextRound::First
+            };
         }
         self.store.update_task(&mut fresh)?;
         tracing::info!(task = %task.display_id(), machine, why, %until, "waiting for a usage limit to reset");
-        let models: Vec<_> = held
-            .iter()
-            .map(|l| serde_json::json!({ "account": l.account, "model": l.model, "until": l.retry_at }))
-            .collect();
-        self.emit(
-            "task.waiting",
-            machine,
-            Some(&fresh),
-            Some(serde_json::json!({
+        let shown = format!("waiting {}", crate::limit::local_time(until, now));
+        let detail = if own {
+            serde_json::json!({
+                "why": why,
+                "account": held.first().map(|l| &l.account),
+                "model": fresh.model(),
+                "until": until,
+                "shown": shown,
+            })
+        } else {
+            let models: Vec<_> = held
+                .iter()
+                .map(|l| serde_json::json!({ "account": l.account, "model": l.model, "until": l.retry_at }))
+                .collect();
+            serde_json::json!({
                 "why": why,
                 "until": until,
                 "models": models,
-                "shown": format!("waiting {}", crate::limit::local_time(until, now)),
-            })),
-        );
+                "shown": shown,
+            })
+        };
+        self.emit("task.waiting", machine, Some(&fresh), Some(detail));
         Ok(())
     }
 
@@ -3091,9 +3110,10 @@ enum Wake {
     Own,
     /// It goes on under another model, its spec settled for it.
     Switch(Box<crate::task::DispatchSpec>),
-    /// It was to move on, and no other model of its list is free or runs
-    /// on its machine: it waits for the earliest of `held` (`why` is
-    /// `all_exhausted` or `no_fallback`).
+    /// It was to move on, and no other model of its list is free: it
+    /// waits for the earliest of `held` (`all_exhausted`); or none runs on
+    /// its machine: it waits on its own model, `held` its limits
+    /// (`no_fallback`).
     Wait {
         why: &'static str,
         held: Vec<AccountLimit>,
@@ -7977,6 +7997,63 @@ mod tests {
         let back = d.store.get_task(t.id).unwrap().unwrap();
         assert_ne!(back.state, TaskState::Waiting, "{:?}", back.error);
         assert_eq!(back.model(), Some("opus"));
+    }
+
+    /// A task whose list has no other model its machine can run (pi has
+    /// no codex agent for gpt) waits on its own model, as a task with no
+    /// list does: `no_fallback`, with its account and model, until its
+    /// own reset, and it resumes on that model.
+    #[tokio::test]
+    async fn a_task_with_no_fallback_its_machine_runs_waits_on_its_own_model() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let mut events = d.subscribe();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("opus"), Some(&["sonnet"]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        let now = chrono::Utc::now();
+        let mut row = seen_limit(&d, "pi", Some("opus"));
+        row.retry_at = now + chrono::Duration::minutes(40);
+        row.until = Some(row.retry_at);
+        d.fleet().record_limit(&row).unwrap();
+        let mut t = d.store.get_task(t.id).unwrap().unwrap();
+        t.state = TaskState::Waiting;
+        t.pane_id = None;
+        t.waiting_until = Some(now);
+        t.spec.agent_source.as_mut().unwrap().fallback = vec!["gpt".into()];
+        t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
+            agent: t.spec.agent.clone(),
+            model: Some("opus".into()),
+            why: "limit".into(),
+            line: "You've hit your session limit".into(),
+            until: now + chrono::Duration::hours(1),
+            tail: String::new(),
+            then: crate::task::NextRound::Switch,
+            waited: None,
+            handover: None,
+        }));
+        d.store.update_task(&mut t).unwrap();
+        d.fleet().dispatch_queued().await;
+        let back = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Waiting);
+        let opus = d.store.limits().unwrap()[0].retry_at;
+        assert_eq!(back.waiting_until, Some(opus));
+        assert_eq!(back.model(), Some("opus"));
+        assert_eq!(
+            back.spec.rounds.stop.as_ref().map(|s| s.then),
+            Some(crate::task::NextRound::Own)
+        );
+        let waiting = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|e| e.kind == "task.waiting")
+            .and_then(|e| e.detail)
+            .unwrap();
+        assert_eq!(waiting["why"], "no_fallback");
+        assert_eq!(waiting["account"], "me");
+        assert_eq!(waiting["model"], "opus");
+        assert_eq!(waiting["until"], serde_json::json!(opus));
+        assert!(waiting.get("models").is_none(), "{waiting}");
     }
 
     /// Tasks on pi that wait for a limit, each until `in_mins` from now,

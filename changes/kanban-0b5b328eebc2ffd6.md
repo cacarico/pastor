@@ -5,7 +5,8 @@
   worktree and branch, as a new round of the same task: in the same Claude
   session when the new model runs on the same login, else from its prompt
   with the end of the last agent's pane. It waits instead when the reset is
-  within `[limits] wait_under`, or when no other model of its list is free.
+  within `[limits] wait_under`, or when no other model of its list is free
+  (`all_exhausted`) or runs on its machine (`no_fallback`, on its own model).
   `task.agent_switched` says so, and `task describe` lists the rounds and why
   a task waited when it could have moved on.
 
