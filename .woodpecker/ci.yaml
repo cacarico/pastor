@@ -5,14 +5,17 @@
 # 4 cores and 8GB at once, per the spec's caution for this phase.
 #
 # check runs as a non-root user, not the step's default root, and this is
-# not cosmetic: several tests assert that an ancestor directory owned by
-# someone else, or world-writable, is refused (create_private_dir_*), and
-# others exercise git worktree/checkout behavior. Running as root broke
-# both categories for real on this cluster (confirmed): the app code's own
-# "root-owned means trusted" logic and git's own root-vs-owner assumptions
-# both only diverge from the GitHub Actions runner (a normal user) when
-# the whole test process is uid 0. A `builder` user, owning the checkout,
-# matches the runner's user model and is what actually goes green.
+# not cosmetic: create_private_dir_refuses_an_unsafe_ancestor asserts that
+# a world-writable ancestor owned by someone other than the caller is
+# refused; the app code trusts a root-owned ancestor unconditionally, which
+# only ever matches when the test process itself is root. Confirmed on a
+# real run: this test (and one unrelated 120s-timeout test, likely just
+# resource contention) failed as root and passed as `builder`.
+#
+# git is installed explicitly: two herdr::transport tests shell out to a
+# real git directly (init a throwaway repo, worktree add/remove) and were
+# failing with ENOENT, not a permissions issue — this image has no git by
+# default, and nothing else in `make check` happened to need it.
 #
 # test-ssh: the GitHub job needs sudo to install and run its own sshd,
 # because the runner isn't root; installing openssh-server needs root
@@ -75,7 +78,7 @@ steps:
       CARGO_TERM_COLOR: always
     commands:
       - apt-get update -qq
-      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev openssh-server make
+      - apt-get install -qq -y --no-install-recommends pkg-config libsqlite3-dev openssh-server make git
       - rustup component add rustfmt clippy
       - useradd --create-home --shell /bin/bash builder
       - mkdir -p /run/sshd
