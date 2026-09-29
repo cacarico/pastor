@@ -52,6 +52,35 @@ footer, below the input prompt, says `1 shell still running` (or `N
 shells`), the task stays `running` and pastor looks again after each settle
 window.
 
+An agent that is not Claude (agy, Codex, opencode) is done only when it says
+so with `pastor task done`. herdr reads agy idle through a long thinking
+pause and while it waits on a command it started, exactly as at the end of
+its turn, and its pane draws no `●` messages to read. So such a task that
+goes idle after working without `task done` goes `blocked`, with `idle
+without task done: <the pane's last lines>` as its error and `task.blocked`
+carrying `{"why": "idle_without_task_done", "tail": ...}`; its pane is not
+closed, it goes back to `running` when the agent works again, and it is
+`done` once the agent runs `task done`. The same read takes agy's
+permission prompts (`Requesting permission for:`, `Run this command?`) as a
+question, `agent asked: ...`, and its footer's `· 1 task` (or `N tasks`), a
+command of its own still going, keeps the task `running` as a background
+shell does. A task whose `summary` is `off` was never asked for `task done`
+and ends on the idle, as a Claude task does.
+
+A done task's pane goes after `close_done_after`, 5s by default, at the
+first reconcile past it: a task called done while its agent still waited
+on a command was closed some 6s later (t-817). That gap is the grace
+working as meant; the fault was the `done`, which the rule above no longer
+gives such an agent.
+
+Codex asks whether to trust a folder it has not seen, and herdr reads that
+dialog idle and ready, not blocked, so a prompt sent then would go into it.
+Before it sends a prompt to an agent that is not Claude, pastor reads its
+pane for Codex's dialog (`Do you trust the contents of this directory`) or
+the agent's own `trust_marker`; while one shows, the task is `blocked` with
+its prompt held, and the prompt goes in a settle window after someone
+answers.
+
 An agent whose process exits while it sits idle between turns (someone typed
 `/exit` after the work) leaves its task `done`; one that exits while
 starting, blocked or working fails it with "agent process exited".

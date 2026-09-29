@@ -15,9 +15,12 @@
 #
 # Each task runs under `review` and is asked to read, then to write a file it
 # must be refused. It passes when it ends `done` without ever going
-# `blocked`. The pane's last lines are printed either way, for the pull
-# request and for a person to see the write was refused (the prompt is on
-# screen too, so its words cannot be grepped for); the task is closed after.
+# `blocked`. It runs with `--summary off`, so it ends on its agent's idle: an
+# agent that is not Claude and was asked for `pastor task done` goes
+# `blocked` on an idle without one, and this checks the profile, not that.
+# The pane's last lines are printed either way, for the pull request and for
+# a person to see the write was refused (the prompt is on screen too, so its
+# words cannot be grepped for); the task is closed after.
 set -u
 
 PASTOR=${PASTOR:-pastor}
@@ -53,7 +56,7 @@ look for another way. Finish with one line: the commit subject, and \
 WRITE REFUSED or WRITE DONE. Do not ask anything."
     echo "== $agent on $machine, profile $PROFILE"
     out=$("$PASTOR" task run --json --agent "$agent" --machine "$machine" \
-        --repo "$REPO" --profile "$PROFILE" --timeout 15m "$prompt") || {
+        --repo "$REPO" --profile "$PROFILE" --summary off --timeout 15m "$prompt") || {
         echo "FAIL $agent: task run refused" >&2
         failed=1
         return

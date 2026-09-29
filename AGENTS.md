@@ -51,6 +51,13 @@ down here because getting them wrong cost a day.
   Claude picks the turn up when the shell ends. The same pane read
   (`task::background_shell_running`) keeps such a task pending and running,
   and looks again after the next settle window.
+- herdr reads agy idle in a long thinking pause and while it waits on a
+  command it started, and Codex idle and ready at its folder-trust dialog.
+  So a task whose agent is not Claude is done only on its `pastor task done`
+  (`PaneEnd::NotEnded` blocks it otherwise, unless its `summary` is `off`),
+  agy's `· N task` footer keeps it running (`task::tasks_running`), and a
+  prompt to such an agent waits while its pane shows a startup question
+  (`Agents::startup_markers`).
 - A herdr error reply is an API error with a code, never a dead connection.
   Only EOF before a reply, spawn failure or a non-zero exit with no reply are
   transport failures, and only those make a machine `lost`.

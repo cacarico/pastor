@@ -596,6 +596,7 @@ async fn dispatch_steps(
         session,
         &pane_id,
         &prompt,
+        agents,
         ready_timeout,
     )
     .await
@@ -611,6 +612,7 @@ async fn finish_dispatch(
     session: Option<String>,
     pane_id: &str,
     prompt: &str,
+    agents: &Agents,
     ready_timeout: Duration,
 ) -> Result<DispatchOutcome, DispatchError> {
     // herdr's `agent.start` returns as soon as it has launched the agent in the
@@ -620,7 +622,9 @@ async fn finish_dispatch(
     start_agent(conn, name, &launch.kind, &launch.args, pane_id).await?;
     task.spec.session_id = session;
 
-    let (outcome, prompted) = prompt_when_ready(conn, task, name, prompt, ready_timeout).await?;
+    let hold = agents.startup_markers(&task.spec.agent);
+    let (outcome, prompted) =
+        prompt_when_ready(conn, task, name, prompt, &hold, ready_timeout).await?;
     // The baseline a completion must move past, and whether the agent was
     // already at work when the prompt went in; see
     // `task::completed_since_prompt`.
@@ -1016,12 +1020,16 @@ async fn check_repo_exists(
 /// `agent.list`: gone means failed now, present-but-`unknown` means wait.
 /// Present-and-`blocked` is a third case, checked before either: herdr answers
 /// that with `agent_blocked`, not `agent_not_ready`, and dispatch returns
-/// `Blocked` without prompting or waiting.
+/// `Blocked` without prompting or waiting. So is an agent whose pane shows
+/// one of `hold` (`Agents::startup_markers`): a startup question herdr reads
+/// idle and ready (Codex's folder trust), which a prompt would answer and
+/// be lost in.
 async fn prompt_when_ready(
     conn: &dyn Connector,
     task: &Task,
     name: &str,
     prompt: &str,
+    hold: &[String],
     ready_timeout: Duration,
 ) -> Result<(DispatchOutcome, Option<AgentInfo>), DispatchError> {
     let machine = task.machine.as_deref().unwrap_or("that machine");
@@ -1058,6 +1066,13 @@ async fn prompt_when_ready(
         if agent.launch_pending {
             // still launching: fall through to the wait below
         } else if can_prompt {
+            if !hold.is_empty() {
+                // A pane that cannot be read is prompted as before.
+                let screen = conn.agent_read(name, 100).await.unwrap_or_default();
+                if crate::config::shows_startup_question(&screen, hold) {
+                    return Ok((DispatchOutcome::Blocked, None));
+                }
+            }
             match conn.agent_prompt(name, prompt).await {
                 // The reply carries the agent's `state_change_seq` and status
                 // as the prompt went in.

@@ -148,6 +148,9 @@ struct State {
     trust_screen: String,
     /// pane id -> when its trust question was answered.
     trust_answered: HashMap<String, Instant>,
+    /// The trust question reads idle and ready, not `blocked` (Codex's, to
+    /// herdr): `agent.prompt` is accepted and lost until it is answered.
+    trust_idle: bool,
     /// How many of the next `pane.list` calls find their workspace gone
     /// (see `vanish_on_pane_list`), and whether it closes for real.
     pane_list_gone: u32,
@@ -482,12 +485,22 @@ impl FakeHerdr {
     /// pane itself, not through `pane.send_keys`: it goes idle, publishes
     /// that, and redraws for `trust_redraw` as after any trust answer.
     pub fn answer_trust_by_hand(&self, pane_id: &str) {
-        self.state
-            .lock()
-            .unwrap()
-            .trust_answered
-            .insert(pane_id.into(), Instant::now());
-        self.set_status(pane_id, AgentStatus::Idle);
+        let idle = {
+            let mut s = self.state.lock().unwrap();
+            s.trust_answered.insert(pane_id.into(), Instant::now());
+            s.trust_idle
+        };
+        // An idle trust question leaves the agent idle: nothing to publish.
+        if !idle {
+            self.set_status(pane_id, AgentStatus::Idle);
+        }
+    }
+
+    /// The trust question of agents started from now on reads idle and
+    /// ready, as herdr reads Codex's, instead of `blocked` (see
+    /// `State::trust_idle`).
+    pub fn set_trust_idle(&self, yes: bool) {
+        self.state.lock().unwrap().trust_idle = yes;
     }
 
     /// `agent.prompt` is accepted from now on, but the agent never starts
@@ -1039,7 +1052,7 @@ impl FakeHerdr {
                 }
                 s.started.insert(pane_id.clone(), Instant::now());
                 s.agents.insert(pane_id.clone(), info.clone());
-                if s.trust_prompt.is_some() {
+                if s.trust_prompt.is_some() && !s.trust_idle {
                     // Its first screen is the trust question, which herdr
                     // reports as `blocked`.
                     change_status(&mut s, &pane_id, AgentStatus::Blocked);
@@ -1075,7 +1088,10 @@ impl FakeHerdr {
                     .trust_answered
                     .get(&found.pane_id)
                     .is_some_and(|at| at.elapsed() < s.trust_redraw);
-                if s.ignore_prompts || redrawing {
+                let at_idle_trust = s.trust_idle
+                    && s.trust_prompt.is_some()
+                    && !s.trust_answered.contains_key(&found.pane_id);
+                if s.ignore_prompts || redrawing || at_idle_trust {
                     return Ok(json!({"type": "agent_prompted", "agent": found}));
                 }
                 let info = change_status(&mut s, &found.pane_id, AgentStatus::Working)
@@ -1140,9 +1156,10 @@ impl FakeHerdr {
                     PaneInput::Keys(keys)
                 };
                 let answered = matches!(&input, PaneInput::Keys(k) if s.trust_prompt.as_ref() == Some(k))
-                    && s.agents
-                        .get(&pane_id)
-                        .is_some_and(|a| a.agent_status == AgentStatus::Blocked);
+                    && s.agents.get(&pane_id).is_some_and(|a| {
+                        a.agent_status == AgentStatus::Blocked
+                            || (s.trust_idle && !s.trust_answered.contains_key(&pane_id))
+                    });
                 s.pane_input.entry(pane_id.clone()).or_default().push(input);
                 if answered {
                     s.trust_answered.insert(pane_id.clone(), Instant::now());
@@ -1165,7 +1182,7 @@ impl FakeHerdr {
                 // Still at its trust question: blocked, never answered.
                 let at_trust = found.is_some_and(|a| {
                     s.trust_prompt.is_some()
-                        && a.agent_status == AgentStatus::Blocked
+                        && (a.agent_status == AgentStatus::Blocked || s.trust_idle)
                         && !s.trust_answered.contains_key(&a.pane_id)
                 });
                 // A pane whose agent is gone is read by its id.
