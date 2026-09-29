@@ -635,15 +635,18 @@ fn note_file(paths: &Paths, name: &str) -> PathBuf {
     paths.orchestrator_state_dir(name).join("note")
 }
 
-/// The orchestrator's state; a missing or unreadable file is a fresh one.
-pub fn load_state(paths: &Paths, name: &str) -> State {
+/// The orchestrator's state; a missing file is a fresh one. A file that
+/// cannot be read or parsed is an error that holds its runs: starting afresh
+/// would forget a live agent (and start a second one) and a pending post
+/// script.
+pub fn load_state(paths: &Paths, name: &str) -> Result<State, String> {
     let path = state_file(paths, name);
     match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|err| {
-            tracing::warn!(orchestrator = name, %err, "state unreadable; starting afresh");
-            State::default()
-        }),
-        Err(_) => State::default(),
+        Ok(text) => {
+            serde_json::from_str(&text).map_err(|err| format!("parse {}: {err}", path.display()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
+        Err(err) => Err(format!("read {}: {err}", path.display())),
     }
 }
 
@@ -878,7 +881,10 @@ fn status_of(
     first_seen: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> OrchestratorStatus {
-    let state = load_state(paths, name);
+    let (state, state_error) = match load_state(paths, name) {
+        Ok(s) => (s, None),
+        Err(e) => (State::default(), Some(e)),
+    };
     let at_work = state
         .task
         .zip(store)
@@ -888,6 +894,7 @@ fn status_of(
     let session = state.session.as_ref();
     let label = match orch {
         None => "invalid",
+        Some(_) if state_error.is_some() => "held",
         Some(_) if session.is_some_and(|s| s.stopping_since.is_some()) => "stopping",
         Some(_) if session.is_some() && quota.is_some() => "waiting for quota",
         Some(_) if session.is_some() => "running",
@@ -918,7 +925,7 @@ fn status_of(
             Plan::Scheduled(s) => s.schedule.describe(),
             Plan::Session(s) => format!("hours {}-{}", s.hours.start, s.hours.stop),
         }),
-        error,
+        error: error.or(state_error),
         last_run_at: state.last_run_at,
         last_result: state.last_result.clone(),
         next_run,
@@ -934,7 +941,7 @@ fn describe_of(
     status: OrchestratorStatus,
     orch: Option<&Orchestrator>,
 ) -> OrchestratorDescription {
-    let state = load_state(paths, &status.name);
+    let state = load_state(paths, &status.name).unwrap_or_default();
     let name = status.name.clone();
     let events = crate::events::read(&paths.events_file(), None)
         .unwrap_or_default()
@@ -1040,6 +1047,9 @@ pub struct Runner {
     /// Held from counting working orchestrator agents to queueing one, so
     /// runs of different orchestrators cannot both see a free slot.
     admit: tokio::sync::Mutex<()>,
+    /// Each orchestrator's bad state file error, once `orchestrator.failed`
+    /// has told it.
+    bad_state: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Runner {
@@ -1057,6 +1067,7 @@ impl Runner {
             entries: Default::default(),
             locks: Default::default(),
             admit: Default::default(),
+            bad_state: Default::default(),
         })
     }
 
@@ -1196,7 +1207,7 @@ impl Runner {
             .collect();
         names
             .into_iter()
-            .find(|n| load_state(&self.paths, n).task == Some(id))
+            .find(|n| load_state(&self.paths, n).is_ok_and(|s| s.task == Some(id)))
     }
 
     /// One tick: re-read the files, run the post script of each agent that
@@ -1212,7 +1223,9 @@ impl Runner {
             .clone();
         for (name, e) in entries {
             let Some(orch) = e.orch else { continue };
-            let state = load_state(&self.paths, &name);
+            let Ok(state) = self.state_of(&name) else {
+                continue;
+            };
             if let Plan::Session(s) = &orch.plan {
                 let due = state.session.is_some()
                     || state.held_since.is_some()
@@ -1324,8 +1337,10 @@ impl Runner {
         let lock = self.lock_of(&orch.name);
         let _turn = lock.lock().await;
         let now = Utc::now();
-        let state = load_state(&self.paths, &orch.name);
-        if state.post_pending && !self.agent_works(&state) {
+        if let Ok(state) = self.state_of(&orch.name)
+            && state.post_pending
+            && !self.agent_works(&state)
+        {
             self.finish(orch, now).await;
         }
         self.run(orch, now).await
@@ -1336,10 +1351,36 @@ impl Runner {
     pub async fn finish_now(&self, orch: &Orchestrator) {
         let lock = self.lock_of(&orch.name);
         let _turn = lock.lock().await;
-        let state = load_state(&self.paths, &orch.name);
-        if state.post_pending && !self.agent_works(&state) {
+        if let Ok(state) = self.state_of(&orch.name)
+            && state.post_pending
+            && !self.agent_works(&state)
+        {
             self.finish(orch, Utc::now()).await;
         }
+    }
+
+    /// Orchestrator `name`'s state. A bad file is an error, told once by
+    /// `orchestrator.failed` until it changes or loads again.
+    fn state_of(&self, name: &str) -> Result<State, String> {
+        let loaded = load_state(&self.paths, name);
+        let mut bad = self.bad_state.lock().unwrap_or_else(|p| p.into_inner());
+        match &loaded {
+            Ok(_) => {
+                bad.remove(name);
+            }
+            Err(err) if bad.get(name) != Some(err) => {
+                tracing::error!(orchestrator = name, %err, "state file bad; runs held");
+                self.emit(
+                    "failed",
+                    name,
+                    None,
+                    serde_json::json!({"stage": "state", "error": err}),
+                );
+                bad.insert(name.to_string(), err.clone());
+            }
+            Err(_) => {}
+        }
+        loaded
     }
 
     fn agent_works(&self, state: &State) -> bool {
@@ -1372,8 +1413,6 @@ impl Runner {
         let Plan::Scheduled(sched) = &orch.plan else {
             unreachable!("only a scheduled orchestrator runs");
         };
-        let mut state = load_state(&self.paths, name);
-        state.last_run_at = Some(now);
         let mut run = RunRecord {
             at: now,
             outcome: RunOutcome::NoLines,
@@ -1382,6 +1421,16 @@ impl Runner {
             task: None,
             log: None,
         };
+        // Not saved: the bad file stays for someone to look at.
+        let mut state = match self.state_of(name) {
+            Ok(s) => s,
+            Err(err) => {
+                run.outcome = RunOutcome::Held;
+                run.detail = Some(format!("state: {err}"));
+                return run;
+            }
+        };
+        state.last_run_at = Some(now);
         if let Some(t) = state
             .task
             .and_then(|id| self.store.get_task(id).ok().flatten())
@@ -1637,7 +1686,7 @@ impl Runner {
             .collect();
         let idle_sessions = names
             .iter()
-            .map(|n| load_state(&self.paths, n))
+            .filter_map(|n| load_state(&self.paths, n).ok())
             .filter(|s| s.session.is_some() && !self.agent_works(s))
             .count();
         Ok(working_orchestrators(&self.store)? + idle_sessions)
@@ -1654,7 +1703,9 @@ impl Runner {
         let orch = self.session_of(name)?;
         let lock = self.lock_of(name);
         let _turn = lock.lock().await;
-        let mut state = load_state(&self.paths, name);
+        let mut state = self
+            .state_of(name)
+            .map_err(|err| ("orchestrator_held".to_string(), format!("state: {err}")))?;
         if let Some(run) = &state.session {
             return Ok(format!(
                 "orchestrator {name} already runs, until {}",
@@ -1699,7 +1750,9 @@ impl Runner {
         };
         let lock = self.lock_of(name);
         let _turn = lock.lock().await;
-        let mut state = load_state(&self.paths, name);
+        let mut state = self
+            .state_of(name)
+            .map_err(|err| ("orchestrator_held".to_string(), format!("state: {err}")))?;
         let Some(mut run) = state.session.clone() else {
             if sess.in_hours(now) {
                 let until = sess.next_stop(now);
@@ -2010,7 +2063,9 @@ impl Runner {
         let Plan::Session(sess) = &orch.plan else {
             return;
         };
-        let mut state = load_state(&self.paths, name);
+        let Ok(mut state) = self.state_of(name) else {
+            return;
+        };
         let before = state.clone();
         self.session_step_state(orch, sess, &mut state, now).await;
         if state != before {
@@ -2148,7 +2203,9 @@ impl Runner {
     /// the lines. A task closed before pastor saw it end runs nothing.
     async fn finish(&self, orch: &Orchestrator, now: DateTime<Utc>) {
         let name = orch.name.as_str();
-        let mut state = load_state(&self.paths, name);
+        let Ok(mut state) = self.state_of(name) else {
+            return;
+        };
         let Some(id) = state.task.filter(|_| state.post_pending) else {
             return;
         };
@@ -2535,7 +2592,7 @@ prompt = "You are the night orchestrator."
         }
 
         fn state(&self) -> State {
-            load_state(&self.paths, "merge")
+            load_state(&self.paths, "merge").unwrap()
         }
 
         fn kinds(&mut self) -> Vec<String> {
@@ -2735,6 +2792,77 @@ prompt = "You are the night orchestrator."
         )
         .unwrap();
         assert_eq!(runs.lines().count(), 1, "the pre script ran again");
+    }
+
+    /// A bad state file holds every run of `head`'s `merge`: `orchestrator.failed`
+    /// once, with `want` in its error, no agent, and the file left as it is.
+    async fn a_bad_state_file_holds_the_run(mut head: Head, want: &str) {
+        let file = head
+            .paths
+            .orchestrator_state_dir("merge")
+            .join("state.json");
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let tasks = head.tasks().len();
+        head.kinds();
+        let mut events = head.runner.events.subscribe();
+        for _ in 0..2 {
+            let run = head.run().await;
+            assert_eq!(run.outcome, RunOutcome::Held, "{run:?}");
+            let detail = run.detail.unwrap();
+            assert!(
+                detail.contains("state.json") && detail.contains(want),
+                "{detail}"
+            );
+            head.runner.pass(Utc::now());
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(head.kinds(), ["orchestrator.failed"], "once per error");
+        let failed = events.try_recv().unwrap().detail.unwrap();
+        assert_eq!(failed["stage"], "state");
+        assert!(
+            failed["error"].as_str().unwrap().contains("state.json"),
+            "{failed}"
+        );
+        assert_eq!(head.tasks().len(), tasks, "no second agent");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(head.runner.statuses(Utc::now())[0].state, "held");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_state_file_holds_the_run() {
+        let head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        assert_eq!(head.run().await.outcome, RunOutcome::Started);
+        let file = head
+            .paths
+            .orchestrator_state_dir("merge")
+            .join("state.json");
+        std::fs::write(&file, "{\"task\": ").unwrap();
+        a_bad_state_file_holds_the_run(head, "parse").await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_state_file_holds_the_run() {
+        let head = Head::new(&scheduled(), "echo 'PR #31'", "");
+        assert_eq!(head.run().await.outcome, RunOutcome::Started);
+        let file = head
+            .paths
+            .orchestrator_state_dir("merge")
+            .join("state.json");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&file).is_ok() {
+            return; // root reads it anyway
+        }
+        a_bad_state_file_holds_the_run(head, "read").await;
+    }
+
+    #[test]
+    fn a_missing_state_file_is_a_fresh_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        assert_eq!(load_state(&paths, "merge").unwrap(), State::default());
     }
 
     #[tokio::test]

@@ -1523,8 +1523,8 @@ A record, which is also what connector event hooks get on stdin:
   `until`; or a session's `restarts`, with `max` and `until`), `until` on
   `quota`, `after` (the agent it replaces) and `restarts` (in the last hour)
   on `restarted`, `reason` (`hours` or `hand`) on `stopping` and `stopped`
-  and `grace` on `stopping`, and `stage` (`pre`, `agent` or `post`) and
-  `error` on `failed`.
+  and `grace` on `stopping`, and `stage` (`pre`, `agent`, `post` or
+  `state`) and `error` on `failed`.
 - `summary`: on `task.done` and `task.failed`, how the round that just ended
   ended (see Task summaries): `round`, `outcome` (`done`, `partial`,
   `blocked`, `nothing to do`, `unknown`, or `no summary`), `text`, `source`
@@ -1852,8 +1852,9 @@ pastor orchestrator note --name merge "merged #31; #32 waits on review"
 
 `list` shows each file's state: `idle`, `running` (its agent works, or its
 session runs), `stopping` (a session in its grace), `held` (a session due but
-held by the limit), `waiting for quota`, `off` (disabled) or `invalid` (the
-file never parsed); a session's next run is its next start.
+held by the limit, or a bad `state.json`, below), `waiting for quota`, `off`
+(disabled) or `invalid` (the file never parsed); a session's next run is its
+next start.
 `run` ignores the schedule and `enabled`, waits for a run or post script of
 the same orchestrator already going, and is still skipped while the last
 agent works; it returns at once, and `describe` shows how it went. Orchestrator
@@ -1870,6 +1871,16 @@ What the head keeps per orchestrator lives in
 failures and backoff, its last agent, the lines it was started with, a quota
 wait, a running session with its restarts, the last ten runs), `note`,
 `scratch/` and `runs/`.
+
+A missing `state.json` is a fresh start. One that cannot be read or parsed
+holds the orchestrator instead, since starting afresh would forget a live
+agent (and start a second one beside it) and a pending post script: a
+scheduled run comes back `held` with the error as its detail, no post script
+or session step runs, and `start` and `stop` by hand answer
+`orchestrator_held`. `orchestrator.failed` (`stage: "state"`) says why once
+per distinct error, and `list` shows it `held` with the error in its `error`
+field. The head never saves over the bad file; fix or remove it and the
+orchestrator runs again on the next tick.
 
 ## Try it
 
