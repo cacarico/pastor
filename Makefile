@@ -1,7 +1,7 @@
 # Developer entry points. Every target maps to one cargo command so the
 # Makefile stays the single list of "what you can run here".
 
-.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh portability leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
+.PHONY: help build release check changelog changelog-check fmt lint test test-machine test-ssh portability coverage coverage-check coverage-run leaks smoke smoke-profiles smoke-rc mutants mutants-diff install install-completions completions cli-reference demo site site-serve links clean
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'
@@ -69,6 +69,30 @@ portability: ## cargo check for the musl and FreeBSD targets, as CI does
 	  echo "cargo-zigbuild check --locked --all-targets --target $$target"; \
 	  cargo-zigbuild check --locked --all-targets --target $$target || exit 1; \
 	done
+
+# Line coverage of the whole suite, instrumented by cargo-llvm-cov (see
+# CONTRIBUTING.md to install it). The pastor and fake-herdr processes that
+# tests/cli.rs spawns count too: cargo-llvm-cov sets LLVM_PROFILE_FILE, which
+# they inherit. The fakes themselves are left out of the numbers. A process
+# the suite kills mid-write leaves a corrupt profile, so a merge fails only
+# when no profile at all can be read (--failure-mode all).
+COVERAGE_IGNORE = --failure-mode all --ignore-filename-regex '(src/bin/fake-herdr\.rs|src/herdr/fake\.rs)$$'
+
+coverage-run:
+	cargo llvm-cov --workspace --all-targets --no-report
+
+coverage: coverage-run ## line coverage table, and target/lcov.info for editors
+	cargo llvm-cov report --lcov --output-path target/lcov.info $(COVERAGE_IGNORE)
+	cargo llvm-cov report $(COVERAGE_IGNORE)
+
+# coverage-floor holds one number, the total line coverage in percent that
+# the suite must not fall under. Raise it when coverage rises; lowering it
+# says so in the pull request.
+coverage-check: coverage-run ## fail when total line coverage is under coverage-floor
+	@floor=$$(cat coverage-floor); echo "$$floor" | grep -Eqx '[0-9]+(\.[0-9]+)?' \
+	  || { echo "make coverage-check: coverage-floor must hold one number, got '$$floor'" >&2; exit 1; }; \
+	cargo llvm-cov report --summary-only --fail-under-lines "$$floor" $(COVERAGE_IGNORE) \
+	  || { echo "make coverage-check: total line coverage is under the floor of $$floor% in coverage-floor" >&2; exit 1; }
 
 # The repository is public; CI runs this same scan. The rules are gitleaks'
 # own defaults at the pinned version, fetched outside the checkout; the scan

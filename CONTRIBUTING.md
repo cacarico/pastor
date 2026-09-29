@@ -41,6 +41,19 @@ CI runs too. It is not part of `make check`, so run it when a change touches
 platform code or a dependency. It needs `cargo-zigbuild`, `zig` and the Rust
 targets, and says in one line which of them to install.
 
+`make coverage` runs the suite under
+[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov), prints the line
+coverage per file and writes `target/lcov.info`; the `pastor` and
+`fake-herdr` processes the CLI tests spawn count too. `make coverage-check`
+fails when the total line coverage falls under the percentage in
+`coverage-floor`; raise that file when coverage rises. Both need the tool and
+the LLVM tools of the toolchain:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+```
+
 ## Pull requests
 
 A good pull request says:
