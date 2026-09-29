@@ -3530,4 +3530,29 @@ mod tests {
             );
         }
     }
+
+    /// Only `workspace_not_found` from `pane.list` means the workspace
+    /// closed and is worth a second look; any other failure fails the
+    /// task as it is, with no second `pane.list`.
+    #[tokio::test]
+    async fn a_pane_list_failure_other_than_not_found_is_not_retried() {
+        let fake = FakeHerdr::new();
+        fake.open_user_workspace("work", None);
+        fake.set_malformed_reply("pane.list");
+        let mut t = task(DispatchSpec {
+            place: Place::Pane("work".into()),
+            ..spec()
+        });
+        let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("closed while"), "{err}");
+        let made = methods(&fake);
+        assert_eq!(
+            made.iter().filter(|m| *m == "pane.list").count(),
+            1,
+            "{made:?}"
+        );
+        assert!(!made.iter().any(|m| m == "agent.start"), "{made:?}");
+    }
 }
