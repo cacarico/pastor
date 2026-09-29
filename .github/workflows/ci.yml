@@ -97,6 +97,20 @@ jobs:
           sudo mkdir -p /run/sshd
       - run: make test-ssh
 
+  # Cargo.toml's rust-version is a promise every other job, on stable, never
+  # tests; this job does, so a newer language feature fails here, not for
+  # whoever builds from source on that toolchain. A `cargo check` of every
+  # target is enough: MSRV breaks are compile errors.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1, 2026-09-12
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --locked --all-targets
+
   # The release builds are static musl binaries and a FreeBSD build is the
   # source-only route, so a change that only compiles against glibc on
   # x86_64 must fail here, on the pull request, not on the tag. This is a

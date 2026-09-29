@@ -970,9 +970,10 @@ async fn probe_head(
         )),
         HeadPing::Pong {
             version, protocol, ..
-        } if let Some((needed, why)) = need
-            && protocol < needed =>
-        {
+        } if need.is_some_and(|(needed, _)| protocol < needed) => {
+            // A plain guard, not `if let`: those are newer than the Rust
+            // 1.88 that Cargo.toml's rust-version promises (the msrv job).
+            let (_, why) = need.unwrap_or_default();
             Err(pastor::cli::CliError::err(
                 "head_too_old",
                 format!("the running pastor serve ({version}) {why}; restart it"),
