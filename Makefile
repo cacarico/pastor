@@ -67,11 +67,13 @@ leaks: ## scan the whole git history for secrets, as CI does
 # Mutation testing with cargo-mutants (`cargo install cargo-mutants`, or
 # mise's cargo:cargo-mutants); which files and what is skipped is in
 # .cargo/mutants.toml. Every mutant rebuilds and runs the whole suite, which
-# itself runs tests in parallel, so half the cores as jobs keeps the host
-# from thrashing into timeouts. A full run is hours: run it on an idle
-# machine, not on a pull request. Results land in mutants.out/;
-# mutants.out/missed.txt lists the survivors.
-MUTANTS_JOBS ?= $(shell n=$$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2); j=$$((n / 2)); [ $$j -ge 1 ] && echo $$j || echo 1)
+# itself runs tests in parallel, so a low job count keeps the host from
+# thrashing into timeouts even on a many-core machine (cargo-mutants itself
+# recommends starting at 2-3: https://mutants.rs/parallelism.html). A full
+# run is hours: run it on an idle machine, not on a pull request. Results
+# land in mutants.out/; mutants.out/missed.txt lists the survivors. Override
+# with `make mutants MUTANTS_JOBS=n` on a host that can take more.
+MUTANTS_JOBS ?= 2
 mutants: ## mutation test the transport, head, dispatch and config (hours)
 	cargo mutants --jobs $(MUTANTS_JOBS)
 
