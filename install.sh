@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs the pastor binary from a GitHub release into ~/.local/bin.
 #
-#   curl -fsSL https://raw.githubusercontent.com/cacarico/pastor/main/install.sh | sh
+#   curl -fsSL https://cacari.co/pastor/install.sh | sh
 #
 # PASTOR_VERSION      the version to install (default: the latest release)
 # PASTOR_INSTALL_DIR  where the binary goes (default: ~/.local/bin)

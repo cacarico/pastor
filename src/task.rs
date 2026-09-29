@@ -1782,6 +1782,110 @@ pub(crate) mod tests {
         );
     }
 
+    /// Every state crossed with every observation and every flag: the rules
+    /// that hold whatever branch `next_state` grows next. Sequences sit
+    /// before, at and past the baseline of 5, with no baseline too (a row
+    /// from a build that recorded none).
+    #[test]
+    fn next_state_keeps_its_invariants_over_the_whole_table() {
+        use TaskState::*;
+        let states = [
+            Queued, Starting, Running, Blocked, Done, Stale, Failed, Closed, Paused,
+        ];
+        let statuses = [
+            AgentStatus::Idle,
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+            AgentStatus::Done,
+            AgentStatus::Unknown,
+        ];
+        let seqs = [None, Some(4), Some(5), Some(6)];
+        let mut observations = vec![
+            Observed::PaneClosed,
+            Observed::PaneExited { agent_idle: false },
+            Observed::PaneExited { agent_idle: true },
+            Observed::DispatchStarting,
+        ];
+        for status in statuses {
+            for state_change_seq in seqs {
+                for completion_seq in seqs {
+                    observations.push(Observed::Status {
+                        status,
+                        state_change_seq,
+                        completion_seq,
+                    });
+                }
+            }
+        }
+        let mut checked = 0;
+        for state in states {
+            for baseline in [None, Some(5)] {
+                for flags in 0..8 {
+                    let t = Task {
+                        ended: flags & 1 != 0,
+                        activity_seen: flags & 2 != 0,
+                        prompt_pending: flags & 4 != 0,
+                        ..task(state, baseline)
+                    };
+                    for seen in &observations {
+                        let got = next_state(&t, seen);
+                        let case = format!(
+                            "{state:?} baseline {baseline:?} ended {} activity_seen {} \
+                             prompt_pending {} on {seen:?} gave {got:?}",
+                            t.ended, t.activity_seen, t.prompt_pending
+                        );
+                        assert_ne!(got, Some(state), "no-op must be None: {case}");
+                        if !state.is_open() {
+                            assert_eq!(got, None, "closed states never move: {case}");
+                        }
+                        if let Observed::Status { status, .. } = seen {
+                            if state == Done && t.ended {
+                                assert_eq!(got, None, "an ended done task stays: {case}");
+                            }
+                            if state == Stale {
+                                assert!(
+                                    !matches!(got, Some(Running | Blocked)),
+                                    "stale never goes back: {case}"
+                                );
+                            }
+                            if *status == AgentStatus::Unknown {
+                                assert_eq!(got, None, "unknown changes nothing: {case}");
+                            }
+                        }
+                        let completion_seq = match seen {
+                            Observed::Status { completion_seq, .. } => *completion_seq,
+                            _ => None,
+                        };
+                        if got == Some(Done) {
+                            assert!(
+                                t.activity_seen || completion_seq.is_some() || baseline.is_none(),
+                                "done needs activity or completion_seq: {case}"
+                            );
+                            assert!(!t.prompt_pending, "prompt_pending is never done: {case}");
+                            // A status only completes on a sequence strictly
+                            // past the baseline: the completion one when the
+                            // agent gave it, the state-change one otherwise.
+                            if let Observed::Status {
+                                state_change_seq,
+                                completion_seq,
+                                ..
+                            } = seen
+                            {
+                                let seq = completion_seq.or(*state_change_seq);
+                                assert!(
+                                    seq.is_some_and(|s| s > baseline.unwrap_or(0)),
+                                    "done needs a sequence past the baseline: {case}"
+                                );
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 9 * 2 * 8 * (4 + 5 * 4 * 4));
+    }
+
     #[test]
     fn ids() {
         assert_eq!(parse_task_id("t-12"), Some(12));

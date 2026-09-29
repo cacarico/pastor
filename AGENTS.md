@@ -69,13 +69,15 @@ down here because getting them wrong cost a day.
 
 - `make check` is the gate: fmt check, clippy with warnings as errors, the
   full suite. Run it before every commit. `make help` lists the rest.
-- CI (`.github/workflows/ci.yml`) runs `make check` and `make test-machine` on
-  every pull request that touches code (`paths:` skips docs-only diffs), or
-  by hand (`workflow_dispatch`). Push to main does not run `check`. Pull
-  requests land as merge commits, so the merge sha on main is never checked
-  itself: only each PR's head was. Two PRs that pass alone can still break
-  main together, and a direct push that skips a PR goes unchecked, unless
-  someone dispatches CI on main by hand.
+- CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine` and
+  `make test-ssh` (the CLI against a head over a real ssh, through a
+  throwaway sshd on localhost; `tests/real_ssh.rs`) on every pull request
+  that touches code (`paths:` skips docs-only diffs), or by hand
+  (`workflow_dispatch`). Push to main does not run `check`. Pull requests
+  land as merge commits, so the merge sha on main is never checked itself:
+  only each PR's head was. Two PRs that pass alone can still break main
+  together, and a direct push that skips a PR goes unchecked, unless someone
+  dispatches CI on main by hand.
 - The repository is public. `.github/workflows/gitleaks.yml` scans the whole
   history of every ref on every pull request, on push to `main`, and weekly,
   and `make leaks` runs the same scan here. It does not run on push to other
@@ -198,6 +200,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
 ~/.local/state/pastor/pastor.db   tasks (schema 13), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/fleet.lock  offline fleet edits and a starting `pastor serve` take turns on it
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/watch/<name>.json `pastor watch` cursors

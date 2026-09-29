@@ -261,4 +261,143 @@ mod tests {
         assert!(control_path_fits(Path::new(&fits)));
         assert!(!control_path_fits(Path::new(&format!("{fits}x"))));
     }
+
+    proptest::proptest! {
+        /// Whatever the target and ControlPath, the target is the word right
+        /// after the first `--`, and everything before `--` is the same as for
+        /// any other target: none of the options came from it.
+        #[test]
+        fn prop_target_sits_right_after_the_double_dash(
+            target in "[^-\\s\\p{C}][^\\s\\p{C}]*",
+            control_path in proptest::option::of("\\PC+"),
+            keepalive in proptest::prelude::any::<bool>(),
+            no_tty in proptest::prelude::any::<bool>(),
+            remote in ".*",
+        ) {
+            proptest::prop_assume!(crate::config::flock::ssh_target_problem(&target).is_none());
+            let control_path = control_path.map(PathBuf::from);
+            let make = |target| Ssh {
+                keepalive,
+                no_tty,
+                ..ssh(target, control_path.as_deref())
+            }
+            .args(&remote);
+            let args = make(&target);
+            let dash = args.iter().position(|a| a == "--").expect("a `--`");
+            proptest::prop_assert_eq!(&args[dash + 1], &target);
+            proptest::prop_assert_eq!(&args[dash + 2], &posix_command(&remote));
+            proptest::prop_assert_eq!(args.len(), dash + 3);
+            proptest::prop_assert_eq!(&args[..dash], &make("other")[..dash]);
+        }
+    }
+
+    /// What ssh makes of a ControlPath pastor built: `%%` is a literal `%` and
+    /// `%C` a 40-byte hash (stood in for by `h`s). Any other token is a path
+    /// pastor should never have built.
+    fn ssh_expand(path: &str) -> String {
+        let mut out = String::new();
+        let mut chars = path.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => out.push('%'),
+                Some('C') => out.push_str(&"h".repeat(EXPANDED_C)),
+                other => panic!("unexpected ssh token %{other:?} in {path:?}"),
+            }
+        }
+        out
+    }
+
+    /// One path component with the characters that trip expanders up: `%`,
+    /// spaces, both quotes, backslashes and non-ASCII. Never `/`, `.` or `..`.
+    fn awkward_component() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::strategy::Strategy;
+        "([%C \"'\\\\a-z._é中]|\\PC){1,12}".prop_filter("a plain component", |s| {
+            !s.contains('/') && s != "." && s != ".."
+        })
+    }
+
+    /// An absolute directory of one to three awkward components.
+    fn awkward_dir() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::strategy::Strategy;
+        proptest::collection::vec(awkward_component(), 1..4)
+            .prop_map(|parts| format!("/{}", parts.join("/")))
+    }
+
+    proptest::proptest! {
+        /// `expanded_len` is the length ssh's expansion really gives, for any
+        /// mix of escaped literal text and `%C` tokens.
+        #[test]
+        fn prop_expanded_len_is_the_expanded_length(
+            segments in proptest::collection::vec(
+                (awkward_component(), proptest::prelude::any::<bool>()),
+                0..6,
+            ),
+        ) {
+            let mut escaped = String::new();
+            let mut literal_len = 0;
+            let mut hashes = 0;
+            for (text, hash) in &segments {
+                escaped.push_str(&text.replace('%', "%%"));
+                literal_len += text.len();
+                if *hash {
+                    escaped.push_str("%C");
+                    hashes += 1;
+                }
+            }
+            let path = Path::new(&escaped);
+            proptest::prop_assert_eq!(expanded_len(path), ssh_expand(&escaped).len());
+            proptest::prop_assert_eq!(expanded_len(path), literal_len + hashes * EXPANDED_C);
+        }
+
+        /// Whatever `%` the state dir holds, ssh expands the ControlPath back
+        /// to the literal ssh dir, then the sanitised name and the hash.
+        #[test]
+        fn prop_control_path_expands_to_the_literal_ssh_dir(
+            state in awkward_dir(),
+            machine in "\\PC{0,16}",
+        ) {
+            let paths = Paths::new("/c", &state);
+            let control = paths.ssh_control_path(&machine);
+            let expanded = ssh_expand(&control.to_string_lossy());
+            let dir = format!("{}/", paths.ssh_dir().display());
+            proptest::prop_assert!(expanded.starts_with(&dir), "{expanded:?} under {dir:?}");
+            let file = &expanded[dir.len()..];
+            let name = file.strip_suffix(&format!("-{}", "h".repeat(EXPANDED_C)));
+            proptest::prop_assert!(name.is_some(), "{file:?}");
+            let name = name.unwrap();
+            proptest::prop_assert_eq!(name.chars().count(), machine.chars().count());
+            proptest::prop_assert!(
+                name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
+                "{name:?}"
+            );
+            proptest::prop_assert_eq!(expanded_len(&control), expanded.len());
+        }
+
+        /// `ensure_control_dir` makes the literal directory ssh will look in,
+        /// not the escaped one.
+        #[test]
+        fn prop_ensure_control_dir_makes_the_literal_dir(
+            parts in proptest::collection::vec(awkward_component(), 1..3),
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = parts.iter().fold(tmp.path().to_path_buf(), |p, c| p.join(c));
+            let paths = Paths::new(tmp.path().join("c"), &state);
+            let control = paths.ssh_control_path("pi-1");
+            ensure_control_dir(Some(&control)).unwrap();
+            proptest::prop_assert!(paths.ssh_dir().is_dir());
+            let expanded = PathBuf::from(ssh_expand(&control.to_string_lossy()));
+            let ssh_dir = paths.ssh_dir();
+            proptest::prop_assert_eq!(expanded.parent(), Some(ssh_dir.as_path()));
+            if parts.iter().any(|p| p.contains('%')) {
+                let escaped = parts
+                    .iter()
+                    .fold(tmp.path().to_path_buf(), |p, c| p.join(c.replace('%', "%%")));
+                proptest::prop_assert!(!escaped.exists(), "{escaped:?}");
+            }
+        }
+    }
 }

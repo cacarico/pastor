@@ -2,8 +2,10 @@
 //! real binary. The flock's one machine is a command that exits at once, so
 //! the head runs with it lost and nothing here talks to a herdr.
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, Instant};
+
+mod common;
 
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -32,10 +34,8 @@ impl Env {
     }
 
     fn cmd(&self, args: &[&str]) -> Output {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
-        c.env_remove("PASTOR_TASK")
-            .env_remove("PASTOR_HEAD")
-            .env("PASTOR_CONFIG_DIR", &self.config)
+        let mut c = common::pastor();
+        c.env("PASTOR_CONFIG_DIR", &self.config)
             .env("PASTOR_STATE_DIR", &self.state)
             .env("PASTOR_DATA_DIR", self.state.join("data"))
             .args(args);
@@ -164,9 +164,7 @@ fn serve_reports_why_a_background_head_did_not_start() {
 #[test]
 fn serve_foreground_keeps_the_head_in_the_terminal() {
     let env = Env::new();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pastor"))
-        .env_remove("PASTOR_TASK")
-        .env_remove("PASTOR_HEAD")
+    let mut child = common::pastor()
         .env("PASTOR_CONFIG_DIR", &env.config)
         .env("PASTOR_STATE_DIR", &env.state)
         .env("PASTOR_DATA_DIR", env.state.join("data"))

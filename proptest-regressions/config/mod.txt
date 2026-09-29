@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9078cb972d759ce45c2686c8f002b6bcaeb33d799ff756952e2e3ee9f4689a9d # shrinks to d_allow = [], d_deny = [], f_allow = [], f_deny = [], a_allow = ["Bash"], a_deny = ["Bash"], machine_agent = None, flock_agent = None, ask_agent = None, with_flock = false, with_machine = false

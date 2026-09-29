@@ -372,7 +372,7 @@ async fn dispatch_steps(
     {
         return Err(DispatchError::Task(format!(
             "{}: the opencode config on {} has permission rules of its own, which opencode would \
-             merge with profile {}'s; move them out of ~/.config/opencode, or run without a profile",
+             merge with profile {}'s; move them out of its opencode config, or run without a profile",
             crate::config::opencode::OPENCODE_PERMISSIONS_CONFLICT,
             task.machine.as_deref().unwrap_or("this machine"),
             spec.profile().unwrap_or_default(),
@@ -430,6 +430,19 @@ async fn dispatch_steps(
         return Err(HerdrError::Protocol("worktree = true needs repo".into()).into());
     }
     let host = host_workspace(conn, &spec, repo.as_deref(), task.machine.as_deref()).await?;
+    // A profiled opencode agent reads no project config, so the repo's
+    // instruction files go in by path, from where it works.
+    let opencode = agents.opencode_profile(&spec);
+    let pane_env = async |cwd: Option<&str>| -> Result<_, DispatchError> {
+        let mut env = env.clone();
+        if opencode && let Some(cwd) = cwd {
+            env.insert(
+                crate::config::opencode::CONFIG_CONTENT_ENV.into(),
+                crate::config::opencode::instructions_content(&instruction_files(conn, cwd).await?),
+            );
+        }
+        Ok(env)
+    };
     let dir = match repo.clone() {
         Some(repo) => Some(repo),
         None => no_repo_dir(conn, task.machine.as_deref()).await?,
@@ -462,7 +475,13 @@ async fn dispatch_steps(
                 Some(_) => task.spec.checkout.as_ref().map(|c| c.path.clone()),
                 None => dir.clone(),
             };
-            let pane = conn.pane_split(&host.pane_id, cwd.as_deref(), &env).await?;
+            let pane = conn
+                .pane_split(
+                    &host.pane_id,
+                    cwd.as_deref(),
+                    &pane_env(cwd.as_deref()).await?,
+                )
+                .await?;
             task.workspace_id = Some(host.workspace_id);
             task.pane_id = Some(pane.pane_id.clone());
             if let Some(created) = worktree.filter(|c| !c.already_open) {
@@ -492,7 +511,9 @@ async fn dispatch_steps(
             // checkout: its root pane is someone else's, and stays.
             let root = created.root_pane.pane_id;
             let cwd = task.spec.checkout.as_ref().map(|c| c.path.clone());
-            let pane = conn.pane_split(&root, cwd.as_deref(), &env).await?;
+            let pane = conn
+                .pane_split(&root, cwd.as_deref(), &pane_env(cwd.as_deref()).await?)
+                .await?;
             task.pane_id = Some(pane.pane_id.clone());
             if !created.already_open {
                 conn.pane_close(&root).await?;
@@ -501,7 +522,9 @@ async fn dispatch_steps(
         }
         (None, _) => {
             let label = workspace_label(task, name);
-            let created = conn.workspace_create(dir.as_deref(), &label, &env).await?;
+            let created = conn
+                .workspace_create(dir.as_deref(), &label, &pane_env(dir.as_deref()).await?)
+                .await?;
             task.workspace_id = Some(created.workspace.workspace_id.clone());
             task.pane_id = Some(created.root_pane.pane_id.clone());
             created.root_pane.pane_id
@@ -902,6 +925,22 @@ pub(crate) async fn expand_home(
 /// 2026-09-24). Refuse before creating anything. A machine that cannot answer
 /// (`None`: a `command` bridge, a shell that printed nothing) goes ahead, as
 /// before.
+/// The instruction file a profiled opencode task working in `dir` gets back:
+/// the first of `opencode::instruction_candidates` that is there, as opencode
+/// itself would pick, none when none is. Every candidate when the machine
+/// cannot say, since a file that is not there matches nothing.
+async fn instruction_files(conn: &dyn Connector, dir: &str) -> Result<Vec<String>, DispatchError> {
+    let candidates = crate::config::opencode::instruction_candidates(dir);
+    for file in &candidates {
+        match conn.file_exists(file).await.map_err(CallError::from)? {
+            Some(true) => return Ok(vec![file.clone()]),
+            Some(false) => {}
+            None => return Ok(candidates),
+        }
+    }
+    Ok(vec![])
+}
+
 async fn check_repo_exists(
     conn: &dyn Connector,
     repo: &str,
@@ -1863,6 +1902,76 @@ mod tests {
         dispatch(&fake, &mut t, &Agents::default(), None, READY)
             .await
             .unwrap();
+    }
+
+    /// A profiled opencode task runs with the repo's own opencode config
+    /// off, so a checkout cannot add rules to the profile's; the repo's
+    /// `AGENTS.md` or `CLAUDE.md`, which that also turns off, comes back
+    /// by its path in the directory the agent works in, a worktree's too:
+    /// the first one there, as opencode would pick. A task with no profile
+    /// keeps the repo's config.
+    #[tokio::test]
+    async fn a_profiled_opencode_task_turns_the_repo_config_off_but_keeps_its_instructions() {
+        let instructions = |env: &serde_json::Value| {
+            let content: serde_json::Value =
+                serde_json::from_str(env["OPENCODE_CONFIG_CONTENT"].as_str().unwrap()).unwrap();
+            content
+        };
+        let fake = FakeHerdr::new();
+        fake.set_file("/srv/app/AGENTS.md");
+        fake.set_file("/srv/app/CLAUDE.md");
+        let mut t = task(opencode_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(env["OPENCODE_DISABLE_PROJECT_CONFIG"], "1");
+        assert_eq!(
+            instructions(&env),
+            serde_json::json!({"instructions": ["/srv/app/AGENTS.md"]}),
+            "opencode reads only the first file there, AGENTS.md before CLAUDE.md"
+        );
+
+        let fake = FakeHerdr::new();
+        let mut t = task(opencode_under(Some("review")));
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(instructions(&env), serde_json::json!({"instructions": []}));
+
+        let fake = FakeHerdr::new();
+        fake.set_file("/fake/worktrees/pastor-k1/CLAUDE.md");
+        let mut t = task(DispatchSpec {
+            worktree: true,
+            branch: Some("pastor/k1".into()),
+            ..opencode_under(Some("review"))
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert_eq!(env["OPENCODE_DISABLE_PROJECT_CONFIG"], "1");
+        assert_eq!(
+            instructions(&env),
+            serde_json::json!({"instructions": ["/fake/worktrees/pastor-k1/CLAUDE.md"]})
+        );
+
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            allow: vec![],
+            deny: vec![],
+            ..opencode_under(None)
+        });
+        dispatch(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let env = fake.pane_env(t.pane_id.as_deref().unwrap());
+        assert!(
+            env.get("OPENCODE_DISABLE_PROJECT_CONFIG").is_none(),
+            "{env}"
+        );
+        assert!(env.get("OPENCODE_CONFIG_CONTENT").is_none(), "{env}");
     }
 
     /// An agent that cannot take a list it was given fails the task before

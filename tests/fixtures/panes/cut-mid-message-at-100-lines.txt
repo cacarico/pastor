@@ -1,0 +1,103 @@
+#! question: yes
+#! shell: no
+#! trust: no
+  - src/module_031.rs: moved the retry loop into Store::with_retry.
+  - src/module_032.rs: moved the retry loop into Store::with_retry.
+  - src/module_033.rs: moved the retry loop into Store::with_retry.
+  - src/module_034.rs: moved the retry loop into Store::with_retry.
+  - src/module_035.rs: moved the retry loop into Store::with_retry.
+  - src/module_036.rs: moved the retry loop into Store::with_retry.
+  - src/module_037.rs: moved the retry loop into Store::with_retry.
+  - src/module_038.rs: moved the retry loop into Store::with_retry.
+  - src/module_039.rs: moved the retry loop into Store::with_retry.
+  - src/module_040.rs: moved the retry loop into Store::with_retry.
+  - src/module_041.rs: moved the retry loop into Store::with_retry.
+  - src/module_042.rs: moved the retry loop into Store::with_retry.
+  - src/module_043.rs: moved the retry loop into Store::with_retry.
+  - src/module_044.rs: moved the retry loop into Store::with_retry.
+  - src/module_045.rs: moved the retry loop into Store::with_retry.
+  - src/module_046.rs: moved the retry loop into Store::with_retry.
+  - src/module_047.rs: moved the retry loop into Store::with_retry.
+  - src/module_048.rs: moved the retry loop into Store::with_retry.
+  - src/module_049.rs: moved the retry loop into Store::with_retry.
+  - src/module_050.rs: moved the retry loop into Store::with_retry.
+  - src/module_051.rs: moved the retry loop into Store::with_retry.
+  - src/module_052.rs: moved the retry loop into Store::with_retry.
+  - src/module_053.rs: moved the retry loop into Store::with_retry.
+  - src/module_054.rs: moved the retry loop into Store::with_retry.
+  - src/module_055.rs: moved the retry loop into Store::with_retry.
+  - src/module_056.rs: moved the retry loop into Store::with_retry.
+  - src/module_057.rs: moved the retry loop into Store::with_retry.
+  - src/module_058.rs: moved the retry loop into Store::with_retry.
+  - src/module_059.rs: moved the retry loop into Store::with_retry.
+  - src/module_060.rs: moved the retry loop into Store::with_retry.
+  - src/module_061.rs: moved the retry loop into Store::with_retry.
+  - src/module_062.rs: moved the retry loop into Store::with_retry.
+  - src/module_063.rs: moved the retry loop into Store::with_retry.
+  - src/module_064.rs: moved the retry loop into Store::with_retry.
+  - src/module_065.rs: moved the retry loop into Store::with_retry.
+  - src/module_066.rs: moved the retry loop into Store::with_retry.
+  - src/module_067.rs: moved the retry loop into Store::with_retry.
+  - src/module_068.rs: moved the retry loop into Store::with_retry.
+  - src/module_069.rs: moved the retry loop into Store::with_retry.
+  - src/module_070.rs: moved the retry loop into Store::with_retry.
+  - src/module_071.rs: moved the retry loop into Store::with_retry.
+  - src/module_072.rs: moved the retry loop into Store::with_retry.
+  - src/module_073.rs: moved the retry loop into Store::with_retry.
+  - src/module_074.rs: moved the retry loop into Store::with_retry.
+  - src/module_075.rs: moved the retry loop into Store::with_retry.
+  - src/module_076.rs: moved the retry loop into Store::with_retry.
+  - src/module_077.rs: moved the retry loop into Store::with_retry.
+  - src/module_078.rs: moved the retry loop into Store::with_retry.
+  - src/module_079.rs: moved the retry loop into Store::with_retry.
+  - src/module_080.rs: moved the retry loop into Store::with_retry.
+  - src/module_081.rs: moved the retry loop into Store::with_retry.
+  - src/module_082.rs: moved the retry loop into Store::with_retry.
+  - src/module_083.rs: moved the retry loop into Store::with_retry.
+  - src/module_084.rs: moved the retry loop into Store::with_retry.
+  - src/module_085.rs: moved the retry loop into Store::with_retry.
+  - src/module_086.rs: moved the retry loop into Store::with_retry.
+  - src/module_087.rs: moved the retry loop into Store::with_retry.
+  - src/module_088.rs: moved the retry loop into Store::with_retry.
+  - src/module_089.rs: moved the retry loop into Store::with_retry.
+  - src/module_090.rs: moved the retry loop into Store::with_retry.
+  - src/module_091.rs: moved the retry loop into Store::with_retry.
+  - src/module_092.rs: moved the retry loop into Store::with_retry.
+  - src/module_093.rs: moved the retry loop into Store::with_retry.
+  - src/module_094.rs: moved the retry loop into Store::with_retry.
+  - src/module_095.rs: moved the retry loop into Store::with_retry.
+  - src/module_096.rs: moved the retry loop into Store::with_retry.
+  - src/module_097.rs: moved the retry loop into Store::with_retry.
+  - src/module_098.rs: moved the retry loop into Store::with_retry.
+  - src/module_099.rs: moved the retry loop into Store::with_retry.
+  - src/module_100.rs: moved the retry loop into Store::with_retry.
+  - src/module_101.rs: moved the retry loop into Store::with_retry.
+  - src/module_102.rs: moved the retry loop into Store::with_retry.
+  - src/module_103.rs: moved the retry loop into Store::with_retry.
+  - src/module_104.rs: moved the retry loop into Store::with_retry.
+  - src/module_105.rs: moved the retry loop into Store::with_retry.
+  - src/module_106.rs: moved the retry loop into Store::with_retry.
+  - src/module_107.rs: moved the retry loop into Store::with_retry.
+  - src/module_108.rs: moved the retry loop into Store::with_retry.
+  - src/module_109.rs: moved the retry loop into Store::with_retry.
+  - src/module_110.rs: moved the retry loop into Store::with_retry.
+  - src/module_111.rs: moved the retry loop into Store::with_retry.
+  - src/module_112.rs: moved the retry loop into Store::with_retry.
+  - src/module_113.rs: moved the retry loop into Store::with_retry.
+  - src/module_114.rs: moved the retry loop into Store::with_retry.
+  - src/module_115.rs: moved the retry loop into Store::with_retry.
+  - src/module_116.rs: moved the retry loop into Store::with_retry.
+  - src/module_117.rs: moved the retry loop into Store::with_retry.
+  - src/module_118.rs: moved the retry loop into Store::with_retry.
+  - src/module_119.rs: moved the retry loop into Store::with_retry.
+
+  That covers every call site. The old helper is unused now.
+
+  Should I delete it in this branch, or leave it for a follow-up?
+
+✻ Worked for 9m 40s
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

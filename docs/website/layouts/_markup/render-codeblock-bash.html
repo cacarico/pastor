@@ -1,1 +1,8 @@
+{{- /* A script (a first line starting #!) is a file to copy, not commands to
+       type: shown plain, without prompts. Anything else is drawn as a
+       terminal by cmd.html. */ -}}
+{{- if hasPrefix .Inner "#!" -}}
+<pre class="cmd"><code>{{ strings.TrimRight "\n" .Inner }}</code></pre>
+{{- else -}}
 {{- partial "cmd.html" . -}}
+{{- end -}}

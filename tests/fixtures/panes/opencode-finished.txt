@@ -1,0 +1,21 @@
+#! question: no
+#! shell: no
+#! trust: no
+┃  Fix the flaky transport test
+┃
+
+   I made the fake herdr wait for the reply before closing stdin.
+
+   ┃ $ make check
+   ┃ test result: ok. 412 passed; 0 failed
+
+   The suite passes ten times in a row. Nothing else changed.
+
+   build · claude-sonnet · 1m 12s
+
+┃
+┃  
+┃
+   enter send
+
+  work/pastor:main                                        opencode 1.0.0

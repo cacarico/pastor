@@ -257,11 +257,46 @@ impl From<std::io::Error> for ProbeError {
     }
 }
 
-/// Reads the answer to `REMOTE_HOME_COMMAND`. Only ssh failing to reach the
-/// machine is an error, and so a transport failure; a machine that answered
-/// without a usable home is fine, its home is just unknown.
-fn remote_home(target: &str, out: &std::process::Output) -> Result<Option<String>, ConnectError> {
-    // 255 is ssh's own failure code; no code at all means it was killed.
+/// A probe's answer and the machine it came from, for the reader's errors
+/// and logs: the ssh target, or `local`.
+struct Probed {
+    target: String,
+    out: std::process::Output,
+}
+
+/// Run `command` (a POSIX shell command) on the machine behind `ep` and
+/// collect its output: under `sh -c` for a local machine, over ssh (the
+/// shared master when there is one) for an ssh machine. `None` for a command
+/// machine, whose bridge says nothing about what else is where it lands.
+/// Every probe of the machine goes through here, so a change to how one
+/// reaches a machine lands once.
+async fn probe(ep: &Endpoint, command: String) -> Result<Option<Probed>, ConnectError> {
+    let (target, argv) = match ep {
+        Endpoint::Local { .. } => (
+            "local".to_string(),
+            vec!["sh".to_string(), "-c".into(), command],
+        ),
+        Endpoint::Ssh {
+            target,
+            control_path,
+            ..
+        } => {
+            // Any probe may be the first ssh to this machine, and so start
+            // the master.
+            ensure_control_dir(control_path.as_deref())?;
+            let argv = ssh_argv_running(target, control_path.as_deref(), command);
+            (target.clone(), argv)
+        }
+        Endpoint::Command { .. } => return Ok(None),
+    };
+    let out = probe_output(&argv).await?;
+    Ok(Some(Probed { target, out }))
+}
+
+/// Was the machine reached? 255 is ssh's own failure code, and no code at all
+/// means the probe was killed: those are transport failures. Any other exit
+/// came from the machine, and what it means is the reader's to say.
+fn reached(target: &str, out: &std::process::Output) -> Result<(), ConnectError> {
     if matches!(out.status.code(), Some(255) | None) {
         return Err(ConnectError {
             message: format!(
@@ -271,6 +306,14 @@ fn remote_home(target: &str, out: &std::process::Output) -> Result<Option<String
             ),
         });
     }
+    Ok(())
+}
+
+/// Reads the answer to `REMOTE_HOME_COMMAND`. Only ssh failing to reach the
+/// machine is an error, and so a transport failure; a machine that answered
+/// without a usable home is fine, its home is just unknown.
+fn remote_home(target: &str, out: &std::process::Output) -> Result<Option<String>, ConnectError> {
+    reached(target, out)?;
     let raw = String::from_utf8_lossy(&out.stdout);
     // Only the newline pastor's own `printf` may trail with is trimmed here;
     // `trim_end()` would also eat a tab or form feed, letting a control
@@ -323,6 +366,13 @@ pub trait Connector: Send + Sync {
     /// whose `cwd` does not exist somewhere else (the shell's home) without an
     /// error, so dispatch asks first. `None` when it cannot be known.
     fn dir_exists(&self, _path: &str) -> DirFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Whether `path` is a regular file on the machine: which of a repo's
+    /// instruction files a profiled opencode task gets back
+    /// (`config::opencode::instructions_content`). `None` when it cannot be
+    /// known.
+    fn file_exists(&self, _path: &str) -> DirFuture<'_> {
         Box::pin(async { Ok(None) })
     }
     /// Make the directory `path` on the machine, parents too, unless it is
@@ -378,6 +428,10 @@ impl Connector for Endpoint {
         let path = path.to_string();
         Box::pin(async move { dir_exists(self, &path).await })
     }
+    fn file_exists(&self, path: &str) -> DirFuture<'_> {
+        let path = path.to_string();
+        Box::pin(async move { file_exists(self, &path).await })
+    }
     fn ensure_dir(&self, path: &str) -> DirFuture<'_> {
         let path = path.to_string();
         Box::pin(async move { ensure_dir(self, &path).await })
@@ -399,42 +453,38 @@ impl Connector for Endpoint {
 }
 
 async fn home_dir(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
-    match ep {
-        // The head and this herdr share a machine, and so a home.
-        Endpoint::Local { .. } => Ok(dirs::home_dir().map(|p| p.to_string_lossy().into_owned())),
-        Endpoint::Ssh {
-            target,
-            control_path,
-            ..
-        } => {
-            // May be the first ssh to this machine, so it may start the master.
-            ensure_control_dir(control_path.as_deref())?;
-            let argv = ssh_argv_running(
-                target,
-                control_path.as_deref(),
-                REMOTE_HOME_COMMAND.to_string(),
-            );
-            let out = probe_output(&argv).await?;
-            remote_home(target, &out)
-        }
-        // An arbitrary bridge command says nothing about where it lands.
-        Endpoint::Command { .. } => Ok(None),
+    // The head and this herdr share a machine, and so a home.
+    if let Endpoint::Local { .. } = ep {
+        return Ok(dirs::home_dir().map(|p| p.to_string_lossy().into_owned()));
+    }
+    match probe(ep, REMOTE_HOME_COMMAND.to_string()).await? {
+        Some(p) => remote_home(&p.target, &p.out),
+        None => Ok(None),
     }
 }
 
 async fn dir_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectError> {
+    // The head and this herdr share a machine, and so a filesystem.
+    if let Endpoint::Local { .. } = ep {
+        return Ok(Some(std::path::Path::new(path).is_dir()));
+    }
+    match probe(ep, remote_dir_command(path)).await? {
+        Some(p) => remote_dir_answer(&p.target, &p.out),
+        None => Ok(None),
+    }
+}
+
+async fn file_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectError> {
     match ep {
         // The head and this herdr share a machine, and so a filesystem.
-        Endpoint::Local { .. } => Ok(Some(std::path::Path::new(path).is_dir())),
+        Endpoint::Local { .. } => Ok(Some(std::path::Path::new(path).is_file())),
         Endpoint::Ssh {
             target,
             control_path,
             ..
         } => {
-            // A repo without `~` skips `home_dir`, so this may be the first ssh
-            // to this machine and start the master.
             ensure_control_dir(control_path.as_deref())?;
-            let argv = ssh_argv_running(target, control_path.as_deref(), remote_dir_command(path));
+            let argv = ssh_argv_running(target, control_path.as_deref(), remote_file_command(path));
             let out = probe_output(&argv).await?;
             remote_dir_answer(target, &out)
         }
@@ -444,73 +494,31 @@ async fn dir_exists(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectEr
 }
 
 async fn ensure_dir(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectError> {
-    match ep {
-        // The head and this herdr share a machine, and so a filesystem.
-        Endpoint::Local { .. } => Ok(Some(std::fs::create_dir_all(path).is_ok())),
-        Endpoint::Ssh {
-            target,
-            control_path,
-            ..
-        } => {
-            ensure_control_dir(control_path.as_deref())?;
-            let argv =
-                ssh_argv_running(target, control_path.as_deref(), remote_mkdir_command(path));
-            let out = probe_output(&argv).await?;
-            // The answer reads like `remote_dir_command`'s, save that a
-            // failed `mkdir` says `no` rather than nothing.
-            Ok(remote_dir_answer(target, &out)?.or(Some(false)))
-        }
-        // An arbitrary bridge command says nothing about where it lands.
-        Endpoint::Command { .. } => Ok(None),
+    // The head and this herdr share a machine, and so a filesystem.
+    if let Endpoint::Local { .. } = ep {
+        return Ok(Some(std::fs::create_dir_all(path).is_ok()));
+    }
+    match probe(ep, remote_mkdir_command(path)).await? {
+        // The answer reads like `remote_dir_command`'s, save that a failed
+        // `mkdir` says `no` rather than nothing.
+        Some(p) => Ok(remote_dir_answer(&p.target, &p.out)?.or(Some(false))),
+        None => Ok(None),
     }
 }
 
 async fn unpushed_commits(ep: &Endpoint, path: &str) -> Result<Option<bool>, ConnectError> {
-    let (target, argv) = match ep {
-        // The head and this herdr share a machine, and so a git.
-        Endpoint::Local { .. } => (
-            "local".to_string(),
-            vec!["sh".to_string(), "-c".into(), remote_unpushed_command(path)],
-        ),
-        Endpoint::Ssh {
-            target,
-            control_path,
-            ..
-        } => {
-            ensure_control_dir(control_path.as_deref())?;
-            let argv = ssh_argv_running(
-                target,
-                control_path.as_deref(),
-                remote_unpushed_command(path),
-            );
-            (target.clone(), argv)
-        }
-        // An arbitrary bridge command says nothing about what else is there.
-        Endpoint::Command { .. } => return Ok(None),
-    };
-    let out = probe_output(&argv).await?;
-    remote_unpushed_answer(&target, &out)
+    // A local machine runs the same git command here.
+    match probe(ep, remote_unpushed_command(path)).await? {
+        Some(p) => remote_unpushed_answer(&p.target, &p.out),
+        None => Ok(None),
+    }
 }
 
 async fn restore_worktree(ep: &Endpoint, command: String) -> Result<Option<bool>, ConnectError> {
-    let (target, argv) = match ep {
-        Endpoint::Local { .. } => (
-            "local".to_string(),
-            vec!["sh".to_string(), "-c".into(), command],
-        ),
-        Endpoint::Ssh {
-            target,
-            control_path,
-            ..
-        } => {
-            ensure_control_dir(control_path.as_deref())?;
-            let argv = ssh_argv_running(target, control_path.as_deref(), command);
-            (target.clone(), argv)
-        }
-        Endpoint::Command { .. } => return Ok(None),
-    };
-    let out = probe_output(&argv).await?;
-    remote_restore_answer(&target, &out)
+    match probe(ep, command).await? {
+        Some(p) => remote_restore_answer(&p.target, &p.out),
+        None => Ok(None),
+    }
 }
 
 /// Re-adds the worktree at `path` on `branch` in `repo`, answering `added`,
@@ -534,15 +542,7 @@ fn remote_restore_answer(
     target: &str,
     out: &std::process::Output,
 ) -> Result<Option<bool>, ConnectError> {
-    if matches!(out.status.code(), Some(255) | None) {
-        return Err(ConnectError {
-            message: format!(
-                "ssh {target}: {} ({})",
-                String::from_utf8_lossy(&out.stderr).trim(),
-                out.status
-            ),
-        });
-    }
+    reached(target, out)?;
     let raw = String::from_utf8_lossy(&out.stdout);
     match raw.trim_end().lines().last().unwrap_or("").trim() {
         "added" if out.status.success() => Ok(Some(true)),
@@ -572,15 +572,7 @@ fn remote_unpushed_answer(
     target: &str,
     out: &std::process::Output,
 ) -> Result<Option<bool>, ConnectError> {
-    if matches!(out.status.code(), Some(255) | None) {
-        return Err(ConnectError {
-            message: format!(
-                "ssh {target}: {} ({})",
-                String::from_utf8_lossy(&out.stderr).trim(),
-                out.status
-            ),
-        });
-    }
+    reached(target, out)?;
     let raw = String::from_utf8_lossy(&out.stdout);
     let last = raw.trim_end().lines().last().unwrap_or("").trim();
     match last.parse::<u64>() {
@@ -594,52 +586,22 @@ fn remote_unpushed_answer(
 
 async fn opencode_permission_rules(ep: &Endpoint) -> Result<Option<bool>, ConnectError> {
     let command = crate::config::opencode::CONFIG_CHECK_COMMAND.to_string();
-    let (target, argv) = match ep {
-        // The head and this herdr share a machine, and so a config.
-        Endpoint::Local { .. } => (
-            "local".to_string(),
-            vec!["sh".to_string(), "-c".into(), command],
-        ),
-        Endpoint::Ssh {
-            target,
-            control_path,
-            ..
-        } => {
-            ensure_control_dir(control_path.as_deref())?;
-            let argv = ssh_argv_running(target, control_path.as_deref(), command);
-            (target.clone(), argv)
-        }
-        // An arbitrary bridge command says nothing about what else is there.
-        Endpoint::Command { .. } => return Ok(None),
-    };
-    let out = probe_output(&argv).await?;
-    // The same one-word answer as the repo check.
-    remote_dir_answer(&target, &out)
+    match probe(ep, command).await? {
+        // The same one-word answer as the repo check.
+        Some(p) => remote_dir_answer(&p.target, &p.out),
+        None => Ok(None),
+    }
 }
 
 async fn pastor_version(ep: &Endpoint) -> Result<Option<String>, ConnectError> {
-    match ep {
-        // The head and this herdr share a machine, so the pastor there is
-        // this one.
-        Endpoint::Local { .. } => Ok(Some(env!("CARGO_PKG_VERSION").to_string())),
-        Endpoint::Ssh {
-            target,
-            control_path,
-            ..
-        } => {
-            // The actor asks right after a ping, so the master is up; a probe
-            // may still be the first ssh, and start it.
-            ensure_control_dir(control_path.as_deref())?;
-            let argv = ssh_argv_running(
-                target,
-                control_path.as_deref(),
-                REMOTE_PASTOR_VERSION_COMMAND.to_string(),
-            );
-            let out = probe_output(&argv).await?;
-            remote_pastor_version(target, &out)
-        }
-        // An arbitrary bridge command says nothing about what else is there.
-        Endpoint::Command { .. } => Ok(None),
+    // The head and this herdr share a machine, so the pastor there is this
+    // one.
+    if let Endpoint::Local { .. } = ep {
+        return Ok(Some(env!("CARGO_PKG_VERSION").to_string()));
+    }
+    match probe(ep, REMOTE_PASTOR_VERSION_COMMAND.to_string()).await? {
+        Some(p) => remote_pastor_version(&p.target, &p.out),
+        None => Ok(None),
     }
 }
 
@@ -658,15 +620,7 @@ fn remote_pastor_version(
     target: &str,
     out: &std::process::Output,
 ) -> Result<Option<String>, ConnectError> {
-    if matches!(out.status.code(), Some(255) | None) {
-        return Err(ConnectError {
-            message: format!(
-                "ssh {target}: {} ({})",
-                String::from_utf8_lossy(&out.stderr).trim(),
-                out.status
-            ),
-        });
-    }
+    reached(target, out)?;
     let raw = String::from_utf8_lossy(&out.stdout);
     let last = raw.trim_end().lines().last().unwrap_or("");
     let words: Vec<&str> = last.split_whitespace().collect();
@@ -692,6 +646,14 @@ fn remote_dir_command(path: &str) -> String {
     )
 }
 
+/// `test -f` on the machine, answered like `remote_dir_command`.
+fn remote_file_command(path: &str) -> String {
+    format!(
+        "if test -f {}; then printf yes; else printf no; fi",
+        shell_quote(path)
+    )
+}
+
 /// `mkdir -p` on the machine, answered like `remote_dir_command`. Its own
 /// complaint goes to stderr, so stdout holds only the answer (and rc noise).
 fn remote_mkdir_command(path: &str) -> String {
@@ -708,15 +670,7 @@ fn remote_dir_answer(
     target: &str,
     out: &std::process::Output,
 ) -> Result<Option<bool>, ConnectError> {
-    if matches!(out.status.code(), Some(255) | None) {
-        return Err(ConnectError {
-            message: format!(
-                "ssh {target}: {} ({})",
-                String::from_utf8_lossy(&out.stderr).trim(),
-                out.status
-            ),
-        });
-    }
+    reached(target, out)?;
     let text = String::from_utf8_lossy(&out.stdout);
     let text = text.trim_end();
     if out.status.success() && text.ends_with("yes") {
@@ -1044,6 +998,32 @@ mod tests {
         assert_eq!(command.dir_exists("/").await.unwrap(), None);
     }
 
+    #[tokio::test]
+    async fn file_exists_per_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("AGENTS.md");
+        std::fs::write(&file, "x").unwrap();
+        let local = Endpoint::Local {
+            session: "s".into(),
+        };
+        assert_eq!(
+            local.file_exists(file.to_str().unwrap()).await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            local
+                .file_exists(tmp.path().to_str().unwrap())
+                .await
+                .unwrap(),
+            Some(false),
+            "a directory is not a file"
+        );
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.file_exists("/").await.unwrap(), None);
+    }
+
     /// A local machine shares the head's pastor; a bridge command cannot know.
     /// The ssh command runs through `sh -c` so the PATH it adds is POSIX
     /// whatever the login shell is (fish, for one).
@@ -1163,6 +1143,14 @@ mod tests {
         assert_eq!(
             remote_dir_command("/srv/my app/it's"),
             "if test -d '/srv/my app/it'\\''s'; then printf yes; else printf no; fi"
+        );
+    }
+
+    #[test]
+    fn remote_file_command_quotes_the_path() {
+        assert_eq!(
+            remote_file_command("/srv/my app/AGENTS.md"),
+            "if test -f '/srv/my app/AGENTS.md'; then printf yes; else printf no; fi"
         );
     }
 
@@ -1389,6 +1377,54 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
+    /// Every probe goes through `probe`: the command under `sh -c` here,
+    /// over ssh on an ssh machine, and nowhere for a command machine, whose
+    /// bridge says nothing about where it lands.
+    #[tokio::test]
+    async fn probe_runs_the_command_where_the_machine_is() {
+        let local = Endpoint::Local {
+            session: "s".into(),
+        };
+        let answer = probe(&local, "printf yes; exit 3".into())
+            .await
+            .unwrap()
+            .expect("a local machine runs the probe");
+        assert_eq!(answer.target, "local");
+        assert_eq!(answer.out.stdout, b"yes");
+        assert_eq!(answer.out.status.code(), Some(3));
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert!(
+            probe(&command, "printf yes".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// ssh's own failure (255) or a killed probe means the machine was not
+    /// reached, with ssh's stderr in the message; any other exit came from
+    /// the machine and is for the caller to read.
+    #[test]
+    fn reached_is_only_an_error_when_ssh_failed() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |raw: i32| std::process::Output {
+            status: std::process::ExitStatus::from_raw(raw),
+            stdout: vec![],
+            stderr: b"no route to host\n".to_vec(),
+        };
+        assert!(reached("t", &out(0)).is_ok());
+        assert!(reached("t", &out(1 << 8)).is_ok());
+        let err = reached("pi-3", &out(255 << 8)).unwrap_err();
+        assert!(
+            err.message.starts_with("ssh pi-3: no route to host ("),
+            "{}",
+            err.message
+        );
+        assert!(reached("t", &out(9)).is_err(), "killed");
+    }
+
     #[test]
     fn remote_home_separates_unreachable_from_unknown() {
         use std::os::unix::process::ExitStatusExt;
@@ -1520,5 +1556,53 @@ mod tests {
             std::env::remove_var("XDG_CONFIG_HOME");
         }
         assert!(err.message.contains("herdr.sock"), "{}", err.message);
+    }
+
+    /// Run `script` in a real `/bin/sh` and return what it printed.
+    fn sh_output(script: &str) -> Vec<u8> {
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("run /bin/sh");
+        assert!(out.status.success(), "{script:?}: {out:?}");
+        out.stdout
+    }
+
+    /// The words `/bin/sh` passes to `name` when it runs `command`, with
+    /// `name` defined as a function that prints its arguments NUL-separated.
+    fn words_for(name: &str, command: &str) -> Vec<String> {
+        let script = format!("{name}() {{ printf '%s\\0' \"$@\"; }}\n{command}");
+        let out = String::from_utf8(sh_output(&script)).expect("utf-8");
+        out.split_terminator('\0').map(String::from).collect()
+    }
+
+    proptest::proptest! {
+        // Each case spawns a shell.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// A shell prints back exactly what was quoted: NUL aside (no argv
+        /// can hold one), no input escapes its single word.
+        #[test]
+        fn prop_shell_quote_round_trips_through_sh(s in "[^\\x00]*") {
+            let out = sh_output(&format!("printf %s {}", shell_quote(&s)));
+            proptest::prop_assert_eq!(out, s.as_bytes());
+        }
+
+        #[test]
+        fn prop_posix_command_keeps_the_command_one_word(command in "[^\\x00]*") {
+            proptest::prop_assert_eq!(
+                words_for("sh", &posix_command(&command)),
+                vec!["-c".to_string(), command]
+            );
+        }
+
+        #[test]
+        fn prop_bridge_command_keeps_the_session_one_word(session in "[^\\x00]*") {
+            proptest::prop_assert_eq!(
+                words_for("herdr", &bridge_command(&session)),
+                vec!["--session".to_string(), session, "remote-api-bridge".to_string()]
+            );
+        }
     }
 }
