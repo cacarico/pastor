@@ -460,6 +460,28 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
     if let Some(e) = &t.error {
         fields.push((if waiting { "limit" } else { "error" }, e.clone()));
     }
+    // Why it waits when it could have moved to its next model.
+    if let Some(waited) = t.spec.rounds.stop.as_ref().and_then(|s| s.waited.as_ref())
+        && waiting
+    {
+        fields.push(("waited", waited.clone()));
+    }
+    // Each model it ran on, and why that round ended; the last is now.
+    if !t.spec.rounds.ended.is_empty() {
+        let now = crate::task::agent_and_model(&t.spec.agent, t.model());
+        let rounds = t
+            .spec
+            .rounds
+            .ended
+            .iter()
+            .map(|r| format!("{r}: {}", r.ended))
+            .chain(std::iter::once(format!("{now}: {}", t.state)))
+            .enumerate()
+            .map(|(i, r)| format!("{} {r}", i + 1))
+            .collect::<Vec<_>>()
+            .join("; ");
+        fields.push(("rounds", rounds));
+    }
     // What the task's Claude session used, as read when its last round
     // ended: its model is the one the machine gave it when `model` is `-`.
     if let Some(u) = &t.usage {
@@ -1438,6 +1460,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         };
         let running_gone = task_with(spec.clone()); // on pi-3, running
         let closed_gone = Task {
@@ -1512,6 +1535,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         };
         let out = task_detail(&task_with(spec.clone()));
         assert!(
@@ -1643,6 +1667,46 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("deny:       -\n"), "{out}");
+    }
+
+    /// `task describe` lists the rounds a task ran on other models and why
+    /// each ended, and says why a waiting task did not move on.
+    #[test]
+    fn task_detail_prints_the_rounds_and_why_it_waited() {
+        let mut t = task_with(serde_json::from_str(r#"{"agent": "claude"}"#).unwrap());
+        assert!(!task_detail(&t).contains("rounds:"));
+        t.spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            model: Some("sonnet".into()),
+            ..Default::default()
+        }));
+        t.spec.rounds.ended.push(crate::task::AgentRound {
+            agent: "claude".into(),
+            model: Some("opus".into()),
+            ended: "limit: Opus weekly limit reached".into(),
+        });
+        t.state = crate::task::TaskState::Waiting;
+        t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
+            agent: "claude".into(),
+            model: Some("sonnet".into()),
+            why: "limit".into(),
+            line: "You've hit your limit".into(),
+            until: Utc::now(),
+            tail: String::new(),
+            then: crate::task::NextRound::Own,
+            waited: Some("reset in 12m, under wait_under 30m".into()),
+            handover: None,
+        }));
+        let out = task_detail(&t);
+        assert!(
+            out.contains(
+                "rounds:     1 claude (opus): limit: Opus weekly limit reached; 2 claude (sonnet): waiting\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("waited:     reset in 12m, under wait_under 30m\n"),
+            "{out}"
+        );
     }
 
     /// `task describe` shows what a finished Claude task's session used,
@@ -1925,6 +1989,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         });
         let out = task_detail(&t);
         assert!(
@@ -1965,6 +2030,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         });
         t.error = Some("ssh failed:\nPermission denied\r\nbye".into());
         let out = task_detail(&t);
@@ -2016,6 +2082,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         });
         t.item = serde_json::json!({"key": "k", "title": format!("x\n t-9  done\x1b[2K{}", "y".repeat(80))});
         let note = task_rows(std::slice::from_ref(&t))[0]
@@ -2051,6 +2118,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         });
         t.prompt = "look at\x1b]8;;http://x\x07this\r\nand stop".into();
         let out = task_detail(&t);

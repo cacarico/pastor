@@ -1716,15 +1716,9 @@ impl Fleet {
         // fallback list whose account is not, as that model settles here.
         let primary = spec.agent_source.clone().expect("settled");
         for (i, name) in primary.fallback.iter().enumerate() {
-            let mut then = ask.clone();
-            then.model = Some(name.clone());
-            let mut fb = task.spec.clone();
-            if self
-                .settle(&mut fb, &then, flock, Some(machine), &by)
-                .is_err()
-            {
+            let Some(mut fb) = self.settle_model(task, flock, machine, name) else {
                 continue;
-            }
+            };
             let more = self.limits_holding(&live, machine, &fb);
             if !more.is_empty() {
                 for l in more {
@@ -1754,6 +1748,238 @@ impl Fleet {
             return Some(Ok(fb));
         }
         Some(Err(exhausted(&held, now)))
+    }
+
+    /// `task`'s spec settled for `machine` in `flock` with the `[models]`
+    /// name `model` in place of its own, as its ask would have it there;
+    /// `None` when the machine cannot run it.
+    fn settle_model(
+        &self,
+        task: &Task,
+        flock: &str,
+        machine: &str,
+        model: &str,
+    ) -> Option<crate::task::DispatchSpec> {
+        let source = task.spec.agent_source.as_ref()?;
+        let mut ask = source.ask.clone();
+        if ask.profile.is_none() {
+            ask.profile = source.profile.clone();
+        }
+        ask.model = Some(model.to_string());
+        let mut spec = task.spec.clone();
+        self.settle(&mut spec, &ask, flock, Some(machine), &asked_by(task))
+            .ok()?;
+        Some(spec)
+    }
+
+    /// What waiting `task`, pinned to `machine`, does now that its time has
+    /// come, as its limit left it (`task::LimitStop::then`) and `live`
+    /// holds its models there. Its own model is its own session; another
+    /// model is a new round. A task that was to move on and finds every
+    /// model after its own exhausted, or none it can run here, waits.
+    fn wake(&self, task: &Task, machine: &str, live: &[AccountLimit]) -> Wake {
+        use crate::task::NextRound;
+        let own = self.limits_holding(live, machine, &task.spec);
+        let then = task
+            .spec
+            .rounds
+            .stop
+            .as_deref()
+            .map_or(NextRound::Own, |s| s.then);
+        let source = task.spec.agent_source.as_deref();
+        let Some(source) = source.filter(|s| then != NextRound::Own && !s.fallback.is_empty())
+        else {
+            return if own.is_empty() {
+                Wake::Own
+            } else {
+                Wake::Hold
+            };
+        };
+        let flock = self.flock();
+        let target = task.flock.as_deref().unwrap_or(flock.default_flock());
+        // Its models in order: the one it started on, then its list.
+        let current = task.model().map(str::to_string);
+        let first = match task.spec.rounds.ended.first() {
+            Some(r) => r.model.clone(),
+            None => current.clone(),
+        };
+        let mut list = vec![first];
+        for m in &source.fallback {
+            if !list.contains(&Some(m.clone())) {
+                list.push(Some(m.clone()));
+            }
+        }
+        let from = match then {
+            NextRound::Switch => list.iter().position(|m| *m == current).map_or(0, |i| i + 1),
+            _ => 0,
+        };
+        let mut held: Vec<AccountLimit> = Vec::new();
+        let mut hold = |more: Vec<AccountLimit>| {
+            for l in more {
+                if !held
+                    .iter()
+                    .any(|h| h.account == l.account && h.model == l.model)
+                {
+                    held.push(l);
+                }
+            }
+        };
+        let mut runnable = false;
+        for model in &list[from..] {
+            if *model == current {
+                runnable = true;
+                if own.is_empty() {
+                    return Wake::Own;
+                }
+                continue;
+            }
+            let Some(name) = model else { continue };
+            let Some(spec) = self.settle_model(task, target, machine, name) else {
+                continue;
+            };
+            runnable = true;
+            let more = self.limits_holding(live, machine, &spec);
+            if more.is_empty() {
+                return Wake::Switch(Box::new(spec));
+            }
+            hold(more);
+        }
+        if then != NextRound::Switch {
+            return Wake::Hold;
+        }
+        hold(own);
+        Wake::Wait {
+            why: if runnable {
+                "all_exhausted"
+            } else {
+                "no_fallback"
+            },
+            held,
+        }
+    }
+
+    /// Move waiting `task` to `spec`, its next model as `wake` settled it
+    /// on `machine`: the round that stopped on the limit ends with `limit:
+    /// <line>`, the new one carries on in the same session when the agent
+    /// is of the same kind and account and has one, else from the prompt
+    /// with the end of the last pane. The row is written for the resume to
+    /// claim, and `task.agent_switched` says so.
+    fn switch_model(
+        &self,
+        task: &Task,
+        machine: &str,
+        mut spec: crate::task::DispatchSpec,
+    ) -> anyhow::Result<Option<Task>> {
+        use crate::task::{AgentRound, Handover, NextRound};
+        let Some(mut stop) = task.spec.rounds.stop.clone() else {
+            return Ok(None);
+        };
+        let old = task.spec.agent_source.as_deref();
+        let (same_kind, same_account) = {
+            let agents = self.agents.read().recover();
+            (
+                agents.kind(&task.spec.agent) == agents.kind(&spec.agent),
+                agents.limit_key(machine, &task.spec.agent)
+                    == agents.limit_key(machine, &spec.agent),
+            )
+        };
+        let handover = if same_kind && same_account && task.spec.session_id.is_some() {
+            Handover::Session
+        } else {
+            spec.session_id = None;
+            Handover::PaneTail
+        };
+        if let (Some(src), Some(old)) = (spec.agent_source.as_mut(), old) {
+            src.model_from = Some(format!("fallback after a {}", stop.why.replace('_', " ")));
+            src.fallback = old.fallback.clone();
+            src.fallback_from = old.fallback_from.clone();
+            src.fallback_use = None;
+        }
+        spec.rounds = task.spec.rounds.clone();
+        spec.rounds.ended.push(AgentRound {
+            agent: task.spec.agent.clone(),
+            model: task.model().map(str::to_string),
+            ended: format!("limit: {}", stop.line),
+        });
+        let from = serde_json::json!({ "agent": task.spec.agent, "model": task.model() });
+        stop.then = NextRound::Own;
+        stop.waited = None;
+        stop.handover = Some(handover);
+        let (why, until, line) = (stop.why.clone(), stop.until, stop.line.clone());
+        spec.rounds.stop = Some(stop);
+        let Some(mut fresh) = self.store.get_task(task.id)? else {
+            return Ok(None);
+        };
+        if fresh.state != TaskState::Waiting || fresh.spec != task.spec {
+            return Ok(None);
+        }
+        fresh.spec = spec;
+        self.store.update_task(&mut fresh)?;
+        if let Err(err) = self.store.end_round_on_limit(task.id, &line) {
+            tracing::error!(task = %task.display_id(), %err, "save the round's summary");
+        }
+        tracing::info!(task = %task.display_id(), machine, from = %task.spec.agent, to = %fresh.spec.agent, model = ?fresh.model(), "moves to its next model");
+        self.emit(
+            "task.agent_switched",
+            machine,
+            Some(&fresh),
+            Some(serde_json::json!({
+                "from": from,
+                "to": { "agent": fresh.spec.agent, "model": fresh.model() },
+                "why": why,
+                "until": until,
+                "handover": handover.as_str(),
+            })),
+        );
+        Ok(Some(fresh))
+    }
+
+    /// Keep waiting `task` until the earliest of `held`, the limits on
+    /// every model it may run: none after its own was free
+    /// (`Wake::Wait`). At that time it starts on the first of its models
+    /// that is free. Emits `task.waiting`.
+    fn wait_longer(
+        &self,
+        task: &Task,
+        machine: &str,
+        why: &str,
+        held: &[AccountLimit],
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now();
+        let Some(mut fresh) = self.store.get_task(task.id)? else {
+            return Ok(());
+        };
+        if fresh.state != TaskState::Waiting || fresh.spec != task.spec {
+            return Ok(());
+        }
+        let until = held
+            .iter()
+            .map(|l| l.retry_at)
+            .min()
+            .or(fresh.spec.rounds.stop.as_ref().map(|s| s.until))
+            .unwrap_or(now);
+        fresh.waiting_until = Some(until);
+        if let Some(stop) = fresh.spec.rounds.stop.as_mut() {
+            stop.then = crate::task::NextRound::First;
+        }
+        self.store.update_task(&mut fresh)?;
+        tracing::info!(task = %task.display_id(), machine, why, %until, "waiting for a usage limit to reset");
+        let models: Vec<_> = held
+            .iter()
+            .map(|l| serde_json::json!({ "account": l.account, "model": l.model, "until": l.retry_at }))
+            .collect();
+        self.emit(
+            "task.waiting",
+            machine,
+            Some(&fresh),
+            Some(serde_json::json!({
+                "why": why,
+                "until": until,
+                "models": models,
+                "shown": format!("waiting {}", crate::limit::local_time(until, now)),
+            })),
+        );
+        Ok(())
     }
 
     /// The live limits, as the store has them at `now`; none when it cannot
@@ -2453,13 +2679,28 @@ impl Fleet {
                     let Some(machine) = task.pinned_machine() else {
                         continue;
                     };
-                    if self.is_in_flight(task.id)
-                        || task.waiting_until.is_some_and(|u| u > now)
-                        || !self.limits_holding(&live, machine, &task.spec).is_empty()
-                    {
+                    if self.is_in_flight(task.id) || task.waiting_until.is_some_and(|u| u > now) {
                         continue;
                     }
-                    placed.extend(self.resume_paused(task, &queued, &takes));
+                    let task = match self.wake(task, machine, &live) {
+                        Wake::Hold => continue,
+                        Wake::Own => task.clone(),
+                        Wake::Switch(spec) => match self.switch_model(task, machine, *spec) {
+                            Ok(Some(t)) => t,
+                            Ok(None) => continue,
+                            Err(err) => {
+                                tracing::error!(task = %task.display_id(), %err, "move to the next model");
+                                continue;
+                            }
+                        },
+                        Wake::Wait { why, held } => {
+                            if let Err(err) = self.wait_longer(task, machine, why, &held) {
+                                tracing::error!(task = %task.display_id(), %err, "wait for a usage limit");
+                            }
+                            continue;
+                        }
+                    };
+                    placed.extend(self.resume_paused(&task, &queued, &takes));
                 }
             }
             Err(err) => tracing::error!(%err, "list waiting"),
@@ -2834,6 +3075,23 @@ pub const TASK_WAITING: &str = "task_waiting";
 
 /// How long `Fleet::live_limits` trusts the table as last read.
 const LIMITS_FRESH: Duration = Duration::from_secs(1);
+
+/// What a waiting task does once its time has come (`Fleet::wake`).
+enum Wake {
+    /// Its models are still exhausted: it keeps waiting.
+    Hold,
+    /// Its own model is free: it resumes on it.
+    Own,
+    /// It goes on under another model, its spec settled for it.
+    Switch(Box<crate::task::DispatchSpec>),
+    /// It was to move on, and no model after its own is free or runs on
+    /// its machine: it waits for the earliest of `held` (`why` is
+    /// `all_exhausted` or `no_fallback`).
+    Wait {
+        why: &'static str,
+        held: Vec<AccountLimit>,
+    },
+}
 
 /// The code of a task every model of which is on an exhausted account
 /// where it would run.
@@ -4649,6 +4907,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 
@@ -7376,6 +7635,250 @@ mod tests {
         assert_eq!(back.machine.as_deref(), Some("pi"));
         assert_eq!(back.waiting_until, None);
         assert_eq!(back.spec.session_id, t.spec.session_id);
+    }
+
+    /// The card's walk: `fallback = ["sonnet", "gpt5"]` and limits with no
+    /// reset near. Opus runs out on its own (`Opus weekly limit`): the task
+    /// goes on under Sonnet in its own session with the switch line. Then
+    /// the whole account runs out: it goes on under the machine's opencode
+    /// with its prompt, the handover and the end of the last pane. Same
+    /// worktree and branch each time, one row, one round per model. Once
+    /// Opus is cleared, the task stays on the model it moved to, and a new
+    /// task starts on Opus again.
+    #[tokio::test]
+    async fn a_limited_task_moves_down_its_fallback_list() {
+        let pi = MachineConfig {
+            agents: [("opencode".to_string(), "opencode".to_string())].into(),
+            ..machine("pi", 3)
+        };
+        let fake = FakeHerdr::new();
+        let (d, _tmp) = opencode_daemon(vec![pi], &[("pi", 3, fake.clone())]).await;
+        let mut config = models_config();
+        config.models.0.insert(
+            "gpt5".into(),
+            crate::config::ModelDef {
+                kind: "opencode".into(),
+                args: vec!["--model".into(), "openai/gpt-5.5".into()],
+            },
+        );
+        config.agents.0.get_mut("claude-personal").unwrap().account = Some("me".into());
+        std::fs::write(d.paths.config_file(), toml::to_string(&config).unwrap()).unwrap();
+        d.fleet().set_config(&config);
+        let mut events = d.subscribe();
+        let IpcRequest::Run {
+            preempt,
+            summary,
+            role,
+            description,
+            prompt,
+            mut spec,
+            flock,
+            agent,
+            priority,
+            now,
+        } = run_fallback(Some("opus"), Some(&["sonnet", "gpt5"]), Some("pi"))
+        else {
+            unreachable!()
+        };
+        spec.repo = Some("/r".into());
+        spec.worktree = true;
+        let run = IpcRequest::Run {
+            preempt,
+            summary,
+            role,
+            description,
+            prompt,
+            spec,
+            flock,
+            agent,
+            priority,
+            now,
+        };
+        let IpcResponse::Task(t) = d.handle(run).await else {
+            panic!()
+        };
+        let get = |id: i64| d.store.get_task(id).unwrap().unwrap();
+        let until = async |what: &str, f: &dyn Fn(&Task) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let t = get(t.id);
+                if f(&t) {
+                    return t;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}: {t:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let first = until("running", &|t| t.state == TaskState::Running).await;
+        assert_eq!(first.model(), Some("opus"));
+        let checkout = first.spec.checkout.clone().expect("a worktree");
+        let session = first.spec.session_id.clone().expect("a Claude session");
+        let stop_on = |pane: &str, line: &str| {
+            fake.set_status(pane, crate::herdr::AgentStatus::Working);
+            fake.set_pane_text(
+                pane,
+                &format!("❯ x\n\n● Half of it is done.\n\n● {line}\n\n────────\n❯ \n────────\n"),
+            );
+        };
+        let idle = |pane: &str| fake.set_status(pane, crate::herdr::AgentStatus::Idle);
+        let last = |method: &str| {
+            fake.requests()
+                .into_iter()
+                .rev()
+                .find(|r| r.method == method)
+                .unwrap()
+                .params
+        };
+
+        // Opus runs out alone: Sonnet, in the same session.
+        let pane = first.pane_id.clone().unwrap();
+        stop_on(&pane, "Opus weekly limit reached");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        idle(&pane);
+        until("moved on", &|t| t.state == TaskState::Waiting).await;
+        d.fleet().dispatch_queued().await;
+        let second = until("running on sonnet", &|t| {
+            t.state == TaskState::Running && t.model() == Some("sonnet")
+        })
+        .await;
+        assert_eq!(second.spec.session_id.as_deref(), Some(session.as_str()));
+        assert_eq!(second.spec.checkout, Some(checkout.clone()));
+        let start = last("agent.start");
+        let args = start["args"].to_string();
+        assert!(
+            args.contains("claude-sonnet-5") && args.contains(&session),
+            "{args}"
+        );
+        assert_eq!(
+            last("agent.prompt")["text"],
+            crate::task::switch_prompt("claude-personal (opus)", "claude-personal (sonnet)")
+        );
+        assert_eq!(second.spec.rounds.ended.len(), 1);
+        assert_eq!(
+            second.spec.rounds.ended[0].ended,
+            "limit: Opus weekly limit reached"
+        );
+
+        // Opus is back: the task stays on Sonnet, a new one starts on Opus.
+        let IpcResponse::Limits(_) = d
+            .handle(IpcRequest::LimitClear {
+                account: "me".into(),
+                model: Some("opus".into()),
+            })
+            .await
+        else {
+            panic!()
+        };
+        let IpcResponse::Task(other) = d
+            .handle(run_fallback(Some("opus"), Some(&["sonnet"]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        assert_eq!(other.model(), Some("opus"));
+        assert_eq!(other.spec.agent_source.unwrap().fallback_use, None);
+        d.fleet().dispatch_queued().await;
+        assert_eq!(get(t.id).model(), Some("sonnet"));
+
+        // The whole account runs out: opencode, from the prompt with the
+        // handover and the end of the last pane.
+        let pane = second.pane_id.clone().unwrap();
+        stop_on(&pane, "You've hit your limit");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        idle(&pane);
+        until("moved on", &|t| t.state == TaskState::Waiting).await;
+        d.fleet().dispatch_queued().await;
+        let third = until("running on gpt5", &|t| {
+            t.state == TaskState::Running && t.model() == Some("gpt5")
+        })
+        .await;
+        assert_eq!(third.spec.agent, "opencode");
+        assert_eq!(third.spec.checkout, Some(checkout.clone()));
+        assert_eq!(last("agent.start")["kind"], "opencode");
+        let text = last("agent.prompt")["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("x"), "{text}");
+        assert!(
+            text.contains("another agent (claude-personal (sonnet))"),
+            "{text}"
+        );
+        assert!(text.contains("Half of it is done."), "{text}");
+        assert!(text.contains("You've hit your limit"), "{text}");
+        let summaries = d.store.summaries(t.id).unwrap();
+        let texts: Vec<_> = summaries.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "limit: Opus weekly limit reached",
+                "limit: You've hit your limit"
+            ]
+        );
+
+        let mut switched = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if ev.kind == "task.agent_switched" && ev.task_id == Some(t.id) {
+                switched.push(ev.detail.unwrap());
+            }
+        }
+        assert_eq!(switched.len(), 2, "{switched:?}");
+        assert_eq!(switched[0]["from"]["model"], "opus");
+        assert_eq!(switched[0]["to"]["model"], "sonnet");
+        assert_eq!(switched[0]["why"], "limit");
+        assert_eq!(switched[0]["handover"], "session");
+        assert!(switched[0]["until"].is_string(), "{:?}", switched[0]);
+        assert_eq!(switched[1]["to"]["agent"], "opencode");
+        assert_eq!(switched[1]["handover"], "pane_tail");
+    }
+
+    /// A task that was to move on finds every model after its own
+    /// exhausted: it waits, until the earliest reset of them, with
+    /// `all_exhausted`; at that time it starts on the first free one.
+    #[tokio::test]
+    async fn a_task_with_every_fallback_exhausted_waits_for_the_earliest_reset() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let mut events = d.subscribe();
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("opus"), Some(&["sonnet"]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        // The whole account is out, as the actor left it: to move on now.
+        d.fleet().record_limit(&seen_limit(&d, "pi", None)).unwrap();
+        let mut t = d.store.get_task(t.id).unwrap().unwrap();
+        t.state = TaskState::Waiting;
+        t.pane_id = None;
+        t.waiting_until = Some(chrono::Utc::now());
+        t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
+            agent: t.spec.agent.clone(),
+            model: Some("opus".into()),
+            why: "limit".into(),
+            line: "You've hit your session limit".into(),
+            until: chrono::Utc::now() + chrono::Duration::hours(1),
+            tail: String::new(),
+            then: crate::task::NextRound::Switch,
+            waited: None,
+            handover: None,
+        }));
+        d.store.update_task(&mut t).unwrap();
+        d.fleet().dispatch_queued().await;
+        let back = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Waiting);
+        let limit = d.store.limits().unwrap()[0].retry_at;
+        assert_eq!(back.waiting_until, Some(limit));
+        assert_eq!(
+            back.spec.rounds.stop.as_ref().map(|s| s.then),
+            Some(crate::task::NextRound::First)
+        );
+        let waiting = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|e| e.kind == "task.waiting")
+            .and_then(|e| e.detail)
+            .unwrap();
+        assert_eq!(waiting["why"], "all_exhausted");
+        assert_eq!(waiting["until"], serde_json::json!(limit));
+        assert_eq!(waiting["models"][0]["account"], "me");
     }
 
     /// Tasks on pi that wait for a limit, each until `in_mins` from now,

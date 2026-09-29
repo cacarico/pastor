@@ -1166,8 +1166,9 @@ enum PaneEnd {
     NotEnded(String),
     ShellRunning,
     /// It stopped on a usage limit (`limit::limit_in`): not done, it waits
-    /// for the reset (`Actor::wait_on_limit`).
-    Limit(crate::limit::Limit),
+    /// for the reset or moves to its next model (`Actor::wait_on_limit`).
+    /// With the pane's text, for an agent it hands the task to.
+    Limit(crate::limit::Limit, String),
 }
 
 /// The error of a task whose agent is not Claude and went idle without
@@ -3334,7 +3335,8 @@ impl Actor {
             && let Some(limit) = self.limit_in(&task, tail)
         {
             return (
-                self.wait_at_start(task, &limit, !resumes_session).await,
+                self.wait_at_start(task, &limit, !resumes_session, tail)
+                    .await,
                 false,
             );
         }
@@ -3361,12 +3363,14 @@ impl Actor {
     /// `wait_on_limit` for a task whose agent died at its start on `limit`:
     /// `task` is the row as the failed start left it, not yet written. Its
     /// pane is closed (there is no agent left to interrupt) and the row
-    /// written `waiting`. `fresh_session` drops the session it started.
+    /// written `waiting`. `fresh_session` drops the session it started;
+    /// `tail` is what its pane showed.
     async fn wait_at_start(
         &self,
         mut task: Task,
         limit: &crate::limit::Limit,
         fresh_session: bool,
+        tail: &str,
     ) -> anyhow::Result<Task> {
         let row = self.keep_limit(&task, limit);
         if let Some(pane) = task.pane_id.clone()
@@ -3376,6 +3380,7 @@ impl Actor {
         }
         let now = Utc::now();
         into_waiting(&mut task, &row, fresh_session, now);
+        self.stop_on_limit(&mut task, &row, limit, tail, now);
         self.store.update_task(&mut task)?;
         self.emit_waiting(&task, &row, now);
         Ok(task)
@@ -3735,19 +3740,19 @@ impl Actor {
             } else {
                 PaneEnd::Finished
             };
-            let short = matches!(&end, PaneEnd::Limit(l) if !l.hard);
+            let short = matches!(&end, PaneEnd::Limit(l, _) if !l.hard);
             if read && !short && !matches!(end, PaneEnd::ShellRunning) {
                 // A turn that ends on anything else than a short limit (one
                 // waiting on a shell has not ended): the count starts over.
                 self.rate_retries.remove(&id);
             }
             match end {
-                PaneEnd::Limit(limit) if !limit.hard && self.retries_left(id) => {
+                PaneEnd::Limit(limit, _) if !limit.hard && self.retries_left(id) => {
                     self.retry_later(task, &observed, &limit)?;
                 }
-                PaneEnd::Limit(limit) => {
+                PaneEnd::Limit(limit, text) => {
                     self.rate_retries.remove(&id);
-                    if let Err(err) = self.wait_on_limit(task, &limit, false).await {
+                    if let Err(err) = self.wait_on_limit(task, &limit, false, &text).await {
                         // The pane could not be closed: look again next window.
                         self.pending_done.insert(id, (seen_seq, Instant::now()));
                         return Err(err);
@@ -4002,12 +4007,16 @@ impl Actor {
     /// kept, and the row pinned to this machine until the limit's
     /// `retry_at`, with its slot freed. `fresh_session` drops a session its
     /// agent never got a prompt in: it died at the start of a new one, and
-    /// the task starts again from its prompt.
+    /// the task starts again from its prompt. A task with a fallback list
+    /// whose reset is not near is left for the next dispatch pass to move
+    /// to its next model (`stop_on_limit`), with `text`, its pane, kept for
+    /// the agent that takes it over.
     async fn wait_on_limit(
         &mut self,
         task: Task,
         limit: &crate::limit::Limit,
         fresh_session: bool,
+        text: &str,
     ) -> anyhow::Result<()> {
         let row = self.keep_limit(&task, limit);
         self.interrupt_and_close(&task).await?;
@@ -4019,6 +4028,7 @@ impl Actor {
                 return false;
             }
             into_waiting(t, &row, fresh_session, now);
+            self.stop_on_limit(t, &row, limit, text, now);
             true
         })?;
         if let Some(t) = waiting {
@@ -4028,15 +4038,59 @@ impl Actor {
         Ok(())
     }
 
+    /// Keep with `t`, which just went `waiting` on `row` (read from
+    /// `limit`), what its next round needs (`task::LimitStop`): wait for
+    /// its own model when the reset is within `[limits] wait_under` or it
+    /// has no fallback list, else move to its next model on the next
+    /// dispatch pass, which is due at once (`waiting_until` is `now`).
+    fn stop_on_limit(
+        &self,
+        t: &mut Task,
+        row: &crate::limit::AccountLimit,
+        limit: &crate::limit::Limit,
+        text: &str,
+        now: DateTime<Utc>,
+    ) {
+        let config = self.settings.limits.clone().unwrap_or_default();
+        let (then, waited) = next_after_limit(t, row, &config, now);
+        if then == crate::task::NextRound::Switch {
+            t.waiting_until = Some(now);
+        }
+        let lines = config.handover_lines as usize;
+        t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
+            agent: t.spec.agent.clone(),
+            model: t.model().map(str::to_string),
+            why: if limit.hard { "limit" } else { "rate_limit" }.into(),
+            line: row.line.clone(),
+            until: row.retry_at,
+            tail: crate::task::pane_tail(text, lines).join("\n"),
+            then,
+            waited,
+            handover: None,
+        }));
+    }
+
     /// `task.waiting` about `t`, which waits on `row`, with what a board
-    /// needs to show it: `waiting 03:00`.
+    /// needs to show it: `waiting 03:00`. None for a task that moves to its
+    /// next model instead: the dispatch pass says what it does.
     fn emit_waiting(&self, t: &Task, row: &crate::limit::AccountLimit, now: DateTime<Utc>) {
-        tracing::info!(machine = %self.name, task = %t.display_id(), until = %row.retry_at, "waiting for a usage limit to reset");
+        let stop = t.spec.rounds.stop.as_deref();
+        if stop.is_some_and(|s| s.then == crate::task::NextRound::Switch) {
+            return;
+        }
+        let waited = stop.and_then(|s| s.waited.clone());
+        let why = if waited.is_some() {
+            "reset_soon"
+        } else {
+            "no_fallback"
+        };
+        tracing::info!(machine = %self.name, task = %t.display_id(), until = %row.retry_at, why, "waiting for a usage limit to reset");
         self.emit_with(
             "task.waiting",
             Some(t.id),
             Some(serde_json::json!({
-                "why": "no_fallback",
+                "why": why,
+                "waited": waited,
                 "account": row.account,
                 "model": row.model,
                 "until": row.retry_at,
@@ -4099,7 +4153,7 @@ impl Actor {
                 // A task its agent ended (`task done`) is done whatever its
                 // pane says.
                 if let Some(limit) = self.limit_in(task, &text) {
-                    return Ok(PaneEnd::Limit(limit));
+                    return Ok(PaneEnd::Limit(limit, text));
                 }
                 // Kept only when the task really is done: a tail left by a
                 // question would reach a later failed task's finish command.
@@ -4557,7 +4611,7 @@ impl Actor {
             Some(id),
             Some(serde_json::json!({"keys": keys, "limit_picker": true})),
         );
-        self.wait_on_limit(task, &picker.limit, false).await
+        self.wait_on_limit(task, &picker.limit, false, &text).await
     }
 
     /// Answer the folder-trust prompt of every task blocked during startup
@@ -4710,6 +4764,41 @@ fn write_task(
     Ok(Some(fresh))
 }
 
+/// What a task that stopped on `row` does next (`task::NextRound`), and why
+/// it waits when it could have moved on. With no fallback list it waits
+/// for its own model. With one, a reset known and within `wait_under` is
+/// waited for, list or not (a short wait keeps the model and the
+/// conversation); any other moves it to its next model. `wait_under = 0`
+/// never waits.
+fn next_after_limit(
+    t: &Task,
+    row: &crate::limit::AccountLimit,
+    limits: &crate::config::LimitsConfig,
+    now: DateTime<Utc>,
+) -> (crate::task::NextRound, Option<String>) {
+    use crate::task::NextRound;
+    if t.spec.agent_source.is_none() || t.fallback().is_empty() {
+        return (NextRound::Own, None);
+    }
+    let wait_under = limits.wait_under_duration();
+    if let Some(until) = row.until
+        && !wait_under.is_zero()
+    {
+        let left = (until - now).to_std().unwrap_or_default();
+        if left <= wait_under {
+            let mins = left.as_secs().div_ceil(60);
+            return (
+                NextRound::Own,
+                Some(format!(
+                    "reset in {mins}m, under wait_under {}",
+                    limits.wait_under.trim()
+                )),
+            );
+        }
+    }
+    (NextRound::Switch, None)
+}
+
 /// Make `t` a task waiting on `row` (`TaskState::Waiting`): no pane or
 /// workspace, pinned to its machine until `row.retry_at`, its error saying
 /// which account and until when. `fresh_session` drops its session.
@@ -4832,6 +4921,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 
@@ -5418,6 +5508,11 @@ mod tests {
         let (_, waiting) = kinds.iter().find(|(k, _)| k == "task.waiting").unwrap();
         let waiting = waiting.as_ref().unwrap();
         assert_eq!(waiting["why"], "no_fallback");
+        assert_eq!(
+            row.spec.rounds.stop.as_ref().map(|s| s.then),
+            Some(crate::task::NextRound::Own),
+            "no list: it waits for its own model"
+        );
         assert!(
             waiting["shown"].as_str().unwrap().starts_with("waiting "),
             "{waiting}"
@@ -5438,6 +5533,90 @@ mod tests {
         );
         let prompt = calls(&fake, "agent.prompt").pop().unwrap();
         assert_eq!(prompt["text"], crate::task::LIMIT_RESUME_PROMPT);
+    }
+
+    /// A task with a fallback list whose agent stops on a limit that resets
+    /// `in_mins` from now, and what it left: its row once `waiting`, and
+    /// the task's events.
+    async fn limited_with_fallback(
+        in_mins: i64,
+    ) -> (Task, Vec<(String, Option<serde_json::Value>)>) {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, mut events) = spawn_with_settings(&fake, &store, limits_kept(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let mut t = new_task(&store);
+        t.spec.agent_source = Some(Box::new(crate::task::AgentSource {
+            model: Some("opus".into()),
+            fallback: vec!["sonnet".into(), "gpt".into()],
+            ..Default::default()
+        }));
+        store.update_task(&mut t).unwrap();
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        let reset = (Utc::now() + chrono::Duration::minutes(in_mins)).timestamp();
+        fake.set_pane_text(
+            &pane,
+            &format!("❯ hi\n\n● Half of it is done.\n\n● Claude AI usage limit reached|{reset}\n\n────────\n❯ \n────────\n"),
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+        let mut kinds = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if ev.task_id == Some(t.id) {
+                kinds.push((ev.kind, ev.detail));
+            }
+        }
+        (store.get_task(t.id).unwrap().unwrap(), kinds)
+    }
+
+    /// With a fallback list and a reset two hours off, the task is left for
+    /// the next dispatch pass to move to its next model, at once, with the
+    /// end of its pane; it says nothing of waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_far_reset_with_a_fallback_list_moves_the_task_on() {
+        let (row, kinds) = limited_with_fallback(120).await;
+        let stop = row.spec.rounds.stop.clone().expect("a stop");
+        assert_eq!(stop.then, crate::task::NextRound::Switch);
+        assert_eq!(
+            (stop.agent.as_str(), stop.model.as_deref()),
+            ("claude", Some("opus"))
+        );
+        assert_eq!(stop.why, "limit");
+        assert!(stop.tail.contains("Half of it is done."), "{}", stop.tail);
+        assert!(row.waiting_until.unwrap() <= Utc::now());
+        assert!(row.spec.session_id.is_some(), "its session is kept");
+        let has = |k: &str| kinds.iter().any(|(kind, _)| kind == k);
+        assert!(has("task.limited"), "{kinds:?}");
+        assert!(!has("task.waiting"), "{kinds:?}");
+    }
+
+    /// A reset ten minutes off is waited for, list or not, and the task
+    /// says why it did not move on.
+    #[tokio::test(start_paused = true)]
+    async fn a_near_reset_is_waited_for_even_with_a_fallback_list() {
+        let (row, kinds) = limited_with_fallback(10).await;
+        let stop = row.spec.rounds.stop.clone().expect("a stop");
+        assert_eq!(stop.then, crate::task::NextRound::Own);
+        let waited = stop.waited.clone().unwrap();
+        assert!(
+            waited.starts_with("reset in ") && waited.ends_with("m, under wait_under 30m"),
+            "{waited}"
+        );
+        assert!(row.waiting_until.unwrap() > Utc::now());
+        let (_, waiting) = kinds.iter().find(|(k, _)| k == "task.waiting").unwrap();
+        let waiting = waiting.as_ref().unwrap();
+        assert_eq!(waiting["why"], "reset_soon");
+        assert_eq!(
+            waiting["until"],
+            serde_json::json!(row.waiting_until.unwrap())
+        );
     }
 
     /// `limits_kept` with short limits retried after 1s, 2s, then 3s.

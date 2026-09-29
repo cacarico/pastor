@@ -1744,12 +1744,12 @@ pub struct LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         LimitsConfig {
-            wait_under: "1h".into(),
+            wait_under: "30m".into(),
             rate_retries: 3,
             rate_backoff: vec!["1m".into(), "5m".into(), "15m".into()],
             unknown_reset_wait: "1h".into(),
             retry_after_no_credit: "6h".into(),
-            handover_lines: 100,
+            handover_lines: 60,
         }
     }
 }
@@ -1759,6 +1759,9 @@ impl LimitsConfig {
         self == &LimitsConfig::default()
     }
     pub fn wait_under_duration(&self) -> Duration {
+        if self.wait_under.trim() == "0" {
+            return Duration::ZERO;
+        }
         duration_or_default(&self.wait_under, &LimitsConfig::default().wait_under)
     }
     /// The wait before retry `attempt` (from 1) of a short limit: that
@@ -1955,6 +1958,8 @@ impl PastorConfig {
             if name.starts_with("close_") && v == CLOSE_NEVER {
                 continue;
             }
+            // A bare `0` is zero in any unit, where zero is allowed.
+            let v = if zero_ok && v.trim() == "0" { "0s" } else { v };
             let d = parse_duration(v)
                 .map_err(|e| anyhow::anyhow!("{}: {name}: {e}", path.display()))?;
             if !zero_ok && d.is_zero() {
@@ -2240,7 +2245,7 @@ mod tests {
         let d = PastorConfig::parse(path, "[limits]\nrate_retries = 1\n").unwrap();
         assert_eq!(d.limits.unknown_reset_wait, "1h");
         assert_eq!(
-            PastorConfig::parse(path, "[limits]\nwait_under = \"0s\"\n")
+            PastorConfig::parse(path, "[limits]\nwait_under = \"0\"\n")
                 .unwrap()
                 .limits
                 .wait_under_duration(),
@@ -3402,6 +3407,7 @@ mod tests {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         }
     }
 

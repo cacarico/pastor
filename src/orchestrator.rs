@@ -1627,6 +1627,7 @@ impl Runner {
             cwd: None,
             keep_pane: None,
             keep_pane_from: None,
+            rounds: Default::default(),
         };
         let task = self
             .fleet
@@ -2908,6 +2909,7 @@ prompt = "You are the night orchestrator."
                         cwd: None,
                         keep_pane: None,
                         keep_pane_from: None,
+                        rounds: Default::default(),
                     },
                     flock: "default".into(),
                 },

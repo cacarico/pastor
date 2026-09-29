@@ -420,6 +420,7 @@ impl Job {
                 cwd: None,
                 keep_pane: d.keep_pane,
                 keep_pane_from: None,
+                rounds: Default::default(),
             },
         })
     }
