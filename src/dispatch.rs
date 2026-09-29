@@ -1183,8 +1183,9 @@ mod tests {
     }
 
     /// One more live task of `flock`, counted on `live`, on `live_jobs`
-    /// when the claim comes from a job, and on that flock's own seat; a
-    /// flock the machine is not in leaves every count untouched.
+    /// when the claim comes from a job, and on that flock's own seat; for
+    /// a flock the machine is not in, `live` still counts it and no seat
+    /// changes.
     #[test]
     fn take_counts_the_task_on_live_and_its_seat() {
         let mut m = MachineView {
@@ -1218,7 +1219,7 @@ mod tests {
     /// `later`'s tasks join `waiting_under_share` only for a machine where
     /// `flock` is past its share and under its max, and only when each is
     /// itself queued, of a different flock under its own share here, with
-    /// no pin elsewhere, every tag the machine has, room for its claim,
+    /// no pin elsewhere, no tag the machine lacks, room for its claim,
     /// and `accepts` it; a flock already in the list does not join twice.
     #[test]
     fn mark_waiting_under_share_filters_each_later_task() {
@@ -1294,11 +1295,14 @@ mod tests {
         run(&mut views, &[pinned], &accepts_all);
         assert!(views[0].waiting_under_share.is_empty(), "pinned elsewhere");
 
-        // Missing a tag the machine has.
+        // Asks for a tag the machine lacks.
         let mut views = vec![desk(1, 1)];
         let tagged = home_task(|t| t.spec.tags = vec!["gpu".into()]);
         run(&mut views, &[tagged], &accepts_all);
-        assert!(views[0].waiting_under_share.is_empty(), "missing tag");
+        assert!(
+            views[0].waiting_under_share.is_empty(),
+            "tag the machine lacks"
+        );
 
         // No room for its claim: the machine's own limit is already met.
         let full = MachineView {
