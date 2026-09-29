@@ -24,6 +24,6 @@
 
 ### Changed
 
-- The store is at schema 14: the `limits` table and `tasks.waiting_until`.
+- The store is at schema 15: the `limits` table and `tasks.waiting_until`.
   An older store migrates on first open; a store at 14 is refused by an
   older pastor, so the release needs a release candidate.

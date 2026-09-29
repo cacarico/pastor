@@ -296,6 +296,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 
 | Code | When |
 | --- | --- |
+| `account_exhausted` | every model the task may run is on an account that ran out where it would run |
 | `agent_kind_missing` | the task's flock names an agent of a kind the machine has none of |
 | `agent_pane_busy` | herdr kept saying the agent's pane was busy after pastor's retries |
 | `agent_refused` | a task or an orchestrator's script asks for a fleet change agents may not make |
@@ -350,6 +351,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `not_allowed_for_agent` | an agent's bridge will not pass the request on |
 | `not_an_orchestrator` | an orchestrator note from a task no orchestrator file started |
 | `not_at_trust_prompt` | `task send --trust` to a task not blocked on its startup prompt |
+| `not_exhausted` | `limit clear` of an account, or an account's model, with no limit kept |
 | `not_in_flock` | the machine is not in that flock |
 | `not_on_machine` | a pull machine reported a task that is not on it |
 | `not_prunable` | `task prune` of a state other than done, failed or closed |
