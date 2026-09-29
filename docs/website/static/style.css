@@ -80,7 +80,9 @@ b, strong { font-weight: 700; color: var(--hot); }
 .term .call .in { color: var(--sel-ink); }
 .term .res { color: var(--dim); }
 /* its controls sit on the pane's top border, like the title on the left */
-.term-ctl { position: absolute; top: -.85em; right: 1ch; display: flex; align-items: center; gap: 1ch; padding: 0 1ch; background: var(--bg); }
+/* only the lower half is painted: enough to hide the border under it, and
+   nothing shows above the border where the page, or a popup's backdrop, is */
+.term-ctl { position: absolute; top: -10px; height: 20px; right: 1ch; display: flex; align-items: center; gap: 1ch; padding: 0 1ch; background: linear-gradient(transparent 45%, var(--bg) 45%); }
 .term-ctl[hidden] { display: none; }
 .term-ctl .act { width: 11px; height: 11px; padding: 0; border: 1.5px solid var(--ink); border-radius: 50%; background: transparent; cursor: pointer; }
 .term-ctl .act.on { background: var(--accent); border-color: var(--accent); }
@@ -93,6 +95,7 @@ b, strong { font-weight: 700; color: var(--hot); }
 /* the terminal's bigger view: a centred dialog, 60% of the window each way */
 .term-big { width: 60vw; height: 60vh; max-width: none; max-height: none; padding: 0; border: 0; background: transparent; color: var(--ink); overflow: visible; }
 .term-big::backdrop { background: rgb(0 0 0 / .65); }
+.term-big .pane > .t { background: linear-gradient(transparent 45%, var(--bg) 45%); }
 .term-big .pane { height: 100%; display: flex; flex-direction: column; background: var(--bg); padding: 16px 12px 12px; }
 .term-big .term { flex: 1; height: auto; margin: 0; font-size: 13px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
