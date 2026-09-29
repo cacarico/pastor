@@ -12803,9 +12803,20 @@ mod tests {
         .await
         .expect("a run on b does not wait for a's dispatch");
         assert_eq!(state_of(&d, &run), TaskState::Running);
-        assert!(!pass.is_finished(), "a is still starting its agent");
+        // Ask the task, not `pass`: the scheduler's own tick also dispatches,
+        // and under load it can claim `a`'s task first, leaving `pass` with
+        // nothing to send.
+        assert_eq!(
+            state_of(&d, &first),
+            TaskState::Starting,
+            "a is still starting its agent"
+        );
         pass.await.unwrap();
-        assert_eq!(state_of(&d, &first), TaskState::Running);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state_of(&d, &first) != TaskState::Running {
+            assert!(Instant::now() < deadline, "a never started its agent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Two passes racing for one task that two machines could take send it
