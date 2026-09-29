@@ -1146,6 +1146,7 @@ mod tests {
             aged_from: None,
             aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
             summary: None,
             created_at: now,
             started_at: Some(now),

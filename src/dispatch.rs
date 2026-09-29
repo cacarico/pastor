@@ -266,6 +266,12 @@ pub enum DispatchError {
     /// never came up, the agent exited. The task failed; the machine is fine.
     #[error("{0}")]
     Task(String),
+    /// The agent exited before it took its prompt. `tail` is the end of its
+    /// pane as it was then, empty when it could not be read: an agent can
+    /// die at its start on a usage limit, and only its pane says so
+    /// (`limit::limit_in`).
+    #[error("{message}")]
+    Exited { message: String, tail: String },
 }
 
 impl From<HerdrError> for DispatchError {
@@ -278,7 +284,7 @@ impl DispatchError {
     pub fn code(&self) -> Option<&str> {
         match self {
             DispatchError::Call(err) => err.code(),
-            DispatchError::Task(_) => None,
+            DispatchError::Task(_) | DispatchError::Exited { .. } => None,
         }
     }
 
@@ -376,6 +382,11 @@ async fn dispatch_steps(
     resume: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
     let spec = task.spec.clone();
+    // A waiting task goes on after a usage limit (`TaskState::Waiting`): with
+    // its session when it has one, else from its prompt again, in the same
+    // checkout.
+    let limited = resume && task.waiting_until.take().is_some();
+    let restart = limited && spec.session_id.is_none();
     // Before anything is made on the machine: a task whose agent cannot take
     // its tool lists (an `[agents]` edit since it was queued) leaves nothing
     // behind.
@@ -406,7 +417,7 @@ async fn dispatch_steps(
     // task that failed before then never had that conversation to resume.
     // A paused task goes back to the session it recorded instead.
     let mut session = None;
-    if resume {
+    if resume && !restart {
         let id = spec
             .session_id
             .clone()
@@ -564,7 +575,15 @@ async fn dispatch_steps(
         }
     };
     // A resumed session already has the line asking for a summary.
-    let prompt = if resume {
+    let prompt = if restart {
+        format!(
+            "{}\n\n{}",
+            crate::task::prompt_to_send(task).trim_end(),
+            crate::task::LIMIT_HANDOVER
+        )
+    } else if limited {
+        crate::task::LIMIT_RESUME_PROMPT.to_string()
+    } else if resume {
         crate::task::RESUME_PROMPT.to_string()
     } else {
         crate::task::prompt_to_send(task)
@@ -1010,10 +1029,15 @@ async fn prompt_when_ready(
     loop {
         let agents = conn.agent_list().await?;
         let Some(agent) = agents.iter().find(|a| a.name.as_deref() == Some(name)) else {
-            return Err(DispatchError::Task(format!(
-                "agent {name} exited before accepting a prompt (is `{}` installed on {machine}?)",
-                task.spec.agent
-            )));
+            return Err(exited(
+                conn,
+                task,
+                format!(
+                    "agent {name} exited before accepting a prompt (is `{}` installed on {machine}?)",
+                    task.spec.agent
+                ),
+            )
+            .await);
         };
         if agent.agent_status == AgentStatus::Blocked {
             // Waiting for a human, usually on the agent's own startup question
@@ -1048,10 +1072,15 @@ async fn prompt_when_ready(
                 Err(err) => return Err(err.into()),
             }
         } else {
-            return Err(DispatchError::Task(format!(
-                "agent {name} exited before becoming interactive (is `{}` installed on {machine}?)",
-                task.spec.agent
-            )));
+            return Err(exited(
+                conn,
+                task,
+                format!(
+                    "agent {name} exited before becoming interactive (is `{}` installed on {machine}?)",
+                    task.spec.agent
+                ),
+            )
+            .await);
         }
         let now = Instant::now();
         if now >= deadline {
@@ -1062,6 +1091,23 @@ async fn prompt_when_ready(
         }
         tokio::time::sleep(READY_POLL.min(deadline - now)).await;
     }
+}
+
+/// How many lines of an agent's pane `exited` keeps.
+const EXIT_TAIL_LINES: u32 = 30;
+
+/// `DispatchError::Exited` with `message` and the end of `task`'s pane,
+/// read by its pane id since the agent is gone. A pane that cannot be read
+/// leaves the tail empty: the task fails as it would have anyway.
+async fn exited(conn: &dyn Connector, task: &Task, message: String) -> DispatchError {
+    let tail = match task.pane_id.as_deref() {
+        Some(pane) => conn
+            .agent_read(pane, EXIT_TAIL_LINES)
+            .await
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    DispatchError::Exited { message, tail }
 }
 
 #[cfg(all(test, feature = "fake-herdr"))]
@@ -1339,6 +1385,7 @@ mod tests {
             aged_from: None,
             aged_at: None,
             pause: Default::default(),
+            waiting_until: None,
             summary: None,
             created_at: now,
             started_at: None,
@@ -2494,6 +2541,86 @@ mod tests {
             .find(|r| r.method == "workspace.create" && r.params["label"] != "pastor")
             .unwrap();
         assert_eq!(req.params["cwd"], "/home/fake");
+    }
+
+    /// A waiting task goes on after its limit: with its session and the
+    /// limit's resume line when it has one, else a new session with its
+    /// prompt and the handover paragraph. Either way `waiting_until` goes.
+    #[tokio::test]
+    async fn a_waiting_task_resumes_its_session_or_starts_again_with_a_handover() {
+        let started = |fake: &FakeHerdr| {
+            let reqs = fake.requests();
+            let start = reqs
+                .iter()
+                .rev()
+                .find(|r| r.method == "agent.start")
+                .unwrap();
+            let prompt = reqs
+                .iter()
+                .rev()
+                .find(|r| r.method == "agent.prompt")
+                .unwrap();
+            (
+                start.params["args"].to_string(),
+                prompt.params["text"].as_str().unwrap().to_string(),
+            )
+        };
+        let session = "0d5bd3a4-2f35-4e1c-9f59-7c1c3a7b8e21";
+        let fake = FakeHerdr::new();
+        let mut t = task(DispatchSpec {
+            session_id: Some(session.into()),
+            ..spec()
+        });
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let (args, prompt) = started(&fake);
+        assert!(
+            args.contains("--resume") && args.contains(session),
+            "{args}"
+        );
+        assert_eq!(prompt, crate::task::LIMIT_RESUME_PROMPT);
+        assert_eq!(t.waiting_until, None);
+        assert_eq!(t.spec.session_id.as_deref(), Some(session));
+
+        let fake = FakeHerdr::new();
+        let mut t = task(spec());
+        t.waiting_until = Some(Utc::now());
+        resume(&fake, &mut t, &Agents::default(), None, READY)
+            .await
+            .unwrap();
+        let (args, prompt) = started(&fake);
+        assert!(args.contains("--session-id"), "{args}");
+        assert!(prompt.starts_with("line one"), "{prompt}");
+        assert!(prompt.ends_with(crate::task::LIMIT_HANDOVER), "{prompt}");
+        assert_eq!(t.waiting_until, None);
+        assert!(t.spec.session_id.is_some(), "a new session to resume next");
+    }
+
+    /// An agent that dies at its start leaves the end of its pane on the
+    /// error, for a usage limit to be read from.
+    #[tokio::test]
+    async fn an_agent_that_exits_on_start_leaves_its_pane_tail() {
+        for listed in [false, true] {
+            let fake = FakeHerdr::new();
+            if listed {
+                fake.exit_agents_listed(true);
+            } else {
+                fake.exit_agents_on_start(true);
+            }
+            fake.set_exit_screen("You've hit your limit · resets 3am\n");
+            let mut t = task(spec());
+            let err = dispatch(&fake, &mut t, &Agents::default(), None, READY)
+                .await
+                .unwrap_err();
+            let DispatchError::Exited { message, tail } = &err else {
+                panic!("{err:?}");
+            };
+            assert!(message.contains("exited before"), "{message}");
+            assert!(tail.contains("You've hit your limit"), "{tail}");
+            assert_eq!(t.error.as_deref(), Some(message.as_str()));
+        }
     }
 
     /// Where `~` cannot be resolved the task fails up front with a reason,

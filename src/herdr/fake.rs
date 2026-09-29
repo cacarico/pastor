@@ -65,6 +65,9 @@ struct State {
     /// Where `requests` is written, whole, each time one is received.
     request_log: Option<std::path::PathBuf>,
     start: Option<StartBehaviour>,
+    /// What the pane of an agent that exits on start shows (`agent.read`
+    /// by pane id); see `set_exit_screen`.
+    exit_screen: Option<String>,
     protocol: u32,
     /// A method name that, once received, gets no reply at all: the connection
     /// just stops answering, simulating a wedged herdr.
@@ -311,6 +314,12 @@ impl FakeHerdr {
     /// managed agent whose process exited before becoming interactive.
     pub fn exit_agents_listed(&self, yes: bool) {
         self.state.lock().unwrap().exit_listed = yes;
+    }
+    /// What the pane of each agent that exits on start shows from then on
+    /// (`exit_agents_on_start`, `exit_agents_listed`), read by its pane id:
+    /// an agent that dies on a usage limit leaves the message there.
+    pub fn set_exit_screen(&self, text: &str) {
+        self.state.lock().unwrap().exit_screen = Some(text.into());
     }
     /// The next `n` `agent.start` calls answer `agent_pane_busy`, the way
     /// herdr refuses a pane whose shell has not finished starting (t-42 and
@@ -1005,6 +1014,11 @@ impl FakeHerdr {
                     launch_pending: false,
                     interactive_ready: true,
                 };
+                if (s.exit_listed || s.exit_on_start)
+                    && let Some(text) = s.exit_screen.clone()
+                {
+                    s.pane_text.insert(pane_id.clone(), text);
+                }
                 if s.exit_listed {
                     // The agent process died on launch, but herdr keeps the pane
                     // in `agent.list` with neither launch flag set, the way it
@@ -1154,7 +1168,9 @@ impl FakeHerdr {
                         && a.agent_status == AgentStatus::Blocked
                         && !s.trust_answered.contains_key(&a.pane_id)
                 });
-                let text = match found.and_then(|a| s.pane_text.get(&a.pane_id)) {
+                // A pane whose agent is gone is read by its id.
+                let pane = found.map_or(target, |a| a.pane_id.as_str());
+                let text = match s.pane_text.get(pane) {
                     Some(text) => text.as_str(),
                     None if at_trust && s.trust_screen.is_empty() => CLAUDE_TRUST_SCREEN,
                     None if at_trust => s.trust_screen.as_str(),

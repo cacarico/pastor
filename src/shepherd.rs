@@ -165,10 +165,15 @@ pub async fn run(paths: Paths, head: String, ask: Ask) -> anyhow::Result<()> {
         config.shepherd.machine_name(),
         config.shepherd.flock_work(),
         shepherd_connector(&config),
-        crate::daemon::machine_settings(&PastorConfig {
-            head_address: None,
-            ..config.clone()
-        }),
+        // The head keeps the limits: a limit read here would be one it never
+        // hears of, so this machine's tasks settle as before.
+        MachineSettings {
+            limits: None,
+            ..crate::daemon::machine_settings(&PastorConfig {
+                head_address: None,
+                ..config.clone()
+            })
+        },
         store.clone(),
         ask.clone(),
     );

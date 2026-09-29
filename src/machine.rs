@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 // tokio's clock, not std's: it is the one the timers here run on, and the one
@@ -339,6 +339,11 @@ pub struct MachineSettings {
     /// `head_address` in `pastor.toml`, for a machine other than the head's
     /// own (`daemon::actor_settings`): its agents get it as `ipc::HEAD_ENV`.
     pub head_address: Option<String>,
+    /// `[limits]` in `pastor.toml`, on the head: a task whose agent stops
+    /// on a usage limit goes `waiting` and its limit goes in the table.
+    /// `None` on a headless serve, which keeps no table: its tasks settle as
+    /// if no limit were read.
+    pub limits: Option<crate::config::LimitsConfig>,
 }
 
 impl Default for MachineSettings {
@@ -356,6 +361,7 @@ impl Default for MachineSettings {
             version_every: Duration::from_secs(10 * 60),
             agents: crate::config::Agents::default(),
             head_address: None,
+            limits: None,
         }
     }
 }
@@ -1145,6 +1151,9 @@ enum PaneEnd {
     Finished,
     Question(String),
     ShellRunning,
+    /// It stopped on a usage limit (`limit::limit_in`): not done, it waits
+    /// for the reset (`Actor::wait_on_limit`).
+    Limit(crate::limit::Limit),
 }
 
 /// Who asked for a close. `pastor task close` refuses what herdr refuses;
@@ -3066,24 +3075,7 @@ impl Actor {
             return Err(refuse(why).into());
         }
         let name = task.display_id();
-        if let Some(pane) = task.pane_id.as_deref() {
-            let timeout = self.settings.request_timeout;
-            let keys = ["esc".to_string()];
-            match tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
-                .await
-                .map_err(|_| TimedOut("pane.send_keys", timeout))?
-            {
-                Ok(()) => {}
-                // Gone already: nothing left to interrupt.
-                Err(err) if err.code() == Some("pane_not_found") => {}
-                Err(err) => {
-                    return Err(
-                        anyhow::Error::from(err).context(format!("interrupt the agent of {name}"))
-                    );
-                }
-            }
-            self.close_pane_of(pane, &name).await?;
-        }
+        self.interrupt_and_close(&task).await?;
         self.pending_done.remove(&task_id);
         let now = Utc::now();
         let paused = write_task(&self.store, task, |t| {
@@ -3201,6 +3193,9 @@ impl Actor {
             Err(e) => return (Err(e), false),
         };
         self.keep_occupied_checkout(&mut task).await;
+        // Whether the agent goes back to a conversation it had: one that dies
+        // at the start of a new one never got its prompt there.
+        let resumes_session = resume && task.spec.session_id.is_some();
         let timeout = self.settings.request_timeout;
         let start = async {
             let (conn, agents) = (self.connector.as_ref(), &self.settings.agents);
@@ -3233,6 +3228,16 @@ impl Actor {
             }
         };
         let dead = matches!(&outcome, Err(err) if err.is_transport());
+        // An agent that died at its start on a usage limit: the task waits
+        // for the reset, it has not failed.
+        if let Err(crate::dispatch::DispatchError::Exited { tail, .. }) = &outcome
+            && let Some(limit) = self.limit_in(&task, tail)
+        {
+            return (
+                self.wait_at_start(task, &limit, !resumes_session).await,
+                false,
+            );
+        }
         if let Err(err) = self.store.update_task(&mut task) {
             return (Err(err), dead);
         }
@@ -3249,6 +3254,31 @@ impl Actor {
                 )
             }
         }
+    }
+}
+
+impl Actor {
+    /// `wait_on_limit` for a task whose agent died at its start on `limit`:
+    /// `task` is the row as the failed start left it, not yet written. Its
+    /// pane is closed (there is no agent left to interrupt) and the row
+    /// written `waiting`. `fresh_session` drops the session it started.
+    async fn wait_at_start(
+        &self,
+        mut task: Task,
+        limit: &crate::limit::Limit,
+        fresh_session: bool,
+    ) -> anyhow::Result<Task> {
+        let row = self.keep_limit(&task, limit);
+        if let Some(pane) = task.pane_id.clone()
+            && let Err(err) = self.close_pane_of(&pane, &task.display_id()).await
+        {
+            tracing::warn!(machine = %self.name, task = %task.display_id(), err = %format!("{err:#}"), "close the pane of an agent that died on a usage limit");
+        }
+        let now = Utc::now();
+        into_waiting(&mut task, &row, fresh_session, now);
+        self.store.update_task(&mut task)?;
+        self.emit_waiting(&task, &row, now);
+        Ok(task)
     }
 }
 
@@ -3581,6 +3611,13 @@ impl Actor {
                 PaneEnd::Finished
             };
             match end {
+                PaneEnd::Limit(limit) => {
+                    if let Err(err) = self.wait_on_limit(task, &limit, false).await {
+                        // The pane could not be closed: look again next window.
+                        self.pending_done.insert(id, (seen_seq, Instant::now()));
+                        return Err(err);
+                    }
+                }
                 PaneEnd::Question(question) => self.block_on_question(task, &observed, question),
                 PaneEnd::ShellRunning => {
                     // The agent ended its turn waiting on a background shell
@@ -3644,6 +3681,134 @@ impl Actor {
         Ok(())
     }
 
+    /// The usage limit `task`'s agent stopped on, if `text`, the end of its
+    /// pane, ends on one. None on a task its agent ended (`task done`), and
+    /// none where no table is kept (`MachineSettings::limits`).
+    fn limit_in(&self, task: &Task, text: &str) -> Option<crate::limit::Limit> {
+        if task.ended || self.settings.limits.is_none() {
+            return None;
+        }
+        let kind = self.settings.agents.kind(&task.spec.agent);
+        crate::limit::limit_in(kind, text, Utc::now())
+    }
+
+    /// Keep `limit`, which `task`'s agent stopped on, in the table under the
+    /// account its agent names here (`Agents::limit_key`), with
+    /// `agent.exhausted` and `task.limited`, and answer the row. A limit
+    /// that is not hard (a 429 or 529 past Claude's own retries) is kept as
+    /// one with no reset named. The row is answered even when the store
+    /// refuses it: the task waits all the same.
+    fn keep_limit(&self, task: &Task, limit: &crate::limit::Limit) -> crate::limit::AccountLimit {
+        let now = Utc::now();
+        let mut limit = limit.clone();
+        if !limit.hard {
+            limit.until = None;
+        }
+        let key = self.settings.agents.limit_key(&self.name, &task.spec.agent);
+        let config = self.settings.limits.clone().unwrap_or_default();
+        let row = crate::limit::AccountLimit::of(
+            &key,
+            task.model(),
+            &limit,
+            Some(task.id),
+            Some(&self.name),
+            Some(&task.spec.agent),
+            now,
+            &config,
+        );
+        match self.store.record_limit(&row) {
+            Ok(()) => {
+                tracing::warn!(machine = %self.name, task = %task.display_id(), account = %row.account, model = ?row.model, retry_at = %row.retry_at, "account exhausted");
+                self.emit_with(
+                    "agent.exhausted",
+                    Some(task.id),
+                    Some(row.event_detail(None)),
+                );
+            }
+            Err(err) => {
+                tracing::error!(machine = %self.name, task = %task.display_id(), %err, "keep the usage limit")
+            }
+        }
+        self.emit_with("task.limited", Some(task.id), Some(row.event_detail(None)));
+        row
+    }
+
+    /// `task`, whose agent stopped on `limit`, goes `waiting`
+    /// (`TaskState::Waiting`): the limit is kept (`keep_limit`), the pane
+    /// closed as a pause closes it (`interrupt_and_close`), the worktree
+    /// kept, and the row pinned to this machine until the limit's
+    /// `retry_at`, with its slot freed. `fresh_session` drops a session its
+    /// agent never got a prompt in: it died at the start of a new one, and
+    /// the task starts again from its prompt.
+    async fn wait_on_limit(
+        &mut self,
+        task: Task,
+        limit: &crate::limit::Limit,
+        fresh_session: bool,
+    ) -> anyhow::Result<()> {
+        let row = self.keep_limit(&task, limit);
+        self.interrupt_and_close(&task).await?;
+        self.pending_done.remove(&task.id);
+        self.unseen_prompt.remove(&task.id);
+        let now = Utc::now();
+        let waiting = write_task(&self.store, task, |t| {
+            if !t.state.occupies_pane() || t.ended {
+                return false;
+            }
+            into_waiting(t, &row, fresh_session, now);
+            true
+        })?;
+        if let Some(t) = waiting {
+            self.emit_waiting(&t, &row, now);
+            self.refresh_live();
+        }
+        Ok(())
+    }
+
+    /// `task.waiting` about `t`, which waits on `row`, with what a board
+    /// needs to show it: `waiting 03:00`.
+    fn emit_waiting(&self, t: &Task, row: &crate::limit::AccountLimit, now: DateTime<Utc>) {
+        tracing::info!(machine = %self.name, task = %t.display_id(), until = %row.retry_at, "waiting for a usage limit to reset");
+        self.emit_with(
+            "task.waiting",
+            Some(t.id),
+            Some(serde_json::json!({
+                "why": "no_fallback",
+                "account": row.account,
+                "model": row.model,
+                "until": row.retry_at,
+                "shown": format!("waiting {}", crate::limit::local_time(row.retry_at, now)),
+            })),
+        );
+    }
+
+    /// Interrupt `task`'s agent (`esc`, so Claude ends its turn and saves
+    /// the conversation as it stands), then close its pane, which ends the
+    /// agent. A worktree stays on disk: only `worktree.remove` deletes one.
+    /// A pane already gone is what this wanted.
+    async fn interrupt_and_close(&self, task: &Task) -> anyhow::Result<()> {
+        let Some(pane) = task.pane_id.as_deref() else {
+            return Ok(());
+        };
+        let name = task.display_id();
+        let timeout = self.settings.request_timeout;
+        let keys = ["esc".to_string()];
+        match tokio::time::timeout(timeout, self.connector.pane_send_keys(pane, &keys))
+            .await
+            .map_err(|_| TimedOut("pane.send_keys", timeout))?
+        {
+            Ok(()) => {}
+            // Gone already: nothing left to interrupt.
+            Err(err) if err.code() == Some("pane_not_found") => {}
+            Err(err) => {
+                return Err(
+                    anyhow::Error::from(err).context(format!("interrupt the agent of {name}"))
+                );
+            }
+        }
+        self.close_pane_of(pane, &name).await
+    }
+
     /// How the task's agent ended its turn, read from the tail of its pane:
     /// on a question (`task::trailing_question`), waiting on a background
     /// shell (`task::background_shell_running`), or finished. A pane herdr
@@ -3660,6 +3825,11 @@ impl Actor {
             Ok(Ok(text)) => {
                 if crate::task::background_shell_running(&text) {
                     return Ok(PaneEnd::ShellRunning);
+                }
+                // A task its agent ended (`task done`) is done whatever its
+                // pane says.
+                if let Some(limit) = self.limit_in(task, &text) {
+                    return Ok(PaneEnd::Limit(limit));
                 }
                 // Kept only when the task really is done: a tail left by a
                 // question would reach a later failed task's finish command.
@@ -4177,6 +4347,28 @@ fn write_task(
     Ok(Some(fresh))
 }
 
+/// Make `t` a task waiting on `row` (`TaskState::Waiting`): no pane or
+/// workspace, pinned to its machine until `row.retry_at`, its error saying
+/// which account and until when. `fresh_session` drops its session.
+fn into_waiting(
+    t: &mut Task,
+    row: &crate::limit::AccountLimit,
+    fresh_session: bool,
+    now: DateTime<Utc>,
+) {
+    t.state = TaskState::Waiting;
+    t.pane_id = None;
+    t.workspace_id = None;
+    t.prompt_pending = false;
+    t.activity_seen = false;
+    t.finished_at = None;
+    t.waiting_until = Some(row.retry_at);
+    t.error = Some(row.note(now));
+    if fresh_session {
+        t.spec.session_id = None;
+    }
+}
+
 /// What `agent.list` says about an agent, as a state machine observation.
 fn observed_from(agent: &AgentInfo) -> Observed {
     Observed::Status {
@@ -4225,6 +4417,7 @@ mod tests {
             version_every: Duration::from_millis(200),
             agents: Default::default(),
             head_address: None,
+            limits: None,
         }
     }
 
@@ -4744,6 +4937,177 @@ mod tests {
         fake.set_pane_text(&pane, "● Kept it. Pushed the branch.\n\n❯\n");
         fake.set_status(&pane, AgentStatus::Idle);
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// `settings_with_settle` on a head, which keeps the limits.
+    fn limits_kept(settle: Duration) -> MachineSettings {
+        MachineSettings {
+            limits: Some(Default::default()),
+            ..settings_with_settle(settle)
+        }
+    }
+
+    /// The bug: an agent that stops on "You've hit your limit" is idle
+    /// like one that finished. Its task goes `waiting`, not done: the limit
+    /// in the table, `esc` and its pane closed, its checkout kept, pinned
+    /// here until the reset. Resumed, it goes back to its session with the
+    /// limit's resume line.
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_idle_on_a_usage_limit_waits_and_resumes_its_session() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, mut events) = spawn_with_settings(&fake, &store, limits_kept(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        let session = t.spec.session_id.clone().expect("a Claude session");
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(
+            &pane,
+            "❯ hi\n\n● Half of it is done.\n\n● You've hit your limit · resets 3am (UTC)\n\n────────\n❯ \n────────\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.pane_id, None);
+        assert_eq!(row.workspace_id, None);
+        assert_eq!(row.machine.as_deref(), Some("m"));
+        assert_eq!(row.spec.session_id.as_deref(), Some(session.as_str()));
+        let limits = store.limits().unwrap();
+        assert_eq!(limits.len(), 1, "{limits:?}");
+        assert_eq!(limits[0].account, "m/claude");
+        assert_eq!(limits[0].task_id, Some(t.id));
+        assert_eq!(row.waiting_until, Some(limits[0].retry_at));
+        let error = row.error.clone().unwrap();
+        assert!(error.starts_with("m/claude exhausted until "), "{error}");
+        assert_eq!(
+            fake.pane_input(&pane),
+            vec![crate::herdr::fake::PaneInput::Keys(vec!["esc".into()])]
+        );
+        assert!(
+            calls(&fake, "pane.close")
+                .iter()
+                .any(|c| c["pane_id"] == pane.as_str())
+        );
+        let mut kinds = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if ev.task_id == Some(t.id) {
+                kinds.push((ev.kind, ev.detail));
+            }
+        }
+        let has = |k: &str| kinds.iter().any(|(kind, _)| kind == k);
+        assert!(has("agent.exhausted") && has("task.limited"), "{kinds:?}");
+        assert!(!has("task.done"), "{kinds:?}");
+        let (_, waiting) = kinds.iter().find(|(k, _)| k == "task.waiting").unwrap();
+        let waiting = waiting.as_ref().unwrap();
+        assert_eq!(waiting["why"], "no_fallback");
+        assert!(
+            waiting["shown"].as_str().unwrap().starts_with("waiting "),
+            "{waiting}"
+        );
+
+        // Nothing seen on the machine moves it meanwhile.
+        tokio::time::sleep(settle * 4).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Waiting);
+
+        let t = h.resume(t.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(t.waiting_until, None);
+        let start = calls(&fake, "agent.start").pop().unwrap();
+        assert!(
+            start["args"].to_string().contains(&session),
+            "{}",
+            start["args"]
+        );
+        let prompt = calls(&fake, "agent.prompt").pop().unwrap();
+        assert_eq!(prompt["text"], crate::task::LIMIT_RESUME_PROMPT);
+    }
+
+    /// A limit further up the pane than the last prompt is an old one:
+    /// the task is done. So is one whose agent said it was (`task done`),
+    /// whatever its pane shows.
+    #[tokio::test(start_paused = true)]
+    async fn a_limit_above_the_last_prompt_or_after_task_done_is_no_limit() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, limits_kept(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(
+            &pane,
+            "● You've hit your limit · resets 3am\n\n❯ go on\n\n● Finished it.\n\n────────\n❯ \n────────\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        assert!(store.limits().unwrap().is_empty());
+
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        h.end(t.id, None).await.unwrap();
+        fake.set_pane_text(
+            &pane,
+            "● You've hit your limit · resets 3am\n\n────────\n❯ \n────────\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 4).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Done);
+        assert!(row.ended);
+        assert!(store.limits().unwrap().is_empty());
+    }
+
+    /// An agent that dies at its start on a usage limit: the task waits
+    /// for the reset instead of failing, and drops the session it never
+    /// got its prompt in, to start again from its prompt.
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_that_dies_at_start_on_a_limit_waits_not_fails() {
+        let fake = FakeHerdr::new();
+        fake.exit_agents_on_start(true);
+        fake.set_exit_screen("You've hit your limit · resets 3am\n");
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) =
+            spawn_with_settings(&fake, &store, limits_kept(Duration::from_millis(100)));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        assert_eq!(t.state, TaskState::Waiting);
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Waiting);
+        assert_eq!(row.spec.session_id, None);
+        assert_eq!(row.pane_id, None);
+        assert!(row.waiting_until.is_some());
+        assert_eq!(store.limits().unwrap().len(), 1);
+        assert!(saw(&mut events, "task.waiting", t.id));
+
+        // Without a table (a headless serve) it fails as before.
+        let fake = FakeHerdr::new();
+        fake.exit_agents_on_start(true);
+        fake.set_exit_screen("You've hit your limit · resets 3am\n");
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn_with_settings(&fake, &store, settings());
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        assert!(h.dispatch(t.id).await.is_err());
+        assert_eq!(state_of(&store, t.id), TaskState::Failed);
     }
 
     /// Claude can end its turn with a command left running in the

@@ -3563,6 +3563,7 @@ mod tests {
                 TaskState::Running,
                 TaskState::Blocked,
                 TaskState::Paused,
+                TaskState::Waiting,
             ]
         );
         for s in [

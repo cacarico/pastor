@@ -59,6 +59,7 @@ pub fn machine_settings(config: &PastorConfig) -> MachineSettings {
         close_failed_after: config.close_failed_after_duration(),
         agents: config.agents.clone(),
         head_address: config.head_address.clone(),
+        limits: Some(config.limits.clone()),
         ..Default::default()
     }
 }
@@ -1889,26 +1890,7 @@ impl Fleet {
         let Some(spawner) = &self.spawner else {
             return;
         };
-        let mut detail = serde_json::json!({
-            "account": limit.account,
-            "model": limit.model,
-            "agent": limit.agent,
-            "retry_at": limit.retry_at,
-        });
-        if let Some(obj) = detail.as_object_mut() {
-            match by {
-                Some(by) => {
-                    obj.insert("by".into(), by.into());
-                }
-                None => {
-                    obj.insert("until".into(), serde_json::json!(limit.until));
-                    obj.insert("hard".into(), limit.hard.into());
-                    obj.insert("no_credit".into(), limit.no_credit.into());
-                    obj.insert("what".into(), limit.what().into());
-                    obj.insert("line".into(), limit.line.clone().into());
-                }
-            }
-        }
+        let detail = limit.event_detail(by);
         let _ = spawner.events.send(PastorEvent {
             kind: kind.into(),
             task_id: limit.task_id,

@@ -189,6 +189,32 @@ impl AccountLimit {
         what_of(&self.line, self.hard, self.no_credit)
     }
 
+    /// The detail of `agent.exhausted` (`by` is `None`) or `agent.reset`
+    /// (`by: time` or `hand`) about this row.
+    pub fn event_detail(&self, by: Option<&str>) -> serde_json::Value {
+        let mut detail = serde_json::json!({
+            "account": self.account,
+            "model": self.model,
+            "agent": self.agent,
+            "retry_at": self.retry_at,
+        });
+        if let Some(obj) = detail.as_object_mut() {
+            match by {
+                Some(by) => {
+                    obj.insert("by".into(), by.into());
+                }
+                None => {
+                    obj.insert("until".into(), serde_json::json!(self.until));
+                    obj.insert("hard".into(), self.hard.into());
+                    obj.insert("no_credit".into(), self.no_credit.into());
+                    obj.insert("what".into(), self.what().into());
+                    obj.insert("line".into(), self.line.clone().into());
+                }
+            }
+        }
+        detail
+    }
+
     /// `claude-personal exhausted until 03:00`: `note` without what ran out.
     pub fn short_note(&self, now: DateTime<Utc>) -> String {
         format!(
