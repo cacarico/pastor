@@ -65,7 +65,7 @@ A plain number is a hard ceiling. To let a busy project use slots that
 quiet ones leave idle, give its flock a share and a max:
 
 ```toml
-# ~/.config/pastor/flock.toml
+# fragment of ~/.config/pastor/flock.toml
 [[flock]]
 name = "code"
 machines = { desk = { share = 2, max = 4 } }
@@ -87,7 +87,7 @@ own flock's, so on a shared machine each project sets its own model,
 permissions, priority and timeout.
 
 ```toml
-# ~/.config/pastor/flock.toml
+# fragment of ~/.config/pastor/flock.toml
 [[flock]]
 name = "app"
 machines = { server-1 = 3 }
