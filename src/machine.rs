@@ -3403,12 +3403,17 @@ impl Actor {
                     }
                     // Only a running task times out, counted from its latest
                     // start (dispatch, resume or reopen): a blocked one waits for
-                    // a person, not for its agent.
+                    // a person, not for its agent. That includes one this list is
+                    // the first to show blocked (a missed event): `apply` below
+                    // marks it so.
                     let timed_out = task
                         .started_at
                         .map(|s| (Utc::now() - s).num_seconds() as u64 > task.spec.timeout_secs)
                         .unwrap_or(false);
-                    if timed_out && task.state == TaskState::Running {
+                    if timed_out
+                        && task.state == TaskState::Running
+                        && agent.agent_status != crate::herdr::AgentStatus::Blocked
+                    {
                         let written = write_task(&self.store, task, |t| {
                             let running = t.state == TaskState::Running;
                             if running {
@@ -8284,6 +8289,22 @@ mod tests {
         wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
         start_an_hour_ago(&store, t.id);
         tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+    }
+
+    /// A running task past its timeout that a reconcile is the first to see
+    /// blocked (its event was missed) is blocked, not stale.
+    #[tokio::test]
+    async fn a_task_first_listed_blocked_past_its_timeout_is_blocked() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
+        // Blocked first: a reconcile between the two would see a running task
+        // past its timeout that is not blocked, which is stale.
+        fake.set_status_silently(t.pane_id.as_deref().unwrap(), AgentStatus::Blocked);
+        start_an_hour_ago(&store, t.id);
+        wait_for("blocked", || state_of(&store, t.id) != TaskState::Running).await;
         assert_eq!(state_of(&store, t.id), TaskState::Blocked);
     }
 
