@@ -102,7 +102,9 @@ down here because getting them wrong cost a day.
   a unit test fails when any Markdown file under `skills/`, `README.md` or
   `docs/manual.md` names a command or flag that does not exist (fences
   tagged `text`, `toml` or `json` are skipped), or a SKILL.md's frontmatter
-  is off. Another fails when a command or argument has no help. The other
+  is off. Every `toml` fence in those docs must parse, and loads as the file
+  its content shows (flock, job, orchestrator, connector manifest,
+  client.toml, else pastor.toml) unless it starts with `# fragment`. Another fails when a command or argument has no help. The other
   skills (`skills/spec/`) are not built in; they install with the repo as the
   Claude Code plugin `pastor` (`.claude-plugin/plugin.json`, whose version
   follows `Cargo.toml`). `tests/cli.rs` runs the spec skill's example plan's

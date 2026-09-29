@@ -139,7 +139,7 @@ system asks before a command, the task sits `blocked` until someone answers.
   lists](manual.md#tool-allow-and-deny-lists)):
 
   ```toml
-  # flock.toml
+  # fragment of flock.toml
   [[flock]]
   name = "personal"
   allow = ["Bash(git:*)", "Bash(cargo:*)", "Bash(make:*)", "Bash(gh pr:*)"]

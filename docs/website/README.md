@@ -22,6 +22,13 @@ tab is also a plain link.
   read the order from `layouts/_partials/docpages.html`.
 - The site is for people learning pastor. `docs/manual.md` stays in the
   repo for agents and is not mounted: what a reader needs goes in a page.
+- `content/docs/reference/cli.md` is generated from the clap definitions
+  by `make cli-reference`: the prose above its "Generated" marker is kept,
+  everything below is rewritten. The test `website_cli_reference_is_current`
+  fails `make check` when the page is stale.
+- `layouts/home.llms.txt` renders `llms.txt` at the site's root, an output
+  format of the homepage set in `hugo.toml`. It lists the docs pages in the
+  nav's order, so a new page shows up there by itself.
 - The unit test that checks commands in the README and the manual reads
   every page under `content/docs/` too, so a page that names a command or
   flag that does not exist fails `make check`.
@@ -33,7 +40,10 @@ tab is also a plain link.
 - The version in the header comes from `Cargo.toml`.
 
 `make site` builds into `docs/website/public/`; `make site-serve` serves it
-with live reload. Both need `hugo` (from mise).
+with live reload. Both need `hugo` (from mise). `make links` builds it and
+checks every internal link and anchor in it, and in `README.md`,
+`docs/*.md` and `skills/**/*.md`, with `lychee --offline`; it needs
+`lychee` on the PATH, and the website workflow runs it.
 
 `.github/workflows/website.yml` builds it on pushes to main and on pull
 requests that touch the docs, but publishes it to GitHub Pages only from

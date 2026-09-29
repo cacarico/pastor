@@ -4020,6 +4020,136 @@ mod tests {
         assert!(check_commands(SKILL).0 > 20);
     }
 
+    /// Every ```toml fence in the docs parses, and one that is a whole file
+    /// loads with the loader of the file it shows, in a temp config dir, so a
+    /// renamed key cannot leave an example that fails for whoever copies it.
+    /// A fence that is deliberately partial starts with `# fragment` and is
+    /// only parsed.
+    #[test]
+    fn docs_toml_examples_load_as_config() {
+        let repo = skills_dir().parent().unwrap().to_path_buf();
+        let mut files = vec![
+            repo.join("README.md"),
+            repo.join("docs/manual.md"),
+            repo.join("docs/recommended-setup.md"),
+        ];
+        markdown_files(&skills_dir(), &mut files);
+        markdown_files(&repo.join("docs/website/content"), &mut files);
+        let mut wrong = Vec::new();
+        let mut loaded = 0;
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (line, fence) in toml_fences(&text) {
+                let at = format!("{}:{line}", file.display());
+                if let Err(e) = toml::from_str::<toml::Table>(&fence) {
+                    wrong.push(format!("{at}: {e}"));
+                    continue;
+                }
+                if fence.trim_start().starts_with("# fragment") {
+                    continue;
+                }
+                match load_example(&fence) {
+                    Ok(()) => loaded += 1,
+                    Err(e) => wrong.push(format!("{at}: {e}")),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        assert!(loaded > 40, "only {loaded} whole-file examples loaded");
+    }
+
+    /// The ```toml fences of a Markdown text with the line each opens on,
+    /// an indented one (in a list item) with its indent taken off.
+    fn toml_fences(text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut open: Option<(usize, usize, String)> = None;
+        for (n, line) in text.lines().enumerate() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            match open.as_mut() {
+                None => {
+                    if trimmed.strip_prefix("```").map(str::trim) == Some("toml") {
+                        open = Some((n + 1, indent, String::new()));
+                    }
+                }
+                Some(_) if trimmed.starts_with("```") => {
+                    let (at, _, block) = open.take().unwrap();
+                    out.push((at, block));
+                }
+                Some((_, pad, block)) => {
+                    block.push_str(line.get(*pad..).unwrap_or(trimmed));
+                    block.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    /// Loads a whole-file example as the file its content shows: a flock
+    /// file (`[[machine]]` or `[[flock]]`), a job (`[connector]` with
+    /// `use`), an orchestrator (`kind`), a connector manifest (`id`), a
+    /// client.toml (`[head]`), or else pastor.toml.
+    fn load_example(text: &str) -> Result<(), String> {
+        use pastor::connector::Catalog;
+        use serde_json::Value;
+        /// Every connector exists: the examples name ones installed apart.
+        struct Any;
+        impl Catalog for Any {
+            fn source(&self, _: &str) -> Option<std::sync::Arc<dyn pastor::connector::ItemSource>> {
+                None
+            }
+            fn check(&self, _: &str, _: &Value) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().join("config"), tmp.path().join("state"));
+        let write = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let err = |e: anyhow::Error| format!("{e:#}");
+        if table.contains_key("machine") || table.contains_key("flock") {
+            write(&paths.flock_file());
+            Flock::load_existing(&paths.flock_file()).map_err(err)?;
+        } else if table
+            .get("connector")
+            .is_some_and(|c| c.get("use").is_some())
+        {
+            let name = table
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("example");
+            let path = pastor::config::job::job_path(&paths.jobs_dir(), name);
+            write(&path);
+            let defaults = PastorConfig::default().defaults;
+            match pastor::config::job::load_file(&path, name, &defaults, &Any) {
+                pastor::config::job::Loaded::Valid(_) => {}
+                pastor::config::job::Loaded::Invalid { error, .. } => return Err(error),
+            }
+        } else if table.contains_key("kind") {
+            let path = paths.orchestrators_dir().join("example.toml");
+            write(&path);
+            match pastor::orchestrator::load_file(&path, "example") {
+                pastor::orchestrator::Loaded::Valid(_) => {}
+                pastor::orchestrator::Loaded::Invalid { error, .. } => return Err(error),
+            }
+        } else if let Some(id) = table.get("id").and_then(|i| i.as_str()) {
+            let dir = paths.connectors_dir().join(id);
+            write(&dir.join(pastor::connector::manifest::MANIFEST_FILE));
+            pastor::connector::load_manifest(&dir, Some(id))?;
+        } else if table.contains_key("head") {
+            let path = pastor::head::client_file(&paths);
+            write(&path);
+            pastor::head::load(&path).map_err(err)?;
+        } else {
+            write(&paths.config_file());
+            PastorConfig::load_existing(&paths.config_file()).map_err(err)?;
+        }
+        Ok(())
+    }
+
     /// The homepage's live terminal types the commands in
     /// `docs/website/data/demo.toml`; each must be a real command with real
     /// long flags, as the docs' commands are, or the demo would show a CLI
@@ -4048,6 +4178,83 @@ mod tests {
         let (checked, wrong) = check_commands(&format!("```sh\n{}\n```\n", cmds.join("\n")));
         assert_eq!(checked, cmds.len(), "{cmds:?}");
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The website's CLI reference is rendered from this command tree. It
+    /// fails when the checked-in page is stale; `make cli-reference` runs it
+    /// with PASTOR_WRITE_CLI_REFERENCE=1, which writes the page instead.
+    #[test]
+    fn website_cli_reference_is_current() {
+        let path = skills_dir()
+            .parent()
+            .unwrap()
+            .join("docs/website/content/docs/reference/cli.md");
+        let page = std::fs::read_to_string(&path).unwrap();
+        let fresh = pastor::cli_reference::refresh(&completion_tree(), &page);
+        if std::env::var_os("PASTOR_WRITE_CLI_REFERENCE").is_some() {
+            std::fs::write(&path, &fresh).unwrap();
+            return;
+        }
+        assert!(
+            page == fresh,
+            "{} is stale: run make cli-reference",
+            path.display()
+        );
+    }
+
+    /// `llms.txt` is the home page in a second output format, so Hugo writes
+    /// it at the site's root from `layouts/home.llms.txt`.
+    #[test]
+    fn website_serves_llms_txt_at_its_root() {
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let config: toml::Table =
+            toml::from_str(&std::fs::read_to_string(site.join("hugo.toml")).unwrap()).unwrap();
+        let llms = &config["outputFormats"]["llms"];
+        assert_eq!(llms["baseName"].as_str(), Some("llms"));
+        assert_eq!(llms["mediaType"].as_str(), Some("text/plain"));
+        let home = config["outputs"]["home"].as_array().unwrap();
+        assert!(home.iter().any(|f| f.as_str() == Some("llms")), "{home:?}");
+        let template = std::fs::read_to_string(site.join("layouts/home.llms.txt")).unwrap();
+        assert!(template.contains("# pastor\n"), "{template}");
+    }
+
+    /// A subpath `baseURL` (the site is served at cacari.co/pastor/) makes
+    /// `.RelPermalink` absolute under that subpath, so `llms.txt`'s docs
+    /// links must be trimmed relative to the home page, not just its
+    /// leading slash, or they resolve one `docs/` level too deep. Needs
+    /// hugo from mise; skips where it is not installed.
+    #[test]
+    fn website_llms_txt_links_resolve_under_a_subpath_base_url() {
+        if std::process::Command::new("hugo")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: hugo not found in PATH");
+            return;
+        }
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let out = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("hugo")
+            .arg("--source")
+            .arg(&site)
+            .arg("--destination")
+            .arg(out.path())
+            .args(["--baseURL", "https://cacari.co/pastor/"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let llms = std::fs::read_to_string(out.path().join("llms.txt")).unwrap();
+        for line in llms.lines().filter(|l| l.starts_with("- [")) {
+            let link = line.split('(').nth(1).unwrap().split(')').next().unwrap();
+            if link.starts_with("http") {
+                continue; // the Optional section links out to github.com
+            }
+            assert!(
+                link.starts_with("docs/"),
+                "link should be relative to llms.txt, not doubled under the subpath: {line}"
+            );
+        }
     }
 
     /// The docs are five sections, each an index with its pages, and every
