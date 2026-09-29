@@ -7,7 +7,8 @@
 # direct push to main that skipped a PR, or to re-check main by hand).
 # `check`, `test-machine` and `portability` only exercise what they build
 # or read, so `paths:` skips docs-only changes, but not the docs the tests
-# read (README.md, docs/manual.md, skills/spec, the plugin manifest);
+# read (README.md, docs/manual.md, docs/recommended-setup.md, the website
+# content, everything under skills/, the plugin manifest);
 # gitleaks has no such filter because a secret can land in any file.
 name: ci
 
@@ -16,10 +17,11 @@ on:
     paths:
       - "src/**"
       - "tests/**"
-      - "skills/pastor/SKILL.md"
-      - "skills/spec/**"
+      - "skills/**"
       - "README.md"
       - "docs/manual.md"
+      - "docs/recommended-setup.md"
+      - "docs/website/content/**"
       - ".claude-plugin/plugin.json"
       - "contrib/systemd/**"
       - "contrib/launchd/**"
