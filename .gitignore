@@ -6,3 +6,6 @@ docs/website/resources/
 docs/website/.hugo_build.lock
 # Design mockups live in the private cacarico-layouts repo, not here.
 docs/website/mockups/
+# `pastor watch` output files and local Claude Code settings.
+/watch_*
+.claude/
