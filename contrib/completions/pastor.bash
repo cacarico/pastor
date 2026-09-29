@@ -5022,12 +5022,20 @@ _pastor_names() {
     local cur="${COMP_WORDS[COMP_CWORD]}" names
     if names=$(pastor __complete bash -- "${COMP_WORDS[@]:1:COMP_CWORD-1}" "${cur}" 2>/dev/null); then
         [[ ${cur} == "=" ]] && cur=""
+        # `--fallback` takes a comma-separated list as one word: complete the
+        # segment after the last comma, keeping the names before it as a
+        # prefix on every candidate.
+        local prefix="" seg="${cur}"
+        if [[ ${cur} == *,* ]]; then
+            prefix="${cur%,*},"
+            seg="${cur##*,}"
+        fi
         # One name per line, kept whole: a flock or machine name may hold a
         # space, which compgen -W would split into two words.
         COMPREPLY=()
         local name
         while IFS= read -r name; do
-            [[ -n ${name} && ${name} == "${cur}"* ]] && COMPREPLY+=( "${name}" )
+            [[ -n ${name} && ${name} == "${seg}"* ]] && COMPREPLY+=( "${prefix}${name}" )
         done <<< "${names}"
         return 0
     fi

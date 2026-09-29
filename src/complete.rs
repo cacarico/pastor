@@ -316,7 +316,11 @@ pub fn render(names: &[(String, Option<String>)], descriptions: bool) -> String 
 
 /// Appended to `pastor completions fish`. The condition runs pastor once and
 /// keeps its answer for the argument list; it fails, leaving the static
-/// completions alone, where the word takes no name.
+/// completions alone, where the word takes no name. `--fallback` takes a
+/// comma-separated list as one word (`sonnet,gpt`), so only the segment
+/// after the last comma is a name to complete; the names before it are kept
+/// as a prefix on every candidate, which is also what fish itself matches
+/// the word under the cursor against.
 pub fn fish_hook(root: &Command) -> String {
     let longs: String = name_options(root)
         .iter()
@@ -326,7 +330,15 @@ pub fn fish_hook(root: &Command) -> String {
         r#"
 # Names (jobs, flocks, machines, tasks, connectors) come from pastor itself.
 function __fish_pastor_names
-    set -g __fish_pastor_names (pastor __complete fish -- (commandline -opc)[2..] (commandline -ct) 2>/dev/null)
+    set -l cur (commandline -ct)
+    set -l parts (string split -- ',' $cur)
+    set -l seg $parts[-1]
+    set -e parts[-1]
+    set -l prefix ""
+    if test (count $parts) -gt 0
+        set prefix (string join -- ',' $parts),
+    end
+    set -g __fish_pastor_names (pastor __complete fish -- (commandline -opc)[2..] $seg 2>/dev/null | string replace -r -- '^' $prefix)
 end
 
 complete -c pastor -n __fish_pastor_names -k -f -a '(printf "%s\n" $__fish_pastor_names)'
@@ -343,12 +355,20 @@ _pastor_names() {
     local cur="${COMP_WORDS[COMP_CWORD]}" names
     if names=$(pastor __complete bash -- "${COMP_WORDS[@]:1:COMP_CWORD-1}" "${cur}" 2>/dev/null); then
         [[ ${cur} == "=" ]] && cur=""
+        # `--fallback` takes a comma-separated list as one word: complete the
+        # segment after the last comma, keeping the names before it as a
+        # prefix on every candidate.
+        local prefix="" seg="${cur}"
+        if [[ ${cur} == *,* ]]; then
+            prefix="${cur%,*},"
+            seg="${cur##*,}"
+        fi
         # One name per line, kept whole: a flock or machine name may hold a
         # space, which compgen -W would split into two words.
         COMPREPLY=()
         local name
         while IFS= read -r name; do
-            [[ -n ${name} && ${name} == "${cur}"* ]] && COMPREPLY+=( "${name}" )
+            [[ -n ${name} && ${name} == "${seg}"* ]] && COMPREPLY+=( "${prefix}${name}" )
         done <<< "${names}"
         return 0
     fi

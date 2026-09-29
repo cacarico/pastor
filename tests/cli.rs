@@ -4698,6 +4698,64 @@ fn complete_offers_model_names_after_model_and_fallback() {
     }
 }
 
+/// `--fallback` takes a comma-separated list as one shell word
+/// (`--fallback sonnet,<TAB>`), so `pastor __complete` alone (which only
+/// ever sees a name slot, never the raw word) cannot show the bug: bash's
+/// own `_pastor_names` must complete the segment after the last comma and
+/// keep the names already typed as the reply's prefix, or every candidate is
+/// filtered out against the whole `sonnet,` word. This runs the real
+/// generated script in bash to catch a regression there.
+#[test]
+fn bash_completion_finishes_a_second_fallback_name() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "[models.sonnet]\nkind = \"claude\"\nargs = []\n[models.gpt]\nkind = \"opencode\"\nargs = []\n",
+    )
+    .unwrap();
+    let script = pastor().args(["completions", "bash"]).output().unwrap();
+    assert!(script.status.success());
+    let script_path = state.join("completions.bash");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(&script_path, &script.stdout).unwrap();
+
+    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_pastor"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            r#"
+source "{script}"
+COMP_WORDS=(pastor task run "fix it" --fallback "sonnet,")
+COMP_CWORD=5
+_pastor_names
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+            script = script_path.display()
+        ))
+        .env("PATH", path)
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .env("PASTOR_DATA_DIR", state.join("data"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reply: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap().lines().collect();
+    // Alphabetical, as `[models]` is a `BTreeMap`: "gpt" before "sonnet".
+    assert_eq!(reply, vec!["sonnet,gpt", "sonnet,sonnet"], "{reply:?}");
+}
+
 #[test]
 fn complete_offers_task_ids_with_their_note() {
     let (_tmp, config, state) = completion_config();
