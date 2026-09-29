@@ -1343,17 +1343,17 @@ fn multi_flock_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| !e.machines.is_empty()))
 }
 
-/// Whether flock.toml gives any flock its own `timeout` or `place`, the
-/// schema an older head's `FlockEntry` does not know (see
-/// `FLOCK_TIMEOUT_PLACE_PROTOCOL`). A flock.toml that does not load counts
-/// as not declaring it: a head that cannot read the file either is refused
-/// for other reasons first.
 /// Whether flock.toml sets `keep_pane` on any flock, a field an older
 /// head's `FlockEntry` does not know (see `KEEP_PANE_PROTOCOL`).
 fn flock_keep_pane_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).is_ok_and(|f| f.flocks.iter().any(|e| e.keep_pane.is_some()))
 }
 
+/// Whether flock.toml gives any flock its own `timeout` or `place`, the
+/// schema an older head's `FlockEntry` does not know (see
+/// `FLOCK_TIMEOUT_PLACE_PROTOCOL`). A flock.toml that does not load counts
+/// as not declaring it: a head that cannot read the file either is refused
+/// for other reasons first.
 fn flock_timeout_or_place_declared(paths: &Paths) -> bool {
     Flock::load(&paths.flock_file()).is_ok_and(|f| {
         f.flocks
