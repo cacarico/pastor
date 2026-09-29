@@ -233,8 +233,11 @@ panes: once the agent is stopped (herdr shows it idle, done or gone) and
 the slot. That clock starts at the first check that finds the pane's agent
 stopped, not at the moment the task failed or timed out, and resets each
 time the same pane is found at work again, so an agent that keeps going past
-the grace is not closed the instant it finally stops. A failed task stays
-`failed` and records no pane any more, and its worktree stays for the retry.
+the grace is not closed the instant it finally stops. The clock is the
+agent's, not the pane's: herdr hands pane ids out again, and another agent
+found in the pane starts it again. A failed task stays `failed` and records
+no pane any more, and its worktree stays for the retry; a failed task whose
+pane someone else closes lets go of it too.
 A stale task whose agent stopped turns `failed` first (a `task.failed`
 event); one whose agent is still at work past its timeout keeps its pane. A
 pane herdr has handed to another agent since is not the task's any more: its
@@ -594,7 +597,7 @@ and `pastor task close t-N` closes one, with or without a row. pastor finds
 them when it reconciles (every `reconcile_every`), and closes an orphan's pane
 itself once `close_failed_after` has passed since a check first observed its
 agent stopped; one at work is left alone, and the clock resets each time the
-same pane is found at work again. It assumes it is the only pastor naming
+same pane is found at work again or holds another orphan. It assumes it is the only pastor naming
 agents `t-N` on each herdr.
 
 ## Flocks
