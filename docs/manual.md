@@ -1556,12 +1556,13 @@ rounds:     1 claude-personal (opus): limit: Opus weekly limit reached; 2 claude
 
 A task that moved stays on its new model when the old one resets; only new
 tasks start on the first choice again. A limit on the new model is handled
-the same way, with the rest of the list. When no model after the one it
-stopped on is free, or none of them runs on its machine, it waits:
-`task.waiting` with `why: all_exhausted` (or `no_fallback`), until the
-earliest reset among the models it may run. At that time it starts on the
-first model of its list that is free: its own session when that is the
-model it stopped on, the handover above otherwise.
+the same way, with the rest of the list; past its end the task goes back to
+the first model before it that is free. When no other model of its list is
+free, or none of them runs on its machine, it waits: `task.waiting` with
+`why: all_exhausted` (or `no_fallback`), until the earliest reset among all
+the models of its list. At that time it starts on the first model of its
+list that is free: its own session when that is the model it stopped on,
+the handover above otherwise.
 
 `waiting` is not `paused`: they share the closing and the resuming, not the
 meaning. A paused task goes first among the `low` tasks when a slot frees;

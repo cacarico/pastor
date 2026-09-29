@@ -1775,8 +1775,9 @@ impl Fleet {
     /// What waiting `task`, pinned to `machine`, does now that its time has
     /// come, as its limit left it (`task::LimitStop::then`) and `live`
     /// holds its models there. Its own model is its own session; another
-    /// model is a new round. A task that was to move on and finds every
-    /// model after its own exhausted, or none it can run here, waits.
+    /// model is a new round. A task that was to move on takes the first
+    /// free model after its own, else before it; with every one of them
+    /// exhausted, or none it can run here, it waits.
     fn wake(&self, task: &Task, machine: &str, live: &[AccountLimit]) -> Wake {
         use crate::task::NextRound;
         let own = self.limits_holding(live, machine, &task.spec);
@@ -1824,11 +1825,17 @@ impl Fleet {
                 }
             }
         };
+        // A move tries the models after its own first, then the ones
+        // before it: they are its models too, and a wait lasts until the
+        // earliest reset among all of them.
+        let (before, after) = list.split_at(from);
         let mut runnable = false;
-        for model in &list[from..] {
+        for model in after.iter().chain(before) {
             if *model == current {
                 runnable = true;
-                if own.is_empty() {
+                // Its own model just stopped on the limit: a move does not
+                // go back to it before `waiting_until`.
+                if then != NextRound::Switch && own.is_empty() {
                     return Wake::Own;
                 }
                 continue;
@@ -1935,7 +1942,7 @@ impl Fleet {
     }
 
     /// Keep waiting `task` until the earliest of `held`, the limits on
-    /// every model it may run: none after its own was free
+    /// every model it may run: no other one was free
     /// (`Wake::Wait`). At that time it starts on the first of its models
     /// that is free. Emits `task.waiting`.
     fn wait_longer(
@@ -3084,8 +3091,8 @@ enum Wake {
     Own,
     /// It goes on under another model, its spec settled for it.
     Switch(Box<crate::task::DispatchSpec>),
-    /// It was to move on, and no model after its own is free or runs on
-    /// its machine: it waits for the earliest of `held` (`why` is
+    /// It was to move on, and no other model of its list is free or runs
+    /// on its machine: it waits for the earliest of `held` (`why` is
     /// `all_exhausted` or `no_fallback`).
     Wait {
         why: &'static str,
@@ -7879,6 +7886,97 @@ mod tests {
         assert_eq!(waiting["why"], "all_exhausted");
         assert_eq!(waiting["until"], serde_json::json!(limit));
         assert_eq!(waiting["models"][0]["account"], "me");
+    }
+
+    /// Task on pi that moved from opus to sonnet, the last model of its
+    /// list, and stopped there on a limit: to move on now, with `limits`
+    /// (each a model and the minutes to its reset) in the table.
+    async fn limited_on_the_last_model(d: &Daemon, limits: &[(&str, i64)]) -> Task {
+        let IpcResponse::Task(t) = d
+            .handle(run_fallback(Some("opus"), Some(&["sonnet"]), Some("pi")))
+            .await
+        else {
+            panic!()
+        };
+        let now = chrono::Utc::now();
+        for (model, mins) in limits {
+            let mut row = seen_limit(d, "pi", Some(model));
+            row.retry_at = now + chrono::Duration::minutes(*mins);
+            row.until = Some(row.retry_at);
+            d.fleet().record_limit(&row).unwrap();
+        }
+        let mut t = d.store.get_task(t.id).unwrap().unwrap();
+        t.state = TaskState::Waiting;
+        t.pane_id = None;
+        t.waiting_until = Some(now);
+        t.spec.agent_source.as_mut().unwrap().model = Some("sonnet".into());
+        t.spec.rounds.ended.push(crate::task::AgentRound {
+            agent: t.spec.agent.clone(),
+            model: Some("opus".into()),
+            ended: "limit: Opus weekly limit reached".into(),
+        });
+        t.spec.rounds.stop = Some(Box::new(crate::task::LimitStop {
+            agent: t.spec.agent.clone(),
+            model: Some("sonnet".into()),
+            why: "limit".into(),
+            line: "You've hit your session limit".into(),
+            until: now + chrono::Duration::hours(1),
+            tail: String::new(),
+            then: crate::task::NextRound::Switch,
+            waited: None,
+            handover: None,
+        }));
+        d.store.update_task(&mut t).unwrap();
+        t
+    }
+
+    /// A task on the last model of its list has no model after its own,
+    /// but the ones before it are still its models: it waits with
+    /// `all_exhausted` until the earliest reset among all of them, here
+    /// opus's, which comes before sonnet's.
+    #[tokio::test]
+    async fn a_task_on_its_last_model_waits_for_the_earliest_reset_of_its_list() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let mut events = d.subscribe();
+        let t = limited_on_the_last_model(&d, &[("opus", 20), ("sonnet", 60)]).await;
+        d.fleet().dispatch_queued().await;
+        let back = d.store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::Waiting);
+        let opus = d
+            .store
+            .limits()
+            .unwrap()
+            .into_iter()
+            .find(|l| l.model.as_deref() == Some("opus"))
+            .unwrap()
+            .retry_at;
+        assert_eq!(back.waiting_until, Some(opus));
+        let waiting = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|e| e.kind == "task.waiting")
+            .and_then(|e| e.detail)
+            .unwrap();
+        assert_eq!(waiting["why"], "all_exhausted");
+        assert_eq!(waiting["until"], serde_json::json!(opus));
+        let mut models: Vec<_> = waiting["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["model"].as_str().unwrap().to_string())
+            .collect();
+        models.sort();
+        assert_eq!(models, vec!["opus", "sonnet"]);
+    }
+
+    /// A task on the last model of its list whose first model is free
+    /// again goes on under it at once instead of waiting for nothing.
+    #[tokio::test]
+    async fn a_task_on_its_last_model_goes_back_to_a_free_earlier_one() {
+        let (d, _tmp) = limits_daemon(true).await;
+        let t = limited_on_the_last_model(&d, &[("sonnet", 60)]).await;
+        d.fleet().dispatch_queued().await;
+        let back = d.store.get_task(t.id).unwrap().unwrap();
+        assert_ne!(back.state, TaskState::Waiting, "{:?}", back.error);
+        assert_eq!(back.model(), Some("opus"));
     }
 
     /// Tasks on pi that wait for a limit, each until `in_mins` from now,
