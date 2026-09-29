@@ -19,6 +19,7 @@ fn is_one(n: &u32) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MachineConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -266,6 +267,7 @@ fn flocks_phrase(flocks: &[String]) -> String {
 /// `flock.toml`: the declared flocks and the machines, each in one or more
 /// of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Flock {
     /// Empty means one implicit flock, `DEFAULT_FLOCK`, holding every machine.
     #[serde(default, rename = "flock", skip_serializing_if = "Vec::is_empty")]
@@ -303,8 +305,10 @@ impl Flock {
     /// `text` as the file at `path` would load: parsed and validated, with
     /// errors that name `path`. `pastor flock edit` checks an edit with it.
     pub fn parse(path: &Path, text: &str) -> anyhow::Result<Flock> {
+        // The toml error in the message, not a context under it: the reload
+        // logs `%err`, which shows only the top, and the key must be there.
         let flock: Flock =
-            toml::from_str(text).with_context(|| format!("parse {}", path.display()))?;
+            toml::from_str(text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
         flock
             .validate()
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
@@ -1221,6 +1225,77 @@ pub(crate) fn ssh_target_problem(target: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A misspelt key in flock.toml fails the load, naming the file and
+    /// the key.
+    fn flock_typo_error(text: &str) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flock.toml");
+        std::fs::write(&path, text).unwrap();
+        // Display, not `{:#}`: the reload logs only the top of the error.
+        let err = Flock::load(&path).unwrap_err().to_string();
+        assert!(err.contains("flock.toml"), "{err}");
+        assert!(Flock::load_existing(&path).is_err());
+        err
+    }
+
+    #[test]
+    fn a_typo_in_a_machine_is_a_load_error() {
+        let err = flock_typo_error("[[machine]]\nname = \"m\"\nlocal = true\nmax_agent = 1\n");
+        assert!(err.contains("max_agent"), "{err}");
+    }
+
+    #[test]
+    fn a_typo_in_a_top_level_key_is_a_load_error() {
+        let err = flock_typo_error("[[machines]]\nname = \"m\"\nlocal = true\n");
+        assert!(err.contains("machines"), "{err}");
+    }
+
+    /// The legacy `flock = "..."` on a machine still loads, and so does
+    /// what `machine add` and `flock join` write.
+    #[test]
+    fn legacy_and_written_machines_still_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flock.toml");
+        std::fs::write(
+            &path,
+            "[[flock]]\nname = \"a\"\ndefault = true\n[[machine]]\nname = \"m\"\nlocal = true\nflock = \"a\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Flock::load(&path).unwrap().machines[0].flock.as_deref(),
+            Some("a")
+        );
+        let mut doc = FlockDoc::open(&path).unwrap();
+        doc.add_flock("b", false, &[]).unwrap();
+        doc.add_machine(&MachineConfig {
+            name: "pi".into(),
+            local: false,
+            pull: false,
+            ssh: Some("user@pi-1".into()),
+            command: None,
+            session: "default".into(),
+            max_agents: 3,
+            job_slots: 0,
+            burst: 2,
+            tags: vec!["arm".into()],
+            flock: Some("a".into()),
+            agent: Some("codex".into()),
+            agent_args: Some(vec![]),
+            model: None,
+            priority: Some(crate::task::Priority::High),
+            agents: Default::default(),
+            profile: None,
+            description: Some("the pi".into()),
+        })
+        .unwrap();
+        doc.join_flock("pi", "b", None).unwrap();
+        doc.join_flock("m", "b", Some(1)).unwrap();
+        doc.save(&path).unwrap();
+        let f = Flock::load(&path).unwrap();
+        assert!(f.in_flock(f.get("pi").unwrap(), "b"));
+        assert!(f.in_flock(f.get("m").unwrap(), "b"));
+    }
 
     fn pi(name: &str) -> MachineConfig {
         MachineConfig {
