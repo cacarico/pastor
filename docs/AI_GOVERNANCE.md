@@ -1,44 +1,43 @@
-# AI Governance
+# AI use
 
-AI tools are allowed in pastor development, but people remain responsible for
-the work. AI output is never authority by itself.
+Much of pastor is written by coding agents, many of them dispatched by
+pastor itself, and I review and merge what they produce. That is the point
+of the tool, so AI help is welcome here too. Whoever opens the pull request
+answers for it, whatever wrote it.
 
-## Contributor rules
+## When you contribute
 
-- Understand every submitted change.
-- Keep generated changes small enough for real review.
-- Run or explain the required tests.
-- Disclose AI assistance in the pull request when it shaped code, tests, docs,
-  or design.
-- Check provenance and license compatibility for generated, copied, or adapted
-  material.
-- Never feed secrets, private prompts, logs, hostnames, credentials, customer
-  data, or private repositories to an AI tool unless that use is approved.
+- Understand the change you send, and keep it small enough to review.
+- Run `make check`, or say why a test is missing.
+- Say in the pull request when an agent shaped the code, tests, docs or
+  design, and where copied or generated material came from if its license
+  could matter.
+- Keep secrets, hostnames, private prompts and logs out of what you give an
+  agent, and out of the commit. The repository is public.
 
-If generated code or text conflicts with the manual, README, behavior, security
-practice, or license obligations, fix it before submitting.
+Where an agent's output disagrees with the manual, the code or the license,
+fix it before you open the pull request.
 
-## Operator rules
+## When you run pastor
 
-pastor dispatches coding agents to machines you control. It does not decide what
-agents are allowed to do; operators are responsible for the prompts,
-repositories, credentials, tools, and machines they make available.
+pastor starts an agent as the user in that machine's `ssh = "user@host"`, or
+the head's own user for a machine it runs locally, and it does decide part of
+what they may do: an agent it started cannot change the fleet unless you set
+`agents_change_fleet`, a task runs under the permission profile and the
+`allow` and `deny` lists you give it, and no task can start an orchestrator.
+What it cannot decide is what that user can reach: files, keys, tokens and
+the network. [Trust model](manual.md#trust-model) in the manual has the
+details, and [SECURITY.md](../SECURITY.md) what that means for connectors.
 
-- Run pastor only on trusted machines and repositories.
-- Use least-privilege SSH keys and service accounts.
-- Keep secrets out of prompts when possible.
-- Assume agent panes, logs, task output, and transcripts may contain sensitive
-  data.
-- Review agent changes before merging or deploying them.
-- Keep audit-relevant task history in the SQLite store and logs according to
-  your retention policy.
+So run it on machines and repositories you trust, with keys that reach no
+more than the work needs, treat pane output, logs and the task store as
+possibly holding secrets, and read what an agent did before you merge or
+deploy it.
 
-## Project rules
+## When you change pastor
 
-- Document behavior that affects agent autonomy, task state, credential flow, or
-  operator review.
-- Prefer explicit configuration over hidden defaults for safety-sensitive
-  behavior.
-- Treat prompt injection, unsafe tool access, and accidental data exposure as
-  security-relevant design concerns.
-- Justify new dependencies and automation in pull requests.
+A change to what an agent may do, how a task's state moves, how credentials
+flow or when a person has to look is documented in the manual in the same
+pull request. Anything safety-related is explicit configuration, not a
+hidden default, and prompt injection or data leaking through a pane counts
+as a security bug.
