@@ -99,10 +99,11 @@ timeout = "1h"
 
 Each setting comes from the first layer that sets it: the task's own flags
 or its job, then its flock, then the machine it runs on, then `[defaults]`.
-Only `model`, `profile` and `priority` have a machine layer. `allow` and
-`deny` add up across layers instead, and a deny always wins. The agent is
-the one exception: the machine comes before the flock, because it knows
-what is installed and logged in there. See
+Besides the agent, only `model`, `profile` and `priority` have a machine
+layer. `allow` and `deny` add up across layers instead, and a deny always
+wins. The agent (`agent`, `agent_args` and `agents`) is the one exception:
+the machine comes before the flock, because it knows what is installed and
+logged in there. See
 [agents and models](../agents-and-models/).
 
 ## manage them

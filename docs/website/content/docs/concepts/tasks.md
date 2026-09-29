@@ -29,9 +29,10 @@ repo starts in `~/pastor-tasks` on its machine.
 | `--machine` | run it on this machine instead of any with room |
 | `--priority` | `low`, `normal`, `high` or `critical`; see [queue](../queue/) |
 
-The agent, its model and its permission profile come from the flock, the
-machine or `[defaults]` unless you pass `--agent`, `--model` or `--profile`
-(see [agents and models](../agents-and-models/) and
+The agent, its model and its permission profile come from the machine, the
+flock or `[defaults]` unless you pass `--agent`, `--model` or `--profile`:
+the agent from the machine first, the model and profile from the flock
+first (see [agents and models](../agents-and-models/) and
 [profiles and trust](../profiles-and-trust/)). Every flag is in the
 [cli reference](../../reference/cli/#task).
 
