@@ -1893,6 +1893,11 @@ fn each_request_refuses_a_head_one_protocol_short_of_it() {
             "labels",
         ),
         (
+            &["task", "run", "hi", "--now", "--machine", "pi-1"],
+            ipc::NOW_PROTOCOL,
+            "--now",
+        ),
+        (
             &["task", "run", "hi", "--summary", "require"],
             ipc::SUMMARY_MODE_PROTOCOL,
             "summary setting",
