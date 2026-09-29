@@ -109,7 +109,11 @@ down here because getting them wrong cost a day.
   Claude Code plugin `pastor` (`.claude-plugin/plugin.json`, whose version
   follows `Cargo.toml`). `tests/cli.rs` runs the spec skill's example plan's
   first task against the fake herdr.
-- Vocabulary is fixed: machine, flock, head, job, task, connector, agent.
+- Vocabulary is fixed: machine, flock, head, job, task, connector, agent,
+  shepherd (a headless `pastor serve` on a machine whose head is elsewhere),
+  orchestrator (an agent pastor runs to drive the others, from
+  `orchestrators/<name>.toml`) and pull machine (`pull = true`: its
+  shepherd asks the head for work, the head never connects to it).
   Agents are never renamed; hosts are not "sheep". "Plugin" is kept free
   for code that changes how pastor itself behaves; what installs a connector
   command or event hooks is a connector. The Claude Code plugin `pastor` that
@@ -171,7 +175,7 @@ Still open as of the last review; none of them blocks normal use.
   and passed on every rerun.
 - With the head set, `tick` and `job reload` go to the head only; the
   headless serve (`src/shepherd.rs`) is reached by the other `job` commands
-  (`main.rs` `local_job`). Its own `job.failed` and `task.queued` events are only logged, never
+  (`main.rs` `names_local_job`). Its own `job.failed` and `task.queued` events are only logged, never
   written to an events log or heard by its hooks. Its jobs share the head's
   seen table by name, so a head job of the same name with the same item key
   refuses the item (`job_task_refused`).
@@ -188,9 +192,20 @@ Still open as of the last review; none of them blocks normal use.
   spec's `orchestrator/<name>-<n>`.
 - With a remote head (`pastor head set`), `task run` fills what its flags
   leave out from the built-in defaults, not the head's `[defaults]` timeout
-  and place. Every other command that reads the fleet goes to the head
-  (`remote_route` in `main.rs`); only `machine authorized-key` fails with
-  `remote_head_unsupported`.
+  and place: `settle_run` (`src/daemon.rs`) only overwrites a spec's timeout
+  and place when an ask or the flock sets one, trusting the spec's own
+  otherwise, which for a remote client is `PastorConfig::default()`
+  (`src/main.rs::run`), not the head's file. Every other command that reads
+  the fleet goes to the head (`remote_route` in `main.rs`); only `machine
+  authorized-key` fails with `remote_head_unsupported`.
+- A task pinned to a machine outside its flock (the machine was moved
+  with `pastor machine move`, or removed) stays queued forever: the
+  scheduler logs it once (`warned_queued` in `src/scheduler.rs`) and never
+  fails or re-flocks it.
+- A profiled opencode task runs with `OPENCODE_DISABLE_PROJECT_CONFIG=1`,
+  so it ignores the repo's own `opencode.json` and `.opencode/` (agents,
+  commands, MCP servers, not only permissions); only `AGENTS.md` or
+  `CLAUDE.md` are passed back as instructions.
 
 ## Where things live
 
@@ -224,6 +239,9 @@ changes/<branch>.md               a pull request's changelog entry, gathered at 
 scripts/changelog.sh              check, notes and gather for those files
 .claude-plugin/plugin.json        makes the repo a Claude Code plugin named pastor
 ```
+
+The schema number above is `SCHEMA_VERSION` in `src/store.rs`; a schema bump
+updates it here too.
 
 `PASTOR_CONFIG_DIR`, `PASTOR_STATE_DIR` and `PASTOR_DATA_DIR` override these;
 tests always set them to temp dirs (`Paths::new` puts the data dir under the
