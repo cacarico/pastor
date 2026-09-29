@@ -6,7 +6,7 @@
 //! at once.
 use clap::Subcommand;
 
-use crate::cli::{CliError, age, request_failure, table};
+use crate::cli::{CliError, age, request_error, table};
 use crate::config::Paths;
 use crate::ipc::{Head, IpcRequest, IpcResponse};
 use crate::store::Store;
@@ -83,10 +83,7 @@ async fn run_on_head(paths: &Paths, cmd: TrustCmd) -> anyhow::Result<()> {
         }
         Ok(IpcResponse::Error { code, message }) => Err(CliError::err(&code, message)),
         Ok(other) => anyhow::bail!("unexpected reply to a trust request: {other:?}"),
-        Err(err) => {
-            let (code, message) = request_failure(&err);
-            Err(CliError::err(&code, message))
-        }
+        Err(err) => Err(request_error(&err).into()),
     }
 }
 

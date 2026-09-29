@@ -1370,4 +1370,62 @@ mod tests {
         assert_eq!(which("herdr", path), Some(b.join("herdr")));
         assert_eq!(which("nope", path), None);
     }
+
+    /// What systemd makes of one unit-file word: specifiers first (`%%` is a
+    /// literal `%`; any other specifier is a word `quote` should not have
+    /// written), then the word split with its quote and backslash rules. Fails
+    /// unless the line holds exactly one word; an empty line holds none.
+    fn systemd_unquote(line: &str) -> Result<String, String> {
+        if line.is_empty() {
+            return Err("no word in an empty line".to_string());
+        }
+        let mut spec = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                spec.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => spec.push('%'),
+                other => return Err(format!("specifier %{other:?} in {line:?}")),
+            }
+        }
+        let mut word = String::new();
+        let mut chars = spec.chars().peekable();
+        let mut quote: Option<char> = None;
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (None, ' ' | '\t' | '\n' | '\r') => return Err(format!("two words in {line:?}")),
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), c) if c == q => {
+                    quote = None;
+                    if chars.peek().is_some() {
+                        return Err(format!("text after the closing quote in {line:?}"));
+                    }
+                }
+                (_, '\\') => match chars.next() {
+                    Some(e @ ('\\' | '"' | '\'')) => word.push(e),
+                    other => return Err(format!("escape \\{other:?} in {line:?}")),
+                },
+                (_, c) => word.push(c),
+            }
+        }
+        if quote.is_some() {
+            return Err(format!("unclosed quote in {line:?}"));
+        }
+        Ok(word)
+    }
+
+    proptest::proptest! {
+        /// systemd reads back exactly the string `quote` was given, whatever
+        /// `%`, spaces, quotes, backslashes or non-ASCII it holds. Not empty:
+        /// `quote("")` writes no word, and no path it is given is empty.
+        #[test]
+        fn prop_quote_round_trips_through_systemd(
+            s in "([%nC \"'\\\\é中\t]|\\PC){1,24}",
+        ) {
+            proptest::prop_assert_eq!(systemd_unquote(&quote(&s)), Ok(s));
+        }
+    }
 }

@@ -71,8 +71,9 @@ down here because getting them wrong cost a day.
 
 - `make check` is the gate: fmt check, clippy with warnings as errors, the
   full suite. Run it before every commit. `make help` lists the rest.
-- CI (`.github/workflows/ci.yml`) runs `make check` and `make test-machine` on
-  every pull request that touches code (`paths:` skips docs-only diffs), or
+- CI (`.github/workflows/ci.yml`) runs `make check`, `make test-machine` and
+  `make test-ssh` (the CLI against a head over a real ssh, through a
+  throwaway sshd on localhost; `tests/real_ssh.rs`) on every pull request that touches code (`paths:` skips docs-only diffs), or
   by hand (`workflow_dispatch`). Since this project merges by fast-forwarding
   a PR's exact head sha to main, that sha was already checked on its PR, so
   push-to-main does not run `check` again; a direct push that skips a PR goes
@@ -199,6 +200,7 @@ Still open as of the last review; none of them blocks normal use.
 ~/.config/pastor/client.toml      [head]: a head on another machine (`pastor head`)
 ~/.local/state/pastor/pastor.db   tasks (schema 9), seen keys, event seq, job state (SQLite)
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/fleet.lock  offline fleet edits and a starting `pastor serve` take turns on it
 ~/.local/state/pastor/shepherd.db a headless serve's job state, seen keys, head event cursor
 ~/.local/state/pastor/events.jsonl events log, rotated to events.jsonl.1
 ~/.local/state/pastor/watch/<name>.json `pastor watch` cursors

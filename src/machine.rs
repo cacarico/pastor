@@ -308,8 +308,10 @@ pub struct MachineSettings {
     /// While `Polling`, how often `agent.list` reconciles. The daemon passes its
     /// `tick`, so a polling machine is reconciled once per tick.
     pub poll_every: Duration,
-    /// How long a `done` task keeps its pane before reconcile closes it
+    /// How long a `done` task keeps its pane before auto-close takes it
     /// (`close_done_after` in `pastor.toml`). `None` turns auto-close off.
+    /// While connected, the check runs after each reconcile and, for a grace
+    /// shorter than `reconcile_every`, every `close_done_after` as well.
     pub close_done_after: Option<Duration>,
     /// While connected or polling, how often the machine is asked for its
     /// pastor version again, so an upgrade shows without a reconnect. Checked
@@ -334,7 +336,7 @@ impl Default for MachineSettings {
             request_timeout: Duration::from_secs(60),
             agent_ready_timeout: Duration::from_secs(30),
             poll_every: Duration::from_secs(10),
-            close_done_after: Some(Duration::from_secs(15 * 60)),
+            close_done_after: Some(Duration::from_secs(5)),
             version_every: Duration::from_secs(10 * 60),
             agents: crate::config::Agents::default(),
             head_address: None,
@@ -1125,6 +1127,20 @@ impl Actor {
                 tokio::time::interval(Duration::from_millis(50).max(self.settings.settle / 4));
             let mut reconcile_tick = tokio::time::interval(self.settings.reconcile_every);
             reconcile_tick.tick().await; // first tick fires immediately; we just reconciled
+            // Auto-close runs after each reconcile. A grace shorter than
+            // `reconcile_every` gets its own tick as well, or a 5s grace
+            // would wait up to a whole reconcile.
+            let close_every = self
+                .settings
+                .close_done_after
+                .filter(|after| *after < self.settings.reconcile_every)
+                .map(|after| after.max(Duration::from_millis(50)));
+            let mut close_tick =
+                tokio::time::interval(close_every.unwrap_or(self.settings.reconcile_every));
+            close_tick.tick().await; // first tick fires immediately; we just reconciled
+            // Only while the last reconcile went through: a machine whose
+            // events will not open is not one to start closing panes on.
+            let mut reconciled = true;
             loop {
                 tokio::select! {
                     cmd = self.rx.recv() => {
@@ -1171,7 +1187,7 @@ impl Actor {
                         }
                     }
                     _ = reconcile_tick.tick() => {
-                        let reconciled = match self.reconcile().await {
+                        reconciled = match self.reconcile().await {
                             Ok(false) => true,
                             Ok(true) => {
                                 match self.open_events().await {
@@ -1191,14 +1207,19 @@ impl Actor {
                             }
                         };
                         // Only here, connected: the poll loop reconciles too, but
-                        // a machine whose events will not open is not one to
-                        // start closing panes on.
+                        // it does not close panes.
                         if reconciled && let Err(err) = self.auto_close_done().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "auto-close failed"); break; }
                             tracing::warn!(machine = %self.name, %err, "auto-close failed; staying connected");
                         }
                         if reconciled {
                             self.refresh_pastor_version().await;
+                        }
+                    }
+                    _ = close_tick.tick(), if reconciled && close_every.is_some() => {
+                        if let Err(err) = self.auto_close_done().await {
+                            if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "auto-close failed"); break; }
+                            tracing::warn!(machine = %self.name, %err, "auto-close failed; staying connected");
                         }
                     }
                 }
@@ -2501,7 +2522,7 @@ impl Actor {
     /// Close the done tasks on this machine that finished `close_done_after`
     /// ago or more, through the same path as `pastor task close`. Failed,
     /// blocked and stale tasks are never closed on their own. A task herdr
-    /// will not close is logged and tried again at the next reconcile; only a
+    /// will not close is logged and tried again at the next check; only a
     /// failure below the API is returned, so the caller can reconnect.
     async fn auto_close_done(&mut self) -> anyhow::Result<()> {
         let Some(after) = self.settings.close_done_after else {
@@ -2539,7 +2560,7 @@ impl Actor {
                     tracing::debug!(machine = %self.name, task = %t.display_id(), %err, "not auto-closed: a new completion has not settled yet");
                 }
                 Err(err) => {
-                    tracing::warn!(machine = %self.name, task = %t.display_id(), err = format!("{err:#}"), "auto-close failed; trying again at the next reconcile");
+                    tracing::warn!(machine = %self.name, task = %t.display_id(), err = format!("{err:#}"), "auto-close failed; trying again at the next check");
                 }
             }
         }
@@ -6323,6 +6344,25 @@ mod tests {
             }
         }
         found
+    }
+
+    /// A grace shorter than `reconcile_every` is not stretched to it: auto-close
+    /// runs on its own tick, so the task closes long before the next reconcile.
+    #[tokio::test]
+    async fn a_short_grace_closes_before_the_next_reconcile() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settings = MachineSettings {
+            reconcile_every: Duration::from_secs(30),
+            ..auto_close_settings()
+        };
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = run_to_done(&h, &fake, &store, new_task(&store)).await;
+        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
     }
 
     #[tokio::test]

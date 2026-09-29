@@ -83,6 +83,12 @@ impl Paths {
         self.state_dir.join("pastor.sock")
     }
 
+    /// The lock an offline fleet edit and a starting head take in turns
+    /// (`fleet_edit::lock_fleet`).
+    pub fn fleet_lock_file(&self) -> PathBuf {
+        self.state_dir.join("fleet.lock")
+    }
+
     /// A background `pastor serve`'s log (`serve_cli`), rotated to
     /// `serve.log.1` .. `serve.log.3`. A head in the foreground or under a
     /// service logs to stderr instead.
@@ -452,7 +458,7 @@ fn safe_ancestors(dir: &Path, euid: u32) -> anyhow::Result<()> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Defaults {
     pub agent: String,
     /// Extra argv for the agent (`["--model", "claude-opus-5-5"]`), for tasks
@@ -1022,7 +1028,7 @@ impl Default for Defaults {
 /// One agent's definition under `[agents.<name>]` in `pastor.toml`. The
 /// name is what tasks, jobs and flocks call it; `kind` is what herdr starts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AgentDef {
     /// The herdr agent kind to start (`claude`, `codex`); unset, the name
     /// itself. Built-in trust keys and tool flags follow it, so
@@ -1192,7 +1198,9 @@ impl Agents {
     /// its definition. Refused as `launch_args` is.
     /// An opencode agent under a profile gets its lists in the env instead
     /// (`opencode::permission_json`), over its definition's, with the
-    /// variables that would load another config emptied.
+    /// variables that would load another config emptied and the repo's
+    /// config turned off; dispatch gives it the repo's instruction file back
+    /// once it knows the checkout (`opencode::instructions_content`).
     pub fn launch(&self, spec: &crate::task::DispatchSpec) -> Result<Launch, AgentRefusal> {
         let mut env = self
             .0
@@ -1203,6 +1211,7 @@ impl Agents {
             for key in opencode::CONFIG_ENV {
                 env.insert(key.into(), String::new());
             }
+            env.insert(opencode::DISABLE_PROJECT_CONFIG_ENV.into(), "1".into());
             env.insert(
                 opencode::PERMISSION_ENV.into(),
                 opencode::permission_json(
@@ -1424,7 +1433,7 @@ impl Models {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PastorConfig {
     pub tick: String,
     pub settle: String,
@@ -1568,7 +1577,7 @@ impl Default for PastorConfig {
             reconcile_every: "60s".into(),
             request_timeout: "60s".into(),
             agent_ready_timeout: "30s".into(),
-            close_done_after: "15m".into(),
+            close_done_after: "5s".into(),
             pull_lost_after: "10m".into(),
             agents_change_fleet: false,
             max_orchestrators: 1,
@@ -1612,8 +1621,10 @@ impl PastorConfig {
     /// `text` as the file at `path` would load, with errors that name
     /// `path`. `pastor config edit` checks an edit with it.
     pub fn parse(path: &Path, text: &str) -> anyhow::Result<PastorConfig> {
+        // The toml error in the message, not a context under it: the reload
+        // logs `%err`, which shows only the top, and the key must be there.
         let cfg: PastorConfig =
-            toml::from_str(text).with_context(|| format!("parse {}", path.display()))?;
+            toml::from_str(text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
         // tick, settle and reconcile_every all drive `tokio::time::interval`,
         // which panics on a zero period. Reject zero here so a bad config
         // fails to load instead of crashing the daemon at startup.
@@ -1842,6 +1853,113 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// A misspelt key in pastor.toml fails the load, naming the file and
+    /// the key, rather than leaving the default it meant to change.
+    fn typo_error(text: &str) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(&path, text).unwrap();
+        // Display, not `{:#}`: the reload logs only the top of the error.
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("pastor.toml"), "{err}");
+        assert_eq!(
+            PastorConfig::load_existing(&path).unwrap_err().to_string(),
+            err
+        );
+        err
+    }
+
+    /// The TOML examples of pastor.toml, flock.toml and client.toml in
+    /// README.md and docs/manual.md load, now that a key they carry and the
+    /// code does not know is a load error. An example says which file it is
+    /// by a leading comment, or by its first table.
+    #[test]
+    fn the_docs_config_examples_load() {
+        #[derive(Deserialize)]
+        struct Client {
+            #[allow(dead_code)]
+            head: crate::head::HeadSetting,
+        }
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0;
+        for doc in ["README.md", "docs/manual.md"] {
+            let text = std::fs::read_to_string(repo.join(doc)).unwrap();
+            for block in text.split("```toml\n").skip(1) {
+                let block = block.split("```").next().unwrap();
+                // One block can hold two files, each under a comment naming
+                // it (`# pastor.toml` then `# flock.toml`): split it there.
+                let names = |line: &str| {
+                    line.starts_with('#').then(|| {
+                        ["pastor.toml", "flock.toml"]
+                            .into_iter()
+                            .find(|f| line.split(&[' ', ':', ',', '/']).any(|w| w == *f))
+                    })?
+                };
+                let mut sections: Vec<(Option<&str>, String)> = vec![(None, String::new())];
+                for line in block.lines() {
+                    if let Some(f) = names(line) {
+                        sections.push((Some(f), String::new()));
+                    }
+                    let (_, text) = sections.last_mut().unwrap();
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                for (named, section) in sections {
+                    let first = section.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                    let which = named.or_else(|| {
+                        if first.starts_with("[[flock]]") || first.starts_with("[[machine]]") {
+                            Some("flock.toml")
+                        } else if first.starts_with("[head]") {
+                            Some("client.toml")
+                        } else if [
+                            "[defaults]",
+                            "[agents.",
+                            "[models.",
+                            "[profiles.",
+                            "[[watch.",
+                        ]
+                        .iter()
+                        .any(|t| first.starts_with(t))
+                        {
+                            Some("pastor.toml")
+                        } else {
+                            None
+                        }
+                    });
+                    let parsed = match which {
+                        Some("pastor.toml") => toml::from_str::<PastorConfig>(&section).map(drop),
+                        Some("flock.toml") => toml::from_str::<flock::Flock>(&section).map(drop),
+                        Some("client.toml") => toml::from_str::<Client>(&section).map(drop),
+                        _ => continue,
+                    };
+                    assert!(parsed.is_ok(), "{doc}: {first}: {}", parsed.unwrap_err());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 20, "only {checked} examples found");
+    }
+
+    #[test]
+    fn a_typo_in_pastor_toml_is_a_load_error() {
+        let err = typo_error("close_done_afer = \"never\"\n");
+        assert!(err.contains("close_done_afer"), "{err}");
+        let err = typo_error("head_adress = \"user@head\"\n");
+        assert!(err.contains("head_adress"), "{err}");
+    }
+
+    #[test]
+    fn a_typo_in_defaults_is_a_load_error() {
+        let err = typo_error("[defaults]\ntimout = \"1h\"\n");
+        assert!(err.contains("timout"), "{err}");
+    }
+
+    #[test]
+    fn a_typo_in_an_agent_is_a_load_error() {
+        let err = typo_error("[agents.claude-personal]\nknd = \"claude\"\n");
+        assert!(err.contains("knd"), "{err}");
+    }
+
     #[test]
     fn from_env_uses_overrides() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2007,6 +2125,29 @@ mod tests {
         assert!(parse_duration("5 m").is_err());
         assert!(parse_duration("x").is_err());
         assert!(parse_duration("300000000000000d").is_err());
+    }
+
+    proptest::proptest! {
+        /// Any text, including numbers past `u64` and counts whose product
+        /// with the unit overflows, is a duration or an error, never a panic.
+        #[test]
+        fn prop_parse_duration_never_panics(s in "\\PC*|[0-9]{0,25}[smhd]?|\\s*[0-9]+\\s*[a-z]{0,3}") {
+            let _ = parse_duration(&s);
+        }
+
+        /// A count and a unit read back as count times the unit's seconds
+        /// when that fits in `u64`, and as an error when it does not.
+        #[test]
+        fn prop_parse_duration_is_count_times_unit(
+            n in proptest::prelude::any::<u64>(),
+            unit in proptest::sample::select(vec![("s", 1u64), ("m", 60), ("h", 3600), ("d", 86400)]),
+        ) {
+            let got = parse_duration(&format!("{n}{}", unit.0));
+            match n.checked_mul(unit.1) {
+                Some(secs) => proptest::prop_assert_eq!(got, Ok(Duration::from_secs(secs))),
+                None => proptest::prop_assert!(got.is_err()),
+            }
+        }
     }
 
     /// A label comes from the first of the ask, the flock and `[defaults]`
@@ -2178,7 +2319,7 @@ mod tests {
             ("[defaults]\nmodel = \"haiku\"\n", "defaults.model"),
         ] {
             std::fs::write(&path, text).unwrap();
-            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            let err = PastorConfig::load(&path).unwrap_err().to_string();
             assert!(err.contains(says), "{text}: {err}");
         }
     }
@@ -2197,7 +2338,7 @@ mod tests {
         let ci = cfg.profiles.resolve("ci").unwrap();
         assert_eq!(ci.chain, vec!["ci", "develop"]);
         std::fs::write(&path, "[profiles.ci]\nextends = \"nope\"\n").unwrap();
-        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("profiles.ci") && err.contains("nope"), "{err}");
     }
 
@@ -2300,7 +2441,7 @@ mod tests {
             Some(crate::task::Priority::High)
         );
         std::fs::write(&path, "[defaults]\npriority = \"urgent\"\n").unwrap();
-        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("urgent"), "{err}");
         for text in [
             "[[flock]]\nname = \"p\"\ndefault = true\npriority = \"asap\"\n",
@@ -2830,6 +2971,7 @@ mod tests {
             assert_eq!(launch.env[key], "", "{key}");
         }
         assert_eq!(launch.env["KEEP"], "1");
+        assert_eq!(launch.env[opencode::DISABLE_PROJECT_CONFIG_ENV], "1");
 
         // A definition of kind opencode is opencode.
         let mine: Agents = toml::from_str("[oc]\nkind = \"opencode\"\n").unwrap();
@@ -2847,6 +2989,7 @@ mod tests {
         assert_eq!(err.code, "agent_tools_unsupported");
         spec.allow.clear();
         spec.deny.clear();
+        // Nor is the repo's own config turned off.
         assert!(Agents::default().launch(&spec).unwrap().env.is_empty());
     }
 
@@ -2914,7 +3057,7 @@ mod tests {
             Some("ci")
         );
         std::fs::write(&path, "[defaults]\nprofile = \"nope\"\n").unwrap();
-        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("defaults.profile: profile nope"), "{err}");
     }
 
@@ -2947,7 +3090,7 @@ mod tests {
             ),
         ] {
             std::fs::write(&path, text).unwrap();
-            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            let err = PastorConfig::load(&path).unwrap_err().to_string();
             assert!(err.contains(want), "{text}: {err}");
         }
     }
@@ -2993,7 +3136,7 @@ mod tests {
             ),
         ] {
             std::fs::write(&path, text).unwrap();
-            let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+            let err = PastorConfig::load(&path).unwrap_err().to_string();
             assert!(err.contains(want), "{text}: {err}");
         }
     }
@@ -3025,7 +3168,7 @@ mod tests {
         assert_eq!(cfg.agents.trust_keys("claude").map(|k| k.len()), Some(2));
 
         std::fs::write(&path, "[agents.claude]\ntrust_keys = [\"Down\", \"\"]\n").unwrap();
-        let err = format!("{:#}", PastorConfig::load(&path).unwrap_err());
+        let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("agents.claude.trust_keys"), "{err}");
     }
 
@@ -3576,13 +3719,10 @@ mod tests {
     }
 
     #[test]
-    fn close_done_after_defaults_to_fifteen_minutes_and_never_disables() {
+    fn close_done_after_defaults_to_five_seconds_and_never_disables() {
         let d = PastorConfig::default();
-        assert_eq!(d.close_done_after, "15m");
-        assert_eq!(
-            d.close_done_after_duration(),
-            Some(Duration::from_secs(15 * 60))
-        );
+        assert_eq!(d.close_done_after, "5s");
+        assert_eq!(d.close_done_after_duration(), Some(Duration::from_secs(5)));
         let c = PastorConfig {
             close_done_after: "never".into(),
             ..Default::default()
@@ -3679,5 +3819,80 @@ mod tests {
         let err = PastorConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("settle"), "{err}");
         assert!(err.contains("must not be zero"), "{err}");
+    }
+
+    /// Tool patterns from a small pool, so the layers' lists often share
+    /// one, mixed with anything at all.
+    fn tool_patterns() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
+        use proptest::prelude::*;
+        let pattern = prop_oneof![
+            3 => proptest::sample::select(vec![
+                "Read", "Edit", "Bash", "Bash(git:*)", "Bash(rm:*)", "WebFetch", "Task",
+            ])
+            .prop_map(String::from),
+            1 => ".{0,12}",
+        ];
+        proptest::collection::vec(pattern, 0..6)
+    }
+
+    proptest::proptest! {
+        /// A pattern any layer denies is never in the resolved allow and
+        /// always in the resolved deny, whatever the layers hold and
+        /// whichever machine the task runs on. A machine has no tool
+        /// lists of its own; it is generated for its agent only.
+        #[test]
+        fn prop_a_denied_pattern_is_never_allowed(
+            d_allow in tool_patterns(), d_deny in tool_patterns(),
+            f_allow in tool_patterns(), f_deny in tool_patterns(),
+            a_allow in tool_patterns(), a_deny in tool_patterns(),
+            machine_agent in proptest::option::of("[a-z]{1,6}"),
+            flock_agent in proptest::option::of("[a-z]{1,6}"),
+            ask_agent in proptest::option::of("[a-z]{1,6}"),
+            with_flock in proptest::prelude::any::<bool>(),
+            with_machine in proptest::prelude::any::<bool>(),
+        ) {
+            let d = Defaults { allow: d_allow, deny: d_deny.clone(), ..Default::default() };
+            let flock = flock::FlockEntry {
+                name: "f".into(),
+                agent: flock_agent,
+                allow: f_allow,
+                deny: f_deny.clone(),
+                ..Default::default()
+            };
+            let mut machine: flock::MachineConfig =
+                toml::from_str("name = \"m\"\nlocal = true\n").unwrap();
+            machine.agent = machine_agent;
+            let ask = AgentChoice {
+                agent: ask_agent,
+                allow: a_allow,
+                deny: a_deny.clone(),
+                ..Default::default()
+            };
+            let pick = d.resolve_agent_on(
+                &ask,
+                with_machine.then_some(&machine),
+                with_flock.then_some(&flock),
+            );
+            let flock_deny = if with_flock { f_deny } else { vec![] };
+            for p in d_deny.iter().chain(&flock_deny).chain(&a_deny) {
+                proptest::prop_assert!(!pick.allow.contains(p), "{p:?} allowed: {pick:?}");
+                proptest::prop_assert!(pick.deny.contains(p), "{p:?} not denied: {pick:?}");
+            }
+        }
+
+        /// `check_tools` refuses a pattern exactly when it is blank or
+        /// starts with `-`.
+        #[test]
+        fn prop_check_tools_refuses_only_blank_and_dash_patterns(
+            p in proptest::prop_oneof![".*", "[ \t\n]*", "-.*", "[ \t]+-?.*"],
+        ) {
+            let refused = p.trim().is_empty() || p.starts_with('-');
+            proptest::prop_assert_eq!(
+                check_tools("allow", std::slice::from_ref(&p)).is_err(),
+                refused,
+                "{:?}",
+                p
+            );
+        }
     }
 }

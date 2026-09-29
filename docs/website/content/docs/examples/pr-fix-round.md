@@ -95,7 +95,7 @@ pastor task attach t-12  # ctrl+b q to leave
 
 When the agent pushes and stops, the task is `done`. `pastor task describe t-12`
 shows its summary. Close it with `pastor task close t-12 --remove-worktree`,
-or leave it: pastor closes a done task's pane after 15 minutes.
+or leave it: pastor closes a done task's pane after 5 seconds.
 
 ## next
 

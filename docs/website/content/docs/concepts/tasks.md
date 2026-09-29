@@ -113,7 +113,7 @@ says how hard pastor asks:
 
 ## end it
 
-pastor closes a done task's pane after 15 minutes (`close_done_after` in
+pastor closes a done task's pane after 5 seconds (`close_done_after` in
 `pastor.toml`), and removes its worktree if it is clean: no uncommitted
 changes and no unpushed commits. Nothing else closes on its own.
 

@@ -7,14 +7,8 @@ use std::time::{Duration, Instant};
 /// bring a daemon up, and a wait that ends early only ever fails a good run.
 const WAIT: Duration = Duration::from_secs(60);
 
-fn pastor() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
-    // The suite may itself run in an agent's pane, which pastor marks; the
-    // tests that want the mark set it. So may an orchestrator's script.
-    c.env_remove("PASTOR_TASK");
-    c.env_remove("PASTOR_ORCHESTRATOR");
-    c
-}
+mod common;
+use common::pastor;
 
 struct Env {
     _tmp: tempfile::TempDir,
@@ -2269,6 +2263,49 @@ fn task_retry_close_and_prune_end_to_end() {
     );
 }
 
+/// `task close` takes several ids: one result line each, every id tried, and
+/// exit 1 naming the ones that failed.
+#[test]
+fn task_close_takes_several_ids() {
+    let env = start();
+    for prompt in ["one", "two", "three", "four"] {
+        env.json(&["task", "run", prompt, "--json"]);
+    }
+    let out = env.cmd(&["task", "close", "t-1", "t-2"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, ["t-1 closed", "t-2 closed"], "{text}");
+
+    // One that fails does not stop the rest, and the exit says which.
+    let out = env.cmd(&["task", "close", "t-99", "t-3", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let results: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(results[0]["task"], "t-99");
+    assert_eq!(results[0]["code"], "task_not_found");
+    assert_eq!(results[1]["task"], "t-3");
+    assert_eq!(results[1]["state"], "closed");
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["code"], "close_failed", "{err}");
+    assert!(err["message"].as_str().unwrap().contains("t-99"), "{err}");
+
+    // --remove-worktree applies to every id: t-4 has none.
+    let out = env.cmd(&["task", "close", "t-4", "t-1", "--remove-worktree"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines().next().unwrap().starts_with("t-4 no_worktree"),
+        "{text}"
+    );
+    assert_ne!(
+        env.json(&["task", "describe", "t-4", "--json"])["state"],
+        "closed"
+    );
+}
 /// Without a head, prune still works on the database; retry and close need
 /// the daemon and say so with a stable code.
 #[test]
@@ -4527,6 +4564,9 @@ fn complete_offers_task_ids_with_their_note() {
         &["task", "read", ""][..],
         &["task", "describe", ""],
         &["task", "done", ""],
+        &["task", "close", ""],
+        // close takes several: past one id it offers more.
+        &["task", "close", "t-2", ""],
         &["events", "--task", ""],
     ] {
         let (ok, out) = complete(&config, &state, words);
@@ -5791,13 +5831,13 @@ fn the_profile_smoke_script_passes_tasks_that_end_done() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/smoke-profiles.sh");
     let run = |vars: &[(&str, &str)]| {
         let mut c = Command::new("sh");
+        common::scrub(&mut c);
         c.arg(script)
             .env("PASTOR", env!("CARGO_BIN_EXE_pastor"))
             .env("PASTOR_CONFIG_DIR", &env.config)
             .env("PASTOR_STATE_DIR", &env.state)
             .env("POLL", "1")
             .env("TIMEOUT", "30")
-            .env_remove("PASTOR_TASK")
             .env_remove("CLAUDE")
             .env_remove("OPENCODE");
         for (k, v) in vars {
@@ -6741,4 +6781,182 @@ fn a_share_and_a_max_refuse_a_head_from_before_them() {
     std::fs::remove_file(&socket).unwrap();
     text_head(&socket, pastor::ipc::FLOCK_SHARE_PROTOCOL);
     assert_eq!(ok(run(&["flock", "add", "spare"])), "said by the head\n");
+}
+
+/// A head of another version may answer a request with a variant this CLI
+/// does not expect. The command stops with the usual JSON error on stderr,
+/// code `internal`, and exit 1, never a Rust panic (exit 101).
+#[test]
+fn an_unexpected_head_reply_is_a_json_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let _reqs = text_head(&state.join("pastor.sock"), pastor::ipc::IPC_PROTOCOL);
+    for args in [
+        &["job", "list"][..],
+        &["task", "list"],
+        &["task", "describe", "t-1"],
+        &["task", "retry", "t-1"],
+        &["queue"],
+    ] {
+        let out = pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        let err: serde_json::Value = serde_json::from_str(stderr.trim())
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {stderr}"));
+        assert_eq!(err["code"], "internal", "{args:?}: {err}");
+    }
+}
+
+/// A flock.toml with a `spare` flock nobody uses, and the dirs around it,
+/// for the fleet lock tests.
+fn spare_flock(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let config = tmp.join("c");
+    let state = tmp.join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"work\"\ndefault = true\n\n[[flock]]\nname = \"spare\"\n\n[[machine]]\nname = \"pi-1\"\nlocal = true\n",
+    )
+    .unwrap();
+    (config, state)
+}
+
+/// Returns once process `pid` has `fleet.lock` in `state` open: an offline
+/// edit opens it only after its ping found no head, just before it waits on
+/// the lock. Linux only, from `/proc`, like CI.
+fn wait_for_fleet_lock_open(pid: u32, state: &std::path::Path) {
+    let lock = state.canonicalize().unwrap().join("fleet.lock");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let open = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|p| p == lock));
+        if open {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the edit never opened {}",
+            lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `flock remove` with no head checks the store and edits flock.toml under
+/// the fleet lock a starting head takes, so a head that starts in between
+/// cannot queue a task in the flock between the check and the save: the
+/// edit waits for the head to let go.
+#[test]
+fn offline_flock_remove_waits_for_a_starting_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, state) = spare_flock(tmp.path());
+    let paths = pastor::config::Paths::new(&config, &state);
+    let held = pastor::fleet_edit::lock_fleet(&paths, Duration::from_secs(5)).unwrap();
+    let child = pastor()
+        .args(["flock", "remove", "spare"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let file = std::fs::read_to_string(config.join("flock.toml")).unwrap();
+    assert!(file.contains("spare"), "edited under the lock: {file}");
+    drop(held);
+    let out = ok(child.wait_with_output().unwrap());
+    assert!(out.contains("removed flock spare"), "{out}");
+    let file = std::fs::read_to_string(config.join("flock.toml")).unwrap();
+    assert!(!file.contains("spare"), "{file}");
+}
+
+/// A head that starts listening while an offline edit waits on the lock
+/// could take a task the edit's store check never saw, so the edit stops
+/// with `head_started` instead of saving.
+#[test]
+fn offline_flock_remove_refuses_a_head_that_started_while_it_waited() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, state) = spare_flock(tmp.path());
+    let paths = pastor::config::Paths::new(&config, &state);
+    let held = pastor::fleet_edit::lock_fleet(&paths, Duration::from_secs(5)).unwrap();
+    let child = pastor()
+        .args(["flock", "remove", "spare"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Past the ping that found no head, the edit waits on the lock.
+    wait_for_fleet_lock_open(child.id(), &state);
+    let _head = std::os::unix::net::UnixListener::bind(state.join("pastor.sock")).unwrap();
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(error_code(&out), "head_started");
+    let file = std::fs::read_to_string(config.join("flock.toml")).unwrap();
+    assert!(file.contains("spare"), "{file}");
+}
+
+/// The reverse: `pastor serve` takes the same lock while it starts, so it
+/// does not load flock.toml or listen while an offline edit holds it.
+#[test]
+fn serve_does_not_listen_while_an_offline_edit_holds_the_fleet_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("c");
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let socket = tmp.path().join("herdr.sock");
+    let herdr = Command::new(env!("CARGO_BIN_EXE_fake-herdr"))
+        .arg("--listen")
+        .arg(&socket)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        format!(
+            "[[machine]]\nname = \"fake\"\ncommand = [\"{}\", \"--connect\", \"{}\"]\nmax_agents = 2\n",
+            env!("CARGO_BIN_EXE_fake-herdr"),
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let paths = pastor::config::Paths::new(&config, &state);
+    let held = pastor::fleet_edit::lock_fleet(&paths, Duration::from_secs(5)).unwrap();
+    let serve = pastor()
+        .args(["serve", "--foreground"])
+        .env("PASTOR_CONFIG_DIR", &config)
+        .env("PASTOR_STATE_DIR", &state)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut env = ServeEnv { serve, herdr };
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(env.serve.try_wait().unwrap().is_none(), "serve exited");
+    assert!(
+        !state.join("pastor.sock").exists(),
+        "serve listened under the lock"
+    );
+    drop(held);
+    let deadline = Instant::now() + WAIT;
+    while !state.join("pastor.sock").exists() {
+        assert!(Instant::now() < deadline, "serve never listened");
+        assert!(env.serve.try_wait().unwrap().is_none(), "serve exited");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

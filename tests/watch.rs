@@ -18,11 +18,11 @@ use pastor::task::{DispatchSpec, Task, TaskState};
 
 const WAIT: Duration = Duration::from_secs(30);
 
+mod common;
+
 fn pastor(config: &Path, state: &Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_pastor"));
-    c.env_remove("PASTOR_TASK")
-        .env_remove("PASTOR_HEAD")
-        .env("PASTOR_CONFIG_DIR", config)
+    let mut c = common::pastor();
+    c.env("PASTOR_CONFIG_DIR", config)
         .env("PASTOR_STATE_DIR", state)
         // Never the real data dir: connectors are linked there.
         .env("PASTOR_DATA_DIR", state.join("data"));

@@ -202,7 +202,7 @@ saved under another label, it prints that entry's remove command rather than
 guessing.
 
 A task that reaches `done` is closed by pastor after `close_done_after`
-(`pastor.toml`, default `15m`; `never` disables it): the pane closes, a
+(`pastor.toml`, default `5s`; `never` disables it): the pane closes, a
 worktree pastor created is removed if it is clean, and the task shows as
 `closed`. Clean means no uncommitted changes and no commits that are on no
 remote (`git rev-list HEAD --not --remotes` is empty; a repo with no remote
@@ -214,7 +214,8 @@ remove`. herdr never deletes the branch, even for a worktree it removes. Failed 
 own. The grace period keeps the pane there for `pastor task attach` (a
 Claude task can be reopened after it anyway; see [Reopening a finished
 task](#reopening-a-finished-task)); the
-check runs with each reconcile, while the machine is connected. An agent
+check runs every `close_done_after` (at most every reconcile) while the
+machine is connected. An agent
 that herdr shows working or blocked again
 at that moment is left alone, and its task goes back to running or blocked.
 
@@ -404,7 +405,12 @@ t-4` closes the task's pane (and the agent in it) and marks it `closed`; a
 queued task only has its row closed. `--remove-worktree` removes the task's
 worktree instead, which closes its workspace, pane included. herdr refuses a
 checkout with uncommitted or untracked files; the task is then left as it was,
-so commit or clean up and run it again. `pastor task prune --done --older-than
+so commit or clean up and run it again. `pastor task close t-4 t-5 t-6` closes
+each in turn, `--remove-worktree` applying to all: it prints one line per
+task (`t-4 closed`, or `t-5 no_worktree: ...` for one that failed; with
+`--json` an array of objects), goes on past a failure, and then exits 1 with
+`close_failed` naming the ones not closed. One task prints as it always has.
+`pastor task prune --done --older-than
 3d` deletes done tasks that finished more than three days ago; `--failed` and
 `--closed` add those states. A pruned task's item stays seen, so a job never
 queues it again, and the newest task is always kept so its id is never handed
@@ -687,6 +693,17 @@ pinned to the machine stays queued with a note, and the output names it.
 machine's `max_agents`, for setups with one flock per machine, so it stays
 there whichever flock is the default later. A machine whose only membership
 is already that flock's `machines` table is left as it is.
+
+With no head running, `flock add|join|leave|remove` and `machine remove`
+hold a lock (`fleet.lock` in the state dir) from their read of the queued
+tasks to the save, and `pastor serve` holds the same lock from before it
+reads flock.toml until it listens. So a head starting meanwhile waits for the
+edit and reads the edited file, never queueing a task in a flock the edit
+just removed. An edit that finds a head listening once the lock is free stops
+with `head_started`; run it again and it goes through the head. Either side
+gives up after 30 seconds with `fleet_locked`. A bare `pastor serve` waits
+for the lock before it starts the head and begins its own 30 seconds, so it
+reports `fleet_locked` too rather than `serve_slow`.
 
 pastor never rewrites a machine's old `flock` key on its own. The first of
 `flock join`, `flock leave` or `machine move` on that machine (a move even to
@@ -1339,20 +1356,29 @@ takes the last rule that matches. `Read` is opencode's `read` and `list`,
 `task`; `Bash(git log:*)` is `bash` on `git log` and `git log *`, and any
 other argument goes as written. A tool opencode has no permission for adds
 nothing, and the agent's to-do list (`todoread`, `todowrite`) is always
-allowed. The pane also gets `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` and
-`OPENCODE_CONFIG_CONTENT` set empty, over an `[agents]` env that sets them,
-so no other config file adds rules around the profile's.
+allowed. The pane also gets `OPENCODE_CONFIG` and `OPENCODE_CONFIG_DIR` set
+empty, and `OPENCODE_CONFIG_CONTENT` set to the repo's instructions and
+nothing else (below), over an `[agents]` env that sets any of them, so no
+other config adds rules around the profile's.
 
 Before it makes anything on the machine, pastor checks the machine's own
 opencode config (`config.json`, `opencode.json` and `opencode.jsonc` in
-`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`): a `"permission"` key
-anywhere in them, even under an agent, fails the task
+`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`, and in
+`~/.opencode`, and the managed `/etc/opencode`, on macOS
+`/Library/Application Support/opencode` and the MDM preferences
+`ai.opencode.managed.plist` in `/Library/Managed Preferences/<user>` and
+`/Library/Managed Preferences`, read through `plutil`, one it cannot read
+counting as rules): a `"permission"` key anywhere in
+them, even under an agent, or a legacy `"tools"` one, fails the task
 (`opencode_permissions_conflict` in its `error`), since opencode would merge
 those rules with the profile's. Move them out, or run the task without a
-profile. A `command` machine cannot be checked, and goes ahead. The repo's
-own opencode config (an `opencode.json` in the checkout) is still read, and
-its rules would merge with the profile's too; keep permission rules out of
-repos that profiled opencode tasks run in.
+profile. A `command` machine cannot be checked, and goes ahead. pastor turns
+the repo's own opencode config (an `opencode.json` or `.opencode/` in the
+checkout) off for a profiled task (`OPENCODE_DISABLE_PROJECT_CONFIG=1`), so a
+branch cannot add rules to the profile's, and passes the checkout's
+instructions back by path in `OPENCODE_CONFIG_CONTENT`: its `AGENTS.md`, or
+when there is none its `CLAUDE.md`, the one file opencode would have read
+itself. On a `command` machine, which cannot be asked, both go.
 
 An agent of any other kind gets the lists through its `allow_flag` and
 `deny_flag`, as any list, and keeps its own permission mode.
@@ -1522,8 +1548,8 @@ A record, which is also what connector event hooks get on stdin:
   `until`; or a session's `restarts`, with `max` and `until`), `until` on
   `quota`, `after` (the agent it replaces) and `restarts` (in the last hour)
   on `restarted`, `reason` (`hours` or `hand`) on `stopping` and `stopped`
-  and `grace` on `stopping`, and `stage` (`pre`, `agent` or `post`) and
-  `error` on `failed`.
+  and `grace` on `stopping`, and `stage` (`pre`, `agent`, `post` or
+  `state`) and `error` on `failed`.
 - `summary`: on `task.done` and `task.failed`, how the round that just ended
   ended (see Task summaries): `round`, `outcome` (`done`, `partial`,
   `blocked`, `nothing to do`, `unknown`, or `no summary`), `text`, `source`
@@ -1581,7 +1607,10 @@ PR 31 reviewed, 2 open threads
   disabled or removed is dropped without a line.
 - `HEAD down: <why>` when the head stops answering, once, and `HEAD up` when
   it answers again. `HEAD gap` says the log rotated events out before the
-  watcher read them; `pastor watch --now` shows where things stand.
+  watcher read them; `pastor watch --now` shows where things stand. `HEAD
+  reset` says the head's log ends before the watcher's cursor (the head
+  moved, or its state dir was wiped): the watcher goes on from the log's end
+  and never replays what is already there.
 - A connector's lines, as it printed them, and `CONNECTOR <id> failing: <why>`
   / `CONNECTOR <id> ok` around a spell of failed runs (see [The watch
   command](#the-watch-command)).
@@ -1848,8 +1877,9 @@ pastor orchestrator note --name merge "merged #31; #32 waits on review"
 
 `list` shows each file's state: `idle`, `running` (its agent works, or its
 session runs), `stopping` (a session in its grace), `held` (a session due but
-held by the limit), `waiting for quota`, `off` (disabled) or `invalid` (the
-file never parsed); a session's next run is its next start.
+held by the limit, or a bad `state.json`, below), `waiting for quota`, `off`
+(disabled) or `invalid` (the file never parsed); a session's next run is its
+next start.
 `run` ignores the schedule and `enabled`, waits for a run or post script of
 the same orchestrator already going, and is still skipped while the last
 agent works; it returns at once, and `describe` shows how it went. Orchestrator
@@ -1866,6 +1896,16 @@ What the head keeps per orchestrator lives in
 failures and backoff, its last agent, the lines it was started with, a quota
 wait, a running session with its restarts, the last ten runs), `note`,
 `scratch/` and `runs/`.
+
+A missing `state.json` is a fresh start. One that cannot be read or parsed
+holds the orchestrator instead, since starting afresh would forget a live
+agent (and start a second one beside it) and a pending post script: a
+scheduled run comes back `held` with the error as its detail, no post script
+or session step runs, and `start` and `stop` by hand answer
+`orchestrator_held`. `orchestrator.failed` (`stage: "state"`) says why once
+per distinct error, and `list` shows it `held` with the error in its `error`
+field. The head never saves over the bad file; fix or remove it and the
+orchestrator runs again on the next tick.
 
 ## Try it
 
@@ -1909,6 +1949,7 @@ pastor task run --priority critical --preempt "prod is down"  # pauses a low tas
 pastor queue                         # the queue in the order it runs, and why each waits
 pastor queue move t-6 --before t-5   # take t-5's place, and its level
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
+pastor task close t-2 t-3 t-4           # several at once, one line each
 pastor task done t-1                 # mark it done; its pane closes after close_done_after
 pastor task done --summary "done: PR #31"   # from its own pane: how it ended
 pastor task run --summary require "Fix issue 12"   # fails if its agent stops without one
@@ -2635,6 +2676,9 @@ store, and never reads `flock.toml`.
 - Events the head rotated out of its log before this machine read them are
   lost to the hooks: it logs a `head_events_gap` warning and goes on from
   the oldest record the head still has.
+- A cursor past the head's newest event (the head moved, or its state dir
+  was wiped) logs a `head_events_reset` warning and moves to the head's end;
+  no hook fires for the records already there.
 - Its database is `shepherd.db` in the state dir: the jobs' state and seen
   keys, and the event cursor. `pastor.db` is left alone.
 - On `pastor.sock` it answers `ping` (with `role: "shepherd"`), `tick` and
@@ -3021,6 +3065,7 @@ sends nothing. A head from before these requests is refused
 ~/.local/state/pastor/pastor.db   tasks (schema 13, with retry_of, flock, trust_sent, activity_seen, ended, priority, priority_from, queue_pos, role, description, preempt, paused_at, paused_for and resumed_at), task summaries, seen keys, job state, trusted repos, the last event seq
 ~/.local/state/pastor/shepherd.db  a headless serve's job state, seen keys and head event cursor
 ~/.local/state/pastor/pastor.sock daemon socket
+~/.local/state/pastor/fleet.lock  held by a fleet edit with no head, and by `pastor serve` while it starts
 ~/.local/state/pastor/events.jsonl events log (and events.jsonl.1, the previous one)
 ~/.local/state/pastor/watch/<name>.json   a `pastor watch` cursor
 ~/.local/state/pastor/orchestrators/<name>/  an orchestrator's state.json, note, scripts' scratch/ and runs/
@@ -3048,7 +3093,7 @@ settle = "10s"               # a finished agent stays idle this long before its 
 reconcile_every = "60s"
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
-close_done_after = "15m"     # a done task's pane closes after this; "never" keeps it
+close_done_after = "5s"      # a done task's pane closes after this; "never" keeps it
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
 max_orchestrators = 1        # orchestrator agents at once, outside max_agents
 # head_address = "user@head.example"  # unset by default; see below
@@ -3176,6 +3221,7 @@ make test             # unit tests plus an end-to-end run against fake-herdr
 make test-machine     # the machine actor tests five times, to catch timing flakes
 make smoke SESSION=s  # opt-in test against a real herdr running session s on this host
 make smoke-profiles REPO='~/src/app' CLAUDE=pi-1 OPENCODE=pi-2  # a live review task per agent through the head
+make smoke-rc TAG=v1.2.0-rc.1 LABEL=arm64  # make smoke against a tag, in a scratch worktree, as a Markdown report
 make build            # debug build of both binaries; cargo run -- --help works from there
 ```
 
@@ -3191,3 +3237,15 @@ without ever going `blocked`. It prints the end of each pane, to paste in a
 pull request, and closes the tasks. The head must run the pastor under test,
 since the head is what hands the agent its profile. Run it before trusting
 a change to profiles.
+
+`make smoke-rc TAG=<tag>` is what a release candidate gets before its final
+tag: it checks the tag out in a scratch worktree under `$TMPDIR`, builds it
+and runs `make smoke` there (`SESSION` picks the herdr session), then prints
+one Markdown block with the tag, the machine's `LABEL`, the herdr version,
+pass or fail per suite and the last lines of a failure, with paths and the
+hostname scrubbed. With `PROFILES=1` and `REPO`, `CLAUDE` and/or `OPENCODE`
+it runs `make smoke-profiles` too, and refuses unless the running head
+answers with the tag's version (`serve status --json`, over ssh when `head
+show` names a remote head), since the head must run the candidate; `PASTOR`
+picks the CLI for both. The exit status is the result; the worktree is
+removed either way.

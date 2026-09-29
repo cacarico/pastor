@@ -126,8 +126,8 @@ not that the work is right: read the diff before you trust it.
 ## see it closed
 
 `pastor task list` shows live tasks only, so the finished task drops out of
-it. A `done` task keeps its pane for 15 minutes (`close_done_after`), so you
-can still attach and look. Then pastor closes the pane and the task shows
+it. A `done` task keeps its pane for 5 seconds (`close_done_after`; set it
+longer to attach and look). Then pastor closes the pane and the task shows
 `closed`. Add `--all` to see it:
 
 ```sh
@@ -141,8 +141,8 @@ t-1  closed  normal    here     default  claude  -      run  22m  worktree kept:
 
 pastor removes a worktree only when it is clean. This one holds a commit no
 remote has, so it stays, and the note says where. Push or merge the branch,
-then remove the checkout with `git worktree remove`. To close a task before
-the 15 minutes are up, run `pastor task close t-1`.
+then remove the checkout with `git worktree remove`. To close a task yourself,
+run `pastor task close t-1`.
 
 More on states, retries and summaries in [tasks](../../concepts/tasks/).
 

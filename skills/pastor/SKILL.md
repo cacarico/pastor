@@ -91,7 +91,7 @@ States:
 - `failed`: dispatch failed or the agent exited before it was done. `task describe` has the error.
 - `closed`: finished for good, by pastor after the grace period or by `task close`. Usually the pane is gone, but a task that never reached a machine, or whose machine left the flock, is closed as a row only: no pane was closed and its worktree may still be on disk.
 
-pastor closes a done task's pane after `close_done_after` (`pastor.toml`, default `15m`; `never` disables it): a worktree pastor created is removed if it is clean (no uncommitted changes and no commits on no remote), kept with a note on the task if it is not, and the task then shows as `closed`. Failed, stale and blocked tasks are never closed on their own; use `pastor task retry` or `pastor task close`. The check runs on each reconcile while the machine is connected; an agent herdr shows working or blocked again at that moment is left alone, and its task goes back to `running` or `blocked`.
+pastor closes a done task's pane after `close_done_after` (`pastor.toml`, default `5s`; `never` disables it): a worktree pastor created is removed if it is clean (no uncommitted changes and no commits on no remote), kept with a note on the task if it is not, and the task then shows as `closed`. Failed, stale and blocked tasks are never closed on their own; use `pastor task retry` or `pastor task close`. The check runs every `close_done_after` (at most every reconcile) while the machine is connected; an agent herdr shows working or blocked again at that moment is left alone, and its task goes back to `running` or `blocked`.
 
 ## Closing and retrying tasks
 
@@ -102,6 +102,7 @@ pastor task close t-4                      # closes the pane if there is one, ma
 pastor task done t-4                       # marks a task with a pane done; its pane closes after close_done_after
 pastor task describe t-4 --all-summaries   # how each round of the task ended
 pastor task close t-4 --remove-worktree    # removes the worktree too; refused if it has uncommitted changes
+pastor task close t-4 t-5 t-6              # several: one line each, the rest go on past a failure, exit 1 (close_failed) if any failed
 pastor task prune --done --older-than 3d   # deletes finished rows; --failed and --closed add those states
 ```
 

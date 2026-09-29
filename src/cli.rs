@@ -1,8 +1,9 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::config::Paths;
 use crate::config::flock::{DEFAULT_FLOCK, Flock, FlockNumber};
-use crate::ipc::{RequestError, connect_error_means_no_daemon};
+use crate::ipc::{IpcRequest, IpcResponse, RequestError, connect_error_means_no_daemon};
 use crate::machine::MachineStatus;
 use crate::scheduler::{JobRunReport, JobStatus};
 use crate::task::Task;
@@ -441,18 +442,19 @@ pub fn task_result(t: &Task) -> String {
         .map_or_else(|| "-".into(), |s| s.outcome.to_string())
 }
 
-/// The stable code and message for a request that got no reply. Only a connect
-/// that was refused or found no socket means nothing is listening; one denied
-/// for permissions may hide a live head, as `probe_daemon` also assumes. A head
-/// that took the connection and then sat on it is running but busy. Telling
-/// the user to start a head in either case would send them the wrong way.
-/// The head handles each request in a detached task, so a timed-out `run`,
+/// The CLI error for a request that got no reply, the one mapper every
+/// command uses. Only a connect that was refused or found no socket means
+/// nothing is listening (`daemon_not_running`); one denied for permissions
+/// may hide a live head, as `probe_daemon` also assumes. A head that took the
+/// connection and then sat on it is running but busy. Telling the user to
+/// start a head in either case would send them the wrong way. The head
+/// handles each request in a detached task, so a timed-out `run`,
 /// `task retry`, `tick` or `job run` may still land; sending it again blindly
 /// can queue a duplicate.
-pub fn request_failure(err: &RequestError) -> (String, String) {
+pub fn request_error(err: &RequestError) -> CliError {
     let (code, message) = match err {
         RequestError::Connect(e) if connect_error_means_no_daemon(e) => (
-            "runtime_error",
+            "daemon_not_running",
             format!("pastor serve is not running ({e}); start it with `pastor serve`"),
         ),
         RequestError::Connect(e) => (
@@ -471,9 +473,53 @@ pub fn request_failure(err: &RequestError) -> (String, String) {
             format!("pastor serve dropped the request: {e:#}"),
         ),
         RequestError::Unreachable(message) => ("head_unreachable", message.clone()),
-        RequestError::Refused { code, message } => return (code.clone(), message.clone()),
+        RequestError::Refused { code, message } => {
+            return CliError {
+                code: code.clone(),
+                message: message.clone(),
+            };
+        }
     };
-    (code.to_string(), message)
+    CliError {
+        code: code.into(),
+        message,
+    }
+}
+
+/// What `request_head` got, as the CLI takes it: a reply, or a `CliError`
+/// for an error reply or for no reply at all (`request_error`).
+pub fn reply(got: Result<IpcResponse, RequestError>) -> Result<IpcResponse, CliError> {
+    match got {
+        Ok(IpcResponse::Error { code, message }) => Err(CliError { code, message }),
+        Ok(resp) => Ok(resp),
+        Err(err) => Err(request_error(&err)),
+    }
+}
+
+/// One request to the head, the local serve or the remote head, whichever
+/// `request_head` reaches. The error is for the caller to return, print or
+/// act on (an invalid edit reopens the editor); nothing here exits.
+pub async fn ask(paths: &Paths, req: IpcRequest) -> Result<IpcResponse, CliError> {
+    reply(crate::ipc::request_head(paths, &req).await)
+}
+
+/// A reply of a variant the command does not expect, as from a head of
+/// another version: an error with code `internal`, never a panic.
+pub fn unexpected(resp: IpcResponse) -> anyhow::Error {
+    CliError::err("internal", format!("unexpected daemon reply: {resp:?}"))
+}
+
+/// One task, as `task show` prints it: JSON, or a one-row table.
+pub fn print_task(t: &Task, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&t.to_json())?);
+    } else {
+        println!(
+            "{}",
+            table(&TASK_HEADER, &task_rows(std::slice::from_ref(t)))
+        );
+    }
+    Ok(())
 }
 
 /// Tasks still holding a pane on a machine the flock no longer has. Nothing
