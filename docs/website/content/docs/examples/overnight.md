@@ -58,7 +58,7 @@ task_state() {
   pastor task list --json |
     jq -r --arg d "$1" '[.[] | select(.description == $d)] | max_by(.id) | .state // empty'
 }
-live() { case "$1" in queued|starting|running|blocked|paused) return 0 ;; esac; return 1; }
+live() { case "$1" in queued|starting|running|blocked|paused|waiting) return 0 ;; esac; return 1; }
 
 # Open review threads on a PR, over every page of them.
 unresolved() {

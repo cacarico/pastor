@@ -707,7 +707,7 @@ Every exhausted account: its model, when it is tried again, what ran out, who sa
 
 ### pastor limit clear
 
-Forget an account's limit, so queued tasks start on it on the next pass
+Forget an account's limit, so queued and waiting tasks start on it on the next pass
 
 | argument | does | default |
 |---|---|---|

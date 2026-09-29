@@ -104,8 +104,15 @@ The head keeps a row per exhausted account (or one model of it) until its
 reset, and a new task does not start on it: it takes the first free model
 of its `fallback` list, or stays queued, and `pastor queue` says why, like
 `waiting: me-personal exhausted until 03:00 (5-hour limit, seen by t-412)`.
+A Claude task whose agent stops on a limit (`You've hit your limit ·
+resets 3am`) goes `waiting`, not `done`: pastor closes its pane, keeps its
+worktree, and resumes its session on the same machine at the reset.
+`pastor task list` shows it as `waiting 03:00`.
+
 `pastor limit list` shows the rows, and `pastor limit clear <account>`
-forgets one. The events are `agent.exhausted` and `agent.reset`, and
+forgets one, which wakes the tasks waiting on it on the next pass. The
+events are `agent.exhausted`, `agent.reset`, `task.limited` and
+`task.waiting`, and
 [`[limits]`](../../reference/pastor-toml/#limits) sets how long a limit
 with no reset holds.
 

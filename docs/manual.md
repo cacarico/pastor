@@ -20,7 +20,8 @@ machines](#pull-machines)). Task state lives in SQLite under
 
 An agent that never becomes ready within 30s fails the task; one that exits
 on start fails it straight away, usually because the agent is not installed
-on that machine. An agent that is blocked on its own startup question marks
+on that machine, unless the end of its pane shows a usage limit: then the
+task waits for the reset (see [Usage limits](#usage-limits)). An agent that is blocked on its own startup question marks
 the task `blocked`; herdr drops the prompt then, so pastor sends it once
 someone answers and the agent leaves `blocked`.
 
@@ -38,6 +39,12 @@ reads the last 100 lines of the pane: when the agent's last message (Claude's
 <question>` as its error, and stays there until the agent moves again.
 Agents that draw their messages without that marker are never read as
 asking.
+
+A Claude agent that stopped on a usage limit (`You've hit your limit ·
+resets 3am`) is idle as well. The same read, before the question, finds the
+limit in the agent's last message after the last prompt, and the task goes
+`waiting` instead of `done` (see [Usage limits](#usage-limits)). A task its
+agent ended with `pastor task done` is done whatever its pane shows.
 
 Claude can also end its turn with a command still running in the background
 (`make check`), and takes the turn up again when it ends. While the pane's
@@ -180,8 +187,11 @@ passes never run at once, and a task moves from `queued` to `starting` with a
 conditional update, so a machine is never given more than its room (see Room
 on a machine).
 
-`pastor task list` shows live tasks only: queued, starting, running, blocked
-and paused (see [Pausing a low task](#pausing-a-low-task)). Finished ones
+`pastor task list` shows live tasks only: queued, starting, running,
+blocked, paused (see [Pausing a low task](#pausing-a-low-task)) and waiting
+(see [Usage limits](#usage-limits)); a waiting task reads `waiting 03:00`,
+its reset in local time, and the waiting ones come first, the soonest reset
+first. Finished ones
 (done, failed, stale, closed) appear with `--all`, and an empty default list
 says so on stderr. `--blocked` and `--done` narrow to just that state,
 `--job`, `--flock` and `--machine` narrow whichever set is shown, and
@@ -1364,7 +1374,7 @@ With none free anywhere, the task stays `queued`, and `task describe` and
 waiting: me-personal exhausted until 03:00 (5-hour limit, seen by t-412)
 ```
 
-Nothing reads a limit from a task's pane yet: the rows come from an
+The rows come from a task's agent that stopped on a limit (below), from an
 orchestrator's agent that stopped on a quota (see
 [Orchestrators](#orchestrators)), and from a pull machine's report. An
 orchestrator whose agent's account is exhausted does not start one before
@@ -1374,10 +1384,10 @@ the account resets, and shows `waiting for quota`.
 whole account), when it is tried again, what ran out and the task that saw
 it; `--json` has every field. `pastor limit clear <account>` forgets an
 account's limits, `--model <m>` only that model's, with `agent.reset`
-(`by: hand`), and the tasks they held start on the next pass; clearing an
-account with no limit fails with `not_exhausted`. There is no `limit set`.
-An agent pastor started may list the limits, and may clear one only with
-`agents_change_fleet`.
+(`by: hand`), and the tasks they held, queued or waiting, start on the next
+pass; clearing an account with no limit fails with `not_exhausted`. There
+is no `limit set`. An agent pastor started may list the limits, and may
+clear one only with `agents_change_fleet`.
 
 `[limits]` in pastor.toml:
 
@@ -1390,13 +1400,72 @@ An agent pastor started may list the limits, and may clear one only with
 | `retry_after_no_credit` | `"6h"` | how long a limit for no credit holds |
 | `handover_lines` | `100` | the pane lines a task moving to another model hands to it |
 
-Only `unknown_reset_wait` and `retry_after_no_credit` are used so far; the
-others are read and checked, for a task that stops on a limit while it runs.
+Only `unknown_reset_wait` and `retry_after_no_credit` are used so far (a
+waiting task's wait, below); the others are read and checked, for what a
+limited task does next: a short limit retried in its pane, a move to its
+next model.
 
 A pull machine's serve reports a limit with its task's state, and the head
 keeps it under the account the task's agent names on that machine. The
 table lives on the head only; a head from before usage limits refuses
 `limit list` and `limit clear` (`head_too_old`).
+
+#### A limited task waits
+
+A Claude agent that runs out stops with a message such as `You've hit your
+limit · resets 3am` and sits idle, exactly like one that finished. Before
+it calls a task `done`, pastor reads the end of the pane (as for a
+question, see [How it works](#how-it-works)); an agent that dies at its
+start leaves the same message at the end of its pane, read before the task
+would fail. Only the agent's last message after the last prompt counts: a
+limit further up, a quoted one, or tool output that shows one (a grep of
+pastor's own source) is no limit. A task its agent ended with `pastor task
+done` is never limited. Only Claude's messages are known.
+
+The limit goes in the table as above, with `agent.exhausted` and
+`task.limited`, and the task goes `waiting`:
+
+- pastor presses `esc` in its pane, so Claude ends its turn and keeps the
+  conversation, then closes the pane, as a pause does. A worktree stays on
+  disk.
+- The task is pinned to its machine, holds no slot there, and waits until
+  the row's `retry_at`, which is `waiting_until` on the task: the reset the
+  message named, else `unknown_reset_wait` (`retry_after_no_credit` for no
+  credit). A 429 or 529 that outlived Claude's own retries is handled the
+  same way, with no reset named.
+- Its error says which account and until when: `me-personal exhausted
+  until 03:00 (5-hour limit, seen by t-412)`. `task list` shows `waiting
+  03:00`; `task describe` has `waiting: until 03:00` and the error as
+  `limit:`.
+- `task.waiting` goes out with `why: no_fallback`, the account, the model,
+  `until`, and `shown`, the `waiting 03:00` a board or a notification can
+  print as it is.
+
+Each dispatch pass looks at the waiting tasks, the soonest first and before
+the queue. One goes on once no live limit holds its agent and model on its
+machine: when the pass drops the row at its `retry_at`, or on the pass after
+`pastor limit clear`. A later limit on the same account keeps it waiting. It
+resumes as a paused task does, on its machine and once there is room: back
+in its own checkout, with `claude --resume <session>` and a line telling the
+agent it stopped on a usage limit that has reset. A task with no session to
+resume (its agent died at the start of a new one, so its prompt never
+reached it) starts again in the same checkout with its prompt and a
+paragraph saying that an earlier start stopped on a limit and may have left
+work there. If the limit still holds, the agent stops on it again and the
+task waits again.
+
+`waiting` is not `paused`: they share the closing and the resuming, not the
+meaning. A paused task goes first among the `low` tasks when a slot frees;
+a waiting one goes on at its time. `pastor task close` closes a waiting
+task's row (`--remove-worktree` removes its kept worktree, as for a paused
+one). `task retry` refuses it with `task_waiting`, since it goes on by
+itself and a retry would put a second agent on the same work, and so does
+`task attach`. `task send` answers `task_not_live`.
+
+A task with [fallback models](#fallback-models) waits all the same for now;
+moving it to the next model is to come. A headless serve keeps no table, so
+its own tasks settle as before, and a pull machine does not read limits from
+its panes yet.
 
 ### Permission profiles
 
@@ -1938,6 +2007,9 @@ A record, which is also what connector event hooks get on stdin:
   every new record has a positive `seq`.
 - `at`: when the daemon received the event, RFC 3339 UTC.
 - `type`: `task.queued|running|blocked|done|stale|failed|closed|paused`,
+  `task.limited` (its agent stopped on a usage limit; the detail is
+  `agent.exhausted`'s) and `task.waiting` (it waits for the reset; see
+  Usage limits),
   `task.input` (`pastor task send`), `task.trusted` (the head answered a
   trust prompt), `job.failed`, `connector.finish_failed` (a connector's
   `[finish]` command failed), `machine.connected`, `machine.lost`,

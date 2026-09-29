@@ -460,7 +460,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand profile; and __fish_seen_s
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and not __fish_seen_subcommand_from list clear help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and not __fish_seen_subcommand_from list clear help" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and not __fish_seen_subcommand_from list clear help" -f -a "list" -d 'Every exhausted account: its model, when it is tried again, what ran out, who saw it'
-complete -c pastor -n "__fish_pastor_using_subcommand limit; and not __fish_seen_subcommand_from list clear help" -f -a "clear" -d 'Forget an account\'s limit, so queued tasks start on it on the next pass'
+complete -c pastor -n "__fish_pastor_using_subcommand limit; and not __fish_seen_subcommand_from list clear help" -f -a "clear" -d 'Forget an account\'s limit, so queued and waiting tasks start on it on the next pass'
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and not __fish_seen_subcommand_from list clear help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and __fish_seen_subcommand_from list" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and __fish_seen_subcommand_from list" -l json -d 'Print as a JSON array'
@@ -469,7 +469,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand limit; and __fish_seen_sub
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and __fish_seen_subcommand_from clear" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and __fish_seen_subcommand_from clear" -s h -l help -d 'Print help'
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and __fish_seen_subcommand_from help" -f -a "list" -d 'Every exhausted account: its model, when it is tried again, what ran out, who saw it'
-complete -c pastor -n "__fish_pastor_using_subcommand limit; and __fish_seen_subcommand_from help" -f -a "clear" -d 'Forget an account\'s limit, so queued tasks start on it on the next pass'
+complete -c pastor -n "__fish_pastor_using_subcommand limit; and __fish_seen_subcommand_from help" -f -a "clear" -d 'Forget an account\'s limit, so queued and waiting tasks start on it on the next pass'
 complete -c pastor -n "__fish_pastor_using_subcommand limit; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list add remove help" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand trust; and not __fish_seen_subcommand_from list add remove help" -s h -l help -d 'Print help'
@@ -588,7 +588,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from profile" -f -a "list" -d 'Every permission profile: name, where it comes from, what it extends'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from profile" -f -a "describe" -d 'One profile with its extends followed: the allow and deny lists it adds up to'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from limit" -f -a "list" -d 'Every exhausted account: its model, when it is tried again, what ran out, who saw it'
-complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from limit" -f -a "clear" -d 'Forget an account\'s limit, so queued tasks start on it on the next pass'
+complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from limit" -f -a "clear" -d 'Forget an account\'s limit, so queued and waiting tasks start on it on the next pass'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "list" -d 'Every saved trust: machine, repo, and when it was saved'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "add" -d 'Save a trust, so the repo\'s tasks on that machine are answered'
 complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subcommand_from trust" -f -a "remove" -d 'Forget a saved trust; the repo\'s next task asks again'
