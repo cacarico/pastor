@@ -73,6 +73,7 @@ pastor task run "<prompt>" --machine pi-3 --agent claude \
   - Without it: the `model` of the task's flock, then its machine, then `[defaults]`, then none.
   - An unknown name is `unknown_model`; a model of another kind than the agent is `model_kind_mismatch`.
   - An unpinned task only goes to machines whose agent has the model's kind. A model of another kind than the default agent's runs on the agent a machine, flock or `[defaults]` names for that kind in `agents = { <kind> = "<agent>" }`; a machine with none never gets it.
+- `--fallback sonnet,gpt` names the `[models]` the task may fall back to, in order; `--no-fallback` names none. Without either: the `fallback` of its machine, then its flock, then `[defaults]`, then none; the first list wins whole, and `[]` means none. An unknown name is `unknown_model`. Nothing switches models yet; `task describe` shows the list.
 - `--priority LEVEL` (`low`, `normal`, `high`, `critical`) orders the queue when machines are full: by level, highest first, then by position, then age.
   - Without it: the `priority` of the task's flock, then the machine it is pinned to, then `[defaults]`, then `normal`. Another word is `unknown_priority`.
   - `pastor task priority t-N LEVEL` changes a queued task's level (`not_queued` once a machine took it); `task retry` keeps it.

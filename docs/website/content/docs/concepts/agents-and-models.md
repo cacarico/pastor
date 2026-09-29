@@ -84,6 +84,12 @@ default. The model's `args` go first on the agent's command line, then the
 task's `agent_args`. `--model` takes only a name; an unknown one is
 refused with `unknown_model`.
 
+`fallback = ["sonnet", "gpt"]` names the models a task may go on under
+when its own runs out, each finding its agent on the machine as above. It
+comes from `--fallback` or the job's `fallback`, then the machine, then
+the flock, then `[defaults]`; the first list wins whole, and `[]` means
+none. `pastor task run --no-fallback` gives one task none.
+
 ## a model of another kind
 
 A model runs only on an agent of its kind. To run an opencode model on a

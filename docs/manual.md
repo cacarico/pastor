@@ -602,6 +602,7 @@ machines = { desk = 1 }   # and at most 1 of work's
 agent = "claude"          # optional: the agent for this flock's tasks
 agent_args = ["--model", "claude-sonnet-5"]
 # model = "sonnet"        # optional: a [models] name, see Models below
+# fallback = ["opus"]     # optional: models its tasks may fall back to, see Fallback models
 # priority = "high"       # optional: see Priority and queue order below
 # agents = { opencode = "opencode" }  # optional: the agent per kind, see Models
 # profile = "develop"     # optional: a permission profile, see Permission profiles below
@@ -785,7 +786,7 @@ that flock has been removed.
 ### What a flock sets
 
 A `[[flock]]` entry takes every per-task setting `[defaults]` has: `agent`,
-`agent_args`, `agents`, `model`, `profile`, `priority`, `allow`, `deny`,
+`agent_args`, `agents`, `model`, `fallback`, `profile`, `priority`, `allow`, `deny`,
 `timeout`, `place`, `label` and `summary` (`max_tasks_per_run` stays a job
 setting). A task gets the settings of its own flock, the one it is queued
 in; a machine in many flocks does not mix them.
@@ -793,9 +794,9 @@ in; a machine in many flocks does not mix them.
 For everything but the agent, the flock comes before the machine: a task
 takes each setting from the first of its run flags (or job's `[dispatch]`),
 its flock, the machine it runs on, and `[defaults]` that sets it. Only
-`model`, `profile` and `priority` have a machine layer; a machine has no
-`timeout`, `place`, `label` or `summary`. `allow` and `deny` add up instead
-(see [Tool allow and deny lists](#tool-allow-and-deny-lists)).
+`model`, `fallback`, `profile` and `priority` have a machine layer; a
+machine has no `timeout`, `place`, `label` or `summary`. `allow` and `deny`
+add up instead (see [Tool allow and deny lists](#tool-allow-and-deny-lists)).
 
 ```toml
 # flock.toml: desk is shared; each project's flock sets its own
@@ -822,9 +823,10 @@ agent = "claude-personal"   # the account logged in here: every flock runs it
 model = "opus"              # only for a flock that names no model
 ```
 
-The agent and its args are the exception: the machine comes before the
-flock, since it knows what is installed and logged in there (see [A flock's
-or a machine's agent](#a-flocks-or-a-machines-agent)). A machine's
+The agent, its args and `fallback` are the exception: the machine comes
+before the flock, since it knows what is installed and logged in there (see
+[A flock's or a machine's agent](#a-flocks-or-a-machines-agent) and
+[Fallback models](#fallback-models)). A machine's
 `profile` also keeps its other job, deciding whether a task may ask for
 `unrestricted` there (see [the unrestricted
 rule](#permission-profiles)); a flock's profile never lifts it.
@@ -1081,6 +1083,59 @@ item. In flock.toml, a flock's or a machine's unknown `model` fails the load
 `--json` a `model` field; `flock describe` and `machine describe` show their
 own `model`; task events carry `model`. The store keeps the name, and a retry
 settles the model's args again from pastor.toml as it stands.
+
+#### Fallback models
+
+`fallback` names, in order, the `[models]` a task may go on under when its
+own model runs out. Nothing switches models yet: pastor settles and keeps
+the list, and shows it.
+
+```toml
+# fragment of flock.toml
+[[flock]]
+name = "personal"
+model = "opus"
+fallback = ["sonnet", "gpt"]   # then sonnet, then gpt
+
+[[machine]]
+name = "desk"
+local = true
+fallback = []                  # tasks on desk fall back to nothing
+```
+
+Each entry is a model, not an agent: `gpt` finds its agent on the task's
+machine as any model of another kind does (see [An agent per
+kind](#an-agent-per-kind)), so a task never falls back to another login of
+its own kind.
+
+A task takes its list from the first of these that sets one:
+`--fallback sonnet,gpt` or `--no-fallback` on `pastor task run` (or
+`fallback` under a job's `[dispatch]`), `fallback` under the `[[machine]]`
+entry it runs on, `fallback` under its `[[flock]]` entry, `[defaults]
+fallback`. Unlike `model`, the machine comes before the flock. The first
+layer that sets a list wins whole: lists never merge, and `fallback = []`
+means none and ends the lookup, so desk above gives its tasks no list
+although the personal flock has one. With none set anywhere, the task has
+none. `--no-fallback` is `[]` for one task, and `--fallback` with it is
+refused.
+
+A job's entries are templates, rendered for each item like its `model`;
+an entry that renders empty is dropped, so `fallback = ["{{ item.fallback
+}}"]` gives an item with no `fallback` a task with no list (the job still
+set it, so the machine's and flock's are not used).
+
+Each entry must be in `[models]`: `unknown_model` from `pastor task run` and
+`pastor task retry`, a load error in flock.toml and pastor.toml, and the
+job records the error for that item. `--fallback` takes names only, never
+raw args. The task's own model, and a repeat, are dropped from its list
+without an error.
+
+`pastor task describe` prints the list and where it came from, such as
+`fallback: sonnet, gpt (from flock personal)`, or `fallback: - (from
+machine desk)` for a `[]`; `--json` has a `fallback` array.
+`flock describe` and `machine describe` show their own `fallback`. A head
+from before fallback models refuses `--fallback`, `--no-fallback` and a
+job's `fallback` (`head_too_old`).
 
 ### Permission profiles
 
@@ -2012,6 +2067,7 @@ that cannot report its home, herdr still decides.
 | `--flock`, `--machine` | the flock the task goes to, or the machine it is pinned to (see [Flocks](#flocks)) |
 | `--agent`, `--agent-arg` | the agent and one argument for it (below) |
 | `--model` | a name from `[models]` (see [Models](#models)) |
+| `--fallback`, `--no-fallback` | the models it may fall back to, comma separated, or none (see [Fallback models](#fallback-models)) |
 | `--priority` | its level (see [Priority and queue order](#priority-and-queue-order)) |
 | `--preempt` | may pause a low task (see [Pausing a low task](#pausing-a-low-task)) |
 | `--summary` | ask for a summary, require one, or not (see [Asking for one](#asking-for-one)) |
@@ -3178,6 +3234,7 @@ max_tasks_per_run = 5
 timeout = "2h"
 place = "repo"               # where a task's pane goes: repo, own, pastor or pane:<workspace>
 # model = "sonnet"           # a [models] name for tasks that name none; unset: no model
+# fallback = ["haiku"]       # [models] names tasks may fall back to; [] or unset: none
 # priority = "normal"        # the level of tasks that set none: low, normal, high or critical
 # agents = { opencode = "opencode" }  # the agent for a model of another kind than agent's
 # profile = "develop"        # a permission profile for tasks that name none; unset: none
@@ -3468,6 +3525,7 @@ A CLI refuses a head below the IPC protocol a request needs
 | `orchestrator` commands | 23 |
 | `orchestrator start` and `stop` | 25 |
 | a flock's share and max in flock.toml | 26 |
+| `task run --fallback` or `--no-fallback`, and a job with `fallback` | 27 |
 
 `task run --description`, `flock add --description` and `machine add
 --description` need a head of 0.7.0 or later.

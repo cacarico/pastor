@@ -71,6 +71,7 @@ see the [`task run` flags](../cli/#task) and
 | `allow` | `[]` | tool patterns the agent may use without asking, like `"Bash(git:*)"` |
 | `deny` | `[]` | tool patterns it must never use; wins over `allow` |
 | `model` | unset | a `[models]` name; unset runs no model |
+| `fallback` | unset | `[models]` names tasks may fall back to, in order; unset or `[]` is none |
 | `priority` | unset | `low`, `normal`, `high` or `critical`; unset is `normal` |
 | `agents` | `{}` | the agent for a model of another kind than `agent`'s, by kind: `{ opencode = "opencode" }` |
 | `profile` | unset | a permission profile; unset runs none |
