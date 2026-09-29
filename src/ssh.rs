@@ -255,6 +255,8 @@ mod tests {
         // A token pastor never builds (neither `%%` nor `%C`) still counts
         // both bytes literally: the `%` and the character after it.
         assert_eq!(expanded_len(Path::new("/abc%x")), 6);
+        // A trailing `%` with nothing after it still counts as one byte.
+        assert_eq!(expanded_len(Path::new("/abc%")), 5);
         assert_eq!(unix_path_max(true), 108);
         assert_eq!(unix_path_max(false), 104);
         let expected = if cfg!(target_os = "linux") { 108 } else { 104 };
