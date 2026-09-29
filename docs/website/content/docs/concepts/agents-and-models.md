@@ -106,7 +106,12 @@ of its `fallback` list, or stays queued, and `pastor queue` says why, like
 `waiting: me-personal exhausted until 03:00 (5-hour limit, seen by t-412)`.
 A Claude task whose agent stops on a limit (`You've hit your limit ·
 resets 3am`) goes `waiting`, not `done`: pastor closes its pane, keeps its
-worktree, and resumes its session on the same machine at the reset.
+worktree, and resumes its session on the same machine at the reset. An agy
+task that stops on its quota (`RESOURCE_EXHAUSTED (code 429): Individual
+quota reached. ... Resets in 4h21m30s.`) waits the same way, and since agy
+keeps no session, starts again at the reset from its prompt, with a line
+saying an earlier start may have left work in the checkout. Other kinds
+are not read for limits yet.
 `pastor task list` shows it as `waiting 03:00`. With a `fallback` list, it
 waits only for a reset within `wait_under` (30 minutes); otherwise it goes
 on under the next free model of its list in the same worktree: in the same

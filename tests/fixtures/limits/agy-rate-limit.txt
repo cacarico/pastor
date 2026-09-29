@@ -1,0 +1,20 @@
+#! kind: agy
+#! source: made
+#! now: 2026-09-29T12:00:00Z
+#! limit: short
+#! model_scoped: no
+#! until: 2026-09-29T12:00:20Z
+> Review the transport module and write your notes to NOTES.md.
+
+  I read the transport module and its tests. The retry loop reconnects
+  on EOF but not on a reply that never comes; that is the first note.
+
+  $ cargo test --test transport
+  test result: ok. 14 passed; 0 failed
+
+  RESOURCE_EXHAUSTED (code 429): Too many requests. Resets in 20s.
+
+╭──────────────────────────────────────────────────────────────────────────╮
+│ >                                                                        │
+╰──────────────────────────────────────────────────────────────────────────╯
+ ~/src/repo  gemini-3-pro

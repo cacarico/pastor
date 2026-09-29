@@ -4,8 +4,8 @@
 //! finished, so the text it left is the only place the difference shows.
 //! `limit_in` reads that text, and is strict about where it looks: pastor's
 //! own source, tests and notes carry the messages it looks for, and an agent
-//! that greps them must not read as limited. Only Claude's messages are
-//! known for now; any other kind reads as no limit.
+//! that greps them must not read as limited. Claude's and agy's messages
+//! are known; any other kind reads as no limit.
 
 use std::time::Duration;
 
@@ -271,11 +271,114 @@ pub fn local_time(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 ///
 /// So a message further up, one quoted in the middle of a line, and tool
 /// output that shows one (a grep of this file) are not limits.
+///
+/// agy draws no marker before its messages, so for agy the end of the turn
+/// is its last paragraph (`agy_limit`).
 pub fn limit_in(kind: &str, text: &str, now: DateTime<Utc>) -> Option<Limit> {
     match kind {
         "claude" => claude_limit(text, now),
+        "agy" => agy_limit(text, now),
         _ => None,
     }
+}
+
+/// The lines of a paragraph of agy's that are read, the first one and the
+/// ones a long message wrapped onto.
+const AGY_MESSAGE_LINES: usize = 4;
+
+/// The limit agy stopped on, if the last paragraph of its turn starts with
+/// one of its messages. The turn is what follows the last prompt that was
+/// sent (a line starting with `>`), above its input box (the `>` line
+/// inside a box drawn with `╭` and `╰`) and the footer under it; the whole
+/// text when it shows neither, as agy's print mode and a task's error do.
+/// Paragraphs are split on empty lines, and the box's edges are not part of
+/// one.
+fn agy_limit(text: &str, now: DateTime<Utc>) -> Option<Limit> {
+    let text = text.replace('\u{a0}', " ");
+    let lines: Vec<&str> = text.lines().collect();
+    let unboxed = |line: &str| {
+        let line = line.trim();
+        line.strip_prefix('│')
+            .unwrap_or(line)
+            .trim_start()
+            .to_string()
+    };
+    let is_prompt = |line: &str| {
+        let line = unboxed(line);
+        line.strip_prefix('>')
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    };
+    // An input box waiting for input has no command text after `>`, only
+    // whitespace and the box's right border; a sent prompt drawn inside a
+    // box has text there instead.
+    let is_empty_prompt = |line: &str| {
+        let line = unboxed(line);
+        line.strip_prefix('>')
+            .is_some_and(|rest| rest.trim_matches([' ', '│']).is_empty())
+    };
+    let is_edge = |line: &str| line.trim_start().starts_with(['╭', '╰']);
+    let prompts: Vec<usize> = (0..lines.len()).filter(|i| is_prompt(lines[*i])).collect();
+    let input_box = prompts.last().copied().filter(|i| {
+        is_empty_prompt(lines[*i])
+            && lines[..*i]
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .is_some_and(|l| l.trim_start().starts_with('╭'))
+    });
+    let end = input_box.map_or(lines.len(), |b| {
+        (0..b).rev().find(|i| is_edge(lines[*i])).unwrap_or(b)
+    });
+    let sent = prompts
+        .iter()
+        .rev()
+        .find(|i| Some(**i) != input_box && **i < end);
+    let start = sent.map_or(0, |i| i + 1);
+    let turn: Vec<&str> = lines[start..end]
+        .iter()
+        .copied()
+        .filter(|l| !is_edge(l))
+        .collect();
+    let last = turn.iter().rposition(|l| !l.trim().is_empty())?;
+    let first = turn[..last]
+        .iter()
+        .rposition(|l| l.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    let paragraph: Vec<&str> = turn[first..=last]
+        .iter()
+        .take(AGY_MESSAGE_LINES)
+        .map(|l| l.trim())
+        .collect();
+    read_agy(paragraph[0], &paragraph[1..].join(" "), now)
+}
+
+/// The limit `said` starts with, if it starts with one of agy's messages:
+/// an API status and its code, `RESOURCE_EXHAUSTED (code 429): ...`. A
+/// `RESOURCE_EXHAUSTED` or a 429 is a limit; it is hard when it says the
+/// quota is reached, a short one otherwise. `more` is what the message goes
+/// on to say on its next lines.
+fn read_agy(said: &str, more: &str, now: DateTime<Utc>) -> Option<Limit> {
+    let (status, rest) = said.split_once(" (code ")?;
+    if status.is_empty() || !status.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+        return None;
+    }
+    let code: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if status != "RESOURCE_EXHAUSTED" && code != "429" {
+        return None;
+    }
+    let whole = format!("{said} {more}");
+    let lower = whole.to_ascii_lowercase();
+    // While agy retries, the agent is at work and the turn goes on.
+    if lower.contains("retrying") {
+        return None;
+    }
+    Some(Limit {
+        hard: lower.contains("quota reached"),
+        until: reset_in(&whole, now),
+        model_scoped: false,
+        no_credit: false,
+        line: said.to_string(),
+    })
 }
 
 fn claude_limit(text: &str, now: DateTime<Utc>) -> Option<Limit> {
@@ -1156,12 +1259,73 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_is_read() {
+    fn only_claude_and_agy_are_read() {
         let pane = "● You've hit your limit · resets 3am\n";
         assert!(limit_in("claude", pane, now()).is_some());
-        for kind in ["opencode", "codex", "claude-personal", ""] {
+        for kind in ["agy", "opencode", "codex", "claude-personal", ""] {
             assert_eq!(limit_in(kind, pane, now()), None, "{kind}");
         }
+        let pane = "RESOURCE_EXHAUSTED (code 429): Individual quota reached.\n";
+        assert!(limit_in("agy", pane, now()).is_some());
+        for kind in ["claude", "opencode", "codex", ""] {
+            assert_eq!(limit_in(kind, pane, now()), None, "{kind}");
+        }
+    }
+
+    /// agy's pane: a sent prompt, `said` as the end of its turn, its input
+    /// box and footer.
+    fn agy_pane(said: &str) -> String {
+        format!(
+            "╭──────────╮\n│ > review │\n╰──────────╯\n\n  Reading the module.\n\n{said}\n\n\
+             ╭──────────╮\n│ >        │\n╰──────────╯\n ~/src/repo  gemini-3-pro\n"
+        )
+    }
+
+    #[test]
+    fn agy_reads_a_429_or_resource_exhausted_that_ends_its_turn() {
+        let agy = |said: &str| limit_in("agy", &agy_pane(said), now());
+        let quota = agy("  RESOURCE_EXHAUSTED (code 429): Individual quota reached.").unwrap();
+        assert!(quota.hard && !quota.model_scoped && !quota.no_credit);
+        assert_eq!(quota.until, None);
+        assert_eq!(quota.what(), "usage limit");
+        let short = agy("  TOO_MANY_REQUESTS (code 429): Slow down. Resets in 1m.").unwrap();
+        assert!(!short.hard);
+        assert_eq!(short.until, Some(now() + chrono::Duration::minutes(1)));
+        assert_eq!(short.what(), "rate limit");
+        for said in [
+            // Another status and code.
+            "  UNAUTHENTICATED (code 401): Sign in again.",
+            // agy still at it.
+            "  RESOURCE_EXHAUSTED (code 429): Quota reached. Retrying in 5s.",
+            // Quoted, not said.
+            "  The log says RESOURCE_EXHAUSTED (code 429): Individual quota reached.",
+            "  resource_exhausted (code 429): in lower case, as code has it.",
+        ] {
+            assert_eq!(agy(said), None, "{said}");
+        }
+    }
+
+    #[test]
+    fn agy_reads_only_what_follows_its_last_prompt() {
+        let limit = "  RESOURCE_EXHAUSTED (code 429): Individual quota reached.";
+        let pane = agy_pane(limit).replacen(
+            "╭──────────╮\n│ >        │",
+            "╭──────────╮\n│ > go on  │\n╰──────────╯\n\n╭──────────╮\n│ >        │",
+            1,
+        );
+        assert_eq!(limit_in("agy", &pane, now()), None, "{pane}");
+        // No box at all: the last paragraph after the last prompt.
+        let pane = format!("> review\n\n{limit}\n");
+        assert!(limit_in("agy", &pane, now()).is_some());
+        let pane = format!("{limit}\n\n> go on\n");
+        assert_eq!(limit_in("agy", &pane, now()), None);
+    }
+
+    #[test]
+    fn agy_reads_a_limit_after_a_boxed_prompt_with_no_trailing_input_box() {
+        let limit = "  RESOURCE_EXHAUSTED (code 429): Individual quota reached.";
+        let pane = format!("╭──────────╮\n│ > review │\n╰──────────╯\n\n{limit}\n");
+        assert!(limit_in("agy", &pane, now()).is_some(), "{pane}");
     }
 
     #[test]
