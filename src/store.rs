@@ -2868,6 +2868,8 @@ mod tests {
                         agent_args: None,
                         model: None,
                         model_from: None,
+                        fallback: vec![],
+                        fallback_from: None,
                         profile: None,
                         profile_from: None,
                         timeout_from: None,

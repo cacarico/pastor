@@ -94,6 +94,7 @@ task's flock, its machine or `[defaults]` in
 | `agent_args` | the machine's, the flock's, `[defaults]` | arguments for the agent; `[]` means none |
 | `allow`, `deny` | `[]` | tool patterns added to the flock's and `[defaults]` |
 | `model` | the flock's, the machine's, `[defaults]` | a `[models]` name, or a template of one; rendered empty, the next layer applies |
+| `fallback` | the machine's, the flock's, `[defaults]` | `[models]` names the tasks may fall back to, each a template; entries rendered empty are dropped, and `[]` means none |
 | `priority` | the flock's, the pinned machine's, `[defaults]`, normal | `low`, `normal`, `high`, `critical`, or a template of one; rendered empty, the next layer applies |
 | `preempt` | `false` | a task that ends up critical may pause a low Claude task on a full machine |
 | `profile` | the flock's, the machine's, `[defaults]` | a permission profile, by name; not a template |
@@ -108,8 +109,8 @@ task's flock, its machine or `[defaults]` in
 invalid. A task whose level comes out below critical loses the flag.
 
 A rendered `priority` that is not a level refuses that item. A rendered
-`model` must be a model name; whether `[models]` has it is checked when the
-task is queued.
+`model`, and each rendered `fallback` entry, must be a model name; whether
+`[models]` has it is checked when the task is queued.
 
 ## templates
 
@@ -119,9 +120,9 @@ compact JSON. A path the item lacks renders empty and is logged.
 
 | variable | is | allowed in |
 |---|---|---|
-| `{{ item.<field> }}` | a field of the item, as the connector sent it | `prompt`, `description`, `repo`, `branch`, `model`, `priority` |
+| `{{ item.<field> }}` | a field of the item, as the connector sent it | `prompt`, `description`, `repo`, `branch`, `model`, `fallback`, `priority` |
 | `{{ item.key }}` | the item's key; every item has one | the same, and `label` |
-| `{{ job.name }}` | the job's name | `prompt`, `description`, `repo`, `branch`, `model`, `priority` |
+| `{{ job.name }}` | the job's name | `prompt`, `description`, `repo`, `branch`, `model`, `fallback`, `priority` |
 | `{{ task.id }}` | the task's id, like `t-12` | `prompt`, `repo`, `branch`, `label` |
 | `{{ flock }}`, `{{ machine }}`, `{{ job }}` | the task's flock, machine and job | `label` only |
 

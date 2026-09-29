@@ -4678,6 +4678,203 @@ fn complete_offers_connector_ids() {
     }
 }
 
+/// `--model` and `--fallback` both take names from `[models]`.
+#[test]
+fn complete_offers_model_names_after_model_and_fallback() {
+    let (_tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "[models.sonnet]\nkind = \"claude\"\nargs = []\n[models.gpt]\nkind = \"opencode\"\nargs = []\n",
+    )
+    .unwrap();
+    for words in [
+        &["task", "run", "fix it", "--model", ""][..],
+        &["task", "run", "fix it", "--fallback", ""],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(ok, "{words:?}");
+        assert!(out.contains("sonnet\tclaude\n"), "{words:?}: {out}");
+        assert!(out.contains("gpt\topencode\n"), "{words:?}: {out}");
+    }
+}
+
+/// `--fallback` takes a comma-separated list as one word, so after
+/// `sonnet,` pastor completes the next name and puts the names already typed
+/// before each candidate, in both the `--fallback x` and `--fallback=x`
+/// forms. No other slot splits on commas.
+#[test]
+fn complete_prefixes_the_names_already_typed_in_a_fallback_list() {
+    let (_tmp, config, state) = fallback_completion_config();
+    for words in [
+        &["task", "run", "fix it", "--fallback", "sonnet,g"][..],
+        &["task", "run", "fix it", "--fallback=sonnet,g"],
+        &["task", "run", "fix it", "--fallback", "=", "sonnet,g"],
+    ] {
+        let (ok, out) = complete(&config, &state, words);
+        assert!(ok, "{words:?}");
+        assert_eq!(
+            out, "sonnet,gpt\topencode\nsonnet,sonnet\tclaude\n",
+            "{words:?}"
+        );
+    }
+    let (ok, out) = complete(
+        &config,
+        &state,
+        &["task", "run", "fix it", "--model", "a,g"],
+    );
+    assert!(ok);
+    assert_eq!(out, "gpt\topencode\nsonnet\tclaude\n");
+    let (ok, out) = complete(&config, &state, &["machine", "describe", "west,e"]);
+    assert!(ok);
+    assert_eq!(out, "west,east\thome\n");
+}
+
+/// Two models, and one machine whose name holds a comma.
+fn fallback_completion_config() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let (tmp, config, state) = completion_config();
+    std::fs::write(
+        config.join("pastor.toml"),
+        "[models.sonnet]\nkind = \"claude\"\nargs = []\n[models.gpt]\nkind = \"opencode\"\nargs = []\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("flock.toml"),
+        "[[flock]]\nname = \"home\"\ndefault = true\n\n\
+         [[machine]]\nname = \"west,east\"\nssh = \"user@pi-1\"\nflock = \"home\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    (tmp, config, state)
+}
+
+/// PATH with the pastor under test first, for the shell scripts' hooks.
+fn path_with_pastor() -> String {
+    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_pastor"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// Runs the real generated bash script's `_pastor_names` for `words`, the
+/// last one under the cursor, and returns COMPREPLY.
+fn bash_complete(
+    config: &std::path::Path,
+    state: &std::path::Path,
+    words: &str,
+    cword: usize,
+) -> Vec<String> {
+    let script = pastor().args(["completions", "bash"]).output().unwrap();
+    assert!(script.status.success());
+    let script_path = state.join("completions.bash");
+    std::fs::write(&script_path, &script.stdout).unwrap();
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            r#"
+source "{script}"
+COMP_WORDS=({words})
+COMP_CWORD={cword}
+_pastor_names
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+            script = script_path.display()
+        ))
+        .env("PATH", path_with_pastor())
+        .env("PASTOR_CONFIG_DIR", config)
+        .env("PASTOR_STATE_DIR", state)
+        .env("PASTOR_DATA_DIR", state.join("data"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// bash filters pastor's answer against the whole word under the cursor:
+/// `sonnet,` finishes a second fallback name, and a machine named
+/// `west,east` still completes from `west,e`.
+#[test]
+fn bash_completion_finishes_a_second_fallback_name_and_comma_names() {
+    let (_tmp, config, state) = fallback_completion_config();
+    // Alphabetical, as `[models]` is a `BTreeMap`: "gpt" before "sonnet".
+    let reply = bash_complete(
+        &config,
+        &state,
+        r#"pastor task run "fix it" --fallback "sonnet,""#,
+        5,
+    );
+    assert_eq!(reply, ["sonnet,gpt", "sonnet,sonnet"]);
+    let reply = bash_complete(
+        &config,
+        &state,
+        r#"pastor task run "fix it" --fallback "sonnet,g""#,
+        5,
+    );
+    assert_eq!(reply, ["sonnet,gpt"]);
+    let reply = bash_complete(&config, &state, r#"pastor machine describe "west,e""#, 3);
+    assert_eq!(reply, ["west,east"]);
+}
+
+/// The same through the real generated fish script, with fish's own
+/// `complete -C`, in the `--fallback x` and `--fallback=x` forms. Skipped,
+/// saying so, where fish is not installed.
+#[test]
+fn fish_completion_finishes_a_second_fallback_name_and_comma_names() {
+    if Command::new("fish").arg("--version").output().is_err() {
+        eprintln!("skipped: fish is not installed, so the fish completion test cannot run");
+        return;
+    }
+    let (_tmp, config, state) = fallback_completion_config();
+    let script = pastor().args(["completions", "fish"]).output().unwrap();
+    assert!(script.status.success());
+    let script_path = state.join("completions.fish");
+    std::fs::write(&script_path, &script.stdout).unwrap();
+    let fish = |line: &str| -> Vec<String> {
+        let out = Command::new("fish")
+            .args(["--no-config", "-c"])
+            .arg(format!(
+                "source '{}'; complete -C '{line}'",
+                script_path.display()
+            ))
+            .env("PATH", path_with_pastor())
+            .env("PASTOR_CONFIG_DIR", &config)
+            .env("PASTOR_STATE_DIR", &state)
+            .env("PASTOR_DATA_DIR", state.join("data"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect()
+    };
+    let reply = fish(r#"pastor task run "fix it" --fallback sonnet,g"#);
+    assert_eq!(reply, ["sonnet,gpt"]);
+    // fish answers an `--opt=value` word with the option kept in front.
+    let reply = fish(r#"pastor task run "fix it" --fallback=sonnet,g"#);
+    assert_eq!(reply, ["--fallback=sonnet,gpt"]);
+    let reply = fish("pastor machine describe west,e");
+    assert_eq!(reply, ["west,east"]);
+}
+
 #[test]
 fn complete_offers_task_ids_with_their_note() {
     let (_tmp, config, state) = completion_config();

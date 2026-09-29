@@ -4703,7 +4703,7 @@ _pastor() {
             return 0
             ;;
         pastor__subcmd__task__subcmd__run)
-            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --priority --preempt --profile --worktree --branch --tag --timeout --label --place --role --summary --description --json --head --help"
+            opts="-h --prompt-file --repo --flock --machine --agent --agent-arg --model --fallback --no-fallback --priority --preempt --profile --worktree --branch --tag --timeout --label --place --role --summary --description --json --head --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4734,6 +4734,10 @@ _pastor() {
                     return 0
                     ;;
                 --model)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --fallback)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -5019,7 +5023,8 @@ _pastor_names() {
     if names=$(pastor __complete bash -- "${COMP_WORDS[@]:1:COMP_CWORD-1}" "${cur}" 2>/dev/null); then
         [[ ${cur} == "=" ]] && cur=""
         # One name per line, kept whole: a flock or machine name may hold a
-        # space, which compgen -W would split into two words.
+        # space, which compgen -W would split into two words. After
+        # `--fallback sonnet,` pastor already puts `sonnet,` before each name.
         COMPREPLY=()
         local name
         while IFS= read -r name; do

@@ -287,6 +287,11 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         Some(m) => format!("{m}{}", from(source.and_then(|s| s.model_from.as_ref()))),
         None => "-".to_string(),
     };
+    // `-` with where it came from: a layer's `[]` gave the task none.
+    let fallback = match t.fallback() {
+        [] => "-".to_string(),
+        names => names.join(", "),
+    } + &from(source.and_then(|s| s.fallback_from.as_ref()));
     let mut priority = format!("{}{}", t.priority, from(t.priority_from.as_ref()));
     if t.pause.preempt {
         priority.push_str(", preempt: pauses a low task on a full machine");
@@ -342,6 +347,7 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         ("machine", opt(&t.machine)),
         ("agent", agent),
         ("model", model),
+        ("fallback", fallback),
         ("profile", profile),
         ("agent args", args),
         ("allow", list(&t.spec.allow)),
@@ -1335,6 +1341,7 @@ mod tests {
                 agent: None,
                 agent_args: None,
                 model: None,
+                fallback: None,
                 priority: None,
                 agents: Default::default(),
                 profile: None,
@@ -1416,6 +1423,8 @@ mod tests {
                 agent_args: Some("flock personal".into()),
                 model: None,
                 model_from: None,
+                fallback: vec![],
+                fallback_from: None,
                 profile: None,
                 profile_from: None,
                 timeout_from: None,
@@ -1440,6 +1449,8 @@ mod tests {
                 agent_args: None,
                 model: None,
                 model_from: None,
+                fallback: vec![],
+                fallback_from: None,
                 profile: None,
                 profile_from: None,
                 timeout_from: None,
@@ -1452,6 +1463,30 @@ mod tests {
             "{bare}"
         );
         assert!(bare.contains("agent args: -\n"), "{bare}");
+    }
+
+    /// `task describe` shows the fallback list and where it came from; a
+    /// layer's `[]` reads as none from that layer.
+    #[test]
+    fn task_detail_prints_the_fallback_and_where_it_came_from() {
+        let spec = |fallback: &[&str], from: Option<&str>| crate::task::DispatchSpec {
+            agent_source: Some(Box::new(crate::task::AgentSource {
+                agent: "defaults".into(),
+                fallback: fallback.iter().map(|s| s.to_string()).collect(),
+                fallback_from: from.map(Into::into),
+                ..Default::default()
+            })),
+            ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
+        };
+        let out = task_detail(&task_with(spec(&["sonnet", "gpt"], Some("flock personal"))));
+        assert!(
+            out.contains("fallback:   sonnet, gpt (from flock personal)\n"),
+            "{out}"
+        );
+        let out = task_detail(&task_with(spec(&[], Some("machine m"))));
+        assert!(out.contains("fallback:   - (from machine m)\n"), "{out}");
+        let out = task_detail(&task_with(spec(&[], None)));
+        assert!(out.contains("fallback:   -\n"), "{out}");
     }
 
     /// `task describe` says when a paused task was paused and for which

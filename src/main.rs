@@ -245,6 +245,21 @@ struct RunArgs {
     /// `[defaults] model`, else none)
     #[arg(long, value_name = "NAME")]
     model: Option<String>,
+    /// The models the task may fall back to, in order: names from
+    /// `[models]` in pastor.toml, comma separated (default: the machine's,
+    /// else the flock's, else `[defaults] fallback`, else none)
+    #[arg(
+        long,
+        value_name = "NAMES",
+        value_delimiter = ',',
+        num_args = 1,
+        conflicts_with = "no_fallback"
+    )]
+    fallback: Option<Vec<String>>,
+    /// Fall back to no other model, whatever the machine, flock or
+    /// `[defaults]` say
+    #[arg(long)]
+    no_fallback: bool,
     /// Queue at this level: low, normal, high or critical; dispatch takes
     /// higher levels first (default: the flock's, else the pinned
     /// machine's, else `[defaults] priority`, else normal)
@@ -828,11 +843,14 @@ fn complete(args: &[String]) -> ! {
     let (Some(shell), Some("--")) = (args.first(), args.get(1).map(String::as_str)) else {
         std::process::exit(1)
     };
-    let Some(kind) = complete::slot(&completion_tree(), &args[2..]) else {
+    let Some(slot) = complete::slot(&completion_tree(), &args[2..]) else {
         std::process::exit(1)
     };
     if let Ok(paths) = Paths::from_env() {
-        let names = complete::names(&paths, kind);
+        let names: Vec<_> = complete::names(&paths, slot.kind)
+            .into_iter()
+            .map(|(name, desc)| (format!("{}{name}", slot.prefix), desc))
+            .collect();
         print!("{}", complete::render(&names, shell == "fish"));
     }
     std::process::exit(0)
@@ -1360,6 +1378,14 @@ async fn run(paths: &Paths, a: RunArgs) -> anyhow::Result<()> {
             )
         })?;
     }
+    for m in a.fallback.iter().flatten() {
+        pastor::config::check_model_name(m).map_err(|e| {
+            CliError::err(
+                "unknown_model",
+                format!("{e}; --fallback takes names from [models] in pastor.toml, not agent args"),
+            )
+        })?;
+    }
     let priority = a
         .priority
         .as_deref()
@@ -1410,6 +1436,10 @@ fn agent_choice(a: &RunArgs) -> AgentChoice {
         agent: a.agent.clone(),
         agent_args: (!a.agent_args.is_empty()).then(|| a.agent_args.clone()),
         model: a.model.clone(),
+        fallback: match a.no_fallback {
+            true => Some(vec![]),
+            false => a.fallback.clone(),
+        },
         profile: a.profile.clone(),
         // Checked by `run_spec`, which refuses a bad one.
         timeout_secs: a
@@ -1995,6 +2025,7 @@ async fn machine(paths: &Paths, cmd: MachineCmd, head: Head) -> anyhow::Result<(
                 agent: None,
                 agent_args: None,
                 model: None,
+                fallback: None,
                 priority: None,
                 agents: Default::default(),
                 profile: None,
@@ -3080,6 +3111,7 @@ async fn machine_describe(paths: &Paths, name: &str, json: bool, head: Head) -> 
         row,
         session: m.session.clone(),
         model: m.model.clone(),
+        fallback: m.fallback.clone(),
         agents_by_kind: m.agents.clone(),
         tasks,
         recent_errors: pastor::describe::machine_errors(events_log(paths), name),
@@ -3217,6 +3249,30 @@ mod tests {
         let a = run_args(&["--agent-arg", "-v", "hi", "--json"]);
         assert_eq!(a.agent_args, vec!["-v"]);
         assert!(a.json);
+    }
+
+    /// `--fallback` takes a comma separated list, `--no-fallback` an empty
+    /// one, and both at once are refused.
+    #[test]
+    fn fallback_flags_make_the_asked_list() {
+        let fallback = |argv: &[&str]| agent_choice(&run_args(argv)).fallback;
+        assert_eq!(fallback(&["hi"]), None);
+        assert_eq!(
+            fallback(&["--fallback", "sonnet,gpt", "hi"]),
+            Some(vec!["sonnet".to_string(), "gpt".to_string()])
+        );
+        assert_eq!(fallback(&["--no-fallback", "hi"]), Some(vec![]));
+        let err = Cli::try_parse_from([
+            "pastor",
+            "task",
+            "run",
+            "hi",
+            "--fallback",
+            "sonnet",
+            "--no-fallback",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

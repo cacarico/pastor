@@ -82,6 +82,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subc
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l agent -d 'The agent command to start, like claude or codex (default: the machine\'s, else its flock\'s, else `[defaults]`, else claude)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l agent-arg -d 'One argument for the agent; repeat it, in order, for more. Replaces the flock\'s and `[defaults]` agent_args. The next word is always the value, dashes and all' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l model -d 'Run this model, a name from `[models]` in pastor.toml; its args go before the agent\'s (default: the flock\'s, else the machine\'s, else `[defaults] model`, else none)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l fallback -d 'The models the task may fall back to, in order: names from `[models]` in pastor.toml, comma separated (default: the machine\'s, else the flock\'s, else `[defaults] fallback`, else none)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l priority -d 'Queue at this level: low, normal, high or critical; dispatch takes higher levels first (default: the flock\'s, else the pinned machine\'s, else `[defaults] priority`, else normal)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l profile -d 'Run under this permission profile, built in or from `[profiles]` in pastor.toml: a Claude agent gets its allow and deny lists and never asks (default: the flock\'s, else the machine\'s, else `[defaults] profile`, else none)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l branch -d 'Branch for the worktree (needs --worktree; a plain workspace has no branch)' -r
@@ -96,6 +97,7 @@ require\t'Ask, and fail the task if its agent stops without one'
 off\t'Add nothing and require nothing'"
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l description -d 'One line on what the task is about, for `task list --wide` and `describe` (default: the prompt\'s first line)' -r
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l head -d 'Use the head at this ssh destination for this command (over PASTOR_HEAD and client.toml)' -r
+complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l no-fallback -d 'Fall back to no other model, whatever the machine, flock or `[defaults]` say'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l preempt -d 'A critical task only: on a full machine, pause the newest low Claude task there (its session resumes when a slot frees) and take its slot'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l worktree -d 'A git worktree per task, branched from --repo (so it needs --repo)'
 complete -c pastor -n "__fish_pastor_using_subcommand task; and __fish_seen_subcommand_from run" -l json -d 'Print as a JSON object'
@@ -580,4 +582,4 @@ function __fish_pastor_names
 end
 
 complete -c pastor -n __fish_pastor_names -k -f -a '(printf "%s\n" $__fish_pastor_names)'
-complete -c pastor -n __fish_pastor_names -l after -l before -l connector -l flock -l job -l machine -l model -l name -l priority -l profile -l task -r -k -f -a '(printf "%s\n" $__fish_pastor_names)'
+complete -c pastor -n __fish_pastor_names -l after -l before -l connector -l fallback -l flock -l job -l machine -l model -l name -l priority -l profile -l task -r -k -f -a '(printf "%s\n" $__fish_pastor_names)'
