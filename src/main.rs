@@ -841,11 +841,14 @@ fn complete(args: &[String]) -> ! {
     let (Some(shell), Some("--")) = (args.first(), args.get(1).map(String::as_str)) else {
         std::process::exit(1)
     };
-    let Some(kind) = complete::slot(&completion_tree(), &args[2..]) else {
+    let Some(slot) = complete::slot(&completion_tree(), &args[2..]) else {
         std::process::exit(1)
     };
     if let Ok(paths) = Paths::from_env() {
-        let names = complete::names(&paths, kind);
+        let names: Vec<_> = complete::names(&paths, slot.kind)
+            .into_iter()
+            .map(|(name, desc)| (format!("{}{name}", slot.prefix), desc))
+            .collect();
         print!("{}", complete::render(&names, shell == "fish"));
     }
     std::process::exit(0)

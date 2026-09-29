@@ -57,11 +57,22 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
     }
 }
 
-/// The kind of name `words` ends in: the words after `pastor`, the last one
+/// A name slot: the kind of name it takes, and what every candidate starts
+/// with. An option that takes a comma-separated list as one word
+/// (`--fallback sonnet,g`) completes the name after the last comma, so the
+/// names typed before it, comma included, are the prefix; any other slot
+/// completes the whole word, commas and all, and its prefix is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slot {
+    pub kind: Kind,
+    pub prefix: String,
+}
+
+/// The name slot `words` ends in: the words after `pastor`, the last one
 /// being the word under the cursor (empty for a fresh one). `None` when that
 /// word is a subcommand, a flag, a value that is not a name, or a slot that
 /// is already filled. `root` is the whole command tree.
-pub fn slot(root: &Command, words: &[String]) -> Option<Kind> {
+pub fn slot(root: &Command, words: &[String]) -> Option<Slot> {
     let (current, done) = match words.split_last() {
         Some((c, d)) => (c.as_str(), d),
         None => ("", &[][..]),
@@ -98,21 +109,30 @@ pub fn slot(root: &Command, words: &[String]) -> Option<Kind> {
             positionals += 1;
         }
     }
-    let arg = match pending {
-        Some(arg) => arg,
+    let (arg, value) = match pending {
+        Some(arg) => (arg, current),
         None if !only_positionals && current.starts_with('-') && current.len() > 1 => {
             // `--flock=<TAB>`: the value of the option before the `=`.
-            let (flag, _) = current.split_once('=')?;
-            option(node, flag).filter(|a| a.get_action().takes_values())?
+            let (flag, value) = current.split_once('=')?;
+            let arg = option(node, flag).filter(|a| a.get_action().takes_values())?;
+            (arg, value)
         }
         // Past the last positional, one that takes many values takes more.
-        None => node.get_positionals().nth(positionals).or_else(|| {
-            node.get_positionals()
-                .last()
-                .filter(|a| matches!(a.get_action(), clap::ArgAction::Append))
-        })?,
+        None => {
+            let arg = node.get_positionals().nth(positionals).or_else(|| {
+                node.get_positionals()
+                    .last()
+                    .filter(|a| matches!(a.get_action(), clap::ArgAction::Append))
+            })?;
+            (arg, current)
+        }
     };
-    kind_of(&path, arg.get_id().as_str())
+    let kind = kind_of(&path, arg.get_id().as_str())?;
+    let prefix = match (arg.get_value_delimiter(), value.rfind(',')) {
+        (Some(','), Some(i)) => value[..=i].to_string(),
+        _ => String::new(),
+    };
+    Some(Slot { kind, prefix })
 }
 
 /// The option `word` names on `node`: `--long`, `--long=value` or `-s`.
@@ -316,11 +336,10 @@ pub fn render(names: &[(String, Option<String>)], descriptions: bool) -> String 
 
 /// Appended to `pastor completions fish`. The condition runs pastor once and
 /// keeps its answer for the argument list; it fails, leaving the static
-/// completions alone, where the word takes no name. `--fallback` takes a
-/// comma-separated list as one word (`sonnet,gpt`), so only the segment
-/// after the last comma is a name to complete; the names before it are kept
-/// as a prefix on every candidate, which is also what fish itself matches
-/// the word under the cursor against.
+/// completions alone, where the word takes no name. The word under the
+/// cursor goes to pastor whole, `--fallback=` and commas included: pastor
+/// knows which option it belongs to and which slots take a comma list, and
+/// answers with candidates that start with the names already typed.
 pub fn fish_hook(root: &Command) -> String {
     let longs: String = name_options(root)
         .iter()
@@ -330,15 +349,7 @@ pub fn fish_hook(root: &Command) -> String {
         r#"
 # Names (jobs, flocks, machines, tasks, connectors) come from pastor itself.
 function __fish_pastor_names
-    set -l cur (commandline -ct)
-    set -l parts (string split -- ',' $cur)
-    set -l seg $parts[-1]
-    set -e parts[-1]
-    set -l prefix ""
-    if test (count $parts) -gt 0
-        set prefix (string join -- ',' $parts),
-    end
-    set -g __fish_pastor_names (pastor __complete fish -- (commandline -opc)[2..] $seg 2>/dev/null | string replace -r -- '^' $prefix)
+    set -g __fish_pastor_names (pastor __complete fish -- (commandline -opc)[2..] (commandline -ct) 2>/dev/null)
 end
 
 complete -c pastor -n __fish_pastor_names -k -f -a '(printf "%s\n" $__fish_pastor_names)'
@@ -355,20 +366,13 @@ _pastor_names() {
     local cur="${COMP_WORDS[COMP_CWORD]}" names
     if names=$(pastor __complete bash -- "${COMP_WORDS[@]:1:COMP_CWORD-1}" "${cur}" 2>/dev/null); then
         [[ ${cur} == "=" ]] && cur=""
-        # `--fallback` takes a comma-separated list as one word: complete the
-        # segment after the last comma, keeping the names before it as a
-        # prefix on every candidate.
-        local prefix="" seg="${cur}"
-        if [[ ${cur} == *,* ]]; then
-            prefix="${cur%,*},"
-            seg="${cur##*,}"
-        fi
         # One name per line, kept whole: a flock or machine name may hold a
-        # space, which compgen -W would split into two words.
+        # space, which compgen -W would split into two words. After
+        # `--fallback sonnet,` pastor already puts `sonnet,` before each name.
         COMPREPLY=()
         local name
         while IFS= read -r name; do
-            [[ -n ${name} && ${name} == "${seg}"* ]] && COMPREPLY+=( "${prefix}${name}" )
+            [[ -n ${name} && ${name} == "${cur}"* ]] && COMPREPLY+=( "${name}" )
         done <<< "${names}"
         return 0
     fi

@@ -578,15 +578,7 @@ complete -c pastor -n "__fish_pastor_using_subcommand help; and __fish_seen_subc
 
 # Names (jobs, flocks, machines, tasks, connectors) come from pastor itself.
 function __fish_pastor_names
-    set -l cur (commandline -ct)
-    set -l parts (string split -- ',' $cur)
-    set -l seg $parts[-1]
-    set -e parts[-1]
-    set -l prefix ""
-    if test (count $parts) -gt 0
-        set prefix (string join -- ',' $parts),
-    end
-    set -g __fish_pastor_names (pastor __complete fish -- (commandline -opc)[2..] $seg 2>/dev/null | string replace -r -- '^' $prefix)
+    set -g __fish_pastor_names (pastor __complete fish -- (commandline -opc)[2..] (commandline -ct) 2>/dev/null)
 end
 
 complete -c pastor -n __fish_pastor_names -k -f -a '(printf "%s\n" $__fish_pastor_names)'
