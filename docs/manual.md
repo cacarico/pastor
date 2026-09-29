@@ -1582,7 +1582,10 @@ PR 31 reviewed, 2 open threads
   disabled or removed is dropped without a line.
 - `HEAD down: <why>` when the head stops answering, once, and `HEAD up` when
   it answers again. `HEAD gap` says the log rotated events out before the
-  watcher read them; `pastor watch --now` shows where things stand.
+  watcher read them; `pastor watch --now` shows where things stand. `HEAD
+  reset` says the head's log ends before the watcher's cursor (the head
+  moved, or its state dir was wiped): the watcher goes on from the log's end
+  and never replays what is already there.
 - A connector's lines, as it printed them, and `CONNECTOR <id> failing: <why>`
   / `CONNECTOR <id> ok` around a spell of failed runs (see [The watch
   command](#the-watch-command)).
@@ -2636,6 +2639,9 @@ store, and never reads `flock.toml`.
 - Events the head rotated out of its log before this machine read them are
   lost to the hooks: it logs a `head_events_gap` warning and goes on from
   the oldest record the head still has.
+- A cursor past the head's newest event (the head moved, or its state dir
+  was wiped) logs a `head_events_reset` warning and moves to the head's end;
+  no hook fires for the records already there.
 - Its database is `shepherd.db` in the state dir: the jobs' state and seen
   keys, and the event cursor. `pastor.db` is left alone.
 - On `pastor.sock` it answers `ping` (with `role: "shepherd"`), `tick` and
