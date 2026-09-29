@@ -311,6 +311,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `job_not_found` | no job by that name |
 | `job_task_refused` | the head would not queue a headless serve's job task |
 | `machine_exists` | `machine add` of a machine that exists |
+| `machine_not_connected` | `task run --now` on a machine that is not connected |
 | `machine_shutting_down` | the machine's actor is stopping; try again |
 | `model_kind_mismatch` | the task's model is for another kind of agent |
 | `no_agent` | `task attach` to a task that has no agent yet |
@@ -332,6 +333,7 @@ such as `pane_not_found`, is passed on as herdr gave it.
 | `not_running` | `serve stop` or `serve status` with no serve running here |
 | `not_trusted` | `trust remove` of a repo that is not trusted on that machine |
 | `nothing_to_send` | `task send` with no text, `--key` or `--trust` |
+| `now_needs_machine` | `task run --now` with no `--machine` |
 | `now_not_started` | `task run --now` could not start the task at once; it is closed, not left queued |
 | `now_refused` | `task run --now` from an agent or an orchestrator's script; only a person may use it |
 | `opencode_permissions_conflict` | a profiled opencode task on a machine whose opencode config has permission rules |
