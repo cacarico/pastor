@@ -2584,6 +2584,9 @@ impl ExtraSignals {
 /// replace. `Daemon::bind_socket` checks this before it binds, and a
 /// background `pastor serve` before it starts the head that would.
 pub async fn refuse_live_socket(socket: &std::path::Path) -> anyhow::Result<()> {
+    // A path past `sun_path` fails the ping's connect, which would read as an
+    // unresponsive daemon; say what is wrong instead.
+    crate::ssh::check_socket_path(socket, crate::ssh::SHORTER_STATE_DIR)?;
     // Staleness is a property of the connect, not of the reply: a live
     // daemon mid-request (e.g. `dispatch_queued` against a slow or wedged
     // herdr) can go a while without answering a ping, and a busy daemon
@@ -2783,6 +2786,7 @@ impl Daemon {
     pub(crate) async fn bind_socket(
         socket: &std::path::Path,
     ) -> anyhow::Result<tokio::net::UnixListener> {
+        crate::ssh::check_socket_path(socket, crate::ssh::SHORTER_STATE_DIR)?;
         if socket.exists() {
             refuse_live_socket(socket).await?;
             std::fs::remove_file(socket)?;
@@ -4180,6 +4184,23 @@ mod tests {
             assert!(Instant::now() < deadline, "{name} never connected");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A state dir deep enough that `pastor.sock` overflows `sun_path` is
+    /// refused before bind, with the hint to shorten `PASTOR_STATE_DIR`.
+    #[tokio::test]
+    async fn bind_socket_refuses_a_socket_path_past_sun_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp
+            .path()
+            .join("x".repeat(crate::ssh::UNIX_PATH_MAX))
+            .join("pastor.sock");
+        let err = Daemon::bind_socket(&socket).await.unwrap_err();
+        let e = err
+            .downcast_ref::<crate::cli::CliError>()
+            .expect("CliError");
+        assert_eq!(e.code, "config_error");
+        assert!(e.message.contains("PASTOR_STATE_DIR"), "{}", e.message);
     }
 
     #[tokio::test]

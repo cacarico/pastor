@@ -249,3 +249,19 @@ fn serve_stop_refuses_a_head_a_service_runs() {
     assert!(out.status.success(), "{}", stderr(&out));
     wait_gone(pid);
 }
+
+/// A `PASTOR_STATE_DIR` deep enough that `pastor.sock` overflows `sun_path`
+/// fails with `config_error` and the hint to shorten it, not the OS's bare
+/// bind failure.
+#[test]
+fn serve_with_a_state_dir_too_deep_for_its_socket_says_to_shorten_it() {
+    let mut env = Env::new();
+    env.state = env.state.join("x".repeat(120));
+    let out = env.cmd(&["serve", "--foreground"]);
+    assert_eq!(error_code(&out), "config_error");
+    assert!(
+        stderr(&out).contains("PASTOR_STATE_DIR"),
+        "{}",
+        stderr(&out)
+    );
+}
