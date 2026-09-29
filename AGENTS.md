@@ -226,7 +226,7 @@ Still open as of the last review; none of them blocks normal use.
 ## Where things live
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, defaults
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, close_done_after, close_failed_after, defaults
 ~/.config/pastor/flock.toml       machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (kind scheduled or session)
@@ -270,7 +270,9 @@ in the actor (`Task::ended` keeps an ended task done, and lets auto-close
 skip its sequence checks; the fleet guard lets an agent through only for its
 own task, `IpcRequest::ends_own_task`); auto-close of done tasks after `close_done_after` is
 `Actor::auto_close_done`, run after each connected reconcile through the same
-`run_close` (`CloseBy::AutoClose`); orphan detection is
+`run_close` (`CloseBy::AutoClose`); the panes of failed and stale tasks and
+orphans whose agents stopped go after `close_failed_after` in
+`Actor::auto_close_stopped`, which keeps the rows failed; orphan detection is
 `machine::orphan_agents`, used by reconcile and by the head-less probe in
 `machine list`.
 

@@ -219,14 +219,29 @@ remove`. herdr never deletes the branch, even for a worktree it removes.
 
 The grace period keeps the pane there for `pastor task attach` (a Claude
 task can be reopened after it anyway; see [Reopening a finished
-task](#reopening-a-finished-task)). The check runs every `close_done_after`
-(at most every reconcile) while the machine is connected. An agent that
-herdr shows working or blocked again at that moment is left alone, and its
-task goes back to running or blocked.
+task](#reopening-a-finished-task)). Auto-close checks run after each
+reconcile while the machine is connected, and in between at the shorter of
+`close_done_after` and `close_failed_after` (leaving out one set to `never`)
+when that is shorter than `reconcile_every`. An agent that herdr shows
+working or blocked again at that moment is left alone, and its task goes
+back to running or blocked.
 
-Failed and stale tasks are left for `pastor task retry`; blocked tasks need
+Failed and stale tasks are left for `pastor task retry`, but not their
+panes: once the agent is stopped (herdr shows it idle, done or gone) and
+`close_failed_after` has passed since that check first observed it stopped
+(default `5s`; `never` keeps the panes), pastor closes the pane and frees
+the slot. That clock starts at the first check that finds the pane's agent
+stopped, not at the moment the task failed or timed out, and resets each
+time the same pane is found at work again, so an agent that keeps going past
+the grace is not closed the instant it finally stops. A failed task stays
+`failed` and records no pane any more, and its worktree stays for the retry.
+A stale task whose agent stopped turns `failed` first (a `task.failed`
+event); one whose agent is still at work past its timeout keeps its pane. A
+pane herdr has handed to another agent since is not the task's any more: its
+task is repaired at the next check (a stale one turns `failed`) and its pane
+id cleared, and the other agent's pane is left alone. Blocked tasks need
 their prompt answered (`pastor task send` or `pastor task attach`) or
-`pastor task close`. None of them is closed on its own.
+`pastor task close`, and are never closed on their own.
 
 An agent says it is finished with `pastor task done` from its own pane (the
 task defaults to `PASTOR_TASK`; a human may name any task, `pastor task done
@@ -576,8 +591,11 @@ so they count toward `max_agents`. `pastor task list` prints a line for each und
 its table, unless `--blocked`, `--done` or `--job` narrows it (an orphan has no
 state or job; `--machine` still applies), `machine list` names them in an ORPHANS column,
 and `pastor task close t-N` closes one, with or without a row. pastor finds
-them when it reconciles (every `reconcile_every`). It assumes it is the only
-pastor naming agents `t-N` on each herdr.
+them when it reconciles (every `reconcile_every`), and closes an orphan's pane
+itself once `close_failed_after` has passed since a check first observed its
+agent stopped; one at work is left alone, and the clock resets each time the
+same pane is found at work again. It assumes it is the only pastor naming
+agents `t-N` on each herdr.
 
 ## Flocks
 
@@ -3196,7 +3214,7 @@ sends nothing.
 ## Files
 
 ```
-~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, pull_lost_after, agents_change_fleet, max_orchestrators, head_address, defaults, agents, models, profiles, watch, shepherd (all optional)
+~/.config/pastor/pastor.toml      tick, settle, reconcile_every, request_timeout, agent_ready_timeout, close_done_after, close_failed_after, pull_lost_after, agents_change_fleet, max_orchestrators, head_address, defaults, agents, models, profiles, watch, shepherd (all optional)
 ~/.config/pastor/flock.toml       flocks and machines
 ~/.config/pastor/jobs/<name>.toml one job per file
 ~/.config/pastor/orchestrators/<name>.toml one orchestrator per file (and an optional .env for its scripts)
@@ -3233,6 +3251,7 @@ reconcile_every = "60s"
 request_timeout = "60s"      # one herdr request, connect included
 agent_ready_timeout = "30s"  # agent.start to an accepted prompt; below request_timeout
 close_done_after = "5s"      # a done task's pane closes after this; "never" keeps it
+close_failed_after = "5s"    # a failed or stale task's, or an orphan's, stopped agent's pane closes after this; "never" keeps it
 pull_lost_after = "10m"      # a pull machine silent this long is lost, its tasks stale
 agents_change_fleet = false  # true lets agents pastor started run tasks and edit the fleet
 max_orchestrators = 1        # orchestrator agents at once; each also takes a max_agents slot
