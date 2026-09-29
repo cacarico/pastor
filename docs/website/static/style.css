@@ -95,9 +95,11 @@ b, strong { font-weight: 700; color: var(--hot); }
 /* the terminal's bigger view: a centred dialog, 60% of the window each way */
 .term-big { width: 60vw; height: 60vh; max-width: none; max-height: none; padding: 0; border: 0; background: transparent; color: var(--ink); overflow: visible; }
 .term-big::backdrop { background: rgb(0 0 0 / .65); }
-.term-big .pane > .t { background: linear-gradient(transparent 45%, var(--bg) 45%); }
-.term-big .pane { height: 100%; display: flex; flex-direction: column; background: var(--bg); padding: 16px 12px 12px; }
-.term-big .term { flex: 1; height: auto; margin: 0; font-size: 13px; }
+/* in the popup the title and controls sit inside the frame, as a header */
+.term-big .pane { height: 100%; display: grid; grid-template: "t ctl" auto "term term" 1fr / minmax(0, 1fr) auto; gap: 8px 12px; background: var(--bg); padding: 10px 12px 12px; }
+.term-big .pane > .t { grid-area: t; position: static; padding: 0; background: none; align-self: center; }
+.term-big .term-ctl { grid-area: ctl; position: static; padding: 0; background: none; }
+.term-big .term { grid-area: term; height: auto; min-height: 0; margin: 0; font-size: 13px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 /* docs */
