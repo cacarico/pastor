@@ -1,0 +1,22 @@
+#! kind: claude
+#! source: real
+#! now: 2026-09-29T21:00:00Z
+#! limit: hard
+#! model_scoped: yes
+#! until: none
+> Read AGENTS.md, then fix the flaky transport test.
+
+● Read(AGENTS.md)
+  ⎿  Read 132 lines
+
+● Bash(cargo test --test transport)
+  ⎿  running 14 tests
+     test result: ok. 14 passed; 0 failed
+     … +12 lines (ctrl+o to expand)
+
+● You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

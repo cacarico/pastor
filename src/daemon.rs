@@ -604,6 +604,11 @@ impl Fleet {
         self.defaults.read().recover().clone()
     }
 
+    /// `[agents]` as last applied.
+    pub fn agents(&self) -> Agents {
+        self.agents.read().recover().clone()
+    }
+
     /// Whether `pastor.toml` as last applied lets an agent pastor started
     /// change the fleet.
     pub fn agents_change_fleet(&self) -> bool {

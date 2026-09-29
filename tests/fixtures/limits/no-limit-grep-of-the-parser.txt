@@ -1,0 +1,21 @@
+#! kind: claude
+#! source: made
+#! now: 2026-09-29T21:00:00Z
+#! limit: none
+> Find where pastor reads a usage limit.
+
+● Bash(grep -n "limit reached" src/limit.rs)
+  ⎿  41://! `5-hour limit reached ∙ resets 3pm`, `Weekly limit reached`
+     212:        "Claude AI usage limit reached|1759201200",
+     230:        "● You've hit your limit · resets 3am (Europe/Lisbon)",
+     … +9 lines (ctrl+o to expand)
+
+● Bash(grep -rh "hit your" tests/fixtures/limits)
+  ⎿  You've hit your session limit · resets 1:10am (Europe/Lisbon)
+     ● You've hit your weekly limit · resets 7pm (Europe/Lisbon)
+     You've hit your limit · resets 3am (Europe/Lisbon)
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

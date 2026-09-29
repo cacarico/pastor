@@ -1,0 +1,28 @@
+#! kind: claude
+#! source: made
+#! now: 2026-09-29T21:00:00Z
+#! limit: none
+> Read AGENTS.md, then fix the flaky transport test.
+
+● Read(AGENTS.md)
+  ⎿  Read 132 lines
+
+● Bash(cargo test --test transport)
+  ⎿  running 14 tests
+     test result: ok. 14 passed; 0 failed
+     … +12 lines (ctrl+o to expand)
+
+● The parser now reads three more messages:
+
+  - You've hit your session limit · resets 1:10am
+  - Weekly limit reached ∙ resets Mon 9am
+
+  "Claude AI usage limit reached" is still read, and a usage limit reached
+  in the middle of a line is not.
+
+✻ Cooked for 2m 51s
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

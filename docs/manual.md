@@ -1881,14 +1881,29 @@ orchestrator starts gets it in its prompt. Its own agent and its scripts
 leave the name out, and may keep only their own orchestrator's note; a
 person names it with `--name`. `-` reads the note from stdin.
 
-**Quota.** When the agent ends on a quota error (its error or the last
-lines of its pane say `usage limit`, `limit reached`, `hit your limit`,
-`quota exceeded` or `exceeded your current quota`, OpenAI's wording), the head reads the reset time from the message
-(`|<unix time>`, or `resets 3am` or `resets at 15:30`, the next such time in
-local time; Claude's messages, for now), or waits an hour when it finds none,
-emits `orchestrator.quota` with `until`, and starts no agent for that
-orchestrator before then. The pre script keeps running, so the mechanical work
-goes on; a session waits, holding its slot, and restarts at the reset.
+**Quota.** When the agent ends its turn on a usage limit, the head reads the
+reset time from the message, or waits an hour when it names none, emits
+`orchestrator.quota` with `until`, and starts no agent for that orchestrator
+before then. The pre script keeps running, so the mechanical work goes on; a
+session waits, holding its slot, and restarts at the reset.
+
+The head looks at the end of the turn only: the agent's error and what
+follows the last prompt in the last lines of its pane, at most the last 15
+lines that are not empty. A line counts when it starts with the message
+(`You've hit your session limit`, `Weekly limit reached`, `Opus weekly limit
+reached`, `Claude AI usage limit reached`, `Credit balance is too low`) and is
+the agent's last `●` message, a `⎿` notice that is not the output of a tool
+call, a line in the first column or the banner under the input box. The same
+words further up, in the middle of a line or in what a tool printed (a grep of
+pastor's own source) are not a limit. Only Claude's messages are read, for
+now; an agent of another kind is restarted like one that ended. So is one that
+ended on `API Error: 429` or `529`: the API was busy, the account is not out.
+
+The reset is a unix time (`|1759201200`), a time of day (`resets 3am`,
+`resets at 15:30`), a weekday (`resets Mon 9am`), a date (`resets Oct 6,
+9am`) or a wait (`try again in 2 hours 13 minutes`). A time of day is the
+next such time in the zone the message names in brackets (`resets 3am
+(Europe/Lisbon)`), else in the head's local time.
 
 ### Session orchestrators
 
