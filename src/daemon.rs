@@ -1642,14 +1642,19 @@ impl Fleet {
 
     /// Move a queued task (`Store::move_queued`), under the dispatch lock
     /// for the reason `set_priority` is: a pass must not take the queue in
-    /// the old order after the move has answered.
+    /// the old order after the move has answered. A task in flight is also
+    /// excluded from the queue this moves within: its row still says
+    /// `queued`, but a dispatch pass has already placed it, so it must not
+    /// be `--before` or `--after`'s target, or counted toward `--to`'s
+    /// position (`Store::move_queued`).
     pub async fn move_queued(&self, id: i64, to: QueueSpot) -> Result<Moved, MoveError> {
         let _pass = self.dispatch_lock.lock().await;
         // As in `set_priority_preempting`.
         if self.in_flight.holds(id) {
             return Err(MoveError::InFlight(id));
         }
-        self.store.move_queued(id, to)
+        let in_flight: Vec<i64> = self.in_flight.placed().iter().map(|p| p.task_id).collect();
+        self.store.move_queued(id, to, &in_flight)
     }
 
     /// The queue as `pastor queue` shows it: dispatch order, each task with
@@ -2296,20 +2301,25 @@ impl Fleet {
     }
 
     /// `dispatch_queued`, then, if another pass placed `task_id` and is
-    /// still sending it, wait for that send to end (at most `reply_wait`),
-    /// so a reply with the row shows where it went. Sends for other tasks
-    /// are not waited for.
+    /// still sending it, wait for that send to end, at most `reply_wait`
+    /// (its reservation itself is not bounded this way, so callers besides
+    /// this one still see the task as in flight for as long as the actor
+    /// may still claim it), so a reply with the row shows where it went.
+    /// Sends for other tasks are not waited for.
     pub async fn dispatch_queued_for(&self, task_id: i64) {
         self.dispatch_queued().await;
-        loop {
-            let sent = self.in_flight.sent.notified();
-            tokio::pin!(sent);
-            sent.as_mut().enable();
-            if !self.is_in_flight(task_id) {
-                return;
+        let wait = async {
+            loop {
+                let sent = self.in_flight.sent.notified();
+                tokio::pin!(sent);
+                sent.as_mut().enable();
+                if !self.is_in_flight(task_id) {
+                    return;
+                }
+                sent.await;
             }
-            sent.await;
-        }
+        };
+        let _ = tokio::time::timeout(self.reply_wait(), wait).await;
     }
 
     /// Count `task` on `handle`'s machine until the returned placement's
@@ -2431,20 +2441,36 @@ impl Fleet {
     }
 }
 
-/// Send what a dispatch pass decided for one task, waiting at most `wait`
-/// for each answer. Its reservation ends with it.
+/// Send what a dispatch pass decided for one task, then move on after at
+/// most `wait`: one machine slow to answer holds up neither the other
+/// machines nor the caller. The command already sent to the actor's channel
+/// cannot be un-sent, so its reservation is not bounded by `wait` the way
+/// the wait for an answer is: `run_placement` keeps it, in a task of its
+/// own, until the actor genuinely answers (or the request fails outright),
+/// however long that takes. Otherwise a priority change or a queue move
+/// could see the task as free the moment `wait` passes, while the actor
+/// still has this exact placement to carry out.
 async fn send_placement(p: Placement, wait: Duration) {
+    let disp = p.task.display_id();
+    let machine = p.handle.name.clone();
+    let done = tokio::spawn(run_placement(p));
+    if tokio::time::timeout(wait, done).await.is_err() {
+        tracing::warn!(task = %disp, machine = %machine, ?wait, "no answer within reply_wait; still in flight until it answers");
+    }
+}
+
+/// The sends `send_placement` decided for one task, unbounded: `wait` only
+/// bounds how long `send_placement` waits on this before moving on, never
+/// how long the placement itself, or the reservation it holds, may take.
+async fn run_placement(p: Placement) {
     let Placement {
         task, handle, send, ..
     } = &p;
     let machine = &handle.name;
     let (res, what) = match *send {
-        Outbound::Resume => (
-            within(machine, wait, handle.resume(task.id)).await,
-            "resume",
-        ),
+        Outbound::Resume => (handle.resume(task.id).await, "resume"),
         Outbound::PauseFor(victim) => {
-            match within(machine, wait, handle.pause(victim, task.id)).await {
+            match handle.pause(victim, task.id).await {
                 Ok(_) => {
                     tracing::info!(task = %task.display_id(), paused = %Task::agent_name_for(victim), machine = %machine, "paused a low task");
                 }
@@ -2453,15 +2479,9 @@ async fn send_placement(p: Placement, wait: Duration) {
                     return;
                 }
             }
-            (
-                within(machine, wait, handle.dispatch(task.id)).await,
-                "dispatch",
-            )
+            (handle.dispatch(task.id).await, "dispatch")
         }
-        Outbound::Dispatch => (
-            within(machine, wait, handle.dispatch(task.id)).await,
-            "dispatch",
-        ),
+        Outbound::Dispatch => (handle.dispatch(task.id).await, "dispatch"),
     };
     match res {
         Ok(t) if what == "resume" => {
@@ -7043,6 +7063,73 @@ mod tests {
         fleet.move_queued(t.id, QueueSpot::Top).await.unwrap();
     }
 
+    /// A dispatch that outlives `reply_wait` (a slow-to-ready agent; herdr
+    /// itself answers every request) keeps its reservation past
+    /// `dispatch_queued` returning: the command already sent to the actor's
+    /// channel cannot be un-sent, so a priority change or a queue move in
+    /// that window must still see the task as in flight, not free to
+    /// reprioritize as if the placement had never happened. Once the actor
+    /// really answers, the task has moved on to `running`, not back to
+    /// `queued`, so the same change is then refused as not queued instead.
+    #[tokio::test]
+    async fn a_dispatch_past_reply_wait_keeps_its_reservation() {
+        let fake = FakeHerdr::new();
+        let (fleet, store) = managed(&[("a", fake.clone())]);
+        let settings = MachineSettings {
+            agent_ready_timeout: Duration::from_millis(1500),
+            ..fast()
+        };
+        fleet.apply_flock(&flock_of(&[("a", 1)]), &settings).await;
+        healthy(&fleet, "a").await;
+        fake.set_ready_after(Duration::from_millis(100));
+        fleet.set_reply_wait(Duration::from_millis(50));
+
+        let t = fleet
+            .queue_run("x".into(), spec(), None, None, None)
+            .await
+            .unwrap();
+        fleet.dispatch_queued().await;
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Starting,
+            "claimed, but the agent is not ready yet: reply_wait gave up long before it is"
+        );
+
+        let err = fleet
+            .set_priority_preempting(t.id, Priority::Critical, "test", true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PriorityError::InFlight(id) if id == t.id),
+            "{err:?}"
+        );
+        let err = fleet.move_queued(t.id, QueueSpot::Top).await.unwrap_err();
+        assert!(
+            matches!(err, MoveError::InFlight(id) if id == t.id),
+            "{err:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().state,
+            TaskState::Running,
+            "the slow dispatch finished on its own past reply_wait"
+        );
+        assert!(
+            matches!(
+                fleet
+                    .set_priority(t.id, Priority::Low, "test")
+                    .await
+                    .unwrap_err(),
+                PriorityError::NotQueued {
+                    state: TaskState::Running,
+                    ..
+                }
+            ),
+            "no longer in flight, but not queued either now it is running"
+        );
+    }
+
     /// `home_and_work` plus `spare`, a flock with no machine.
     async fn spare_daemon() -> (Daemon, tempfile::TempDir) {
         let mut flock = home_and_work();
@@ -10350,7 +10437,9 @@ mod tests {
 
     /// An actor that never reads its queue: a request to it fails with
     /// `NoReply` after the bound, and a pass that placed a task on it ends
-    /// then too, leaving the task queued and the slot free.
+    /// then too, leaving the task queued. Its reservation stays, though: the
+    /// command sent to the actor's channel cannot be un-sent, so the slot it
+    /// holds is not free until the actor genuinely answers (never, here).
     #[tokio::test]
     async fn a_request_to_a_stuck_actor_fails_after_the_bound() {
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -10392,8 +10481,16 @@ mod tests {
             TaskState::Queued
         );
         assert!(
-            fleet.in_flight.placed().is_empty(),
-            "the slot is free again"
+            fleet.in_flight.holds(t.id),
+            "still in flight: the actor may yet read and claim it"
+        );
+        let err = fleet
+            .set_priority_preempting(t.id, Priority::Critical, "test", true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PriorityError::InFlight(id) if id == t.id),
+            "{err:?}"
         );
     }
 }
