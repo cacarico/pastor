@@ -308,14 +308,23 @@ fn agy_limit(text: &str, now: DateTime<Utc>) -> Option<Limit> {
         line.strip_prefix('>')
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
     };
+    // An input box waiting for input has no command text after `>`, only
+    // whitespace and the box's right border; a sent prompt drawn inside a
+    // box has text there instead.
+    let is_empty_prompt = |line: &str| {
+        let line = unboxed(line);
+        line.strip_prefix('>')
+            .is_some_and(|rest| rest.trim_matches([' ', '│']).is_empty())
+    };
     let is_edge = |line: &str| line.trim_start().starts_with(['╭', '╰']);
     let prompts: Vec<usize> = (0..lines.len()).filter(|i| is_prompt(lines[*i])).collect();
     let input_box = prompts.last().copied().filter(|i| {
-        lines[..*i]
-            .iter()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .is_some_and(|l| l.trim_start().starts_with('╭'))
+        is_empty_prompt(lines[*i])
+            && lines[..*i]
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .is_some_and(|l| l.trim_start().starts_with('╭'))
     });
     let end = input_box.map_or(lines.len(), |b| {
         (0..b).rev().find(|i| is_edge(lines[*i])).unwrap_or(b)
@@ -1310,6 +1319,13 @@ mod tests {
         assert!(limit_in("agy", &pane, now()).is_some());
         let pane = format!("{limit}\n\n> go on\n");
         assert_eq!(limit_in("agy", &pane, now()), None);
+    }
+
+    #[test]
+    fn agy_reads_a_limit_after_a_boxed_prompt_with_no_trailing_input_box() {
+        let limit = "  RESOURCE_EXHAUSTED (code 429): Individual quota reached.";
+        let pane = format!("╭──────────╮\n│ > review │\n╰──────────╯\n\n{limit}\n");
+        assert!(limit_in("agy", &pane, now()).is_some(), "{pane}");
     }
 
     #[test]
