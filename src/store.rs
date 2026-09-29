@@ -1221,16 +1221,21 @@ impl Store {
     /// (`Priority::aged`): since it last aged, else since it was queued.
     /// `age_after` gives a task's wait, `None` when its flock does not age.
     /// One level a call, never past `high`; a paused task does not age.
+    /// `exclude` (a dispatch pass's in-flight task ids, `Fleet::in_flight`)
+    /// is left alone: their row still says `queued`, but they were placed
+    /// and have left the queue, so the level they were placed at stays.
     /// Returns the tasks lifted, as they are now.
     pub fn age_queued(
         &self,
         now: DateTime<Utc>,
         age_after: impl Fn(&Task) -> Option<std::time::Duration>,
+        exclude: &[i64],
     ) -> anyhow::Result<Vec<Task>> {
         let due: Vec<Task> = self
             .queued_tasks()?
             .into_iter()
             .filter(|t| t.state == TaskState::Queued && t.priority.aged().is_some())
+            .filter(|t| !exclude.contains(&t.id))
             .filter(|t| {
                 let Some(wait) = age_after(t).and_then(|d| chrono::Duration::from_std(d).ok())
                 else {
@@ -3606,8 +3611,8 @@ mod tests {
         let after = |t: &Task| (t.id != never.id).then_some(wait);
         let t0 = low.created_at;
         let mins = |m: i64| t0 + chrono::Duration::minutes(m);
-        assert!(s.age_queued(mins(29), after).unwrap().is_empty());
-        let aged = s.age_queued(mins(30), after).unwrap();
+        assert!(s.age_queued(mins(29), after, &[]).unwrap().is_empty());
+        let aged = s.age_queued(mins(30), after, &[]).unwrap();
         assert_eq!(aged.len(), 1);
         assert_eq!(aged[0].id, low.id);
         assert_eq!(aged[0].priority, Priority::Normal);
@@ -3615,11 +3620,11 @@ mod tests {
         assert_eq!(aged[0].aged_at, Some(mins(30)));
         assert_eq!(aged[0].priority_from.as_deref(), Some("defaults"));
         // The next step counts from the last one, not from the queue.
-        assert!(s.age_queued(mins(59), after).unwrap().is_empty());
-        let aged = s.age_queued(mins(60), after).unwrap();
+        assert!(s.age_queued(mins(59), after, &[]).unwrap().is_empty());
+        let aged = s.age_queued(mins(60), after, &[]).unwrap();
         assert_eq!(aged[0].priority, Priority::High);
         assert_eq!(aged[0].aged_from, Some(Priority::Low));
-        assert!(s.age_queued(mins(600), after).unwrap().is_empty());
+        assert!(s.age_queued(mins(600), after, &[]).unwrap().is_empty());
         for (t, p) in [
             (&high, Priority::High),
             (&critical, Priority::Critical),
@@ -3630,21 +3635,24 @@ mod tests {
         }
     }
 
-    /// A task a machine took, or one paused, has left the queue's ageing.
+    /// A task a machine took, one paused, or one in flight (placed, its
+    /// row still `queued`) has left the queue's ageing.
     #[test]
     fn age_queued_passes_over_what_is_not_queued() {
         let s = Store::open_in_memory().unwrap();
         let t = s
             .insert_task_at(new_task("run"), Priority::Low, None, TaskRole::Agent)
             .unwrap();
-        s.claim_task(t.id, "m").unwrap().unwrap();
-        let later = t.created_at + chrono::Duration::hours(1);
         let wait = |_: &Task| Some(std::time::Duration::from_secs(60));
-        assert!(s.age_queued(later, wait).unwrap().is_empty());
+        let later = t.created_at + chrono::Duration::hours(1);
+        assert!(s.age_queued(later, wait, &[t.id]).unwrap().is_empty());
+        assert_eq!(s.get_task(t.id).unwrap().unwrap().priority, Priority::Low);
+        s.claim_task(t.id, "m").unwrap().unwrap();
+        assert!(s.age_queued(later, wait, &[]).unwrap().is_empty());
         let mut t = s.get_task(t.id).unwrap().unwrap();
         t.state = TaskState::Paused;
         s.update_task(&mut t).unwrap();
-        assert!(s.age_queued(later, wait).unwrap().is_empty());
+        assert!(s.age_queued(later, wait, &[]).unwrap().is_empty());
         assert_eq!(s.get_task(t.id).unwrap().unwrap().priority, Priority::Low);
     }
 
@@ -3664,7 +3672,7 @@ mod tests {
         let high = at(Priority::High);
         let wait = |_: &Task| Some(std::time::Duration::from_secs(60));
         let later = a.created_at + chrono::Duration::minutes(5);
-        assert_eq!(s.age_queued(later, wait).unwrap().len(), 2);
+        assert_eq!(s.age_queued(later, wait, &[]).unwrap().len(), 2);
         let before_set = Utc::now();
         let t = s
             .set_priority(a.id, Priority::Low, "task priority")
@@ -3676,7 +3684,7 @@ mod tests {
         assert_eq!(m.task.aged_from, None);
         assert!(m.task.aged_at.is_some_and(|at| at >= before_set));
         let aged = s
-            .age_queued(later + chrono::Duration::minutes(1), wait)
+            .age_queued(later + chrono::Duration::minutes(1), wait, &[])
             .unwrap();
         assert_eq!(aged.len(), 1);
         assert_eq!(aged[0].id, a.id);
@@ -3707,7 +3715,7 @@ mod tests {
         let wait = std::time::Duration::from_secs(1800);
         let after = |_: &Task| Some(wait);
         let aged = s
-            .age_queued(queued + chrono::Duration::minutes(30), after)
+            .age_queued(queued + chrono::Duration::minutes(30), after, &[])
             .unwrap();
         assert_eq!(aged.len(), 1);
         assert_eq!(aged[0].priority, Priority::Normal);
@@ -3716,7 +3724,7 @@ mod tests {
             .unwrap();
         assert_eq!(lowered.priority, Priority::Low);
         assert!(
-            s.age_queued(Utc::now(), after)
+            s.age_queued(Utc::now(), after, &[])
                 .unwrap()
                 .into_iter()
                 .all(|a| a.id != t.id)
@@ -3737,7 +3745,7 @@ mod tests {
             )
             .unwrap();
         let later = t.created_at + chrono::Duration::hours(1);
-        s.age_queued(later, |_| Some(std::time::Duration::from_secs(60)))
+        s.age_queued(later, |_| Some(std::time::Duration::from_secs(60)), &[])
             .unwrap();
         s.claim_task(t.id, "m").unwrap().unwrap();
         let mut t = s.get_task(t.id).unwrap().unwrap();

@@ -2074,6 +2074,8 @@ impl Fleet {
     /// level (`Store::age_queued`), so a `low` task still runs behind a
     /// steady stream of higher ones. Each dispatch pass does it first,
     /// under the dispatch lock, so a hand change never races it.
+    /// A task in flight has left the queue though its row still says
+    /// `queued`, and keeps the level it was placed at.
     fn age_queued(&self, now: chrono::DateTime<chrono::Utc>) {
         let flock = self.flock();
         let defaults = self.defaults.read().recover().clone();
@@ -2081,7 +2083,8 @@ impl Fleet {
             let theirs = t.flock.as_deref().unwrap_or(flock.default_flock());
             defaults.resolve_age_after(flock.entry(theirs))
         };
-        match self.store.age_queued(now, after) {
+        let in_flight: Vec<i64> = self.in_flight.placed().iter().map(|p| p.task_id).collect();
+        match self.store.age_queued(now, after, &in_flight) {
             Ok(aged) => {
                 for t in aged {
                     tracing::info!(
@@ -10575,6 +10578,66 @@ mod tests {
         assert_eq!(level(work.id), (Priority::Normal, Some(Priority::Low)));
         assert_eq!(level(still.id), (Priority::Low, None));
         assert_eq!(level(fresh.id), (Priority::Low, None));
+    }
+
+    /// A task a pass placed keeps its `queued` row while its machine's
+    /// actor works through what came before it (`in_flight`). It has left
+    /// the queue, so a later pass must not age it: the level it runs at,
+    /// and a retry keeps, is the one it was placed at, even when the
+    /// placement is held across an ageing deadline.
+    #[tokio::test]
+    async fn a_placement_held_across_an_ageing_deadline_keeps_its_level() {
+        use crate::config::flock::FlockEntry;
+        let flock = Flock {
+            flocks: vec![FlockEntry {
+                name: "work".into(),
+                default: true,
+                age_after: Some("5m".into()),
+                ..Default::default()
+            }],
+            machines: vec![],
+        };
+        let (d, _tmp) = daemon_with_flock(flock, &[]).await;
+        let store = d.store();
+        let fleet = d.fleet();
+        let t = store
+            .insert_task_at(
+                NewTask {
+                    description: None,
+                    job: "run".into(),
+                    item: serde_json::Value::Null,
+                    prompt: "p".into(),
+                    spec: spec(),
+                    flock: "work".into(),
+                },
+                Priority::Low,
+                Some("task run"),
+                crate::task::TaskRole::Agent,
+            )
+            .unwrap();
+        fleet.in_flight.placed.lock().unwrap().push(Placed {
+            task_id: t.id,
+            machine: "nowhere".into(),
+            flock: t.flock.clone(),
+            from_job: false,
+        });
+        let held = Reservation {
+            in_flight: fleet.in_flight.clone(),
+            task_id: t.id,
+        };
+        // The deadline passes while the placement is held.
+        let ago = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        store.execute_raw(&format!(
+            "UPDATE tasks SET created_at = '{ago}' WHERE id = {}",
+            t.id
+        ));
+        fleet.dispatch_queued().await;
+        let got = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            (got.priority, got.aged_from, got.aged_at),
+            (Priority::Low, None, None)
+        );
+        drop(held);
     }
 
     /// A queued task pinned to `machine`, straight into the store.

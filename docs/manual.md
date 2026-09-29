@@ -1409,7 +1409,8 @@ level an aged task had before (`high (was low)`, `aged_from` in `--json`),
 `task describe` too (`priority: high, aged from low (from task run)`), and
 the task's JSON has `aged_from` and `aged_at`. A retry of an aged task
 queues at the level it had before it aged, and waits afresh. The level the
-task had when a machine took it is the one it keeps.
+task had when a dispatch pass placed it is the one it keeps: it does not age
+while its machine is still starting it.
 
 `pastor task describe` prints the level and the layer that set it, such as
 `priority: high (from flock work)` (`task priority` when set by hand);
