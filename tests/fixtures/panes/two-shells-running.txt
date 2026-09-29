@@ -1,0 +1,17 @@
+#! question: no
+#! shell: yes
+#! trust: no
+● Bash(make check)
+  ⎿  cargo fmt --check
+     cargo clippy --all-targets -- -D warnings
+     test result: ok. 412 passed; 0 failed
+     … +38 lines (ctrl+o to expand)
+
+● Started the release build and the smoke test in the background.
+
+✻ Worked for 48s
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · 2 shells still running · ← for agents
