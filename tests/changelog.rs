@@ -190,3 +190,44 @@ fn check_fails_on_a_malformed_change_file() {
 fn this_repository_passes_the_check() {
     ok(run(Path::new(env!("CARGO_MANIFEST_DIR")), &["check"]));
 }
+
+#[test]
+fn check_fails_on_an_entry_already_released() {
+    // A branch older than the release can bring back entries the release
+    // already gathered; the next gather would publish them twice.
+    let released =
+        "## 0.1.0 - 2026-01-01\n\n### Added\n\n- The start.\n- A long one,\n  on two lines.\n";
+    for body in [
+        "### Added\n\n- The start.\n",
+        "### Fixed\n\n- New.\n- A long one,\n  on two lines.\n",
+    ] {
+        let dir = repo();
+        let d = dir.path();
+        std::fs::write(d.join("CHANGELOG.md"), format!("{HEADER}{released}")).unwrap();
+        std::fs::write(d.join("changes/stale.md"), body).unwrap();
+        let out = run(d, &["check"]);
+        assert!(!out.status.success(), "{body} passed");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("changes/stale.md") && err.contains("already released"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn check_passes_a_new_entry_that_shares_a_first_line_with_a_released_one() {
+    let dir = repo();
+    let d = dir.path();
+    std::fs::write(
+        d.join("CHANGELOG.md"),
+        format!("{HEADER}## 0.1.0 - 2026-01-01\n\n### Added\n\n- The start,\n  first.\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("changes/new.md"),
+        "### Fixed\n\n- The start,\n  again.\n- Something new.\n",
+    )
+    .unwrap();
+    ok(run(d, &["check"]));
+}
