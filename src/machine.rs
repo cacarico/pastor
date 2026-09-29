@@ -1150,10 +1150,31 @@ pub enum EndBy {
 enum PaneEnd {
     Finished,
     Question(String),
+    /// Not Claude, idle with no `pastor task done` (`Actor::not_ended`):
+    /// the pane's last lines. herdr cannot tell such an agent's pause
+    /// (agy thinking, waiting on a process of its own) from its end.
+    NotEnded(String),
     ShellRunning,
     /// It stopped on a usage limit (`limit::limit_in`): not done, it waits
     /// for the reset (`Actor::wait_on_limit`).
     Limit(crate::limit::Limit),
+}
+
+/// The error of a task whose agent is not Claude and went idle without
+/// `pastor task done` (`PaneEnd::NotEnded`), before the pane's last lines.
+pub const IDLE_WITHOUT_TASK_DONE: &str = "idle without task done";
+
+/// How many of the pane's last lines `PaneEnd::NotEnded` keeps.
+const IDLE_TAIL_LINES: usize = 5;
+
+/// Whether an idle agent that is not Claude has yet to end `task`: it was
+/// asked to run `pastor task done` (its `summary` is not `off`) and has not.
+/// herdr shows such an agent idle while it thinks or waits on a process of
+/// its own as it does when it is finished, and it draws nothing pastor can
+/// tell those apart by, so only its own word ends the task. One never asked
+/// ends on the idle, as before.
+fn not_ended(task: &Task) -> bool {
+    !task.ended && task.spec.summary != crate::task::SummaryMode::Off
 }
 
 /// Who asked for a close. `pastor task close` refuses what herdr refuses;
@@ -3418,6 +3439,26 @@ impl Actor {
             .clone()
             .unwrap_or_else(|| Task::agent_name_for(task.id));
         let timeout = self.settings.request_timeout;
+        // Still at a startup question herdr reads idle (Codex's folder
+        // trust): the prompt would answer it and be lost. The next status
+        // or reconcile looks again, and waits out the redraw once it is gone.
+        let hold = self.settings.agents.startup_markers(&task.spec.agent);
+        if !hold.is_empty() {
+            match tokio::time::timeout(timeout, self.connector.agent_read(&name, 100))
+                .await
+                .map_err(|_| TimedOut("agent.read", timeout))?
+            {
+                Ok(screen) if crate::config::shows_startup_question(&screen, &hold) => {
+                    self.trust_answered.remove(&task.id);
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(err) if err.is_transport() => return Err(err.into()),
+                Err(err) => {
+                    tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a startup question");
+                }
+            }
+        }
         let prompt = crate::task::prompt_to_send(&task);
         let result = tokio::time::timeout(timeout, self.connector.agent_prompt(&name, &prompt))
             .await
@@ -3619,7 +3660,20 @@ impl Actor {
                         return Err(err);
                     }
                 }
-                PaneEnd::Question(question) => self.block_on_question(task, &observed, question),
+                PaneEnd::Question(question) => {
+                    let error = format!("agent asked: {question}");
+                    let detail = serde_json::json!({ "question": question });
+                    self.block_idle(task, &observed, error, detail)
+                }
+                PaneEnd::NotEnded(tail) => {
+                    let error = format!(
+                        "{IDLE_WITHOUT_TASK_DONE}: {}",
+                        tail.lines().collect::<Vec<_>>().join(" / ")
+                    );
+                    let detail =
+                        serde_json::json!({ "why": "idle_without_task_done", "tail": tail });
+                    self.block_idle(task, &observed, error, detail)
+                }
                 PaneEnd::ShellRunning => {
                     // The agent ended its turn waiting on a background shell
                     // and takes it up again when the shell ends: not done.
@@ -3812,7 +3866,11 @@ impl Actor {
 
     /// How the task's agent ended its turn, read from the tail of its pane:
     /// on a question (`task::trailing_question`), waiting on a background
-    /// shell (`task::background_shell_running`), or finished. A pane herdr
+    /// shell (`task::background_shell_running`), or finished. An agent that
+    /// is not Claude is read for agy's permission prompts
+    /// (`task::permission_question`) and its `· N task` footer
+    /// (`task::tasks_running`) too, and is finished only once it said so
+    /// (`not_ended`). A pane herdr
     /// cannot read is finished, so the task is done as it would have been
     /// without this check. A lost connection or a read that never answers is
     /// an outage (`is_outage`): the task is not settled on it, and the caller
@@ -3824,7 +3882,10 @@ impl Actor {
         let timeout = self.settings.request_timeout;
         match tokio::time::timeout(timeout, self.connector.agent_read(target, 100)).await {
             Ok(Ok(text)) => {
-                if crate::task::background_shell_running(&text) {
+                let claude = self.settings.agents.kind(&task.spec.agent) == "claude";
+                if crate::task::background_shell_running(&text)
+                    || (!claude && crate::task::tasks_running(&text))
+                {
                     return Ok(PaneEnd::ShellRunning);
                 }
                 // A task its agent ended (`task done`) is done whatever its
@@ -3834,7 +3895,13 @@ impl Actor {
                 }
                 // Kept only when the task really is done: a tail left by a
                 // question would reach a later failed task's finish command.
-                Ok(match crate::task::trailing_question(&text) {
+                let question = crate::task::trailing_question(&text)
+                    .or_else(|| (!claude).then(|| crate::task::permission_question(&text))?);
+                if question.is_none() && !claude && not_ended(task) {
+                    let tail = crate::task::pane_tail(&text, IDLE_TAIL_LINES).join("\n");
+                    return Ok(PaneEnd::NotEnded(tail));
+                }
+                Ok(match question {
                     Some(question) => PaneEnd::Question(question),
                     None => {
                         self.store.note_pane_tail(task.id, &text);
@@ -3851,12 +3918,19 @@ impl Actor {
         }
     }
 
-    /// Mark a task whose agent went idle on a question `blocked` instead of
-    /// `done`, so `task send` can answer it. The baseline moves to the idle it
-    /// was found at, as a completion would move it, so `next_state` holds the
-    /// task here until the agent moves again, and the answer's own work is
-    /// what finishes it next.
-    fn block_on_question(&mut self, mut task: Task, observed: &Observed, question: String) {
+    /// Mark a task whose agent went idle on a question, or not ended
+    /// (`PaneEnd::NotEnded`), `blocked` instead of `done`, so `task send`
+    /// can answer it, with `error` and `task.blocked` carrying `detail`. The
+    /// baseline moves to the idle it was found at, as a completion would
+    /// move it, so `next_state` holds the task here until the agent moves
+    /// again, and the answer's own work is what finishes it next.
+    fn block_idle(
+        &mut self,
+        mut task: Task,
+        observed: &Observed,
+        error: String,
+        detail: serde_json::Value,
+    ) {
         if let Observed::Status {
             state_change_seq,
             completion_seq,
@@ -3868,16 +3942,12 @@ impl Actor {
         task.activity_seen = false;
         task.state = TaskState::Blocked;
         task.finished_at = None;
-        task.error = Some(format!("agent asked: {question}"));
+        task.error = Some(error);
         if let Err(err) = self.store.update_task(&mut task) {
             tracing::error!(%err, "update task");
             return;
         }
-        self.emit_with(
-            "task.blocked",
-            Some(task.id),
-            Some(serde_json::json!({ "question": question })),
-        );
+        self.emit_with("task.blocked", Some(task.id), Some(detail));
         self.refresh_live();
     }
 
@@ -5147,6 +5217,177 @@ mod tests {
         // The shell ended: the agent takes the turn up, pushes, goes idle.
         fake.set_status(&pane, AgentStatus::Working);
         fake.set_pane_text(&pane, "● make check passed. Pushed the branch.\n\n❯\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+    }
+
+    /// A task of `agent` (no `[agents]` entry, so its kind is its name).
+    fn new_task_of(store: &Store, agent: &str) -> Task {
+        store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    agent: agent.into(),
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap()
+    }
+
+    /// agy idles in a long thinking pause, or while a command it started
+    /// runs, and herdr reads that as it reads the end of its turn. So a task
+    /// whose agent is not Claude is not done on an idle: it goes `blocked`,
+    /// "idle without task done" and the pane's last lines, its pane is not
+    /// closed, it runs again when the agent does, and it is done when the
+    /// agent says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_claude_task_idle_without_task_done_is_blocked() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, mut events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task_of(&store, "agy");
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(
+            &pane,
+            "  Reading the diff.\n\n  Thinking about the lock order\n\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            row.error.as_deref(),
+            Some("idle without task done: Reading the diff. / Thinking about the lock order")
+        );
+        assert_eq!(row.finished_at, None);
+        let ev = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if ev.kind != "task.running" {
+                break ev;
+            }
+        };
+        assert_eq!(ev.kind, "task.blocked");
+        assert_eq!(
+            ev.detail,
+            Some(serde_json::json!({
+                "why": "idle_without_task_done",
+                "tail": "Reading the diff.\nThinking about the lock order",
+            }))
+        );
+        tokio::time::sleep(settle * 6).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+        assert!(fake.agents().iter().any(|a| a.pane_id == pane), "pane kept");
+
+        // The pause is over: it works again, and ends with `task done`.
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        assert_eq!(store.get_task(t.id).unwrap().unwrap().error, None);
+        h.end(t.id, Some("done: reviewed".into())).await.unwrap();
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 6).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
+    }
+
+    /// agy stops on a permission prompt idle too; that is a question, and
+    /// its footer's `· 1 task` (a command of its own still going) keeps the
+    /// task running until the agent takes its turn up again.
+    #[tokio::test(start_paused = true)]
+    async fn agy_permission_prompts_block_and_its_tasks_footer_keeps_running() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task_of(&store, "agy");
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(
+            &pane,
+            "  Started make mutants.\n\n  > \n ~/src/repo · 1 task\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle * 6).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "a task of its own keeps the task running"
+        );
+
+        fake.set_status(&pane, AgentStatus::Working);
+        fake.set_pane_text(
+            &pane,
+            "  $ make deploy\n  Run this command? (y/n)\n\n  > \n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        assert_eq!(
+            store.get_task(t.id).unwrap().unwrap().error.as_deref(),
+            Some("agent asked: Run this command? (y/n)")
+        );
+    }
+
+    /// A task whose prompt never asked for `task done` (`summary = "off"`)
+    /// ends on the idle, as before; so does a Claude task, whatever its
+    /// pane says.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_never_asked_for_task_done_is_done_on_the_idle() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = store
+            .insert_task(NewTask {
+                description: None,
+                job: "run".into(),
+                item: serde_json::Value::Null,
+                prompt: "hi".into(),
+                spec: DispatchSpec {
+                    agent: "codex".into(),
+                    summary: crate::task::SummaryMode::Off,
+                    ..spec()
+                },
+                flock: "default".into(),
+            })
+            .unwrap();
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(&pane, "  Pushed the branch.\n");
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+
+        let t = new_task(&store);
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(&pane, "  Run this command?\n ~/src · 1 task\n");
         fake.set_status(&pane, AgentStatus::Idle);
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
     }
@@ -6979,6 +7220,36 @@ mod tests {
         fake.answer_trust_by_hand(t.pane_id.as_deref().unwrap());
         wait_for("the agent working on its prompt", || agent_working(&fake)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+    }
+
+    /// Codex's folder-trust dialog, as a new folder shows it.
+    const CODEX_TRUST_SCREEN: &str = "> You are in /home/fake/src/app\n\n  Do you trust the contents of this directory? Working with untrusted\n  contents comes with higher risk of prompt injection.\n\n\u{203a} 1. Yes, continue\n  2. No, quit\n\n  Press enter to continue\n";
+
+    /// Codex asks whether to trust a new folder, and herdr reads that
+    /// dialog idle and ready, not blocked: a prompt sent then goes into the
+    /// dialog and is lost. pastor reads the pane first, holds the prompt
+    /// with the task blocked, and sends it once a person has answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_codex_task_in_a_new_folder_gets_its_prompt_after_the_trust_answer() {
+        let fake = FakeHerdr::new();
+        fake.set_trust_prompt(Some(vec!["Enter".into()]));
+        fake.set_trust_idle(true);
+        fake.set_trust_screen(CODEX_TRUST_SCREEN);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = connected(&fake, &store).await;
+        let t = h.dispatch(new_task_of(&store, "codex").id).await.unwrap();
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(t.prompt_pending);
+        assert_eq!(calls(&fake, "agent.prompt").len(), 0);
+        // Reconciles and settle windows go by: still at the dialog.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(calls(&fake, "agent.prompt").len(), 0);
+        assert_eq!(state_of(&store, t.id), TaskState::Blocked);
+
+        fake.answer_trust_by_hand(t.pane_id.as_deref().unwrap());
+        wait_for("the agent working on its prompt", || agent_working(&fake)).await;
         assert_eq!(calls(&fake, "agent.prompt").len(), 1);
         assert_eq!(state_of(&store, t.id), TaskState::Running);
     }

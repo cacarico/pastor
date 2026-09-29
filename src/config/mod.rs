@@ -1161,6 +1161,14 @@ const CLAUDE_TRUST_KEYS: [&str; 2] = ["Down", "Enter"];
 /// accept that; saved trust presses them only while this is on screen.
 const CLAUDE_TRUST_MARKER: &str = "Yes, I trust this folder";
 
+/// Text Codex's folder-trust dialog shows, in its newer and older wording.
+/// herdr reads Codex at that dialog idle and ready, not blocked, so a prompt
+/// sent then would go into the dialog.
+const CODEX_TRUST_MARKERS: [&str; 2] = [
+    "Do you trust the contents of this directory",
+    "allow Codex to work in this folder",
+];
+
 /// Does the prompt at the bottom of `screen` (a pane's text, scrollback
 /// included) show `marker`? Only `bottom_prompt` is searched, so a trust
 /// prompt answered earlier and still in scrollback does not count for the
@@ -1175,6 +1183,11 @@ pub fn shows_trust_marker(screen: &str, marker: &str) -> bool {
     };
     let marker = squash(marker);
     !marker.is_empty() && squash(&bottom_prompt(screen)).contains(&marker)
+}
+
+/// Does `screen` show one of `markers` at its bottom (`shows_trust_marker`)?
+pub fn shows_startup_question(screen: &str, markers: &[String]) -> bool {
+    markers.iter().any(|m| shows_trust_marker(screen, m))
 }
 
 /// The trailing lines of `screen` that make up the prompt at its bottom:
@@ -1267,6 +1280,27 @@ impl Agents {
             None => return None,
         };
         (!marker.trim().is_empty()).then_some(marker)
+    }
+
+    /// What shows that `agent` sits at a startup question herdr reads idle
+    /// and ready, so its prompt waits (`shows_startup_question`): its own
+    /// `trust_marker`, and Codex's dialog for the `codex` kind. None for
+    /// Claude, whose dialog herdr reads `blocked`.
+    pub fn startup_markers(&self, agent: &str) -> Vec<String> {
+        let kind = self.kind(agent);
+        if kind == "claude" {
+            return vec![];
+        }
+        let own = self.0.get(agent).and_then(|d| d.trust_marker.clone());
+        let builtin: &[&str] = if kind == "codex" {
+            &CODEX_TRUST_MARKERS
+        } else {
+            &[]
+        };
+        own.into_iter()
+            .chain(builtin.iter().map(|m| m.to_string()))
+            .filter(|m| !m.trim().is_empty())
+            .collect()
     }
 
     /// The flags that carry `agent`'s allow and deny lists: its own, else the
@@ -3628,6 +3662,36 @@ mod tests {
             None,
             "empty turns it off"
         );
+    }
+
+    /// A prompt waits for Codex's folder-trust dialog, which herdr reads
+    /// idle, and for any agent's own `trust_marker`; never for Claude,
+    /// whose dialog herdr reads `blocked`.
+    #[test]
+    fn codex_and_agents_with_a_trust_marker_hold_their_prompt() {
+        let cfg = PastorConfig::default();
+        assert!(cfg.agents.startup_markers("claude").is_empty());
+        assert!(cfg.agents.startup_markers("agy").is_empty());
+        let codex = cfg.agents.startup_markers("codex");
+        let screen = "  Do you trust the contents of this directory? Working with\n\u{203a} 1. Yes, continue\n  2. No, quit\n";
+        assert!(shows_startup_question(screen, &codex));
+        assert!(!shows_startup_question(
+            "\u{203a} Explain this codebase\n",
+            &codex
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pastor.toml");
+        std::fs::write(
+            &path,
+            "[agents.agy]\ntrust_marker = \"Trust this workspace?\"\n[agents.claude]\ntrust_marker = \"Other\"\n",
+        )
+        .unwrap();
+        let cfg = PastorConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.agents.startup_markers("agy"),
+            vec!["Trust this workspace?"]
+        );
+        assert!(cfg.agents.startup_markers("claude").is_empty());
     }
 
     #[test]

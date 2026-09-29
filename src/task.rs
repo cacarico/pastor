@@ -1236,6 +1236,62 @@ pub fn background_shell_running(pane: &str) -> bool {
     })
 }
 
+/// What agy draws when it stops for a person, idle to herdr: a tool it wants
+/// to run ("Requesting permission for:", the tool on the next line) or a
+/// command to confirm ("Run this command?"). Only the last lines count, so
+/// a prompt answered long ago and still in scrollback does not.
+const PERMISSION_ASKS: [&str; 2] = ["Requesting permission for:", "Run this command?"];
+
+/// How many lines at the end of a pane `permission_question` and
+/// `tasks_running` read.
+const BOTTOM_LINES: usize = 20;
+
+/// The last `n` lines of `pane` that are not blank, trimmed.
+pub fn pane_tail(pane: &str, n: usize) -> Vec<&str> {
+    let mut tail: Vec<&str> = pane
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(n)
+        .collect();
+    tail.reverse();
+    tail
+}
+
+/// The permission prompt at the bottom of a pane of an agent that draws its
+/// messages without Claude's marker (agy), if it stopped on one: the asking
+/// line, and for "Requesting permission for:" the line naming what it asks
+/// for.
+pub fn permission_question(pane: &str) -> Option<String> {
+    let tail = pane_tail(pane, BOTTOM_LINES);
+    let at = tail
+        .iter()
+        .rposition(|l| PERMISSION_ASKS.iter().any(|ask| l.contains(ask)))?;
+    let line = tail[at];
+    Some(match tail.get(at + 1) {
+        Some(next) if line.ends_with(':') => format!("{line} {next}"),
+        _ => line.to_string(),
+    })
+}
+
+/// Whether agy's footer says it still has work of its own going (`· 1 task`,
+/// `· 2 tasks`): a process it started, which it takes up again when it ends,
+/// while herdr reads the agent idle. Only the last lines are the footer.
+pub fn tasks_running(pane: &str) -> bool {
+    pane_tail(pane, 3).iter().any(|line| {
+        line.match_indices('·').any(|(at, dot)| {
+            let rest = line[at + dot.len()..].trim_start();
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            let Some(after) = rest[digits..].trim_start().strip_prefix("task") else {
+                return false;
+            };
+            let after = after.strip_prefix('s').unwrap_or(after);
+            digits > 0 && !after.starts_with(char::is_alphanumeric)
+        })
+    })
+}
+
 /// Pure transition. `None` means no change. The settle window for `Done` is the
 /// caller's job: it should confirm the agent is still idle after the window.
 pub fn next_state(task: &Task, observed: &Observed) -> Option<TaskState> {
@@ -2096,6 +2152,55 @@ pub(crate) mod tests {
         let pane = claude_pane("● It said 1 shell still running, now ended.");
         assert!(!background_shell_running(&pane));
         assert!(!background_shell_running("fake output\n"));
+    }
+
+    /// agy's pane when it stops on a permission prompt, and when it ends a
+    /// turn with a process of its own still going.
+    fn agy_pane(bottom: &str) -> String {
+        format!(
+            "  I ran the review and wrote the notes.\n\n{bottom}\n\n\
+             ╭────────────────────╮\n│ >                  │\n╰────────────────────╯\n\
+             \u{20}~/src/repo  gemini-3-pro\n"
+        )
+    }
+
+    #[test]
+    fn agy_permission_prompts_are_questions() {
+        let pane =
+            agy_pane("Requesting permission for:\n  run_command make deploy\n  1. Allow  2. Deny");
+        assert_eq!(
+            permission_question(&pane).as_deref(),
+            Some("Requesting permission for: run_command make deploy")
+        );
+        let pane = agy_pane("$ git push origin HEAD\nRun this command? (y/n)");
+        assert_eq!(
+            permission_question(&pane).as_deref(),
+            Some("Run this command? (y/n)")
+        );
+        assert_eq!(permission_question(&agy_pane("Pushed the branch.")), None);
+        // Far up in the scrollback: answered long ago.
+        let old = format!("Run this command?\n{}", "line\n".repeat(40));
+        assert_eq!(permission_question(&old), None);
+    }
+
+    #[test]
+    fn agy_footer_with_tasks_is_still_running() {
+        let footer = |f: &str| format!("{}{f}\n", agy_pane("Started make mutants."));
+        assert!(tasks_running(&footer(" ~/src/repo · 1 task")));
+        assert!(tasks_running(&footer(
+            " ~/src/repo · 2 tasks · gemini-3-pro"
+        )));
+        assert!(!tasks_running(&footer(" ~/src/repo · gemini-3-pro")));
+        assert!(!tasks_running(&footer(" ~/src/repo · 2 taskforces")));
+        assert!(!tasks_running(&footer(" ~/src/repo · task list")));
+        // In a message far above the footer.
+        assert!(!tasks_running(&agy_pane("Waiting · 1 task left to do")));
+    }
+
+    #[test]
+    fn a_pane_tail_is_its_last_lines_that_are_not_blank() {
+        assert_eq!(pane_tail("a\n\n  b \n\nc\n\n", 2), vec!["b", "c"]);
+        assert_eq!(pane_tail("", 3), Vec::<&str>::new());
     }
 
     /// A task marked blocked on a question moves its baseline to the idle
