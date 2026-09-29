@@ -4420,6 +4420,33 @@ mod tests {
         assert!(links > 5, "only {links} docs links on the home");
     }
 
+    /// Each use in the home's "what you can do" pane is also linked from
+    /// the docs start page, so a reader who lands on the docs finds the same
+    /// ways in as one who lands on the home.
+    #[test]
+    fn website_uses_on_docs_start_page() {
+        let site = skills_dir().parent().unwrap().join("docs/website");
+        let home = std::fs::read_to_string(site.join("layouts/home.html")).unwrap();
+        let pane = home
+            .split("what you can do</h2>")
+            .nth(1)
+            .and_then(|rest| rest.split("</ul>").next())
+            .expect("no \"what you can do\" list");
+        let linked: Vec<&str> = pane
+            .split("{{ \"docs/")
+            .skip(1)
+            .map(|rest| rest.split(['#', '"']).next().unwrap())
+            .collect();
+        assert!(linked.len() >= 6, "only {linked:?} in the pane");
+        let start = std::fs::read_to_string(site.join("content/docs/_index.md")).unwrap();
+        for page in &linked {
+            assert!(
+                start.contains(&format!("({page})")),
+                "the docs start page does not link {page}"
+            );
+        }
+    }
+
     /// The manual's remote head section lists which commands go to the head,
     /// which stay here, and names the ones refused; each list must be what
     /// `remote_route` does.
