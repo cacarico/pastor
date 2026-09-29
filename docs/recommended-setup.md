@@ -162,6 +162,8 @@ system asks before a command, the task sits `blocked` until someone answers.
   machine you would wipe without a second thought.
 - Accept a repository's folder-trust prompt once per machine with
   `pastor task send t-3 --trust`; later tasks there go through on their own.
+  Or save it ahead of time, with no blocked task:
+  `pastor trust add pi-1 '~/work/api'`.
 
 ## Fresh code for every task
 

@@ -109,7 +109,7 @@ while read -r pr sha merge review checks <&3; do
     echo "PR #$pr: approved, with unresolved review threads"
   elif [ "$merge" = CLEAN ] && [ "$merged" = no ]; then
     # One merge a round: the next one's state is stale until GitHub catches up.
-    if gh pr merge "$pr" --repo "$repo" --squash --delete-branch >&2; then
+    if gh pr merge "$pr" --repo "$repo" --merge --delete-branch >&2; then
       merged=yes
     else
       echo "PR #$pr: approved and green, but the merge was refused"
