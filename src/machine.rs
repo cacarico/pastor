@@ -3963,7 +3963,7 @@ impl Actor {
     /// Keep `limit`, which `task`'s agent stopped on, in the table under the
     /// account its agent names here (`Agents::limit_key`), with
     /// `agent.exhausted` and `task.limited`, and answer the row. A limit
-    /// that is not hard (a 429 or 529 past Claude's own retries) is kept as
+    /// that is not hard (a 429 or 529 past the agent's own retries) is kept as
     /// one with no reset named. The row is answered even when the store
     /// refuses it: the task waits all the same.
     fn keep_limit(&self, task: &Task, limit: &crate::limit::Limit) -> crate::limit::AccountLimit {
@@ -5597,6 +5597,64 @@ mod tests {
         let text = prompt["text"].as_str().unwrap();
         assert!(text.starts_with("hi"), "{text}");
         assert!(text.ends_with(crate::task::LIMIT_HANDOVER), "{text}");
+    }
+
+    /// An opencode task that fell back to GPT and ran out there is not
+    /// done either: out of credit, it waits `retry_after_no_credit`. opencode
+    /// has no session to go back to, so at its time it starts again from
+    /// its prompt with the handover.
+    #[tokio::test(start_paused = true)]
+    async fn an_opencode_task_out_of_quota_waits_and_starts_again_with_the_handover() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_millis(100);
+        let (h, _events) = spawn_with_settings(&fake, &store, limits_kept(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h
+            .dispatch(new_task_of(&store, "opencode").id)
+            .await
+            .unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        assert_eq!(t.spec.session_id, None, "opencode keeps no session");
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        let seen = Utc::now();
+        fake.set_pane_text(
+            &pane,
+            "  ┃\n  ┃  hi\n  ┃\n\n  ┃\n  ┃  You exceeded your current quota, please check your plan and billing details.\n  ┃\n\n     ▣  Build · GPT-4.1\n\n  ┃\n  ┃\n  ┃  Build · GPT-4.1 OpenAI\n  ╹▀▀▀▀▀▀▀▀\n",
+        );
+        fake.set_status(&pane, AgentStatus::Idle);
+        wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.pane_id, None);
+        let limits = store.limits().unwrap();
+        assert_eq!(limits.len(), 1, "{limits:?}");
+        assert_eq!(limits[0].account, "m/opencode");
+        assert!(limits[0].hard && limits[0].no_credit, "{limits:?}");
+        let wait = crate::config::LimitsConfig::default().retry_after_no_credit_duration();
+        let wait = chrono::Duration::from_std(wait).unwrap();
+        let retry = limits[0].retry_at;
+        assert!(
+            retry >= seen + wait && retry <= Utc::now() + wait,
+            "{retry} is not {wait} after the limit"
+        );
+        assert_eq!(row.waiting_until, Some(retry));
+
+        tokio::time::sleep(settle * 4).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Waiting);
+
+        let t = h.resume(t.id).await.unwrap();
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(t.waiting_until, None);
+        let start = calls(&fake, "agent.start").pop().unwrap();
+        assert_eq!(start["kind"], "opencode");
+        let prompt = calls(&fake, "agent.prompt").pop().unwrap();
+        let prompt = prompt["text"].as_str().unwrap();
+        assert!(prompt.starts_with("hi"), "{prompt}");
+        assert!(prompt.ends_with(crate::task::LIMIT_HANDOVER), "{prompt}");
     }
 
     /// A task with a fallback list whose agent stops on a limit that resets

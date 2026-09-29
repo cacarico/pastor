@@ -3,26 +3,32 @@
 //! with `#!` header lines naming the right answer:
 //!
 //! ```text
-//! #! kind: claude         the agent's kind
+//! #! kind: claude         the agent's kind: claude or opencode
 //! #! source: real|spec|made
 //! #! now: <rfc 3339>      when the pane is read
 //! #! limit: hard|short|none
+//! #! no_credit: yes|no    optional, no when left out
 //! #! model_scoped: yes|no
 //! #! until: none | <rfc 3339> | local [<weekday> | <date>] <HH:MM>
 //! ```
 //!
-//! and the pane follows; a screen with no limit leaves the last two out.
+//! and the pane follows; a screen with no limit leaves the last three out.
 //! `until: local ...` is for a message that names no time zone, which is
 //! read in the zone of the machine the test runs on: the next such time of
 //! day, the next such weekday, or that day.
 //!
-//! `source` says where the message comes from. `real`: Claude Code 2.1.281
-//! wrote it in a transcript when the account reached its limit, and only the
-//! time zone's name was changed; for agy, agy's own log held it from a
-//! print-mode run at its quota, word for word. `spec`: from the list in the spec, written
-//! from memory of the tool. `made`: written for the test. The pane around
-//! the message is laid out like the fixtures of `tests/panes.rs` in every
-//! case; none is a captured screen.
+//! `source` says where the message comes from. `real`, for Claude: Claude
+//! Code 2.1.281 wrote it in a transcript when the account reached its
+//! limit, and only the time zone's name was changed; the pane around it is
+//! laid out like the fixtures of `tests/panes.rs`, not captured. `real`, for
+//! agy: agy's own log held it from a print-mode run at its quota, word for
+//! word; the pane around it is laid out the same way. `real`, for
+//! opencode: the whole screen is captured from opencode 1.18.32 in a
+//! 100-column terminal, run against a local stand-in for the provider that
+//! answered with the provider's documented error body; only the path in its
+//! footer was changed. `spec`: the message is from the list in the spec,
+//! written from memory of the tool (for opencode, drawn on a captured
+//! layout). `made`: written for the test.
 //!
 //! `tests/panes.rs` checks that these files are scrubbed too.
 
@@ -50,6 +56,7 @@ struct Fixture {
     now: DateTime<Utc>,
     /// `Some(hard)`.
     limit: Option<bool>,
+    no_credit: bool,
     model_scoped: bool,
     until: Until,
     pane: String,
@@ -104,6 +111,9 @@ fn load(name: &str) -> Fixture {
             "{name}: {key} given twice"
         );
     }
+    let no_credit = header
+        .remove("no_credit")
+        .is_some_and(|v| yes_no(name, "no_credit", v));
     let mut take = |key: &str| {
         header
             .remove(key)
@@ -126,6 +136,7 @@ fn load(name: &str) -> Fixture {
             .parse()
             .unwrap_or_else(|e| panic!("{name}: now: {e}")),
         limit,
+        no_credit,
         model_scoped: limit.is_some() && yes_no(name, "model_scoped", take("model_scoped")),
         until: match limit {
             Some(_) => until(name, take("until")),
@@ -146,6 +157,11 @@ fn check(name: &str) {
     };
     let limit = limit.unwrap_or_else(|| panic!("{name}: no limit read"));
     assert_eq!(limit.hard, hard, "{name}: hard, from {:?}", limit.line);
+    assert_eq!(
+        limit.no_credit, f.no_credit,
+        "{name}: no_credit, from {:?}",
+        limit.line
+    );
     assert_eq!(
         limit.model_scoped, f.model_scoped,
         "{name}: model_scoped, from {:?}",
@@ -231,6 +247,15 @@ limits! {
     no_agy_limit_above_the_last_prompt: "no-limit-agy-above-the-last-prompt.txt",
     no_agy_limit_before_the_last_message: "no-limit-agy-before-the-last-message.txt",
     no_agy_limit_in_a_grep_of_the_parser: "no-limit-agy-grep-of-the-parser.txt",
+    opencode_openai_quota: "opencode-openai-quota.txt",
+    opencode_openai_rate_limit: "opencode-openai-rate-limit.txt",
+    opencode_anthropic_rate_limit: "opencode-anthropic-rate-limit.txt",
+    opencode_anthropic_overloaded: "opencode-anthropic-overloaded.txt",
+    opencode_anthropic_json: "opencode-anthropic-json.txt",
+    opencode_chatgpt_usage_limit: "opencode-chatgpt-usage-limit.txt",
+    no_limit_above_opencodes_last_prompt: "no-limit-opencode-above-the-last-prompt.txt",
+    no_limit_in_opencode_tool_output: "no-limit-opencode-tool-output.txt",
+    no_limit_while_opencode_retries: "no-limit-opencode-retrying.txt",
 }
 
 #[test]
@@ -245,13 +270,17 @@ fn every_fixture_has_a_test() {
     assert_eq!(on_disk, listed, "tests/fixtures/limits and limits! differ");
 }
 
-/// Every fixture is a Claude or an agy screen, and the same screen under
-/// another kind reads as no limit: each kind reads only its own messages.
+/// A screen of one kind read as another reads as no limit: each kind's
+/// messages are read only where that kind draws them, and a kind whose
+/// messages are not known reads none.
 #[test]
 fn another_kind_reads_no_limit() {
     for name in FILES {
         let f = load(name);
-        assert!(["claude", "agy"].contains(&f.kind.as_str()), "{name}");
+        assert!(
+            ["claude", "agy", "opencode"].contains(&f.kind.as_str()),
+            "{name}"
+        );
         for kind in ["claude", "agy", "opencode", "codex", "claude-personal"] {
             if kind == f.kind {
                 continue;

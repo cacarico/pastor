@@ -2,6 +2,7 @@
 #! source: spec
 #! now: 2026-09-29T12:00:00Z
 #! limit: hard
+#! no_credit: yes
 #! model_scoped: no
 #! until: none
 > Read AGENTS.md, then fix the flaky transport test.

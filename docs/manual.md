@@ -1477,15 +1477,30 @@ limit further up, a quoted one, or tool output that shows one (a grep of
 pastor's own source) is no limit. A task its agent ended with `pastor task
 done` is never limited.
 
-pastor reads limits for two kinds of agent, Claude and agy (the
-Antigravity CLI); another kind that runs out reads as done. agy draws no
-marker before its messages, so for agy the end of its turn is its last
+pastor reads limits for three kinds of agent, Claude, agy (the
+Antigravity CLI) and opencode; another kind that runs out reads as done.
+agy draws no marker before its messages, so for agy the end of its turn is its last
 paragraph after the last prompt, above its input box. It counts when it
 starts with agy's API error, `RESOURCE_EXHAUSTED (code 429): Individual
 quota reached. ... Resets in 4h21m30s.`: a message that says the quota is
 reached is a usage limit, with its reset read from `Resets in`, and any
 other `RESOURCE_EXHAUSTED` or 429 is a short one, retried in the pane as
 Claude's 429 is. The quota counts for the whole account, not one model.
+
+opencode shows its provider's error once its own retries are over, as a
+block right above the `▣  Build · <model>` line that closes the turn, and
+pastor reads that block only, from its first line, and only when nothing
+but the input box is under the turn. The block's first line decides:
+
+| opencode shows | limit |
+|---|---|
+| `You exceeded your current quota` (OpenAI's `insufficient_quota`), `Quota exceeded` | no credit: waits `retry_after_no_credit` |
+| `The usage limit has been reached` (a ChatGPT sign-in), `You've hit your usage limit` | usage limit, with the reset it names, if any |
+| `Rate limit reached for ... Please try again in 20s` (OpenAI) | short, reset in 20 seconds |
+| `This request would exceed the rate limit ...`, `Overloaded` (Anthropic's 429 and 529), or their `rate_limit_error` or `overloaded_error` JSON | short |
+
+A tool call's output is a block too, but it starts with the call (`$ grep
+...`), so it is no limit, and neither is an error above a later prompt.
 
 The limit goes in the table as above, with `agent.exhausted` and
 `task.limited`, and the task goes `waiting`:
@@ -1531,7 +1546,8 @@ agent it stopped on a usage limit that has reset. A task with no session to
 resume (an agy task, or one whose agent died at the start of a new one, so
 its prompt never reached it) starts again in the same checkout with its prompt and a
 paragraph saying that an earlier start stopped on a limit and may have left
-work there. If the limit still holds, the agent stops on it again and the
+work there. An opencode task keeps no session, so it always starts again
+this way. If the limit still holds, the agent stops on it again and the
 task waits again.
 
 #### A limited task moves to its next model
