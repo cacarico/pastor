@@ -208,7 +208,7 @@ fn reply_wait_ms(config: &PastorConfig) -> std::sync::atomic::AtomicU64 {
 /// actor's queue, and `Store::claim_task` keeps a dispatch from happening
 /// twice.
 #[derive(Debug, thiserror::Error)]
-#[error("machine {machine} did not answer within {}s", after.as_secs())]
+#[error("machine {machine} did not answer within {after:?}")]
 pub struct NoReply {
     pub machine: String,
     pub after: Duration,
@@ -2062,10 +2062,7 @@ impl Fleet {
             let Ok(handle) = self.pull_handle(name) else {
                 continue;
             };
-            let why = format!(
-                "pull machine {name} has not claimed or reported for {}s",
-                after.as_secs()
-            );
+            let why = format!("pull machine {name} has not claimed or reported for {after:?}");
             {
                 let mut s = handle.status.write().unwrap();
                 s.channel = crate::machine::ChannelState::Reconnecting;
@@ -10318,6 +10315,10 @@ mod tests {
         let started = Instant::now();
         let err = fleet.bounded("a", stuck.read(1, 10)).await.unwrap_err();
         assert!(err.downcast_ref::<NoReply>().is_some(), "{err:#}");
+        assert!(
+            err.to_string().ends_with("within 200ms"),
+            "a subsecond bound keeps its unit: {err:#}"
+        );
         assert!(started.elapsed() >= wait);
 
         let t = queue_on(&store, "stuck", None);
