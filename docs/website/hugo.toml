@@ -2,9 +2,9 @@
 # like a small TUI. docs/manual.md is mounted as the last docs page, so the
 # full reference stays one file in the repo, not a copy.
 #
-# For now it is served at https://cacari.co/pastor/: the blog repo copies a
-# build into its static/pastor/ with scripts/sync-pastor-site.sh. Relative
-# URLs keep it working under that subpath.
+# It is served at https://cacari.co/pastor/: the blog repo copies a build
+# into its static/pastor/ with scripts/sync-pastor-site.sh. Relative URLs keep
+# it working under that subpath.
 
 baseURL = "/"
 relativeURLs = true
@@ -42,6 +42,12 @@ target = "content/docs/manual.md"
 [[module.mounts]]
 source = "static"
 target = "static"
+
+# The install script is served from the site, so the install command points
+# here; it is the repo's own install.sh, not a copy that could drift.
+[[module.mounts]]
+source = "../../install.sh"
+target = "static/install.sh"
 
 # The homepage's terminal transcript.
 [[module.mounts]]

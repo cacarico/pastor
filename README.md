@@ -69,7 +69,7 @@ someone else's cloud. The longer story is in [the blog post](https://cacari.co/p
 One line, no Rust toolchain and no sudo:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/cacarico/pastor/main/install.sh | sh
+curl -fsSL https://cacari.co/pastor/install.sh | sh
 ```
 
 It downloads the release for your OS and CPU, checks it against the
