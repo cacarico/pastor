@@ -72,6 +72,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 mutants = "0.0.4"
 proptest = "1.11.0"
 tempfile = "3.27.0"
+# `start_paused` and a clock the machine actor tests can move: test builds only.
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 # The daemon mostly waits on sockets, so build time is cheap to spend on a
 # smaller binary: a Pi downloads and stores it, and nobody debugs a release

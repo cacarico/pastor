@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
+// tokio's clock, so a test that pauses it moves `ready_after` and the trust
+// redraw along with the actor's own timers.
+use tokio::time::Instant;
 
 use super::{AgentInfo, AgentStatus, BoxRead, BoxWrite, Connection, Event, Request};
 

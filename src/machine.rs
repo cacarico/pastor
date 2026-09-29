@@ -2,12 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+// tokio's clock, not std's: it is the one the timers here run on, and the one
+// a test can pause, so a settle window and the tick that checks it agree.
+use tokio::time::Instant;
 
 use crate::MIN_HERDR_PROTOCOL;
 use crate::dispatch::dispatch;
@@ -1492,7 +1495,7 @@ impl Actor {
                                     Err(err) => {
                                         retry_delay = (retry_delay * 2).min(self.settings.max_backoff);
                                         tracing::debug!(machine = %self.name, %err, next_in = ?retry_delay, "could not prepare the subscribe request");
-                                        retry.as_mut().reset(tokio::time::Instant::now() + retry_delay);
+                                        retry.as_mut().reset(Instant::now() + retry_delay);
                                     }
                                 }
                             }
@@ -1541,7 +1544,7 @@ impl Actor {
                         Err(err) => {
                             retry_delay = (retry_delay * 2).min(self.settings.max_backoff);
                             tracing::debug!(machine = %self.name, %err, next_in = ?retry_delay, "could not prepare the subscribe request");
-                            retry.as_mut().reset(tokio::time::Instant::now() + retry_delay);
+                            retry.as_mut().reset(Instant::now() + retry_delay);
                         }
                     }
                 }
@@ -1552,7 +1555,7 @@ impl Actor {
                         Err(err) => {
                             retry_delay = (retry_delay * 2).min(self.settings.max_backoff);
                             tracing::debug!(machine = %self.name, %err, next_in = ?retry_delay, "subscribe still failing");
-                            retry.as_mut().reset(tokio::time::Instant::now() + retry_delay);
+                            retry.as_mut().reset(Instant::now() + retry_delay);
                         }
                     }
                 }
@@ -3649,11 +3652,8 @@ mod tests {
         }
     }
 
-    /// `settings()` with a wider settle window, for the couple of tests that sleep
-    /// for a short, fixed time and assert the settle window has *not* fired yet: a
-    /// 30ms sleep against a 100ms window is close enough to flake under load. 500ms
-    /// gives a comfortable margin without slowing the rest of the suite, which
-    /// doesn't wait out `settle` at all.
+    /// `settings()` with another settle window, for the tests that wait out a
+    /// part of the window and assert it has *not* fired yet.
     fn settings_with_settle(settle: Duration) -> MachineSettings {
         MachineSettings {
             settle,
@@ -3697,6 +3697,14 @@ mod tests {
             .unwrap()
     }
 
+    /// Polls on tokio's clock. The tests here start with it paused
+    /// (`start_paused`), so a sleep costs no wall time: the clock jumps to the
+    /// next timer once every task is waiting, and each timer of the actor
+    /// fires in order on the way. A sleep followed by "nothing happened" has
+    /// therefore let the actor do all it would in that time, on any runner.
+    /// What the actor measures in calendar time (a task's timeout, the
+    /// auto-close grace) does not move with it: see `start_an_hour_ago` and
+    /// `finished_an_hour_ago`.
     async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !f() {
@@ -3781,7 +3789,7 @@ mod tests {
     /// A flock reload stops a removed or replaced machine's actor. Afterwards
     /// the actor asks herdr nothing, the handle refuses new work, and the task
     /// it was tracking is left exactly as it was: agents are herdr's.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_stops_the_actor_and_leaves_tasks_alone() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -3983,7 +3991,7 @@ mod tests {
         assert_eq!(calls.get(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dispatch_then_events_drive_state() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4047,12 +4055,47 @@ mod tests {
         let _ = h.read(t.id, 10).await.unwrap_err();
     }
 
+    /// The tests here pause tokio's clock, so the actor has to measure the
+    /// settle window on that clock and not the wall's: else a test that waits
+    /// out `settle` and asserts nothing happened would pass with no window
+    /// ever over. Ten seconds of settle go by in no wall time at all.
+    #[tokio::test(start_paused = true)]
+    async fn the_settle_window_runs_on_the_paused_clock() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let settle = Duration::from_secs(10);
+        let (h, _events) = spawn_with_settings(&fake, &store, settings_with_settle(settle));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = new_task(&store);
+        let t = h.dispatch(t.id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+
+        fake.set_status(&pane, AgentStatus::Idle);
+        tokio::time::sleep(settle / 2).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Running,
+            "half a window is not settled"
+        );
+        tokio::time::sleep(settle).await;
+        assert_eq!(
+            state_of(&store, t.id),
+            TaskState::Done,
+            "settled once the window is over on tokio's clock"
+        );
+    }
+
     /// An agent that ends its turn on a question goes idle just like one that
     /// finished: pastor reads the pane and marks the task blocked, with the
     /// question as its error, and keeps it there until the agent moves. The
     /// same agent answered, working and idle again with a plain report, is
     /// done.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_turn_that_ends_on_a_question_is_blocked_not_done() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4113,7 +4156,7 @@ mod tests {
     /// turn up again when the shell ends. herdr reads it idle all the while,
     /// but the task is not done: it stays running through settle windows
     /// until the shell has ended and the agent went idle again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_agent_waiting_on_a_background_shell_is_not_done() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4150,7 +4193,7 @@ mod tests {
 
     /// The pane text read to settle a task as done is kept as its tail, for
     /// its connector's finish command (`Store::take_pane_tail`).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_done_task_leaves_the_end_of_its_pane_for_the_finish_command() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4177,7 +4220,7 @@ mod tests {
     /// A pane read that never answers is an outage, not an empty pane: the
     /// task must not be settled `done` on it. The actor reconnects, the task
     /// stays pending, and the next settle check reads the question.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_pane_read_that_hangs_does_not_settle_a_question_as_done() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4207,7 +4250,7 @@ mod tests {
     /// prompt pending. Flipping the task to `running` on its own would leave
     /// the agent with nothing to do, so the prompt has to be sent once a
     /// human clears the block.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_blocked_agent_is_not_prompted_at_dispatch_but_is_once_it_clears() {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_millis(150));
@@ -4274,7 +4317,7 @@ mod tests {
     /// through the blocked-while-launching path deterministically, instead
     /// of racing to see whether the launching window happens to have closed
     /// by the time dispatch polls again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_agent_blocked_at_launch_gets_its_prompt_once_answered() {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_secs(2));
@@ -4344,7 +4387,7 @@ mod tests {
     /// A startup block cleared past the old deadline gets a fresh timeout
     /// too: `deliver_pending_prompt` takes the same branch `apply` does for
     /// a later block, not the time spent waiting for a person at launch.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_startup_block_cleared_past_its_timeout_gets_fresh_time() {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_secs(2));
@@ -4381,7 +4424,7 @@ mod tests {
 
     /// A store error in reconcile is pastor's problem, not the machine's: the
     /// channel stays connected and no `machine.lost` goes out.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_local_error_in_reconcile_is_not_an_outage() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4397,7 +4440,7 @@ mod tests {
         ));
         // Several reconcile ticks (200ms each) run into the corrupt row.
         let deadline = Instant::now() + Duration::from_millis(800);
-        while let Ok(ev) = tokio::time::timeout_at(deadline.into(), events.recv()).await {
+        while let Ok(ev) = tokio::time::timeout_at(deadline, events.recv()).await {
             assert_ne!(ev.unwrap().kind, "machine.lost");
         }
         assert_eq!(h.snapshot().channel, ChannelState::Connected);
@@ -4406,7 +4449,7 @@ mod tests {
     /// Recovering from `Blocked` must not carry the startup advice onto a task
     /// that is running again, and a `Done` task that goes back to work must not
     /// keep the finish time of the cycle it just left.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn state_changes_clear_the_previous_state_s_metadata() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4457,7 +4500,7 @@ mod tests {
 
     /// The pane of a finished task closing later is not when its work
     /// finished: `done -> closed` keeps `finished_at`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn closing_a_done_task_keeps_its_finish_time() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4481,7 +4524,7 @@ mod tests {
     /// A pane adopted by a reconcile while connected is not in the event
     /// subscription that is already open; the actor must resubscribe so its
     /// status changes arrive as events, not only at the next reconcile.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_pane_adopted_while_connected_is_subscribed() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4521,7 +4564,7 @@ mod tests {
     /// resubscribe gets that subscription refused with herdr's
     /// `pane_not_found`, an API error: the machine answers, so it polls and
     /// subscribes again instead of announcing `machine.lost`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_pane_gone_before_the_resubscribe_is_not_an_outage() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4611,7 +4654,7 @@ mod tests {
     /// An agent named like a task that no open task owns is an orphan: its
     /// row failed, closed or is gone. It holds a pane, so it counts in `live`,
     /// and it is named in the status; nothing closes it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reconcile_reports_orphaned_agents() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4657,7 +4700,7 @@ mod tests {
 
     /// The case orphans exist for: dispatch failed after `agent.start`, so the
     /// task is failed while its agent is still in its pane.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_dispatch_that_fails_after_agent_start_leaves_an_orphan() {
         let fake = FakeHerdr::new();
         fake.exit_agents_listed(true);
@@ -4732,7 +4775,7 @@ mod tests {
     /// git's "fatal: '<path>' already exists", because the failed task's
     /// checkout is still on disk. The retry works on in that checkout, on the
     /// same branch, instead of creating it again; a retry of the retry too.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_retry_reopens_the_worktree_of_the_task_it_retries() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4779,7 +4822,7 @@ mod tests {
     /// task already has the branch the job names. That checkout is not the
     /// failed task's, so its retry must not reopen it: it gets a branch and a
     /// worktree of its own.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_retry_never_reopens_a_checkout_its_task_did_not_make() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4810,7 +4853,7 @@ mod tests {
     /// A failed task whose agent is still listed may be at work in its
     /// checkout, and one whose checkout is now somewhere else is not the one
     /// it made. Neither is reopened: the retry gets a new branch and worktree.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_retry_reopens_only_a_checkout_whose_agent_is_gone_at_the_same_path() {
         for moved in [false, true] {
             let fake = FakeHerdr::new();
@@ -4840,7 +4883,7 @@ mod tests {
     /// so the second must not reopen it too: any agent listed in the
     /// checkout's workspace keeps it, and the second gets a new branch and
     /// worktree.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_second_retry_of_one_task_never_reopens_a_checkout_in_use() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -4869,7 +4912,7 @@ mod tests {
     /// own (its pane stays after the agent exits) or one someone opened
     /// since. That workspace is not the retry's, and its root pane is not
     /// pastor's to close; only the root of a workspace herdr just made goes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_retry_never_closes_a_pane_of_a_workspace_already_open() {
         for place in [Place::Own, Place::Pastor] {
             let fake = FakeHerdr::new();
@@ -4916,7 +4959,7 @@ mod tests {
     /// pane in it, so the checkout stays with a note to remove it by hand,
     /// for `--remove-worktree` and auto-close alike; only the retry's own
     /// pane goes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_worktree_whose_workspace_was_already_open_is_never_removed() {
         for (place, auto) in [
             (Place::Own, false),
@@ -4957,7 +5000,7 @@ mod tests {
 
             if auto {
                 fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
-                wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+                auto_closed(&store, t.id).await;
             } else {
                 let closed = h.close(t.id, true).await.unwrap();
                 assert_eq!(closed.state, TaskState::Closed, "{what}");
@@ -4977,7 +5020,7 @@ mod tests {
     /// a pane of the shared workspace. A retry must not reopen a checkout
     /// someone works in: it looks for agents by the checkout's path, as
     /// removing it does, and gets a new branch and worktree instead.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_retry_never_reopens_a_checkout_another_agent_works_in() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5007,7 +5050,7 @@ mod tests {
     }
 
     /// A retry whose old checkout was removed meanwhile gets a new one.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_retry_creates_the_worktree_when_the_old_one_is_gone() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5036,7 +5079,7 @@ mod tests {
     /// A stale task may still have its agent at work in its checkout, so its
     /// retry never reopens it, even on a branch the job names: it gets a
     /// branch and a worktree of its own.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_retry_of_a_stale_task_gets_its_own_worktree() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5062,7 +5105,7 @@ mod tests {
         assert_eq!(created[1]["branch"], format!("pastor/t-{}", retry.id));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_closes_the_pane_then_the_row() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5095,7 +5138,7 @@ mod tests {
         assert_eq!(calls(&fake, "pane.close").len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_with_remove_worktree_removes_it_and_a_dirty_one_is_refused() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5157,7 +5200,7 @@ mod tests {
 
     /// A task placed as a pane in a workspace it did not make: closing it
     /// closes its pane and nothing else, whatever the place.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_leaves_a_workspace_the_task_did_not_make() {
         for (place, worktree) in [
             (Place::Repo, false),
@@ -5191,7 +5234,7 @@ mod tests {
     /// that task's workspace. Removing the worktree would end the fix
     /// round: auto-close keeps it with a note, `--remove-worktree` refuses,
     /// and either way only the first task's pane closes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_worktree_another_agent_works_in_stays() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5216,7 +5259,7 @@ mod tests {
         );
 
         fake.set_status(first.pane_id.as_deref().unwrap(), AgentStatus::Idle);
-        wait_for("closed", || state_of(&store, first.id) == TaskState::Closed).await;
+        auto_closed(&store, first.id).await;
         assert!(calls(&fake, "worktree.remove").is_empty());
         assert_eq!(fake.panes(&ws), vec![fix.pane_id.clone().unwrap()]);
         let row = store.get_task(first.id).unwrap().unwrap();
@@ -5230,7 +5273,7 @@ mod tests {
     /// A worktree task in a shared workspace has no workspace on its
     /// checkout: `--remove-worktree` closes its pane, has herdr open the
     /// checkout and removes that, never the shared workspace.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn remove_worktree_of_a_task_in_a_shared_workspace() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5268,7 +5311,7 @@ mod tests {
     /// removing it would take the other agent. `--remove-worktree` refuses,
     /// auto-close keeps the checkout with a note, and the other workspace
     /// keeps every pane it had.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_shared_task_worktree_another_agent_has_open_stays() {
         for auto in [false, true] {
             let fake = FakeHerdr::new();
@@ -5304,7 +5347,7 @@ mod tests {
 
             if auto {
                 fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
-                wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+                auto_closed(&store, t.id).await;
                 let row = store.get_task(t.id).unwrap().unwrap();
                 assert!(
                     row.error.as_deref().unwrap().contains("mine works in it"),
@@ -5335,7 +5378,7 @@ mod tests {
     /// open it, so the checkout stays with a note to remove it by hand, for
     /// `--remove-worktree` and auto-close alike, and the workspace keeps every
     /// pane it had.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_shared_task_worktree_already_open_elsewhere_is_never_removed() {
         for auto in [false, true] {
             let fake = FakeHerdr::new();
@@ -5368,7 +5411,7 @@ mod tests {
 
             if auto {
                 fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
-                wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+                auto_closed(&store, t.id).await;
             } else {
                 let closed = h.close(t.id, true).await.unwrap();
                 assert_eq!(closed.state, TaskState::Closed);
@@ -5398,7 +5441,7 @@ mod tests {
     /// with the worktree is itself shared or has its own workspace, the
     /// checkout stays: `--remove-worktree` refuses and names the other
     /// agent, auto-close keeps it with a note, and nothing is opened on it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_worktree_another_agent_works_in_from_a_shared_workspace_stays() {
         for (place, auto) in [
             (Place::Pastor, false),
@@ -5436,7 +5479,7 @@ mod tests {
 
             if auto {
                 fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
-                wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+                auto_closed(&store, t.id).await;
                 let row = store.get_task(t.id).unwrap().unwrap();
                 assert!(
                     row.error
@@ -5473,7 +5516,7 @@ mod tests {
     /// workspace of the checkout lists it. Its failed row still names it, so
     /// `--remove-worktree` refuses and names it, whatever the place of the
     /// task with the worktree.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_task_s_agent_still_in_the_checkout_keeps_it() {
         for place in [Place::Pastor, Place::Own] {
             let fake = FakeHerdr::new();
@@ -5504,7 +5547,7 @@ mod tests {
 
     /// A dirty checkout is refused as for any worktree task, and the
     /// workspace herdr opened to reach it goes again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn remove_worktree_in_a_shared_workspace_refuses_a_dirty_checkout() {
         let fake = FakeHerdr::new();
         fake.dirty_worktrees(true);
@@ -5526,7 +5569,7 @@ mod tests {
 
     /// Auto-close removes a clean checkout of a task in `pastor` as it does
     /// for any worktree task, and leaves the `pastor` workspace.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_removes_the_worktree_of_a_task_in_a_shared_workspace() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5537,7 +5580,7 @@ mod tests {
         .await;
         let t = run_to_done(&h, &fake, &store, placed_task(&store, Place::Pastor, true)).await;
         let pastor = t.workspace_id.clone().unwrap();
-        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        auto_closed(&store, t.id).await;
         assert!(fake.worktree_list("/r").await.unwrap().is_empty());
         assert_eq!(fake.workspaces(), vec![pastor.clone()]);
         assert_eq!(fake.panes(&pastor), vec![format!("{pastor}:p1")]);
@@ -5546,7 +5589,7 @@ mod tests {
         assert!(row.error.is_none(), "{:?}", row.error);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn remove_worktree_on_a_plain_workspace_is_refused_up_front() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5560,7 +5603,7 @@ mod tests {
 
     /// `task close` is how an orphan goes: a failed row whose agent is still
     /// alive, or an agent with no row at all.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_takes_orphans_by_agent_name() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5595,7 +5638,7 @@ mod tests {
     /// `task close` has the same guard: a failed task whose recorded pane now
     /// holds another agent closes its row and leaves that pane and its
     /// workspace alone.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_leaves_a_pane_reused_by_another_agent() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5624,7 +5667,7 @@ mod tests {
     /// and leaves them open with no agent in them. Close must use those ids:
     /// looking for an agent by name finds nothing and would leak the pane,
     /// and refuse `--remove-worktree`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_uses_the_recorded_pane_of_a_failed_task_with_no_agent() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5668,7 +5711,7 @@ mod tests {
     /// through pastor's own close: `--remove-worktree` must use that
     /// recorded id rather than fall back to a name lookup that finds
     /// nothing and leaves the checkout behind.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_remove_worktree_uses_the_recorded_workspace_of_a_closed_row() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5698,7 +5741,7 @@ mod tests {
     /// the row (the pane is gone with the workspace), and reports the same
     /// manual-cleanup note the no-target path gives instead of failing with
     /// `close_failed`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_remove_worktree_handles_a_recorded_workspace_herdr_has_lost() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5730,7 +5773,7 @@ mod tests {
     /// workspace and prune will not take it. `--remove-worktree` afterwards
     /// finds the workspace gone, gives the manual-cleanup note and clears
     /// the workspace; running it again has nothing left to do.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_keeps_the_workspace_until_the_worktree_is_dealt_with() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5755,7 +5798,7 @@ mod tests {
         assert_eq!(calls(&fake, "worktree.remove").len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn close_without_herdr_work() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5795,7 +5838,7 @@ mod tests {
         out
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_types_text_then_enter_then_keys_into_the_task_pane() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5883,7 +5926,7 @@ mod tests {
     /// The folder-trust dialog answered by hand: `--trust` sends the agent's
     /// trust keys, the agent goes on to get its prompt, and the repo is saved
     /// as trusted on this machine.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_trust_answers_the_prompt_and_saves_the_repo() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
@@ -5934,7 +5977,7 @@ mod tests {
 
     /// `--trust` on an agent that redraws after its dialog: the prompt waits
     /// out the settle window, so it reaches the agent, and goes in once.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_trust_delivers_the_prompt_once_after_the_agent_redraws() {
         let (fake, settings) = redrawing_after_trust();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5958,7 +6001,7 @@ mod tests {
 
     /// The same when a person answers the dialog at the pane: pastor sees
     /// only the agent leave `blocked`, and still waits out the redraw.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_trust_prompt_answered_at_the_pane_gets_the_prompt_after_the_redraw() {
         let (fake, settings) = redrawing_after_trust();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -5982,7 +6025,7 @@ mod tests {
     /// An agent that sits at an empty input after its prompt went in (herdr
     /// accepted it, the agent lost it) gets the prompt again once it has
     /// sat idle a settle window at the sequence the prompt went in at.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_prompt_the_agent_did_not_take_is_sent_again() {
         let fake = FakeHerdr::new();
         fake.ignore_prompts(true);
@@ -6001,7 +6044,7 @@ mod tests {
 
     /// A resumed task's prompt is watched the same way: an agent that lost
     /// `RESUME_PROMPT` gets it again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_resume_prompt_the_agent_did_not_take_is_sent_again() {
         let fake = FakeHerdr::new();
         fake.ignore_prompts(true);
@@ -6023,7 +6066,7 @@ mod tests {
 
     /// An agent that never takes its prompt is not left `running` with
     /// nothing pending: after the resends it is `blocked`, saying so.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_agent_that_never_takes_its_prompt_ends_blocked() {
         let fake = FakeHerdr::new();
         fake.ignore_prompts(true);
@@ -6053,7 +6096,7 @@ mod tests {
 
     /// The same for an agent that took its trust answer: a prompt lost
     /// anyway (a redraw longer than `settle`) is sent again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_prompt_lost_after_a_trust_answer_is_sent_again() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
@@ -6076,7 +6119,7 @@ mod tests {
     }
 
     /// The same for the actor's own answer to a trusted repo's dialog.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_trust_delivers_the_prompt_once_after_the_agent_redraws() {
         let (fake, settings) = redrawing_after_trust();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6096,7 +6139,7 @@ mod tests {
     /// `--trust` answers only the startup prompt: a task that is starting,
     /// running, or blocked on something else is refused, and nothing is
     /// sent, saved or claimed, so saved trust can still answer it later.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_trust_refuses_a_task_not_at_its_startup_prompt() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6133,7 +6176,7 @@ mod tests {
         assert!(input_events(&mut events).is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_trust_needs_trust_keys_and_saves_nothing_without_a_repo() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
@@ -6172,7 +6215,7 @@ mod tests {
 
     /// A worktree task of a trusted repo blocks on the trust prompt of its
     /// new folder; the actor answers it once and the task runs.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_task_of_a_trusted_repo_is_answered_once_and_runs() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
@@ -6197,7 +6240,7 @@ mod tests {
 
     /// A trust send that fails (here it times out) is not a send: a later
     /// reconcile tries again, and the task runs once one gets through.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_trust_send_is_tried_again() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
@@ -6233,7 +6276,7 @@ mod tests {
     /// trusted repo blocked on some other dialog, one the same keys would
     /// accept (Claude's bypass-permissions warning opens on "No, exit" too),
     /// is left blocked for a human.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn saved_trust_leaves_a_dialog_that_is_not_the_trust_prompt_alone() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
@@ -6255,7 +6298,7 @@ mod tests {
 
     /// The pane read is scrollback: a trust prompt still in it above another
     /// dialog is not the prompt on screen, and gets no keys.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn saved_trust_ignores_a_trust_prompt_left_in_scrollback() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
@@ -6275,7 +6318,7 @@ mod tests {
         assert!(!store.trust_sent(t.id).unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_task_of_an_untrusted_repo_stays_blocked() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Down".into(), "Enter".into()]));
@@ -6292,7 +6335,7 @@ mod tests {
 
     /// Keys that do not answer the prompt leave the task blocked for a
     /// human; the actor does not try again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_task_still_blocked_after_the_trust_keys_is_left_to_a_human() {
         let fake = FakeHerdr::new();
         fake.set_trust_prompt(Some(vec!["Enter".into()]));
@@ -6312,7 +6355,7 @@ mod tests {
         drop(h2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_refuses_a_task_that_is_not_live() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6342,7 +6385,7 @@ mod tests {
     /// the input goes into its still-open pane and the task runs again. The
     /// baseline stays at the idle it was done at, so only the agent's next
     /// turn marks it done again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_to_a_done_task_types_into_its_pane_and_runs_it_again() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6394,7 +6437,7 @@ mod tests {
     }
 
     /// A done row with no pane has nothing to type into.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_refuses_a_done_task_with_no_pane() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6438,6 +6481,29 @@ mod tests {
         store.get_task(t.id).unwrap().unwrap()
     }
 
+    /// Moves a task's finish an hour back, well past `close_done_after`,
+    /// retrying when the actor wrote the row in between. The grace is calendar
+    /// time, which a paused clock does not move, so no test can wait it out.
+    fn finished_an_hour_ago(store: &Store, id: i64) -> Task {
+        loop {
+            let mut t = store.get_task(id).unwrap().unwrap();
+            t.finished_at = Some(Utc::now() - chrono::Duration::hours(1));
+            match store.update_task(&mut t) {
+                Ok(()) => return t,
+                Err(err) if err.downcast_ref::<crate::store::Conflict>().is_some() => {}
+                Err(err) => panic!("{err:#}"),
+            }
+        }
+    }
+
+    /// Waits for a task to be done, puts its grace behind it and waits for
+    /// auto-close to take it.
+    async fn auto_closed(store: &Store, id: i64) {
+        wait_for("done", || state_of(store, id) == TaskState::Done).await;
+        finished_an_hour_ago(store, id);
+        wait_for("closed", || state_of(store, id) == TaskState::Closed).await;
+    }
+
     fn count(
         events: &mut broadcast::Receiver<PastorEvent>,
         kind: &str,
@@ -6454,7 +6520,7 @@ mod tests {
 
     /// A grace shorter than `reconcile_every` is not stretched to it: auto-close
     /// runs on its own tick, so the task closes long before the next reconcile.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_short_grace_closes_before_the_next_reconcile() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6468,23 +6534,32 @@ mod tests {
         })
         .await;
         let t = run_to_done(&h, &fake, &store, new_task(&store)).await;
-        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        auto_closed(&store, t.id).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_done_task_is_closed_after_close_done_after() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let (h, _events) = spawn_with_settings(&fake, &store, auto_close_settings());
+        // Half an hour of grace: no stall of the test's own can use it up.
+        let settings = MachineSettings {
+            close_done_after: Some(Duration::from_secs(1800)),
+            ..auto_close_settings()
+        };
+        let (h, _events) = spawn_with_settings(&fake, &store, settings);
         wait_for("connected", || {
             h.snapshot().channel == ChannelState::Connected
         })
         .await;
         let t = run_to_done(&h, &fake, &store, new_task(&store)).await;
+        // Some auto-close checks later, the finish is still a moment ago.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(state_of(&store, t.id), TaskState::Done);
         assert!(
             calls(&fake, "pane.close").is_empty(),
             "the pane stays open for the grace period"
         );
+        let t = finished_an_hour_ago(&store, t.id);
         wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
         let closed = store.get_task(t.id).unwrap().unwrap();
         assert!(
@@ -6505,7 +6580,7 @@ mod tests {
     /// is done at once and stays so while the agent works on, and auto-close
     /// frees its pane once the agent is idle, although that turn moved the
     /// sequence past the baseline.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_ended_task_is_closed_once_its_agent_is_idle() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6527,6 +6602,8 @@ mod tests {
         assert_eq!(count(&mut events, "task.done", t.id).len(), 1);
         // Ending again changes nothing and says nothing.
         assert!(h.end(t.id, None).await.unwrap().ended);
+        // Past its grace: only the agent at work keeps the pane.
+        finished_an_hour_ago(&store, t.id);
         let before = lists(&fake);
         wait_for("a few reconciles", || lists(&fake) >= before + 4).await;
         assert_eq!(state_of(&store, t.id), TaskState::Done, "still at work");
@@ -6544,7 +6621,7 @@ mod tests {
 
     /// `task done --summary` ends the round with what the agent said; said
     /// again, it replaces that round's rather than starting another.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_task_ended_with_a_summary_keeps_it_for_its_round() {
         use crate::task::{Outcome, SummarySource};
         let fake = FakeHerdr::new();
@@ -6574,7 +6651,7 @@ mod tests {
     /// A task pastor finds done on its own ends a round with no summary,
     /// holding the pane's last lines; the tail stays for the finish command,
     /// and a summary the agent sends after replaces that round's.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_round_with_no_summary_keeps_the_end_of_the_pane() {
         use crate::task::{Outcome, SummarySource};
         let fake = FakeHerdr::new();
@@ -6625,7 +6702,7 @@ mod tests {
 
     /// With `require`, the agent's own `task done` without a summary is
     /// refused and leaves the task as it was; with one it ends `done`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_required_summary_refuses_the_agents_bare_task_done() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6663,7 +6740,7 @@ mod tests {
 
     /// With `require`, a person's `task done t-N` is not refused; the round
     /// says it was ended by hand.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_required_summary_lets_a_person_end_the_task() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6683,7 +6760,7 @@ mod tests {
     /// With `require`, an agent pastor finds idle and finished without a
     /// summary ends the task `failed`, with the pane's last lines kept;
     /// with `ask` the same finish is `done`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_required_summary_fails_an_idle_finish_without_one() {
         use crate::task::{Outcome, SummarySource};
         let fake = FakeHerdr::new();
@@ -6716,7 +6793,7 @@ mod tests {
 
     /// Typing into an ended task gives it more to do: it runs again, and no
     /// longer counts as ended.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn sending_to_an_ended_task_reopens_it() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6781,7 +6858,7 @@ mod tests {
     }
 
     /// Only a task with a pane on this machine can end.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_task_with_no_pane_cannot_end() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6806,7 +6883,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_emits_task_closed_once() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6826,7 +6903,7 @@ mod tests {
             })
             .unwrap();
         let t = run_to_done(&h, &fake, &store, task).await;
-        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        auto_closed(&store, t.id).await;
         // Two more reconcile passes, and the pane.closed event herdr sends.
         tokio::time::sleep(Duration::from_millis(250)).await;
         let closed = count(&mut events, "task.closed", t.id);
@@ -6836,7 +6913,7 @@ mod tests {
         assert_eq!(calls(&fake, "pane.close").len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn never_disables_auto_close() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6860,7 +6937,7 @@ mod tests {
 
     /// Failed, blocked and stale tasks are left for `task retry` and `task
     /// close`, however long ago they stopped.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn only_done_tasks_are_auto_closed() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6898,7 +6975,7 @@ mod tests {
         assert!(calls(&fake, "worktree.remove").is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_removes_a_clean_worktree() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6908,7 +6985,7 @@ mod tests {
         })
         .await;
         let t = run_to_done(&h, &fake, &store, worktree_task(&store)).await;
-        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        auto_closed(&store, t.id).await;
         assert_eq!(
             calls(&fake, "worktree.remove"),
             vec![
@@ -6919,7 +6996,7 @@ mod tests {
         assert!(store.get_task(t.id).unwrap().unwrap().error.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_keeps_a_dirty_worktree() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6930,7 +7007,7 @@ mod tests {
         .await;
         fake.dirty_worktrees(true);
         let t = run_to_done(&h, &fake, &store, worktree_task(&store)).await;
-        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        auto_closed(&store, t.id).await;
         let removes = calls(&fake, "worktree.remove");
         assert_eq!(
             removes,
@@ -6955,7 +7032,7 @@ mod tests {
     /// A clean checkout with commits on no remote (a push that failed) is
     /// kept like a dirty one: herdr's `worktree.remove` only refuses
     /// uncommitted changes, so pastor asks git first and never calls it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_keeps_a_worktree_with_unpushed_commits() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -6972,7 +7049,7 @@ mod tests {
             .expect("dispatch records the checkout");
         fake.set_unpushed(&checkout.path);
         fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Idle);
-        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        auto_closed(&store, t.id).await;
         assert!(
             calls(&fake, "worktree.remove").is_empty(),
             "the checkout stays"
@@ -7000,7 +7077,7 @@ mod tests {
     /// refusing the call: `code()` is `None`, so it must not be mistaken for
     /// the "keep the worktree, close the pane anyway" path. Nothing closes;
     /// the next reconcile, with a proper reply, closes it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_retries_after_a_malformed_worktree_remove_reply() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7011,6 +7088,7 @@ mod tests {
         .await;
         fake.set_malformed_reply("worktree.remove");
         let t = run_to_done(&h, &fake, &store, worktree_task(&store)).await;
+        finished_an_hour_ago(&store, t.id);
         // First reconcile: the reply fails to decode, so nothing closes. Checked
         // right after that one attempt, before the next reconcile (100ms later)
         // can retry with a proper reply and close it.
@@ -7033,7 +7111,7 @@ mod tests {
 
     /// A done task whose pane the user already closed in herdr ends closed,
     /// with no error, once, and later passes leave it alone.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_tolerates_a_missing_pane() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7062,7 +7140,7 @@ mod tests {
     /// another agent, idle. Auto-close must neither close that pane nor remove
     /// its workspace, since pastor never closes a pane it did not open for the
     /// task. The row is left `Done`, for reconcile to move on.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_skips_a_pane_reused_by_another_agent() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7098,7 +7176,7 @@ mod tests {
     /// has moved past the row's baseline. Closing now would destroy that
     /// unsettled completion; it must skip and leave the row for reconcile's
     /// settle window instead.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_skips_an_agent_whose_sequence_moved() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7137,7 +7215,7 @@ mod tests {
     /// as any agent that ever worked is. That must not read as a moved
     /// sequence: the first pass seeds the baseline from herdr and a later
     /// pass closes the task.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_closes_a_done_row_without_a_baseline() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7212,7 +7290,7 @@ mod tests {
 
     /// Only the fresh `agent.list` saw the agent at work again: auto-close
     /// leaves it, and the next reconcile moves the task back to running.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_skips_an_agent_that_resumed_work() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7236,7 +7314,7 @@ mod tests {
 
     /// The same task closes once its agent is idle again, done again, and
     /// past the grace period from the new finish.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_close_closes_a_resumed_task_once_it_is_done_again() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7254,7 +7332,7 @@ mod tests {
         let done = store.get_task(t.id).unwrap().unwrap();
         assert!(done.finished_at > t.finished_at, "a new finish time");
         assert!(calls(&fake, "pane.close").is_empty(), "a new grace period");
-        wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
+        auto_closed(&store, t.id).await;
         assert_eq!(
             calls(&fake, "pane.close"),
             vec![serde_json::json!({"pane_id": pane})]
@@ -7266,7 +7344,7 @@ mod tests {
     /// Auto-close waits for a connected machine: while polling, reconcile
     /// runs on every poll tick, but a done task is only closed once the
     /// events are back. (A lost machine runs no reconcile at all.)
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_polling_machine_does_not_auto_close() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7313,7 +7391,7 @@ mod tests {
         wait_for("closed", || state_of(&store, t.id) == TaskState::Closed).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn done_is_cancelled_if_agent_resumes_within_settle() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7349,7 +7427,7 @@ mod tests {
     /// The fleet bug of 2026-09-25: herdr 0.9.1 has no `completion_seq`, so a
     /// finished agent only shows as `idle`/`done` with a newer
     /// `state_change_seq`. That alone, after `settle`, must make the task done.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_agent_that_works_then_goes_idle_is_done_after_settle() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7384,7 +7462,7 @@ mod tests {
     /// The agent finished, sat idle, and the human typed `/exit` before the
     /// settle window confirmed it: the process exiting is the end of work
     /// that was done, not a failure.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_idle_agent_that_exits_leaves_its_task_done() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7409,7 +7487,7 @@ mod tests {
 
     /// An agent that exits while working crashed, or was killed: that task
     /// did fail.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_working_agent_that_exits_fails_its_task() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7432,7 +7510,7 @@ mod tests {
     /// that the agent is working on it. Without an event stream nothing else
     /// tells the actor, so the reply itself must: an exit after it is an exit
     /// while working, a failure, not the end of work that was done.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_exit_after_the_pending_prompt_went_in_is_not_an_idle_completion() {
         let fake = FakeHerdr::new();
         fake.set_ready_after(Duration::from_millis(150));
@@ -7496,7 +7574,7 @@ mod tests {
     /// replaced (a daemon restart, a flock or settings reload) before the
     /// agent went idle. What it saw is kept with the task now, so the new
     /// actor settles the idle agent as done.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn work_seen_before_a_restart_still_completes_the_task() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7517,7 +7595,7 @@ mod tests {
 
     /// Only work seen after the prompt counts across a restart, as it does
     /// within one actor: an agent never seen at work stays `running`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_agent_never_seen_at_work_stays_running_after_a_restart() {
         let fake = FakeHerdr::new();
         fake.ignore_prompts(true);
@@ -7535,7 +7613,7 @@ mod tests {
 
     /// herdr's `done` status (idle, not yet looked at) finishes a task the same
     /// way `idle` does.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_agent_reporting_done_is_done_after_settle() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7554,7 +7632,7 @@ mod tests {
     /// mark the task done: it records the sequence `agent.list` shows and starts
     /// a new window from there. A moved sequence restarts the window again; an
     /// unchanged one at the next check is done.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_idle_event_without_a_sequence_waits_a_window_from_the_listed_one() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7615,7 +7693,7 @@ mod tests {
     /// even when the flip back to work was missed on the event stream: the
     /// settle check sees `state_change_seq` moved past the value it recorded
     /// and waits another window.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_then_working_again_unseen_within_settle_does_not_complete() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7656,7 +7734,7 @@ mod tests {
     /// An agent that is idle without ever having worked on the prompt has not
     /// done anything: `state_change_seq` never moved past the value recorded
     /// when the prompt was sent, so no amount of settling makes it done.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_agent_idle_since_its_prompt_never_completes() {
         let fake = FakeHerdr::new();
         fake.ignore_prompts(true);
@@ -7691,7 +7769,7 @@ mod tests {
     /// that flickers `idle -> unknown -> idle` sits idle past its baseline
     /// without having worked. With no `working` or `blocked` seen since the
     /// prompt, no amount of settling makes that done.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_unknown_idle_without_activity_never_completes() {
         let fake = FakeHerdr::new();
         fake.ignore_prompts(true);
@@ -7715,7 +7793,7 @@ mod tests {
 
     /// A working spell only `agent.list` saw (the event was missed) counts as
     /// activity: the later idle completes the task after settle.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn working_seen_only_by_reconcile_counts_as_activity() {
         let fake = FakeHerdr::new();
         fake.ignore_prompts(true);
@@ -7737,7 +7815,7 @@ mod tests {
 
     /// `blocked` after the prompt is activity too: the agent asked a human,
     /// got its answer and finished, so its idle completes the task.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn blocked_then_idle_is_done_after_settle() {
         let fake = FakeHerdr::new();
         fake.ignore_prompts(true);
@@ -7759,7 +7837,7 @@ mod tests {
     /// its agent goes idle while the prompt still cannot be delivered, even
     /// though the agent's `state_change_seq` has moved: the moves were its
     /// launch and its startup question, not our work.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_agent_idle_before_its_prompt_is_delivered_never_completes() {
         let fake = FakeHerdr::new();
         // Still launching for the whole test: every delivery is `agent_not_ready`.
@@ -7797,7 +7875,7 @@ mod tests {
     /// Rows left `running` by earlier builds have no baseline. Their agents
     /// did work (`state_change_seq` is past 0) and sit idle, so after this fix
     /// reconcile finishes them instead of holding their slots forever.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_running_task_without_a_baseline_completes_when_its_agent_is_idle() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7821,7 +7899,7 @@ mod tests {
         wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reconcile_marks_missing_agents_failed() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7844,7 +7922,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reconcile_closes_done_tasks_whose_pane_vanished() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7863,7 +7941,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reconcile_adopts_live_agent_state() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7896,7 +7974,7 @@ mod tests {
     /// must not *depend* on that; a crash between `agent.start` and `agent.prompt`
     /// is exactly as real), so this exercises adoption doing all the work itself,
     /// not a test fixture that already looks like a successful dispatch.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reconcile_adopts_a_starting_task_by_agent_name() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -7962,7 +8040,7 @@ mod tests {
     /// that is its startup, not this task's work, so the task is not done:
     /// the prompt is sent then, and only idle past the prompt reply's sequence
     /// completes it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reconcile_keeps_the_prompt_pending_for_a_launching_agent() {
         let fake = FakeHerdr::new();
         let ready_after = Duration::from_millis(600);
@@ -8032,7 +8110,7 @@ mod tests {
     /// Same interrupted-dispatch shape, but no agent named `t-<id>` exists anywhere:
     /// the crash happened before `agent.start` even ran. Nothing to adopt, so the
     /// task must fail, not hang forever as `Starting`.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reconcile_fails_a_starting_task_with_no_agent() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8069,7 +8147,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn machine_reports_reconnecting_with_error() {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let (events, mut rx) = broadcast::channel(64);
@@ -8100,7 +8178,7 @@ mod tests {
         assert!(extra.is_err(), "machine.lost repeated: {extra:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn disconnect_triggers_reconnect_and_resubscribe() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8154,7 +8232,7 @@ mod tests {
 
     /// Each connect asks the machine for its pastor version once, and the
     /// status carries the answer until the next connect asks again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn status_carries_the_pastor_version_from_each_connect() {
         let fake = FakeHerdr::new();
         fake.set_pastor_version(Some("0.2.0"));
@@ -8177,7 +8255,7 @@ mod tests {
     /// An upgrade on a machine that stays connected shows without a restart
     /// or a reconnect: the reconcile tick asks again once `version_every`
     /// has passed.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_connected_machine_picks_up_a_new_pastor_version() {
         let fake = FakeHerdr::new();
         fake.set_pastor_version(Some("0.2.0"));
@@ -8204,7 +8282,7 @@ mod tests {
 
     /// The same refresh while polling: a machine whose events will not open
     /// still answers requests and can stay that way for as long as it likes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_polling_machine_picks_up_a_new_pastor_version() {
         let fake = FakeHerdr::new();
         fake.set_pastor_version(Some("0.2.0"));
@@ -8240,7 +8318,7 @@ mod tests {
         assert_eq!(h.snapshot().channel, ChannelState::Polling);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn incompatible_protocol_is_reported_and_not_dispatched_to() {
         let fake = FakeHerdr::new();
         fake.set_protocol(20);
@@ -8255,7 +8333,7 @@ mod tests {
         assert!(err.to_string().contains("not connected"), "{err}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stale_after_timeout() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8279,6 +8357,8 @@ mod tests {
             .unwrap();
         let t = h.dispatch(t.id).await.unwrap();
         assert_eq!(t.state, TaskState::Running);
+        // The timeout is calendar time, which no paused clock moves.
+        start_an_hour_ago(&store, t.id);
         wait_for("stale", || state_of(&store, t.id) == TaskState::Stale).await;
         assert_eq!(fake.agents().len(), 1, "nothing was killed");
     }
@@ -8317,7 +8397,7 @@ mod tests {
     /// The timeout counts from the latest start: a done task given more to
     /// do after its timeout runs again, and is not stale on the next
     /// reconcile.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_done_task_sent_more_work_after_its_timeout_runs() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8350,7 +8430,7 @@ mod tests {
 
     /// A paused task never goes stale, however long it waits, and a resumed
     /// one counts its timeout from the resume.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_paused_task_is_never_stale_and_a_resumed_one_counts_from_its_resume() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8370,12 +8450,13 @@ mod tests {
         fake.set_status(t.pane_id.as_deref().unwrap(), AgentStatus::Working);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(state_of(&store, t.id), TaskState::Running);
+        start_an_hour_ago(&store, t.id);
         wait_for("stale", || state_of(&store, t.id) == TaskState::Stale).await;
     }
 
     /// A blocked task waits for a person, not for its agent: past its
     /// timeout it stays blocked.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_blocked_task_past_its_timeout_stays_blocked() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8390,7 +8471,7 @@ mod tests {
 
     /// A block cleared past the old deadline gets a fresh timeout: the time
     /// spent waiting for a person does not count against it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_block_cleared_past_its_timeout_gets_fresh_time() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8415,7 +8496,7 @@ mod tests {
 
     /// A running task past its timeout that a reconcile is the first to see
     /// blocked (its event was missed) is blocked, not stale.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_task_first_listed_blocked_past_its_timeout_is_blocked() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8431,7 +8512,7 @@ mod tests {
 
     /// A stale task whose agent finishes after all is done, through the
     /// actor, and `task.stale` went out once, not on every reconcile.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_stale_task_whose_agent_completes_is_done() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8439,6 +8520,7 @@ mod tests {
         let t = h.dispatch(new_task_timing_out(&store).id).await.unwrap();
         let pane = t.pane_id.clone().unwrap();
         fake.set_status(&pane, AgentStatus::Working);
+        start_an_hour_ago(&store, t.id);
         wait_for("stale", || state_of(&store, t.id) == TaskState::Stale).await;
         // Some reconciles while stale.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -8575,7 +8657,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn event_stream_failures_back_off() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8599,9 +8681,8 @@ mod tests {
         );
         // Busy-spinning would run this thousands of times in 300ms; exponential
         // backoff (50ms, 100ms, 200ms, 200ms, ...) keeps it to about 3 attempts
-        // in that window. Bound generously above that to avoid flakes from
-        // scheduling jitter while still catching a real spin — and from below,
-        // so a test that stopped reaching the subscribe at all fails too.
+        // in that window. Bound above that to catch a real spin, and from
+        // below, so a test that stopped reaching the subscribe at all fails too.
         tokio::time::sleep(Duration::from_millis(300)).await;
         let n = subscribes.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
@@ -8622,7 +8703,7 @@ mod tests {
     /// succeeds. That is comfortably past the 100ms `poll_every` below, so the
     /// Blocked status set right after dispatch is certain to be caught by a
     /// poll tick while still `Polling`, not by a lucky `Connected` reconcile.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_machine_whose_events_will_not_open_polls_instead_of_dropping() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8689,7 +8770,7 @@ mod tests {
     /// window this test actually waits; the old inline `self.open_events().await`
     /// in the retry arm would have held up commands and poll ticks for up to
     /// that long.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_wedged_subscribe_does_not_block_dispatch_while_polling() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8749,7 +8830,7 @@ mod tests {
     /// completes on its own if the resubscribe-on-`Dispatch` fix is missing:
     /// a wedged attempt would just hang forever and this test would time out
     /// either way, proving nothing about *which* subscription landed.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_pane_added_mid_subscribe_is_not_lost_to_a_stale_subscription() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8800,7 +8881,7 @@ mod tests {
     /// The reply to a dispatch must carry an already-refreshed live count: a
     /// caller that reads `snapshot().live` the moment `dispatch` returns is the
     /// serialised dispatch pass deciding whether the machine has room left.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn live_count_is_current_when_dispatch_replies() {
         let fake = FakeHerdr::new();
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -8858,7 +8939,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_request_failing_at_the_transport_level_triggers_reconnect() {
         let fake = FakeHerdr::new();
         let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -8907,7 +8988,7 @@ mod tests {
     /// (`fail_until: usize::MAX`), so the machine can only ever be `Polling` or
     /// `Reconnecting`, never `Connected`, which keeps this test about the
     /// poll loop's own `PollExit::Reconnect` path specifically.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_broken_request_while_polling_reconnects_and_returns_to_polling() {
         let fake = FakeHerdr::new();
         let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -8965,7 +9046,7 @@ mod tests {
         assert_eq!(h.snapshot().channel, ChannelState::Polling);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dispatch_over_a_wedged_connection_times_out_fails_and_reconnects() {
         let fake = FakeHerdr::new();
         // `agent.start` is the first herdr call inside `dispatch()` that can hang;
@@ -9022,7 +9103,7 @@ mod tests {
     /// subscription must not hang the actor: `open_events` bounds the subscribe
     /// by `request_timeout` and the attempt is retried after backoff.
     /// `hang_method` is one-shot, so only the first attempt is wedged.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_wedged_subscribe_reconnects() {
         let fake = FakeHerdr::new();
         fake.hang_method("events.subscribe");
@@ -9043,7 +9124,7 @@ mod tests {
     /// which in turn blocks `Daemon::dispatch_queued` and the accept loop behind it.
     /// `hang_method` is one-shot, so this hangs only the first connect attempt's
     /// `agent.list`; the retry after backoff finds it answering normally again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reconcile_over_a_wedged_connection_reconnects() {
         let fake = FakeHerdr::new();
         fake.hang_method("agent.list");

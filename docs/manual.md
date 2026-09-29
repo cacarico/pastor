@@ -3365,7 +3365,7 @@ The Makefile is the list of things you can run here; `make help` prints it.
 ```bash
 make check            # changelog entry check, fmt check, clippy with warnings as errors, full test suite
 make test             # unit tests plus an end-to-end run against fake-herdr
-make test-machine     # the machine actor tests five times, to catch timing flakes
+make test-machine     # the machine actor tests on their own
 make portability      # cargo check for the musl and FreeBSD targets; needs cargo-zigbuild, zig and the Rust targets
 make smoke SESSION=s  # opt-in test against a real herdr running session s on this host
 make smoke-profiles REPO='~/src/app' CLAUDE=pi-1 OPENCODE=pi-2  # a live review task per agent through the head
