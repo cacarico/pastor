@@ -1037,7 +1037,7 @@ async fn prompt_when_ready(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     use super::*;
     use crate::config::flock::FlockNumber;

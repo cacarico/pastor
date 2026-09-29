@@ -1625,7 +1625,7 @@ impl Scheduler {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fake-herdr"))]
     fn set_source_for_tests(&mut self, id: &str, source: Arc<dyn ItemSource>) {
         let id = id.to_string();
         let previous = self.resolve.take();
@@ -1642,7 +1642,7 @@ impl Scheduler {
         }));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fake-herdr"))]
     fn set_jobs_for_tests(&mut self, jobs: Vec<Job>) {
         let now = Utc::now();
         self.entries = jobs
@@ -1733,7 +1733,7 @@ fn fingerprint(dir: &std::path::Path) -> Vec<(PathBuf, Option<SystemTime>, u64)>
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     use super::*;
 

@@ -40,9 +40,10 @@ path = "src/lib.rs"
 name = "pastor"
 path = "src/main.rs"
 
-# The fake herdr: the `fake-herdr` binary and `pastor::herdr::fake`. The
-# library's unit tests get the module through cfg(test) without it; the
-# Makefile turns it on for the binary and the integration tests below.
+# The fake herdr: the `fake-herdr` binary and `pastor::herdr::fake`. Both
+# need this feature; the Makefile turns it on for every target that does,
+# including the library's own unit tests, so a plain `cargo test` still
+# succeeds on the published crate, which leaves src/herdr/fake.rs out.
 [features]
 fake-herdr = []
 

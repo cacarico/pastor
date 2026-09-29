@@ -86,6 +86,10 @@ jobs:
       # fmt-check, clippy -D warnings and the whole suite, including
       # tests/cli.rs against fake-herdr.
       - run: make check
+      # `make check` always builds with fake-herdr on; a plain `cargo
+      # install pastor-cli` never has it, so check that default
+      # configuration compiles here too.
+      - run: cargo check --all-targets
       # The machine actor tests on their own.
       - run: make test-machine
       # The CLI against a head over a real ssh: every other test runs a fake

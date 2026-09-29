@@ -172,8 +172,9 @@ fn the_fake_herdr_needs_its_feature() {
         assert!(needs(declared), "{declared:?}");
     }
     let src = std::fs::read_to_string(root.join("src/herdr/mod.rs")).unwrap();
+    let src = src.replace("\r\n", "\n");
     assert!(
-        src.contains("#[cfg(any(test, feature = \"fake-herdr\"))]\npub mod fake;"),
+        src.contains("#[cfg(feature = \"fake-herdr\")]\npub mod fake;"),
         "src/herdr/mod.rs"
     );
 }

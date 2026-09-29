@@ -3595,7 +3595,7 @@ fn observed_from(agent: &AgentInfo) -> Observed {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fake-herdr"))]
 mod tests {
     /// A retry drops `spec.branch` and reopens the checkout of the task it
     /// retries; the note must name that checkout's branch, where the work is.

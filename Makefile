@@ -39,7 +39,7 @@ test: ## whole suite, including the end-to-end CLI tests against the fake herdr
 # load changes nothing. Two shutdown tests need a second thread and keep the
 # wall clock; they only wait for something to happen, with seconds to spare.
 test-machine: ## the machine actor tests on their own
-	cargo test --lib machine:: -q
+	cargo test --lib --features fake-herdr machine:: -q
 
 # Starts an sshd of its own on a localhost port, as the user running it, and
 # drives the CLI against a head through the real ssh and `pastor bridge`;
