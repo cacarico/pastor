@@ -1246,6 +1246,38 @@ mod tests {
         assert_eq!(command.ensure_dir("/").await.unwrap(), None);
     }
 
+    /// The command itself (every real source of "yes") is
+    /// `config::opencode`'s own to test; this only proves the wiring here
+    /// runs it and passes its answer through, using the managed-config
+    /// override the script keeps for tests, so it needs no real `$HOME`.
+    #[tokio::test]
+    async fn opencode_permission_rules_per_endpoint() {
+        let managed = tempfile::tempdir().unwrap();
+        let local = Endpoint::Local {
+            session: "s".into(),
+        };
+        unsafe {
+            std::env::set_var("OPENCODE_TEST_MANAGED_CONFIG_DIR", managed.path());
+        }
+        assert_eq!(
+            local.opencode_permission_rules().await.unwrap(),
+            Some(false)
+        );
+        std::fs::write(
+            managed.path().join("opencode.json"),
+            r#"{"permission": {"bash": "allow"}}"#,
+        )
+        .unwrap();
+        assert_eq!(local.opencode_permission_rules().await.unwrap(), Some(true));
+        unsafe {
+            std::env::remove_var("OPENCODE_TEST_MANAGED_CONFIG_DIR");
+        }
+        let command = Endpoint::Command {
+            argv: vec!["true".into()],
+        };
+        assert_eq!(command.opencode_permission_rules().await.unwrap(), None);
+    }
+
     /// Only ssh failing to reach the machine is an error. rc-file noise comes
     /// before the answer, so the answer is read from the end of stdout.
     #[test]
