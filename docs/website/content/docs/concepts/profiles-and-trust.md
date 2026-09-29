@@ -57,6 +57,11 @@ profiled task runs through without you, and the profile is the whole of
 what it may do. Agent args that pick a permission mode themselves are
 refused while a profile applies (`profile_args_conflict`).
 
+A Codex agent starts with `--ask-for-approval never --sandbox
+workspace-write`: it never asks, and it may write only its workspace, with
+no network. Codex has no flag for a per-command list, so the sandbox takes
+the lists' place, and `pastor task describe` marks them not applied.
+
 An opencode agent gets the lists as opencode permissions in its pane's
 environment. Any other agent gets them through its `allow_flag` and
 `deny_flag` and keeps its own mode.

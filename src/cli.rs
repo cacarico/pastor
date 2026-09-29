@@ -365,6 +365,11 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
                 .join(" ")
         }
     };
+    // A list the agent never gets (`AgentSource::lists_unapplied`) says so.
+    let unapplied = |shown: String| match source.and_then(|s| s.lists_unapplied.as_deref()) {
+        Some(why) if shown != "-" => format!("{shown} ({why})"),
+        _ => shown,
+    };
     let mut repo = opt(&t.spec.repo);
     if t.spec.worktree {
         repo.push_str(" (worktree");
@@ -393,8 +398,8 @@ pub fn task_detail_with(t: &Task, summaries: &[crate::task::TaskSummary]) -> Str
         ("fallback", fallback),
         ("profile", profile),
         ("agent args", args),
-        ("allow", list(&t.spec.allow)),
-        ("deny", list(&t.spec.deny)),
+        ("allow", unapplied(list(&t.spec.allow))),
+        ("deny", unapplied(list(&t.spec.deny))),
         ("repo", repo),
         (
             "place",
@@ -1554,6 +1559,7 @@ mod tests {
                 profile_from: None,
                 timeout_from: None,
                 place_from: None,
+                lists_unapplied: None,
             })),
             ..serde_json::from_str(r#"{"agent": "claude"}"#).unwrap()
         };
@@ -1581,6 +1587,7 @@ mod tests {
                 profile_from: None,
                 timeout_from: None,
                 place_from: None,
+                lists_unapplied: None,
             })),
             ..spec
         }));
@@ -1613,6 +1620,29 @@ mod tests {
         assert!(out.contains("fallback:   - (from machine m)\n"), "{out}");
         let out = task_detail(&task_with(spec(&[], None)));
         assert!(out.contains("fallback:   -\n"), "{out}");
+    }
+
+    /// `task describe` says when the lists never reach the agent (a
+    /// profiled Codex task), and says nothing on an empty list.
+    #[test]
+    fn task_detail_says_when_the_lists_are_not_applied() {
+        let why = "not applied: codex has no per-command allow or deny flag; it runs in its workspace-write sandbox";
+        let spec = crate::task::DispatchSpec {
+            allow: vec!["Edit".into()],
+            agent_source: Some(Box::new(crate::task::AgentSource {
+                agent: "defaults".into(),
+                profile: Some("develop".into()),
+                lists_unapplied: Some(why.into()),
+                ..Default::default()
+            })),
+            ..serde_json::from_str(r#"{"agent": "codex"}"#).unwrap()
+        };
+        let out = task_detail(&task_with(spec));
+        assert!(
+            out.contains(&format!("allow:      Edit ({why})\n")),
+            "{out}"
+        );
+        assert!(out.contains("deny:       -\n"), "{out}");
     }
 
     /// `task describe` shows what a finished Claude task's session used,
