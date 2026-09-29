@@ -11,7 +11,7 @@ use crate::config::flock::{
 };
 use crate::config::{
     AGENT_KIND_MISSING, AgentChoice, AgentPick, AgentRefusal, Agents, Defaults, Layer,
-    MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
+    LimitsConfig, MODEL_KIND_MISMATCH, Models, PastorConfig, Paths, profile::PROFILE_NOT_ALLOWED,
 };
 use crate::dispatch::{
     Claim, FlockSeat, MachineView, flock_held, mark_waiting_under_share, now_machine, pick_machine,
@@ -398,6 +398,8 @@ pub struct Fleet {
     agents_change_fleet: std::sync::atomic::AtomicBool,
     /// `max_orchestrators` as last applied.
     max_orchestrators: std::sync::atomic::AtomicU32,
+    /// `[limits]` as last applied: how long a limit holds.
+    limits: RwLock<LimitsConfig>,
     store: Arc<Store>,
     /// `None` for a fixed fleet (`Fleet::new`): tests and the daemon-less CLI.
     spawner: Option<Spawner>,
@@ -437,6 +439,7 @@ impl Fleet {
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             max_orchestrators: std::sync::atomic::AtomicU32::new(1),
+            limits: RwLock::default(),
             store,
             spawner: None,
             forward: None,
@@ -481,6 +484,7 @@ impl Fleet {
             profiles: RwLock::default(),
             agents_change_fleet: Default::default(),
             max_orchestrators: std::sync::atomic::AtomicU32::new(1),
+            limits: RwLock::default(),
             store,
             spawner: Some(Spawner { connect, events }),
             forward: None,
@@ -568,6 +572,7 @@ impl Fleet {
         *self.agents.write().recover() = config.agents.clone();
         *self.models.write().recover() = config.models.clone();
         *self.profiles.write().recover() = config.profiles.clone();
+        *self.limits.write().recover() = config.limits.clone();
         self.agents_change_fleet.store(
             config.agents_change_fleet,
             std::sync::atomic::Ordering::Relaxed,
@@ -1771,6 +1776,40 @@ impl Fleet {
         Ok(())
     }
 
+    /// `[limits]` as last applied.
+    pub fn limits_config(&self) -> LimitsConfig {
+        self.limits.read().recover().clone()
+    }
+
+    /// Keep `limit`, which `task`'s agent stopped on at `now` on `machine`,
+    /// under the account that agent names there (`Agents::limit_key`); a
+    /// limit that is one model's is kept for the task's model.
+    pub fn note_limit(
+        &self,
+        task: &Task,
+        machine: &str,
+        limit: &crate::limit::Limit,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<AccountLimit> {
+        let key = self
+            .agents
+            .read()
+            .recover()
+            .limit_key(machine, &task.spec.agent);
+        let row = AccountLimit::of(
+            &key,
+            task.model(),
+            limit,
+            Some(task.id),
+            Some(machine),
+            Some(&task.spec.agent),
+            now,
+            &self.limits_config(),
+        );
+        self.record_limit(&row)?;
+        Ok(row)
+    }
+
     /// Drop the limits past their `retry_at`, each with `agent.reset`
     /// (`by: time`).
     pub fn expire_limits(&self) {
@@ -2032,9 +2071,18 @@ impl Fleet {
         state: TaskState,
         pane: Option<String>,
         detail: Option<String>,
+        limit: Option<crate::limit::Limit>,
     ) -> anyhow::Result<Task> {
         let handle = self.pull_handle(machine)?;
         self.heard(&handle);
+        // The head owns the limits: one a pull machine read goes in the
+        // table as one this head read would, keyed by the machine it ran on.
+        if let Some(limit) = &limit
+            && let Some(task) = self.store.get_task(id)?
+            && task.machine.as_deref() == Some(machine)
+        {
+            self.note_limit(&task, machine, limit, chrono::Utc::now())?;
+        }
         if matches!(state, TaskState::Queued | TaskState::Paused) {
             return Err(crate::cli::CliError::err(
                 "invalid_report",
@@ -3745,6 +3793,20 @@ impl Daemon {
                     )),
                 }
             }
+            IpcRequest::LimitList => match self.store.limits() {
+                Ok(list) => IpcResponse::Limits(list),
+                Err(err) => IpcResponse::error("store_error", err),
+            },
+            IpcRequest::LimitClear { account, model } => {
+                match self.fleet.clear_limits(&account, model.as_deref()) {
+                    Ok(gone) if gone.is_empty() => IpcResponse::error(
+                        crate::limit_cli::NOT_EXHAUSTED,
+                        crate::limit_cli::not_exhausted(&account, model.as_deref()),
+                    ),
+                    Ok(gone) => IpcResponse::Limits(gone),
+                    Err(err) => IpcResponse::error("store_error", err),
+                }
+            }
             IpcRequest::TrustList => match self.store.trusted_repos() {
                 Ok(list) => IpcResponse::Trusted(list),
                 Err(err) => IpcResponse::error("store_error", err),
@@ -3786,7 +3848,12 @@ impl Daemon {
                 state,
                 pane,
                 detail,
-            } => match self.fleet.report(&machine, id, state, pane, detail).await {
+                limit,
+            } => match self
+                .fleet
+                .report(&machine, id, state, pane, detail, limit)
+                .await
+            {
                 Ok(task) => IpcResponse::Task(task),
                 Err(err) => cli_error(err),
             },
@@ -4983,6 +5050,7 @@ mod tests {
             state,
             pane: Some("p-9".into()),
             detail: detail.map(str::to_string),
+            limit: None,
         }
     }
 

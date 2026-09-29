@@ -29,7 +29,7 @@ const TURN_LINES: usize = 15;
 const OUTPUT_MARKER: char = '⎿';
 
 /// A limit an agent stopped on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limit {
     /// A usage limit, or no credit. `false` for a 429 or 529 that outlived
     /// the agent's own retries.
@@ -42,6 +42,7 @@ pub struct Limit {
     pub model_scoped: bool,
     /// The account has no credit left (`Credit balance is too low`): no
     /// reset is coming, someone has to pay.
+    #[serde(default)]
     pub no_credit: bool,
     /// The line it was read from, without its marker.
     pub line: String,

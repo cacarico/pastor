@@ -693,6 +693,27 @@ One profile with its extends followed: the allow and deny lists it adds up to
 | `<PROFILE>` | The profile's name, as `profile list` shows it |  |
 | `--json` | Print as a JSON object |  |
 
+## limit
+
+The accounts that ran out of usage, which no new task starts on until they reset
+
+### pastor limit list
+
+Every exhausted account: its model, when it is tried again, what ran out, who saw it
+
+| argument | does | default |
+|---|---|---|
+| `--json` | Print as a JSON array |  |
+
+### pastor limit clear
+
+Forget an account's limit, so queued tasks start on it on the next pass
+
+| argument | does | default |
+|---|---|---|
+| `<ACCOUNT>` | The account, as `limit list` shows it: an agent's `account`, or `<machine>/<agent>` |  |
+| `--model <MODEL>` | Clear only this model's limit, not the whole account's |  |
+
 ## trust
 
 The repos whose folder-trust prompt pastor answers on each machine

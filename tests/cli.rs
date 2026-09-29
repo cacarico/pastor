@@ -4367,6 +4367,82 @@ fn trust_add_list_and_remove_without_a_head() {
     assert!(ok(o.cmd(&["trust", "list"])).contains("no trusted repos"));
 }
 
+/// A usage limit on the account `me`, seen by t-7 on pi-1, that resets in
+/// an hour, written straight into the store at `state`.
+fn seed_limit(state: &std::path::Path) {
+    let now = chrono::Utc::now();
+    let store = pastor::store::Store::open(&state.join("pastor.db")).unwrap();
+    store
+        .record_limit(&pastor::limit::AccountLimit {
+            account: "me".into(),
+            model: None,
+            hard: true,
+            no_credit: false,
+            until: Some(now + chrono::Duration::hours(1)),
+            retry_at: now + chrono::Duration::hours(1),
+            line: "5-hour limit reached".into(),
+            task_id: Some(7),
+            machine: Some("pi-1".into()),
+            agent: Some("claude".into()),
+            seen_at: now,
+        })
+        .unwrap();
+}
+
+/// With a head running, `limit` goes through it; an agent pastor started
+/// may list the limits but not clear one.
+#[test]
+fn limit_list_and_clear_go_through_the_head() {
+    let env = start();
+    seed_limit(&env.state);
+    let list = env.json(&["limit", "list", "--json"]);
+    assert_eq!(list[0]["account"], "me", "{list}");
+    assert_eq!(list[0]["task_id"], 7, "{list}");
+    let text = ok(env.cmd(&["limit", "list"]));
+    assert!(text.contains("ACCOUNT"), "{text}");
+    assert!(text.contains("5-hour limit"), "{text}");
+    assert!(text.contains("t-7 on pi-1"), "{text}");
+    let as_agent = |args: &[&str]| {
+        pastor()
+            .args(args)
+            .env("PASTOR_CONFIG_DIR", &env.config)
+            .env("PASTOR_STATE_DIR", &env.state)
+            .env("PASTOR_TASK", "t-1")
+            .output()
+            .unwrap()
+    };
+    assert!(ok(as_agent(&["limit", "list"])).contains("me"));
+    assert_eq!(
+        error_code(&as_agent(&["limit", "clear", "me"])),
+        "agent_refused"
+    );
+    assert_eq!(
+        error_code(&env.cmd(&["limit", "clear", "me", "--model", "opus"])),
+        "not_exhausted"
+    );
+    assert!(ok(env.cmd(&["limit", "clear", "me"])).contains("cleared me"));
+    assert_eq!(
+        error_code(&env.cmd(&["limit", "clear", "me"])),
+        "not_exhausted"
+    );
+    assert!(ok(env.cmd(&["limit", "list"])).contains("no account is exhausted"));
+}
+
+#[test]
+fn limit_list_and_clear_without_a_head() {
+    let o = offline();
+    assert!(ok(o.cmd(&["limit", "list"])).contains("no account is exhausted"));
+    seed_limit(&o.state);
+    let list: serde_json::Value =
+        serde_json::from_str(&ok(o.cmd(&["limit", "list", "--json"]))).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    ok(o.cmd(&["limit", "clear", "me"]));
+    assert_eq!(
+        error_code(&o.cmd(&["limit", "clear", "me"])),
+        "not_exhausted"
+    );
+}
+
 /// clap leaves a visible alias out of the `help` subtree, so `pastor help
 /// task describe` would not complete; the completion tree adds it back.
 #[test]
