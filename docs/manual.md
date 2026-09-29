@@ -1473,7 +1473,17 @@ start leaves the same message at the end of its pane, read before the task
 would fail. Only the agent's last message after the last prompt counts: a
 limit further up, a quoted one, or tool output that shows one (a grep of
 pastor's own source) is no limit. A task its agent ended with `pastor task
-done` is never limited. Only Claude's messages are known.
+done` is never limited.
+
+pastor reads limits for two kinds of agent, Claude and agy (the
+Antigravity CLI); another kind that runs out reads as done. agy draws no
+marker before its messages, so for agy the end of its turn is its last
+paragraph after the last prompt, above its input box. It counts when it
+starts with agy's API error, `RESOURCE_EXHAUSTED (code 429): Individual
+quota reached. ... Resets in 4h21m30s.`: a message that says the quota is
+reached is a usage limit, with its reset read from `Resets in`, and any
+other `RESOURCE_EXHAUSTED` or 429 is a short one, retried in the pane as
+Claude's 429 is. The quota counts for the whole account, not one model.
 
 The limit goes in the table as above, with `agent.exhausted` and
 `task.limited`, and the task goes `waiting`:
@@ -1516,8 +1526,8 @@ its machine and once there is room, and like one, past its flock's share
 there, it leaves the slot to a flock under its share that has a task queued
 for it: back in its own checkout, with `claude --resume <session>` and a line telling the
 agent it stopped on a usage limit that has reset. A task with no session to
-resume (its agent died at the start of a new one, so its prompt never
-reached it) starts again in the same checkout with its prompt and a
+resume (an agy task, or one whose agent died at the start of a new one, so
+its prompt never reached it) starts again in the same checkout with its prompt and a
 paragraph saying that an earlier start stopped on a limit and may have left
 work there. If the limit still holds, the agent stops on it again and the
 task waits again.
@@ -2489,9 +2499,12 @@ reached`, `Claude AI usage limit reached`, `Credit balance is too low`) and is
 the agent's last `●` message, a `⎿` notice that is not the output of a tool
 call, a line in the first column or the banner under the input box. The same
 words further up, in the middle of a line or in what a tool printed (a grep of
-pastor's own source) are not a limit. Only Claude's messages are read, for
-now; an agent of another kind is restarted like one that ended. So is one that
-ended on `API Error: 429` or `529`: the API was busy, the account is not out.
+pastor's own source) are not a limit. An agy orchestrator is read for agy's
+quota message (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`) as
+its last paragraph, as in [A limited task waits](#a-limited-task-waits). An
+agent of another kind is restarted like one that ended. So is one that ended
+on `API Error: 429` or `529`, or agy's 429 without the quota: the API was
+busy, the account is not out.
 
 The reset is a unix time (`|1759201200`), a time of day (`resets 3am`,
 `resets at 15:30`), a weekday (`resets Mon 9am`), a date (`resets Oct 6,
