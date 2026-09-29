@@ -3,6 +3,16 @@
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- The head's socket (`pastor.sock` under `PASTOR_STATE_DIR`) and herdr's
+  local socket (under `XDG_CONFIG_HOME`) are checked against `sun_path`
+  before use: a path too long for a unix socket fails with `config_error`
+  and says which directory to shorten, instead of a bare OS error or, for
+  `pastor serve`, a daemon reported as unresponsive.
+
 ## 0.8.0 - 2026-09-29
 
 ### Added

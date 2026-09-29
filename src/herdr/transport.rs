@@ -6,7 +6,7 @@ use std::process::Stdio;
 use super::Connection;
 use crate::config::Paths;
 use crate::config::flock::MachineConfig;
-use crate::ssh::fitting_control_path;
+use crate::ssh::{SHORTER_STATE_DIR, check_socket_path, fitting_control_path};
 
 /// How long an ssh `ControlMaster` sticks around with no channels open. Every
 /// request opens a connection, so the master is what makes them cheap: the same
@@ -43,7 +43,7 @@ impl Endpoint {
                 tracing::warn!(
                     machine = %m.name,
                     path = %paths.ssh_control_path("").display(),
-                    "ssh ControlPath is too long for a unix socket even without the machine name; connecting without multiplexing (every request pays a full ssh handshake). Set PASTOR_STATE_DIR to something shorter."
+                    "ssh ControlPath is too long for a unix socket even without the machine name; connecting without multiplexing (every request pays a full ssh handshake). {SHORTER_STATE_DIR}"
                 );
             }
             Endpoint::Ssh {
@@ -96,14 +96,24 @@ pub struct ConnectError {
 pub fn local_socket_path(session: &str) -> anyhow::Result<PathBuf> {
     // herdr keeps its socket under `~/.config/herdr` on macOS as on Linux,
     // not in `~/Library/Application Support`, which `dirs` would pick there.
-    let base = crate::config::config_home()
-        .ok_or_else(|| anyhow::anyhow!("no config dir"))?
-        .join("herdr");
-    Ok(if session == "default" {
+    let base = crate::config::config_home().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    socket_path_under(&base, session)
+}
+
+/// herdr's socket for `session` under the config home `base`, refused when it
+/// would not fit in `sun_path`.
+fn socket_path_under(base: &Path, session: &str) -> anyhow::Result<PathBuf> {
+    let base = base.join("herdr");
+    let path = if session == "default" {
         base.join("herdr.sock")
     } else {
         base.join("sessions").join(session).join("herdr.sock")
-    })
+    };
+    check_socket_path(
+        &path,
+        "Set XDG_CONFIG_HOME to something shorter, or use a shorter session name.",
+    )?;
+    Ok(path)
 }
 
 /// The exact command herdr's own client runs on the remote host.
@@ -855,6 +865,22 @@ mod tests {
         assert_eq!(control_path, None);
     }
     use crate::herdr::ConnectorExt;
+
+    /// herdr's socket is under `XDG_CONFIG_HOME`, so a path there past
+    /// `sun_path` says to shorten that (or the session name), before any
+    /// connect gets the OS's bare refusal.
+    #[test]
+    fn local_socket_path_refuses_a_path_past_sun_path() {
+        let deep = PathBuf::from(format!("/{}", "x".repeat(crate::ssh::UNIX_PATH_MAX)));
+        let err = socket_path_under(&deep, "default").unwrap_err();
+        let e = err
+            .downcast_ref::<crate::cli::CliError>()
+            .expect("CliError");
+        assert_eq!(e.code, "config_error");
+        assert!(e.message.contains("XDG_CONFIG_HOME"), "{}", e.message);
+        let p = socket_path_under(Path::new("/c"), "s").unwrap();
+        assert_eq!(p, Path::new("/c/herdr/sessions/s/herdr.sock"));
+    }
 
     #[test]
     fn socket_paths_and_bridge_command() {
