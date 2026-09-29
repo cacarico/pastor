@@ -12,7 +12,8 @@ use crate::task::{DispatchSpec, Task, TaskRole, TaskState};
 
 /// The head's IPC protocol, answered in `Pong`. Bumped when a request gains a
 /// field an older head would silently ignore (serde skips unknown fields), so
-/// the CLI can refuse to send it there. A head that answers no protocol is 0.
+/// every sender can refuse to send it there (`IpcRequest::min_protocol`). A head
+/// that answers no protocol is 0.
 /// 1: flocks (`Run::flock`, `TaskFilter::flock`). 2: flock agents and tool
 /// lists. 3: `TaskRetry::place`. 4: `EventsSince`. 5: flock and machine
 /// edits (`FLEET_EDIT_PROTOCOL`). 6: `FileGet`, `FilePut`, `JobDescribe`,
@@ -160,7 +161,7 @@ pub const DESCRIPTION_PROTOCOL: u32 = 14;
 pub const LABEL_PROTOCOL: u32 = 19;
 
 /// The first protocol whose head knows `JobSubmit`. An older one refuses the
-/// request as unreadable; `check_protocol` says why before it is sent.
+/// request as unreadable; `min_protocol` says why before it is sent.
 pub const JOB_SUBMIT_PROTOCOL: u32 = 7;
 
 /// The first protocol whose head runs a task's named model (`--model`, a
@@ -207,16 +208,148 @@ pub const ORCHESTRATOR_PROTOCOL: u32 = 23;
 /// unreadable.
 pub const SESSION_PROTOCOL: u32 = 25;
 
-/// `head_too_old` unless the head (its version and protocol, from `Pong`)
-/// speaks at least `needed`; `what` names what the older head lacks.
-pub fn check_protocol(version: &str, protocol: u32, needed: u32, what: &str) -> anyhow::Result<()> {
-    if protocol >= needed {
-        return Ok(());
+/// `head_too_old` for a head (its version, from `Pong`) older than a
+/// request needs; `why` says what it lacks and would do instead
+/// (`IpcRequest::min_protocol`).
+pub fn too_old(version: &str, why: &str) -> crate::cli::CliError {
+    crate::cli::CliError {
+        code: "head_too_old".into(),
+        message: format!("the running pastor serve ({version}) {why}; restart it"),
     }
-    Err(crate::cli::CliError::err(
-        "head_too_old",
-        format!("the running pastor serve ({version}) predates {what}; restart it"),
-    ))
+}
+
+/// The highest protocol a request needs so far, with why
+/// (`IpcRequest::min_protocol`); a tie keeps the first reason.
+struct Need(Option<(u32, &'static str)>);
+
+impl Need {
+    fn at(&mut self, protocol: u32, why: &'static str) {
+        if self.0.is_none_or(|(n, _)| protocol > n) {
+            self.0 = Some((protocol, why));
+        }
+    }
+}
+
+// What a head too old for a request lacks, and would do with it instead:
+// the `why` of `IpcRequest::min_protocol`, read after "the running pastor
+// serve (0.5.0)".
+const FLOCKS: &str = "predates flocks and would act on every flock";
+const QUEUES: &str = "predates permission profiles (or named models, flock agents and tool allow and deny lists), and would start the agent without them";
+const RETRY_PLACE: &str = "predates permission profiles and `task retry --place`, and would retry the task where it was, without them";
+const PRIORITY: &str =
+    "predates task priority, and would queue the task at its own level or refuse the request";
+const ROLE: &str = "predates task roles and permission profiles, and would start a plain agent without them instead of an orchestrator";
+const DESCRIPTION: &str = "predates descriptions and would drop the description";
+const PREEMPT: &str = "predates pausing a low task, and would queue the task without --preempt";
+const LABEL: &str = "predates workspace labels and would name the workspace t-N";
+const SUMMARY_MODE: &str =
+    "predates the summary setting, and would queue the task without --summary";
+const SUMMARY: &str = "predates task summaries, and would drop the summary or refuse the request";
+const QUEUE: &str = "predates `pastor queue`, and would refuse the request";
+const EVENTS: &str = "predates reading the events log through the head";
+const FLEET_EDIT: &str = "predates flock and machine edits through the head, and would refuse them (stop it to edit flock.toml without a head)";
+const JOIN: &str = "predates `flock join` and `flock leave`, and would refuse them or add the flock without its machines";
+const FILES: &str = "predates edits and job requests through the head, and would refuse them";
+const HEAD_READS: &str =
+    "predates trust and describe requests through the head, and would refuse them";
+const JOB_SUBMIT: &str = "predates job submits from a headless serve, and would refuse them";
+const JOB_TASK: &str = "predates job tasks from a headless serve, and would refuse them";
+const JOB_MODEL: &str =
+    "predates a job naming a model, and would start its agents on their default model";
+const JOB_PROFILE: &str =
+    "predates a job naming a permission profile, and would start its agents unenforced";
+const JOB_DESCRIPTION: &str =
+    "predates a job naming a description, and would refuse its dispatch table";
+const JOB_PREEMPT: &str = "predates a job with preempt, and would refuse its dispatch table";
+const JOB_LABEL: &str =
+    "predates a job naming a workspace label, and would name its workspaces t-N";
+const JOB_SUMMARY: &str = "predates a job with summary, and would refuse its dispatch table";
+const PULL: &str = "predates pull machines, and would refuse the claim or report";
+const ORCHESTRATOR: &str = "predates orchestrator files, and would refuse the request";
+const SESSION: &str = "predates session orchestrators, and would refuse the request";
+
+/// How long a head's `Pong` settles the protocol check before it is asked
+/// again: a long-lived sender (a headless serve) sees a restarted head
+/// within this, and one CLI command never pings twice.
+const PONG_FRESH: Duration = Duration::from_secs(60);
+
+/// The protocol check every sender makes before a request goes out: one
+/// `Pong` per head, kept for `PONG_FRESH`, against the request's
+/// `min_protocol`. A request that needs nothing sends no ping.
+#[derive(Debug, Default)]
+pub struct ProtocolGate {
+    pong: std::sync::Mutex<Option<(std::time::Instant, String, u32)>>,
+}
+
+impl ProtocolGate {
+    /// Keep what the head said to a ping sent elsewhere (`probe_head`), so
+    /// the check does not ask again.
+    pub fn remember(&self, version: &str, protocol: u32) {
+        *self.pong.lock().expect("pong lock") =
+            Some((std::time::Instant::now(), version.to_string(), protocol));
+    }
+
+    /// `Ok` when the head may take `req`, else `head_too_old` naming what it
+    /// lacks. `ping` asks the head; it is awaited only when `req` needs a
+    /// protocol and no fresh `Pong` is kept.
+    pub async fn check<E: From<crate::cli::CliError>>(
+        &self,
+        req: &IpcRequest,
+        ping: impl std::future::Future<Output = Result<IpcResponse, E>>,
+    ) -> Result<(), E> {
+        let Some((needed, why)) = req.min_protocol() else {
+            return Ok(());
+        };
+        let kept = self
+            .pong
+            .lock()
+            .expect("pong lock")
+            .as_ref()
+            .filter(|(at, ..)| at.elapsed() < PONG_FRESH)
+            .map(|(_, version, protocol)| (version.clone(), *protocol));
+        let (version, protocol) = match kept {
+            Some(pong) => pong,
+            None => match ping.await? {
+                IpcResponse::Pong {
+                    version, protocol, ..
+                } => {
+                    self.remember(&version, protocol);
+                    (version, protocol)
+                }
+                other => {
+                    return Err(crate::cli::CliError {
+                        code: "internal".into(),
+                        message: format!("unexpected daemon reply to ping: {other:?}"),
+                    }
+                    .into());
+                }
+            },
+        };
+        if protocol >= needed {
+            Ok(())
+        } else {
+            Err(too_old(&version, why).into())
+        }
+    }
+}
+
+static HEAD_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ProtocolGate>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The gate of the head `request_head` reaches from `paths`: the remote
+/// head when one is set, else this machine's socket.
+pub fn head_gate(paths: &crate::config::Paths) -> std::sync::Arc<ProtocolGate> {
+    let key = match remote_head() {
+        Some(head) => format!("ssh {}", head.ssh),
+        None => paths.socket_file().display().to_string(),
+    };
+    HEAD_GATES
+        .lock()
+        .expect("gates lock")
+        .entry(key)
+        .or_default()
+        .clone()
 }
 
 // One request is read per connection and dropped once answered, so the
@@ -557,6 +690,195 @@ pub enum IpcRequest {
 }
 
 impl IpcRequest {
+    /// The protocol a head needs to honour this request whole, and what an
+    /// older one would do with it instead, worked out from what the request
+    /// carries: a head reads unknown fields as nothing, so a field it
+    /// predates is dropped without a word. The highest need wins. `None` for
+    /// a request every head takes as it is. Every sender checks it before
+    /// the request goes out (`ProtocolGate`).
+    pub fn min_protocol(&self) -> Option<(u32, &'static str)> {
+        use IpcRequest as R;
+        let mut need = Need(None);
+        match self {
+            R::Ping
+            | R::TaskShow { .. }
+            | R::TaskRead { .. }
+            | R::FlockList
+            | R::FlockRemove { .. }
+            | R::Reload
+            | R::JobList
+            | R::TaskClose { .. }
+            | R::TaskSend { .. }
+            | R::TaskPrune { .. } => {}
+            R::List { filter } => {
+                if filter.flock.is_some() {
+                    need.at(FLOCK_PROTOCOL, FLOCKS);
+                }
+            }
+            R::Run {
+                flock,
+                agent,
+                priority,
+                role,
+                description,
+                preempt,
+                summary,
+                spec,
+                ..
+            } => {
+                // A run with a role needs roles as much as profiles, and
+                // says so: the refusal names both.
+                let queues = if role.is_agent() { QUEUES } else { ROLE };
+                need.at(PROFILE_PROTOCOL, queues);
+                if flock.is_some() {
+                    need.at(FLOCK_PROTOCOL, FLOCKS);
+                }
+                if agent.is_some() {
+                    need.at(AGENT_PROTOCOL, queues);
+                }
+                if agent.as_ref().is_some_and(|a| a.model.is_some()) {
+                    need.at(MODEL_PROTOCOL, queues);
+                }
+                if priority.is_some() {
+                    need.at(PRIORITY_PROTOCOL, PRIORITY);
+                }
+                if !role.is_agent() {
+                    need.at(ROLE_PROTOCOL, ROLE);
+                }
+                if description.is_some() {
+                    need.at(DESCRIPTION_PROTOCOL, DESCRIPTION);
+                }
+                if *preempt {
+                    need.at(PREEMPT_PROTOCOL, PREEMPT);
+                }
+                if spec.label.template.is_some() {
+                    need.at(LABEL_PROTOCOL, LABEL);
+                }
+                if summary.is_some() {
+                    need.at(SUMMARY_MODE_PROTOCOL, SUMMARY_MODE);
+                }
+            }
+            R::Tick { dry_run, .. } => {
+                if !dry_run {
+                    need.at(PROFILE_PROTOCOL, QUEUES);
+                }
+            }
+            R::JobRun { .. } => need.at(PROFILE_PROTOCOL, QUEUES),
+            R::TaskRetry { place, .. } => match place {
+                Some(_) => {
+                    need.at(PLACE_PROTOCOL, RETRY_PLACE);
+                    need.at(PROFILE_PROTOCOL, RETRY_PLACE);
+                }
+                None => need.at(PROFILE_PROTOCOL, QUEUES),
+            },
+            R::TaskPriority { preempt, .. } => {
+                need.at(PRIORITY_PROTOCOL, PRIORITY);
+                if *preempt {
+                    need.at(PREEMPT_PROTOCOL, PREEMPT);
+                }
+            }
+            R::Queue { .. } | R::QueueMove { .. } => need.at(QUEUE_PROTOCOL, QUEUE),
+            R::TaskDone { summary, .. } => {
+                if summary.is_some() {
+                    need.at(SUMMARY_PROTOCOL, SUMMARY);
+                }
+            }
+            R::TaskSummaries { .. } => need.at(SUMMARY_PROTOCOL, SUMMARY),
+            R::EventsSince { .. } => need.at(EVENTS_PROTOCOL, EVENTS),
+            R::FlockAdd {
+                description,
+                machines,
+                ..
+            } => {
+                need.at(FLEET_EDIT_PROTOCOL, FLEET_EDIT);
+                if description.is_some() {
+                    need.at(DESCRIPTION_PROTOCOL, DESCRIPTION);
+                }
+                if !machines.is_empty() {
+                    need.at(JOIN_PROTOCOL, JOIN);
+                }
+            }
+            R::FlockJoin { .. } | R::FlockLeave { .. } => need.at(JOIN_PROTOCOL, JOIN),
+            R::FlockSetDefault { .. } | R::MachineRemove { .. } | R::MachineMove { .. } => {
+                need.at(FLEET_EDIT_PROTOCOL, FLEET_EDIT);
+            }
+            R::MachineAdd { machine } => {
+                need.at(FLEET_EDIT_PROTOCOL, FLEET_EDIT);
+                if machine.description.is_some() {
+                    need.at(DESCRIPTION_PROTOCOL, DESCRIPTION);
+                }
+            }
+            R::FileGet { .. }
+            | R::FilePut { .. }
+            | R::JobDescribe { .. }
+            | R::JobSetEnabled { .. } => need.at(FILE_PROTOCOL, FILES),
+            R::JobSubmit { dispatch, .. } => {
+                // The job's `[dispatch]` table, which the head reads with
+                // its own `DispatchTable`: a key it predates is dropped, or
+                // refuses the whole submit as an opaque `invalid_dispatch`.
+                let has = |key: &str| {
+                    dispatch
+                        .get(key)
+                        .is_some_and(|v| !v.is_null() && *v != serde_json::Value::Bool(false))
+                };
+                need.at(JOB_SUBMIT_PROTOCOL, JOB_SUBMIT);
+                if has("model") {
+                    need.at(MODEL_PROTOCOL, JOB_MODEL);
+                }
+                if has("profile") {
+                    need.at(PROFILE_PROTOCOL, JOB_PROFILE);
+                }
+                if has("description") {
+                    need.at(DESCRIPTION_PROTOCOL, JOB_DESCRIPTION);
+                }
+                if has("preempt") {
+                    need.at(PREEMPT_PROTOCOL, JOB_PREEMPT);
+                }
+                if has("label") {
+                    need.at(LABEL_PROTOCOL, JOB_LABEL);
+                }
+                if has("summary") {
+                    need.at(SUMMARY_MODE_PROTOCOL, JOB_SUMMARY);
+                }
+            }
+            R::JobTask {
+                agent,
+                spec,
+                description,
+                ..
+            } => {
+                need.at(SHEPHERD_PROTOCOL, JOB_TASK);
+                if agent.profile.is_some() {
+                    need.at(PROFILE_PROTOCOL, JOB_PROFILE);
+                }
+                if description.is_some() {
+                    need.at(DESCRIPTION_PROTOCOL, JOB_DESCRIPTION);
+                }
+                if spec.label.template.is_some() {
+                    need.at(LABEL_PROTOCOL, JOB_LABEL);
+                }
+                if !spec.summary.is_ask() {
+                    need.at(SUMMARY_MODE_PROTOCOL, JOB_SUMMARY);
+                }
+            }
+            R::TrustList
+            | R::TrustAdd { .. }
+            | R::TrustRemove { .. }
+            | R::FlockDescribe { .. }
+            | R::MachineDescribe { .. } => need.at(HEAD_READS_PROTOCOL, HEAD_READS),
+            R::TaskClaim { .. } | R::TaskReport { .. } => need.at(PULL_PROTOCOL, PULL),
+            R::OrchestratorStart { .. } | R::OrchestratorStop { .. } => {
+                need.at(SESSION_PROTOCOL, SESSION);
+            }
+            R::OrchestratorList
+            | R::OrchestratorDescribe { .. }
+            | R::OrchestratorRun { .. }
+            | R::OrchestratorSetEnabled { .. }
+            | R::OrchestratorNote { .. } => need.at(ORCHESTRATOR_PROTOCOL, ORCHESTRATOR),
+        }
+        need.0
+    }
+
     /// Whether the request can start, stop, feed or reshape work: anything
     /// but a read. A reload and a tick, dry or not, count: both apply
     /// pastor.toml and flock.toml first. An agent pastor started is refused
@@ -832,9 +1154,19 @@ pub enum RequestError {
     #[error("{0}")]
     Unreachable(String),
     /// A remote head: `pastor bridge` answered with an error of its own
-    /// (`no_head`) instead of the head's reply.
+    /// (`no_head`) instead of the head's reply. Or any head: it is too old
+    /// for the request (`ProtocolGate`), which was not sent.
     #[error("{message}")]
     Refused { code: String, message: String },
+}
+
+impl From<crate::cli::CliError> for RequestError {
+    fn from(e: crate::cli::CliError) -> RequestError {
+        RequestError::Refused {
+            code: e.code,
+            message: e.message,
+        }
+    }
 }
 
 static REMOTE_HEAD: std::sync::OnceLock<Option<crate::head::RemoteHead>> =
@@ -853,7 +1185,7 @@ pub fn remote_head() -> Option<&'static crate::head::RemoteHead> {
 
 /// One request to the head, wherever it is: over ssh to a remote head when
 /// one is set, else to this machine's socket. Every CLI request goes through
-/// here.
+/// here, and none goes to a head too old for it (`ProtocolGate`).
 pub async fn request_head(
     paths: &crate::config::Paths,
     req: &IpcRequest,
@@ -863,6 +1195,18 @@ pub async fn request_head(
 
 /// `request_head` with its own bound on the round trip.
 pub async fn request_head_with_timeout(
+    paths: &crate::config::Paths,
+    req: &IpcRequest,
+    timeout: Duration,
+) -> Result<IpcResponse, RequestError> {
+    head_gate(paths)
+        .check(req, send_to_head(paths, &IpcRequest::Ping, timeout))
+        .await?;
+    send_to_head(paths, req, timeout).await
+}
+
+/// `request_head_with_timeout` without the protocol check.
+async fn send_to_head(
     paths: &crate::config::Paths,
     req: &IpcRequest,
     timeout: Duration,
@@ -1609,24 +1953,342 @@ mod tests {
         assert_eq!(from, both);
     }
 
-    /// A client refuses to send `JobSubmit` to a head older than
-    /// `JOB_SUBMIT_PROTOCOL`, which would not read it.
+    /// A request from its JSON, as a sender would build it.
+    fn req(v: serde_json::Value) -> IpcRequest {
+        serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("{v}: {e}"))
+    }
+
+    /// For each protocol a request can need: one request that needs it,
+    /// the protocol, and a word of what a head before it lacks.
+    fn needs() -> Vec<(IpcRequest, u32, &'static str)> {
+        let run = |extra: serde_json::Value| {
+            let mut v =
+                serde_json::json!({"op": "run", "prompt": "p", "spec": {"agent": "claude"}});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            req(v)
+        };
+        let submit = |dispatch: serde_json::Value| {
+            req(
+                serde_json::json!({"op": "job_submit", "job": "j", "dispatch": dispatch, "prompt": "p", "items": []}),
+            )
+        };
+        vec![
+            (
+                req(
+                    serde_json::json!({"op": "list", "filter": {"job": null, "flock": "w", "machine": null, "states": null}}),
+                ),
+                FLOCK_PROTOCOL,
+                "flocks",
+            ),
+            (
+                run(serde_json::json!({})),
+                AGENT_PROTOCOL,
+                "tool allow and deny",
+            ),
+            (
+                IpcRequest::TaskRetry {
+                    id: 1,
+                    place: Some(crate::task::Place::Pastor),
+                },
+                PLACE_PROTOCOL,
+                "--place",
+            ),
+            (
+                req(serde_json::json!({"op": "events_since", "after": 0, "limit": 1})),
+                EVENTS_PROTOCOL,
+                "events log",
+            ),
+            (
+                req(serde_json::json!({"op": "machine_move", "name": "m", "flock": "f"})),
+                FLEET_EDIT_PROTOCOL,
+                "flock and machine edits",
+            ),
+            (
+                req(serde_json::json!({"op": "file_get", "file": "flock"})),
+                FILE_PROTOCOL,
+                "edits and job requests",
+            ),
+            (
+                submit(serde_json::json!({"repo": "r"})),
+                JOB_SUBMIT_PROTOCOL,
+                "job submits",
+            ),
+            (
+                submit(serde_json::json!({"model": "fast"})),
+                MODEL_PROTOCOL,
+                "model",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "job_task", "job": "j", "agent": {}, "prompt": "p", "spec": {"agent": "claude"}, "item": {"key": "k"}}),
+                ),
+                SHEPHERD_PROTOCOL,
+                "job tasks",
+            ),
+            (
+                req(serde_json::json!({"op": "trust_list"})),
+                HEAD_READS_PROTOCOL,
+                "trust and describe",
+            ),
+            (
+                req(serde_json::json!({"op": "task_priority", "id": 1, "priority": "high"})),
+                PRIORITY_PROTOCOL,
+                "priority",
+            ),
+            (
+                run(serde_json::json!({"role": "orchestrator"})),
+                ROLE_PROTOCOL,
+                "roles",
+            ),
+            (
+                run(serde_json::json!({})),
+                PROFILE_PROTOCOL,
+                "permission profiles",
+            ),
+            (
+                submit(serde_json::json!({"profile": "ci"})),
+                PROFILE_PROTOCOL,
+                "permission profile",
+            ),
+            (
+                run(serde_json::json!({"description": "d"})),
+                DESCRIPTION_PROTOCOL,
+                "descriptions",
+            ),
+            (
+                req(serde_json::json!({"op": "queue"})),
+                QUEUE_PROTOCOL,
+                "pastor queue",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "task_priority", "id": 1, "priority": "critical", "preempt": true}),
+                ),
+                PREEMPT_PROTOCOL,
+                "pausing",
+            ),
+            (
+                submit(serde_json::json!({"preempt": true})),
+                PREEMPT_PROTOCOL,
+                "preempt",
+            ),
+            (
+                req(serde_json::json!({"op": "task_done", "id": 1, "summary": "s"})),
+                SUMMARY_PROTOCOL,
+                "summaries",
+            ),
+            (
+                run(serde_json::json!({"spec": {"agent": "claude", "label": {"template": "x"}}})),
+                LABEL_PROTOCOL,
+                "labels",
+            ),
+            (
+                submit(serde_json::json!({"label": "x"})),
+                LABEL_PROTOCOL,
+                "workspace label",
+            ),
+            (
+                run(serde_json::json!({"summary": "require"})),
+                SUMMARY_MODE_PROTOCOL,
+                "summary setting",
+            ),
+            (
+                submit(serde_json::json!({"summary": "off"})),
+                SUMMARY_MODE_PROTOCOL,
+                "summary",
+            ),
+            (
+                req(serde_json::json!({"op": "task_claim", "machine": "m", "free_slots": 1})),
+                PULL_PROTOCOL,
+                "pull machines",
+            ),
+            (
+                req(
+                    serde_json::json!({"op": "task_report", "machine": "m", "id": 1, "state": "running"}),
+                ),
+                PULL_PROTOCOL,
+                "pull machines",
+            ),
+            (
+                req(serde_json::json!({"op": "flock_join", "flock": "f", "machine": "m"})),
+                JOIN_PROTOCOL,
+                "flock join",
+            ),
+            (
+                req(serde_json::json!({"op": "orchestrator_list"})),
+                ORCHESTRATOR_PROTOCOL,
+                "orchestrator files",
+            ),
+            (
+                req(serde_json::json!({"op": "orchestrator_start", "name": "o"})),
+                SESSION_PROTOCOL,
+                "session orchestrators",
+            ),
+        ]
+    }
+
+    /// Every request a head may be too old for is refused `head_too_old`
+    /// by a head one protocol short, naming what it lacks, and goes to one
+    /// that has it. A protocol no request covers here would be a field a
+    /// sender could slip past an older head.
+    #[tokio::test]
+    async fn a_head_one_protocol_short_refuses_the_request() {
+        let mut covered = std::collections::BTreeSet::new();
+        for (r, needed, feature) in needs() {
+            let (at, why) = r.min_protocol().unwrap_or_else(|| panic!("{r:?}"));
+            assert!(at >= needed, "{r:?} needs {at}");
+            covered.insert(needed);
+            let gate = ProtocolGate::default();
+            for short in [needed - 1, at - 1] {
+                gate.remember("0.5.0", short);
+                let err = gate
+                    .check(&r, async {
+                        Ok::<_, crate::cli::CliError>(IpcResponse::Text("never asked".into()))
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, "head_too_old", "{r:?}");
+                assert!(err.message.contains("0.5.0"), "{}", err.message);
+                assert!(err.message.contains(feature), "{r:?}: {why}");
+            }
+            gate.remember("0.9.0", at);
+            gate.check(&r, async {
+                Ok::<_, crate::cli::CliError>(IpcResponse::Text("never asked".into()))
+            })
+            .await
+            .unwrap();
+        }
+        // Every protocol but the three only a flock.toml can need, which
+        // are checked against the file (`flock_file_need` in main.rs).
+        for p in [
+            FLOCK_PROTOCOL,
+            AGENT_PROTOCOL,
+            PLACE_PROTOCOL,
+            EVENTS_PROTOCOL,
+            FLEET_EDIT_PROTOCOL,
+            FILE_PROTOCOL,
+            JOB_SUBMIT_PROTOCOL,
+            MODEL_PROTOCOL,
+            SHEPHERD_PROTOCOL,
+            HEAD_READS_PROTOCOL,
+            PRIORITY_PROTOCOL,
+            ROLE_PROTOCOL,
+            PROFILE_PROTOCOL,
+            DESCRIPTION_PROTOCOL,
+            QUEUE_PROTOCOL,
+            PREEMPT_PROTOCOL,
+            SUMMARY_PROTOCOL,
+            LABEL_PROTOCOL,
+            SUMMARY_MODE_PROTOCOL,
+            PULL_PROTOCOL,
+            JOIN_PROTOCOL,
+            ORCHESTRATOR_PROTOCOL,
+            SESSION_PROTOCOL,
+        ] {
+            assert!(covered.contains(&p), "no request needs protocol {p}");
+        }
+    }
+
+    /// A request every head takes needs nothing and sends no ping; one
+    /// that needs a protocol pings once and keeps the pong.
+    #[tokio::test]
+    async fn the_gate_pings_only_when_a_request_needs_it_and_once() {
+        let pings = std::sync::atomic::AtomicU32::new(0);
+        let ping = || async {
+            pings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, crate::cli::CliError>(IpcResponse::Pong {
+                version: "0.9.0".into(),
+                protocol: IPC_PROTOCOL,
+                role: None,
+            })
+        };
+        let gate = ProtocolGate::default();
+        for r in [
+            IpcRequest::Ping,
+            IpcRequest::JobList,
+            IpcRequest::Reload,
+            IpcRequest::TaskShow { id: 1 },
+            IpcRequest::Tick {
+                job: None,
+                dry_run: true,
+            },
+        ] {
+            assert_eq!(r.min_protocol(), None, "{r:?}");
+            gate.check(&r, ping()).await.unwrap();
+        }
+        assert_eq!(pings.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for _ in 0..3 {
+            gate.check(&IpcRequest::TrustList, ping()).await.unwrap();
+        }
+        assert_eq!(pings.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The highest need names the refusal: a run with a label and a
+    /// description is refused for the label, the newer of the two.
     #[test]
-    fn an_older_head_is_too_old_to_submit_to() {
-        let err = check_protocol("0.5.0", 3, JOB_SUBMIT_PROTOCOL, "job submit").unwrap_err();
-        let err = err.downcast_ref::<crate::cli::CliError>().unwrap();
-        assert_eq!(err.code, "head_too_old");
-        assert!(err.message.contains("0.5.0"), "{}", err.message);
-        assert!(check_protocol("0.6.0", IPC_PROTOCOL, JOB_SUBMIT_PROTOCOL, "job submit").is_ok());
-        let v = serde_json::to_value(IpcRequest::JobSubmit {
-            job: "j".into(),
-            dispatch: serde_json::json!({"repo": "r"}),
-            prompt: "p".into(),
-            items: vec![serde_json::json!({"key": "k"})],
-        })
-        .unwrap();
-        assert_eq!(v["op"], "job_submit");
-        assert_eq!(v["items"][0]["key"], "k");
+    fn the_highest_need_wins() {
+        let r = req(
+            serde_json::json!({"op": "run", "prompt": "p", "description": "d",
+            "spec": {"agent": "claude", "label": {"template": "x"}}}),
+        );
+        assert_eq!(r.min_protocol().map(|n| n.0), Some(LABEL_PROTOCOL));
+        let r = req(serde_json::json!({"op": "flock_add", "name": "f", "default": false}));
+        assert_eq!(r.min_protocol().map(|n| n.0), Some(FLEET_EDIT_PROTOCOL));
+        let r = req(
+            serde_json::json!({"op": "flock_add", "name": "f", "default": false, "machines": ["m"], "description": "d"}),
+        );
+        assert_eq!(r.min_protocol().map(|n| n.0), Some(JOIN_PROTOCOL));
+        let r = IpcRequest::TaskRetry { id: 1, place: None };
+        let (at, why) = r.min_protocol().unwrap();
+        assert_eq!(at, PROFILE_PROTOCOL);
+        assert!(!why.contains("--place"), "{why}");
+    }
+
+    /// `request_head` checks too: a head one protocol short answers only the
+    /// ping, and the request is refused `head_too_old` without being sent.
+    #[tokio::test]
+    async fn request_head_refuses_a_head_too_old_for_the_request() {
+        use tokio::io::AsyncWriteExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::new(tmp.path().join("c"), tmp.path().join("s"));
+        paths.ensure().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket_file()).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (r, mut w) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(r).read_line(&mut line).await.unwrap();
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                log.lock()
+                    .unwrap()
+                    .push(v["op"].as_str().unwrap().to_string());
+                let pong = IpcResponse::Pong {
+                    version: "0.5.0".into(),
+                    protocol: QUEUE_PROTOCOL - 1,
+                    role: None,
+                };
+                let mut out = serde_json::to_string(&pong).unwrap();
+                out.push('\n');
+                w.write_all(out.as_bytes()).await.unwrap();
+            }
+        });
+        let queue = IpcRequest::Queue {
+            flock: None,
+            machine: None,
+        };
+        match request_head(&paths, &queue).await {
+            Err(RequestError::Refused { code, message }) => {
+                assert_eq!(code, "head_too_old");
+                assert!(message.contains("pastor queue"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(*seen.lock().unwrap(), ["ping"]);
     }
 
     #[tokio::test]

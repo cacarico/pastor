@@ -2587,6 +2587,14 @@ It needs:
 `bridge` or speaks an older protocol. Any command fails the same way later;
 it never falls back to this machine's files.
 
+Every request to a head, from the CLI or from a headless serve, is checked
+against the head's IPC protocol before it goes out: a request that carries
+something the head predates (a field it would drop without a word, or a
+request it does not know) is refused `head_too_old`, naming what the head
+lacks, and is not sent. The check uses one ping per head, kept for a minute,
+so a command pings once and a headless serve sees a restarted head within a
+minute. A request every head takes sends no ping for it.
+
 These commands go to a remote head: `task run|list|describe|read|retry|priority|close|prune|send|done`,
 `queue` and `queue move`, `machine list|add|remove|move|describe`, `flock list|add|remove|describe|default|edit`,
 `trust list|add|remove`, `profile list|describe`, `config edit`, `tick`, `job reload`, `events`, and job commands for
@@ -2631,8 +2639,10 @@ store, and never reads `flock.toml`.
   the id it gives the task, checks its paths and the flock, and queues and
   dispatches the tasks under the job's name. The keys it queued, and those
   it had seen already (a run whose reply was lost), are marked seen here.
-- A head that does not answer fails the run with `head_unreachable`, and a
-  head with a job file of that name with `job_name_taken`: either counts as
+- A head that does not answer fails the run with `head_unreachable`, a head
+  too old for what the job's `[dispatch]` names (a model, a profile, a
+  label, `preempt`, `summary`, a description) with `head_too_old`, and a
+  head with a job file of that name with `job_name_taken`: each counts as
   a failed run, backing the job off as a failing connector does, and no item
   is kept, so the next run asks the connector for them again. An item the
   head refuses for its paths is reported and skipped; one past its cap waits

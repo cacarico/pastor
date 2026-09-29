@@ -18,7 +18,7 @@ use crate::dispatch::{
     pick_machine_where,
 };
 use crate::herdr::{Connector, Endpoint};
-use crate::ipc::{HeadPing, IpcRequest, IpcResponse, MODEL_PROTOCOL, check_protocol};
+use crate::ipc::{HeadPing, IpcRequest, IpcResponse};
 use crate::machine::{
     ActorStopped, MachineHandle, MachineSettings, OrphanClosed, PastorEvent, SendInput,
     SendRefused, ShutdownOutcome, spawn_machine,
@@ -1152,7 +1152,8 @@ impl Fleet {
     /// `JobSubmit`: the head keeps the `seen` keys, renders and queues each
     /// item as that job's task, and dispatches them. The keys it queued or
     /// had seen are marked seen here too, since this store is the one the
-    /// job's next run checks. An unreachable head, or an error reply such as
+    /// job's next run checks. An unreachable head, a head too old for the
+    /// job's dispatch table (`head_too_old`), or an error reply such as
     /// `job_name_taken`, is an `Err` with its code, and nothing is kept.
     pub async fn submit_to_head(
         &self,
@@ -1162,99 +1163,9 @@ impl Fleet {
         let Some(forward) = &self.forward else {
             anyhow::bail!("this pastor serve is the head; it queues its jobs' items itself");
         };
-        // A named model rides in `dispatch`, which only a head of
-        // `MODEL_PROTOCOL` or later reads; an older one would drop it and
-        // start the agent on its default model without a word.
-        if job.agent.model.is_some() {
-            match forward(IpcRequest::Ping).await? {
-                IpcResponse::Pong {
-                    version, protocol, ..
-                } => check_protocol(&version, protocol, MODEL_PROTOCOL, "a job naming a model")?,
-                other => anyhow::bail!("the head answered a ping with {other:?}"),
-            }
-        }
-        // A permission profile rides in `dispatch` the same way; a head
-        // before `PROFILE_PROTOCOL` would drop it (serde skips the unknown
-        // field) and start the agent unenforced instead of refusing.
-        if job.agent.profile.is_some() {
-            match forward(IpcRequest::Ping).await? {
-                IpcResponse::Pong {
-                    version, protocol, ..
-                } => check_protocol(
-                    &version,
-                    protocol,
-                    crate::ipc::PROFILE_PROTOCOL,
-                    "a job naming a permission profile",
-                )?,
-                other => anyhow::bail!("the head answered a ping with {other:?}"),
-            }
-        }
-        // A description template rides in `dispatch` the same way; the
-        // head's `DispatchTable` refuses an unknown field, so an older head
-        // would answer an opaque `invalid_dispatch` instead of this clear
-        // refusal.
-        if job.task_description.is_some() {
-            match forward(IpcRequest::Ping).await? {
-                IpcResponse::Pong {
-                    version, protocol, ..
-                } => check_protocol(
-                    &version,
-                    protocol,
-                    crate::ipc::DESCRIPTION_PROTOCOL,
-                    "a job naming a description",
-                )?,
-                other => anyhow::bail!("the head answered a ping with {other:?}"),
-            }
-        }
-        // `preempt` rides in `dispatch` the same way; the head's
-        // `DispatchTable` refuses an unknown field, so a head before
-        // `PREEMPT_PROTOCOL` would answer an opaque `invalid_dispatch`
-        // instead of this clear refusal.
-        if job.preempt {
-            match forward(IpcRequest::Ping).await? {
-                IpcResponse::Pong {
-                    version, protocol, ..
-                } => check_protocol(
-                    &version,
-                    protocol,
-                    crate::ipc::PREEMPT_PROTOCOL,
-                    "a job with preempt",
-                )?,
-                other => anyhow::bail!("the head answered a ping with {other:?}"),
-            }
-        }
-        // A workspace label template rides in `dispatch` the same way; a
-        // head before `LABEL_PROTOCOL` would drop it (serde skips the
-        // unknown field) and name the workspace by its default instead of
-        // refusing.
-        if job.spec.label.template.is_some() {
-            match forward(IpcRequest::Ping).await? {
-                IpcResponse::Pong {
-                    version, protocol, ..
-                } => check_protocol(
-                    &version,
-                    protocol,
-                    crate::ipc::LABEL_PROTOCOL,
-                    "a job naming a workspace label",
-                )?,
-                other => anyhow::bail!("the head answered a ping with {other:?}"),
-            }
-        }
-        // `summary` rides in `dispatch` the same way; a head before
-        // `SUMMARY_MODE_PROTOCOL` would answer an opaque `invalid_dispatch`.
-        if job.summary.is_some() {
-            match forward(IpcRequest::Ping).await? {
-                IpcResponse::Pong {
-                    version, protocol, ..
-                } => check_protocol(
-                    &version,
-                    protocol,
-                    crate::ipc::SUMMARY_MODE_PROTOCOL,
-                    "a job with summary",
-                )?,
-                other => anyhow::bail!("the head answered a ping with {other:?}"),
-            }
-        }
+        // What the job's `[dispatch]` names (a model, a profile, a label)
+        // rides in `dispatch`; the forward refuses a head too old for any of
+        // it before the submit goes (`IpcRequest::min_protocol`).
         let reply = forward(IpcRequest::JobSubmit {
             job: job.name.clone(),
             dispatch: job.dispatch.clone(),
