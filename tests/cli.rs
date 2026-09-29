@@ -2263,6 +2263,49 @@ fn task_retry_close_and_prune_end_to_end() {
     );
 }
 
+/// `task close` takes several ids: one result line each, every id tried, and
+/// exit 1 naming the ones that failed.
+#[test]
+fn task_close_takes_several_ids() {
+    let env = start();
+    for prompt in ["one", "two", "three", "four"] {
+        env.json(&["task", "run", prompt, "--json"]);
+    }
+    let out = env.cmd(&["task", "close", "t-1", "t-2"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, ["t-1 closed", "t-2 closed"], "{text}");
+
+    // One that fails does not stop the rest, and the exit says which.
+    let out = env.cmd(&["task", "close", "t-99", "t-3", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let results: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(results[0]["task"], "t-99");
+    assert_eq!(results[0]["code"], "task_not_found");
+    assert_eq!(results[1]["task"], "t-3");
+    assert_eq!(results[1]["state"], "closed");
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["code"], "close_failed", "{err}");
+    assert!(err["message"].as_str().unwrap().contains("t-99"), "{err}");
+
+    // --remove-worktree applies to every id: t-4 has none.
+    let out = env.cmd(&["task", "close", "t-4", "t-1", "--remove-worktree"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines().next().unwrap().starts_with("t-4 no_worktree"),
+        "{text}"
+    );
+    assert_ne!(
+        env.json(&["task", "describe", "t-4", "--json"])["state"],
+        "closed"
+    );
+}
 /// Without a head, prune still works on the database; retry and close need
 /// the daemon and say so with a stable code.
 #[test]
@@ -4521,6 +4564,9 @@ fn complete_offers_task_ids_with_their_note() {
         &["task", "read", ""][..],
         &["task", "describe", ""],
         &["task", "done", ""],
+        &["task", "close", ""],
+        // close takes several: past one id it offers more.
+        &["task", "close", "t-2", ""],
         &["events", "--task", ""],
     ] {
         let (ok, out) = complete(&config, &state, words);

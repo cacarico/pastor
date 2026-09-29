@@ -41,7 +41,7 @@ pub fn kind_of(path: &[&str], id: &str) -> Option<Kind> {
         (["queue", "move"], "task" | "before" | "after") => Some(Kind::QueuedTask),
         (_, "flock") => Some(Kind::Flock),
         (_, "machine") | (["flock", "add"], "machines") => Some(Kind::Machine),
-        (_, "task") => Some(Kind::Task),
+        (_, "task") | (["task", "close"], "tasks") => Some(Kind::Task),
         (_, "job") => Some(Kind::Job),
         (_, "model") => Some(Kind::Model),
         (_, "profile") => Some(Kind::Profile),

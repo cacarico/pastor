@@ -405,7 +405,12 @@ t-4` closes the task's pane (and the agent in it) and marks it `closed`; a
 queued task only has its row closed. `--remove-worktree` removes the task's
 worktree instead, which closes its workspace, pane included. herdr refuses a
 checkout with uncommitted or untracked files; the task is then left as it was,
-so commit or clean up and run it again. `pastor task prune --done --older-than
+so commit or clean up and run it again. `pastor task close t-4 t-5 t-6` closes
+each in turn, `--remove-worktree` applying to all: it prints one line per
+task (`t-4 closed`, or `t-5 no_worktree: ...` for one that failed; with
+`--json` an array of objects), goes on past a failure, and then exits 1 with
+`close_failed` naming the ones not closed. One task prints as it always has.
+`pastor task prune --done --older-than
 3d` deletes done tasks that finished more than three days ago; `--failed` and
 `--closed` add those states. A pruned task's item stays seen, so a job never
 queues it again, and the newest task is always kept so its id is never handed
@@ -1935,6 +1940,7 @@ pastor task run --priority critical --preempt "prod is down"  # pauses a low tas
 pastor queue                         # the queue in the order it runs, and why each waits
 pastor queue move t-6 --before t-5   # take t-5's place, and its level
 pastor task close t-1 --remove-worktree   # close its pane and remove its worktree
+pastor task close t-2 t-3 t-4           # several at once, one line each
 pastor task done t-1                 # mark it done; its pane closes after close_done_after
 pastor task done --summary "done: PR #31"   # from its own pane: how it ended
 pastor task run --summary require "Fix issue 12"   # fails if its agent stops without one
