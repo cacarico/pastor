@@ -100,7 +100,8 @@ check() {
 # Fails when a change file holds an entry that a released section of
 # CHANGELOG.md already has, word for word: a branch cut before a release can
 # bring back entries that release gathered, and the next gather would publish
-# them again. An entry is a "- " line and its indented continuation lines.
+# them again. An entry is a "- " line and its indented continuation lines,
+# blank lines between them kept (a loose list item) and trailing ones dropped.
 released_entries() {
 	local files=() f
 	while IFS= read -r f; do
@@ -115,12 +116,13 @@ released_entries() {
 				print "changelog: " src ":" eline ": entry already released in CHANGELOG.md; delete it" > "/dev/stderr"
 				bad = 1
 			}
-			entry = ""
+			entry = ""; blanks = ""
 		}
 		FNR == 1 { end_entry() }
 		{ sub(/[ \t]+$/, "") }
 		/^- / { end_entry(); entry = $0; src = FILENAME; eline = FNR; next }
-		entry != "" && /^[ \t]+[^ \t]/ { entry = entry "\n" $0; next }
+		entry != "" && /^$/ { blanks = blanks "\n"; next }
+		entry != "" && /^[ \t]+[^ \t]/ { entry = entry blanks "\n" $0; blanks = ""; next }
 		{ end_entry() }
 		END { end_entry(); exit bad }
 	' CHANGELOG.md "${files[@]}"
