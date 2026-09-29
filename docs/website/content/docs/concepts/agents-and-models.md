@@ -107,7 +107,10 @@ of its `fallback` list, or stays queued, and `pastor queue` says why, like
 A Claude task whose agent stops on a limit (`You've hit your limit ·
 resets 3am`) goes `waiting`, not `done`: pastor closes its pane, keeps its
 worktree, and resumes its session on the same machine at the reset.
-`pastor task list` shows it as `waiting 03:00`.
+`pastor task list` shows it as `waiting 03:00`. Where Claude shows its
+limit picker instead, pastor picks "Stop and wait for limit to reset" by
+its text and the task waits the same way; it never picks extra usage or an
+upgrade, and a picker without "Stop and wait" is left `blocked` for you.
 
 `pastor limit list` shows the rows, and `pastor limit clear <account>`
 forgets one, which wakes the tasks waiting on it on the next pass. The

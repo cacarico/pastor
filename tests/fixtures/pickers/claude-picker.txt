@@ -1,0 +1,25 @@
+#! kind: claude
+#! source: spec
+#! now: 2026-09-29T21:00:00Z
+#! picker: stop
+#! keys: Enter
+#! until: 2026-09-30T03:00:00Z
+> Read AGENTS.md, then fix the flaky transport test.
+
+● Read(AGENTS.md)
+  ⎿  Read 132 lines
+
+● Bash(cargo test --test transport)
+  ⎿  running 14 tests
+     test result: ok. 14 passed; 0 failed
+
+● You've hit your limit · resets 3am (UTC)
+
+──────────────────────────────────────────────────────────────────────────────
+ What do you want to do?
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Upgrade your plan
+   3. Use extra usage
+
+ Enter to confirm · Esc to cancel

@@ -18,7 +18,8 @@
 //!
 //! The repository is public, so the fixtures are scrubbed: `fixtures_are_scrubbed`
 //! fails on a home path, an IPv4 address, this host's name or a machine of the
-//! local flock, here and in `tests/fixtures/limits/` (`tests/limits.rs`).
+//! local flock, here, in `tests/fixtures/limits/` (`tests/limits.rs`) and in
+//! `tests/fixtures/pickers/` (`tests/pickers.rs`).
 
 use std::path::{Path, PathBuf};
 
@@ -278,13 +279,17 @@ fn fleet_names() -> Vec<String> {
 fn fixtures_are_scrubbed() {
     let fleet = fleet_names();
     // The screens of `tests/limits.rs` are published with these.
-    let limits = dir().with_file_name("limits");
-    let limits: Vec<String> = std::fs::read_dir(&limits)
-        .expect("tests/fixtures/limits")
-        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-        .map(|name| format!("../limits/{name}"))
-        .collect();
-    assert!(!limits.is_empty(), "no fixture under tests/fixtures/limits");
+    // So are those of `tests/pickers.rs`.
+    let mut limits = Vec::new();
+    for sub in ["limits", "pickers"] {
+        let found: Vec<String> = std::fs::read_dir(dir().with_file_name(sub))
+            .unwrap_or_else(|e| panic!("tests/fixtures/{sub}: {e}"))
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .map(|name| format!("../{sub}/{name}"))
+            .collect();
+        assert!(!found.is_empty(), "no fixture under tests/fixtures/{sub}");
+        limits.extend(found);
+    }
     for name in FILES
         .iter()
         .copied()

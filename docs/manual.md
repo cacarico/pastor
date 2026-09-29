@@ -1450,16 +1450,14 @@ clear one only with `agents_change_fleet`.
 | key | default | does |
 |---|---|---|
 | `wait_under` | `"1h"` | a limited task waits for a reset closer than this, and falls back past it; `"0s"` never waits |
-| `rate_retries` | `3` | a task stopped on a 429 or 529 is sent on this many times before it counts as limited |
-| `rate_backoff` | `"1m"` | the wait before the first of those; each next one doubles it |
+| `rate_retries` | `3` | a task stopped on a 429 or 529 is retried in its pane this many times before it counts as limited |
+| `rate_backoff` | `["1m", "5m", "15m"]` | the wait before each of those retries; the last one repeats |
 | `unknown_reset_wait` | `"1h"` | how long a limit whose message names no reset holds |
 | `retry_after_no_credit` | `"6h"` | how long a limit for no credit holds |
 | `handover_lines` | `100` | the pane lines a task moving to another model hands to it |
 
-Only `unknown_reset_wait` and `retry_after_no_credit` are used so far (a
-waiting task's wait, below); the others are read and checked, for what a
-limited task does next: a short limit retried in its pane, a move to its
-next model.
+`wait_under` and `handover_lines` are read and checked, for a limited
+task's move to its next model, which is to come; the others are used below.
 
 A pull machine's serve reports a limit with its task's state, and the head
 keeps it under the account the task's agent names on that machine. The
@@ -1487,8 +1485,7 @@ The limit goes in the table as above, with `agent.exhausted` and
 - The task is pinned to its machine, holds no slot there, and waits until
   the row's `retry_at`, which is `waiting_until` on the task: the reset the
   message named, else `unknown_reset_wait` (`retry_after_no_credit` for no
-  credit). A 429 or 529 that outlived Claude's own retries is handled the
-  same way, with no reset named.
+  credit).
 - Its error says which account and until when: `me-personal exhausted
   until 03:00 (5-hour limit, seen by t-412)`. `task list` shows `waiting
   03:00`; `task describe` has `waiting: until 03:00` and the error as
@@ -1521,6 +1518,51 @@ task's row (`--remove-worktree` removes its kept worktree, as for a paused
 one). `task retry` refuses it with `task_waiting`, since it goes on by
 itself and a retry would put a second agent on the same work, and so does
 `task attach`. `task send` answers `task_not_live`.
+
+#### Short limits are retried in the pane
+
+Claude retries a 429 (rate limit) or 529 (overloaded) about ten times by
+itself; pastor sees only one that outlives that, when the turn ends on
+`API Error: 529 ...`. Such a task keeps its pane, its slot and its state,
+so the conversation goes on where it stopped:
+
+- After the next wait of `rate_backoff` (`1m`, `5m`, `15m` by default, the
+  last one repeating), pastor types `pastor: the API was busy; carry on
+  where you left off.` into its pane and presses Enter, as `task send`
+  would, with a `task.input` that has `rate_retry: true`. A message that
+  names a wait (`try again in 20s`) is waited at least that long.
+- Before each retry, `task.rate_limited` goes out with `line` (the error),
+  `attempt` (from 1) and `retry_at`.
+- A turn that ends on anything else starts the count over.
+- After `rate_retries` retries (3 by default) whose turns still end on a
+  short limit, the next one is handled as a hard limit with no reset: the
+  task waits `unknown_reset_wait`, as above. `rate_retries = 0` does that
+  at once.
+
+The count is kept in memory: after a restart of the head it starts over.
+
+#### Claude's limit picker
+
+Some Claude builds show a picker at the limit instead of ending the turn:
+stop and wait for the limit to reset, upgrade the plan, or use extra usage.
+herdr reports the agent `blocked`. Each time a task goes `blocked`, pastor
+reads the end of its pane once, as strictly as it reads a limit message:
+the picker has to be the last thing there, under at most its key hints, a
+list numbered from 1 with the cursor (`❯`) on one option, and either an
+option of Claude's limit picker or a limit message just above it. A
+numbered list in a message, or another dialog such as a permission prompt,
+is no picker.
+
+pastor picks "Stop and wait for limit to reset" by its text, wherever it
+sits in the list (the arrow keys to it, then Enter), emits `task.input`
+with the keys and `limit_picker: true`, and the task waits for its reset as
+above. A picker without that option, or in words pastor does not know,
+gets no key: the task stays `blocked` for a person, its error saying
+`looks like a usage limit picker with no "Stop and wait for limit to reset"
+(1. Upgrade your plan, 2. Use extra usage); nothing was pressed`.
+
+pastor never picks extra usage or an upgrade, and no setting makes it:
+spending money stays a person's call.
 
 A task with [fallback models](#fallback-models) waits all the same for now;
 moving it to the next model is to come. A headless serve keeps no table, so
@@ -2068,9 +2110,11 @@ A record, which is also what connector event hooks get on stdin:
 - `at`: when the daemon received the event, RFC 3339 UTC.
 - `type`: `task.queued|running|blocked|done|stale|failed|closed|paused`,
   `task.limited` (its agent stopped on a usage limit; the detail is
-  `agent.exhausted`'s) and `task.waiting` (it waits for the reset; see
-  Usage limits),
-  `task.input` (`pastor task send`), `task.trusted` (the head answered a
+  `agent.exhausted`'s), `task.waiting` (it waits for the reset) and
+  `task.rate_limited` (a 429 or 529 it retries in its pane; see Usage
+  limits),
+  `task.input` (`pastor task send`, or pastor at Claude's limit picker),
+  `task.trusted` (the head answered a
   trust prompt), `job.failed`, `connector.finish_failed` (a connector's
   `[finish]` command failed), `machine.connected`, `machine.lost`,
   `agent.exhausted` and `agent.reset` (see Usage limits), and
@@ -2094,7 +2138,10 @@ A record, which is also what connector event hooks get on stdin:
   A task's machine is `task.machine`.
 - `detail`: only on events that carry more, and absent otherwise. On
   `task.input`, `keys` (the key names pressed, Enter included), `text_len`
-  (the length of any text) and `trust` (sent by `--trust`); on
+  (the length of any text), `trust` (sent by `--trust`),
+  `limit_picker` (pastor answered Claude's limit picker) and `rate_retry`
+  (pastor retried a short limit); on `task.rate_limited`, `line`, `attempt`
+  and `retry_at`; on
   `task.trusted`, `keys`; on a `task.blocked` for an agent that ended its
   turn on a question, `question`; on `connector.finish_failed`, `connector`
   (its id) and `reason` (why: the exit status and stderr tail, or a timeout);
@@ -3772,8 +3819,8 @@ takes_flock_work = false     # true: also its flocks' unpinned tasks, not only t
 # command = ["fake-herdr"]   # developer option: argv speaking herdr on stdio; unset: this herdr
 [limits]                     # usage limits; see Usage limits
 wait_under = "1h"            # a limited task waits for a reset closer than this, else falls back; "0s": never waits
-rate_retries = 3             # a 429 or 529 is sent on this many times before it counts as a limit
-rate_backoff = "1m"          # the wait before the first of those; each next one doubles it
+rate_retries = 3             # a 429 or 529 is retried in its pane this many times before it counts as a limit
+rate_backoff = ["1m", "5m", "15m"]  # the wait before each of those retries; the last one repeats
 unknown_reset_wait = "1h"    # how long a limit whose message names no reset holds
 retry_after_no_credit = "6h" # how long a no-credit limit holds
 handover_lines = 100         # pane lines a task moving to another model hands over

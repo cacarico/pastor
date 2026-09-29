@@ -1,0 +1,16 @@
+#! kind: claude
+#! source: made
+#! now: 2026-09-29T21:00:00Z
+#! picker: none
+ What do you want to do?
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Upgrade your plan
+
+> go on
+
+● Done.
+
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────

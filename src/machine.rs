@@ -895,6 +895,8 @@ pub fn spawn_machine(
         trust_answered: HashMap::new(),
         unseen_prompt: HashMap::new(),
         idle_agents: HashSet::new(),
+        picker_read: HashSet::new(),
+        rate_retries: HashMap::new(),
         was_connected: false,
         failures: 0,
         lost_announced: false,
@@ -997,6 +999,14 @@ struct Actor {
     /// changes nothing). Decides what an exit means: an agent that ends
     /// between turns finished its task; see `Observed::PaneExited`.
     idle_agents: HashSet<i64>,
+    /// Tasks whose pane was read for Claude's limit picker since their
+    /// agent was last seen `blocked` (`answer_limit_picker`): once a
+    /// blocked spell. Cleared when the agent is seen out of `blocked`.
+    picker_read: HashSet<i64>,
+    /// task id -> its short limits in a row (`RateRetry`): a 429 or 529
+    /// past the agent's own retries, retried in its pane. Kept in memory
+    /// only: after a restart the count starts over.
+    rate_retries: HashMap<i64, RateRetry>,
     /// Has the actor connected successfully at least once (ever)?
     was_connected: bool,
     /// Consecutive connect-attempt failures since the last success. Only decides
@@ -1175,6 +1185,14 @@ const IDLE_TAIL_LINES: usize = 5;
 /// ends on the idle, as before.
 fn not_ended(task: &Task) -> bool {
     !task.ended && task.spec.summary != crate::task::SummaryMode::Off
+}
+
+/// A task's short limits in a row (`Actor::rate_retries`).
+struct RateRetry {
+    /// The retries scheduled so far, the one due included.
+    attempts: u32,
+    /// When `RATE_RETRY_PROMPT` goes into its pane; `None` once sent.
+    due: Option<Instant>,
 }
 
 /// Who asked for a close. `pastor task close` refuses what herdr refuses;
@@ -1388,6 +1406,10 @@ impl Actor {
                         if let Err(err) = self.deliver_held_prompts().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "held prompt delivery failed"); break; }
                             tracing::warn!(machine = %self.name, %err, "held prompt delivery failed; staying connected");
+                        }
+                        if let Err(err) = self.send_rate_retries().await {
+                            if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "short limit retry failed"); break; }
+                            tracing::warn!(machine = %self.name, %err, "short limit retry failed; staying connected");
                         }
                         if let Err(err) = self.confirm_pending_done().await {
                             if is_outage(&err) { tracing::warn!(machine = %self.name, %err, "settle check failed"); break; }
@@ -1780,6 +1802,12 @@ impl Actor {
                             if is_outage(&err) {
                                 return PollExit::Reconnect(format!("poll reconcile failed: {err}"));
                             }
+                        }
+                    }
+                    if let Err(err) = self.send_rate_retries().await {
+                        tracing::warn!(machine = %self.name, %err, "short limit retry failed");
+                        if is_outage(&err) {
+                            return PollExit::Reconnect(format!("short limit retry failed: {err}"));
                         }
                     }
                     if let Err(err) = self.confirm_pending_done().await {
@@ -3401,6 +3429,7 @@ impl Actor {
             }
             return Ok(());
         };
+        let id = task.id;
         let observed = if ev.is_pane_closed() {
             Observed::PaneClosed
         } else if ev.is_pane_exited() {
@@ -3446,6 +3475,7 @@ impl Actor {
                 ..
             }
         ) {
+            self.answer_limit_picker(id).await?;
             self.auto_trust().await?;
         }
         Ok(())
@@ -3688,7 +3718,10 @@ impl Actor {
                 continue;
             }
             let observed = observed_from(agent);
-            let end = if next_state(&task, &observed) == Some(TaskState::Done) {
+            // Only a turn whose end was read says anything about the short
+            // limits in a row: the others are not an end at all.
+            let read = next_state(&task, &observed) == Some(TaskState::Done);
+            let end = if read {
                 match self.pane_end(&task).await {
                     Ok(end) => end,
                     Err(err) => {
@@ -3702,8 +3735,18 @@ impl Actor {
             } else {
                 PaneEnd::Finished
             };
+            let short = matches!(&end, PaneEnd::Limit(l) if !l.hard);
+            if read && !short && !matches!(end, PaneEnd::ShellRunning) {
+                // A turn that ends on anything else than a short limit (one
+                // waiting on a shell has not ended): the count starts over.
+                self.rate_retries.remove(&id);
+            }
             match end {
+                PaneEnd::Limit(limit) if !limit.hard && self.retries_left(id) => {
+                    self.retry_later(task, &observed, &limit)?;
+                }
                 PaneEnd::Limit(limit) => {
+                    self.rate_retries.remove(&id);
                     if let Err(err) = self.wait_on_limit(task, &limit, false).await {
                         // The pane could not be closed: look again next window.
                         self.pending_done.insert(id, (seen_seq, Instant::now()));
@@ -3734,6 +3777,121 @@ impl Actor {
                 }
                 PaneEnd::Finished => self.apply(task, &observed),
             }
+        }
+        Ok(())
+    }
+
+    /// Whether task `id`, whose agent stopped on a short limit, is retried
+    /// in its pane again: fewer than `[limits] rate_retries` so far.
+    fn retries_left(&self, id: i64) -> bool {
+        let Some(limits) = &self.settings.limits else {
+            return false;
+        };
+        let done = self.rate_retries.get(&id).map_or(0, |r| r.attempts);
+        done < limits.rate_retries
+    }
+
+    /// `task`'s agent stopped on `limit`, a 429 or 529 past its own
+    /// retries: it keeps its pane, its slot and its state, and
+    /// `RATE_RETRY_PROMPT` goes into its pane after the next wait of
+    /// `[limits] rate_backoff`, or the wait the message names when that is
+    /// longer (`send_rate_retries`). The baseline moves to the idle it was
+    /// found at, as for a question (`block_on_question`), so that idle is
+    /// not read as done meanwhile. Emits `task.rate_limited`.
+    fn retry_later(
+        &mut self,
+        mut task: Task,
+        observed: &Observed,
+        limit: &crate::limit::Limit,
+    ) -> anyhow::Result<()> {
+        let limits = self.settings.limits.clone().unwrap_or_default();
+        let attempt = self.rate_retries.get(&task.id).map_or(0, |r| r.attempts) + 1;
+        let now = Utc::now();
+        let mut wait = limits.rate_backoff_for(attempt);
+        if let Some(named) = limit.until.and_then(|u| (u - now).to_std().ok()) {
+            wait = wait.max(named);
+        }
+        let retry_at = now
+            .checked_add_signed(chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::MAX))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        if let Observed::Status {
+            state_change_seq,
+            completion_seq,
+            ..
+        } = observed
+        {
+            task.last_completion_seq = completion_seq.or(*state_change_seq);
+        }
+        task.activity_seen = false;
+        self.store.update_task(&mut task)?;
+        self.rate_retries.insert(
+            task.id,
+            RateRetry {
+                attempts: attempt,
+                due: Some(Instant::now() + wait),
+            },
+        );
+        tracing::warn!(machine = %self.name, task = %task.display_id(), attempt, %retry_at, line = %limit.line, "short usage limit; retrying in the pane");
+        self.emit_with(
+            "task.rate_limited",
+            Some(task.id),
+            Some(serde_json::json!({
+                "line": limit.line,
+                "attempt": attempt,
+                "retry_at": retry_at,
+            })),
+        );
+        Ok(())
+    }
+
+    /// Send `RATE_RETRY_PROMPT`, then Enter, into the pane of each task
+    /// whose short-limit wait has passed (`retry_later`), as `task send`
+    /// would, with `task.input`. A task that is no longer running with a
+    /// pane is not sent anything. A send that fails is tried again on the
+    /// next tick.
+    async fn send_rate_retries(&mut self) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let due: Vec<i64> = self
+            .rate_retries
+            .iter()
+            .filter(|(_, r)| r.due.is_some_and(|d| d <= now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in due {
+            let task = match self.store.get_task(id) {
+                Ok(Some(t)) if t.state == TaskState::Running => t,
+                Ok(_) => {
+                    self.rate_retries.remove(&id);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let Some(pane) = task.pane_id.clone() else {
+                self.rate_retries.remove(&id);
+                continue;
+            };
+            let text = crate::task::RATE_RETRY_PROMPT;
+            let keys = ["Enter".to_string()];
+            let timeout = self.settings.request_timeout;
+            tokio::time::timeout(timeout, async {
+                self.connector.pane_send_text(&pane, text).await?;
+                self.connector.pane_send_keys(&pane, &keys).await
+            })
+            .await
+            .map_err(|_| TimedOut("pane input", timeout))??;
+            if let Some(r) = self.rate_retries.get_mut(&id) {
+                r.due = None;
+            }
+            tracing::info!(machine = %self.name, task = %task.display_id(), "sent the retry prompt after a short usage limit");
+            self.emit_with(
+                "task.input",
+                Some(id),
+                Some(serde_json::json!({
+                    "text_len": text.chars().count(),
+                    "keys": keys,
+                    "rate_retry": true,
+                })),
+            );
         }
         Ok(())
     }
@@ -4007,8 +4165,12 @@ impl Actor {
         match status {
             AgentStatus::Idle | AgentStatus::Done => {
                 self.idle_agents.insert(id);
+                self.picker_read.remove(&id);
             }
             AgentStatus::Working | AgentStatus::Blocked => {
+                if status == AgentStatus::Working {
+                    self.picker_read.remove(&id);
+                }
                 self.idle_agents.remove(&id);
                 // It took its prompt, or stopped on something a person answers.
                 self.unseen_prompt.remove(&id);
@@ -4135,6 +4297,8 @@ impl Actor {
         let agents: Vec<AgentInfo> = tokio::time::timeout(timeout, self.connector.agent_list())
             .await
             .map_err(|_| TimedOut("agent.list", timeout))??;
+        // Tasks whose agent this list shows blocked, for the limit picker.
+        let mut blocked = Vec::new();
         for task in self.store.tasks_on_machine(&self.name)? {
             let Some(pane_id) = task.pane_id.clone() else {
                 // Only a `Starting` task can occupy a pane slot with no pane recorded
@@ -4253,6 +4417,9 @@ impl Actor {
                 }
                 Some(agent) => {
                     self.note_status(task.id, agent.agent_status);
+                    if agent.agent_status == AgentStatus::Blocked {
+                        blocked.push(task.id);
+                    }
                     // Before the timeout check: a task that sat blocked past its
                     // timeout has not started its work yet.
                     if task.prompt_pending
@@ -4314,8 +4481,83 @@ impl Actor {
         }
         self.find_orphans(&agents)?;
         self.refresh_live();
+        for id in blocked {
+            self.answer_limit_picker(id).await?;
+        }
         self.auto_trust().await?;
         Ok(adopted)
+    }
+
+    /// Claude's limit picker: read the pane of task `id`, whose agent is
+    /// `blocked`, once a blocked spell (`picker_read`), and when it ends on
+    /// the picker (`limit::limit_picker`), pick "Stop and wait for limit to
+    /// reset" by its text and handle the limit as an agent that stopped on
+    /// it (`wait_on_limit`). The other options spend money or change the
+    /// plan, which stays a person's call, so a picker without that option,
+    /// or in words pastor does not know, gets no key: the task stays
+    /// `blocked` with an error saying what it looks like. A task blocked on
+    /// its startup (`prompt_pending`, see `auto_trust`), one its agent
+    /// ended, and any where no limits are kept are not read.
+    async fn answer_limit_picker(&mut self, id: i64) -> anyhow::Result<()> {
+        if self.settings.limits.is_none() || self.picker_read.contains(&id) {
+            return Ok(());
+        }
+        let Ok(Some(task)) = self.store.get_task(id) else {
+            return Ok(());
+        };
+        if task.state != TaskState::Blocked || task.prompt_pending || task.ended {
+            return Ok(());
+        }
+        let (Some(pane), Some(target)) = (task.pane_id.clone(), task.agent_name.clone()) else {
+            return Ok(());
+        };
+        let timeout = self.settings.request_timeout;
+        let text = match tokio::time::timeout(timeout, self.connector.agent_read(&target, 100))
+            .await
+        {
+            Ok(Ok(text)) => text,
+            Ok(Err(err)) if err.is_transport() => return Err(err.into()),
+            Ok(Err(err)) => {
+                tracing::warn!(machine = %self.name, task = %task.display_id(), %err, "read pane for a limit picker");
+                self.picker_read.insert(id);
+                return Ok(());
+            }
+            Err(_) => return Err(TimedOut("agent.read", timeout).into()),
+        };
+        self.picker_read.insert(id);
+        let kind = self.settings.agents.kind(&task.spec.agent);
+        let Some(picker) = crate::limit::limit_picker(kind, &text, Utc::now()) else {
+            return Ok(());
+        };
+        let Some(keys) = picker.stop_keys() else {
+            let message = format!(
+                "looks like a usage limit picker with no \"{}\" ({}); nothing was pressed",
+                crate::limit::STOP_AND_WAIT,
+                picker.listed()
+            );
+            tracing::warn!(machine = %self.name, task = %task.display_id(), "{message}");
+            let written = write_task(&self.store, task, |t| {
+                let blocked = t.state == TaskState::Blocked;
+                if blocked {
+                    t.error = Some(message.clone());
+                }
+                blocked
+            })?;
+            if written.is_some() {
+                self.refresh_live();
+            }
+            return Ok(());
+        };
+        tokio::time::timeout(timeout, self.connector.pane_send_keys(&pane, &keys))
+            .await
+            .map_err(|_| TimedOut("pane.send_keys", timeout))??;
+        tracing::info!(machine = %self.name, task = %task.display_id(), "answered the limit picker: stop and wait");
+        self.emit_with(
+            "task.input",
+            Some(id),
+            Some(serde_json::json!({"keys": keys, "limit_picker": true})),
+        );
+        self.wait_on_limit(task, &picker.limit, false).await
     }
 
     /// Answer the folder-trust prompt of every task blocked during startup
@@ -5196,6 +5438,309 @@ mod tests {
         );
         let prompt = calls(&fake, "agent.prompt").pop().unwrap();
         assert_eq!(prompt["text"], crate::task::LIMIT_RESUME_PROMPT);
+    }
+
+    /// `limits_kept` with short limits retried after 1s, 2s, then 3s.
+    fn short_limits(rate_retries: u32) -> MachineSettings {
+        MachineSettings {
+            limits: Some(crate::config::LimitsConfig {
+                rate_retries,
+                rate_backoff: vec!["1s".into(), "2s".into(), "3s".into()],
+                ..Default::default()
+            }),
+            ..settings_with_settle(Duration::from_millis(100))
+        }
+    }
+
+    /// The end of a pane whose agent stopped on a 529 past its own retries.
+    const OVERLOADED: &str = "❯ fix it\n\n● Half of it is done.\n\n● API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n────────\n❯ \n────────\n";
+
+    /// The agent works again, then stops on `screen`.
+    async fn turn_ends_on(fake: &FakeHerdr, pane: &str, screen: &str) {
+        fake.set_status(pane, AgentStatus::Working);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fake.set_pane_text(pane, screen);
+        fake.set_status(pane, AgentStatus::Idle);
+    }
+
+    /// The next `task.rate_limited` about task `id`.
+    async fn next_rate_limited(
+        events: &mut broadcast::Receiver<PastorEvent>,
+        id: i64,
+    ) -> serde_json::Value {
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("a task.rate_limited")
+                .unwrap();
+            if ev.kind == "task.rate_limited" && ev.task_id == Some(id) {
+                return ev.detail.unwrap();
+            }
+        }
+    }
+
+    /// What pastor typed into `pane`: the retry prompt, then Enter.
+    fn retries_sent(fake: &FakeHerdr, pane: &str) -> usize {
+        fake.pane_input(pane)
+            .iter()
+            .filter(|i| {
+                matches!(i, crate::herdr::fake::PaneInput::Text(t) if t == crate::task::RATE_RETRY_PROMPT)
+            })
+            .count()
+    }
+
+    /// A 529 past Claude's own retries: the task keeps its pane, its slot
+    /// and its state, and after each wait of `rate_backoff` gets
+    /// `RATE_RETRY_PROMPT` in its pane, with `task.rate_limited` (`line`,
+    /// `attempt`, `retry_at`) before each. After `rate_retries` of them it
+    /// is handled as a hard limit with no reset: it waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_short_limit_is_retried_in_the_pane_then_handled_as_a_limit() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, short_limits(3));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        for (attempt, wait) in [(1, 1), (2, 2), (3, 3)] {
+            turn_ends_on(&fake, &pane, OVERLOADED).await;
+            let before = Utc::now();
+            let detail = next_rate_limited(&mut events, t.id).await;
+            assert_eq!(detail["attempt"], attempt, "{detail}");
+            assert!(
+                detail["line"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("API Error: 529"),
+                "{detail}"
+            );
+            let retry_at: chrono::DateTime<Utc> =
+                serde_json::from_value(detail["retry_at"].clone()).unwrap();
+            let secs = (retry_at - before).num_milliseconds();
+            assert!(
+                (wait * 1000 - 500..=wait * 1000 + 500).contains(&secs),
+                "{secs}ms"
+            );
+            let row = store.get_task(t.id).unwrap().unwrap();
+            assert_eq!(row.state, TaskState::Running, "no state change");
+            assert_eq!(row.pane_id.as_deref(), Some(pane.as_str()));
+            assert_eq!(
+                retries_sent(&fake, &pane),
+                attempt as usize - 1,
+                "not before the wait"
+            );
+            tokio::time::sleep(Duration::from_millis(wait as u64 * 1000 + 300)).await;
+            assert_eq!(
+                retries_sent(&fake, &pane),
+                attempt as usize,
+                "after the wait"
+            );
+            assert_eq!(state_of(&store, t.id), TaskState::Running);
+        }
+        turn_ends_on(&fake, &pane, OVERLOADED).await;
+        wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+        let limits = store.limits().unwrap();
+        assert_eq!(limits.len(), 1, "{limits:?}");
+        assert!(!limits[0].hard);
+        assert_eq!(limits[0].until, None);
+        assert_eq!(retries_sent(&fake, &pane), 3);
+    }
+
+    /// A message that names a wait (`try again in 20s`) is waited at least
+    /// that long, past a shorter `rate_backoff`.
+    #[tokio::test(start_paused = true)]
+    async fn a_short_limit_waits_at_least_the_time_it_names() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, short_limits(3));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        turn_ends_on(
+            &fake,
+            &pane,
+            "❯ fix it\n\n● API Error: 429 rate_limit_error, try again in 20s\n\n────────\n❯ \n────────\n",
+        )
+        .await;
+        let before = Utc::now();
+        let detail = next_rate_limited(&mut events, t.id).await;
+        let retry_at: chrono::DateTime<Utc> =
+            serde_json::from_value(detail["retry_at"].clone()).unwrap();
+        assert!((retry_at - before).num_seconds() >= 19, "{detail}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(retries_sent(&fake, &pane), 0, "the message's 20s, not 1s");
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        assert_eq!(retries_sent(&fake, &pane), 1);
+    }
+
+    /// A retry that works (the turn ends on anything but a short limit)
+    /// starts the count over: with one retry allowed, the next 529 of a
+    /// task sent more work is retried again, not a limit.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_that_works_starts_the_count_over() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, mut events) = spawn_with_settings(&fake, &store, short_limits(1));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        turn_ends_on(&fake, &pane, OVERLOADED).await;
+        assert_eq!(next_rate_limited(&mut events, t.id).await["attempt"], 1);
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(retries_sent(&fake, &pane), 1);
+        turn_ends_on(
+            &fake,
+            &pane,
+            "❯ fix it\n\n● All done.\n\n────────\n❯ \n────────\n",
+        )
+        .await;
+        wait_for("done", || state_of(&store, t.id) == TaskState::Done).await;
+        h.send(
+            t.id,
+            SendInput {
+                text: Some("one more thing".into()),
+                enter: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        turn_ends_on(&fake, &pane, OVERLOADED).await;
+        assert_eq!(next_rate_limited(&mut events, t.id).await["attempt"], 1);
+        assert_eq!(state_of(&store, t.id), TaskState::Running);
+        assert!(store.limits().unwrap().is_empty());
+    }
+
+    /// A screen of `tests/fixtures/pickers/`, without its header.
+    fn picker_screen(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pickers")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with("#! "))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    /// A task whose agent goes `blocked` on `screen`, on a head that keeps
+    /// the limits: the fake, the store, the task and its pane.
+    async fn blocked_on(
+        screen: &str,
+    ) -> (
+        FakeHerdr,
+        Arc<Store>,
+        Task,
+        String,
+        broadcast::Receiver<PastorEvent>,
+    ) {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, events) =
+            spawn_with_settings(&fake, &store, limits_kept(Duration::from_millis(100)));
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        let t = h.dispatch(new_task(&store).id).await.unwrap();
+        let pane = t.pane_id.clone().unwrap();
+        fake.set_status(&pane, AgentStatus::Working);
+        wait_for("running", || state_of(&store, t.id) == TaskState::Running).await;
+        fake.set_pane_text(&pane, screen);
+        fake.set_status(&pane, AgentStatus::Blocked);
+        // The handle has to outlive the test's waits.
+        std::mem::forget(h);
+        (fake, store, t, pane, events)
+    }
+
+    /// The keys pressed in `pane`, all of them.
+    fn keys_in(fake: &FakeHerdr, pane: &str) -> Vec<String> {
+        fake.pane_input(pane)
+            .into_iter()
+            .flat_map(|i| match i {
+                crate::herdr::fake::PaneInput::Keys(k) => k,
+                crate::herdr::fake::PaneInput::Text(t) => vec![format!("text:{t}")],
+            })
+            .collect()
+    }
+
+    /// Claude's limit picker: pastor picks "Stop and wait for limit to
+    /// reset" by its text, wherever it is in the list, and the task waits
+    /// for its reset as one that stopped on the limit does. Nothing else is
+    /// ever pressed: no key reaches extra usage or an upgrade.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_agent_at_the_limit_picker_stops_and_waits() {
+        for (screen, keys) in [
+            ("claude-picker.txt", vec!["Enter"]),
+            ("claude-picker-reordered.txt", vec!["Down", "Down", "Enter"]),
+        ] {
+            let (fake, store, t, pane, mut events) = blocked_on(&picker_screen(screen)).await;
+            wait_for("waiting", || state_of(&store, t.id) == TaskState::Waiting).await;
+            let mut want: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+            want.push("esc".into());
+            assert_eq!(keys_in(&fake, &pane), want, "{screen}");
+            let row = store.get_task(t.id).unwrap().unwrap();
+            assert_eq!(row.pane_id, None, "{screen}");
+            assert!(row.waiting_until.is_some(), "{screen}");
+            let limits = store.limits().unwrap();
+            assert_eq!(limits.len(), 1, "{screen}: {limits:?}");
+            assert!(limits[0].hard, "{screen}");
+            assert!(saw(&mut events, "task.waiting", t.id), "{screen}");
+        }
+    }
+
+    /// A limit picker with no "Stop and wait" (or in words pastor does not
+    /// know) gets no key at all: the task stays `blocked`, its error saying
+    /// what it looks like, for a person to answer. The pane is read once
+    /// per blocked spell.
+    #[tokio::test(start_paused = true)]
+    async fn a_limit_picker_without_stop_and_wait_gets_no_key() {
+        for screen in [
+            "claude-picker-no-stop.txt",
+            "claude-picker-unknown-wording.txt",
+        ] {
+            let (fake, store, t, pane, _events) = blocked_on(&picker_screen(screen)).await;
+            wait_for("error", || {
+                store
+                    .get_task(t.id)
+                    .unwrap()
+                    .unwrap()
+                    .error
+                    .is_some_and(|e| e.contains("limit picker"))
+            })
+            .await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let row = store.get_task(t.id).unwrap().unwrap();
+            assert_eq!(row.state, TaskState::Blocked, "{screen}");
+            assert!(keys_in(&fake, &pane).is_empty(), "{screen}");
+            assert!(store.limits().unwrap().is_empty(), "{screen}");
+            let reads = calls(&fake, "agent.read").len();
+            assert_eq!(reads, 1, "{screen}: read once");
+        }
+    }
+
+    /// Blocked on anything else (a permission prompt), the task is left
+    /// for a person as before: nothing pressed, no error written.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_agent_on_another_dialog_is_left_alone() {
+        let (fake, store, t, pane, _events) =
+            blocked_on(&picker_screen("no-picker-permission-prompt.txt")).await;
+        wait_for("blocked", || state_of(&store, t.id) == TaskState::Blocked).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let row = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Blocked);
+        assert_eq!(row.error, None);
+        assert!(keys_in(&fake, &pane).is_empty());
     }
 
     /// A limit further up the pane than the last prompt is an old one:
