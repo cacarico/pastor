@@ -2041,7 +2041,11 @@ impl Runner {
                 },
                 s if s.occupies_pane() => {
                     match t.machine.as_deref().and_then(|m| self.fleet.get(m)) {
-                        Some(h) => h.close(t.id, false).await.map(|_| ()),
+                        Some(h) => self
+                            .fleet
+                            .bounded(&h.name, h.close(t.id, false))
+                            .await
+                            .map(|_| ()),
                         None => self.store.close_task(t.id).map(|_| ()),
                     }
                 }
