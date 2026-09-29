@@ -143,9 +143,10 @@ demo: build ## record the README gifs with vhs against a demo head
 	for t in docs/demo/*.tape; do vhs $$t; done; \
 	for i in 1 2 3 4; do pastor task close t-$$i >/dev/null 2>&1 || true; done
 
-# The scripts are generated from the clap definitions, so they cannot drift
-# from the real command tree; `pastor completions <shell>` prints the same
-# thing at runtime for shells not listed here.
+# The scripts are generated from the clap definitions; the checked-in copies
+# ship in the release tarball, so `make check` fails when they are stale.
+# `pastor completions <shell>` prints the same thing at runtime for shells
+# not listed here.
 completions: ## regenerate contrib/completions/pastor.{bash,fish} from the CLI
 	cargo build -q
 	mkdir -p contrib/completions

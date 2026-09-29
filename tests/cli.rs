@@ -5006,6 +5006,27 @@ fn completion_scripts_ask_pastor_for_names() {
     );
 }
 
+/// The release tarball ships `contrib/completions/*` as checked in, so a copy
+/// that no longer matches what the CLI prints would ship stale without anyone
+/// noticing. `make completions` regenerates them.
+#[test]
+fn shipped_completions_match_the_cli() {
+    for shell in ["bash", "fish"] {
+        let out = pastor().args(["completions", shell]).output().unwrap();
+        assert!(out.status.success());
+        let fresh = String::from_utf8(out.stdout).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib/completions")
+            .join(format!("pastor.{shell}"));
+        let shipped = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            shipped == fresh,
+            "{} is stale: run make completions",
+            path.display()
+        );
+    }
+}
+
 /// `pastor bridge` carries each request line to the head's socket and each
 /// reply back, in order, one connection per line, and leaves the bytes alone.
 /// The fake head answers every connection with the line it got, numbered, so

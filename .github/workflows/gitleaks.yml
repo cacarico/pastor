@@ -1,13 +1,13 @@
 name: gitleaks
 
 # The repository is public and every commit gets one scan: `pull_request`
-# covers every commit on a branch, and this project merges by
-# fast-forwarding a PR's exact head sha to main, so a push to main is
-# already-scanned history, kept here only so a direct push that skipped a PR
-# is not silently unchecked. Pushing to every other branch is not a trigger
-# any more, to save runner time; the gap that leaves is a secret landing on
-# a branch with no open PR yet, which sits unscanned by this workflow until
-# a PR opens or the Monday sweep runs. GitHub secret scanning with push
+# covers every commit on a branch, and PRs merge with a merge commit, so a
+# push to main adds only that merge commit on top of already-scanned
+# history; it stays a trigger so a direct push that skipped a PR is not
+# silently unchecked. Pushing to every other branch is not a trigger any
+# more, to save runner time; the gap that leaves is a secret landing on a
+# branch with no open PR yet, which sits unscanned by this workflow until a
+# PR opens or the Monday sweep runs. GitHub secret scanning with push
 # protection (server side, on every push, regardless of this workflow) is
 # the front line for that gap, but it only catches the provider patterns it
 # recognises, not gitleaks' broader default ruleset, so the gap is real, not

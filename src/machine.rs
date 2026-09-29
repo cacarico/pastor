@@ -16,6 +16,7 @@ use crate::herdr::{
     subscription_agent_status, subscription_lifecycle,
 };
 use crate::store::Store;
+use crate::sync::Recover;
 use crate::task::{Observed, Task, TaskState, TaskSummary, next_state};
 
 /// A herdr request that got no answer within `request_timeout`.
@@ -557,7 +558,7 @@ impl MachineHandle {
     pub fn with_slots(mut self, job_slots: u32, burst: u32) -> MachineHandle {
         self.job_slots = job_slots;
         self.burst = burst;
-        let mut s = self.status.write().unwrap();
+        let mut s = self.status.write().recover();
         s.job_slots = job_slots;
         s.burst = burst;
         drop(s);
@@ -611,7 +612,7 @@ impl MachineHandle {
     }
 
     pub fn snapshot(&self) -> MachineStatus {
-        self.status.read().unwrap().clone()
+        self.status.read().recover().clone()
     }
 
     pub async fn dispatch(&self, task_id: i64) -> anyhow::Result<Task> {
@@ -1063,7 +1064,7 @@ impl Actor {
             let pastor_version = self.ask_pastor_version().await.flatten();
             self.version_asked_at = Instant::now();
             {
-                let mut s = self.status.write().unwrap();
+                let mut s = self.status.write().recover();
                 s.herdr_version = Some(pong.version.clone());
                 s.pastor_version = pastor_version;
                 s.protocol = Some(pong.protocol);
@@ -1268,7 +1269,7 @@ impl Actor {
         }
         self.version_asked_at = Instant::now();
         if let Some(v) = self.ask_pastor_version().await {
-            self.status.write().unwrap().pastor_version = v;
+            self.status.write().recover().pastor_version = v;
         }
     }
 
@@ -1328,7 +1329,7 @@ impl Actor {
     }
 
     fn set_channel(&self, channel: ChannelState, error: Option<String>) {
-        let mut s = self.status.write().unwrap();
+        let mut s = self.status.write().recover();
         s.channel = channel;
         s.error = error;
     }
@@ -1338,7 +1339,7 @@ impl Actor {
             Ok(v) => {
                 // An orphan holds a pane and an agent just like a task does;
                 // leaving it out would let the picker over-dispatch.
-                let mut s = self.status.write().unwrap();
+                let mut s = self.status.write().recover();
                 count_live(&mut s, &v);
                 s.live += self.orphans.len();
                 s.orphans = self.orphans.iter().map(|(name, _)| name.clone()).collect();
@@ -3731,6 +3732,50 @@ mod tests {
 
     fn state_of(store: &Store, id: i64) -> TaskState {
         store.get_task(id).unwrap().unwrap().state
+    }
+
+    /// Poisons the status lock the way a panicking request would: a thread
+    /// panics while it holds the write guard.
+    fn poison_status(h: &MachineHandle) {
+        let status = h.status.clone();
+        let r = std::thread::spawn(move || {
+            let _s = status.write().unwrap();
+            panic!("poison the status lock");
+        })
+        .join();
+        assert!(r.is_err());
+        assert!(h.status.is_poisoned());
+    }
+
+    /// A panic while the status lock is held must not break the handle: the
+    /// status is plain values, so later reads and writes take the guard back.
+    #[test]
+    fn the_handle_works_after_a_panic_poisoned_the_status_lock() {
+        let h = pull_machine("m".into(), 2, vec![]);
+        poison_status(&h);
+        let h = h.with_slots(3, 1);
+        let s = h.snapshot();
+        assert_eq!((s.job_slots, s.burst), (3, 1));
+    }
+
+    /// The actor writes the status on every connect and poll. With the lock
+    /// poisoned it must still connect and report, not panic and leave the
+    /// machine `connecting` until restart.
+    #[tokio::test]
+    async fn the_actor_works_after_a_panic_poisoned_the_status_lock() {
+        let fake = FakeHerdr::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let (h, _events) = spawn(&fake, &store);
+        // The test runtime has one thread, so the actor has not run yet.
+        poison_status(&h);
+        wait_for("connected", || {
+            h.snapshot().channel == ChannelState::Connected
+        })
+        .await;
+        assert!(!h.actor_finished(), "the actor survived the poisoned lock");
+        let t = new_task(&store);
+        h.dispatch(t.id).await.unwrap();
+        wait_for("live count", || h.snapshot().live == 1).await;
     }
 
     /// A flock reload stops a removed or replaced machine's actor. Afterwards

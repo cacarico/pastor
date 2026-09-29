@@ -332,9 +332,6 @@ pub enum SummaryMode {
     Off,
 }
 
-/// The code of a `summary` that is not one of `SummaryMode`'s.
-pub const UNKNOWN_SUMMARY_MODE: &str = "unknown_summary_mode";
-
 /// The paragraph pastor adds to a task's prompt when it sends it, unless
 /// the task's `summary` is `off`. Not stored in the task's prompt.
 pub const SUMMARY_ASK: &str = "When you finish, run `pastor task done --summary-file -` with a short summary on stdin: first line `done`, `partial`, `blocked` or `nothing to do`; then up to five short lines: what changed, where (branch, PR, files or notes), what is left.";

@@ -70,12 +70,6 @@ pub struct DoneArgs {
 }
 
 impl DoneArgs {
-    /// Whether a summary is given, which only a head of `SUMMARY_PROTOCOL`
-    /// keeps.
-    pub fn has_summary(&self) -> bool {
-        self.summary.is_some() || self.summary_file.is_some()
-    }
-
     /// The summary given: `--summary` as it is, or `--summary-file` read
     /// (`-` is stdin). A blank one is an error, not a round with none.
     pub fn summary_text(&self) -> anyhow::Result<Option<String>> {

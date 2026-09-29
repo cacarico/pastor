@@ -73,11 +73,6 @@ impl MachineView {
         self.seat(flock).is_some()
     }
 
-    /// Is `flock` under its number here? Job slots and burst never pass it.
-    pub fn flock_has_room(&self, flock: &str) -> bool {
-        self.seat(flock).is_some_and(FlockSeat::has_room)
-    }
-
     /// May a task of `flock` take a slot here, as far as the flock's number
     /// goes? Under its share, yes; from its share up to its max, only while
     /// no flock under its share here has a task waiting; at its max, no.
