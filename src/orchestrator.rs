@@ -1905,7 +1905,11 @@ impl Runner {
                 enter: true,
                 ..Default::default()
             };
-            if let Err(err) = handle.send(task.id, input).await {
+            if let Err(err) = self
+                .fleet
+                .bounded(&handle.name, handle.send(task.id, input))
+                .await
+            {
                 tracing::warn!(orchestrator = name, task = %task.display_id(), err = %format!("{err:#}"), "send the last message");
             }
         }
